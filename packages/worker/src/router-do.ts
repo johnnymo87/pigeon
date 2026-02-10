@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { handleSessionRequest } from "./sessions";
 import { handleSendNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
+import { cleanupCommandQueue, retrySentCommands, type CommandWsLike } from "./command-queue";
 
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
@@ -49,8 +50,10 @@ export class RouterDurableObject extends DurableObject<Env> {
         status TEXT NOT NULL DEFAULT 'pending',
         attempts INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
-        next_retry_at INTEGER NOT NULL,
-        acked_at INTEGER
+        sent_at INTEGER,
+        next_retry_at INTEGER,
+        acked_at INTEGER,
+        last_error TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_command_queue_machine_status
@@ -96,5 +99,17 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     // TODO: websocket
     return new Response(`Not found: ${url.pathname}`, { status: 404 });
+  }
+
+  private getMachineWebSocket(_machineId: string): CommandWsLike | null {
+    // Placeholder until ccr-v3m implements live machine socket tracking.
+    return null;
+  }
+
+  async alarm(): Promise<void> {
+    cleanupCommandQueue(this.sql);
+    retrySentCommands(this.sql, (machineId) => this.getMachineWebSocket(machineId));
+
+    await this.ctx.storage.setAlarm(Date.now() + (60 * 60 * 1000));
   }
 }

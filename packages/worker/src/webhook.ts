@@ -1,4 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
+import { generateCommandId } from "./command-queue";
 
 /**
  * Verify the Telegram webhook secret header (constant-time).
@@ -216,15 +217,6 @@ async function resolveSessionMachine(
   sql.exec("UPDATE sessions SET updated_at = ? WHERE session_id = ?", Date.now(), sessionId);
 
   return { machineId: session.machine_id, label: session.label };
-}
-
-/**
- * Generate a unique command ID (16 random bytes → 32 hex chars).
- */
-function generateCommandId(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 const MAX_QUEUE_PER_MACHINE = 100;

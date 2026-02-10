@@ -4,7 +4,7 @@
  *
  * @see https://github.com/cloudflare/workers-sdk/issues/11031
  */
-import { env, SELF, fetchMock } from "cloudflare:test";
+import { env, SELF, fetchMock, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { isAllowedChatId, generateToken } from "../src/notifications";
 import {
@@ -41,6 +41,96 @@ async function sendNotification(body: Record<string, unknown>): Promise<Response
     method: "POST",
     headers: authHeaders,
     body: JSON.stringify(body),
+  });
+}
+
+interface QueueRow {
+  command_id: string;
+  machine_id: string;
+  session_id: string;
+  command: string;
+  chat_id: string;
+  status: string;
+  attempts: number;
+  created_at: number;
+  sent_at: number | null;
+  next_retry_at: number | null;
+  acked_at: number | null;
+  last_error: string | null;
+}
+
+async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
+  const id = env.ROUTER.idFromName("singleton");
+  const stub = env.ROUTER.get(id);
+
+  return runInDurableObject(stub, async (_instance, state) => {
+    return state.storage.sql.exec(
+      `SELECT command_id, machine_id, session_id, command, chat_id, status,
+              attempts, created_at, sent_at, next_retry_at, acked_at, last_error
+       FROM command_queue
+       WHERE session_id = ?
+       ORDER BY created_at ASC`,
+      sessionId,
+    ).toArray() as QueueRow[];
+  });
+}
+
+async function insertQueueRow(row: {
+  commandId: string;
+  machineId: string;
+  sessionId: string;
+  status: string;
+  createdAt: number;
+  sentAt?: number | null;
+  ackedAt?: number | null;
+  attempts?: number;
+  nextRetryAt?: number | null;
+}): Promise<void> {
+  const id = env.ROUTER.idFromName("singleton");
+  const stub = env.ROUTER.get(id);
+
+  await runInDurableObject(stub, async (_instance, state) => {
+    state.storage.sql.exec(
+      `INSERT INTO command_queue (
+         command_id, machine_id, session_id, command, chat_id,
+         status, attempts, created_at, sent_at, next_retry_at, acked_at, last_error
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      row.commandId,
+      row.machineId,
+      row.sessionId,
+      "echo test",
+      "8248645256",
+      row.status,
+      row.attempts ?? 0,
+      row.createdAt,
+      row.sentAt ?? null,
+      row.nextRetryAt ?? null,
+      row.ackedAt ?? null,
+      null,
+    );
+  });
+}
+
+async function insertMessageMapping(input: {
+  chatId: string;
+  messageId: number;
+  sessionId: string;
+  token: string;
+  createdAt?: number;
+}): Promise<void> {
+  const id = env.ROUTER.idFromName("singleton");
+  const stub = env.ROUTER.get(id);
+
+  await runInDurableObject(stub, async (_instance, state) => {
+    state.storage.sql.exec(
+      `INSERT INTO messages (chat_id, message_id, session_id, token, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      input.chatId,
+      input.messageId,
+      input.sessionId,
+      input.token,
+      input.createdAt ?? Date.now(),
+    );
   });
 }
 
@@ -646,6 +736,125 @@ describe("webhook reply routing", () => {
       edited_message: { chat: { id: CHAT_ID_NUM }, text: "edited" },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+// ─── Command Queue + Alarm: Integration ───────────────────────────────
+
+describe("command queue lifecycle", () => {
+  const CHAT_ID_NUM = 8248645256;
+  const MACHINE_ID = "queue-machine";
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("queues webhook commands as pending rows", async () => {
+    const sessionId = `queue-session-${Date.now()}-${Math.random()}`;
+    await registerSession(sessionId, MACHINE_ID);
+
+    const uniqueMessageId = Number(String(Date.now()).slice(-6)) + 900_000;
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: uniqueMessageId,
+      sessionId,
+      token: `queue-token-${uniqueMessageId}`,
+    });
+
+    const webhookRes = await sendWebhook(makeTextReply("ls -la", uniqueMessageId));
+    expect(webhookRes.status).toBe(200);
+
+    const queueRows = await queryQueueBySession(sessionId);
+    expect(queueRows.length).toBe(1);
+    expect(queueRows[0]?.machine_id).toBe(MACHINE_ID);
+    expect(queueRows[0]?.status).toBe("pending");
+    expect(queueRows[0]?.attempts).toBe(0);
+    expect(queueRows[0]?.command).toBe("ls -la");
+  });
+
+  it("alarm deletes old acked and old stuck commands", async () => {
+    const now = Date.now();
+    const baseSession = `cleanup-session-${Date.now()}`;
+    await registerSession(baseSession, MACHINE_ID);
+
+    await insertQueueRow({
+      commandId: `acked-old-${now}`,
+      machineId: MACHINE_ID,
+      sessionId: baseSession,
+      status: "acked",
+      attempts: 1,
+      createdAt: now - (2 * 60 * 60 * 1000),
+      ackedAt: now - (90 * 60 * 1000),
+      nextRetryAt: now - 10_000,
+    });
+
+    await insertQueueRow({
+      commandId: `pending-stuck-${now}`,
+      machineId: MACHINE_ID,
+      sessionId: baseSession,
+      status: "pending",
+      attempts: 2,
+      createdAt: now - (2 * 24 * 60 * 60 * 1000),
+      nextRetryAt: now - 10_000,
+    });
+
+    await insertQueueRow({
+      commandId: `pending-fresh-${now}`,
+      machineId: MACHINE_ID,
+      sessionId: baseSession,
+      status: "pending",
+      attempts: 0,
+      createdAt: now - (10 * 60 * 1000),
+      nextRetryAt: now - 1_000,
+    });
+
+    const id = env.ROUTER.idFromName("singleton");
+    const stub = env.ROUTER.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+
+    const rows = await queryQueueBySession(baseSession);
+    const ids = rows.map((row) => row.command_id);
+
+    expect(ids).not.toContain(`acked-old-${now}`);
+    expect(ids).not.toContain(`pending-stuck-${now}`);
+    expect(ids).toContain(`pending-fresh-${now}`);
+  });
+
+  it("alarm retries stale sent commands by scheduling backoff when machine offline", async () => {
+    const now = Date.now();
+    const sessionId = `retry-session-${now}`;
+    await registerSession(sessionId, MACHINE_ID);
+
+    await insertQueueRow({
+      commandId: `sent-stale-${now}`,
+      machineId: MACHINE_ID,
+      sessionId,
+      status: "sent",
+      attempts: 1,
+      createdAt: now - (2 * 60 * 1000),
+      sentAt: now - (2 * 60 * 1000),
+      nextRetryAt: now - 5_000,
+    });
+
+    const id = env.ROUTER.idFromName("singleton");
+    const stub = env.ROUTER.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+
+    const rows = await queryQueueBySession(sessionId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.status).toBe("sent");
+    expect(rows[0]?.next_retry_at).toBeGreaterThan(now);
   });
 });
 
