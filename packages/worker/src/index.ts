@@ -1,4 +1,7 @@
-export { RouterDurableObject } from "./router-do";
+import { RouterDurableObject } from "./router-do";
+
+export { RouterDurableObject };
+export class RouterDO extends RouterDurableObject {}
 
 export default {
   async fetch(

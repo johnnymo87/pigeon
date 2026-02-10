@@ -5,11 +5,11 @@ keep_vars = true
 
 [[durable_objects.bindings]]
 name = "ROUTER"
-class_name = "RouterDurableObject"
+class_name = "RouterDO"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["RouterDurableObject"]
+new_sqlite_classes = ["RouterDO"]
 
 [vars]
 ALLOWED_CHAT_IDS = "8248645256"
