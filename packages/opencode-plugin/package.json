@@ -1,0 +1,17 @@
+{
+  "name": "@pigeon/opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "echo 'Placeholder - populate with opencode-pigeon source first'"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.19",
+    "@tsconfig/bun": "^1.0.10",
+    "@types/bun": "latest",
+    "typescript": "^5.7.3"
+  }
+}

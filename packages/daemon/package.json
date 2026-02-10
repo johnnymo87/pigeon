@@ -1,0 +1,10 @@
+{
+  "name": "@pigeon/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "echo 'No tests yet'",
+    "typecheck": "echo 'Not yet implemented'"
+  }
+}

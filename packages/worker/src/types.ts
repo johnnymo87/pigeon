@@ -1,0 +1,14 @@
+// Env is declared globally for Cloudflare Workers
+// See: https://developers.cloudflare.com/workers/configuration/typescript/
+
+declare global {
+  interface Env {
+    ROUTER: DurableObjectNamespace;
+    TELEGRAM_BOT_TOKEN: string;
+    TELEGRAM_WEBHOOK_SECRET: string;
+    CCR_API_KEY: string;
+    ALLOWED_CHAT_IDS: string;
+  }
+}
+
+export {};
