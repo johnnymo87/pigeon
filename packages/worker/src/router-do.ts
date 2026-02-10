@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { handleSessionRequest } from "./sessions";
+import { handleSendNotification } from "./notifications";
 
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
@@ -24,10 +25,19 @@ export class RouterDurableObject extends DurableObject<Env> {
         ON sessions(machine_id);
 
       CREATE TABLE IF NOT EXISTS messages (
-        message_id INTEGER PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
         session_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        token TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
       );
+
+      CREATE INDEX IF NOT EXISTS idx_messages_created
+        ON messages(created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_messages_token_chat
+        ON messages(token, chat_id);
 
       CREATE TABLE IF NOT EXISTS command_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +71,12 @@ export class RouterDurableObject extends DurableObject<Env> {
       return handleSessionRequest(this.sql, this.env, request, "unregister");
     }
 
-    // TODO: webhook, notifications, websocket
+    // Notifications
+    if (url.pathname === "/notifications/send" && method === "POST") {
+      return handleSendNotification(this.sql, this.env, request);
+    }
+
+    // TODO: webhook, websocket
     return new Response(`Not found: ${url.pathname}`, { status: 404 });
   }
 }

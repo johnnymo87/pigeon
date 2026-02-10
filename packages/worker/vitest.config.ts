@@ -12,7 +12,7 @@ export default defineWorkersConfig({
             CCR_API_KEY: "test-api-key",
             TELEGRAM_BOT_TOKEN: "test-bot-token",
             TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret",
-            ALLOWED_CHAT_IDS: "12345",
+            ALLOWED_CHAT_IDS: "8248645256",
           },
         },
       },
