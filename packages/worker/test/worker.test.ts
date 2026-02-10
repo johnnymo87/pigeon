@@ -22,6 +22,8 @@ const authHeaders = {
   "Content-Type": "application/json",
 };
 
+const API_KEY = "test-api-key";
+
 async function registerSession(
   sessionId: string,
   machineId: string,
@@ -855,6 +857,115 @@ describe("command queue lifecycle", () => {
     expect(rows.length).toBe(1);
     expect(rows[0]?.status).toBe("sent");
     expect(rows[0]?.next_retry_at).toBeGreaterThan(now);
+  });
+});
+
+// ─── WebSocket Machine Agent: Integration ──────────────────────────────
+
+async function openMachineSocket(machineId: string, apiKey = API_KEY): Promise<WebSocket> {
+  const response = await SELF.fetch(`https://worker/ws?machineId=${encodeURIComponent(machineId)}`, {
+    headers: {
+      Upgrade: "websocket",
+      "Sec-WebSocket-Protocol": `ccr,${apiKey}`,
+    },
+  });
+
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  expect(socket).toBeDefined();
+
+  socket!.accept();
+  return socket!;
+}
+
+async function waitForWsMessage(socket: WebSocket): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for websocket message")), 2000);
+    socket.addEventListener("message", (event) => {
+      clearTimeout(timeout);
+      resolve(String(event.data));
+    }, { once: true });
+  });
+}
+
+describe("websocket machine agent", () => {
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("rejects missing websocket protocol auth", async () => {
+    const response = await SELF.fetch("https://worker/ws?machineId=machine-a", {
+      headers: {
+        Upgrade: "websocket",
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("Unauthorized");
+  });
+
+  it("rejects invalid machine id", async () => {
+    const response = await SELF.fetch("https://worker/ws?machineId=bad_machine_id", {
+      headers: {
+        Upgrade: "websocket",
+        "Sec-WebSocket-Protocol": `ccr,${API_KEY}`,
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid machine ID");
+  });
+
+  it("responds to ping with pong", async () => {
+    const ws = await openMachineSocket(`machine-ping-${Date.now()}`);
+    ws.send(JSON.stringify({ type: "ping" }));
+
+    const message = await waitForWsMessage(ws);
+    expect(JSON.parse(message)).toEqual({ type: "pong" });
+
+    ws.close();
+  });
+
+  it("flushes pending queued commands to connected machine and handles ack", async () => {
+    const now = Date.now();
+    const machineId = `machine-flush-${now}`;
+    const sessionId = `session-flush-${now}`;
+    const commandId = `cmd-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await insertQueueRow({
+      commandId,
+      machineId,
+      sessionId,
+      status: "pending",
+      attempts: 0,
+      createdAt: now - 1_000,
+      nextRetryAt: now - 1,
+    });
+
+    const ws = await openMachineSocket(machineId);
+    const inbound = await waitForWsMessage(ws);
+    const commandMsg = JSON.parse(inbound) as {
+      type: string;
+      commandId: string;
+      sessionId: string;
+      command: string;
+      chatId: string;
+    };
+
+    expect(commandMsg.type).toBe("command");
+    expect(commandMsg.commandId).toBe(commandId);
+    expect(commandMsg.sessionId).toBe(sessionId);
+
+    ws.send(JSON.stringify({ type: "ack", commandId }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const queueRows = await queryQueueBySession(sessionId);
+    expect(queueRows.length).toBe(1);
+    expect(queueRows[0]?.status).toBe("acked");
+    expect(queueRows[0]?.acked_at).not.toBeNull();
+
+    ws.close();
   });
 });
 

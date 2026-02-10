@@ -8,6 +8,7 @@ declare global {
     TELEGRAM_WEBHOOK_SECRET: string;
     CCR_API_KEY: string;
     ALLOWED_CHAT_IDS: string;
+    ALLOWED_USER_IDS?: string;
   }
 }
 

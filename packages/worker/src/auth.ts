@@ -26,6 +26,26 @@ export function verifyApiKey(request: Request, expectedKey: string): boolean {
 }
 
 /**
+ * Verify WS auth from Sec-WebSocket-Protocol header.
+ * Expects: "ccr,<apiKey>"
+ */
+export function verifyApiKeyFromProtocols(
+  protocolsHeader: string | null,
+  expectedKey: string,
+): boolean {
+  if (!protocolsHeader) return false;
+
+  const protocols = protocolsHeader.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+  if (protocols.length < 2) return false;
+  if (protocols[0] !== "ccr") return false;
+
+  const providedKey = protocols[1];
+  if (!providedKey) return false;
+
+  return timingSafeEqual(providedKey, expectedKey);
+}
+
+/**
  * Returns a 401 JSON response.
  */
 export function unauthorized(): Response {

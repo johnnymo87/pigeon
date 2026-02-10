@@ -2,10 +2,18 @@ import { DurableObject } from "cloudflare:workers";
 import { handleSessionRequest } from "./sessions";
 import { handleSendNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
-import { cleanupCommandQueue, retrySentCommands, type CommandWsLike } from "./command-queue";
+import {
+  cleanupCommandQueue,
+  flushCommandQueue,
+  markCommandAcked,
+  retrySentCommands,
+  type CommandWsLike,
+} from "./command-queue";
+import { verifyApiKeyFromProtocols } from "./auth";
 
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
+  private static readonly MAX_WS_MESSAGE_BYTES = 65536;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -76,6 +84,10 @@ export class RouterDurableObject extends DurableObject<Env> {
     const url = new URL(request.url);
     const method = request.method;
 
+    if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
+      return this.handleWebSocketUpgrade(request);
+    }
+
     // Session management
     if (url.pathname === "/sessions" && method === "GET") {
       return handleSessionRequest(this.sql, this.env, request, "list");
@@ -101,9 +113,132 @@ export class RouterDurableObject extends DurableObject<Env> {
     return new Response(`Not found: ${url.pathname}`, { status: 404 });
   }
 
-  private getMachineWebSocket(_machineId: string): CommandWsLike | null {
-    // Placeholder until ccr-v3m implements live machine socket tracking.
-    return null;
+  private async handleWebSocketUpgrade(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const machineId = url.searchParams.get("machineId");
+
+    if (!machineId || machineId.length > 64 || !/^[a-zA-Z0-9-]+$/.test(machineId)) {
+      return new Response("Invalid machine ID", { status: 400 });
+    }
+
+    const protocols = request.headers.get("Sec-WebSocket-Protocol");
+    if (!verifyApiKeyFromProtocols(protocols, this.env.CCR_API_KEY)) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const existing = this.getMachineWebSocket(machineId);
+    if (existing) {
+      try {
+        existing.close(4000, "Replaced by new connection");
+      } catch {
+        // Best-effort close.
+      }
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    this.ctx.acceptWebSocket(server, [machineId]);
+    server.serializeAttachment({ machineId });
+
+    flushCommandQueue(this.sql, machineId, server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: {
+        "Sec-WebSocket-Protocol": "ccr",
+      },
+    });
+  }
+
+  private getMachineWebSocket(machineId: string): (WebSocket & CommandWsLike) | null {
+    const sockets = this.ctx.getWebSockets(machineId);
+    const ws = sockets[0] as (WebSocket & CommandWsLike) | undefined;
+    return ws ?? null;
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const machineId = this.getMachineIdFromSocket(ws);
+    if (!machineId) {
+      return;
+    }
+
+    const size = typeof message === "string" ? message.length : message.byteLength;
+    if (size > RouterDurableObject.MAX_WS_MESSAGE_BYTES) {
+      return;
+    }
+
+    let payload: unknown;
+    try {
+      const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+      payload = JSON.parse(text);
+    } catch {
+      return;
+    }
+
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+
+    const msg = payload as Record<string, unknown>;
+    const type = msg.type;
+
+    if (type === "ping") {
+      ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
+
+    if (type === "ack") {
+      const commandId = msg.commandId;
+      if (typeof commandId !== "string" || commandId.length > 64) {
+        return;
+      }
+
+      const acked = markCommandAcked(this.sql, commandId, machineId);
+      if (acked) {
+        flushCommandQueue(this.sql, machineId, ws as WebSocket & CommandWsLike);
+      }
+      return;
+    }
+
+    if (type === "commandResult") {
+      const success = msg.success;
+      const chatId = msg.chatId;
+      const error = msg.error;
+      if (success === false && (typeof chatId === "string" || typeof chatId === "number")) {
+        const errorText = typeof error === "string" ? error : "Unknown error";
+        await this.sendTelegramMessage(String(chatId), `Command failed: ${errorText}`);
+      }
+    }
+  }
+
+  webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {
+    // No explicit cleanup needed; Durable Object tracks sockets by tag.
+  }
+
+  webSocketError(_ws: WebSocket, _error: unknown): void {
+    // Keep alive; machine agent should reconnect.
+  }
+
+  private getMachineIdFromSocket(ws: WebSocket): string | null {
+    const attachment = ws.deserializeAttachment() as { machineId?: unknown } | null;
+    const machineId = attachment?.machineId;
+    return typeof machineId === "string" ? machineId : null;
+  }
+
+  private async sendTelegramMessage(chatId: string, text: string): Promise<void> {
+    const botToken = this.env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) {
+      return;
+    }
+
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
   }
 
   async alarm(): Promise<void> {
