@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { handleSessionRequest } from "./sessions";
 import { handleSendNotification } from "./notifications";
+import { handleTelegramWebhook } from "./webhook";
 
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
@@ -40,19 +41,31 @@ export class RouterDurableObject extends DurableObject<Env> {
         ON messages(token, chat_id);
 
       CREATE TABLE IF NOT EXISTS command_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_id TEXT PRIMARY KEY,
+        machine_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         command TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        attempts INTEGER DEFAULT 0,
+        chat_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
+        next_retry_at INTEGER NOT NULL,
         acked_at INTEGER
       );
 
+      CREATE INDEX IF NOT EXISTS idx_command_queue_machine_status
+        ON command_queue(machine_id, status);
+
+      CREATE INDEX IF NOT EXISTS idx_command_queue_retry
+        ON command_queue(status, next_retry_at);
+
       CREATE TABLE IF NOT EXISTS seen_updates (
         update_id INTEGER PRIMARY KEY,
-        seen_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_seen_updates_created
+        ON seen_updates(created_at);
     `);
   }
 
@@ -76,7 +89,12 @@ export class RouterDurableObject extends DurableObject<Env> {
       return handleSendNotification(this.sql, this.env, request);
     }
 
-    // TODO: webhook, websocket
+    // Telegram webhook
+    if (url.pathname.startsWith("/webhook/telegram") && method === "POST") {
+      return handleTelegramWebhook(this.sql, this.env, request);
+    }
+
+    // TODO: websocket
     return new Response(`Not found: ${url.pathname}`, { status: 404 });
   }
 }

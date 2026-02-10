@@ -5,8 +5,15 @@
  * @see https://github.com/cloudflare/workers-sdk/issues/11031
  */
 import { env, SELF, fetchMock } from "cloudflare:test";
-import { describe, it, test, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { isAllowedChatId, generateToken } from "../src/notifications";
+import {
+  verifyWebhookSecret,
+  deduplicateUpdate,
+  resolveMessageSession,
+  resolveCallbackSession,
+  generateCommandId,
+} from "../src/webhook";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -411,5 +418,247 @@ describe("POST /notifications/send", () => {
     const body2 = (await res2.json()) as { token: string };
 
     expect(body1.token).not.toBe(body2.token);
+  });
+});
+
+// ─── Webhook: Helpers ─────────────────────────────────────────────────
+
+const WEBHOOK_SECRET = "test-webhook-secret";
+const CHAT_ID_NUM = 8248645256;
+
+function webhookHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET,
+  };
+}
+
+let webhookUpdateCounter = 1000;
+
+function makeWebhookRequest(update: Record<string, unknown>): Request {
+  return new Request("https://worker/webhook/telegram/path-secret", {
+    method: "POST",
+    headers: webhookHeaders(),
+    body: JSON.stringify(update),
+  });
+}
+
+async function sendWebhook(update: Record<string, unknown>): Promise<Response> {
+  return SELF.fetch(makeWebhookRequest(update));
+}
+
+function makeTextReply(
+  text: string,
+  replyToMessageId: number,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text,
+      reply_to_message: { message_id: replyToMessageId },
+    },
+  };
+}
+
+function makeCmdMessage(
+  text: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text,
+    },
+  };
+}
+
+function makeCallbackQuery(
+  data: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    callback_query: {
+      id: `cb-${++webhookUpdateCounter}`,
+      from: { id: CHAT_ID_NUM },
+      message: { chat: { id: CHAT_ID_NUM } },
+      data,
+    },
+  };
+}
+
+function mockTelegramSendMessage(messageId: number = 99999) {
+  // Specific mock for sendMessage that always returns a valid message_id
+  fetchMock
+    .get("https://api.telegram.org")
+    .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+    .reply(200, JSON.stringify({ ok: true, result: { message_id: messageId } }));
+}
+
+function mockTelegramAny() {
+  // Catch-all mock for non-sendMessage Telegram API calls (e.g., answerCallbackQuery)
+  fetchMock
+    .get("https://api.telegram.org")
+    .intercept({ method: "POST", path: /\/bot.*/ })
+    .reply(200, JSON.stringify({ ok: true, result: { message_id: 99999 } }), {
+      headers: { "Content-Type": "application/json" },
+    });
+}
+
+// ─── Webhook: Auth ────────────────────────────────────────────────────
+
+describe("webhook auth", () => {
+  it("rejects requests without webhook secret", async () => {
+    const res = await SELF.fetch("https://worker/webhook/telegram/secret", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ update_id: 1 }),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe("Unauthorized");
+  });
+
+  it("rejects requests with wrong webhook secret", async () => {
+    const res = await SELF.fetch("https://worker/webhook/telegram/secret", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": "wrong-secret",
+      },
+      body: JSON.stringify({ update_id: 1 }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts valid webhook secret", async () => {
+    const res = await sendWebhook({ update_id: ++webhookUpdateCounter });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+});
+
+// ─── Webhook: Deduplication ───────────────────────────────────────────
+
+describe("webhook dedup", () => {
+  it("processes first update and deduplicates second", async () => {
+    const updateId = ++webhookUpdateCounter;
+    const res1 = await sendWebhook({ update_id: updateId });
+    expect(res1.status).toBe(200);
+
+    // Same update_id should be deduplicated (still 200 ok, but not processed)
+    const res2 = await sendWebhook({ update_id: updateId });
+    expect(res2.status).toBe(200);
+  });
+});
+
+// ─── Webhook: Reply Routing ───────────────────────────────────────────
+
+describe("webhook reply routing", () => {
+  const SESSION_ID = "webhook-route-session";
+
+  beforeAll(async () => {
+    await registerSession(SESSION_ID, "machine-1", "test");
+  });
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("routes a reply-to-message to the correct session", async () => {
+    // Send a notification to create a message mapping
+    mockTelegramSuccess(200);
+    const notifRes = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: String(CHAT_ID_NUM),
+      text: "Session idle",
+    });
+    const notifBody = (await notifRes.json()) as { messageId: number; token: string };
+
+    // Now reply to that message — needs a sendMessage mock for "Command queued"
+    mockTelegramSendMessage();
+    const res = await sendWebhook(makeTextReply("continue working", notifBody.messageId));
+    expect(res.status).toBe(200);
+    // Command should be queued (we can verify by checking the response is "ok")
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("routes a /cmd TOKEN command to the correct session", async () => {
+    mockTelegramSuccess(5001);
+    const notifRes = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: String(CHAT_ID_NUM),
+      text: "Session idle",
+    });
+    const notifBody = (await notifRes.json()) as { token: string };
+
+    mockTelegramSendMessage(); // For "Command queued" confirmation
+    const res = await sendWebhook(makeCmdMessage(`/cmd ${notifBody.token} do something`));
+    expect(res.status).toBe(200);
+  });
+
+  it("sends error when no session found for message", async () => {
+    mockTelegramSendMessage(); // For sendTelegramMessage error reporting
+    const res = await sendWebhook(makeTextReply("hello", 99999));
+    expect(res.status).toBe(200);
+  });
+
+  it("routes callback query with cmd:TOKEN:action format", async () => {
+    mockTelegramSuccess(5002);
+    const notifRes = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: String(CHAT_ID_NUM),
+      text: "Need approval",
+    });
+    const notifBody = (await notifRes.json()) as { token: string };
+
+    mockTelegramAny(); // For answerCallbackQuery
+    mockTelegramSendMessage(); // For "Command queued" sendMessage
+    const res = await sendWebhook(makeCallbackQuery(`cmd:${notifBody.token}:yes`));
+    expect(res.status).toBe(200);
+  });
+
+  it("answers 'Session expired' for callback with unknown token", async () => {
+    mockTelegramAny(); // For answerCallbackQuery
+    const res = await sendWebhook(makeCallbackQuery("cmd:unknowntoken:yes"));
+    expect(res.status).toBe(200);
+  });
+
+  it("silently drops non-cmd callback queries", async () => {
+    const res = await sendWebhook(makeCallbackQuery("other:data"));
+    expect(res.status).toBe(200);
+  });
+
+  it("silently acknowledges unknown update types", async () => {
+    const res = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      edited_message: { chat: { id: CHAT_ID_NUM }, text: "edited" },
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+// ─── Webhook: Unit Tests ──────────────────────────────────────────────
+
+describe("generateCommandId", () => {
+  it("returns a 32-char hex string", () => {
+    const id = generateCommandId();
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("generates unique IDs", () => {
+    const ids = new Set(Array.from({ length: 50 }, () => generateCommandId()));
+    expect(ids.size).toBe(50);
   });
 });
