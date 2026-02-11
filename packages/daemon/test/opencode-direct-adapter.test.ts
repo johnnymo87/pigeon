@@ -46,6 +46,7 @@ describe("executeViaOpencodeDirectChannel", () => {
 
     expect(result.ok).toBe(true);
     expect(result.status).toBe(200);
+    expect(result.attempts).toBe(1);
     expect(result.result?.success).toBe(true);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
@@ -80,6 +81,7 @@ describe("executeViaOpencodeDirectChannel", () => {
 
     expect(result.ok).toBe(false);
     expect(result.ack?.accepted).toBe(false);
+    expect(result.attempts).toBe(1);
     expect(result.error).toBe("BUSY");
   });
 
@@ -99,6 +101,7 @@ describe("executeViaOpencodeDirectChannel", () => {
     );
 
     expect(result.ok).toBe(false);
+    expect(result.attempts).toBe(1);
     expect(result.error).toContain("Invalid JSON");
   });
 
@@ -115,12 +118,15 @@ describe("executeViaOpencodeDirectChannel", () => {
         command: "echo hi",
         endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         authToken: "tok",
+        timeoutMs: 100,
+        maxRetries: 2,
       },
       { fetchFn: fetchFn as unknown as typeof fetch },
     );
 
     expect(result.ok).toBe(false);
     expect(result.status).toBe(0);
+    expect(result.attempts).toBe(3);
     expect(result.error).toContain("ECONNREFUSED");
   });
 
@@ -163,7 +169,111 @@ describe("executeViaOpencodeDirectChannel", () => {
     );
 
     expect(result.ok).toBe(false);
+    expect(result.attempts).toBe(1);
     expect(result.result?.success).toBe(false);
     expect(result.result?.errorCode).toBe(ResultErrorCode.ExecutionError);
+  });
+
+  it("retries once on 5xx response and succeeds", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          ack: {
+            type: OpencodeDirectMessageType.Ack,
+            version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            requestId: "req-6",
+            commandId: "cmd-6",
+            sessionId: "sess-6",
+            accepted: true,
+            acceptedAt: Date.now(),
+          },
+          result: {
+            type: OpencodeDirectMessageType.Result,
+            version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            requestId: "req-6",
+            commandId: "cmd-6",
+            sessionId: "sess-6",
+            success: false,
+            finishedAt: Date.now(),
+            errorCode: ResultErrorCode.Internal,
+            errorMessage: "temporary",
+          },
+        }), { status: 500 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          ack: {
+            type: OpencodeDirectMessageType.Ack,
+            version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            requestId: "req-6",
+            commandId: "cmd-6",
+            sessionId: "sess-6",
+            accepted: true,
+            acceptedAt: Date.now(),
+          },
+          result: {
+            type: OpencodeDirectMessageType.Result,
+            version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            requestId: "req-6",
+            commandId: "cmd-6",
+            sessionId: "sess-6",
+            success: true,
+            finishedAt: Date.now(),
+            output: "ok",
+          },
+        }), { status: 200 }),
+      );
+
+    const result = await executeViaOpencodeDirectChannel(
+      {
+        requestId: "req-6",
+        commandId: "cmd-6",
+        sessionId: "sess-6",
+        command: "echo hi",
+        endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        authToken: "tok",
+        maxRetries: 1,
+      },
+      {
+        fetchFn: fetchFn as unknown as typeof fetch,
+        sleep: async () => undefined,
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(2);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails on correlation mismatch", async () => {
+    const fetchFn = vi.fn(async () => {
+      return new Response(JSON.stringify({
+        ack: {
+          type: OpencodeDirectMessageType.Ack,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "wrong",
+          commandId: "cmd-7",
+          sessionId: "sess-7",
+          accepted: true,
+          acceptedAt: Date.now(),
+        },
+      }), { status: 200 });
+    });
+
+    const result = await executeViaOpencodeDirectChannel(
+      {
+        requestId: "req-7",
+        commandId: "cmd-7",
+        sessionId: "sess-7",
+        command: "echo hi",
+        endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        authToken: "tok",
+      },
+      { fetchFn: fetchFn as unknown as typeof fetch },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("correlation mismatch");
   });
 });

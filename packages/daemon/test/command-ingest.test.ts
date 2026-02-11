@@ -114,6 +114,7 @@ describe("ingestWorkerCommand", () => {
           return {
             ok: true,
             status: 200,
+            attempts: 1,
             ack: {
               type: "pigeon.command.ack",
               version: 1,
@@ -178,6 +179,7 @@ describe("ingestWorkerCommand", () => {
           return {
             ok: false,
             status: 200,
+            attempts: 1,
             ack: {
               type: "pigeon.command.ack",
               version: 1,
