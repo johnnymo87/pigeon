@@ -106,7 +106,12 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     // Telegram webhook
     if (url.pathname.startsWith("/webhook/telegram") && method === "POST") {
-      return handleTelegramWebhook(this.sql, this.env, request);
+      return handleTelegramWebhook(this.sql, this.env, request, (machineId) => {
+        const ws = this.getMachineWebSocket(machineId);
+        if (ws) {
+          flushCommandQueue(this.sql, machineId, ws);
+        }
+      });
     }
 
     // TODO: websocket

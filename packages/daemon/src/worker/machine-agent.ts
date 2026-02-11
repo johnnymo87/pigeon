@@ -68,6 +68,7 @@ export class MachineAgent {
     this.ws = ws;
 
     ws.addEventListener("open", () => {
+      console.log(`[machine-agent] connected machineId=${this.config.machineId}`);
       this.reconnectDelayMs = RECONNECT_BASE_MS;
       this.lastPongAt = this.now();
       this.startPing();
@@ -79,11 +80,13 @@ export class MachineAgent {
     });
 
     ws.addEventListener("error", () => {
+      console.warn("[machine-agent] websocket error");
       this.clearTimers();
       this.ws?.close();
     });
 
     ws.addEventListener("close", () => {
+      console.warn("[machine-agent] websocket closed");
       this.clearTimers();
       this.ws = null;
       if (!this.stopped) {
@@ -180,6 +183,8 @@ export class MachineAgent {
       return;
     }
 
+    console.log(`[machine-agent] received command id=${String(record.commandId ?? record.id ?? "<none>")}`);
+
     await ingestWorkerCommand(this.storage, record as unknown as WorkerCommandMessage, {
       send: (payload) => this.send(payload),
     });
@@ -200,8 +205,11 @@ export class MachineAgent {
         }),
       });
       const payload = await response.json() as { ok?: boolean };
-      return Boolean(payload.ok);
+      const ok = Boolean(payload.ok);
+      console.log(`[machine-agent] registerSession sessionId=${sessionId} ok=${ok}`);
+      return ok;
     } catch {
+      console.warn(`[machine-agent] registerSession failed sessionId=${sessionId}`);
       return false;
     }
   }
@@ -217,8 +225,11 @@ export class MachineAgent {
         body: JSON.stringify({ sessionId }),
       });
       const payload = await response.json() as { ok?: boolean };
-      return Boolean(payload.ok);
+      const ok = Boolean(payload.ok);
+      console.log(`[machine-agent] unregisterSession sessionId=${sessionId} ok=${ok}`);
+      return ok;
     } catch {
+      console.warn(`[machine-agent] unregisterSession failed sessionId=${sessionId}`);
       return false;
     }
   }

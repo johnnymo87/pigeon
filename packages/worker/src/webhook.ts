@@ -266,6 +266,7 @@ export async function handleTelegramWebhook(
   sql: SqlStorage,
   env: Env,
   request: Request,
+  deliverNow?: (machineId: string) => void,
 ): Promise<Response> {
   // Auth: verify webhook secret
   if (!verifyWebhookSecret(request, env.TELEGRAM_WEBHOOK_SECRET)) {
@@ -306,7 +307,7 @@ export async function handleTelegramWebhook(
     const commandId = await queueCommand(sql, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label);
     if (!commandId) return OK();
 
-    // TODO: attempt live WebSocket delivery (ccr-v3m)
+    deliverNow?.(machine.machineId);
     return OK();
   }
 
@@ -334,7 +335,7 @@ export async function handleTelegramWebhook(
     if (!commandId) return OK();
 
     await answerCallbackQuery(env, update.callback_query.id, "Command sent");
-    // TODO: attempt live WebSocket delivery (ccr-v3m)
+    deliverNow?.(machine.machineId);
     return OK();
   }
 

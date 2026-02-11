@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "dev": "bun --watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "parity:harness": "tsx scripts/parity-harness.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.9.1"
@@ -15,6 +17,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/bun": "latest",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.0"
   }
