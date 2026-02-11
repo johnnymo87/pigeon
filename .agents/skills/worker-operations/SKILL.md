@@ -1,6 +1,6 @@
 ---
 name: worker-operations
-description: Use for day-to-day operations tasks like health checks, log tailing, incident triage, and safe rollback of the Pigeon worker
+description: Use when handling day-to-day worker operations such as health checks, log triage, incident response, and rollback
 ---
 
 # Worker Operations Runbook

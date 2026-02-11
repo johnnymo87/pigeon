@@ -1,6 +1,6 @@
 ---
 name: worker-troubleshooting
-description: Use when worker endpoints fail, Telegram notifications do not send, or command routing is broken
+description: Use when worker endpoints fail, notifications are not sent, webhook auth breaks, or command routing regresses
 ---
 
 # Troubleshooting Pigeon Worker

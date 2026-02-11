@@ -1,6 +1,6 @@
 ---
 name: worker-parity-checks
-description: Use when validating deployed worker parity through authenticated endpoint checks and a notification-plus-reply flow
+description: Use when validating deployed worker parity with authenticated checks and an end-to-end notification and reply flow
 ---
 
 # Worker Parity Checklist

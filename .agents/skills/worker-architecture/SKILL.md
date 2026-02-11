@@ -1,6 +1,6 @@
 ---
 name: worker-architecture
-description: Use when you need to understand how the Pigeon worker routes Telegram replies, manages sessions, and delivers commands to machine agents
+description: Use when you need to understand worker architecture, endpoint flow, and command routing behavior before making changes
 ---
 
 # Pigeon Worker Architecture

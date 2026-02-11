@@ -1,6 +1,6 @@
 ---
 name: worker-deployment
-description: Use when deploying or updating the Pigeon worker on Cloudflare and validating production health
+description: Use when deploying or updating the worker on Cloudflare and validating production health and auth behavior
 ---
 
 # Deploying the Pigeon Worker
