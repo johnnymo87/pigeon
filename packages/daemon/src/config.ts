@@ -1,6 +1,8 @@
 export interface DaemonConfig {
   port: number;
   dbPath: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
 }
 
 const DEFAULT_PORT = 4731;
@@ -24,5 +26,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     port: parsePort(env.PIGEON_DAEMON_PORT),
     dbPath: env.PIGEON_DAEMON_DB_PATH?.trim() || defaultDbPath,
+    telegramBotToken: env.TELEGRAM_BOT_TOKEN?.trim() || undefined,
+    telegramChatId: env.TELEGRAM_CHAT_ID?.trim() || env.TELEGRAM_GROUP_ID?.trim() || undefined,
   };
 }

@@ -30,4 +30,13 @@ describe("loadConfig", () => {
     const config = loadConfig({ PIGEON_DAEMON_DB_PATH: "/tmp/daemon.db" });
     expect(config.dbPath).toBe("/tmp/daemon.db");
   });
+
+  it("loads telegram env vars", () => {
+    const config = loadConfig({
+      TELEGRAM_BOT_TOKEN: "bot",
+      TELEGRAM_CHAT_ID: "123",
+    });
+    expect(config.telegramBotToken).toBe("bot");
+    expect(config.telegramChatId).toBe("123");
+  });
 });

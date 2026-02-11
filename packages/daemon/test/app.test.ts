@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import type { StopNotifier } from "../src/notification-service";
 
 describe("createApp", () => {
   let storage: StorageDb | null = null;
@@ -12,9 +13,9 @@ describe("createApp", () => {
     }
   });
 
-  function newApp(now = 1_000) {
+  function newApp(now = 1_000, notifier?: StopNotifier) {
     storage = openStorageDb(":memory:");
-    return createApp(storage, () => now);
+    return createApp(storage, { nowFn: () => now, notifier });
   }
 
   it("returns health payload", async () => {
@@ -131,5 +132,96 @@ describe("createApp", () => {
     const missing = await app(new Request("http://localhost/sessions/sess-3"));
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ error: "Session not found" });
+  });
+
+  it("returns no-op stop response when notify=false", async () => {
+    const app = newApp(40_000);
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-1", notify: false }),
+    }));
+
+    const stop = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-1", event: "Stop", message: "Done" }),
+    }));
+
+    expect(stop.status).toBe(200);
+    expect(await stop.json()).toEqual({ ok: true, notified: false, reason: "notify=false" });
+  });
+
+  it("returns no-notifier response when notify=true but handler missing", async () => {
+    const app = newApp(50_000);
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-2", notify: true }),
+    }));
+
+    const stop = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-2", event: "Stop", message: "Done" }),
+    }));
+
+    expect(stop.status).toBe(200);
+    expect(await stop.json()).toEqual({ ok: true, notified: false, reason: "no notification handler" });
+  });
+
+  it("uses notifier and returns token for stop notifications", async () => {
+    const notifier: StopNotifier = {
+      sendStopNotification: vi.fn(async () => ({ token: "tok-1" })),
+    };
+
+    const app = newApp(60_000, notifier);
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-3", notify: true, label: "My Session" }),
+    }));
+
+    const stop = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-3",
+        event: "Stop",
+        summary: "Summary text",
+      }),
+    }));
+
+    expect(stop.status).toBe(200);
+    expect(await stop.json()).toEqual({ ok: true, notified: true, token: "tok-1" });
+    expect((notifier.sendStopNotification as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it("returns notified=false when notifier throws", async () => {
+    const notifier: StopNotifier = {
+      sendStopNotification: vi.fn(async () => {
+        throw new Error("telegram down");
+      }),
+    };
+
+    const app = newApp(70_000, notifier);
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-4", notify: true }),
+    }));
+
+    const stop = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-4", message: "Done" }),
+    }));
+
+    expect(stop.status).toBe(200);
+    expect(await stop.json()).toEqual({ ok: true, notified: false, error: "telegram down" });
   });
 });

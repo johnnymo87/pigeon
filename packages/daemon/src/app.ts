@@ -1,4 +1,5 @@
 import type { StorageDb } from "./storage/database";
+import type { StopNotifier } from "./notification-service";
 
 interface LegacyTransport {
   kind: string;
@@ -112,7 +113,15 @@ function maybeNumber(value: unknown): number | undefined {
   return undefined;
 }
 
-export function createApp(storage: StorageDb, nowFn: () => number = Date.now) {
+interface AppOptions {
+  nowFn?: () => number;
+  notifier?: StopNotifier;
+}
+
+export function createApp(storage: StorageDb, options: AppOptions = {}) {
+  const nowFn = options.nowFn ?? Date.now;
+  const notifier = options.notifier;
+
   return async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -223,6 +232,52 @@ export function createApp(storage: StorageDb, nowFn: () => number = Date.now) {
             tokens: cleanedTokens,
           },
         });
+      }
+
+      if (request.method === "POST" && url.pathname === "/stop") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+
+        const session = storage.sessions.get(sessionId);
+        if (!session) {
+          return Response.json({ error: "Session not found" }, { status: 404 });
+        }
+
+        storage.sessions.touch(sessionId, nowFn());
+
+        if (!session.notify) {
+          return Response.json({ ok: true, notified: false, reason: "notify=false" });
+        }
+
+        if (!notifier) {
+          return Response.json({ ok: true, notified: false, reason: "no notification handler" });
+        }
+
+        const message = typeof body.message === "string" ? body.message : null;
+        const summary = typeof body.summary === "string" ? body.summary : null;
+        const event = typeof body.event === "string" ? body.event : "Stop";
+        const label = typeof body.label === "string" ? body.label : null;
+
+        try {
+          const result = await notifier.sendStopNotification({
+            session: {
+              sessionId: session.sessionId,
+              label: session.label,
+              cwd: session.cwd,
+            },
+            event,
+            summary: message || summary || "Task completed",
+            label: label || session.label || undefined,
+          });
+
+          return Response.json({ ok: true, notified: true, ...result });
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: true, notified: false, error: errorMessage });
+        }
       }
 
       if (url.pathname.startsWith("/sessions/") && url.pathname !== "/sessions/enable-notify") {
