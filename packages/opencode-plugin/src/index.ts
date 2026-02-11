@@ -1,6 +1,12 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import {
+  OPENCODE_DIRECT_PROTOCOL_VERSION,
+  ResultErrorCode,
+  type ExecuteCommandEnvelope,
+} from "../../daemon/src/opencode-direct/contracts"
 import { registerSession, notifyStop } from "./daemon-client"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
+import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { SessionManager } from "./session-state"
 import { serializeError } from "./utils"
@@ -32,6 +38,36 @@ const plugin: Plugin = async (ctx) => {
     const daemonUrl =
       process.env.PIGEON_DAEMON_URL ??
       `http://127.0.0.1:${process.env.TELEGRAM_WEBHOOK_PORT ?? "4731"}`
+
+    const directChannel = await startDirectChannelServer({
+      async onExecute(request: ExecuteCommandEnvelope) {
+        try {
+          await ctx.client.session.promptAsync({
+            path: { id: request.sessionId },
+            body: {
+              parts: [
+                {
+                  type: "text",
+                  text: request.command,
+                },
+              ],
+              noReply: false,
+            },
+          })
+
+          return {
+            success: true,
+            output: "queued",
+          }
+        } catch (error) {
+          return {
+            success: false,
+            errorCode: ResultErrorCode.ExecutionError,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          }
+        }
+      },
+    })
 
     const envInfoP = detectEnvironment(ctx.$, log).catch((err) => {
       log("env detection failed, using fallback", serializeError(err))
@@ -67,6 +103,10 @@ const plugin: Plugin = async (ctx) => {
               tmuxPane: envInfo.tmuxPane,
               tmuxPaneId: envInfo.tmuxPaneId,
               tty: envInfo.tty,
+              backendKind: "opencode-plugin-direct",
+              backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+              backendEndpoint: directChannel.endpoint,
+              backendAuthToken: directChannel.authToken,
               daemonUrl,
               log,
             })
@@ -96,6 +136,10 @@ const plugin: Plugin = async (ctx) => {
             tmuxPane: envInfo.tmuxPane,
             tmuxPaneId: envInfo.tmuxPaneId,
             tty: envInfo.tty,
+            backendKind: "opencode-plugin-direct",
+            backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            backendEndpoint: directChannel.endpoint,
+            backendAuthToken: directChannel.authToken,
             daemonUrl,
             log,
           })
@@ -144,6 +188,10 @@ const plugin: Plugin = async (ctx) => {
                 tmuxPane: envInfo.tmuxPane,
                 tmuxPaneId: envInfo.tmuxPaneId,
                 tty: envInfo.tty,
+                backendKind: "opencode-plugin-direct",
+                backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+                backendEndpoint: directChannel.endpoint,
+                backendAuthToken: directChannel.authToken,
                 daemonUrl,
                 log,
               })

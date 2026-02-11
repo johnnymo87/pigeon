@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
+import { ResultErrorCode } from "../src/opencode-direct/contracts";
 
 describe("ingestWorkerCommand", () => {
   it("acks and marks command done on successful injection", async () => {
@@ -78,6 +79,142 @@ describe("ingestWorkerCommand", () => {
 
     const unfinished = storage.inbox.listUnfinished();
     expect(unfinished).toHaveLength(1);
+    storage.db.close();
+  });
+
+  it("routes opencode-plugin-direct sessions through direct adapter", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-direct",
+      notify: true,
+      transportKind: "unknown",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-direct-1",
+        sessionId: "sess-direct",
+        command: "echo hi",
+        chatId: "3",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        async executeDirect() {
+          return {
+            ok: true,
+            status: 200,
+            ack: {
+              type: "pigeon.command.ack",
+              version: 1,
+              requestId: "cmd-direct-1",
+              commandId: "cmd-direct-1",
+              sessionId: "sess-direct",
+              accepted: true,
+              acceptedAt: Date.now(),
+            },
+            result: {
+              type: "pigeon.command.result",
+              version: 1,
+              requestId: "cmd-direct-1",
+              commandId: "cmd-direct-1",
+              sessionId: "sess-direct",
+              success: true,
+              finishedAt: Date.now(),
+              output: "queued",
+            },
+          };
+        },
+      },
+    );
+
+    expect(sent).toEqual([
+      { type: "ack", commandId: "cmd-direct-1" },
+      { type: "commandResult", commandId: "cmd-direct-1", success: true, error: null, chatId: "3" },
+    ]);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    storage.db.close();
+  });
+
+  it("returns direct adapter error as commandResult failure", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-direct-fail",
+      notify: true,
+      transportKind: "unknown",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-direct-2",
+        sessionId: "sess-direct-fail",
+        command: "echo hi",
+        chatId: "4",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        async executeDirect() {
+          return {
+            ok: false,
+            status: 200,
+            ack: {
+              type: "pigeon.command.ack",
+              version: 1,
+              requestId: "cmd-direct-2",
+              commandId: "cmd-direct-2",
+              sessionId: "sess-direct-fail",
+              accepted: true,
+              acceptedAt: Date.now(),
+            },
+            result: {
+              type: "pigeon.command.result",
+              version: 1,
+              requestId: "cmd-direct-2",
+              commandId: "cmd-direct-2",
+              sessionId: "sess-direct-fail",
+              success: false,
+              finishedAt: Date.now(),
+              errorCode: ResultErrorCode.ExecutionError,
+              errorMessage: "plugin failed",
+            },
+            error: "plugin failed",
+          };
+        },
+      },
+    );
+
+    expect(sent).toEqual([
+      { type: "ack", commandId: "cmd-direct-2" },
+      {
+        type: "commandResult",
+        commandId: "cmd-direct-2",
+        success: false,
+        error: "plugin failed",
+        chatId: "4",
+      },
+    ]);
+    expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 });

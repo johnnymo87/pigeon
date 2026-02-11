@@ -11,6 +11,10 @@ type RegisterSessionOpts = {
   tmuxPane?: string
   tmuxPaneId?: string
   tty?: string
+  backendKind?: string
+  backendProtocolVersion?: number
+  backendEndpoint?: string
+  backendAuthToken?: string
   daemonUrl?: string
   log: LogFn
 }
@@ -82,6 +86,10 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
           tmux_pane: opts.tmuxPane,
           tmux_pane_id: opts.tmuxPaneId,
           tty: opts.tty,
+          backend_kind: opts.backendKind,
+          backend_protocol_version: opts.backendProtocolVersion,
+          backend_endpoint: opts.backendEndpoint,
+          backend_auth_token: opts.backendAuthToken,
         }),
         signal: AbortSignal.timeout(1000),
       })
