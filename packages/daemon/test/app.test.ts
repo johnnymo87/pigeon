@@ -33,7 +33,14 @@ describe("createApp", () => {
   });
 
   it("supports /session-start and /sessions lookup parity", async () => {
-    const app = newApp(10_000);
+    const started: Array<{ sessionId: string; notify: boolean; label: string | null | undefined }> = [];
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 10_000,
+      onSessionStart: (sessionId, notify, label) => {
+        started.push({ sessionId, notify, label });
+      },
+    });
 
     const start = await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -74,10 +81,18 @@ describe("createApp", () => {
     expect(single.status).toBe(200);
     const singleBody = (await single.json()) as { ok: boolean; session: { session_id: string } };
     expect(singleBody.session.session_id).toBe("sess-1");
+    expect(started).toEqual([]);
   });
 
   it("supports /sessions/enable-notify parity behavior", async () => {
-    const app = newApp(20_000);
+    const started: Array<{ sessionId: string; notify: boolean; label: string | null | undefined }> = [];
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 20_000,
+      onSessionStart: (sessionId, notify, label) => {
+        started.push({ sessionId, notify, label });
+      },
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -101,10 +116,18 @@ describe("createApp", () => {
     expect(body.session.notify).toBe(true);
     expect(body.session.label).toBe("Renamed");
     expect(body.session.transport).toEqual({ kind: "nvim", nvim_socket: "/tmp/new.sock" });
+    expect(started).toEqual([{ sessionId: "sess-2", notify: true, label: "Renamed" }]);
   });
 
   it("supports /cleanup and DELETE /sessions/:id", async () => {
-    const app = newApp(30_000);
+    const deleted: string[] = [];
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 30_000,
+      onSessionDelete: async (sessionId) => {
+        deleted.push(sessionId);
+      },
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -128,6 +151,7 @@ describe("createApp", () => {
     }));
     expect(del.status).toBe(200);
     expect(await del.json()).toEqual({ ok: true });
+    expect(deleted).toEqual(["sess-3"]);
 
     const missing = await app(new Request("http://localhost/sessions/sess-3"));
     expect(missing.status).toBe(404);

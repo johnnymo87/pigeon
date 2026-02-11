@@ -116,11 +116,15 @@ function maybeNumber(value: unknown): number | undefined {
 interface AppOptions {
   nowFn?: () => number;
   notifier?: StopNotifier;
+  onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
+  onSessionDelete?: (sessionId: string) => Promise<void> | void;
 }
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
   const nowFn = options.nowFn ?? Date.now;
   const notifier = options.notifier;
+  const onSessionStart = options.onSessionStart;
+  const onSessionDelete = options.onSessionDelete;
 
   return async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -170,6 +174,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
+        if (onSessionStart && ((body.notify as boolean | undefined) ?? existing?.notify ?? false)) {
+          await onSessionStart(sessionId, true, (typeof body.label === "string" ? body.label : null) ?? existing?.label);
+        }
+
         return Response.json({ ok: true, session_id: sessionId });
       }
 
@@ -209,6 +217,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+
+        if (onSessionStart) {
+          await onSessionStart(sessionId, true, label ?? existing.label);
+        }
 
         const session = storage.sessions.get(sessionId);
         return Response.json({ ok: true, session: session ? toLegacySession(session) : null });
@@ -293,6 +305,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         if (request.method === "DELETE") {
           storage.sessions.delete(sessionId);
+          if (onSessionDelete) {
+            await onSessionDelete(sessionId);
+          }
           return Response.json({ ok: true });
         }
       }

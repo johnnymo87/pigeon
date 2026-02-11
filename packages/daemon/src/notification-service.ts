@@ -36,6 +36,15 @@ export interface StopNotifier {
   sendStopNotification(input: StopNotificationInput): Promise<NotificationResult>;
 }
 
+export interface WorkerNotificationSender {
+  sendNotification(
+    sessionId: string,
+    chatId: string,
+    text: string,
+    replyMarkup: { inline_keyboard?: unknown[] },
+  ): Promise<{ ok: boolean }>;
+}
+
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*[\]]/g, "\\$&");
 }
@@ -151,5 +160,73 @@ export class TelegramNotificationService implements StopNotifier {
     }
 
     return { token };
+  }
+}
+
+export class WorkerNotificationService implements StopNotifier {
+  constructor(
+    private readonly storage: StorageDb,
+    private readonly workerSender: WorkerNotificationSender,
+    private readonly chatId: string,
+    private readonly nowFn: () => number = Date.now,
+  ) {}
+
+  async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
+    const now = this.nowFn();
+    const token = generateToken();
+
+    this.storage.sessionTokens.mint({
+      token,
+      sessionId: input.session.sessionId,
+      chatId: this.chatId,
+      context: {
+        event: input.event,
+        summary: input.summary,
+      },
+    }, now);
+
+    const buttons: NotificationButton[] = [
+      { text: "▶️ Continue", action: "continue" },
+      { text: "✅ Yes", action: "y" },
+      { text: "❌ No", action: "n" },
+      { text: "🛑 Exit", action: "exit" },
+    ];
+
+    const notification = formatTelegramNotification({
+      event: input.event,
+      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      summary: input.summary,
+      cwd: input.session.cwd,
+      token,
+      buttons,
+    });
+
+    const result = await this.workerSender.sendNotification(
+      input.session.sessionId,
+      this.chatId,
+      notification.text,
+      notification.replyMarkup,
+    );
+
+    if (!result.ok) {
+      throw new Error("Worker notification send failed");
+    }
+
+    return { token };
+  }
+}
+
+export class FallbackStopNotifier implements StopNotifier {
+  constructor(
+    private readonly primary: StopNotifier,
+    private readonly fallback: StopNotifier,
+  ) {}
+
+  async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
+    try {
+      return await this.primary.sendStopNotification(input);
+    } catch {
+      return this.fallback.sendStopNotification(input);
+    }
   }
 }
