@@ -80,6 +80,45 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
 - Webhook reply returns `ok` (`200`)
 - Session is removable (`/sessions/unregister` returns `{ ok: true }`)
 
+## Plugin-Direct Variant
+
+For OpenCode sessions using the direct command channel (`backend_kind: "opencode-plugin-direct"`),
+use the daemon parity harness with `PARITY_MODE=direct`:
+
+```bash
+op run --env-file=.env.1password -- bash -lc '
+  cd ~/projects/pigeon/packages/daemon
+  PARITY_MODE=direct bun run parity:harness
+'
+```
+
+This variant:
+- Spins up a `startDirectChannelServer` instead of a tmux session
+- Registers the session with `backend_kind`, `backend_protocol_version`, `backend_endpoint`, `backend_auth_token`
+- Verifies that webhook reply commands are delivered directly to the plugin server's `onExecute` callback
+- Does **not** require tmux to be installed
+
+The legacy (tmux) variant remains the default when `PARITY_MODE` is unset or `"legacy"`.
+
+### Manual Plugin-Direct Registration
+
+To register a plugin-direct session manually via curl:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  "http://127.0.0.1:4731/session-start" \
+  --data '{
+    "session_id": "direct-parity-test",
+    "notify": true,
+    "label": "Direct Parity",
+    "backend_kind": "opencode-plugin-direct",
+    "backend_protocol_version": 1,
+    "backend_endpoint": "http://127.0.0.1:PORT/pigeon/direct/execute",
+    "backend_auth_token": "YOUR_TOKEN"
+  }'
+```
+
 ## Verify
 
 Run the Example Script and confirm all three pass criteria.
+For plugin-direct, also run `PARITY_MODE=direct bun run parity:harness` and confirm it passes.

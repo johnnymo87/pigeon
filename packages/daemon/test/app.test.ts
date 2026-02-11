@@ -84,6 +84,83 @@ describe("createApp", () => {
     expect(started).toEqual([]);
   });
 
+  it("supports /session-start with plugin-direct backend_kind parity", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 10_000 });
+
+    const start = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "direct-sess-1",
+        notify: true,
+        label: "Direct Plugin Session",
+        backend_kind: "opencode-plugin-direct",
+        backend_protocol_version: 1,
+        backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+        backend_auth_token: "secret-token-abc",
+      }),
+    }));
+
+    expect(start.status).toBe(200);
+    expect(await start.json()).toEqual({ ok: true, session_id: "direct-sess-1" });
+
+    const list = await app(new Request("http://localhost/sessions"));
+    const listBody = (await list.json()) as { ok: boolean; sessions: Array<Record<string, unknown>> };
+    expect(list.status).toBe(200);
+    expect(listBody.sessions).toHaveLength(1);
+    const sess = listBody.sessions[0]!;
+    expect(sess.session_id).toBe("direct-sess-1");
+    expect(sess.backend_kind).toBe("opencode-plugin-direct");
+    expect(sess.backend_protocol_version).toBe(1);
+    expect(sess.backend_endpoint).toBe("http://127.0.0.1:9999/pigeon/direct/execute");
+    // backend_auth_token should not be exposed in session list responses
+    expect(sess).not.toHaveProperty("backend_auth_token");
+
+    // Verify single-session lookup too
+    const single = await app(new Request("http://localhost/sessions/direct-sess-1"));
+    expect(single.status).toBe(200);
+    const singleBody = (await single.json()) as { ok: boolean; session: Record<string, unknown> };
+    expect(singleBody.session.backend_kind).toBe("opencode-plugin-direct");
+    expect(singleBody.session.backend_protocol_version).toBe(1);
+    expect(singleBody.session.backend_endpoint).toBe("http://127.0.0.1:9999/pigeon/direct/execute");
+  });
+
+  it("supports /sessions/enable-notify preserving backend_kind fields", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 20_000 });
+
+    // Create a direct session without notify
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "direct-sess-2",
+        notify: false,
+        backend_kind: "opencode-plugin-direct",
+        backend_protocol_version: 1,
+        backend_endpoint: "http://127.0.0.1:8888/pigeon/direct/execute",
+        backend_auth_token: "token-xyz",
+      }),
+    }));
+
+    // Enable notify — backend fields should be preserved
+    const response = await app(new Request("http://localhost/sessions/enable-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "direct-sess-2", label: "Notified Direct" }),
+    }));
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; session: Record<string, unknown> };
+    expect(body.ok).toBe(true);
+    expect(body.session.notify).toBe(true);
+    expect(body.session.label).toBe("Notified Direct");
+    expect(body.session.backend_kind).toBe("opencode-plugin-direct");
+    expect(body.session.backend_protocol_version).toBe(1);
+    expect(body.session.backend_endpoint).toBe("http://127.0.0.1:8888/pigeon/direct/execute");
+  });
+
   it("supports /sessions/enable-notify parity behavior", async () => {
     const started: Array<{ sessionId: string; notify: boolean; label: string | null | undefined }> = [];
     storage = openStorageDb(":memory:");

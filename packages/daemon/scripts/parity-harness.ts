@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import BetterSqlite3 from "better-sqlite3";
+import { startDirectChannelServer } from "../../opencode-plugin/src/direct-channel";
 
+type ParityMode = "legacy" | "direct";
 type Json = Record<string, unknown>;
 
 function envRequired(name: string): string {
@@ -125,7 +127,110 @@ function inboxCommandStatus(dbPath: string, marker: string): { total: number; do
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mode-specific session setup / verification / cleanup
+// ---------------------------------------------------------------------------
+
+interface LegacyResources {
+  mode: "legacy";
+  tmuxSession: string;
+  paneId: string;
+}
+
+interface DirectResources {
+  mode: "direct";
+  server: { endpoint: string; authToken: string; close: () => Promise<void> };
+  receivedCommands: string[];
+}
+
+type ModeResources = LegacyResources | DirectResources;
+
+function setupLegacyResources(runId: string): LegacyResources {
+  ensureTmuxInstalled();
+  const tmuxSession = `pigeon-parity-${runId}`;
+  const { paneId } = createTmuxSession(tmuxSession);
+  return { mode: "legacy", tmuxSession, paneId };
+}
+
+async function setupDirectResources(): Promise<DirectResources> {
+  const receivedCommands: string[] = [];
+  const server = await startDirectChannelServer({
+    onExecute: async (req) => {
+      receivedCommands.push(req.command);
+      return { success: true, exitCode: 0, output: `executed: ${req.command}` };
+    },
+  });
+  return { mode: "direct", server, receivedCommands };
+}
+
+function buildSessionStartBody(
+  sessionId: string,
+  resources: ModeResources,
+): Record<string, unknown> {
+  const base = { session_id: sessionId, notify: true, label: "Parity Harness Session" };
+  if (resources.mode === "legacy") {
+    return { ...base, tmux_session: resources.tmuxSession, tmux_pane: resources.tmuxSession };
+  }
+  return {
+    ...base,
+    backend_kind: "opencode-plugin-direct",
+    backend_protocol_version: 1,
+    backend_endpoint: resources.server.endpoint,
+    backend_auth_token: resources.server.authToken,
+  };
+}
+
+async function waitForInjection(
+  resources: ModeResources,
+  daemonDbPath: string,
+  marker: string,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    // Both modes: check inbox status in daemon DB
+    const inbox = inboxCommandStatus(daemonDbPath, marker);
+    if (inbox.done > 0) return;
+
+    if (resources.mode === "legacy") {
+      if (paneContains(resources.paneId, marker)) return;
+    } else {
+      if (resources.receivedCommands.some((cmd) => cmd.includes(marker))) return;
+    }
+
+    await sleep(250);
+  }
+
+  // Timeout — build diagnostic error
+  const inbox = inboxCommandStatus(daemonDbPath, marker);
+  if (resources.mode === "direct") {
+    throw new Error(
+      `Timed out waiting for direct-channel command delivery (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")}, receivedCommands=${resources.receivedCommands.length})`,
+    );
+  }
+  throw new Error(
+    `Timed out waiting for local injection completion (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")})`,
+  );
+}
+
+async function cleanupResources(resources: ModeResources): Promise<void> {
+  if (resources.mode === "legacy") {
+    destroyTmuxSession(resources.tmuxSession);
+  } else {
+    await resources.server.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main harness
+// ---------------------------------------------------------------------------
+
 async function main(): Promise<void> {
+  const mode: ParityMode = (process.env.PARITY_MODE?.trim() as ParityMode) || "legacy";
+  if (mode !== "legacy" && mode !== "direct") {
+    throw new Error(`Invalid PARITY_MODE: ${mode} (expected "legacy" or "direct")`);
+  }
+
   const workerUrl = envRequired("CCR_WORKER_URL");
   const workerApiKey = envRequired("CCR_API_KEY");
   const webhookSecret = envRequired("TELEGRAM_WEBHOOK_SECRET");
@@ -134,7 +239,7 @@ async function main(): Promise<void> {
     throw new Error("Missing TELEGRAM_CHAT_ID or TELEGRAM_GROUP_ID for parity harness");
   }
 
-  ensureTmuxInstalled();
+  console.log(`[parity] mode=${mode}`);
 
   const runId = randomUUID().slice(0, 8);
   const machineId = `pigeon-parity-${runId}`;
@@ -142,10 +247,12 @@ async function main(): Promise<void> {
   const daemonBase = `http://127.0.0.1:${daemonPort}`;
   const workerBase = workerUrl.replace(/\/$/, "");
   const sessionId = `parity-session-${runId}`;
-  const tmuxSession = `pigeon-parity-${runId}`;
   const marker = `__PIGEON_PARITY_${runId}__`;
 
-  const { paneId } = createTmuxSession(tmuxSession);
+  const resources =
+    mode === "direct"
+      ? await setupDirectResources()
+      : setupLegacyResources(runId);
 
   const daemonEnv = {
     ...process.env,
@@ -178,21 +285,17 @@ async function main(): Promise<void> {
   try {
     await waitForHealth(`${daemonBase}/health`);
 
+    // --- Session registration (mode-specific body) ---
     const startResp = await fetchJson(`${daemonBase}/session-start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sessionId,
-        notify: true,
-        label: "Parity Harness Session",
-        tmux_session: tmuxSession,
-        tmux_pane: tmuxSession,
-      }),
+      body: JSON.stringify(buildSessionStartBody(sessionId, resources)),
     });
     if (startResp.status !== 200) {
       throw new Error(`session-start failed: ${startResp.status} ${JSON.stringify(startResp.body)}`);
     }
 
+    // --- Verify worker registration ---
     await sleep(1200);
     const sessionsResp = await fetchJson(`${workerBase}/sessions`, {
       headers: { Authorization: `Bearer ${workerApiKey}` },
@@ -206,6 +309,7 @@ async function main(): Promise<void> {
       throw new Error("session not registered in worker after session-start");
     }
 
+    // --- Stop notification ---
     const stopResp = await fetchJson(`${daemonBase}/stop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -218,6 +322,9 @@ async function main(): Promise<void> {
     if (stopResp.status !== 200 || stopResp.body.notified !== true) {
       throw new Error(`/stop failed parity expectation: ${stopResp.status} ${JSON.stringify(stopResp.body)}`);
     }
+
+    // --- Send notification via worker ---
+    const replyCommand = mode === "direct" ? marker : `printf '${marker}\\n'`;
 
     const notifyResp = await fetchJson(`${workerBase}/notifications/send`, {
       method: "POST",
@@ -245,6 +352,7 @@ async function main(): Promise<void> {
       throw new Error(`worker notifications/send missing messageId/token: ${JSON.stringify(notifyResp.body)}`);
     }
 
+    // --- Simulate Telegram text reply webhook ---
     const replyUpdateId = Number(`91${Date.now().toString().slice(-8)}`);
     const replyResp = await fetch(`${workerBase}/webhook/telegram/parity-harness`, {
       method: "POST",
@@ -258,7 +366,7 @@ async function main(): Promise<void> {
           message_id: 700001,
           from: { id: Number(chatId) },
           chat: { id: Number(chatId) },
-          text: `printf '${marker}\\n'`,
+          text: replyCommand,
           reply_to_message: { message_id: messageId },
         },
       }),
@@ -267,6 +375,7 @@ async function main(): Promise<void> {
       throw new Error(`reply webhook failed: HTTP ${replyResp.status}`);
     }
 
+    // --- Simulate Telegram callback query webhook ---
     const callbackResp = await fetch(`${workerBase}/webhook/telegram/parity-harness`, {
       method: "POST",
       headers: {
@@ -290,30 +399,21 @@ async function main(): Promise<void> {
       throw new Error(`callback webhook failed: HTTP ${callbackResp.status}`);
     }
 
-    let injected = false;
-    const injectionStart = Date.now();
-    while (Date.now() - injectionStart < 20_000) {
-      const inbox = inboxCommandStatus(daemonDbPath, marker);
-      if (inbox.done > 0) {
-        injected = true;
-        break;
-      }
+    // --- Wait for injection (mode-specific verification) ---
+    await waitForInjection(resources, daemonDbPath, marker);
 
-      if (paneContains(paneId, marker)) {
-        injected = true;
-        break;
+    // --- Direct-channel: verify the command was actually received ---
+    if (resources.mode === "direct") {
+      const markerMatch = resources.receivedCommands.find((cmd) => cmd.includes(marker));
+      if (!markerMatch) {
+        throw new Error(
+          `direct-channel: marker command not received by plugin server (got ${resources.receivedCommands.length} commands: ${JSON.stringify(resources.receivedCommands)})`,
+        );
       }
-
-      await sleep(250);
+      console.log(`[parity] direct-channel verified: received ${resources.receivedCommands.length} command(s)`);
     }
 
-    if (!injected) {
-      const inbox = inboxCommandStatus(daemonDbPath, marker);
-      throw new Error(
-        `Timed out waiting for local injection completion (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")})`,
-      );
-    }
-
+    // --- Session cleanup ---
     const unregisterResp = await fetchJson(`${daemonBase}/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
     });
@@ -331,10 +431,10 @@ async function main(): Promise<void> {
       throw new Error("session still present in worker after daemon delete/unregister");
     }
 
-    console.log("[parity] PASS: end-to-end daemon parity harness completed successfully");
+    console.log(`[parity] PASS: end-to-end daemon parity harness completed successfully (mode=${mode})`);
   } finally {
     daemon.kill("SIGTERM");
-    destroyTmuxSession(tmuxSession);
+    await cleanupResources(resources);
   }
 }
 
