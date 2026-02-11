@@ -1,0 +1,55 @@
+---
+name: daemon-architecture
+description: Use when you need to understand daemon route flow, storage model, worker connectivity, and command injection architecture before making changes
+---
+
+# Pigeon Daemon Architecture
+
+## When To Use
+
+Use this skill before changing daemon routes, storage schema, worker integration, or injection behavior.
+
+## Overview
+
+`@pigeon/daemon` is the local control plane.
+
+- API routes live in `packages/daemon/src/app.ts`
+- Storage is SQLite-first in `packages/daemon/src/storage/*`
+- Worker integration is in `packages/daemon/src/worker/*`
+- Injection adapters are in `packages/daemon/src/injectors/*`
+
+## Route Surface
+
+- `GET /health`
+- `POST /session-start`
+- `POST /sessions/enable-notify`
+- `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`
+- `POST /stop`
+- `POST /cleanup`
+
+## Storage Domains
+
+- `sessions`: active session registry + transport metadata
+- `session_tokens`: reply/command token validation state
+- `reply_tokens`: message reply-key to token mapping
+- `inbox`: durable local command ingest queue
+
+## Integration Flow
+
+1. Session start hits daemon route and writes session row.
+2. Daemon registers session with worker (if configured).
+3. Stop event sends notification and mints token.
+4. Worker delivers reply/callback as `command` message over WS.
+5. Daemon acks, injects command, sends `commandResult`.
+
+## Verify
+
+```bash
+bun run --filter '@pigeon/daemon' typecheck
+bun run --filter '@pigeon/daemon' test
+```
+
+Expected:
+
+- typecheck passes
+- tests pass

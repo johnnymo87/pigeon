@@ -5,3 +5,4 @@ dist/
 .env
 .env.local
 .dev.vars
+packages/daemon/data/
