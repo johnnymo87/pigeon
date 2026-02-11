@@ -219,4 +219,105 @@ describe("ingestWorkerCommand", () => {
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
+
+  it("rejects opencode-plugin-direct sessions with missing endpoint instead of falling through to injection", async () => {
+    const storage = openStorageDb(":memory:");
+    // Session has backendKind but NO endpoint or auth token — incomplete registration
+    storage.sessions.upsert({
+      sessionId: "sess-incomplete",
+      notify: true,
+      transportKind: "tmux",
+      tmuxPaneId: "%5",
+      tmuxSession: "dev",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      // backendEndpoint and backendAuthToken intentionally omitted
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    const injectCalled = { value: false };
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-guard-1",
+        sessionId: "sess-incomplete",
+        command: "echo test",
+        chatId: "5",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        async injectCommand() {
+          injectCalled.value = true;
+          return { ok: true, transport: "tmux" };
+        },
+      },
+    );
+
+    // Should reject with error, NOT fall through to injectCommand
+    expect(injectCalled.value).toBe(false);
+    expect(sent).toEqual([
+      { type: "ack", commandId: "cmd-guard-1" },
+      {
+        type: "commandResult",
+        commandId: "cmd-guard-1",
+        success: false,
+        error: "OpenCode session missing backend endpoint or auth token. Cannot deliver command — re-register the session.",
+        chatId: "5",
+      },
+    ]);
+    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    storage.db.close();
+  });
+
+  it("rejects opencode-plugin-direct sessions with endpoint but missing auth token", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-no-token",
+      notify: true,
+      transportKind: "tmux",
+      tmuxPaneId: "%6",
+      tmuxSession: "dev",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+      // backendAuthToken intentionally omitted
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    const injectCalled = { value: false };
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-guard-2",
+        sessionId: "sess-no-token",
+        command: "echo test",
+        chatId: "6",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        async injectCommand() {
+          injectCalled.value = true;
+          return { ok: true, transport: "tmux" };
+        },
+      },
+    );
+
+    expect(injectCalled.value).toBe(false);
+    expect(sent[1]).toMatchObject({
+      type: "commandResult",
+      commandId: "cmd-guard-2",
+      success: false,
+    });
+    storage.db.close();
+  });
 });

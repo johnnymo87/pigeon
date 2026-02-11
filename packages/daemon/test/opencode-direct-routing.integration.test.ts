@@ -382,6 +382,55 @@ describe("opencode direct-channel routing integration", () => {
     storage.db.close();
   });
 
+  it("rejects opencode-plugin-direct session with incomplete backend registration", async () => {
+    const storage = openStorageDb(":memory:");
+    // Session has backendKind but NO endpoint/token — incomplete registration
+    storage.sessions.upsert({
+      sessionId: "sess-int-10",
+      notify: true,
+      transportKind: "tmux",
+      tmuxPaneId: "%9",
+      tmuxSession: "dev",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      // Missing backendEndpoint and backendAuthToken
+    }, 1_000);
+
+    const injected = vi.fn(async () => ({ ok: true }));
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-int-10",
+        sessionId: "sess-int-10",
+        command: "echo should-not-inject",
+        chatId: "99",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        injectCommand: injected,
+      },
+    );
+
+    // Must NOT fall through to legacy injection
+    expect(injected).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-10" });
+    expect(sent[1]).toMatchObject({
+      type: "commandResult",
+      commandId: "cmd-int-10",
+      success: false,
+    });
+    expect((sent[1] as Record<string, unknown>).error).toMatch(/missing backend endpoint/i);
+
+    storage.db.close();
+  });
+
   it("falls through to legacy injector for non-direct sessions", async () => {
     const storage = openStorageDb(":memory:");
     // Session WITHOUT backendKind = legacy path

@@ -134,6 +134,21 @@ export async function ingestWorkerCommand(
     return;
   }
 
+  // Guard: OpenCode sessions must never fall through to legacy tmux/nvim injection.
+  // If backendKind is set but endpoint or token is missing, the session has an
+  // incomplete backend registration — reject rather than silently injecting keystrokes.
+  if (session.backendKind === "opencode-plugin-direct") {
+    callbacks.send({
+      type: "commandResult",
+      commandId,
+      success: false,
+      error: "OpenCode session missing backend endpoint or auth token. Cannot deliver command — re-register the session.",
+      chatId: msg.chatId,
+    });
+    return;
+  }
+
+  // Legacy injection path (tmux/nvim) — only for non-OpenCode sessions
   const injectCommand = options.injectCommand ?? injectWithFallback;
   const result = await injectCommand(session, msg.command);
 
