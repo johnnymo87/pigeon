@@ -5,6 +5,10 @@ description: Use when validating deployed worker parity through authenticated en
 
 # Worker Parity Checklist
 
+## When To Use
+
+Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity.
+
 Run from `~/projects/claude-code-remote` so `op run --env-file=.env.1password` can inject secrets.
 
 ## Baseline
@@ -75,3 +79,7 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
 - Notification send returns `{ ok: true, messageId, token }`
 - Webhook reply returns `ok` (`200`)
 - Session is removable (`/sessions/unregister` returns `{ ok: true }`)
+
+## Verify
+
+Run the Example Script and confirm all three pass criteria.

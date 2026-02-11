@@ -5,6 +5,10 @@ description: Use when worker endpoints fail, Telegram notifications do not send,
 
 # Troubleshooting Pigeon Worker
 
+## When To Use
+
+Use this skill for diagnosing regressions in auth, notifications, webhook processing, or command delivery.
+
 ## Fast Triage
 
 1. Health check
@@ -65,3 +69,11 @@ If deploy fails with DO class mismatch, verify:
 
 - `wrangler.toml` uses `RouterDO`
 - `src/index.ts` exports `RouterDO`
+
+## Verify
+
+```bash
+curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
+```
+
+Expected: `ok`

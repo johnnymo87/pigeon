@@ -5,6 +5,10 @@ description: Use for day-to-day operations tasks like health checks, log tailing
 
 # Worker Operations Runbook
 
+## When To Use
+
+Use this skill for production support and incident response, not feature implementation.
+
 ## Scope
 
 Use this skill for active operations, not feature development.
@@ -89,3 +93,11 @@ Then:
 - Do not rotate secrets during active incidents unless confirmed compromised.
 - Keep DO class compatibility (`RouterDO`) intact across deploys.
 - Prefer `op run --env-file=.env.1password` for secret injection over manual exports.
+
+## Verify
+
+```bash
+curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
+```
+
+Expected: `ok`

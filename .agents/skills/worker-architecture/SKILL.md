@@ -5,6 +5,10 @@ description: Use when you need to understand how the Pigeon worker routes Telegr
 
 # Pigeon Worker Architecture
 
+## When To Use
+
+Use this skill when you need system-level understanding before debugging, deployment, or parity checks.
+
 ## Overview
 
 `@pigeon/worker` is a Cloudflare Worker + Durable Object router.
@@ -44,7 +48,7 @@ description: Use when you need to understand how the Pigeon worker routes Telegr
 - Alarm-driven cleanup + retry sweep runs hourly (`alarm()` in DO)
 - Retry and backoff logic lives in `packages/worker/src/command-queue.ts`
 
-## Verify Understanding
+## Verify
 
 Run:
 
@@ -52,3 +56,8 @@ Run:
 bun run --filter '@pigeon/worker' test
 bun run --filter '@pigeon/worker' typecheck
 ```
+
+Expected:
+
+- tests pass
+- typecheck passes

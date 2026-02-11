@@ -5,6 +5,10 @@ description: Use when deploying or updating the Pigeon worker on Cloudflare and 
 
 # Deploying the Pigeon Worker
 
+## When To Use
+
+Use this skill when releasing worker changes or validating production deploy safety.
+
 ## Prereqs
 
 - Repo: `~/projects/pigeon`
@@ -70,3 +74,18 @@ op run --env-file=.env.1password -- sh -c '
 ```
 
 Expected: HTTP `200`.
+
+## Verify
+
+Run these in order:
+
+```bash
+curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
+cd ~/projects/claude-code-remote
+op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/deploy_sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
+```
+
+Expected:
+
+- health returns `ok`
+- authenticated `/sessions` returns HTTP `200`
