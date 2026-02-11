@@ -161,9 +161,12 @@ export async function executeViaOpencodeDirectChannel(
     }
 
     if (
-      ack.requestId !== input.requestId
-      || ack.commandId !== input.commandId
-      || ack.sessionId !== input.sessionId
+      ack.accepted
+      && (
+        ack.requestId !== input.requestId
+        || ack.commandId !== input.commandId
+        || ack.sessionId !== input.sessionId
+      )
     ) {
       return {
         ok: false,
