@@ -1,5 +1,6 @@
 export interface DaemonConfig {
   port: number;
+  dbPath: string;
 }
 
 const DEFAULT_PORT = 4731;
@@ -18,7 +19,10 @@ export function parsePort(value: string | undefined): number {
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): DaemonConfig {
+  const defaultDbPath = `${process.cwd()}/data/pigeon-daemon.db`;
+
   return {
     port: parsePort(env.PIGEON_DAEMON_PORT),
+    dbPath: env.PIGEON_DAEMON_DB_PATH?.trim() || defaultDbPath,
   };
 }

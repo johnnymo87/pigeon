@@ -23,5 +23,11 @@ describe("loadConfig", () => {
   it("loads port from env", () => {
     const config = loadConfig({ PIGEON_DAEMON_PORT: "6123" });
     expect(config.port).toBe(6123);
+    expect(config.dbPath).toContain("data/pigeon-daemon.db");
+  });
+
+  it("loads db path override from env", () => {
+    const config = loadConfig({ PIGEON_DAEMON_DB_PATH: "/tmp/daemon.db" });
+    expect(config.dbPath).toBe("/tmp/daemon.db");
   });
 });

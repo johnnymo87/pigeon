@@ -1,4 +1,6 @@
 import BetterSqlite3 from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { initSchema } from "./schema";
 import {
   InboxRepository,
@@ -16,6 +18,10 @@ export interface StorageDb {
 }
 
 export function openStorageDb(path: string): StorageDb {
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+
   const db = new BetterSqlite3(path);
   db.exec("PRAGMA foreign_keys = ON;");
   initSchema(db);

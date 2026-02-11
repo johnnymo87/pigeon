@@ -133,10 +133,23 @@ export class SessionRepository {
     return row ? asSession(row) : null;
   }
 
-  listActive(now = Date.now()): SessionRecord[] {
-    const rows = this.db
-      .prepare("SELECT * FROM sessions WHERE state = 'running' AND expires_at > ? ORDER BY updated_at DESC")
-      .all(now) as SqlRow[];
+  list(options: { active?: boolean; notify?: boolean; now?: number } = {}): SessionRecord[] {
+    const clauses: string[] = [];
+    const args: unknown[] = [];
+    const now = options.now ?? Date.now();
+
+    if (options.active) {
+      clauses.push("state = 'running'", "expires_at > ?");
+      args.push(now);
+    }
+
+    if (options.notify) {
+      clauses.push("notify = 1");
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const sql = `SELECT * FROM sessions ${where} ORDER BY last_seen DESC`;
+    const rows = this.db.prepare(sql).all(...args) as SqlRow[];
     return rows.map(asSession);
   }
 
