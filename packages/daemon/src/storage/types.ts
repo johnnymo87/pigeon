@@ -15,6 +15,10 @@ export interface SessionRecord {
   paneId: string | null;
   sessionName: string | null;
   ptyPath: string | null;
+  backendKind: string | null;
+  backendProtocolVersion: number | null;
+  backendEndpoint: string | null;
+  backendAuthToken: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -63,6 +67,10 @@ export interface UpsertSessionInput {
   paneId?: string | null;
   sessionName?: string | null;
   ptyPath?: string | null;
+  backendKind?: string | null;
+  backendProtocolVersion?: number | null;
+  backendEndpoint?: string | null;
+  backendAuthToken?: string | null;
 }
 
 export interface MintSessionTokenInput {

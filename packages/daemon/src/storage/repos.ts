@@ -35,6 +35,10 @@ function asSession(row: SqlRow): SessionRecord {
     paneId: (row.pane_id as string | null) ?? null,
     sessionName: (row.session_name as string | null) ?? null,
     ptyPath: (row.pty_path as string | null) ?? null,
+    backendKind: (row.backend_kind as string | null) ?? null,
+    backendProtocolVersion: (row.backend_protocol_version as number | null) ?? null,
+    backendEndpoint: (row.backend_endpoint as string | null) ?? null,
+    backendAuthToken: (row.backend_auth_token as string | null) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     lastSeen: Number(row.last_seen),
@@ -83,8 +87,9 @@ export class SessionRepository {
       `INSERT INTO sessions (
          session_id, ppid, pid, start_time, cwd, label, notify, state,
          transport_kind, nvim_socket, instance_name, tmux_pane_id, tmux_session,
-         pane_id, session_name, pty_path, created_at, updated_at, last_seen, expires_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         pane_id, session_name, pty_path, backend_kind, backend_protocol_version,
+         backend_endpoint, backend_auth_token, created_at, updated_at, last_seen, expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          ppid = excluded.ppid,
          pid = excluded.pid,
@@ -101,6 +106,10 @@ export class SessionRepository {
          pane_id = excluded.pane_id,
          session_name = excluded.session_name,
          pty_path = excluded.pty_path,
+         backend_kind = excluded.backend_kind,
+         backend_protocol_version = excluded.backend_protocol_version,
+         backend_endpoint = excluded.backend_endpoint,
+         backend_auth_token = excluded.backend_auth_token,
          updated_at = excluded.updated_at,
          last_seen = excluded.last_seen,
          expires_at = excluded.expires_at`,
@@ -121,6 +130,10 @@ export class SessionRepository {
       input.paneId ?? null,
       input.sessionName ?? null,
       input.ptyPath ?? null,
+      input.backendKind ?? null,
+      input.backendProtocolVersion ?? null,
+      input.backendEndpoint ?? null,
+      input.backendAuthToken ?? null,
       now,
       now,
       now,

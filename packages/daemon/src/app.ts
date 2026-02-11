@@ -19,6 +19,9 @@ interface LegacySession {
   notify: boolean;
   state: string;
   transport: LegacyTransport;
+  backend_kind: string | null;
+  backend_protocol_version: number | null;
+  backend_endpoint: string | null;
   created_at: number;
   updated_at: number;
   last_seen: number;
@@ -80,6 +83,10 @@ function toLegacySession(session: {
   tmuxSession: string | null;
   paneId: string | null;
   sessionName: string | null;
+  backendKind: string | null;
+  backendProtocolVersion: number | null;
+  backendEndpoint: string | null;
+  backendAuthToken: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -95,6 +102,9 @@ function toLegacySession(session: {
     notify: session.notify,
     state: session.state,
     transport: transportFromSession(session),
+    backend_kind: session.backendKind,
+    backend_protocol_version: session.backendProtocolVersion,
+    backend_endpoint: session.backendEndpoint,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     last_seen: session.lastSeen,
@@ -170,6 +180,18 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             paneId: tmuxPane ?? (transportKind === "tmux" ? existing?.paneId : null),
             sessionName: tmuxSession ?? (transportKind === "tmux" ? existing?.sessionName : null),
             ptyPath: typeof body.tty === "string" ? body.tty : existing?.ptyPath,
+            backendKind:
+              (typeof body.backend_kind === "string" ? body.backend_kind : undefined)
+              ?? existing?.backendKind,
+            backendProtocolVersion:
+              (typeof body.backend_protocol_version === "number" ? body.backend_protocol_version : undefined)
+              ?? existing?.backendProtocolVersion,
+            backendEndpoint:
+              (typeof body.backend_endpoint === "string" ? body.backend_endpoint : undefined)
+              ?? existing?.backendEndpoint,
+            backendAuthToken:
+              (typeof body.backend_auth_token === "string" ? body.backend_auth_token : undefined)
+              ?? existing?.backendAuthToken,
           },
           nowFn(),
         );
@@ -214,6 +236,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             paneId: existing.paneId,
             sessionName: existing.sessionName,
             ptyPath: existing.ptyPath,
+            backendKind: existing.backendKind,
+            backendProtocolVersion: existing.backendProtocolVersion,
+            backendEndpoint: existing.backendEndpoint,
+            backendAuthToken: existing.backendAuthToken,
           },
           nowFn(),
         );

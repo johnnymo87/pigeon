@@ -24,6 +24,10 @@ export function initSchema(db: BetterSqlite3.Database): void {
       pane_id TEXT,
       session_name TEXT,
       pty_path TEXT,
+      backend_kind TEXT,
+      backend_protocol_version INTEGER,
+      backend_endpoint TEXT,
+      backend_auth_token TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       last_seen INTEGER NOT NULL,
@@ -33,6 +37,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(state, expires_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_notify ON sessions(notify, state, expires_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_ppid ON sessions(ppid);
+    CREATE INDEX IF NOT EXISTS idx_sessions_backend_kind ON sessions(backend_kind);
 
     CREATE TABLE IF NOT EXISTS session_tokens (
       token TEXT PRIMARY KEY,
@@ -69,4 +74,20 @@ export function initSchema(db: BetterSqlite3.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_inbox_status_updated ON inbox(status, updated_at);
   `);
+
+  // Additive migrations for existing databases created before backend fields.
+  const additiveColumns = [
+    "ALTER TABLE sessions ADD COLUMN backend_kind TEXT",
+    "ALTER TABLE sessions ADD COLUMN backend_protocol_version INTEGER",
+    "ALTER TABLE sessions ADD COLUMN backend_endpoint TEXT",
+    "ALTER TABLE sessions ADD COLUMN backend_auth_token TEXT",
+  ];
+
+  for (const statement of additiveColumns) {
+    try {
+      db.exec(statement);
+    } catch {
+      // Column already exists.
+    }
+  }
 }
