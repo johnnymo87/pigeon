@@ -97,4 +97,3 @@ If rejected:
 
 - No feature flag rollout for this channel.
 - OpenCode sessions must use plugin-direct backend once implemented.
-- nvim/tmux fallback is removed for OpenCode sessions in final Phase 3 cutover task.

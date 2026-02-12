@@ -14,7 +14,7 @@ Use this when daemon behavior regresses in production or parity tests.
 1. Check service and health endpoint.
 2. Check worker connectivity logs.
 3. Check route contract (`/session-start`, `/stop`, `/sessions`).
-4. Check injection path (nvim/tmux target availability).
+4. Check command delivery path.
 
 ## Commands
 
@@ -31,15 +31,9 @@ curl -s http://127.0.0.1:4731/health
 - stop notifications not sent
   - notifier configuration missing or 1Password env injection failure
 - reply commands not injected
-  - no WS command delivery, invalid transport metadata, or tmux target mismatch
+  - no WS command delivery or invalid transport metadata
 - repeated command processing
   - inspect `inbox` status transitions and ack handling
-
-## Injection Checks
-
-- nvim path requires `nvimSocket` + `instanceName`
-- tmux path requires pane or session target
-- nvim failures should fallback to tmux when metadata exists
 
 ## Verify
 

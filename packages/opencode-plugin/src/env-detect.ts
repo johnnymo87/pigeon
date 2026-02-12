@@ -4,10 +4,6 @@ import { readlink } from "node:fs/promises"
 type LogFn = (message: string, data?: unknown) => void
 
 export type EnvironmentInfo = {
-  nvimSocket?: string
-  tmuxSession?: string
-  tmuxPane?: string
-  tmuxPaneId?: string
   tty?: string
   pid: number
   ppid: number
@@ -30,33 +26,6 @@ export async function detectEnvironment($: PluginInput["$"], log: LogFn): Promis
   const info: EnvironmentInfo = {
     pid: process.pid,
     ppid: process.ppid,
-  }
-
-  const nvimSocket = process.env.NVIM ?? process.env.NVIM_LISTEN_ADDRESS
-  if (nvimSocket) {
-    info.nvimSocket = nvimSocket
-  }
-
-  if (process.env.TMUX) {
-    try {
-      const safe = $.nothrow()
-
-      const [sessionResult, paneResult, paneIdResult] = await Promise.all([
-        safe`tmux display-message -p '#{session_name}'`.text(),
-        safe`tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}'`.text(),
-        safe`tmux display-message -p '#{pane_id}'`.text(),
-      ])
-
-      const session = sessionResult.trim()
-      const pane = paneResult.trim()
-      const paneId = paneIdResult.trim()
-
-      if (session) info.tmuxSession = session
-      if (pane) info.tmuxPane = pane
-      if (paneId) info.tmuxPaneId = paneId
-    } catch (err) {
-      log("tmux environment detection failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
-    }
   }
 
   // TTY detection

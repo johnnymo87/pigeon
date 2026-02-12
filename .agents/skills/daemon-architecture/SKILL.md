@@ -16,7 +16,6 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - API routes live in `packages/daemon/src/app.ts`
 - Storage is SQLite-first in `packages/daemon/src/storage/*`
 - Worker integration is in `packages/daemon/src/worker/*`
-- Injection adapters are in `packages/daemon/src/injectors/*`
 
 ## Route Surface
 

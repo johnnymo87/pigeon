@@ -6,10 +6,6 @@ type RegisterSessionOpts = {
   label: string
   pid: number
   ppid: number
-  nvimSocket?: string
-  tmuxSession?: string
-  tmuxPane?: string
-  tmuxPaneId?: string
   tty?: string
   backendKind?: string
   backendProtocolVersion?: number
@@ -81,10 +77,6 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
           label: opts.label,
           pid: opts.pid,
           ppid: opts.ppid,
-          nvim_socket: opts.nvimSocket,
-          tmux_session: opts.tmuxSession,
-          tmux_pane: opts.tmuxPane,
-          tmux_pane_id: opts.tmuxPaneId,
           tty: opts.tty,
           backend_kind: opts.backendKind,
           backend_protocol_version: opts.backendProtocolVersion,

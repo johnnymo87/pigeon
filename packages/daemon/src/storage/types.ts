@@ -7,13 +7,6 @@ export interface SessionRecord {
   label: string | null;
   notify: boolean;
   state: string;
-  transportKind: string | null;
-  nvimSocket: string | null;
-  instanceName: string | null;
-  tmuxPaneId: string | null;
-  tmuxSession: string | null;
-  paneId: string | null;
-  sessionName: string | null;
   ptyPath: string | null;
   backendKind: string | null;
   backendProtocolVersion: number | null;
@@ -59,13 +52,6 @@ export interface UpsertSessionInput {
   label?: string | null;
   notify?: boolean;
   state?: string;
-  transportKind?: string | null;
-  nvimSocket?: string | null;
-  instanceName?: string | null;
-  tmuxPaneId?: string | null;
-  tmuxSession?: string | null;
-  paneId?: string | null;
-  sessionName?: string | null;
   ptyPath?: string | null;
   backendKind?: string | null;
   backendProtocolVersion?: number | null;

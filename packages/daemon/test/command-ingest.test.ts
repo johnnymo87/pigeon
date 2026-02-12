@@ -4,14 +4,15 @@ import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import { ResultErrorCode } from "../src/opencode-direct/contracts";
 
 describe("ingestWorkerCommand", () => {
-  it("acks and marks command done on successful injection", async () => {
+  it("acks and marks command done on successful direct-channel delivery", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-1",
       notify: true,
-      transportKind: "tmux",
-      tmuxPaneId: "%3",
-      tmuxSession: "dev",
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
     }, 1_000);
 
     const sent: unknown[] = [];
@@ -30,8 +31,31 @@ describe("ingestWorkerCommand", () => {
         },
       },
       {
-        async injectCommand() {
-          return { ok: true, transport: "tmux" };
+        async executeDirect() {
+          return {
+            ok: true,
+            status: 200,
+            attempts: 1,
+            ack: {
+              type: "pigeon.command.ack",
+              version: 1,
+              requestId: "cmd-1",
+              commandId: "cmd-1",
+              sessionId: "sess-1",
+              accepted: true,
+              acceptedAt: Date.now(),
+            },
+            result: {
+              type: "pigeon.command.result",
+              version: 1,
+              requestId: "cmd-1",
+              commandId: "cmd-1",
+              sessionId: "sess-1",
+              success: true,
+              finishedAt: Date.now(),
+              output: "queued",
+            },
+          };
         },
       },
     );
@@ -87,7 +111,6 @@ describe("ingestWorkerCommand", () => {
     storage.sessions.upsert({
       sessionId: "sess-direct",
       notify: true,
-      transportKind: "unknown",
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
       backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
@@ -152,7 +175,6 @@ describe("ingestWorkerCommand", () => {
     storage.sessions.upsert({
       sessionId: "sess-direct-fail",
       notify: true,
-      transportKind: "unknown",
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
       backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
@@ -220,22 +242,18 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
-  it("rejects opencode-plugin-direct sessions with missing endpoint instead of falling through to injection", async () => {
+  it("rejects opencode-plugin-direct sessions with missing endpoint", async () => {
     const storage = openStorageDb(":memory:");
     // Session has backendKind but NO endpoint or auth token — incomplete registration
     storage.sessions.upsert({
       sessionId: "sess-incomplete",
       notify: true,
-      transportKind: "tmux",
-      tmuxPaneId: "%5",
-      tmuxSession: "dev",
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
       // backendEndpoint and backendAuthToken intentionally omitted
     }, 1_000);
 
     const sent: unknown[] = [];
-    const injectCalled = { value: false };
     await ingestWorkerCommand(
       storage,
       {
@@ -250,23 +268,15 @@ describe("ingestWorkerCommand", () => {
           sent.push(payload);
         },
       },
-      {
-        async injectCommand() {
-          injectCalled.value = true;
-          return { ok: true, transport: "tmux" };
-        },
-      },
     );
 
-    // Should reject with error, NOT fall through to injectCommand
-    expect(injectCalled.value).toBe(false);
     expect(sent).toEqual([
       { type: "ack", commandId: "cmd-guard-1" },
       {
         type: "commandResult",
         commandId: "cmd-guard-1",
         success: false,
-        error: "OpenCode session missing backend endpoint or auth token. Cannot deliver command — re-register the session.",
+        error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
         chatId: "5",
       },
     ]);
@@ -279,9 +289,6 @@ describe("ingestWorkerCommand", () => {
     storage.sessions.upsert({
       sessionId: "sess-no-token",
       notify: true,
-      transportKind: "tmux",
-      tmuxPaneId: "%6",
-      tmuxSession: "dev",
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
       backendEndpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
@@ -289,7 +296,6 @@ describe("ingestWorkerCommand", () => {
     }, 1_000);
 
     const sent: unknown[] = [];
-    const injectCalled = { value: false };
     await ingestWorkerCommand(
       storage,
       {
@@ -304,15 +310,8 @@ describe("ingestWorkerCommand", () => {
           sent.push(payload);
         },
       },
-      {
-        async injectCommand() {
-          injectCalled.value = true;
-          return { ok: true, transport: "tmux" };
-        },
-      },
     );
 
-    expect(injectCalled.value).toBe(false);
     expect(sent[1]).toMatchObject({
       type: "commandResult",
       commandId: "cmd-guard-2",

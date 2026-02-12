@@ -29,14 +29,14 @@ curl -s http://127.0.0.1:4731/health
 
 ```bash
 test -r /run/secrets/op_service_account_token && echo ok
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c 'echo ${CCR_API_KEY:+ok}'
 ```
 
 ## Worker Connectivity Check
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
 ```
 

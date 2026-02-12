@@ -25,7 +25,7 @@ Use this before changing plugin event handling or daemon payload contracts.
 
 - head-first message capture for summary fidelity
 - dedup to avoid repeated notifications
-- environment detection for local transport metadata (nvim/tmux/tty)
+- environment detection for local transport metadata (tty)
 - circuit-breaker around daemon HTTP calls
 
 ## Daemon Contracts

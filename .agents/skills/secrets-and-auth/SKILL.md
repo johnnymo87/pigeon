@@ -13,7 +13,7 @@ Use this for secret setup, auth failures, or token rotation.
 
 - 1Password is source-of-truth for app secrets.
 - Devbox bootstrap secret is `/run/secrets/op_service_account_token`.
-- Use `op run --env-file=/home/dev/projects/claude-code-remote/.env.1password -- ...` for runtime injection.
+- Use `op run --env-file=/home/dev/projects/pigeon/.env.1password -- ...` for runtime injection.
 
 ## Core Secrets
 
@@ -32,7 +32,7 @@ Use this for secret setup, auth failures, or token rotation.
 ## Quick Checks
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c 'echo ${CCR_API_KEY:+ok}'
 op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
 ```

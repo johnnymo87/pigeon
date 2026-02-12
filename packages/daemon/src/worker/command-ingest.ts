@@ -1,6 +1,4 @@
 import type { StorageDb } from "../storage/database";
-import { injectWithFallback } from "../injectors/injector-factory";
-import type { InjectionResult } from "../injectors/types";
 import type { SessionRecord } from "../storage/types";
 import { OpencodeDirectSource, type OpencodeDirectSource as OpencodeDirectSourceType } from "../opencode-direct/contracts";
 import {
@@ -35,7 +33,6 @@ export interface WorkerCommandIngestCallbacks {
 }
 
 export interface WorkerCommandIngestOptions {
-  injectCommand?: (session: SessionRecord, command: string) => Promise<InjectionResult>;
   executeDirect?: (
     session: SessionRecord,
     msg: WorkerCommandMessage,
@@ -134,41 +131,14 @@ export async function ingestWorkerCommand(
     return;
   }
 
-  // Guard: OpenCode sessions must never fall through to legacy tmux/nvim injection.
-  // If backendKind is set but endpoint or token is missing, the session has an
-  // incomplete backend registration — reject rather than silently injecting keystrokes.
-  if (session.backendKind === "opencode-plugin-direct") {
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: false,
-      error: "OpenCode session missing backend endpoint or auth token. Cannot deliver command — re-register the session.",
-      chatId: msg.chatId,
-    });
-    return;
-  }
-
-  // Legacy injection path (tmux/nvim) — only for non-OpenCode sessions
-  const injectCommand = options.injectCommand ?? injectWithFallback;
-  const result = await injectCommand(session, msg.command);
-
-  if (result.ok) {
-    storage.inbox.markDone(commandId);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: true,
-      error: null,
-      chatId: msg.chatId,
-    });
-    return;
-  }
-
+  // Session exists but is not configured for direct-channel delivery.
+  // This means the session is either missing backend fields or uses an
+  // unsupported backend kind.
   callbacks.send({
     type: "commandResult",
     commandId,
     success: false,
-    error: result.error ?? "Injection failed",
+    error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
     chatId: msg.chatId,
   });
 }

@@ -53,10 +53,7 @@ describe("createApp", () => {
         cwd: "/tmp",
         label: "Session One",
         notify: false,
-        nvim_socket: "/tmp/nvim.sock",
         tty: "pts/8",
-        tmux_pane_id: "%3",
-        tmux_session: "dev",
       }),
     }));
 
@@ -69,13 +66,6 @@ describe("createApp", () => {
     expect(listBody.ok).toBe(true);
     expect(listBody.sessions).toHaveLength(1);
     expect(listBody.sessions[0]?.session_id).toBe("sess-1");
-    expect(listBody.sessions[0]?.transport).toEqual({
-      kind: "nvim",
-      nvim_socket: "/tmp/nvim.sock",
-      instance_name: "pts/8",
-      pane_id: "%3",
-      session_name: "dev",
-    });
 
     const single = await app(new Request("http://localhost/sessions/sess-1"));
     expect(single.status).toBe(200);
@@ -183,7 +173,6 @@ describe("createApp", () => {
       body: JSON.stringify({
         session_id: "sess-2",
         label: "Renamed",
-        nvim_socket: "/tmp/new.sock",
       }),
     }));
 
@@ -192,7 +181,6 @@ describe("createApp", () => {
     expect(body.ok).toBe(true);
     expect(body.session.notify).toBe(true);
     expect(body.session.label).toBe("Renamed");
-    expect(body.session.transport).toEqual({ kind: "nvim", nvim_socket: "/tmp/new.sock" });
     expect(started).toEqual([{ sessionId: "sess-2", notify: true, label: "Renamed" }]);
   });
 

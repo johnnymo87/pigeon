@@ -21,7 +21,6 @@ describe("storage schema and repositories", () => {
       label: "demo",
       notify: true,
       state: "running",
-      instanceName: "pts/9",
     }, 1_000);
 
     const session = storage.sessions.get("sess-1");

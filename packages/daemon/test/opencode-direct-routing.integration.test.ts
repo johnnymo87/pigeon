@@ -388,15 +388,11 @@ describe("opencode direct-channel routing integration", () => {
     storage.sessions.upsert({
       sessionId: "sess-int-10",
       notify: true,
-      transportKind: "tmux",
-      tmuxPaneId: "%9",
-      tmuxSession: "dev",
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
       // Missing backendEndpoint and backendAuthToken
     }, 1_000);
 
-    const injected = vi.fn(async () => ({ ok: true }));
     const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
@@ -404,7 +400,7 @@ describe("opencode direct-channel routing integration", () => {
         type: "command",
         commandId: "cmd-int-10",
         sessionId: "sess-int-10",
-        command: "echo should-not-inject",
+        command: "echo should-not-deliver",
         chatId: "99",
       },
       {
@@ -412,13 +408,8 @@ describe("opencode direct-channel routing integration", () => {
           sent.push(payload);
         },
       },
-      {
-        injectCommand: injected,
-      },
     );
 
-    // Must NOT fall through to legacy injection
-    expect(injected).not.toHaveBeenCalled();
     expect(sent).toHaveLength(2);
     expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-10" });
     expect(sent[1]).toMatchObject({
@@ -426,49 +417,7 @@ describe("opencode direct-channel routing integration", () => {
       commandId: "cmd-int-10",
       success: false,
     });
-    expect((sent[1] as Record<string, unknown>).error).toMatch(/missing backend endpoint/i);
-
-    storage.db.close();
-  });
-
-  it("falls through to legacy injector for non-direct sessions", async () => {
-    const storage = openStorageDb(":memory:");
-    // Session WITHOUT backendKind = legacy path
-    storage.sessions.upsert({
-      sessionId: "sess-int-9",
-      notify: true,
-    }, 1_000);
-
-    const injected = vi.fn(async () => ({ ok: true }));
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-9",
-        sessionId: "sess-int-9",
-        command: "echo legacy",
-        chatId: "56",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-      {
-        injectCommand: injected,
-      },
-    );
-
-    // Should have used the legacy injector, not direct channel
-    expect(injected).toHaveBeenCalledTimes(1);
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-9" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-9",
-      success: true,
-    });
+    expect((sent[1] as Record<string, unknown>).error).toMatch(/not configured for command delivery/i);
 
     storage.db.close();
   });

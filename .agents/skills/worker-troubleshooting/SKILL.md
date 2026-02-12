@@ -25,7 +25,7 @@ curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
 Authenticated endpoint check:
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c '
   curl -s -o /tmp/sessions.json -w "%{http_code}" \
     -H "Authorization: Bearer $CCR_API_KEY" \
@@ -39,7 +39,7 @@ Expected: HTTP `200`.
 
 - `401` on `/sessions` or `/notifications/send`
   - Wrong/missing `CCR_API_KEY`
-  - Check `.env.1password` mapping in `~/projects/claude-code-remote`
+  - Check `.env.1password` mapping in `~/projects/pigeon`
 - `401 Unauthorized` on webhook route
   - `X-Telegram-Bot-Api-Secret-Token` mismatch
 - Notification send fails

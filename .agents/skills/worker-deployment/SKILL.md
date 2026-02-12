@@ -52,7 +52,7 @@ Expected: `ok`
 Use 1Password injection instead of storing `CCR_API_KEY` in shell history:
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c '
   curl -s -H "Authorization: Bearer $CCR_API_KEY" \
     "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
@@ -62,7 +62,7 @@ op run --env-file=.env.1password -- sh -c '
 ## Telegram Webhook Check
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c '
   curl -s -o /tmp/webhook-auth-check.txt -w "%{http_code}" \
     -X POST \
@@ -81,7 +81,7 @@ Run these in order:
 
 ```bash
 curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/deploy_sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
 ```
 

@@ -1,14 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier } from "./notification-service";
 
-interface LegacyTransport {
-  kind: string;
-  nvim_socket?: string;
-  instance_name?: string;
-  pane_id?: string;
-  session_name?: string;
-}
-
 interface LegacySession {
   session_id: string;
   ppid: number | null;
@@ -18,7 +10,6 @@ interface LegacySession {
   label: string | null;
   notify: boolean;
   state: string;
-  transport: LegacyTransport;
   backend_kind: string | null;
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
@@ -26,45 +17,6 @@ interface LegacySession {
   updated_at: number;
   last_seen: number;
   expires_at: number;
-}
-
-function transportFromSession(session: {
-  transportKind: string | null;
-  nvimSocket: string | null;
-  instanceName: string | null;
-  tmuxPaneId: string | null;
-  tmuxSession: string | null;
-  paneId: string | null;
-  sessionName: string | null;
-}): LegacyTransport {
-  if (session.transportKind === "nvim") {
-    const transport: LegacyTransport = {
-      kind: "nvim",
-    };
-
-    if (session.nvimSocket) transport.nvim_socket = session.nvimSocket;
-    if (session.instanceName) transport.instance_name = session.instanceName;
-    if (session.tmuxPaneId && session.tmuxSession) {
-      transport.pane_id = session.tmuxPaneId;
-      transport.session_name = session.tmuxSession;
-    }
-    return transport;
-  }
-
-  if (session.transportKind === "tmux") {
-    const transport: LegacyTransport = {
-      kind: "tmux",
-    };
-    const paneId = session.paneId ?? session.tmuxPaneId;
-    const sessionName = session.sessionName ?? session.tmuxSession;
-    if (paneId) transport.pane_id = paneId;
-    if (sessionName) transport.session_name = sessionName;
-    return transport;
-  }
-
-  return {
-    kind: session.transportKind ?? "unknown",
-  };
 }
 
 function toLegacySession(session: {
@@ -76,13 +28,6 @@ function toLegacySession(session: {
   label: string | null;
   notify: boolean;
   state: string;
-  transportKind: string | null;
-  nvimSocket: string | null;
-  instanceName: string | null;
-  tmuxPaneId: string | null;
-  tmuxSession: string | null;
-  paneId: string | null;
-  sessionName: string | null;
   backendKind: string | null;
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
@@ -101,7 +46,6 @@ function toLegacySession(session: {
     label: session.label,
     notify: session.notify,
     state: session.state,
-    transport: transportFromSession(session),
     backend_kind: session.backendKind,
     backend_protocol_version: session.backendProtocolVersion,
     backend_endpoint: session.backendEndpoint,
@@ -152,15 +96,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const existing = storage.sessions.get(sessionId);
-        const nvimSocket = typeof body.nvim_socket === "string" ? body.nvim_socket : null;
-        const tmuxSession = typeof body.tmux_session === "string" ? body.tmux_session : null;
-        const tmuxPane = typeof body.tmux_pane === "string" ? body.tmux_pane : null;
-        const tmuxPaneId = typeof body.tmux_pane_id === "string" ? body.tmux_pane_id : null;
-        const tty = typeof body.tty === "string" ? body.tty : null;
-
-        const transportKind = nvimSocket
-          ? "nvim"
-          : (tmuxSession && tmuxPane ? "tmux" : (existing?.transportKind ?? "unknown"));
 
         storage.sessions.upsert(
           {
@@ -172,13 +107,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             label: (typeof body.label === "string" && body.label !== "" ? body.label : undefined) ?? existing?.label,
             notify: (body.notify as boolean | undefined) ?? existing?.notify ?? false,
             state: existing?.state ?? "running",
-            transportKind,
-            nvimSocket: nvimSocket ?? (transportKind === "nvim" ? existing?.nvimSocket : null),
-            instanceName: tty ?? (transportKind === "nvim" ? existing?.instanceName : null),
-            tmuxPaneId: tmuxPaneId ?? existing?.tmuxPaneId,
-            tmuxSession: tmuxSession ?? existing?.tmuxSession,
-            paneId: tmuxPane ?? (transportKind === "tmux" ? existing?.paneId : null),
-            sessionName: tmuxSession ?? (transportKind === "tmux" ? existing?.sessionName : null),
             ptyPath: typeof body.tty === "string" ? body.tty : existing?.ptyPath,
             backendKind:
               (typeof body.backend_kind === "string" ? body.backend_kind : undefined)
@@ -215,7 +143,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "Session not found" }, { status: 404 });
         }
 
-        const nvimSocket = typeof body.nvim_socket === "string" ? body.nvim_socket : null;
         const label = typeof body.label === "string" && body.label !== "" ? body.label : null;
 
         storage.sessions.upsert(
@@ -228,13 +155,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             label: label ?? existing.label,
             notify: true,
             state: existing.state,
-            transportKind: nvimSocket ? "nvim" : existing.transportKind,
-            nvimSocket: nvimSocket ?? existing.nvimSocket,
-            instanceName: existing.instanceName,
-            tmuxPaneId: existing.tmuxPaneId,
-            tmuxSession: existing.tmuxSession,
-            paneId: existing.paneId,
-            sessionName: existing.sessionName,
             ptyPath: existing.ptyPath,
             backendKind: existing.backendKind,
             backendProtocolVersion: existing.backendProtocolVersion,

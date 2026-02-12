@@ -30,7 +30,7 @@ Expected: `ok`
 Authenticated check:
 
 ```bash
-cd ~/projects/claude-code-remote
+cd ~/projects/pigeon
 op run --env-file=.env.1password -- sh -c '
   curl -s -o /tmp/worker_sessions.json -w "%{http_code}" \
     -H "Authorization: Bearer $CCR_API_KEY" \

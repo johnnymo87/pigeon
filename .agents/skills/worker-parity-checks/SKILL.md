@@ -9,7 +9,7 @@ description: Use when validating deployed worker parity with authenticated check
 
 Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity.
 
-Run from `~/projects/claude-code-remote` so `op run --env-file=.env.1password` can inject secrets.
+Run from `~/projects/pigeon` so `op run --env-file=.env.1password` can inject secrets.
 
 ## Baseline
 
@@ -93,12 +93,9 @@ op run --env-file=.env.1password -- bash -lc '
 ```
 
 This variant:
-- Spins up a `startDirectChannelServer` instead of a tmux session
+- Spins up a `startDirectChannelServer`
 - Registers the session with `backend_kind`, `backend_protocol_version`, `backend_endpoint`, `backend_auth_token`
 - Verifies that webhook reply commands are delivered directly to the plugin server's `onExecute` callback
-- Does **not** require tmux to be installed
-
-The legacy (tmux) variant remains the default when `PARITY_MODE` is unset or `"legacy"`.
 
 ### Manual Plugin-Direct Registration
 

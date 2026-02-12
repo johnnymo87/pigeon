@@ -37,10 +37,6 @@ describe("daemon-client", () => {
         label: "Test Session",
         pid: 12345,
         ppid: 12344,
-        nvimSocket: "/tmp/nvim.sock",
-        tmuxSession: "main",
-        tmuxPane: "0",
-        tmuxPaneId: "%1",
         daemonUrl: `http://127.0.0.1:${serverPort}`,
         log: mockLog,
       }
@@ -59,10 +55,6 @@ describe("daemon-client", () => {
         label: "Test Session",
         pid: 12345,
         ppid: 12344,
-        nvim_socket: "/tmp/nvim.sock",
-        tmux_session: "main",
-        tmux_pane: "0",
-        tmux_pane_id: "%1",
       })
     })
 
