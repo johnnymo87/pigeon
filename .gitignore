@@ -6,3 +6,8 @@ dist/
 .env.local
 .dev.vars
 packages/daemon/data/
+
+# Devenv
+.devenv/
+.devenv.flake.nix
+devenv.local.yaml
