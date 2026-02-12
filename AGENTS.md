@@ -49,6 +49,8 @@ Use this file as the quickstart and table of contents for agent-facing docs.
   - Use for plugin event lifecycle, session state, and daemon contract understanding.
 - `opencode-plugin-development` -> `.agents/skills/opencode-plugin-development/SKILL.md`
   - Use when changing plugin handlers, tests, or daemon payload fields.
+- `opencode-plugin-deployment` -> `.agents/skills/opencode-plugin-deployment/SKILL.md`
+  - Use when deploying or updating the OpenCode plugin on devbox or via Nix.
 
 ### Cross-Cutting
 
