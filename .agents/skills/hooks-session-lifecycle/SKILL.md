@@ -16,6 +16,10 @@ Use this when hook-driven session registration or stop notifications fail.
 3. Daemon notification path emits Telegram message and reply token.
 4. Worker routes replies/callbacks back to machine agent command ingest.
 
+## Hook Scripts
+
+Hook scripts live in `packages/hooks/` in the pigeon repo. The workstation Nix config wraps these for deployment (installs them into the correct paths with proper env). Edit hooks in `packages/hooks/`, not in the Nix derivation.
+
 ## Hook Debugging
 
 Check runtime probes/logs:

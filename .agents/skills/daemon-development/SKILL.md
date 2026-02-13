@@ -1,6 +1,6 @@
 ---
 name: daemon-development
-description: Use when implementing daemon route, service, storage, or worker changes with a test-first workflow
+description: Use when implementing daemon route, service, storage, worker, or injector changes with a test-first workflow
 ---
 
 # Daemon Development Workflow
@@ -12,7 +12,7 @@ Use this skill while adding or refactoring daemon behavior.
 ## Default Workflow
 
 1. Add/adjust tests first in `packages/daemon/test/*`.
-2. Implement in a focused module (`app`, `storage`, `worker`, `notification-service`).
+2. Implement in a focused module (`app`, `storage`, `worker`, `notification-service`, `adapters`).
 3. Run daemon package checks.
 4. Re-run workspace checks when interface contracts changed.
 
@@ -30,6 +30,12 @@ bun run --filter '@pigeon/daemon' typecheck
 bun run test
 bun run typecheck
 ```
+
+## Adapter Pattern
+
+- `CommandDeliveryAdapter` interface lives in `adapters/`. New delivery transports implement it.
+- Routing logic selects adapter based on session transport metadata.
+- Testing: inject `createAdapter` factory for routing tests; inject `exec` for nvim subprocess tests (avoid real nvim in CI).
 
 ## Guardrails
 

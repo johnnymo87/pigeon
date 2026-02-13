@@ -33,13 +33,23 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
 
+## Command Delivery Adapters
+
+Command injection is routed through `packages/daemon/src/adapters/`:
+
+- `CommandDeliveryAdapter` — interface: `deliver(session, command) => Promise<Result>`
+- `DirectChannelAdapter` — HTTP POST to OpenCode plugin backend endpoint (uses `backend_endpoint` + `backend_auth_token` from session)
+- `NvimRpcAdapter` — shells out to `nvim --server <socket> --remote-expr` to call `pigeon.inject()` via RPC (uses `nvim_socket` from session)
+
+**Routing priority:** direct-channel (if `backend_endpoint` set) > nvim (if `nvim_socket` set) > error.
+
 ## Integration Flow
 
 1. Session start hits daemon route and writes session row.
 2. Daemon registers session with worker (if configured).
 3. Stop event sends notification and mints token.
 4. Worker delivers reply/callback as `command` message over WS.
-5. Daemon acks, injects command, sends `commandResult`.
+5. Daemon acks, routes command through adapter, sends `commandResult`.
 
 ## Verify
 

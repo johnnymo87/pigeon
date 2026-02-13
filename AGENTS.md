@@ -12,6 +12,8 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Worker package path: `packages/worker`
 - Daemon package path: `packages/daemon`
 - OpenCode plugin package path: `packages/opencode-plugin`
+- Nvim plugin package path: `packages/nvim-plugin` (Lua plugin loaded into nvim for RPC command delivery)
+- Hook scripts package path: `packages/hooks` (session-start/stop hooks, wrapped by workstation Nix for deployment)
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
 - Daemon health (local): `curl http://127.0.0.1:4731/health`
 

@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
+import { resolve } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
 import { startDirectChannelServer } from "../../opencode-plugin/src/direct-channel";
 
 type Json = Record<string, unknown>;
+type ParityMode = "direct" | "nvim";
+
+const PROJECT_ROOT = resolve(import.meta.dirname, "../../..");
 
 function envRequired(name: string): string {
   const value = process.env[name]?.trim();
@@ -80,10 +85,23 @@ function inboxCommandStatus(dbPath: string, marker: string): { total: number; do
 }
 
 // ---------------------------------------------------------------------------
+// Common interface for mode-specific resources
+// ---------------------------------------------------------------------------
+
+interface ParityResources {
+  mode: ParityMode;
+  buildSessionStartBody(sessionId: string): Record<string, unknown>;
+  waitForInjection(daemonDbPath: string, marker: string, timeoutMs?: number): Promise<void>;
+  verifyInjection(marker: string): void;
+  cleanup(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
 // Direct-channel session setup / verification / cleanup
 // ---------------------------------------------------------------------------
 
-interface DirectResources {
+interface DirectResources extends ParityResources {
+  mode: "direct";
   server: { endpoint: string; authToken: string; close: () => Promise<void> };
   receivedCommands: string[];
 }
@@ -96,48 +114,247 @@ async function setupDirectResources(): Promise<DirectResources> {
       return { success: true, exitCode: 0, output: `executed: ${req.command}` };
     },
   });
-  return { server, receivedCommands };
-}
 
-function buildSessionStartBody(
-  sessionId: string,
-  resources: DirectResources,
-): Record<string, unknown> {
   return {
-    session_id: sessionId,
-    notify: true,
-    label: "Parity Harness Session",
-    backend_kind: "opencode-plugin-direct",
-    backend_protocol_version: 1,
-    backend_endpoint: resources.server.endpoint,
-    backend_auth_token: resources.server.authToken,
+    mode: "direct",
+    server,
+    receivedCommands,
+
+    buildSessionStartBody(sessionId: string): Record<string, unknown> {
+      return {
+        session_id: sessionId,
+        notify: true,
+        label: "Parity Harness Session (direct)",
+        backend_kind: "opencode-plugin-direct",
+        backend_protocol_version: 1,
+        backend_endpoint: server.endpoint,
+        backend_auth_token: server.authToken,
+      };
+    },
+
+    async waitForInjection(daemonDbPath: string, marker: string, timeoutMs = 20_000): Promise<void> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const inbox = inboxCommandStatus(daemonDbPath, marker);
+        if (inbox.done > 0) return;
+
+        if (receivedCommands.some((cmd) => cmd.includes(marker))) return;
+
+        await sleep(250);
+      }
+
+      const inbox = inboxCommandStatus(daemonDbPath, marker);
+      throw new Error(
+        `Timed out waiting for direct-channel command delivery (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")}, receivedCommands=${receivedCommands.length})`,
+      );
+    },
+
+    verifyInjection(marker: string): void {
+      const markerMatch = receivedCommands.find((cmd) => cmd.includes(marker));
+      if (!markerMatch) {
+        throw new Error(
+          `direct-channel: marker command not received by plugin server (got ${receivedCommands.length} commands: ${JSON.stringify(receivedCommands)})`,
+        );
+      }
+      console.log(`[parity] direct-channel verified: received ${receivedCommands.length} command(s)`);
+    },
+
+    async cleanup(): Promise<void> {
+      await server.close();
+    },
   };
 }
 
-async function waitForInjection(
-  resources: DirectResources,
-  daemonDbPath: string,
-  marker: string,
-  timeoutMs = 20_000,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const inbox = inboxCommandStatus(daemonDbPath, marker);
-    if (inbox.done > 0) return;
+// ---------------------------------------------------------------------------
+// Nvim session setup / verification / cleanup
+// ---------------------------------------------------------------------------
 
-    if (resources.receivedCommands.some((cmd) => cmd.includes(marker))) return;
-
-    await sleep(250);
-  }
-
-  const inbox = inboxCommandStatus(daemonDbPath, marker);
-  throw new Error(
-    `Timed out waiting for direct-channel command delivery (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")}, receivedCommands=${resources.receivedCommands.length})`,
-  );
+interface NvimResources extends ParityResources {
+  mode: "nvim";
+  nvimProcess: ChildProcess;
+  socketPath: string;
+  ptyPath: string;
 }
 
-async function cleanupResources(resources: DirectResources): Promise<void> {
-  await resources.server.close();
+/**
+ * Send a pigeon.lua RPC dispatch call to the headless nvim instance.
+ * Returns the parsed JSON response from pigeon.dispatch.
+ */
+function nvimRpcDispatch(socketPath: string, payload: Record<string, unknown>): Record<string, unknown> {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64");
+  const expr = `luaeval('require("pigeon").dispatch(_A)', '${encoded}')`;
+  const stdout = execFileSync("nvim", [
+    "--headless",
+    "--server", socketPath,
+    "--remote-expr", expr,
+  ], { timeout: 10_000, encoding: "utf-8" }).trim();
+
+  if (!stdout) {
+    throw new Error("nvim RPC returned empty response");
+  }
+
+  // pigeon.dispatch returns base64-encoded JSON
+  let decoded: string;
+  try {
+    decoded = Buffer.from(stdout, "base64").toString("utf-8");
+  } catch {
+    throw new Error(`nvim RPC returned non-base64 response: ${stdout.slice(0, 200)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    throw new Error(`nvim RPC returned invalid JSON: ${decoded.slice(0, 200)}`);
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error(`nvim RPC returned non-object: ${decoded.slice(0, 200)}`);
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+async function setupNvimResources(runId: string): Promise<NvimResources> {
+  const socketPath = `/tmp/pigeon-parity-nvim-${runId}.sock`;
+  const nvimPluginDir = resolve(PROJECT_ROOT, "packages/nvim-plugin");
+
+  // Clean up stale socket if it exists
+  if (existsSync(socketPath)) {
+    unlinkSync(socketPath);
+  }
+
+  // Start headless nvim with pigeon.lua loaded
+  const nvimProcess = spawn("nvim", [
+    "--headless",
+    "--listen", socketPath,
+    "--cmd", `set runtimepath+=${nvimPluginDir}`,
+    "-c", `lua require("pigeon").setup()`,
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  nvimProcess.on("error", (error) => {
+    console.error(`[nvim] failed to spawn: ${error.message}`);
+  });
+
+  nvimProcess.stdout?.on("data", (chunk: Buffer) => {
+    process.stdout.write(`[nvim] ${chunk}`);
+  });
+  nvimProcess.stderr?.on("data", (chunk: Buffer) => {
+    process.stderr.write(`[nvim] ${chunk}`);
+  });
+
+  // Wait for the nvim socket to appear
+  const socketStart = Date.now();
+  while (Date.now() - socketStart < 10_000) {
+    if (existsSync(socketPath)) break;
+    await sleep(100);
+  }
+  if (!existsSync(socketPath)) {
+    nvimProcess.kill("SIGTERM");
+    throw new Error(`nvim socket never appeared at ${socketPath}`);
+  }
+  // Extra grace period for nvim to finish initialization
+  await sleep(500);
+
+  // Open a terminal buffer in nvim — this creates a PTY that pigeon.lua auto-registers
+  execFileSync("nvim", [
+    "--headless",
+    "--server", socketPath,
+    "--remote-send", ":terminal<CR>",
+  ], { timeout: 5_000 });
+
+  // Wait for the terminal buffer to be created and auto-registered
+  await sleep(1500);
+
+  // Query pigeon.lua for the registered PTY via the list RPC
+  const listResp = nvimRpcDispatch(socketPath, { type: "list" });
+  if (!listResp.ok) {
+    nvimProcess.kill("SIGTERM");
+    throw new Error(`nvim pigeon list failed: ${JSON.stringify(listResp)}`);
+  }
+
+  const instances = listResp.instances;
+  if (!Array.isArray(instances) || instances.length === 0) {
+    nvimProcess.kill("SIGTERM");
+    throw new Error("nvim pigeon has no registered instances after opening terminal buffer");
+  }
+
+  // Find the instance — auto-registered instances use the PTY path as their name
+  const instance = instances[0] as Record<string, unknown>;
+  const ptyPath = String(instance.name || "");
+  if (!ptyPath || !ptyPath.startsWith("/dev/")) {
+    nvimProcess.kill("SIGTERM");
+    throw new Error(`nvim pigeon instance has unexpected name (expected PTY path): ${JSON.stringify(instance)}`);
+  }
+
+  console.log(`[parity] nvim: socket=${socketPath} pty=${ptyPath}`);
+
+  return {
+    mode: "nvim",
+    nvimProcess,
+    socketPath,
+    ptyPath,
+
+    buildSessionStartBody(sessionId: string): Record<string, unknown> {
+      return {
+        session_id: sessionId,
+        notify: true,
+        label: "Parity Harness Session (nvim)",
+        nvim_socket: socketPath,
+        tty: ptyPath,
+      };
+    },
+
+    async waitForInjection(daemonDbPath: string, marker: string, timeoutMs = 20_000): Promise<void> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const inbox = inboxCommandStatus(daemonDbPath, marker);
+        if (inbox.done > 0) return;
+        await sleep(250);
+      }
+
+      const inbox = inboxCommandStatus(daemonDbPath, marker);
+      throw new Error(
+        `Timed out waiting for nvim command delivery (inbox total=${inbox.total}, done=${inbox.done}, statuses=${inbox.statuses.join(",")})`,
+      );
+    },
+
+    verifyInjection(marker: string): void {
+      // Verify via list that pigeon.lua is still live
+      const listResult = nvimRpcDispatch(socketPath, { type: "list" });
+      if (!listResult.ok) {
+        throw new Error(`nvim pigeon list failed during verify: ${JSON.stringify(listResult)}`);
+      }
+      const verifyInstances = listResult.instances;
+      if (!Array.isArray(verifyInstances) || verifyInstances.length === 0) {
+        throw new Error("nvim pigeon has no registered instances during verify");
+      }
+
+      // Use tail RPC to check the terminal buffer output for the marker
+      const tailResult = nvimRpcDispatch(socketPath, { type: "tail", name: ptyPath, lines: 100 });
+      if (!tailResult.ok) {
+        throw new Error(`nvim pigeon tail failed: ${JSON.stringify(tailResult)}`);
+      }
+      const output = String(tailResult.output || "");
+      if (!output.includes(marker)) {
+        throw new Error(
+          `nvim: marker not found in terminal buffer output (got ${output.length} chars). Last 200 chars: ${output.slice(-200)}`,
+        );
+      }
+      console.log("[parity] nvim verified: marker found in terminal buffer output via pigeon tail RPC");
+    },
+
+    async cleanup(): Promise<void> {
+      nvimProcess.kill("SIGTERM");
+      // Give nvim a moment to exit
+      await sleep(500);
+      if (existsSync(socketPath)) {
+        try { unlinkSync(socketPath); } catch { /* ignore */ }
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +370,12 @@ async function main(): Promise<void> {
     throw new Error("Missing TELEGRAM_CHAT_ID or TELEGRAM_GROUP_ID for parity harness");
   }
 
-  console.log("[parity] mode=direct");
+  const mode: ParityMode = (process.env.PARITY_MODE?.trim() as ParityMode) || "direct";
+  if (mode !== "direct" && mode !== "nvim") {
+    throw new Error(`Invalid PARITY_MODE: ${mode} (expected "direct" or "nvim")`);
+  }
+
+  console.log(`[parity] mode=${mode}`);
 
   const runId = randomUUID().slice(0, 8);
   const machineId = `pigeon-parity-${runId}`;
@@ -163,7 +385,9 @@ async function main(): Promise<void> {
   const sessionId = `parity-session-${runId}`;
   const marker = `__PIGEON_PARITY_${runId}__`;
 
-  const resources = await setupDirectResources();
+  const resources: ParityResources = mode === "direct"
+    ? await setupDirectResources()
+    : await setupNvimResources(runId);
 
   const daemonEnv = {
     ...process.env,
@@ -200,7 +424,7 @@ async function main(): Promise<void> {
     const startResp = await fetchJson(`${daemonBase}/session-start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildSessionStartBody(sessionId, resources)),
+      body: JSON.stringify(resources.buildSessionStartBody(sessionId)),
     });
     if (startResp.status !== 200) {
       throw new Error(`session-start failed: ${startResp.status} ${JSON.stringify(startResp.body)}`);
@@ -309,16 +533,10 @@ async function main(): Promise<void> {
     }
 
     // --- Wait for injection ---
-    await waitForInjection(resources, daemonDbPath, marker);
+    await resources.waitForInjection(daemonDbPath, marker);
 
     // --- Verify the command was actually received ---
-    const markerMatch = resources.receivedCommands.find((cmd) => cmd.includes(marker));
-    if (!markerMatch) {
-      throw new Error(
-        `direct-channel: marker command not received by plugin server (got ${resources.receivedCommands.length} commands: ${JSON.stringify(resources.receivedCommands)})`,
-      );
-    }
-    console.log(`[parity] direct-channel verified: received ${resources.receivedCommands.length} command(s)`);
+    resources.verifyInjection(marker);
 
     // --- Session cleanup ---
     const unregisterResp = await fetchJson(`${daemonBase}/sessions/${encodeURIComponent(sessionId)}`, {
@@ -338,10 +556,10 @@ async function main(): Promise<void> {
       throw new Error("session still present in worker after daemon delete/unregister");
     }
 
-    console.log("[parity] PASS: end-to-end daemon parity harness completed successfully");
+    console.log(`[parity] PASS: end-to-end daemon parity harness (mode=${mode}) completed successfully`);
   } finally {
     daemon.kill("SIGTERM");
-    await cleanupResources(resources);
+    await resources.cleanup();
   }
 }
 
