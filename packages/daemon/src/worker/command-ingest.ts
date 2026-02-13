@@ -1,10 +1,15 @@
 import type { StorageDb } from "../storage/database";
 import type { SessionRecord } from "../storage/types";
-import { OpencodeDirectSource, type OpencodeDirectSource as OpencodeDirectSourceType } from "../opencode-direct/contracts";
+import type { CommandDeliveryAdapter, CommandDeliveryResult } from "../adapters/types";
+import { DirectChannelAdapter } from "../adapters/direct-channel";
+import { NvimRpcAdapter } from "../adapters/nvim-rpc";
 import {
-  executeViaOpencodeDirectChannel,
   type OpencodeDirectExecuteResult,
 } from "../opencode-direct/adapter";
+import {
+  OpencodeDirectSource,
+  type OpencodeDirectSource as OpencodeDirectSourceType,
+} from "../opencode-direct/contracts";
 
 export interface WorkerCommandMessage {
   type: "command";
@@ -33,6 +38,13 @@ export interface WorkerCommandIngestCallbacks {
 }
 
 export interface WorkerCommandIngestOptions {
+  /** Override adapter selection for testing */
+  createAdapter?: (session: SessionRecord) => CommandDeliveryAdapter | null;
+  /**
+   * Legacy test injection for direct-channel execution.
+   * If provided AND session matches direct-channel, wraps the function in an adapter.
+   * Prefer `createAdapter` for new code.
+   */
   executeDirect?: (
     session: SessionRecord,
     msg: WorkerCommandMessage,
@@ -46,6 +58,22 @@ function directSourceForMessage(msg: WorkerCommandMessage): OpencodeDirectSource
     return OpencodeDirectSource.TelegramCallback;
   }
   return OpencodeDirectSource.TelegramReply;
+}
+
+function selectAdapter(session: SessionRecord): CommandDeliveryAdapter | null {
+  if (
+    session.backendKind === "opencode-plugin-direct"
+    && session.backendEndpoint
+    && session.backendAuthToken
+  ) {
+    return new DirectChannelAdapter();
+  }
+
+  if (session.nvimSocket && session.ptyPath) {
+    return new NvimRpcAdapter();
+  }
+
+  return null;
 }
 
 export async function ingestWorkerCommand(
@@ -83,62 +111,81 @@ export async function ingestWorkerCommand(
     return;
   }
 
+  // Legacy executeDirect support: wrap in an adapter shim for backward compat
   if (
-    session.backendKind === "opencode-plugin-direct"
+    options.executeDirect
+    && session.backendKind === "opencode-plugin-direct"
     && session.backendEndpoint
     && session.backendAuthToken
   ) {
-    const executeDirect = options.executeDirect ?? ((sess, commandMsg, id) =>
-      executeViaOpencodeDirectChannel({
-        requestId: id,
-        commandId: id,
-        sessionId: commandMsg.sessionId,
-        command: commandMsg.command,
-        endpoint: sess.backendEndpoint!,
-        authToken: sess.backendAuthToken!,
-        source: directSourceForMessage(commandMsg),
-        ...(commandMsg.chatId ? { chatId: commandMsg.chatId } : {}),
-      }));
+    const executeDirect = options.executeDirect;
+    const legacyAdapter: CommandDeliveryAdapter = {
+      name: "direct-channel-legacy",
+      async deliverCommand(sess, cmd, ctx) {
+        const direct = await executeDirect(sess, msg, ctx.commandId);
+        if (direct.ok) {
+          return { ok: true, meta: { attempts: direct.attempts, status: direct.status } };
+        }
+        const error =
+          direct.result?.errorMessage
+          || direct.error
+          || direct.ack?.message
+          || direct.ack?.rejectReason
+          || "OpenCode direct-channel execution failed";
+        return { ok: false, error, meta: { attempts: direct.attempts, status: direct.status } };
+      },
+    };
+    return deliverViaAdapter(legacyAdapter, session, msg, commandId, storage, callbacks);
+  }
 
-    const direct = await executeDirect(session, msg, commandId);
+  const adapter = options.createAdapter
+    ? options.createAdapter(session)
+    : selectAdapter(session);
 
-    if (direct.ok) {
-      storage.inbox.markDone(commandId);
-      callbacks.send({
-        type: "commandResult",
-        commandId,
-        success: true,
-        error: null,
-        chatId: msg.chatId,
-      });
-      return;
-    }
-
-    const error =
-      direct.result?.errorMessage
-      || direct.error
-      || direct.ack?.message
-      || direct.ack?.rejectReason
-      || "OpenCode direct-channel execution failed";
-
+  if (!adapter) {
     callbacks.send({
       type: "commandResult",
       commandId,
       success: false,
-      error,
+      error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
       chatId: msg.chatId,
     });
     return;
   }
 
-  // Session exists but is not configured for direct-channel delivery.
-  // This means the session is either missing backend fields or uses an
-  // unsupported backend kind.
+  return deliverViaAdapter(adapter, session, msg, commandId, storage, callbacks);
+}
+
+async function deliverViaAdapter(
+  adapter: CommandDeliveryAdapter,
+  session: SessionRecord,
+  msg: WorkerCommandMessage,
+  commandId: string,
+  storage: StorageDb,
+  callbacks: WorkerCommandIngestCallbacks,
+): Promise<void> {
+  const result = await adapter.deliverCommand(session, msg.command, {
+    commandId,
+    chatId: msg.chatId,
+  });
+
+  if (result.ok) {
+    storage.inbox.markDone(commandId);
+    callbacks.send({
+      type: "commandResult",
+      commandId,
+      success: true,
+      error: null,
+      chatId: msg.chatId,
+    });
+    return;
+  }
+
   callbacks.send({
     type: "commandResult",
     commandId,
     success: false,
-    error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
+    error: result.error || "Command delivery failed",
     chatId: msg.chatId,
   });
 }
