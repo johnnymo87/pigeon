@@ -17,6 +17,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
       notify INTEGER NOT NULL DEFAULT 0,
       state TEXT NOT NULL DEFAULT 'running',
       pty_path TEXT,
+      nvim_socket TEXT DEFAULT NULL,
       backend_kind TEXT,
       backend_protocol_version INTEGER,
       backend_endpoint TEXT,
@@ -74,6 +75,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
     "ALTER TABLE sessions ADD COLUMN backend_protocol_version INTEGER",
     "ALTER TABLE sessions ADD COLUMN backend_endpoint TEXT",
     "ALTER TABLE sessions ADD COLUMN backend_auth_token TEXT",
+    "ALTER TABLE sessions ADD COLUMN nvim_socket TEXT DEFAULT NULL",
   ];
 
   for (const statement of additiveColumns) {

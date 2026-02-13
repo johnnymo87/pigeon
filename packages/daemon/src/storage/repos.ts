@@ -28,6 +28,7 @@ function asSession(row: SqlRow): SessionRecord {
     notify: Number(row.notify) === 1,
     state: String(row.state),
     ptyPath: (row.pty_path as string | null) ?? null,
+    nvimSocket: (row.nvim_socket as string | null) ?? null,
     backendKind: (row.backend_kind as string | null) ?? null,
     backendProtocolVersion: (row.backend_protocol_version as number | null) ?? null,
     backendEndpoint: (row.backend_endpoint as string | null) ?? null,
@@ -79,9 +80,9 @@ export class SessionRepository {
     this.db.prepare(
       `INSERT INTO sessions (
          session_id, ppid, pid, start_time, cwd, label, notify, state,
-         pty_path, backend_kind, backend_protocol_version,
+         pty_path, nvim_socket, backend_kind, backend_protocol_version,
          backend_endpoint, backend_auth_token, created_at, updated_at, last_seen, expires_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          ppid = excluded.ppid,
          pid = excluded.pid,
@@ -91,6 +92,7 @@ export class SessionRepository {
          notify = excluded.notify,
          state = excluded.state,
          pty_path = excluded.pty_path,
+         nvim_socket = excluded.nvim_socket,
          backend_kind = excluded.backend_kind,
          backend_protocol_version = excluded.backend_protocol_version,
          backend_endpoint = excluded.backend_endpoint,
@@ -108,6 +110,7 @@ export class SessionRepository {
       input.notify ? 1 : 0,
       input.state ?? "running",
       input.ptyPath ?? null,
+      input.nvimSocket ?? null,
       input.backendKind ?? null,
       input.backendProtocolVersion ?? null,
       input.backendEndpoint ?? null,

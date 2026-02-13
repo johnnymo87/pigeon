@@ -10,6 +10,7 @@ interface LegacySession {
   label: string | null;
   notify: boolean;
   state: string;
+  nvim_socket: string | null;
   backend_kind: string | null;
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
@@ -28,6 +29,7 @@ function toLegacySession(session: {
   label: string | null;
   notify: boolean;
   state: string;
+  nvimSocket: string | null;
   backendKind: string | null;
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
@@ -46,6 +48,7 @@ function toLegacySession(session: {
     label: session.label,
     notify: session.notify,
     state: session.state,
+    nvim_socket: session.nvimSocket,
     backend_kind: session.backendKind,
     backend_protocol_version: session.backendProtocolVersion,
     backend_endpoint: session.backendEndpoint,
@@ -97,6 +100,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const existing = storage.sessions.get(sessionId);
 
+        const nvim_socket = body.nvim_socket as string | undefined;
+
         storage.sessions.upsert(
           {
             sessionId,
@@ -108,6 +113,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             notify: (body.notify as boolean | undefined) ?? existing?.notify ?? false,
             state: existing?.state ?? "running",
             ptyPath: typeof body.tty === "string" ? body.tty : existing?.ptyPath,
+            nvimSocket: nvim_socket ?? existing?.nvimSocket ?? null,
             backendKind:
               (typeof body.backend_kind === "string" ? body.backend_kind : undefined)
               ?? existing?.backendKind,
@@ -156,6 +162,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             notify: true,
             state: existing.state,
             ptyPath: existing.ptyPath,
+            nvimSocket: existing.nvimSocket,
             backendKind: existing.backendKind,
             backendProtocolVersion: existing.backendProtocolVersion,
             backendEndpoint: existing.backendEndpoint,

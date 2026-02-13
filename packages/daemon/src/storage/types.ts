@@ -8,6 +8,7 @@ export interface SessionRecord {
   notify: boolean;
   state: string;
   ptyPath: string | null;
+  nvimSocket: string | null;
   backendKind: string | null;
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
@@ -53,6 +54,7 @@ export interface UpsertSessionInput {
   notify?: boolean;
   state?: string;
   ptyPath?: string | null;
+  nvimSocket?: string | null;
   backendKind?: string | null;
   backendProtocolVersion?: number | null;
   backendEndpoint?: string | null;
