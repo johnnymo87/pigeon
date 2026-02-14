@@ -21,7 +21,7 @@ sudo nixos-rebuild switch --flake .#devbox
 
 ## Post-Cutover Checklist
 
-1. `systemctl status ccr-webhooks.service`
+1. `systemctl status pigeon-daemon.service`
 2. local health endpoint
 3. session lifecycle smoke test
 4. worker registration/unregister evidence in logs
@@ -44,6 +44,6 @@ sudo nixos-rebuild switch --flake .#devbox
 ## Verify
 
 ```bash
-systemctl status ccr-webhooks.service --no-pager
+systemctl status pigeon-daemon.service --no-pager
 curl -s http://127.0.0.1:4731/health
 ```

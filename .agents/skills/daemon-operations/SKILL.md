@@ -11,13 +11,13 @@ Use this skill for day-to-day daemon ops and post-deploy checks.
 
 ## Service Identity
 
-- Active service name on devbox: `ccr-webhooks.service`
+- Active service name on devbox: `pigeon-daemon.service`
 - Service now runs Pigeon daemon entrypoint from `packages/daemon/src/index.ts`
 
 ## Health Checks
 
 ```bash
-systemctl status ccr-webhooks.service --no-pager
+systemctl status pigeon-daemon.service --no-pager
 curl -s http://127.0.0.1:4731/health
 ```
 
@@ -29,7 +29,7 @@ Expected:
 ## Operational Logs
 
 ```bash
-journalctl -u ccr-webhooks.service -n 100 --no-pager
+journalctl -u pigeon-daemon.service -n 100 --no-pager
 ```
 
 Look for:
@@ -41,8 +41,8 @@ Look for:
 ## Restart Procedure
 
 ```bash
-sudo systemctl restart ccr-webhooks.service
-systemctl status ccr-webhooks.service --no-pager
+sudo systemctl restart pigeon-daemon.service
+systemctl status pigeon-daemon.service --no-pager
 ```
 
 ## Verify

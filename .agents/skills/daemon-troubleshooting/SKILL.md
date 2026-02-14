@@ -19,8 +19,8 @@ Use this when daemon behavior regresses in production or parity tests.
 ## Commands
 
 ```bash
-systemctl status ccr-webhooks.service --no-pager
-journalctl -u ccr-webhooks.service -n 120 --no-pager
+systemctl status pigeon-daemon.service --no-pager
+journalctl -u pigeon-daemon.service -n 120 --no-pager
 curl -s http://127.0.0.1:4731/health
 ```
 

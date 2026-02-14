@@ -21,7 +21,7 @@ Use this for new machine onboarding or broken environment recovery.
 ## Service Checks
 
 ```bash
-systemctl status ccr-webhooks.service --no-pager
+systemctl status pigeon-daemon.service --no-pager
 curl -s http://127.0.0.1:4731/health
 ```
 
