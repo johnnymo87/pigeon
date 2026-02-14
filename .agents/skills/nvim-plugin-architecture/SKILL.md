@@ -30,7 +30,7 @@ On `TermOpen`, pigeon.lua registers each terminal buffer by its PTY path:
 instances[info.pty] = { bufnr = bufnr, job_id = chan, registered_at = os.time() }
 ```
 
-Instances are keyed by PTY device path (e.g., `/dev/pts/42`). Cleaned up on `TermClose`/`BufWipeout`.
+Instances are keyed by PTY device path (`/dev/pts/42` on Linux, `/dev/ttys048` on macOS). Cleaned up on `TermClose`/`BufWipeout`.
 
 ## Dispatch Protocol
 
