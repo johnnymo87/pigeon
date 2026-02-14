@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { NvimRpcAdapter } from "../src/adapters/nvim-rpc";
 import type { SessionRecord } from "../src/storage/types";
 
+/** Encode a JSON object as base64, matching pigeon.lua's dispatch response format */
+function b64(obj: unknown): string {
+  return Buffer.from(JSON.stringify(obj)).toString("base64");
+}
+
 function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     sessionId: "sess-1",
@@ -31,7 +36,7 @@ const defaultContext = { commandId: "cmd-1", chatId: 12345 };
 describe("NvimRpcAdapter", () => {
   it("returns ok true on successful command delivery", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: true }),
+      stdout: b64({ ok: true }),
       stderr: "",
       exitCode: 0,
     }));
@@ -51,7 +56,7 @@ describe("NvimRpcAdapter", () => {
 
   it("propagates error when nvim reports instance not found", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: false, error: "instance not found" }),
+      stdout: b64({ ok: false, error: "instance not found" }),
       stderr: "",
       exitCode: 0,
     }));
@@ -135,9 +140,9 @@ describe("NvimRpcAdapter", () => {
     expect(result.error).toContain("this is not json at all");
   });
 
-  it("encodes the correct base64 JSON payload with type, instance, and text", async () => {
+  it("encodes the correct base64 JSON payload with type, name, and command", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: true }),
+      stdout: b64({ ok: true }),
       stderr: "",
       exitCode: 0,
     }));
@@ -159,14 +164,14 @@ describe("NvimRpcAdapter", () => {
 
     expect(decoded).toEqual({
       type: "send",
-      instance: "/dev/pts/99",
-      text: "do something",
+      name: "/dev/pts/99",
+      command: "do something",
     });
   });
 
   it("constructs the correct nvim command with --headless --server and pigeon luaeval", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: true }),
+      stdout: b64({ ok: true }),
       stderr: "",
       exitCode: 0,
     }));
@@ -219,7 +224,7 @@ describe("NvimRpcAdapter", () => {
 
   it("returns error for unexpected response shape (missing ok field)", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ status: "done" }),
+      stdout: b64({ status: "done" }),
       stderr: "",
       exitCode: 0,
     }));
@@ -234,7 +239,7 @@ describe("NvimRpcAdapter", () => {
 
   it("passes the configured timeout to exec", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: true }),
+      stdout: b64({ ok: true }),
       stderr: "",
       exitCode: 0,
     }));
@@ -249,7 +254,7 @@ describe("NvimRpcAdapter", () => {
 
   it("uses default timeout of 10000ms when not specified", async () => {
     const exec = vi.fn(async () => ({
-      stdout: JSON.stringify({ ok: true }),
+      stdout: b64({ ok: true }),
       stderr: "",
       exitCode: 0,
     }));

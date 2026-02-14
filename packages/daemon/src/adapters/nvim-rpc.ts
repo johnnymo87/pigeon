@@ -60,8 +60,8 @@ export class NvimRpcAdapter implements CommandDeliveryAdapter {
 
     const payload = JSON.stringify({
       type: "send",
-      instance: session.ptyPath,
-      text: command,
+      name: session.ptyPath,
+      command,
     });
     const encoded = Buffer.from(payload).toString("base64");
 
@@ -92,15 +92,22 @@ export class NvimRpcAdapter implements CommandDeliveryAdapter {
       return { ok: false, error: `nvim exited with code ${result.exitCode}: ${detail}` };
     }
 
-    // Parse the JSON response from pigeon.lua dispatch
+    // pigeon.lua dispatch returns base64-encoded JSON
     const raw = result.stdout.trim();
     if (!raw) {
       return { ok: false, error: "nvim returned empty response" };
     }
 
+    let decoded: string;
+    try {
+      decoded = Buffer.from(raw, "base64").toString("utf-8");
+    } catch {
+      decoded = raw; // fall through to JSON.parse which will give a clear error
+    }
+
     let response: unknown;
     try {
-      response = JSON.parse(raw);
+      response = JSON.parse(decoded);
     } catch {
       return { ok: false, error: `nvim returned invalid JSON: ${raw.slice(0, 200)}` };
     }
