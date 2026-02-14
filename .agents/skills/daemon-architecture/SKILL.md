@@ -39,7 +39,7 @@ Command injection is routed through `packages/daemon/src/adapters/`:
 
 - `CommandDeliveryAdapter` — interface: `deliver(session, command) => Promise<Result>`
 - `DirectChannelAdapter` — HTTP POST to OpenCode plugin backend endpoint (uses `backend_endpoint` + `backend_auth_token` from session)
-- `NvimRpcAdapter` — shells out to `nvim --server <socket> --remote-expr` to call `pigeon.inject()` via RPC (uses `nvim_socket` from session)
+- `NvimRpcAdapter` — shells out to `nvim --server <socket> --remote-expr` to call `pigeon.dispatch()` via RPC (uses `nvim_socket` + `pty_path` from session; payload/response are base64-encoded JSON)
 
 **Routing priority:** direct-channel (if `backend_endpoint` set) > nvim (if `nvim_socket` set) > error.
 

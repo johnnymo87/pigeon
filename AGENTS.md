@@ -54,6 +54,11 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - `opencode-plugin-deployment` -> `.agents/skills/opencode-plugin-deployment/SKILL.md`
   - Use when deploying or updating the OpenCode plugin on devbox or via Nix.
 
+### Nvim Plugin
+
+- `nvim-plugin-architecture` -> `.agents/skills/nvim-plugin-architecture/SKILL.md`
+  - Use for pigeon.lua dispatch protocol, instance registration, and RPC contract.
+
 ### Cross-Cutting
 
 - `secrets-and-auth` -> `.agents/skills/secrets-and-auth/SKILL.md`
