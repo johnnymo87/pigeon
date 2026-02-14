@@ -55,10 +55,15 @@ fi
 session_tty=""
 if [[ -n "${NVIM:-}" && "$ppid" =~ ^[0-9]+$ ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        # macOS: no /proc, use ps to get controlling terminal
-        tty_name="$(ps -o tty= -p "$ppid" 2>/dev/null | sed 's/^[[:space:]]*//')"
-        if [[ -n "$tty_name" && "$tty_name" != "??" ]]; then
-            session_tty="/dev/$tty_name"
+        # macOS: no /proc filesystem. ps -o tty= returns "??" for processes in
+        # nvim's terminal (no controlling tty). Use lsof to read the parent's
+        # fd 0 device path instead. -F n gives machine-parseable "nPATH" lines.
+        session_tty="$(
+            lsof -nP -w -p "$ppid" -a -d 0 -F n 2>/dev/null |
+                awk '/^n\// {sub(/^n/,""); print; exit}'
+        )"
+        if [[ "$session_tty" != /dev/ttys* ]]; then
+            session_tty=""
         fi
     else
         # Linux: read PTY device from CC's stdin fd
