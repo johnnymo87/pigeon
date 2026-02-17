@@ -9,7 +9,7 @@ import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { SessionManager } from "./session-state"
-import { serializeError } from "./utils"
+import { errorMessage, serializeError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
   try {
@@ -299,7 +299,7 @@ const plugin: Plugin = async (ctx) => {
               sessionManager.setNotified(sessionID, errorMarker)
 
               const errorMsg = error
-                ? `Error: ${String(error)}`
+                ? `Error: ${errorMessage(error)}`
                 : "Session error occurred"
 
               notifyStop({
