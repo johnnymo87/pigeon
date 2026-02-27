@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { serializeError } from "../src/utils"
+import { serializeError, errorMessage } from "../src/utils"
 
 describe("serializeError", () => {
   describe("Error instances", () => {
@@ -95,6 +95,94 @@ describe("serializeError", () => {
     })
   })
 
+})
+
+describe("errorMessage", () => {
+  test("returns message from Error instance", () => {
+    expect(errorMessage(new Error("boom"))).toBe("boom")
+  })
+
+  test("returns string as-is", () => {
+    expect(errorMessage("something broke")).toBe("something broke")
+  })
+
+  test("returns message from plain { message } object", () => {
+    expect(errorMessage({ message: "plain obj" })).toBe("plain obj")
+  })
+
+  // OpenCode NamedError variants: { name: string, data: { message?: string } }
+  describe("OpenCode NamedError objects", () => {
+    test("ContextOverflowError", () => {
+      const err = {
+        name: "ContextOverflowError",
+        data: { message: "prompt is too long: 200210 tokens > 200000 maximum" },
+      }
+      expect(errorMessage(err)).toBe(
+        "prompt is too long: 200210 tokens > 200000 maximum",
+      )
+    })
+
+    test("APIError", () => {
+      const err = {
+        name: "APIError",
+        data: {
+          message: "rate limit exceeded",
+          statusCode: 429,
+          isRetryable: true,
+        },
+      }
+      expect(errorMessage(err)).toBe("rate limit exceeded")
+    })
+
+    test("ProviderAuthError", () => {
+      const err = {
+        name: "ProviderAuthError",
+        data: { providerID: "anthropic", message: "invalid API key" },
+      }
+      expect(errorMessage(err)).toBe("invalid API key")
+    })
+
+    test("UnknownError", () => {
+      const err = { name: "UnknownError", data: { message: "something went wrong" } }
+      expect(errorMessage(err)).toBe("something went wrong")
+    })
+
+    test("MessageAbortedError", () => {
+      const err = {
+        name: "MessageAbortedError",
+        data: { message: "user cancelled" },
+      }
+      expect(errorMessage(err)).toBe("user cancelled")
+    })
+
+    test("MessageOutputLengthError (no data.message)", () => {
+      const err = { name: "MessageOutputLengthError", data: {} }
+      expect(errorMessage(err)).toBe("MessageOutputLengthError")
+    })
+  })
+
+  describe("edge cases", () => {
+    test("object with no message anywhere falls back to JSON", () => {
+      const err = { code: 42, detail: "no message field" }
+      expect(errorMessage(err)).toBe('{"code":42,"detail":"no message field"}')
+    })
+
+    test("null returns stringified null", () => {
+      expect(errorMessage(null)).toBe("null")
+    })
+
+    test("undefined returns stringified undefined", () => {
+      expect(errorMessage(undefined)).toBe("undefined")
+    })
+
+    test("number returns stringified number", () => {
+      expect(errorMessage(500)).toBe("500")
+    })
+  })
+})
+
+// serializeError tests continued
+describe("serializeError (continued)", () => {
   describe("JSON.stringify compatibility", () => {
     test("should produce valid JSON from serialized Error", () => {
       const error = new Error("test")
