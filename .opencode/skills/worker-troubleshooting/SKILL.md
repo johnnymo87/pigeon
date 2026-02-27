@@ -63,6 +63,15 @@ wrangler tail --format=pretty
   - callback data `cmd:<token>:<action>`
 - Confirm machine agent connects to `/ws?machineId=<id>` with protocol `ccr,<CCR_API_KEY>`
 
+## Question Button Callbacks
+
+For question notifications, the daemon embeds its token in button `callback_data` as `cmd:TOKEN:q0`, `cmd:TOKEN:q1`, etc. The worker extracts this token via `extractTokenFromCallbackData()` in `notifications.ts` and stores it in the `messages` table. This ensures button press lookups succeed.
+
+If button presses return "Session expired":
+- The stored token doesn't match the callback_data token.
+- Verify `extractTokenFromCallbackData()` is parsing the `replyMarkup` correctly.
+- Check the `messages` table has the daemon token, not a worker-generated one.
+
 ## Durable Object Mismatch on Deploy
 
 If deploy fails with DO class mismatch, verify:

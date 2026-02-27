@@ -80,6 +80,12 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
 - Webhook reply returns `ok` (`200`)
 - Session is removable (`/sessions/unregister` returns `{ ok: true }`)
 
+## Question Notification Token Parity
+
+When sending a notification with inline buttons (question notifications), verify the returned `token` matches the daemon's token embedded in the `callback_data`. The worker should extract the token from `cmd:TOKEN:action` in the first button's `callback_data` instead of generating its own.
+
+Test: send a notification with `replyMarkup` containing `cmd:MY_TOKEN:q0` in a button's `callback_data`. The response `token` field must equal `MY_TOKEN`.
+
 ## Plugin-Direct Variant
 
 For OpenCode sessions using the direct command channel (`backend_kind: "opencode-plugin-direct"`),

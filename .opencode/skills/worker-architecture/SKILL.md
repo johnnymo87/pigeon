@@ -25,6 +25,12 @@ Use this skill when you need system-level understanding before debugging, deploy
 4. Worker resolves session, queues command, delivers via WebSocket (`/ws?machineId=...`)
 5. Machine agent sends `ack`, queue row becomes `acked`
 
+## Token Handling
+
+When the daemon sends a notification with inline buttons, the `callback_data` contains the daemon's token as `cmd:TOKEN:action`. The worker's `/notifications/send` handler **extracts this token** from the first button's `callback_data` and stores it in the `messages` table (instead of generating its own). This ensures that when the user clicks a button, the worker can look up the token and resolve it to the correct session.
+
+If no `cmd:TOKEN:action` pattern is found in the `replyMarkup` (e.g. plain text notifications), the worker generates a fresh random token. See `extractTokenFromCallbackData()` in `notifications.ts`.
+
 ## Durable Object Tables
 
 - `sessions`: session-to-machine registry

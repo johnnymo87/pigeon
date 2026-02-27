@@ -35,6 +35,19 @@ curl -s http://127.0.0.1:4731/health
 - repeated command processing
   - inspect `inbox` status transitions and ack handling
 
+## Question Reply Failures
+
+- **"Unable to connect" on Telegram button press / swipe-reply**
+  - The plugin's `onQuestionReply` must use the SDK client's in-process fetch, not `globalThis.fetch`. In TUI mode, no HTTP server listens on `ctx.serverUrl` (`localhost:4096`). See `opencode-plugin-architecture` skill for the `internalFetch` pattern.
+  - If the plugin was recently changed, ensure `internalFetch` is extracted from `(ctx.client as any)._client?.getConfig?.().fetch`.
+- **"Session expired" on Telegram button press**
+  - Token mismatch: the worker must store the daemon's token from `callback_data`, not generate its own. Check `extractTokenFromCallbackData()` in `packages/worker/src/notifications.ts`.
+- **"This question has already been answered"**
+  - Normal behavior when the user answered in the TUI before pressing the Telegram button. The `pending_questions` row was already deleted.
+- **Pending question not found after notification sent**
+  - Check `pending_questions` table TTL (4h). Old questions are evicted.
+  - Verify `/question-asked` was called (daemon has no HTTP request logging by default; add temporary logging if needed).
+
 ## Nvim Adapter Failures
 
 - **Check `nvim_socket` is set on session:**
