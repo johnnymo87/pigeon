@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { StorageDb } from "./storage/database";
+import type { QuestionInfoData } from "./storage/types";
 
 interface NotificationButton {
   text: string;
@@ -28,12 +29,23 @@ interface StopNotificationInput {
   label?: string;
 }
 
+export interface QuestionNotificationInput {
+  session: SessionLike;
+  questionRequestId: string;
+  questions: QuestionInfoData[];
+  label?: string;
+}
+
 interface NotificationResult {
   token: string;
 }
 
 export interface StopNotifier {
   sendStopNotification(input: StopNotificationInput): Promise<NotificationResult>;
+}
+
+export interface QuestionNotifier {
+  sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult>;
 }
 
 export interface WorkerNotificationSender {
@@ -51,6 +63,7 @@ function escapeMarkdown(text: string): string {
 
 function eventEmoji(event: string): string {
   if (event === "SubagentStop") return "🔧";
+  if (event === "Question") return "❓";
   if (event === "Notification") return "❓";
   return "🤖";
 }
@@ -92,11 +105,79 @@ export function formatTelegramNotification(input: NotificationInput): {
   };
 }
 
+export function formatQuestionNotification(input: {
+  label: string;
+  questions: QuestionInfoData[];
+  cwd: string | null;
+  token: string;
+}): {
+  text: string;
+  replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+} {
+  const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
+  const firstQuestion = input.questions[0];
+
+  const lines = [
+    `❓ *Question*: ${escapeMarkdown(input.label)}`,
+    "",
+  ];
+
+  if (firstQuestion) {
+    if (firstQuestion.header) {
+      lines.push(`*${escapeMarkdown(firstQuestion.header)}*`);
+    }
+    lines.push(escapeMarkdown(firstQuestion.question));
+
+    if (firstQuestion.options.length > 0) {
+      lines.push("");
+      firstQuestion.options.forEach((opt, i) => {
+        const desc = opt.description ? ` — ${escapeMarkdown(opt.description)}` : "";
+        lines.push(`${i + 1}\\. ${escapeMarkdown(opt.label)}${desc}`);
+      });
+    }
+  }
+
+  if (input.questions.length > 1) {
+    lines.push("");
+    lines.push(`_\\+${input.questions.length - 1} more question(s) — answer in app_`);
+  }
+
+  lines.push("");
+  lines.push(`📂 \`${cwdShort}\``);
+
+  const hasCustom = firstQuestion?.custom !== false;
+  if (hasCustom) {
+    lines.push("");
+    lines.push("↩️ _Swipe-reply for custom answer_");
+  }
+
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+
+  // Only provide buttons for single-question requests
+  if (input.questions.length === 1 && firstQuestion && firstQuestion.options.length > 0) {
+    const options = firstQuestion.options;
+    // Put up to 3 per row
+    for (let i = 0; i < options.length; i += 3) {
+      rows.push(
+        options.slice(i, i + 3).map((opt, j) => ({
+          text: opt.label,
+          callback_data: `cmd:${input.token}:q${i + j}`,
+        })),
+      );
+    }
+  }
+
+  return {
+    text: lines.join("\n"),
+    replyMarkup: { inline_keyboard: rows },
+  };
+}
+
 function generateToken(): string {
   return randomBytes(16).toString("base64url");
 }
 
-export class TelegramNotificationService implements StopNotifier {
+export class TelegramNotificationService implements StopNotifier, QuestionNotifier {
   private readonly apiBase: string;
 
   constructor(
@@ -109,46 +190,20 @@ export class TelegramNotificationService implements StopNotifier {
     this.apiBase = `https://api.telegram.org/bot${this.botToken}`;
   }
 
-  async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
-    const now = this.nowFn();
-    const token = generateToken();
-
-    this.storage.sessionTokens.mint({
-      token,
-      sessionId: input.session.sessionId,
-      chatId: this.chatId,
-      context: {
-        event: input.event,
-        summary: input.summary,
-      },
-    }, now);
-
-    const buttons: NotificationButton[] = [
-      { text: "▶️ Continue", action: "continue" },
-      { text: "✅ Yes", action: "y" },
-      { text: "❌ No", action: "n" },
-      { text: "🛑 Exit", action: "exit" },
-    ];
-
-    const notification = formatTelegramNotification({
-      event: input.event,
-      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
-      summary: input.summary,
-      cwd: input.session.cwd,
-      token,
-      buttons,
-    });
-
+  private async sendTelegramMessage(
+    sessionId: string,
+    text: string,
+    replyMarkup: { inline_keyboard: unknown[] },
+    token: string,
+  ): Promise<void> {
     const response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: this.chatId,
-        text: notification.text,
+        text,
         parse_mode: "Markdown",
-        reply_markup: notification.replyMarkup,
+        reply_markup: replyMarkup,
       }),
     });
 
@@ -156,20 +211,9 @@ export class TelegramNotificationService implements StopNotifier {
     const messageId = payload?.result?.message_id;
 
     if (messageId) {
-      this.storage.replyTokens.store(this.chatId, String(messageId), token, now);
+      this.storage.replyTokens.store(this.chatId, String(messageId), token, this.nowFn());
     }
-
-    return { token };
   }
-}
-
-export class WorkerNotificationService implements StopNotifier {
-  constructor(
-    private readonly storage: StorageDb,
-    private readonly workerSender: WorkerNotificationSender,
-    private readonly chatId: string,
-    private readonly nowFn: () => number = Date.now,
-  ) {}
 
   async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
     const now = this.nowFn();
@@ -185,12 +229,102 @@ export class WorkerNotificationService implements StopNotifier {
       },
     }, now);
 
-    const buttons: NotificationButton[] = [
-      { text: "▶️ Continue", action: "continue" },
-      { text: "✅ Yes", action: "y" },
-      { text: "❌ No", action: "n" },
-      { text: "🛑 Exit", action: "exit" },
-    ];
+    const notification = formatTelegramNotification({
+      event: input.event,
+      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      summary: input.summary,
+      cwd: input.session.cwd,
+      token,
+      buttons: [],
+    });
+
+    await this.sendTelegramMessage(
+      input.session.sessionId,
+      notification.text,
+      notification.replyMarkup,
+      token,
+    );
+
+    return { token };
+  }
+
+  async sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult> {
+    const now = this.nowFn();
+    const token = generateToken();
+
+    this.storage.sessionTokens.mint({
+      token,
+      sessionId: input.session.sessionId,
+      chatId: this.chatId,
+      context: {
+        type: "question",
+        questionRequestId: input.questionRequestId,
+      },
+    }, now);
+
+    this.storage.pendingQuestions.store({
+      sessionId: input.session.sessionId,
+      requestId: input.questionRequestId,
+      questions: input.questions,
+      token,
+    }, now);
+
+    const notification = formatQuestionNotification({
+      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      questions: input.questions,
+      cwd: input.session.cwd,
+      token,
+    });
+
+    await this.sendTelegramMessage(
+      input.session.sessionId,
+      notification.text,
+      notification.replyMarkup,
+      token,
+    );
+
+    return { token };
+  }
+}
+
+export class WorkerNotificationService implements StopNotifier, QuestionNotifier {
+  constructor(
+    private readonly storage: StorageDb,
+    private readonly workerSender: WorkerNotificationSender,
+    private readonly chatId: string,
+    private readonly nowFn: () => number = Date.now,
+  ) {}
+
+  private async sendViaWorker(
+    sessionId: string,
+    text: string,
+    replyMarkup: { inline_keyboard: unknown[] },
+  ): Promise<void> {
+    const result = await this.workerSender.sendNotification(
+      sessionId,
+      this.chatId,
+      text,
+      replyMarkup,
+    );
+
+    if (!result.ok) {
+      throw new Error("Worker notification send failed");
+    }
+  }
+
+  async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
+    const now = this.nowFn();
+    const token = generateToken();
+
+    this.storage.sessionTokens.mint({
+      token,
+      sessionId: input.session.sessionId,
+      chatId: this.chatId,
+      context: {
+        event: input.event,
+        summary: input.summary,
+      },
+    }, now);
 
     const notification = formatTelegramNotification({
       event: input.event,
@@ -198,28 +332,60 @@ export class WorkerNotificationService implements StopNotifier {
       summary: input.summary,
       cwd: input.session.cwd,
       token,
-      buttons,
+      buttons: [],
     });
 
-    const result = await this.workerSender.sendNotification(
+    await this.sendViaWorker(
       input.session.sessionId,
-      this.chatId,
       notification.text,
       notification.replyMarkup,
     );
 
-    if (!result.ok) {
-      throw new Error("Worker notification send failed");
-    }
+    return { token };
+  }
+
+  async sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult> {
+    const now = this.nowFn();
+    const token = generateToken();
+
+    this.storage.sessionTokens.mint({
+      token,
+      sessionId: input.session.sessionId,
+      chatId: this.chatId,
+      context: {
+        type: "question",
+        questionRequestId: input.questionRequestId,
+      },
+    }, now);
+
+    this.storage.pendingQuestions.store({
+      sessionId: input.session.sessionId,
+      requestId: input.questionRequestId,
+      questions: input.questions,
+      token,
+    }, now);
+
+    const notification = formatQuestionNotification({
+      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      questions: input.questions,
+      cwd: input.session.cwd,
+      token,
+    });
+
+    await this.sendViaWorker(
+      input.session.sessionId,
+      notification.text,
+      notification.replyMarkup,
+    );
 
     return { token };
   }
 }
 
-export class FallbackStopNotifier implements StopNotifier {
+export class FallbackNotifier implements StopNotifier, QuestionNotifier {
   constructor(
-    private readonly primary: StopNotifier,
-    private readonly fallback: StopNotifier,
+    private readonly primary: StopNotifier & QuestionNotifier,
+    private readonly fallback: StopNotifier & QuestionNotifier,
   ) {}
 
   async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
@@ -229,4 +395,15 @@ export class FallbackStopNotifier implements StopNotifier {
       return this.fallback.sendStopNotification(input);
     }
   }
+
+  async sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult> {
+    try {
+      return await this.primary.sendQuestionNotification(input);
+    } catch {
+      return this.fallback.sendQuestionNotification(input);
+    }
+  }
 }
+
+/** @deprecated Use FallbackNotifier instead */
+export const FallbackStopNotifier = FallbackNotifier;

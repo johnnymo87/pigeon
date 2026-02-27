@@ -23,6 +23,34 @@ type NotifyStopOpts = {
   log: LogFn
 }
 
+type QuestionOption = {
+  label: string
+  description: string
+}
+
+type QuestionInfo = {
+  question: string
+  header: string
+  options: QuestionOption[]
+  multiple?: boolean
+  custom?: boolean
+}
+
+type NotifyQuestionAskedOpts = {
+  sessionId: string
+  requestId: string
+  questions: QuestionInfo[]
+  label: string
+  daemonUrl?: string
+  log: LogFn
+}
+
+type NotifyQuestionAnsweredOpts = {
+  sessionId: string
+  daemonUrl?: string
+  log: LogFn
+}
+
 type DaemonResult = { ok: boolean; notified?: boolean } | null
 
 const BreakerState = { Closed: 0, Open: 1, HalfOpen: 2 } as const
@@ -134,6 +162,71 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
   } catch (err) {
     onFailure()
     opts.log("notifyStop failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
+    return null
+  }
+}
+
+export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promise<DaemonResult> {
+  if (!checkBreaker()) return null
+
+  const url = getDaemonUrl(opts.daemonUrl)
+
+  try {
+    const res = await fetch(`${url}/question-asked`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: opts.sessionId,
+        request_id: opts.requestId,
+        questions: opts.questions,
+        label: opts.label,
+      }),
+      signal: AbortSignal.timeout(1000),
+    })
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      opts.log("daemon returned error for question-asked", { status: res.status, body: text })
+      onFailure()
+      return null
+    }
+
+    const data = (await res.json()) as { ok: boolean; notified?: boolean }
+    onSuccess()
+    return data
+  } catch (err) {
+    onFailure()
+    opts.log("notifyQuestionAsked failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
+    return null
+  }
+}
+
+export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): Promise<DaemonResult> {
+  if (!checkBreaker()) return null
+
+  const url = getDaemonUrl(opts.daemonUrl)
+
+  try {
+    const res = await fetch(`${url}/question-answered`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: opts.sessionId,
+      }),
+      signal: AbortSignal.timeout(1000),
+    })
+
+    if (!res.ok) {
+      onFailure()
+      return null
+    }
+
+    const data = (await res.json()) as { ok: boolean }
+    onSuccess()
+    return data
+  } catch (err) {
+    onFailure()
+    opts.log("notifyQuestionAnswered failed:", err instanceof Error ? { message: err.message } : String(err))
     return null
   }
 }

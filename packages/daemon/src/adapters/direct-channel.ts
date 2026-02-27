@@ -1,7 +1,8 @@
 import type { SessionRecord } from "../storage/types";
-import type { CommandDeliveryAdapter, CommandDeliveryResult } from "./types";
+import type { CommandDeliveryAdapter, CommandDeliveryResult, QuestionReplyInput } from "./types";
 import {
   executeViaOpencodeDirectChannel,
+  replyQuestionViaOpencodeDirectChannel,
   type OpencodeDirectAdapterDeps,
 } from "../opencode-direct/adapter";
 import {
@@ -84,6 +85,45 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         attempts: result.attempts,
         status: result.status,
       },
+    };
+  }
+
+  async deliverQuestionReply(
+    session: SessionRecord,
+    reply: QuestionReplyInput,
+    context: { commandId: string; chatId?: string | number },
+  ): Promise<CommandDeliveryResult> {
+    const endpoint = session.backendEndpoint;
+    const authToken = session.backendAuthToken;
+
+    if (!endpoint || !authToken) {
+      return {
+        ok: false,
+        error: "Session missing backendEndpoint or backendAuthToken",
+      };
+    }
+
+    const result = await replyQuestionViaOpencodeDirectChannel(
+      {
+        requestId: context.commandId,
+        sessionId: session.sessionId,
+        questionRequestId: reply.questionRequestId,
+        answers: reply.answers,
+        endpoint,
+        authToken,
+        ...(context.chatId !== undefined ? { chatId: String(context.chatId) } : {}),
+      },
+      this.deps,
+    );
+
+    if (result.ok) {
+      return { ok: true, meta: { status: result.status } };
+    }
+
+    return {
+      ok: false,
+      error: result.error || "Question reply delivery failed",
+      meta: { status: result.status },
     };
   }
 }

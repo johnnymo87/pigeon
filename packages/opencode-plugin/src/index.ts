@@ -4,7 +4,7 @@ import {
   ResultErrorCode,
   type ExecuteCommandEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
-import { registerSession, notifyStop } from "./daemon-client"
+import { registerSession, notifyStop, notifyQuestionAsked, notifyQuestionAnswered } from "./daemon-client"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
@@ -59,6 +59,39 @@ const plugin: Plugin = async (ctx) => {
             success: true,
             output: "queued",
           }
+        } catch (error) {
+          return {
+            success: false,
+            errorCode: ResultErrorCode.ExecutionError,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          }
+        }
+      },
+
+      async onQuestionReply(request) {
+        try {
+          // SDK client may not have question.reply() typed yet, call HTTP API directly
+          const replyUrl = new URL(
+            `/question/${encodeURIComponent(request.questionRequestId)}/reply`,
+            ctx.serverUrl,
+          )
+          const res = await fetch(replyUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ answers: request.answers }),
+            signal: AbortSignal.timeout(10_000),
+          })
+
+          if (!res.ok) {
+            const text = await res.text().catch(() => "")
+            return {
+              success: false,
+              errorCode: ResultErrorCode.ExecutionError,
+              errorMessage: `OpenCode question reply failed: ${res.status} ${text}`,
+            }
+          }
+
+          return { success: true }
         } catch (error) {
           return {
             success: false,
@@ -151,9 +184,11 @@ const plugin: Plugin = async (ctx) => {
     return {
       event: async (input) => {
         const { event } = input
+        // Widen event.type to string to support newer event types (question.*) not yet in SDK
+        const eventType = event.type as string
         const props = event.properties as Record<string, unknown> | undefined
 
-        if (event.type === "session.created") {
+        if (eventType === "session.created") {
           const sessionInfo = props?.info as
             | { id?: string; title?: string; parentID?: string }
             | undefined
@@ -198,7 +233,7 @@ const plugin: Plugin = async (ctx) => {
           return
         }
 
-         if (event.type === "session.idle") {
+         if (eventType === "session.idle") {
            const sessionID = props?.sessionID as string | undefined
 
            if (!sessionID) return
@@ -232,7 +267,7 @@ const plugin: Plugin = async (ctx) => {
            return
          }
 
-        if (event.type === "message.updated") {
+        if (eventType === "message.updated") {
           const info = props?.info as
             | { id?: string; sessionID?: string; role?: string }
             | undefined
@@ -257,7 +292,7 @@ const plugin: Plugin = async (ctx) => {
           return
         }
 
-        if (event.type === "message.part.updated") {
+        if (eventType === "message.part.updated") {
           const part = props?.part as any
           const delta = props?.delta as string | undefined
 
@@ -268,7 +303,7 @@ const plugin: Plugin = async (ctx) => {
           return
         }
 
-        if (event.type === "session.deleted") {
+        if (eventType === "session.deleted") {
           const sessionInfo = props?.info as { id?: string } | undefined
           const sessionID = sessionInfo?.id
 
@@ -280,7 +315,7 @@ const plugin: Plugin = async (ctx) => {
           return
         }
 
-        if (event.type === "session.error") {
+        if (eventType === "session.error") {
           const sessionID = props?.sessionID as string | undefined
           const error = props?.error
 
@@ -316,6 +351,67 @@ const plugin: Plugin = async (ctx) => {
             sessionManager.onDeleted(sessionID)
             messageTail.clear(sessionID)
           }
+
+          return
+        }
+
+        if (eventType === "question.asked") {
+          const questionProps = props as {
+            id?: string
+            sessionID?: string
+            questions?: Array<{
+              question: string
+              header: string
+              options: Array<{ label: string; description: string }>
+              multiple?: boolean
+              custom?: boolean
+            }>
+          } | undefined
+
+          const sessionID = questionProps?.sessionID
+          const requestId = questionProps?.id
+          const questions = questionProps?.questions
+
+          if (!sessionID || !requestId || !questions || questions.length === 0) return
+
+          // Only notify for main sessions that are registered
+          await lateDiscoverSession(sessionID)
+          await sessionManager.awaitRegistration(sessionID)
+
+          if (
+            !sessionManager.isMainSession(sessionID) ||
+            !sessionManager.isRegistered(sessionID)
+          ) return
+
+          log("question.asked", { sessionID, requestId, questionCount: questions.length })
+
+          notifyQuestionAsked({
+            sessionId: sessionID,
+            requestId,
+            questions,
+            label,
+            daemonUrl,
+            log,
+          }).catch((err) => {
+            log("notifyQuestionAsked error:", serializeError(err))
+          })
+
+          return
+        }
+
+        if (eventType === "question.replied" || eventType === "question.rejected") {
+          const sessionID = props?.sessionID as string | undefined
+
+          if (!sessionID) return
+
+          // Clear pending question in daemon (it may have been answered from the TUI)
+          notifyQuestionAnswered({
+            sessionId: sessionID,
+            daemonUrl,
+            log,
+          }).catch((err) => {
+            log("notifyQuestionAnswered error:", serializeError(err))
+          })
 
           return
         }

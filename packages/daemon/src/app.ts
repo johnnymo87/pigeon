@@ -1,5 +1,6 @@
 import type { StorageDb } from "./storage/database";
-import type { StopNotifier } from "./notification-service";
+import type { StopNotifier, QuestionNotifier } from "./notification-service";
+import type { QuestionInfoData } from "./storage/types";
 
 interface LegacySession {
   session_id: string;
@@ -72,7 +73,7 @@ function maybeNumber(value: unknown): number | undefined {
 
 interface AppOptions {
   nowFn?: () => number;
-  notifier?: StopNotifier;
+  notifier?: StopNotifier & Partial<QuestionNotifier>;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
 }
@@ -243,6 +244,68 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           return Response.json({ ok: true, notified: false, error: errorMessage });
         }
+      }
+
+      if (request.method === "POST" && url.pathname === "/question-asked") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+
+        const requestId = typeof body.request_id === "string" ? body.request_id : "";
+        if (!requestId) {
+          return Response.json({ error: "request_id is required" }, { status: 400 });
+        }
+
+        const questions = body.questions as QuestionInfoData[] | undefined;
+        if (!Array.isArray(questions) || questions.length === 0) {
+          return Response.json({ error: "questions array is required" }, { status: 400 });
+        }
+
+        const session = storage.sessions.get(sessionId);
+        if (!session) {
+          return Response.json({ error: "Session not found" }, { status: 404 });
+        }
+
+        if (!session.notify) {
+          return Response.json({ ok: true, notified: false, reason: "notify=false" });
+        }
+
+        if (!notifier || !("sendQuestionNotification" in notifier) || typeof notifier.sendQuestionNotification !== "function") {
+          return Response.json({ ok: true, notified: false, reason: "no question notification handler" });
+        }
+
+        const label = typeof body.label === "string" ? body.label : null;
+
+        try {
+          const result = await notifier.sendQuestionNotification({
+            session: {
+              sessionId: session.sessionId,
+              label: session.label,
+              cwd: session.cwd,
+            },
+            questionRequestId: requestId,
+            questions,
+            label: label || session.label || undefined,
+          });
+
+          return Response.json({ ok: true, notified: true, ...result });
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: true, notified: false, error: errorMessage });
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/question-answered") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+
+        const deleted = storage.pendingQuestions.delete(sessionId);
+        return Response.json({ ok: true, cleared: deleted });
       }
 
       if (url.pathname.startsWith("/sessions/") && url.pathname !== "/sessions/enable-notify") {

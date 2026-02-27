@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import { ResultErrorCode } from "../src/opencode-direct/contracts";
+import type { CommandDeliveryAdapter, QuestionReplyInput } from "../src/adapters/types";
 
 describe("ingestWorkerCommand", () => {
   it("acks and marks command done on successful direct-channel delivery", async () => {
@@ -317,6 +318,210 @@ describe("ingestWorkerCommand", () => {
       commandId: "cmd-guard-2",
       success: false,
     });
+    storage.db.close();
+  });
+
+  it("routes button press as question reply when pending question exists", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-q1",
+      requestId: "question_abc",
+      questions: [{
+        question: "Which DB?",
+        header: "DB",
+        options: [
+          { label: "PostgreSQL", description: "Relational" },
+          { label: "SQLite", description: "File-based" },
+        ],
+      }],
+    }, now);
+
+    let capturedReply: QuestionReplyInput | null = null;
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-q1",
+        sessionId: "sess-q1",
+        command: "q1",
+        chatId: "1",
+      },
+      { send(payload) { sent.push(payload); } },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply(_session, reply) {
+            capturedReply = reply;
+            return { ok: true };
+          },
+        }),
+      },
+    );
+
+    expect(capturedReply).toEqual({
+      questionRequestId: "question_abc",
+      answers: [["SQLite"]],
+    });
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "commandResult", commandId: "cmd-q1", success: true }),
+    );
+
+    // Pending question should be cleared
+    expect(storage.pendingQuestions.getBySessionId("sess-q1")).toBeNull();
+    storage.db.close();
+  });
+
+  it("routes custom text as question reply when pending question exists", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q2",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-q2",
+      requestId: "question_def",
+      questions: [{
+        question: "Which DB?",
+        header: "DB",
+        options: [{ label: "PostgreSQL", description: "" }],
+      }],
+    }, now);
+
+    let capturedReply: QuestionReplyInput | null = null;
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-q2",
+        sessionId: "sess-q2",
+        command: "Use MongoDB instead",
+        chatId: "1",
+      },
+      { send(payload) { sent.push(payload); } },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply(_session, reply) {
+            capturedReply = reply;
+            return { ok: true };
+          },
+        }),
+      },
+    );
+
+    expect(capturedReply).toEqual({
+      questionRequestId: "question_def",
+      answers: [["Use MongoDB instead"]],
+    });
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "commandResult", commandId: "cmd-q2", success: true }),
+    );
+    storage.db.close();
+  });
+
+  it("rejects stale question option press when no pending question", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q3",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    // No pending question stored
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-q3",
+        sessionId: "sess-q3",
+        command: "q0",
+        chatId: "1",
+      },
+      { send(payload) { sent.push(payload); } },
+    );
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "commandResult",
+        commandId: "cmd-q3",
+        success: false,
+        error: "This question has already been answered.",
+      }),
+    );
+    storage.db.close();
+  });
+
+  it("rejects out-of-range option index", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q4",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-q4",
+      requestId: "question_oob",
+      questions: [{
+        question: "Pick one",
+        header: "Choice",
+        options: [{ label: "Only Option", description: "" }],
+      }],
+    }, now);
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-q4",
+        sessionId: "sess-q4",
+        command: "q5",
+        chatId: "1",
+      },
+      { send(payload) { sent.push(payload); } },
+    );
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "commandResult",
+        success: false,
+        error: expect.stringContaining("Invalid option index"),
+      }),
+    );
     storage.db.close();
   });
 });

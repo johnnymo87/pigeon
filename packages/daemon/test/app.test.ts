@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import type { StopNotifier } from "../src/notification-service";
+import type { StopNotifier, QuestionNotifier } from "../src/notification-service";
 
 describe("createApp", () => {
   let storage: StorageDb | null = null;
@@ -312,5 +312,95 @@ describe("createApp", () => {
 
     expect(stop.status).toBe(200);
     expect(await stop.json()).toEqual({ ok: true, notified: false, error: "telegram down" });
+  });
+
+  it("POST /question-asked stores pending question and notifies", async () => {
+    const questionNotifier: StopNotifier & QuestionNotifier = {
+      sendStopNotification: vi.fn(async () => ({ token: "t" })),
+      sendQuestionNotification: vi.fn(async () => ({ token: "qtok-1" })),
+    };
+
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000, notifier: questionNotifier });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-q", notify: true }),
+    }));
+
+    const response = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q",
+        request_id: "question_abc",
+        questions: [{
+          question: "Which DB?",
+          header: "DB Choice",
+          options: [
+            { label: "PostgreSQL", description: "Relational" },
+            { label: "SQLite", description: "File-based" },
+          ],
+        }],
+      }),
+    }));
+
+    expect(response.status).toBe(200);
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.ok).toBe(true);
+    expect(json.notified).toBe(true);
+    expect(json.token).toBe("qtok-1");
+    expect(questionNotifier.sendQuestionNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /question-asked returns 400 for missing fields", async () => {
+    const app = newApp();
+
+    const noSession = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: "q1", questions: [{ question: "?" }] }),
+    }));
+    expect(noSession.status).toBe(400);
+
+    const noRequest = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "s1", questions: [{ question: "?" }] }),
+    }));
+    expect(noRequest.status).toBe(400);
+
+    const noQuestions = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "s1", request_id: "q1", questions: [] }),
+    }));
+    expect(noQuestions.status).toBe(400);
+  });
+
+  it("POST /question-answered clears pending question", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-qa",
+      requestId: "question_xyz",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, 50_000);
+
+    expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeTruthy();
+
+    const response = await app(new Request("http://localhost/question-answered", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qa" }),
+    }));
+
+    expect(response.status).toBe(200);
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.ok).toBe(true);
+    expect(json.cleared).toBe(true);
+    expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
   });
 });

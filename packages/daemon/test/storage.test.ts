@@ -100,4 +100,71 @@ describe("storage schema and repositories", () => {
 
     storage.db.close();
   });
+
+  it("stores, retrieves, deletes, and expires pending questions", () => {
+    const storage = createStorage();
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-pq",
+      requestId: "question_abc",
+      questions: [{
+        question: "Which DB?",
+        header: "DB",
+        options: [
+          { label: "PostgreSQL", description: "Relational" },
+          { label: "SQLite", description: "File-based" },
+        ],
+      }],
+      token: "tok-pq",
+    }, 1_000);
+
+    const record = storage.pendingQuestions.getBySessionId("sess-pq", 1_001);
+    expect(record).not.toBeNull();
+    expect(record!.requestId).toBe("question_abc");
+    expect(record!.questions).toHaveLength(1);
+    expect(record!.questions[0]!.options).toHaveLength(2);
+    expect(record!.token).toBe("tok-pq");
+
+    // Not expired yet
+    expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_000 + 2 * 60 * 60 * 1000)).not.toBeNull();
+
+    // Expired (4h TTL)
+    expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_000 + 5 * 60 * 60 * 1000)).toBeNull();
+
+    // Delete
+    expect(storage.pendingQuestions.delete("sess-pq")).toBe(true);
+    expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_001)).toBeNull();
+
+    // Cleanup expired
+    storage.pendingQuestions.store({
+      sessionId: "sess-pq2",
+      requestId: "q2",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, 1_000);
+    expect(storage.pendingQuestions.cleanupExpired(1_000 + 5 * 60 * 60 * 1000)).toBe(1);
+
+    storage.db.close();
+  });
+
+  it("replaces pending question for same session on re-store", () => {
+    const storage = createStorage();
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-replace",
+      requestId: "q-old",
+      questions: [{ question: "Old?", header: "H", options: [] }],
+    }, 1_000);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-replace",
+      requestId: "q-new",
+      questions: [{ question: "New?", header: "H", options: [] }],
+    }, 2_000);
+
+    const record = storage.pendingQuestions.getBySessionId("sess-replace", 2_001);
+    expect(record!.requestId).toBe("q-new");
+    expect(record!.questions[0]!.question).toBe("New?");
+
+    storage.db.close();
+  });
 });

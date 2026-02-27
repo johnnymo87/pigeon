@@ -44,6 +44,35 @@ export interface InboxRecord {
   updatedAt: number;
 }
 
+export interface QuestionOptionData {
+  label: string;
+  description: string;
+}
+
+export interface QuestionInfoData {
+  question: string;
+  header: string;
+  options: QuestionOptionData[];
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface PendingQuestionRecord {
+  sessionId: string;
+  requestId: string;
+  questions: QuestionInfoData[];
+  token: string | null;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface StorePendingQuestionInput {
+  sessionId: string;
+  requestId: string;
+  questions: QuestionInfoData[];
+  token?: string;
+}
+
 export interface UpsertSessionInput {
   sessionId: string;
   ppid?: number | null;

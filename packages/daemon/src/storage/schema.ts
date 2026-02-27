@@ -4,6 +4,7 @@ export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 export const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const REPLY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const INBOX_DONE_RETENTION_MS = 60 * 60 * 1000;
+export const PENDING_QUESTION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 export function initSchema(db: BetterSqlite3.Database): void {
   db.exec(`
@@ -67,6 +68,17 @@ export function initSchema(db: BetterSqlite3.Database): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_inbox_status_updated ON inbox(status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS pending_questions (
+      session_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      questions_json TEXT NOT NULL,
+      token TEXT,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pending_questions_expires ON pending_questions(expires_at);
   `);
 
   // Additive migrations for existing databases created before backend fields.

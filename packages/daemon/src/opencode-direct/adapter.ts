@@ -4,9 +4,12 @@ import {
   OpencodeDirectSource,
   isCommandAckEnvelope,
   isCommandResultEnvelope,
+  isQuestionReplyResultEnvelope,
   type CommandAckEnvelope,
   type CommandResultEnvelope,
   type ExecuteCommandEnvelope,
+  type QuestionReplyResultEnvelope,
+  type ReplyQuestionEnvelope,
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "./contracts";
 
@@ -234,5 +237,111 @@ export async function executeViaOpencodeDirectChannel(
     status: 0,
     attempts: maxAttempts,
     error: "Unexpected adapter state",
+  };
+}
+
+export interface OpencodeDirectQuestionReplyInput {
+  requestId: string;
+  sessionId: string;
+  questionRequestId: string;
+  answers: string[][];
+  endpoint: string;
+  authToken: string;
+  chatId?: string;
+  timeoutMs?: number;
+}
+
+export interface OpencodeDirectQuestionReplyResult {
+  ok: boolean;
+  status: number;
+  result?: QuestionReplyResultEnvelope;
+  error?: string;
+}
+
+export async function replyQuestionViaOpencodeDirectChannel(
+  input: OpencodeDirectQuestionReplyInput,
+  deps: OpencodeDirectAdapterDeps = {},
+): Promise<OpencodeDirectQuestionReplyResult> {
+  const fetchFn = deps.fetchFn ?? fetch;
+  const now = deps.now ?? Date.now;
+  const log = deps.logger ?? (() => undefined);
+  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  // Derive question-reply endpoint from execute endpoint
+  const questionReplyEndpoint = input.endpoint.replace(
+    "/pigeon/direct/execute",
+    "/pigeon/direct/question-reply",
+  );
+
+  const envelope: ReplyQuestionEnvelope = {
+    type: OpencodeDirectMessageType.QuestionReply,
+    version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+    requestId: input.requestId,
+    sessionId: input.sessionId,
+    questionRequestId: input.questionRequestId,
+    answers: input.answers,
+    issuedAt: now(),
+    ...(input.chatId ? { metadata: { chatId: input.chatId } } : {}),
+  };
+
+  log("opencode-direct.question-reply.start", {
+    endpoint: questionReplyEndpoint,
+    sessionId: input.sessionId,
+    questionRequestId: input.questionRequestId,
+  });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetchFn(questionReplyEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${input.authToken}`,
+      },
+      body: JSON.stringify(envelope),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    const message = error instanceof Error ? error.message : String(error);
+    log("opencode-direct.question-reply.network_error", { error: message });
+    return { ok: false, status: 0, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return { ok: false, status: response.status, error: "Invalid JSON response" };
+  }
+
+  const record = (payload && typeof payload === "object")
+    ? (payload as Record<string, unknown>)
+    : null;
+
+  const result = record?.result;
+
+  if (isQuestionReplyResultEnvelope(result)) {
+    log("opencode-direct.question-reply.done", {
+      status: response.status,
+      success: result.success,
+    });
+    return {
+      ok: response.ok && result.success,
+      status: response.status,
+      result,
+      ...(!result.success ? { error: result.errorMessage ?? "Question reply failed" } : {}),
+    };
+  }
+
+  return {
+    ok: false,
+    status: response.status,
+    error: "Invalid question reply result",
   };
 }

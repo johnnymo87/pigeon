@@ -6,15 +6,24 @@ import {
   OpencodeDirectMessageType,
   ResultErrorCode,
   isExecuteCommandEnvelope,
+  isReplyQuestionEnvelope,
   type CommandAckEnvelope,
   type CommandResultEnvelope,
   type ExecuteCommandEnvelope,
+  type ReplyQuestionEnvelope,
+  type QuestionReplyResultEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
 
 export interface ExecuteResult {
   success: boolean
   exitCode?: number
   output?: string
+  errorCode?: (typeof ResultErrorCode)[keyof typeof ResultErrorCode]
+  errorMessage?: string
+}
+
+export interface QuestionReplyResult {
+  success: boolean
   errorCode?: (typeof ResultErrorCode)[keyof typeof ResultErrorCode]
   errorMessage?: string
 }
@@ -27,6 +36,7 @@ export interface DirectChannelServer {
 
 export interface DirectChannelOptions {
   onExecute: (request: ExecuteCommandEnvelope) => Promise<ExecuteResult>
+  onQuestionReply?: (request: ReplyQuestionEnvelope) => Promise<QuestionReplyResult>
   host?: string
   port?: number
   authToken?: string
@@ -81,7 +91,7 @@ export async function startDirectChannelServer(options: DirectChannelOptions): P
       return
     }
 
-    if (req.method !== "POST" || req.url !== "/pigeon/direct/execute") {
+    if (req.method !== "POST" || (req.url !== "/pigeon/direct/execute" && req.url !== "/pigeon/direct/question-reply")) {
       json(res, 404, { error: "Not found" })
       return
     }
@@ -100,6 +110,50 @@ export async function startDirectChannelServer(options: DirectChannelOptions): P
       return
     }
 
+    // Question reply route
+    if (req.url === "/pigeon/direct/question-reply") {
+      if (!isReplyQuestionEnvelope(payload)) {
+        json(res, 400, { error: "Invalid question reply envelope" })
+        return
+      }
+
+      if (!options.onQuestionReply) {
+        json(res, 501, { error: "Question reply not supported" })
+        return
+      }
+
+      try {
+        const execution = await options.onQuestionReply(payload)
+        const result: QuestionReplyResultEnvelope = {
+          type: OpencodeDirectMessageType.QuestionReplyResult,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: payload.requestId,
+          sessionId: payload.sessionId,
+          questionRequestId: payload.questionRequestId,
+          success: execution.success,
+          finishedAt: Date.now(),
+          errorCode: execution.errorCode,
+          errorMessage: execution.errorMessage,
+        }
+        json(res, execution.success ? 200 : 500, { result })
+      } catch (error) {
+        const result: QuestionReplyResultEnvelope = {
+          type: OpencodeDirectMessageType.QuestionReplyResult,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: payload.requestId,
+          sessionId: payload.sessionId,
+          questionRequestId: payload.questionRequestId,
+          success: false,
+          finishedAt: Date.now(),
+          errorCode: ResultErrorCode.Internal,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }
+        json(res, 500, { result })
+      }
+      return
+    }
+
+    // Execute command route
     if (!isExecuteCommandEnvelope(payload)) {
       json(res, 400, { ack: rejectAck(AckRejectReason.InvalidPayload, "Invalid execute envelope") })
       return

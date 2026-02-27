@@ -1,6 +1,7 @@
 import type BetterSqlite3 from "better-sqlite3";
 import {
   INBOX_DONE_RETENTION_MS,
+  PENDING_QUESTION_TTL_MS,
   REPLY_TOKEN_TTL_MS,
   SESSION_TTL_MS,
   TOKEN_TTL_MS,
@@ -8,10 +9,12 @@ import {
 import type {
   InboxRecord,
   MintSessionTokenInput,
+  PendingQuestionRecord,
   PersistInboxCommandInput,
   ReplyTokenRecord,
   SessionRecord,
   SessionTokenRecord,
+  StorePendingQuestionInput,
   UpsertSessionInput,
 } from "./types";
 
@@ -292,6 +295,59 @@ export class InboxRepository {
     const result = this.db
       .prepare("DELETE FROM inbox WHERE status = 'done' AND updated_at < ?")
       .run(now - retentionMs);
+    return result.changes;
+  }
+}
+
+function asPendingQuestion(row: SqlRow): PendingQuestionRecord {
+  return {
+    sessionId: String(row.session_id),
+    requestId: String(row.request_id),
+    questions: JSON.parse(String(row.questions_json)) as PendingQuestionRecord["questions"],
+    token: (row.token as string | null) ?? null,
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+  };
+}
+
+export class PendingQuestionRepository {
+  constructor(private readonly db: BetterSqlite3.Database) {}
+
+  store(input: StorePendingQuestionInput, now = Date.now(), ttlMs = PENDING_QUESTION_TTL_MS): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO pending_questions
+         (session_id, request_id, questions_json, token, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.sessionId,
+        input.requestId,
+        JSON.stringify(input.questions),
+        input.token ?? null,
+        now,
+        now + ttlMs,
+      );
+  }
+
+  getBySessionId(sessionId: string, now = Date.now()): PendingQuestionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM pending_questions WHERE session_id = ? AND expires_at > ?")
+      .get(sessionId, now) as SqlRow | null;
+    return row ? asPendingQuestion(row) : null;
+  }
+
+  delete(sessionId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM pending_questions WHERE session_id = ?")
+      .run(sessionId);
+    return result.changes > 0;
+  }
+
+  cleanupExpired(now = Date.now()): number {
+    const result = this.db
+      .prepare("DELETE FROM pending_questions WHERE expires_at < ?")
+      .run(now);
     return result.changes;
   }
 }

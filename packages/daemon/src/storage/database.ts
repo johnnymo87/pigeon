@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { initSchema } from "./schema";
 import {
   InboxRepository,
+  PendingQuestionRepository,
   ReplyTokenRepository,
   SessionRepository,
   SessionTokenRepository,
@@ -15,6 +16,7 @@ export interface StorageDb {
   sessionTokens: SessionTokenRepository;
   replyTokens: ReplyTokenRepository;
   inbox: InboxRepository;
+  pendingQuestions: PendingQuestionRepository;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -32,5 +34,6 @@ export function openStorageDb(path: string): StorageDb {
     sessionTokens: new SessionTokenRepository(db),
     replyTokens: new ReplyTokenRepository(db),
     inbox: new InboxRepository(db),
+    pendingQuestions: new PendingQuestionRepository(db),
   };
 }

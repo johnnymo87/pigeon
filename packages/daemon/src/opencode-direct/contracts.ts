@@ -4,6 +4,8 @@ export const OpencodeDirectMessageType = {
   Execute: "pigeon.command.execute",
   Ack: "pigeon.command.ack",
   Result: "pigeon.command.result",
+  QuestionReply: "pigeon.question.reply",
+  QuestionReplyResult: "pigeon.question.reply.result",
 } as const;
 
 export const OpencodeDirectSource = {
@@ -82,10 +84,37 @@ export interface CommandResultEnvelope {
   errorMessage?: string;
 }
 
+export interface ReplyQuestionEnvelope {
+  type: typeof OpencodeDirectMessageType.QuestionReply;
+  version: typeof OPENCODE_DIRECT_PROTOCOL_VERSION;
+  requestId: string;
+  sessionId: string;
+  questionRequestId: string;
+  answers: string[][];
+  issuedAt: number;
+  metadata?: {
+    chatId?: string;
+  };
+}
+
+export interface QuestionReplyResultEnvelope {
+  type: typeof OpencodeDirectMessageType.QuestionReplyResult;
+  version: typeof OPENCODE_DIRECT_PROTOCOL_VERSION;
+  requestId: string;
+  sessionId: string;
+  questionRequestId: string;
+  success: boolean;
+  finishedAt: number;
+  errorCode?: ResultErrorCode;
+  errorMessage?: string;
+}
+
 export type OpencodeDirectEnvelope =
   | ExecuteCommandEnvelope
   | CommandAckEnvelope
-  | CommandResultEnvelope;
+  | CommandResultEnvelope
+  | ReplyQuestionEnvelope
+  | QuestionReplyResultEnvelope;
 
 export interface OpencodeDirectSessionRegistration {
   backend_kind: "opencode-plugin-direct";
@@ -131,6 +160,37 @@ export function isCommandAckEnvelope(value: unknown): value is CommandAckEnvelop
   if (typeof record.accepted !== "boolean") return false;
   if (!isFiniteNumber(record.acceptedAt)) return false;
   if (record.rejectReason !== undefined && !Object.values(AckRejectReason).includes(record.rejectReason as AckRejectReason)) return false;
+
+  return true;
+}
+
+export function isReplyQuestionEnvelope(value: unknown): value is ReplyQuestionEnvelope {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+
+  if (record.type !== OpencodeDirectMessageType.QuestionReply) return false;
+  if (record.version !== OPENCODE_DIRECT_PROTOCOL_VERSION) return false;
+  if (!isNonEmptyString(record.requestId)) return false;
+  if (!isNonEmptyString(record.sessionId)) return false;
+  if (!isNonEmptyString(record.questionRequestId)) return false;
+  if (!Array.isArray(record.answers)) return false;
+  if (!isFiniteNumber(record.issuedAt)) return false;
+
+  return true;
+}
+
+export function isQuestionReplyResultEnvelope(value: unknown): value is QuestionReplyResultEnvelope {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+
+  if (record.type !== OpencodeDirectMessageType.QuestionReplyResult) return false;
+  if (record.version !== OPENCODE_DIRECT_PROTOCOL_VERSION) return false;
+  if (!isNonEmptyString(record.requestId)) return false;
+  if (!isNonEmptyString(record.sessionId)) return false;
+  if (!isNonEmptyString(record.questionRequestId)) return false;
+  if (typeof record.success !== "boolean") return false;
+  if (!isFiniteNumber(record.finishedAt)) return false;
+  if (record.errorCode !== undefined && !Object.values(ResultErrorCode).includes(record.errorCode as ResultErrorCode)) return false;
 
   return true;
 }
