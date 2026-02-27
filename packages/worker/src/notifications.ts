@@ -91,6 +91,31 @@ export function lookupMessageByToken(
 }
 
 /**
+ * Extract the daemon-generated token from inline-keyboard callback_data.
+ * The daemon embeds tokens as `cmd:TOKEN:action` in button callback_data.
+ * If found, the worker reuses this token so callback lookups succeed.
+ */
+function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
+  if (!replyMarkup || typeof replyMarkup !== "object") return null;
+  const markup = replyMarkup as { inline_keyboard?: unknown[][] };
+  if (!Array.isArray(markup.inline_keyboard)) return null;
+
+  for (const row of markup.inline_keyboard) {
+    if (!Array.isArray(row)) continue;
+    for (const button of row) {
+      if (!button || typeof button !== "object") continue;
+      const btn = button as { callback_data?: string };
+      if (typeof btn.callback_data !== "string") continue;
+      const parts = btn.callback_data.split(":");
+      if (parts[0] === "cmd" && parts.length >= 3 && parts[1]) {
+        return parts[1];
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Handle POST /notifications/send
  */
 export async function handleSendNotification(
@@ -133,8 +158,9 @@ export async function handleSendNotification(
     sessionId
   );
 
-  // Generate reply token
-  const token = generateToken();
+  // Use daemon-supplied token from callback_data if present (keeps button callbacks working),
+  // otherwise generate a fresh token for reply-to-message routing.
+  const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
   // Call Telegram API
   const telegramPayload: Record<string, unknown> = {

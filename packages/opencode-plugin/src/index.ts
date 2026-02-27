@@ -13,6 +13,13 @@ import { errorMessage, serializeError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
   try {
+    // OpenCode's SDK client uses a custom in-process fetch that calls
+    // Server.App().fetch() directly (no network I/O). In TUI mode, no HTTP
+    // server is running, so raw fetch() to ctx.serverUrl fails. Extract
+    // the SDK client's internal fetch to use for question reply calls.
+    const sdkClientConfig = (ctx.client as any)._client?.getConfig?.()
+    const internalFetch: typeof fetch = sdkClientConfig?.fetch ?? globalThis.fetch
+
     const messageTail = new MessageTail()
     const sessionManager = new SessionManager()
 
@@ -70,17 +77,27 @@ const plugin: Plugin = async (ctx) => {
 
       async onQuestionReply(request) {
         try {
-          // SDK client may not have question.reply() typed yet, call HTTP API directly
+          // Use the SDK client's in-process fetch — in TUI mode no HTTP server
+          // is running, so raw fetch() to ctx.serverUrl would fail.
           const replyUrl = new URL(
             `/question/${encodeURIComponent(request.questionRequestId)}/reply`,
             ctx.serverUrl,
           )
-          const res = await fetch(replyUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ answers: request.answers }),
-            signal: AbortSignal.timeout(10_000),
+          log("question-reply: attempting fetch", {
+            serverUrl: String(ctx.serverUrl),
+            replyUrl: replyUrl.toString(),
+            questionRequestId: request.questionRequestId,
           })
+          // Build a Request object — the in-process Hono fetch expects
+          // a Request, not a bare URL object.
+          const res = await internalFetch(
+            new Request(replyUrl.toString(), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ answers: request.answers }),
+              signal: AbortSignal.timeout(10_000),
+            }),
+          )
 
           if (!res.ok) {
             const text = await res.text().catch(() => "")
@@ -93,6 +110,10 @@ const plugin: Plugin = async (ctx) => {
 
           return { success: true }
         } catch (error) {
+          log("question-reply: fetch error", {
+            serverUrl: ctx.serverUrl,
+            error: error instanceof Error ? { message: error.message, name: error.name, stack: error.stack } : String(error),
+          })
           return {
             success: false,
             errorCode: ResultErrorCode.ExecutionError,

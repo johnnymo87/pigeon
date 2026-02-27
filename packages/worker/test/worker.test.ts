@@ -511,6 +511,48 @@ describe("POST /notifications/send", () => {
 
     expect(body1.token).not.toBe(body2.token);
   });
+
+  it("reuses daemon token from callback_data instead of generating own", async () => {
+    const DAEMON_TOKEN = "daemon-supplied-token-abc";
+    mockTelegramSuccess(9001);
+
+    const res = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "Question notification",
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: "Blue", callback_data: `cmd:${DAEMON_TOKEN}:q0` },
+            { text: "Green", callback_data: `cmd:${DAEMON_TOKEN}:q1` },
+          ],
+        ],
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; token: string; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.token).toBe(DAEMON_TOKEN);
+  });
+
+  it("generates fresh token when replyMarkup has no cmd: callback_data", async () => {
+    mockTelegramSuccess(9002);
+
+    const res = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "Stop notification",
+      replyMarkup: { inline_keyboard: [] },
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; token: string };
+    expect(body.ok).toBe(true);
+    // Token should be a base64url string (not a specific daemon token)
+    expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(body.token).not.toBe("");
+  });
 });
 
 // ─── Webhook: Helpers ─────────────────────────────────────────────────
