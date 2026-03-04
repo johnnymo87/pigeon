@@ -1,5 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
-import { generateCommandId } from "./command-queue";
+import { generateCommandId, type CommandType } from "./command-queue";
 
 /**
  * Verify the Telegram webhook secret header (constant-time).
@@ -229,10 +229,12 @@ async function queueCommand(
   sql: SqlStorage,
   env: Env,
   machineId: string,
-  sessionId: string,
+  sessionId: string | null,
   command: string,
   chatId: string,
   label: string | null,
+  commandType: CommandType = "execute",
+  directory: string | null = null,
 ): Promise<string | null> {
   // Check queue size
   const countRows = sql.exec(
@@ -251,9 +253,9 @@ async function queueCommand(
   const now = Date.now();
 
   sql.exec(
-    `INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at)
-     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
-    commandId, machineId, sessionId, command, chatId, now, now,
+    `INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at, command_type, directory)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+    commandId, machineId, sessionId, command, chatId, now, now, commandType, directory,
   );
 
   return commandId;
@@ -267,6 +269,7 @@ export async function handleTelegramWebhook(
   env: Env,
   request: Request,
   deliverNow?: (machineId: string) => void,
+  isMachineConnected?: (machineId: string) => boolean,
 ): Promise<Response> {
   // Auth: verify webhook secret
   if (!verifyWebhookSecret(request, env.TELEGRAM_WEBHOOK_SECRET)) {
@@ -288,6 +291,34 @@ export async function handleTelegramWebhook(
 
   if (chatId && !isAllowedTelegramSource(chatId, userId, env)) {
     return OK(); // silent drop
+  }
+
+  // Handle /launch command
+  if (update.message?.text) {
+    const launchMatch = update.message.text.match(/^\/launch\s+(\S+)\s+(\S+)\s+(.+)$/s);
+    if (launchMatch) {
+      const machineId = launchMatch[1]!;
+      const directory = launchMatch[2]!;
+      const prompt = launchMatch[3]!;
+      const launchChatId = update.message.chat.id;
+
+      // NOTE: No per-user machine authorization — assumes single-tenant deployment.
+      // If multi-tenant is needed, validate machineId against an allowlist.
+      // Check if machine has an active WebSocket connection
+      const isConnected = isMachineConnected ? isMachineConnected(machineId) : false;
+
+      if (!isConnected) {
+        await sendTelegramMessage(env, launchChatId, `${machineId} is not connected.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(sql, env, machineId, null, prompt, String(launchChatId), null, "launch", directory);
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`);
+      deliverNow?.(machineId);
+      return OK();
+    }
   }
 
   // Handle message (text, reply)

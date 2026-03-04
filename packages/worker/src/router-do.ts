@@ -52,7 +52,7 @@ export class RouterDurableObject extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS command_queue (
         command_id TEXT PRIMARY KEY,
         machine_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
+        session_id TEXT,
         command TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
@@ -78,6 +78,19 @@ export class RouterDurableObject extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_seen_updates_created
         ON seen_updates(created_at);
     `);
+
+    // Migrations: add new columns to existing tables (ignore "duplicate column" errors).
+    const migrations = [
+      `ALTER TABLE command_queue ADD COLUMN command_type TEXT NOT NULL DEFAULT 'execute'`,
+      `ALTER TABLE command_queue ADD COLUMN directory TEXT`,
+    ];
+    for (const migration of migrations) {
+      try {
+        this.sql.exec(migration);
+      } catch {
+        // Column already exists — ignore.
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -106,12 +119,18 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     // Telegram webhook
     if (url.pathname.startsWith("/webhook/telegram") && method === "POST") {
-      return handleTelegramWebhook(this.sql, this.env, request, (machineId) => {
-        const ws = this.getMachineWebSocket(machineId);
-        if (ws) {
-          flushCommandQueue(this.sql, machineId, ws);
-        }
-      });
+      return handleTelegramWebhook(
+        this.sql,
+        this.env,
+        request,
+        (machineId) => {
+          const ws = this.getMachineWebSocket(machineId);
+          if (ws) {
+            flushCommandQueue(this.sql, machineId, ws);
+          }
+        },
+        (machineId) => this.getMachineWebSocket(machineId) !== null,
+      );
     }
 
     // TODO: websocket

@@ -3,6 +3,8 @@ export interface CommandWsLike {
   send(message: string): void;
 }
 
+export type CommandType = "execute" | "launch";
+
 interface QueueCountRow {
   count: number;
   [key: string]: SqlStorageValue;
@@ -11,10 +13,12 @@ interface QueueCountRow {
 interface QueueCommandRow {
   command_id: string;
   machine_id: string;
-  session_id: string;
+  session_id: string | null;
   command: string;
   chat_id: string;
   attempts: number;
+  command_type: CommandType;
+  directory: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -43,22 +47,22 @@ export function sendCommand(
   sql: SqlStorage,
   ws: CommandWsLike,
   commandId: string,
-  sessionId: string,
+  sessionId: string | null,
   command: string,
   chatId: string,
   now = Date.now(),
+  commandType: CommandType = "execute",
+  directory: string | null = null,
 ): void {
   const currentAttempts = getAttempts(sql, commandId);
   const newAttempts = currentAttempts + 1;
 
   try {
-    ws.send(JSON.stringify({
-      type: "command",
-      commandId,
-      sessionId,
-      command,
-      chatId,
-    }));
+    const message = commandType === "launch"
+      ? JSON.stringify({ type: "launch", commandId, directory, prompt: command, chatId })
+      : JSON.stringify({ type: "command", commandId, sessionId, command, chatId });
+
+    ws.send(message);
 
     sql.exec(
       `UPDATE command_queue
@@ -105,7 +109,7 @@ export function flushCommandQueue(
 
   const toSend = Math.min(BATCH_SIZE, MAX_INFLIGHT - inflight);
   const rows = sql.exec(
-    `SELECT command_id, machine_id, session_id, command, chat_id, attempts
+    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory
      FROM command_queue
      WHERE machine_id = ?
        AND status IN ('pending', 'sent')
@@ -118,7 +122,7 @@ export function flushCommandQueue(
   ).toArray() as QueueCommandRow[];
 
   for (const row of rows) {
-    sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now);
+    sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory);
   }
 
   return rows.length;
@@ -149,7 +153,7 @@ export function retrySentCommands(
 ): number {
   const cutoff = now - RETRY_INTERVAL_MS;
   const rows = sql.exec(
-    `SELECT command_id, machine_id, session_id, command, chat_id, attempts
+    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory
      FROM command_queue
      WHERE status = 'sent'
        AND sent_at < ?
@@ -165,7 +169,7 @@ export function retrySentCommands(
   for (const row of rows) {
     const ws = getMachineWebSocket(row.machine_id);
     if (ws && ws.readyState === 1) {
-      sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now);
+      sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory);
       continue;
     }
 

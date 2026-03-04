@@ -49,7 +49,7 @@ async function sendNotification(body: Record<string, unknown>): Promise<Response
 interface QueueRow {
   command_id: string;
   machine_id: string;
-  session_id: string;
+  session_id: string | null;
   command: string;
   chat_id: string;
   status: string;
@@ -59,6 +59,8 @@ interface QueueRow {
   next_retry_at: number | null;
   acked_at: number | null;
   last_error: string | null;
+  command_type?: string;
+  directory?: string | null;
 }
 
 async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
@@ -68,7 +70,8 @@ async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
   return runInDurableObject(stub, async (_instance, state) => {
     return state.storage.sql.exec(
       `SELECT command_id, machine_id, session_id, command, chat_id, status,
-              attempts, created_at, sent_at, next_retry_at, acked_at, last_error
+              attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
+              command_type, directory
        FROM command_queue
        WHERE session_id = ?
        ORDER BY created_at ASC`,
@@ -77,16 +80,35 @@ async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
   });
 }
 
+async function queryQueueByMachine(machineId: string): Promise<QueueRow[]> {
+  const id = env.ROUTER.idFromName("singleton");
+  const stub = env.ROUTER.get(id);
+
+  return runInDurableObject(stub, async (_instance, state) => {
+    return state.storage.sql.exec(
+      `SELECT command_id, machine_id, session_id, command, chat_id, status,
+              attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
+              command_type, directory
+       FROM command_queue
+       WHERE machine_id = ?
+       ORDER BY created_at ASC`,
+      machineId,
+    ).toArray() as QueueRow[];
+  });
+}
+
 async function insertQueueRow(row: {
   commandId: string;
   machineId: string;
-  sessionId: string;
+  sessionId: string | null;
   status: string;
   createdAt: number;
   sentAt?: number | null;
   ackedAt?: number | null;
   attempts?: number;
   nextRetryAt?: number | null;
+  commandType?: string;
+  directory?: string | null;
 }): Promise<void> {
   const id = env.ROUTER.idFromName("singleton");
   const stub = env.ROUTER.get(id);
@@ -95,8 +117,9 @@ async function insertQueueRow(row: {
     state.storage.sql.exec(
       `INSERT INTO command_queue (
          command_id, machine_id, session_id, command, chat_id,
-         status, attempts, created_at, sent_at, next_retry_at, acked_at, last_error
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         status, attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
+         command_type, directory
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.commandId,
       row.machineId,
       row.sessionId,
@@ -109,6 +132,8 @@ async function insertQueueRow(row: {
       row.nextRetryAt ?? null,
       row.ackedAt ?? null,
       null,
+      row.commandType ?? "execute",
+      row.directory ?? null,
     );
   });
 }
@@ -1022,5 +1047,152 @@ describe("generateCommandId", () => {
   it("generates unique IDs", () => {
     const ids = new Set(Array.from({ length: 50 }, () => generateCommandId()));
     expect(ids.size).toBe(50);
+  });
+});
+
+// ─── /launch Command: Integration Tests ──────────────────────────────
+
+function makeLaunchMessage(
+  machineId: string,
+  directory: string,
+  prompt: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/launch ${machineId} ${directory} ${prompt}`,
+    },
+  };
+}
+
+describe("/launch command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("replies with 'not connected' when machine has no WebSocket", async () => {
+    mockTelegramSendMessage(); // ack for error message
+
+    const res = await sendWebhook(
+      makeLaunchMessage("offline-machine", "/home/dev/project", "do something"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("queues a launch command when machine is connected via WebSocket", async () => {
+    const now = Date.now();
+    const machineId = `launch-machine-${now}`;
+
+    // Connect the machine via WebSocket so isMachineConnected returns true
+    const ws = await openMachineSocket(machineId);
+
+    mockTelegramSendMessage(); // ack "Launching on ..."
+
+    const res = await sendWebhook(
+      makeLaunchMessage(machineId, "/home/dev/myproject", "build and test the app"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Verify the launch command was queued with correct type and directory
+    const rows = await queryQueueByMachine(machineId);
+    // Filter to launch-type commands only (ignore any flushed execute commands)
+    const launchRows = rows.filter((r) => r.command_type === "launch");
+    expect(launchRows.length).toBeGreaterThanOrEqual(1);
+    const launchRow = launchRows[launchRows.length - 1]!;
+    expect(launchRow.command_type).toBe("launch");
+    expect(launchRow.directory).toBe("/home/dev/myproject");
+    expect(launchRow.command).toBe("build and test the app");
+    expect(launchRow.session_id).toBeNull();
+    expect(launchRow.machine_id).toBe(machineId);
+
+    ws.close();
+  });
+
+  it("sends a launch WebSocket message (not command type) to the machine", async () => {
+    const now = Date.now();
+    const machineId = `launch-ws-${now}`;
+
+    const ws = await openMachineSocket(machineId);
+
+    mockTelegramSendMessage(); // ack "Launching on ..."
+
+    // Set up listener BEFORE sending the webhook so we don't miss the message
+    const messagePromise = waitForWsMessage(ws);
+
+    await sendWebhook(
+      makeLaunchMessage(machineId, "/workspace/app", "run all tests"),
+    );
+
+    // The machine should receive a "launch" type message
+    const inbound = await messagePromise;
+    const msg = JSON.parse(inbound) as Record<string, unknown>;
+
+    expect(msg.type).toBe("launch");
+    expect(msg.directory).toBe("/workspace/app");
+    expect(msg.prompt).toBe("run all tests");
+    expect(msg.chatId).toBe(String(CHAT_ID_NUM));
+    expect(typeof msg.commandId).toBe("string");
+    // launch messages must NOT have sessionId
+    expect(msg.sessionId).toBeUndefined();
+
+    ws.close();
+  });
+
+  it("prompt captures everything after directory including spaces", async () => {
+    const now = Date.now();
+    const machineId = `launch-multiword-${now}`;
+
+    const ws = await openMachineSocket(machineId);
+    mockTelegramSendMessage();
+
+    // Set up listener BEFORE sending the webhook so we don't miss the message
+    const messagePromise = waitForWsMessage(ws);
+
+    await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/launch ${machineId} /tmp/proj implement a login page with JWT auth`,
+      },
+    });
+
+    const inbound = await messagePromise;
+    const msg = JSON.parse(inbound) as Record<string, unknown>;
+
+    expect(msg.type).toBe("launch");
+    expect(msg.prompt).toBe("implement a login page with JWT auth");
+    expect(msg.directory).toBe("/tmp/proj");
+
+    ws.close();
+  });
+
+  it("does not fall through to regular session resolution for /launch", async () => {
+    // Even if there's no session for the machine, /launch should not
+    // produce the "Could not find session" error message — it should only
+    // produce the "not connected" message.
+    mockTelegramSendMessage(); // exactly one Telegram call expected (not connected)
+
+    const res = await sendWebhook(
+      makeLaunchMessage("never-connected-machine", "/tmp", "hello"),
+    );
+
+    expect(res.status).toBe(200);
+    // fetchMock should have consumed exactly the one mock (not connected)
+    // If it tried a second sendMessage it would throw (no more mocks).
   });
 });
