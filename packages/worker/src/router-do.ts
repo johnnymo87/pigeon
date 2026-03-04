@@ -80,17 +80,66 @@ export class RouterDurableObject extends DurableObject<Env> {
     `);
 
     // Migrations: add new columns to existing tables (ignore "duplicate column" errors).
-    const migrations = [
+    const addColumnMigrations = [
       `ALTER TABLE command_queue ADD COLUMN command_type TEXT NOT NULL DEFAULT 'execute'`,
       `ALTER TABLE command_queue ADD COLUMN directory TEXT`,
     ];
-    for (const migration of migrations) {
+    for (const migration of addColumnMigrations) {
       try {
         this.sql.exec(migration);
       } catch {
         // Column already exists — ignore.
       }
     }
+
+    // Migration: make session_id nullable (needed for launch commands which have no session yet).
+    // The original table was created with session_id TEXT NOT NULL, but CREATE TABLE IF NOT EXISTS
+    // won't update an existing table. SQLite doesn't support ALTER COLUMN, so we recreate the table.
+    this.migrateSessionIdNullable();
+  }
+
+  private migrateSessionIdNullable(): void {
+    const columns = this.sql.exec("PRAGMA table_info(command_queue)").toArray() as Array<{
+      name: string;
+      notnull: number;
+      [key: string]: SqlStorageValue;
+    }>;
+    const sessionIdCol = columns.find((c) => c.name === "session_id");
+    if (!sessionIdCol || sessionIdCol.notnull !== 1) {
+      return; // Already nullable or column doesn't exist.
+    }
+
+    // Recreate table with session_id as nullable.
+    this.sql.exec("DROP TABLE IF EXISTS command_queue_v2");
+    this.sql.exec(`
+      CREATE TABLE command_queue_v2 (
+        command_id TEXT PRIMARY KEY,
+        machine_id TEXT NOT NULL,
+        session_id TEXT,
+        command TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        sent_at INTEGER,
+        next_retry_at INTEGER,
+        acked_at INTEGER,
+        last_error TEXT,
+        command_type TEXT NOT NULL DEFAULT 'execute',
+        directory TEXT
+      )
+    `);
+    this.sql.exec("INSERT INTO command_queue_v2 SELECT * FROM command_queue");
+    this.sql.exec("DROP TABLE command_queue");
+    this.sql.exec("ALTER TABLE command_queue_v2 RENAME TO command_queue");
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_command_queue_machine_status
+        ON command_queue(machine_id, status)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_command_queue_retry
+        ON command_queue(status, next_retry_at)
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
