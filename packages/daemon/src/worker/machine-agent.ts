@@ -1,5 +1,7 @@
+import type { OpencodeClient } from "../opencode-client";
 import type { StorageDb } from "../storage/database";
 import { ingestWorkerCommand, type WorkerCommandMessage } from "./command-ingest";
+import { ingestLaunchCommand } from "./launch-ingest";
 
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
@@ -17,6 +19,8 @@ export interface MachineAgentDeps {
   now?: () => number;
   fetchFn?: typeof fetch;
   createWebSocket?: (url: string, protocols: string[]) => WebSocket;
+  opencodeClient?: OpencodeClient;
+  sendTelegramMessage?: (chatId: string, text: string) => Promise<void>;
 }
 
 export function buildWorkerWebSocketUrl(workerUrl: string, machineId: string): string {
@@ -27,6 +31,8 @@ export class MachineAgent {
   private readonly now: () => number;
   private readonly fetchFn: typeof fetch;
   private readonly createWebSocket: (url: string, protocols: string[]) => WebSocket;
+  private readonly opencodeClient: OpencodeClient | undefined;
+  private readonly sendTelegramMessage: ((chatId: string, text: string) => Promise<void>) | undefined;
 
   private ws: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -44,6 +50,8 @@ export class MachineAgent {
     this.now = deps.now ?? Date.now;
     this.fetchFn = deps.fetchFn ?? fetch;
     this.createWebSocket = deps.createWebSocket ?? ((url, protocols) => new WebSocket(url, protocols));
+    this.opencodeClient = deps.opencodeClient;
+    this.sendTelegramMessage = deps.sendTelegramMessage;
   }
 
   connect(): void {
@@ -176,6 +184,41 @@ export class MachineAgent {
     const record = msg as Record<string, unknown>;
     if (record.type === "pong") {
       this.lastPongAt = this.now();
+      return;
+    }
+
+    if (record.type === "launch") {
+      const { commandId, directory, prompt, chatId } = record as Record<string, unknown>;
+      if (
+        typeof commandId !== "string"
+        || typeof directory !== "string"
+        || typeof prompt !== "string"
+        || typeof chatId !== "string"
+      ) {
+        console.warn("[machine-agent] received malformed launch message");
+        return;
+      }
+
+      if (!this.opencodeClient) {
+        console.warn("[machine-agent] received launch command but no opencodeClient is configured");
+        return;
+      }
+
+      console.log(`[machine-agent] received launch commandId=${commandId}`);
+
+      await ingestLaunchCommand({
+        commandId,
+        directory,
+        prompt,
+        chatId,
+        opencodeClient: this.opencodeClient,
+        sendTelegramReply: async (replyTo, text) => {
+          if (this.sendTelegramMessage) {
+            await this.sendTelegramMessage(replyTo, text);
+          }
+        },
+        sendAck: (id) => this.send({ type: "ack", commandId: id }),
+      });
       return;
     }
 

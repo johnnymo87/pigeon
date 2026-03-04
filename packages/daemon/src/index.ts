@@ -5,12 +5,27 @@ import {
   TelegramNotificationService,
   WorkerNotificationService,
 } from "./notification-service";
+import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
 import { MachineAgent } from "./worker/machine-agent";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
+
+const opencodeClient = config.opencodeUrl
+  ? new OpencodeClient({ baseUrl: config.opencodeUrl, password: config.opencodePassword })
+  : undefined;
+
+async function sendTelegramMessage(chatId: string, text: string): Promise<void> {
+  if (!config.telegramBotToken) return;
+  const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
+  await fetch(`${apiBase}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+  });
+}
 
 const machineAgent = config.workerUrl && config.workerApiKey && config.machineId
   ? new MachineAgent(
@@ -21,6 +36,10 @@ const machineAgent = config.workerUrl && config.workerApiKey && config.machineId
         chatId: config.telegramChatId,
       },
       storage,
+      {
+        opencodeClient,
+        sendTelegramMessage,
+      },
     )
   : undefined;
 
