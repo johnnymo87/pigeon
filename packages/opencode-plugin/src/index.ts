@@ -49,18 +49,33 @@ const plugin: Plugin = async (ctx) => {
     const directChannel = await startDirectChannelServer({
       async onExecute(request: ExecuteCommandEnvelope) {
         try {
-          await ctx.client.session.promptAsync({
-            path: { id: request.sessionId },
-            body: {
-              parts: [
-                {
-                  type: "text",
-                  text: request.command,
-                },
-              ],
-              noReply: false,
-            },
-          })
+          // Use internalFetch directly instead of ctx.client.session.promptAsync()
+          // because the SDK method silently fails in serve mode — it returns
+          // without error but the prompt is never actually delivered to the session.
+          const promptUrl = new URL(
+            `/session/${encodeURIComponent(request.sessionId)}/prompt_async`,
+            ctx.serverUrl,
+          )
+          const res = await internalFetch(
+            new Request(promptUrl.toString(), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                parts: [{ type: "text", text: request.command }],
+                noReply: false,
+              }),
+              signal: AbortSignal.timeout(10_000),
+            }),
+          )
+
+          if (!res.ok) {
+            const text = await res.text().catch(() => "")
+            return {
+              success: false,
+              errorCode: ResultErrorCode.ExecutionError,
+              errorMessage: `prompt_async failed: ${res.status} ${text}`,
+            }
+          }
 
           return {
             success: true,
