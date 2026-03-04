@@ -39,4 +39,19 @@ describe("loadConfig", () => {
     expect(config.telegramBotToken).toBe("bot");
     expect(config.telegramChatId).toBe("123");
   });
+
+  it("loads opencode env vars when OPENCODE_URL and OPENCODE_PASSWORD are set", () => {
+    const config = loadConfig({
+      OPENCODE_URL: "http://localhost:4320",
+      OPENCODE_PASSWORD: "hunter2",
+    });
+    expect(config.opencodeUrl).toBe("http://localhost:4320");
+    expect(config.opencodePassword).toBe("hunter2");
+  });
+
+  it("returns undefined for opencodeUrl and opencodePassword when env vars are not set", () => {
+    const config = loadConfig({});
+    expect(config.opencodeUrl).toBeUndefined();
+    expect(config.opencodePassword).toBeUndefined();
+  });
 });

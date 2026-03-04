@@ -6,6 +6,8 @@ export interface DaemonConfig {
   workerUrl?: string;
   workerApiKey?: string;
   machineId?: string;
+  opencodeUrl?: string;
+  opencodePassword?: string;
 }
 
 const DEFAULT_PORT = 4731;
@@ -34,5 +36,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     workerUrl: env.CCR_WORKER_URL?.trim() || undefined,
     workerApiKey: env.CCR_API_KEY?.trim() || undefined,
     machineId: env.CCR_MACHINE_ID?.trim() || undefined,
+    opencodeUrl: env.OPENCODE_URL?.trim() || undefined,
+    opencodePassword: env.OPENCODE_PASSWORD?.trim() || undefined,
   };
 }
