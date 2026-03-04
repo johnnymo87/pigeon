@@ -215,6 +215,8 @@ export class MachineAgent {
         sendTelegramReply: async (replyTo, text) => {
           if (this.sendTelegramMessage) {
             await this.sendTelegramMessage(replyTo, text);
+          } else {
+            console.warn("[machine-agent] sendTelegramMessage not configured, cannot reply:", text);
           }
         },
         sendAck: (id) => this.send({ type: "ack", commandId: id }),

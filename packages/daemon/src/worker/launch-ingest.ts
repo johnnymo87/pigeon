@@ -24,6 +24,7 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
   try {
     const session = await opencodeClient.createSession(directory);
     await opencodeClient.sendPrompt(session.id, directory, prompt);
+    console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
     await sendTelegramReply(
       chatId,
       `Session started: \`${session.id}\`\nDirectory: \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,

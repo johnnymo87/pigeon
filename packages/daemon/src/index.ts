@@ -19,12 +19,19 @@ const opencodeClient = config.opencodeUrl
 
 async function sendTelegramMessage(chatId: string, text: string): Promise<void> {
   if (!config.telegramBotToken) return;
-  const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
-  await fetch(`${apiBase}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
-  });
+  try {
+    const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
+    const res = await fetch(`${apiBase}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+    });
+    if (!res.ok) {
+      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status}`);
+    }
+  } catch (err) {
+    console.warn("[pigeon-daemon] sendTelegramMessage fetch error:", err);
+  }
 }
 
 const machineAgent = config.workerUrl && config.workerApiKey && config.machineId
