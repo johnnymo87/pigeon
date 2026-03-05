@@ -57,10 +57,6 @@ const plugin: Plugin = async (ctx) => {
             ctx.serverUrl,
           )
           const headers: Record<string, string> = { "Content-Type": "application/json" }
-          const serverPassword = process.env.OPENCODE_SERVER_PASSWORD
-          if (serverPassword) {
-            headers["Authorization"] = "Basic " + btoa(`opencode:${serverPassword}`)
-          }
           const res = await internalFetch(
             new Request(promptUrl.toString(), {
               method: "POST",

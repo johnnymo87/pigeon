@@ -3,7 +3,7 @@ export interface CommandWsLike {
   send(message: string): void;
 }
 
-export type CommandType = "execute" | "launch";
+export type CommandType = "execute" | "launch" | "kill";
 
 interface QueueCountRow {
   count: number;
@@ -60,6 +60,8 @@ export function sendCommand(
   try {
     const message = commandType === "launch"
       ? JSON.stringify({ type: "launch", commandId, directory, prompt: command, chatId })
+      : commandType === "kill"
+      ? JSON.stringify({ type: "kill", commandId, sessionId, chatId })
       : JSON.stringify({ type: "command", commandId, sessionId, command, chatId });
 
     ws.send(message);

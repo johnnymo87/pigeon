@@ -319,6 +319,38 @@ export async function handleTelegramWebhook(
       deliverNow?.(machineId);
       return OK();
     }
+
+    // Handle /kill command
+    const killMatch = update.message.text.match(/^\/kill\s+(\S+)$/);
+    if (killMatch) {
+      const sessionId = killMatch[1]!;
+      const killChatId = update.message.chat.id;
+
+      // Look up session to find its machine
+      const sessionRows = sql.exec(
+        "SELECT machine_id, label FROM sessions WHERE session_id = ?",
+        sessionId,
+      ).toArray() as Array<{ machine_id: string; label: string | null; [key: string]: SqlStorageValue }>;
+
+      const session = sessionRows[0];
+      if (!session) {
+        await sendTelegramMessage(env, killChatId, `Session \`${sessionId}\` not found.`);
+        return OK();
+      }
+
+      const isConnected = isMachineConnected ? isMachineConnected(session.machine_id) : false;
+      if (!isConnected) {
+        await sendTelegramMessage(env, killChatId, `${session.machine_id} is not connected.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(sql, env, session.machine_id, sessionId, "", String(killChatId), session.label, "kill");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\`...`);
+      deliverNow?.(session.machine_id);
+      return OK();
+    }
   }
 
   // Handle message (text, reply)

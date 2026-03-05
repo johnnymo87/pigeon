@@ -1,6 +1,7 @@
 import type { OpencodeClient } from "../opencode-client";
 import type { StorageDb } from "../storage/database";
 import { ingestWorkerCommand, type WorkerCommandMessage } from "./command-ingest";
+import { ingestKillCommand } from "./kill-ingest";
 import { ingestLaunchCommand } from "./launch-ingest";
 
 const PING_INTERVAL_MS = 30_000;
@@ -210,6 +211,41 @@ export class MachineAgent {
         commandId,
         directory,
         prompt,
+        chatId,
+        opencodeClient: this.opencodeClient,
+        sendTelegramReply: async (replyTo, text) => {
+          if (this.sendTelegramMessage) {
+            await this.sendTelegramMessage(replyTo, text);
+          } else {
+            console.warn("[machine-agent] sendTelegramMessage not configured, cannot reply:", text);
+          }
+        },
+        sendAck: (id) => this.send({ type: "ack", commandId: id }),
+      });
+      return;
+    }
+
+    if (record.type === "kill") {
+      const { commandId, sessionId, chatId } = record as Record<string, unknown>;
+      if (
+        typeof commandId !== "string"
+        || typeof sessionId !== "string"
+        || typeof chatId !== "string"
+      ) {
+        console.warn("[machine-agent] received malformed kill message");
+        return;
+      }
+
+      if (!this.opencodeClient) {
+        console.warn("[machine-agent] received kill command but no opencodeClient is configured");
+        return;
+      }
+
+      console.log(`[machine-agent] received kill commandId=${commandId}`);
+
+      await ingestKillCommand({
+        commandId,
+        sessionId,
         chatId,
         opencodeClient: this.opencodeClient,
         sendTelegramReply: async (replyTo, text) => {

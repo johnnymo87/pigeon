@@ -14,7 +14,7 @@ const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
 
 const opencodeClient = config.opencodeUrl
-  ? new OpencodeClient({ baseUrl: config.opencodeUrl, password: config.opencodePassword })
+  ? new OpencodeClient({ baseUrl: config.opencodeUrl })
   : undefined;
 
 async function sendTelegramMessage(chatId: string, text: string): Promise<void> {

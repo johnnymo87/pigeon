@@ -1196,3 +1196,95 @@ describe("/launch command", () => {
     // If it tried a second sendMessage it would throw (no more mocks).
   });
 });
+
+// ─── /kill Command: Integration Tests ──────────────────────────────
+
+function makeKillMessage(
+  sessionId: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/kill ${sessionId}`,
+    },
+  };
+}
+
+describe("/kill command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("replies with 'not found' when session does not exist", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeKillMessage("nonexistent-session"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("replies with 'not connected' when machine has no WebSocket", async () => {
+    const now = Date.now();
+    const sessionId = `kill-offline-${now}`;
+    const machineId = `kill-offline-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeKillMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("queues a kill command and sends WebSocket message when machine is connected", async () => {
+    const now = Date.now();
+    const sessionId = `kill-connected-${now}`;
+    const machineId = `kill-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+
+    const ws = await openMachineSocket(machineId);
+    mockTelegramSendMessage(); // ack "Killing session..."
+
+    const messagePromise = waitForWsMessage(ws);
+
+    const res = await sendWebhook(makeKillMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // The machine should receive a "kill" type message
+    const inbound = await messagePromise;
+    const msg = JSON.parse(inbound) as Record<string, unknown>;
+
+    expect(msg.type).toBe("kill");
+    expect(msg.sessionId).toBe(sessionId);
+    expect(msg.chatId).toBe(String(CHAT_ID_NUM));
+    expect(typeof msg.commandId).toBe("string");
+    // kill messages must NOT have command or directory
+    expect(msg.command).toBeUndefined();
+    expect(msg.directory).toBeUndefined();
+
+    ws.close();
+  });
+
+  it("does not fall through to regular session resolution for /kill", async () => {
+    // /kill with unknown session should produce "not found", not "Could not find session"
+    mockTelegramSendMessage(); // exactly one Telegram call expected
+
+    const res = await sendWebhook(makeKillMessage("unknown-session"));
+
+    expect(res.status).toBe(200);
+  });
+});

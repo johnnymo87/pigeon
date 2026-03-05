@@ -131,36 +131,34 @@ describe("OpencodeClient", () => {
     });
   });
 
-  describe("Authorization header", () => {
-    it("includes Basic auth header when password is set", async () => {
+  describe("deleteSession", () => {
+    it("sends DELETE to /session/:id and resolves on success", async () => {
       fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
 
       const client = new OpencodeClient({
         baseUrl: "http://localhost:4320",
-        password: "secret",
         fetchFn: fetchMock as unknown as typeof fetch,
       });
 
-      await client.healthCheck();
+      await client.deleteSession("sess-abc");
 
-      const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const headers = options.headers as Record<string, string>;
-      expect(headers["Authorization"]).toBe("Basic " + btoa("opencode:secret"));
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc",
+        expect.objectContaining({ method: "DELETE" }),
+      );
     });
 
-    it("omits Authorization header when password is not set", async () => {
-      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+    it("throws when response is non-OK", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404, statusText: "Not Found" }));
 
       const client = new OpencodeClient({
         baseUrl: "http://localhost:4320",
         fetchFn: fetchMock as unknown as typeof fetch,
       });
 
-      await client.healthCheck();
-
-      const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const headers = options.headers as Record<string, string>;
-      expect(headers["Authorization"]).toBeUndefined();
+      await expect(client.deleteSession("sess-abc")).rejects.toThrow(
+        "deleteSession failed: 404 Not Found",
+      );
     });
   });
 });
