@@ -19,17 +19,20 @@ Use this skill for day-to-day daemon ops and post-deploy checks.
 ```bash
 systemctl status pigeon-daemon.service --no-pager
 curl -s http://127.0.0.1:4731/health
+systemctl status opencode-serve.service --no-pager
+curl -s http://127.0.0.1:4096/global/health
 ```
 
 Expected:
 
-- service is active/running
-- health returns `{"ok":true,"service":"pigeon-daemon"}`
+- pigeon-daemon is active/running, health returns `{"ok":true,"service":"pigeon-daemon"}`
+- opencode-serve is active/running, health returns `{"healthy":true,...}`
 
 ## Operational Logs
 
 ```bash
 journalctl -u pigeon-daemon.service -n 100 --no-pager
+journalctl -u opencode-serve.service -n 100 --no-pager
 ```
 
 Look for:
@@ -37,12 +40,17 @@ Look for:
 - machine-agent connect/reconnect messages
 - worker register/unregister success
 - notification send failures
+- launch-ingest: `session started sessionId=... directory=...`
+- kill-ingest: `session terminated sessionId=...`
 
 ## Restart Procedure
 
 ```bash
 sudo systemctl restart pigeon-daemon.service
 systemctl status pigeon-daemon.service --no-pager
+# If opencode serve needs restart:
+sudo systemctl restart opencode-serve.service
+systemctl status opencode-serve.service --no-pager
 ```
 
 ## Verify

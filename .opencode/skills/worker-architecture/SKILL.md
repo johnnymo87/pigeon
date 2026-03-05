@@ -48,6 +48,37 @@ If no `cmd:TOKEN:action` pattern is found in the `replyMarkup` (e.g. plain text 
 - `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks
 - `GET /ws?machineId=...` with upgrade + protocol `ccr,<CCR_API_KEY>` -> machine agent socket
 
+## Telegram Commands
+
+### `/launch <machine> <directory> <prompt>`
+
+Starts a headless OpenCode session on a remote machine.
+
+1. Worker parses machine, directory, and prompt from the message text.
+2. Checks if the machine has an active WebSocket connection; replies "not connected" if not.
+3. Queues a `"launch"` type command with `session_id = null` and the directory.
+4. WebSocket message format: `{ type: "launch", commandId, directory, prompt, chatId }`
+5. Daemon's `launch-ingest.ts` creates a session via `OpencodeClient.createSession()`, sends the prompt, and replies to Telegram with the session ID.
+6. The pigeon plugin in opencode-serve detects the new session and registers it with the worker via `/sessions/register`.
+
+### `/kill <session-id>`
+
+Terminates a running OpenCode session.
+
+1. Worker looks up the session in the `sessions` table to find the `machine_id`.
+2. Replies "not found" if session doesn't exist, "not connected" if machine is offline.
+3. Queues a `"kill"` type command.
+4. WebSocket message format: `{ type: "kill", commandId, sessionId, chatId }`
+5. Daemon's `kill-ingest.ts` calls `OpencodeClient.deleteSession()` and replies to Telegram with the result.
+
+## Command Types
+
+`CommandType = "execute" | "launch" | "kill"` (in `command-queue.ts`)
+
+- `execute`: regular command injection into an existing session (default)
+- `launch`: create a new headless session + send initial prompt
+- `kill`: terminate an existing session via opencode API
+
 ## Command Queue Notes
 
 - At-least-once behavior through persisted queue rows

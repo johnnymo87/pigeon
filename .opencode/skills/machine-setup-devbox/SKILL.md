@@ -23,6 +23,8 @@ Use this for new machine onboarding or broken environment recovery.
 ```bash
 systemctl status pigeon-daemon.service --no-pager
 curl -s http://127.0.0.1:4731/health
+systemctl status opencode-serve.service --no-pager
+curl -s http://127.0.0.1:4096/global/health
 ```
 
 ## Secret Checks
@@ -44,6 +46,6 @@ op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/sessions.json -w "%{h
 
 Expected:
 
-- daemon service running
-- local health endpoint returns ok
+- pigeon-daemon service running, health returns ok
+- opencode-serve service running, health returns `{"healthy":true,...}`
 - authenticated worker call returns 200

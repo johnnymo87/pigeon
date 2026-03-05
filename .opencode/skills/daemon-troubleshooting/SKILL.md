@@ -48,6 +48,20 @@ curl -s http://127.0.0.1:4731/health
   - Check `pending_questions` table TTL (4h). Old questions are evicted.
   - Verify `/question-asked` was called (daemon has no HTTP request logging by default; add temporary logging if needed).
 
+## Launch / Kill Failures
+
+- **"opencode serve is not running on this machine"**
+  - `opencode-serve.service` is down or unhealthy. Check: `systemctl status opencode-serve.service` and `curl http://127.0.0.1:4096/global/health`.
+- **"Failed to launch session: createSession failed: ..."**
+  - opencode serve rejected the session creation. Check the directory exists and opencode-serve logs: `journalctl -u opencode-serve.service -n 50`.
+- **"Failed to kill session: deleteSession failed: ..."**
+  - Session may already be terminated, or opencode serve is down. Check opencode-serve logs.
+- **Launch succeeds but no Telegram notifications from the session**
+  - The pigeon plugin in opencode-serve must detect and register the session. Check that the plugin symlink is intact: `ls -la ~/.config/opencode/plugins/opencode-pigeon.ts`.
+  - Check opencode-serve logs for plugin initialization errors.
+- **`/kill` returns "Session not found" from worker**
+  - The session was never registered by the plugin, or was already unregistered. The plugin registers sessions via `/sessions/register` after late discovery. If `/kill` is sent immediately after `/launch`, there may be a race condition -- retry after a few seconds.
+
 ## Nvim Adapter Failures
 
 - **Check `nvim_socket` is set on session:**

@@ -57,6 +57,23 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 
 The notifier tries the worker path first (`WorkerNotificationService`), falling back to direct Telegram API (`TelegramNotificationService`).
 
+## OpenCode Serve Integration
+
+The daemon communicates with a local `opencode serve` instance for headless session management. Configuration:
+
+- `OPENCODE_URL` env var (e.g. `http://127.0.0.1:4096`) -- no authentication (localhost-only, single-user)
+- `OpencodeClient` class in `packages/daemon/src/opencode-client.ts`
+- Methods: `healthCheck()`, `createSession(directory)`, `sendPrompt(sessionId, directory, prompt)`, `deleteSession(sessionId)`
+
+### Launch / Kill Ingest
+
+Worker commands of type `"launch"` and `"kill"` are handled by dedicated ingest modules in `packages/daemon/src/worker/`:
+
+- `launch-ingest.ts`: acks immediately, checks opencode health, creates session, sends prompt, replies to Telegram with session ID
+- `kill-ingest.ts`: acks immediately, calls `DELETE /session/<id>`, replies to Telegram with result
+
+Both are wired through `machine-agent.ts` message handlers (alongside the existing `"command"` type for regular command injection).
+
 ## Integration Flow
 
 ### Stop Flow

@@ -14,6 +14,7 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - OpenCode plugin package path: `packages/opencode-plugin`
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
 - Daemon health (local): `curl http://127.0.0.1:4731/health`
+- OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
 
 ## Skills TOC
 
