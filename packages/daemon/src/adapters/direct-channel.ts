@@ -5,25 +5,9 @@ import {
   replyQuestionViaOpencodeDirectChannel,
   type OpencodeDirectAdapterDeps,
 } from "../opencode-direct/adapter";
-import {
-  OpencodeDirectSource,
-  type OpencodeDirectSource as OpencodeDirectSourceType,
-} from "../opencode-direct/contracts";
+import { OpencodeDirectSource } from "../opencode-direct/contracts";
 
 export interface DirectChannelAdapterDeps extends OpencodeDirectAdapterDeps {}
-
-function sourceForCommand(command: string): OpencodeDirectSourceType {
-  const trimmed = command.trim();
-  if (
-    trimmed === "continue"
-    || trimmed === "y"
-    || trimmed === "n"
-    || trimmed === "exit"
-  ) {
-    return OpencodeDirectSource.TelegramCallback;
-  }
-  return OpencodeDirectSource.TelegramReply;
-}
 
 export class DirectChannelAdapter implements CommandDeliveryAdapter {
   readonly name = "direct-channel";
@@ -53,7 +37,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         command,
         endpoint,
         authToken,
-        source: sourceForCommand(command),
+        source: OpencodeDirectSource.TelegramReply,
         ...(context.chatId !== undefined
           ? { chatId: String(context.chatId) }
           : {}),

@@ -470,7 +470,7 @@ async function main(): Promise<void> {
         chatId,
         text: `Parity injection test ${runId}`,
         replyMarkup: {
-          inline_keyboard: [[{ text: "Continue", callback_data: "cmd:dummy:continue" }]],
+          inline_keyboard: [],
         },
       }),
     });

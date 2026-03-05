@@ -7,25 +7,18 @@ import {
 import { openStorageDb } from "../src/storage/database";
 
 describe("formatTelegramNotification", () => {
-  it("formats markdown body and callback buttons", () => {
+  it("formats markdown body with no inline buttons", () => {
     const result = formatTelegramNotification({
       event: "Stop",
       label: "my_[label]*",
       summary: "Done",
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
-      buttons: [
-        { text: "A", action: "continue" },
-        { text: "B", action: "y" },
-        { text: "C", action: "n" },
-        { text: "D", action: "exit" },
-      ],
     });
 
     expect(result.text).toContain("*Stop*: my\\_\\[label\\]\\*");
     expect(result.text).toContain("📂 `projects/pigeon`");
-    expect(result.replyMarkup.inline_keyboard[0]?.[0]?.callback_data).toBe("cmd:tok123:continue");
-    expect(result.replyMarkup.inline_keyboard[1]?.[0]?.callback_data).toBe("cmd:tok123:exit");
+    expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
   it("includes machine ID in info line when provided", () => {
@@ -35,7 +28,6 @@ describe("formatTelegramNotification", () => {
       summary: "Done",
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
-      buttons: [],
       machineId: "devbox",
     });
 
@@ -49,7 +41,6 @@ describe("formatTelegramNotification", () => {
       summary: "Done",
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
-      buttons: [],
     });
 
     expect(result.text).toContain("📂 `projects/pigeon`");

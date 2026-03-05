@@ -2,18 +2,12 @@ import { randomBytes } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 
-interface NotificationButton {
-  text: string;
-  action: string;
-}
-
 interface NotificationInput {
   event: string;
   label: string;
   summary: string;
   cwd: string | null;
   token: string;
-  buttons: NotificationButton[];
   machineId?: string;
 }
 
@@ -88,23 +82,10 @@ export function formatTelegramNotification(input: NotificationInput): {
     "↩️ _Swipe-reply to respond_",
   ].join("\n");
 
-  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
-  rows.push(input.buttons.slice(0, 3).map((button) => ({
-    text: button.text,
-    callback_data: `cmd:${input.token}:${button.action}`,
-  })));
-
-  if (input.buttons.length > 3) {
-    rows.push(input.buttons.slice(3).map((button) => ({
-      text: button.text,
-      callback_data: `cmd:${input.token}:${button.action}`,
-    })));
-  }
-
   return {
     text,
     replyMarkup: {
-      inline_keyboard: rows,
+      inline_keyboard: [],
     },
   };
 }
@@ -244,7 +225,6 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       summary: input.summary,
       cwd: input.session.cwd,
       token,
-      buttons: [],
       machineId: this.machineId,
     });
 
@@ -344,7 +324,6 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       summary: input.summary,
       cwd: input.session.cwd,
       token,
-      buttons: [],
       machineId: this.machineId,
     });
 

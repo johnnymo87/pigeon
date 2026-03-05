@@ -172,13 +172,7 @@ function resolveCallbackSession(
   const mapping = lookupMessageByToken(sql, token, String(chatId));
   if (!mapping) return null;
 
-  const commandMap: Record<string, string> = {
-    continue: "",
-    yes: "y",
-    no: "n",
-    exit: "/exit",
-  };
-  const command = commandMap[action] ?? action;
+  const command = action;
 
   return { sessionId: mapping.session_id, command };
 }
