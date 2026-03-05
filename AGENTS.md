@@ -16,6 +16,25 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Daemon health (local): `curl http://127.0.0.1:4731/health`
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
 
+## Usage
+
+Pigeon is a Telegram bot that routes commands to machines running opencode.
+Messages flow: Telegram → Worker (Cloudflare) → Daemon (local) → opencode serve.
+
+### Commands
+
+| Command | Example | What it does |
+|---------|---------|--------------|
+| *(plain message)* | `fix the failing test in src/auth.ts` | Executes in the current opencode TUI session via the plugin |
+| `/launch <machine> <dir> <prompt>` | `/launch devbox ~/projects/pigeon "say hello"` | Starts a headless opencode session on the specified machine |
+| `/kill <session-id>` | `/kill sess-abc123` | Terminates a headless session (machine looked up automatically) |
+
+### Notifications
+
+Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name.
+
+Health check URLs are listed in the Quickstart section above.
+
 ## Skills TOC
 
 ### Worker
