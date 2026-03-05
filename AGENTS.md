@@ -29,6 +29,16 @@ Messages flow: Telegram → Worker (Cloudflare) → Daemon (local) → opencode 
 | `/launch <machine> <dir> <prompt>` | `/launch devbox ~/projects/pigeon "say hello"` | Starts a headless opencode session on the specified machine |
 | `/kill <session-id>` | `/kill sess-abc123` | Terminates a headless session (machine looked up automatically) |
 
+### Attaching to a headless session
+
+From a terminal on the machine, connect to a session launched via `/launch`:
+
+```
+opencode attach http://localhost:4096 --session <session-id>
+```
+
+The session ID is included in the Telegram confirmation message.
+
 ### Notifications
 
 Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name.
