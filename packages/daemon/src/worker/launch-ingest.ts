@@ -5,19 +5,21 @@ export interface LaunchCommandInput {
   directory: string;
   prompt: string;
   chatId: string;
+  machineId?: string;
   opencodeClient: OpencodeClient;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
   sendAck: (commandId: string) => void;
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
-  const { commandId, directory, prompt, chatId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const { commandId, directory, prompt, chatId, machineId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const machineLabel = machineId ? ` on ${machineId}` : "";
 
   sendAck(commandId);
 
   const healthy = await opencodeClient.healthCheck();
   if (!healthy) {
-    await sendTelegramReply(chatId, "opencode serve is not running on this machine.");
+    await sendTelegramReply(chatId, `opencode serve is not running${machineLabel}.`);
     return;
   }
 
@@ -27,10 +29,10 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
     await sendTelegramReply(
       chatId,
-      `Session started: \`${session.id}\`\nDirectory: \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,
+      `Session started${machineLabel}: \`${session.id}\`\nDirectory: \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await sendTelegramReply(chatId, `Failed to launch session: ${message}`);
+    await sendTelegramReply(chatId, `Failed to launch session${machineLabel}: ${message}`);
   }
 }

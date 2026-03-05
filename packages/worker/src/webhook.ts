@@ -347,7 +347,7 @@ export async function handleTelegramWebhook(
       const commandId = await queueCommand(sql, env, session.machine_id, sessionId, "", String(killChatId), session.label, "kill");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\`...`);
+      await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\` on ${session.machine_id}...`);
       deliverNow?.(session.machine_id);
       return OK();
     }

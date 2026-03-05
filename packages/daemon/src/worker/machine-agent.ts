@@ -212,6 +212,7 @@ export class MachineAgent {
         directory,
         prompt,
         chatId,
+        machineId: this.config.machineId,
         opencodeClient: this.opencodeClient,
         sendTelegramReply: async (replyTo, text) => {
           if (this.sendTelegramMessage) {
@@ -247,6 +248,7 @@ export class MachineAgent {
         commandId,
         sessionId,
         chatId,
+        machineId: this.config.machineId,
         opencodeClient: this.opencodeClient,
         sendTelegramReply: async (replyTo, text) => {
           if (this.sendTelegramMessage) {

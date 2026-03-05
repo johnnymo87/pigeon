@@ -14,6 +14,7 @@ interface NotificationInput {
   cwd: string | null;
   token: string;
   buttons: NotificationButton[];
+  machineId?: string;
 }
 
 interface SessionLike {
@@ -73,13 +74,16 @@ export function formatTelegramNotification(input: NotificationInput): {
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
+  const infoLine = input.machineId
+    ? `📂 \`${cwdShort}\` · 🖥 ${escapeMarkdown(input.machineId)}`
+    : `📂 \`${cwdShort}\``;
 
   const text = [
     `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`,
     "",
     input.summary,
     "",
-    `📂 \`${cwdShort}\``,
+    infoLine,
     "",
     "↩️ _Swipe-reply to respond_",
   ].join("\n");
@@ -110,6 +114,7 @@ export function formatQuestionNotification(input: {
   questions: QuestionInfoData[];
   cwd: string | null;
   token: string;
+  machineId?: string;
 }): {
   text: string;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
@@ -142,8 +147,11 @@ export function formatQuestionNotification(input: {
     lines.push(`_\\+${input.questions.length - 1} more question(s) — answer in app_`);
   }
 
+  const questionInfoLine = input.machineId
+    ? `📂 \`${cwdShort}\` · 🖥 ${escapeMarkdown(input.machineId)}`
+    : `📂 \`${cwdShort}\``;
   lines.push("");
-  lines.push(`📂 \`${cwdShort}\``);
+  lines.push(questionInfoLine);
 
   const hasCustom = firstQuestion?.custom !== false;
   if (hasCustom) {
@@ -186,6 +194,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
     private readonly chatId: string,
     private readonly nowFn: () => number = Date.now,
     private readonly fetchFn: typeof fetch = fetch,
+    private readonly machineId?: string,
   ) {
     this.apiBase = `https://api.telegram.org/bot${this.botToken}`;
   }
@@ -236,6 +245,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       cwd: input.session.cwd,
       token,
       buttons: [],
+      machineId: this.machineId,
     });
 
     await this.sendTelegramMessage(
@@ -274,6 +284,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       questions: input.questions,
       cwd: input.session.cwd,
       token,
+      machineId: this.machineId,
     });
 
     await this.sendTelegramMessage(
@@ -293,6 +304,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     private readonly workerSender: WorkerNotificationSender,
     private readonly chatId: string,
     private readonly nowFn: () => number = Date.now,
+    private readonly machineId?: string,
   ) {}
 
   private async sendViaWorker(
@@ -333,6 +345,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       cwd: input.session.cwd,
       token,
       buttons: [],
+      machineId: this.machineId,
     });
 
     await this.sendViaWorker(
@@ -370,6 +383,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       questions: input.questions,
       cwd: input.session.cwd,
       token,
+      machineId: this.machineId,
     });
 
     await this.sendViaWorker(

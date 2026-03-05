@@ -27,6 +27,34 @@ describe("formatTelegramNotification", () => {
     expect(result.replyMarkup.inline_keyboard[0]?.[0]?.callback_data).toBe("cmd:tok123:continue");
     expect(result.replyMarkup.inline_keyboard[1]?.[0]?.callback_data).toBe("cmd:tok123:exit");
   });
+
+  it("includes machine ID in info line when provided", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "test",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      buttons: [],
+      machineId: "devbox",
+    });
+
+    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
+  });
+
+  it("omits machine ID from info line when not provided", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "test",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      buttons: [],
+    });
+
+    expect(result.text).toContain("📂 `projects/pigeon`");
+    expect(result.text).not.toContain("🖥");
+  });
 });
 
 describe("TelegramNotificationService", () => {

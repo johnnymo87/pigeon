@@ -81,7 +81,7 @@ describe("ingestLaunchCommand", () => {
 
       expect(input.sendTelegramReply).toHaveBeenCalledWith(
         "42",
-        "opencode serve is not running on this machine.",
+        "opencode serve is not running.",
       );
     });
 

@@ -55,11 +55,11 @@ if (machineAgent) {
 }
 
 const workerNotifier = machineAgent && config.telegramChatId
-  ? new WorkerNotificationService(storage, machineAgent, config.telegramChatId)
+  ? new WorkerNotificationService(storage, machineAgent, config.telegramChatId, Date.now, config.machineId)
   : undefined;
 
 const telegramNotifier = config.telegramBotToken && config.telegramChatId
-  ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId)
+  ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
   : undefined;
 
 const notifier = workerNotifier && telegramNotifier
