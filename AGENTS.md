@@ -15,6 +15,8 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
 - Daemon health (local): `curl http://127.0.0.1:4731/health`
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
+- Deploy worker: `bun run --filter '@pigeon/worker' deploy`
+- Deploy daemon/plugin: `git pull && bun install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
 
 ## Usage
 
@@ -88,3 +90,5 @@ Health check URLs are listed in the Quickstart section above.
   - Use for 1Password/sops secret flow, token sources, and auth boundaries.
 - [machine-setup-devbox](.opencode/skills/machine-setup-devbox/SKILL.md)
   - Use when onboarding or repairing devbox/macOS machine configuration.
+- [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md)
+  - Use when deploying pigeon code changes across all machines after merging to main.
