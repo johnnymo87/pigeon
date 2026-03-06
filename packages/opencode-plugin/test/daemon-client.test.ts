@@ -1,5 +1,7 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test"
-import { registerSession, notifyStop, _resetBreakerForTesting } from "../src/daemon-client"
+import { registerSession, notifyStop, notifyQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
+import { SessionManager } from "../src/session-state"
+import { MessageTail } from "../src/message-tail"
 
 describe("daemon-client", () => {
   let server: ReturnType<typeof Bun.serve> | undefined
@@ -339,6 +341,150 @@ describe("daemon-client", () => {
       const result = await registerSession(opts)
       expect(result).toBeNull()
       expect(requestLog).toHaveLength(0)
+    })
+  })
+
+  describe("question.asked flushes unnotified text", () => {
+    // Simulates the plugin's question.asked handler: when a question fires
+    // and there's unnotified assistant text, a stop notification should be
+    // sent first, then the question notification.
+
+    test("sends stop before question when text is unnotified", async () => {
+      // given - registered session with unnotified assistant text
+      const sessionManager = new SessionManager()
+      const messageTail = new MessageTail()
+
+      sessionManager.onSessionCreated("sess-q")
+      sessionManager.onRegistered("sess-q")
+
+      // Simulate assistant text arriving (message.updated + part.updated)
+      messageTail.onMessageUpdated({ id: "msg-1", sessionID: "sess-q", role: "assistant" })
+      messageTail.onPartUpdated(
+        { id: "part-1", sessionID: "sess-q", messageID: "msg-1", type: "text" },
+        "Here is the design for section 1...",
+      )
+
+      const daemonUrl = `http://127.0.0.1:${serverPort}`
+
+      // when - question.asked fires (no session.idle preceded it)
+      // This is what the plugin handler should do:
+      const currentMsgId = messageTail.getCurrentMessageId("sess-q")
+      if (sessionManager.shouldNotify("sess-q", currentMsgId)) {
+        sessionManager.setNotified("sess-q", currentMsgId!)
+        const summary = messageTail.getSummary("sess-q")
+        if (summary) {
+          await notifyStop({
+            sessionId: "sess-q",
+            message: summary,
+            label: "test",
+            daemonUrl,
+            log: mockLog,
+          })
+        }
+      }
+      await notifyQuestionAsked({
+        sessionId: "sess-q",
+        requestId: "req-1",
+        questions: [{ question: "Looks good?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl,
+        log: mockLog,
+      })
+
+      // then - stop sent first, then question
+      expect(requestLog).toHaveLength(2)
+      expect(requestLog[0].path).toBe("/stop")
+      expect(requestLog[0].body.session_id).toBe("sess-q")
+      expect(requestLog[0].body.message).toBe("Here is the design for section 1...")
+      expect(requestLog[1].path).toBe("/question-asked")
+      expect(requestLog[1].body.session_id).toBe("sess-q")
+    })
+
+    test("does not send duplicate stop if text was already notified", async () => {
+      // given - registered session where idle already sent the stop notification
+      const sessionManager = new SessionManager()
+      const messageTail = new MessageTail()
+
+      sessionManager.onSessionCreated("sess-q2")
+      sessionManager.onRegistered("sess-q2")
+
+      messageTail.onMessageUpdated({ id: "msg-2", sessionID: "sess-q2", role: "assistant" })
+      messageTail.onPartUpdated(
+        { id: "part-2", sessionID: "sess-q2", messageID: "msg-2", type: "text" },
+        "Some text that was already notified",
+      )
+
+      // Simulate: session.idle already fired and notified this message
+      sessionManager.setNotified("sess-q2", "msg-2")
+
+      const daemonUrl = `http://127.0.0.1:${serverPort}`
+
+      // when - question.asked fires after idle already notified
+      const currentMsgId = messageTail.getCurrentMessageId("sess-q2")
+      if (sessionManager.shouldNotify("sess-q2", currentMsgId)) {
+        sessionManager.setNotified("sess-q2", currentMsgId!)
+        const summary = messageTail.getSummary("sess-q2")
+        if (summary) {
+          await notifyStop({
+            sessionId: "sess-q2",
+            message: summary,
+            label: "test",
+            daemonUrl,
+            log: mockLog,
+          })
+        }
+      }
+      await notifyQuestionAsked({
+        sessionId: "sess-q2",
+        requestId: "req-2",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl,
+        log: mockLog,
+      })
+
+      // then - only question sent, no duplicate stop
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/question-asked")
+    })
+
+    test("does not send stop if no assistant text exists", async () => {
+      // given - registered session with no text
+      const sessionManager = new SessionManager()
+      const messageTail = new MessageTail()
+
+      sessionManager.onSessionCreated("sess-q3")
+      sessionManager.onRegistered("sess-q3")
+
+      const daemonUrl = `http://127.0.0.1:${serverPort}`
+
+      // when - question.asked fires with no preceding text
+      const currentMsgId = messageTail.getCurrentMessageId("sess-q3")
+      if (sessionManager.shouldNotify("sess-q3", currentMsgId)) {
+        sessionManager.setNotified("sess-q3", currentMsgId!)
+        const summary = messageTail.getSummary("sess-q3")
+        if (summary) {
+          await notifyStop({
+            sessionId: "sess-q3",
+            message: summary,
+            label: "test",
+            daemonUrl,
+            log: mockLog,
+          })
+        }
+      }
+      await notifyQuestionAsked({
+        sessionId: "sess-q3",
+        requestId: "req-3",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl,
+        log: mockLog,
+      })
+
+      // then - only question sent
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/question-asked")
     })
   })
 })

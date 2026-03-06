@@ -420,9 +420,27 @@ const plugin: Plugin = async (ctx) => {
             !sessionManager.isRegistered(sessionID)
           ) return
 
-          log("question.asked", { sessionID, requestId, questionCount: questions.length })
+           log("question.asked", { sessionID, requestId, questionCount: questions.length })
 
-          notifyQuestionAsked({
+           // Flush any unnotified assistant text as a stop notification before
+           // sending the question. Without this, text output in the same turn as
+           // a question tool call is never sent to Telegram (no session.idle fires).
+           const currentMsgId = messageTail.getCurrentMessageId(sessionID)
+           if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
+             sessionManager.setNotified(sessionID, currentMsgId!)
+             const summary = messageTail.getSummary(sessionID)
+             if (summary) {
+               await notifyStop({
+                 sessionId: sessionID,
+                 message: summary,
+                 label,
+                 daemonUrl,
+                 log,
+               })
+             }
+           }
+
+           notifyQuestionAsked({
             sessionId: sessionID,
             requestId,
             questions,
