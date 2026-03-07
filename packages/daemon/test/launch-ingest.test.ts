@@ -39,6 +39,20 @@ describe("ingestLaunchCommand", () => {
       expect(input.opencodeClient.createSession).toHaveBeenCalledWith("/home/user/project");
     });
 
+    it("resolves tilde in directory before calling opencode API", async () => {
+      const input = makeInput({ directory: "~/project" });
+
+      await ingestLaunchCommand(input);
+
+      const homeDir = require("os").homedir();
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith(`${homeDir}/project`);
+      expect(input.opencodeClient.sendPrompt).toHaveBeenCalledWith(
+        "sess-123",
+        `${homeDir}/project`,
+        "Write a hello world program",
+      );
+    });
+
     it("sends the prompt to the created session with directory and prompt", async () => {
       const input = makeInput();
 

@@ -1,4 +1,12 @@
+import os from "os";
 import type { OpencodeClient } from "../opencode-client";
+
+/** Resolve leading `~` or `~/` to the user's home directory. */
+function resolveHome(dir: string): string {
+  if (dir === "~") return os.homedir();
+  if (dir.startsWith("~/")) return os.homedir() + dir.slice(1);
+  return dir;
+}
 
 export interface LaunchCommandInput {
   commandId: string;
@@ -12,7 +20,8 @@ export interface LaunchCommandInput {
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
-  const { commandId, directory, prompt, chatId, machineId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const directory = resolveHome(input.directory);
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   sendAck(commandId);
