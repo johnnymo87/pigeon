@@ -232,6 +232,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       cwd: input.session.cwd,
       token,
       machineId: this.machineId,
+      sessionId: input.session.sessionId,
     });
 
     await this.sendTelegramMessage(
@@ -271,6 +272,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       cwd: input.session.cwd,
       token,
       machineId: this.machineId,
+      sessionId: input.session.sessionId,
     });
 
     await this.sendTelegramMessage(
@@ -331,6 +333,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       cwd: input.session.cwd,
       token,
       machineId: this.machineId,
+      sessionId: input.session.sessionId,
     });
 
     await this.sendViaWorker(
@@ -369,6 +372,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       cwd: input.session.cwd,
       token,
       machineId: this.machineId,
+      sessionId: input.session.sessionId,
     });
 
     await this.sendViaWorker(
