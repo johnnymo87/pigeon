@@ -98,6 +98,7 @@ export function formatQuestionNotification(input: {
   questions: QuestionInfoData[];
   cwd: string | null;
   token: string;
+  sessionId: string;
   machineId?: string;
 }): {
   text: string;
@@ -131,9 +132,11 @@ export function formatQuestionNotification(input: {
     lines.push(`_\\+${input.questions.length - 1} more question(s) — answer in app_`);
   }
 
-  const questionInfoLine = input.machineId
-    ? `📂 \`${cwdShort}\` · 🖥 ${escapeMarkdown(input.machineId)}`
-    : `📂 \`${cwdShort}\``;
+  let questionInfoLine = `📂 \`${cwdShort}\``;
+  if (input.machineId) {
+    questionInfoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+  }
+  questionInfoLine += ` · 🆔 \`${input.sessionId}\``;
   lines.push("");
   lines.push(questionInfoLine);
 

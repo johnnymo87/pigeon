@@ -119,6 +119,8 @@ describe("formatQuestionNotification", () => {
       }],
       cwd: "/home/dev/projects/pigeon",
       token: "tok-q1",
+      sessionId: "sess-q1",
+      machineId: "devbox",
     });
 
     expect(result.text).toContain("❓ *Question*: pigeon");
@@ -127,6 +129,8 @@ describe("formatQuestionNotification", () => {
     expect(result.text).toContain("PostgreSQL");
     expect(result.text).toContain("SQLite");
     expect(result.text).toContain("📂 `projects/pigeon`");
+    expect(result.text).toContain("🆔 `sess-q1`");
+    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox · 🆔 `sess-q1`");
     expect(result.text).toContain("Swipe-reply for custom answer");
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(1);
@@ -151,6 +155,7 @@ describe("formatQuestionNotification", () => {
       }],
       cwd: "/tmp",
       token: "tok-wrap",
+      sessionId: "sess-wrap",
     });
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(2);
@@ -168,6 +173,7 @@ describe("formatQuestionNotification", () => {
       ],
       cwd: "/tmp",
       token: "tok-multi",
+      sessionId: "sess-multi",
     });
 
     // Shows only first question
@@ -188,6 +194,7 @@ describe("formatQuestionNotification", () => {
       }],
       cwd: "/tmp",
       token: "tok-nocustom",
+      sessionId: "sess-nocustom",
     });
 
     expect(result.text).not.toContain("Swipe-reply");
