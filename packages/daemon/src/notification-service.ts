@@ -9,6 +9,7 @@ interface NotificationInput {
   cwd: string | null;
   token: string;
   machineId?: string;
+  sessionId: string;
 }
 
 interface SessionLike {
@@ -68,9 +69,11 @@ export function formatTelegramNotification(input: NotificationInput): {
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
-  const infoLine = input.machineId
-    ? `📂 \`${cwdShort}\` · 🖥 ${escapeMarkdown(input.machineId)}`
-    : `📂 \`${cwdShort}\``;
+  let infoLine = `📂 \`${cwdShort}\``;
+  if (input.machineId) {
+    infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+  }
+  infoLine += ` · 🆔 \`${input.sessionId}\``;
 
   const text = [
     `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`,

@@ -14,10 +14,12 @@ describe("formatTelegramNotification", () => {
       summary: "Done",
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
+      sessionId: "sess-abc123",
     });
 
     expect(result.text).toContain("*Stop*: my\\_\\[label\\]\\*");
     expect(result.text).toContain("📂 `projects/pigeon`");
+    expect(result.text).toContain("🆔 `sess-abc123`");
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
@@ -29,9 +31,10 @@ describe("formatTelegramNotification", () => {
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
       machineId: "devbox",
+      sessionId: "sess-xyz",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
+    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox · 🆔 `sess-xyz`");
   });
 
   it("omits machine ID from info line when not provided", () => {
@@ -41,9 +44,10 @@ describe("formatTelegramNotification", () => {
       summary: "Done",
       cwd: "/home/dev/projects/pigeon",
       token: "tok123",
+      sessionId: "sess-nomachine",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon`");
+    expect(result.text).toContain("📂 `projects/pigeon` · 🆔 `sess-nomachine`");
     expect(result.text).not.toContain("🖥");
   });
 });
