@@ -129,8 +129,6 @@ describe("formatQuestionNotification", () => {
     expect(result.text).toContain("Which database should I use?");
     expect(result.text).toContain("PostgreSQL");
     expect(result.text).toContain("SQLite");
-    expect(result.text).toContain("📂 `projects/pigeon`");
-    expect(result.text).toContain("🆔 `sess-q1`");
     expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox · 🆔 `sess-q1`");
     expect(result.text).toContain("Swipe-reply for custom answer");
 
