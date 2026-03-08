@@ -19,6 +19,7 @@ interface QueueCommandRow {
   attempts: number;
   command_type: CommandType;
   directory: string | null;
+  media_json: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -53,16 +54,18 @@ export function sendCommand(
   now = Date.now(),
   commandType: CommandType = "execute",
   directory: string | null = null,
+  mediaJson: string | null = null,
 ): void {
   const currentAttempts = getAttempts(sql, commandId);
   const newAttempts = currentAttempts + 1;
 
   try {
+    const media = mediaJson ? JSON.parse(mediaJson) : undefined;
     const message = commandType === "launch"
       ? JSON.stringify({ type: "launch", commandId, directory, prompt: command, chatId })
       : commandType === "kill"
       ? JSON.stringify({ type: "kill", commandId, sessionId, chatId })
-      : JSON.stringify({ type: "command", commandId, sessionId, command, chatId });
+      : JSON.stringify({ type: "command", commandId, sessionId, command, chatId, ...(media ? { media } : {}) });
 
     ws.send(message);
 
@@ -111,7 +114,7 @@ export function flushCommandQueue(
 
   const toSend = Math.min(BATCH_SIZE, MAX_INFLIGHT - inflight);
   const rows = sql.exec(
-    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory
+    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory, media_json
      FROM command_queue
      WHERE machine_id = ?
        AND status IN ('pending', 'sent')
@@ -124,7 +127,7 @@ export function flushCommandQueue(
   ).toArray() as QueueCommandRow[];
 
   for (const row of rows) {
-    sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory);
+    sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory, row.media_json);
   }
 
   return rows.length;
@@ -155,7 +158,7 @@ export function retrySentCommands(
 ): number {
   const cutoff = now - RETRY_INTERVAL_MS;
   const rows = sql.exec(
-    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory
+    `SELECT command_id, machine_id, session_id, command, chat_id, attempts, command_type, directory, media_json
      FROM command_queue
      WHERE status = 'sent'
        AND sent_at < ?
@@ -171,7 +174,7 @@ export function retrySentCommands(
   for (const row of rows) {
     const ws = getMachineWebSocket(row.machine_id);
     if (ws && ws.readyState === 1) {
-      sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory);
+      sendCommand(sql, ws, row.command_id, row.session_id, row.command, row.chat_id, now, row.command_type, row.directory, row.media_json);
       continue;
     }
 

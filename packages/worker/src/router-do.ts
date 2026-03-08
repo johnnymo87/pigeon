@@ -84,6 +84,7 @@ export class RouterDurableObject extends DurableObject<Env> {
     const addColumnMigrations = [
       `ALTER TABLE command_queue ADD COLUMN command_type TEXT NOT NULL DEFAULT 'execute'`,
       `ALTER TABLE command_queue ADD COLUMN directory TEXT`,
+      `ALTER TABLE command_queue ADD COLUMN media_json TEXT`,
     ];
     for (const migration of addColumnMigrations) {
       try {
@@ -127,7 +128,8 @@ export class RouterDurableObject extends DurableObject<Env> {
         acked_at INTEGER,
         last_error TEXT,
         command_type TEXT NOT NULL DEFAULT 'execute',
-        directory TEXT
+        directory TEXT,
+        media_json TEXT
       )
     `);
     this.sql.exec("INSERT INTO command_queue_v2 SELECT * FROM command_queue");

@@ -1,5 +1,6 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, type CommandType } from "./command-queue";
+import type { MediaRef } from "./media";
 
 /**
  * Verify the Telegram webhook secret header (constant-time).
@@ -192,6 +193,49 @@ export function extractMedia(message: TelegramMessage): ExtractedMedia | null {
   return null;
 }
 
+async function relayMediaToR2(
+  env: Env,
+  media: ExtractedMedia,
+): Promise<{ key: string } | { error: string }> {
+  if (media.size > MAX_FILE_SIZE) {
+    return { error: `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)` };
+  }
+
+  const getFileRes = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_id: media.fileId }),
+    },
+  );
+
+  const getFileResult = (await getFileRes.json()) as {
+    ok: boolean;
+    result?: { file_path: string };
+  };
+
+  if (!getFileResult.ok || !getFileResult.result?.file_path) {
+    return { error: "Could not download file from Telegram" };
+  }
+
+  const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${getFileResult.result.file_path}`;
+  const fileRes = await fetch(fileUrl);
+  if (!fileRes.ok || !fileRes.body) {
+    return { error: "Could not download file from Telegram" };
+  }
+
+  const timestamp = Date.now();
+  const key = `inbound/${timestamp}-${media.fileUniqueId}/${media.filename}`;
+
+  await env.MEDIA.put(key, fileRes.body, {
+    httpMetadata: { contentType: media.mime },
+    customMetadata: { filename: media.filename },
+  });
+
+  return { key };
+}
+
 /**
  * Send a message via the Telegram Bot API.
  */
@@ -232,7 +276,7 @@ function resolveMessageSession(
   message: TelegramMessage,
 ): { sessionId: string; command: string } | null {
   const chatId = String(message.chat.id);
-  const text = message.text || "";
+  const text = message.text || message.caption || "";
 
   // Try 1: reply-to-message lookup
   if (message.reply_to_message) {
@@ -337,6 +381,7 @@ async function queueCommand(
   label: string | null,
   commandType: CommandType = "execute",
   directory: string | null = null,
+  mediaRef: MediaRef | null = null,
 ): Promise<string | null> {
   // Check queue size
   const countRows = sql.exec(
@@ -353,11 +398,12 @@ async function queueCommand(
 
   const commandId = generateCommandId();
   const now = Date.now();
+  const mediaJson = mediaRef ? JSON.stringify(mediaRef) : null;
 
   sql.exec(
-    `INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at, command_type, directory)
-     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-    commandId, machineId, sessionId, command, chatId, now, now, commandType, directory,
+    `INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at, command_type, directory, media_json)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+    commandId, machineId, sessionId, command, chatId, now, now, commandType, directory, mediaJson,
   );
 
   return commandId;
@@ -455,8 +501,20 @@ export async function handleTelegramWebhook(
     }
   }
 
-  // Handle message (text, reply)
+  // Handle message (text, media, reply)
   if (update.message) {
+    // Extract media if present
+    const media = extractMedia(update.message);
+
+    // Check file size before routing
+    if (media && media.size > MAX_FILE_SIZE) {
+      if (chatId) {
+        await sendTelegramMessage(env, chatId,
+          `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)`);
+      }
+      return OK();
+    }
+
     const resolved = resolveMessageSession(sql, update.message);
     if (!resolved) {
       if (chatId) {
@@ -469,7 +527,20 @@ export async function handleTelegramWebhook(
     const machine = await resolveSessionMachine(sql, env, resolved.sessionId, resolved.command, chatId!);
     if (!machine) return OK();
 
-    const commandId = await queueCommand(sql, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label);
+    // Relay media to R2 if present
+    let mediaRef: MediaRef | null = null;
+    if (media) {
+      const relayResult = await relayMediaToR2(env, media);
+      if ("error" in relayResult) {
+        if (chatId) {
+          await sendTelegramMessage(env, chatId, relayResult.error);
+        }
+        return OK();
+      }
+      mediaRef = { key: relayResult.key, mime: media.mime, filename: media.filename, size: media.size };
+    }
+
+    const commandId = await queueCommand(sql, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef);
     if (!commandId) return OK();
 
     deliverNow?.(machine.machineId);

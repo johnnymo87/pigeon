@@ -63,6 +63,7 @@ interface QueueRow {
   last_error: string | null;
   command_type?: string;
   directory?: string | null;
+  media_json?: string | null;
 }
 
 async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
@@ -73,7 +74,7 @@ async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
     return state.storage.sql.exec(
       `SELECT command_id, machine_id, session_id, command, chat_id, status,
               attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
-              command_type, directory
+              command_type, directory, media_json
        FROM command_queue
        WHERE session_id = ?
        ORDER BY created_at ASC`,
@@ -90,7 +91,7 @@ async function queryQueueByMachine(machineId: string): Promise<QueueRow[]> {
     return state.storage.sql.exec(
       `SELECT command_id, machine_id, session_id, command, chat_id, status,
               attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
-              command_type, directory
+              command_type, directory, media_json
        FROM command_queue
        WHERE machine_id = ?
        ORDER BY created_at ASC`,
@@ -1508,5 +1509,217 @@ describe("extractMedia", () => {
 
   it("MAX_FILE_SIZE is 20MB", () => {
     expect(MAX_FILE_SIZE).toBe(20 * 1024 * 1024);
+  });
+});
+
+// ─── Telegram Media: Integration Tests ───────────────────────────────
+
+function makeMediaReply(
+  replyToMessageId: number,
+  media: Record<string, unknown>,
+  caption?: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      caption,
+      reply_to_message: { message_id: replyToMessageId },
+      ...media,
+    },
+  };
+}
+
+function mockGetFile(filePath: string) {
+  fetchMock
+    .get("https://api.telegram.org")
+    .intercept({ method: "POST", path: /\/bot.*\/getFile/ })
+    .reply(200, JSON.stringify({ ok: true, result: { file_path: filePath } }), {
+      headers: { "Content-Type": "application/json" },
+    });
+}
+
+function mockFileDownload(content = "fake-file-data") {
+  fetchMock
+    .get("https://api.telegram.org")
+    .intercept({ method: "GET", path: /\/file\/bot.*/ })
+    .reply(200, content, {
+      headers: { "Content-Type": "application/octet-stream" },
+    });
+}
+
+describe("Telegram media webhook", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("uses caption as command text for media messages", async () => {
+    const now = Date.now();
+    const sessionId = `media-caption-session-${now}`;
+    const notifMsgId = 2_000_001 + (now % 100);
+    await registerSession(sessionId, "machine-1", "test");
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-caption-token-${now}` });
+
+    mockGetFile("photos/abc123.jpg");
+    mockFileDownload("fake-photo-data");
+
+    const res = await sendWebhook(makeMediaReply(
+      notifMsgId,
+      { photo: [{ file_id: "photo-id", file_unique_id: "photo-uid", width: 100, height: 100, file_size: 1024 }] },
+      "describe this image",
+    ));
+    expect(res.status).toBe(200);
+
+    const queueRows = await queryQueueBySession(sessionId);
+    const lastRow = queueRows[queueRows.length - 1];
+    expect(lastRow?.command).toBe("describe this image");
+  });
+
+  it("sends error for files over 20MB", async () => {
+    const now = Date.now();
+    const sessionId = `media-oversize-session-${now}`;
+    const notifMsgId = 2_000_101 + (now % 100);
+    await registerSession(sessionId, "machine-1", "test");
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-oversize-token-${now}` });
+
+    // Mock sendMessage for error reply
+    mockTelegramSendMessage();
+
+    const oversizedDoc = {
+      document: {
+        file_id: "big-doc-id",
+        file_unique_id: "big-doc-uid",
+        file_name: "huge.zip",
+        mime_type: "application/zip",
+        file_size: 25 * 1024 * 1024, // 25MB
+      },
+    };
+
+    const res = await sendWebhook(makeMediaReply(
+      notifMsgId,
+      oversizedDoc,
+      "here is a large file",
+    ));
+    expect(res.status).toBe(200);
+
+    // No command should be queued — the error should have caused early return
+    const queueRows = await queryQueueBySession(sessionId);
+    expect(queueRows.length).toBe(0);
+  });
+
+  it("relays photo to R2 and includes media in command", async () => {
+    const now = Date.now();
+    const sessionId = `media-relay-session-${now}`;
+    const notifMsgId = 2_000_201 + (now % 100);
+    await registerSession(sessionId, "machine-1", "test");
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-relay-token-${now}` });
+
+    mockGetFile("photos/xyz789.jpg");
+    mockFileDownload("fake-photo-bytes");
+
+    const res = await sendWebhook(makeMediaReply(
+      notifMsgId,
+      {
+        photo: [
+          { file_id: "small-id", file_unique_id: "small-uid", width: 100, height: 100, file_size: 1024 },
+          { file_id: "large-id", file_unique_id: "large-uid", width: 800, height: 800, file_size: 8192 },
+        ],
+      },
+      "analyze this",
+    ));
+    expect(res.status).toBe(200);
+
+    const queueRows = await queryQueueBySession(sessionId);
+    const lastRow = queueRows[queueRows.length - 1];
+    expect(lastRow?.media_json).not.toBeNull();
+
+    const media = JSON.parse(lastRow!.media_json!);
+    expect(media.key).toMatch(/^inbound\/\d+-large-uid\/photo_large-uid\.jpg$/);
+    expect(media.mime).toBe("image/jpeg");
+    expect(media.filename).toBe("photo_large-uid.jpg");
+    expect(media.size).toBe(8192);
+  });
+
+  it("queues text-only command without media_json", async () => {
+    const now = Date.now();
+    const sessionId = `media-textonly-session-${now}`;
+    const notifMsgId = 2_000_301 + (now % 100);
+    await registerSession(sessionId, "machine-1", "test");
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-textonly-token-${now}` });
+
+    const res = await sendWebhook(makeTextReply("ls -la", notifMsgId));
+    expect(res.status).toBe(200);
+
+    const queueRows = await queryQueueBySession(sessionId);
+    const lastRow = queueRows[queueRows.length - 1];
+    expect(lastRow?.command).toBe("ls -la");
+    expect(lastRow?.media_json).toBeNull();
+  });
+
+  it("media message with no caption routes with empty command", async () => {
+    const now = Date.now();
+    const sessionId = `media-nocaption-session-${now}`;
+    const notifMsgId = 2_000_401 + (now % 100);
+    await registerSession(sessionId, "machine-1", "test");
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-nocaption-token-${now}` });
+
+    mockGetFile("photos/nocaption.jpg");
+    mockFileDownload("fake-photo-data");
+
+    const res = await sendWebhook(makeMediaReply(
+      notifMsgId,
+      { photo: [{ file_id: "nc-photo-id", file_unique_id: "nc-photo-uid", width: 200, height: 200, file_size: 2048 }] },
+      undefined, // no caption
+    ));
+    expect(res.status).toBe(200);
+
+    const queueRows = await queryQueueBySession(sessionId);
+    const lastRow = queueRows[queueRows.length - 1];
+    expect(lastRow?.command).toBe("");
+    expect(lastRow?.media_json).not.toBeNull();
+  });
+
+  it("media command includes media field in WebSocket message", async () => {
+    const now = Date.now();
+    const machineId = `media-ws-machine-${now}`;
+    const sessionId = `media-ws-session-${now}`;
+    const notifMsgId = 2_000_501 + (now % 100);
+
+    await registerSession(sessionId, machineId);
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-ws-token-${now}` });
+
+    const ws = await openMachineSocket(machineId);
+
+    mockGetFile("photos/ws-test.jpg");
+    mockFileDownload("fake-photo-for-ws");
+
+    const messagePromise = waitForWsMessage(ws);
+
+    const res = await sendWebhook(makeMediaReply(
+      notifMsgId,
+      { photo: [{ file_id: "ws-photo-id", file_unique_id: "ws-photo-uid", width: 400, height: 400, file_size: 4096 }] },
+      "check this photo",
+    ));
+    expect(res.status).toBe(200);
+
+    const inbound = await messagePromise;
+    const msg = JSON.parse(inbound) as Record<string, unknown>;
+
+    expect(msg.type).toBe("command");
+    expect(msg.command).toBe("check this photo");
+    expect(msg.media).toBeDefined();
+    const media = msg.media as Record<string, unknown>;
+    expect(media.key).toMatch(/^inbound\/\d+-ws-photo-uid\/photo_ws-photo-uid\.jpg$/);
+    expect(media.mime).toBe("image/jpeg");
+
+    ws.close();
   });
 });
