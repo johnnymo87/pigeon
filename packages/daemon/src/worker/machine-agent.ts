@@ -270,6 +270,10 @@ export class MachineAgent {
 
     await ingestWorkerCommand(this.storage, record as unknown as WorkerCommandMessage, {
       send: (payload) => this.send(payload),
+    }, {
+      workerUrl: this.config.workerUrl,
+      apiKey: this.config.apiKey,
+      fetchFn: this.fetchFn,
     });
   }
 
@@ -380,6 +384,10 @@ export class MachineAgent {
         const parsed = JSON.parse(row.payload) as WorkerCommandMessage;
         await ingestWorkerCommand(this.storage, parsed, {
           send: (payload) => this.send(payload),
+        }, {
+          workerUrl: this.config.workerUrl,
+          apiKey: this.config.apiKey,
+          fetchFn: this.fetchFn,
         });
       } catch {
         // Ignore malformed payload rows.

@@ -228,10 +228,14 @@ async function relayMediaToR2(
   const timestamp = Date.now();
   const key = `inbound/${timestamp}-${media.fileUniqueId}/${media.filename}`;
 
-  await env.MEDIA.put(key, fileRes.body, {
-    httpMetadata: { contentType: media.mime },
-    customMetadata: { filename: media.filename },
-  });
+  try {
+    await env.MEDIA.put(key, fileRes.body, {
+      httpMetadata: { contentType: media.mime },
+      customMetadata: { filename: media.filename },
+    });
+  } catch {
+    return { error: "Media storage failed, please try again" };
+  }
 
   return { key };
 }

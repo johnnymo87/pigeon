@@ -64,7 +64,7 @@ export class MessageTail {
     }
   }
 
-  onPartUpdated(part: PartInfo & { mime?: string; filename?: string; url?: string }, delta?: string): void {
+  onPartUpdated(part: PartInfo & { mime?: string; filename?: string; url?: string; state?: { status?: string; attachments?: Array<{ mime?: string; filename?: string; url?: string }> } }, delta?: string): void {
     // Handle file parts
     if (part.type === "file" && part.mime && part.url) {
       const tail = this.getOrCreate(part.sessionID)
@@ -74,6 +74,23 @@ export class MessageTail {
           filename: part.filename ?? "file",
           url: part.url,
         })
+      }
+      return
+    }
+
+    // Handle tool parts with file attachments
+    if (part.type === "tool" && part.state?.status === "completed" && part.state.attachments) {
+      const tail = this.getOrCreate(part.sessionID)
+      if (tail.currentMessageId === part.messageID) {
+        for (const att of part.state.attachments) {
+          if (att.mime && att.url) {
+            tail.files.push({
+              mime: att.mime,
+              filename: att.filename ?? "file",
+              url: att.url,
+            })
+          }
+        }
       }
       return
     }
