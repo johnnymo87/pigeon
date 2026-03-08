@@ -57,12 +57,30 @@ const plugin: Plugin = async (ctx) => {
             ctx.serverUrl,
           )
           const headers: Record<string, string> = { "Content-Type": "application/json" }
+
+          // Build parts array: always include text, optionally include file
+          const parts: Array<Record<string, unknown>> = []
+          if (request.command) {
+            parts.push({ type: "text", text: request.command })
+          }
+          if (request.media) {
+            parts.push({
+              type: "file",
+              mime: request.media.mime,
+              filename: request.media.filename,
+              url: request.media.url,
+            })
+          }
+          if (parts.length === 0) {
+            parts.push({ type: "text", text: "" })
+          }
+
           const res = await internalFetch(
             new Request(promptUrl.toString(), {
               method: "POST",
               headers,
               body: JSON.stringify({
-                parts: [{ type: "text", text: request.command }],
+                parts,
                 noReply: false,
               }),
               signal: AbortSignal.timeout(10_000),

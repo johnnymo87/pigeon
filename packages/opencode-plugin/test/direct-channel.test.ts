@@ -132,4 +132,46 @@ describe("direct channel server", () => {
     expect(body.result.errorCode).toBe(ResultErrorCode.Internal)
     expect(body.result.errorMessage).toContain("boom")
   })
+
+  it("passes media field from envelope to onExecute callback", async () => {
+    let capturedRequest: { command?: string; media?: { mime: string; filename: string; url: string } } | null = null
+    const onExecute = vi.fn(async (req: any) => {
+      capturedRequest = req
+      return { success: true, output: "ok" }
+    })
+
+    const server = await startDirectChannelServer({ onExecute })
+    closers.push(server.close)
+
+    const media = {
+      mime: "image/jpeg",
+      filename: "photo.jpg",
+      url: "data:image/jpeg;base64,ZmFrZQ==",
+    }
+
+    const request = {
+      type: OpencodeDirectMessageType.Execute,
+      version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+      requestId: "req-media",
+      commandId: "cmd-media",
+      sessionId: "sess-media",
+      command: "caption text",
+      source: OpencodeDirectSource.TelegramReply,
+      issuedAt: Date.now(),
+      media,
+    }
+
+    const response = await fetch(server.endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${server.authToken}`,
+      },
+      body: JSON.stringify(request),
+    })
+
+    expect(response.status).toBe(200)
+    expect(onExecute).toHaveBeenCalledTimes(1)
+    expect(capturedRequest?.media).toEqual(media)
+  })
 })
