@@ -1,4 +1,5 @@
 import { RouterDurableObject } from "./router-do";
+import { cleanupExpiredMedia } from "./media";
 
 export { RouterDurableObject };
 export class RouterDO extends RouterDurableObject {}
@@ -19,5 +20,13 @@ export default {
     const id = env.ROUTER.idFromName("singleton");
     const stub = env.ROUTER.get(id);
     return stub.fetch(request);
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<void> {
+    await cleanupExpiredMedia(env);
   },
 } satisfies ExportedHandler<Env>;

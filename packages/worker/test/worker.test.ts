@@ -16,6 +16,7 @@ import {
   extractMedia,
   MAX_FILE_SIZE,
 } from "../src/webhook";
+import { cleanupExpiredMedia } from "../src/media";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -1948,5 +1949,75 @@ describe("POST /notifications/send with media", () => {
     const body = await res.json() as { ok: boolean; messageId: number };
     expect(body.ok).toBe(true);
     expect(body.messageId).toBe(textMsgId);
+  });
+});
+
+// ─── R2 Cleanup ───────────────────────────────────────────────────────
+
+describe("R2 cleanup", () => {
+  const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+  it("handles empty bucket gracefully", async () => {
+    // The bucket may contain objects from earlier tests, but none with expired timestamps.
+    // We verify no errors are thrown and the return type is a non-negative integer.
+    const count = await cleanupExpiredMedia(env);
+    expect(typeof count).toBe("number");
+    expect(count).toBeGreaterThanOrEqual(0);
+  });
+
+  it("deletes objects older than 24 hours", async () => {
+    const now = Date.now();
+    const oldTimestamp = now - TTL_MS - 1000; // older than 24h
+    const recentTimestamp = now - 1000; // 1 second old (well within TTL)
+
+    // Upload old objects (should be deleted)
+    await env.MEDIA.put(`inbound/${oldTimestamp}-old1/file.jpg`, new Uint8Array([1, 2, 3]));
+    await env.MEDIA.put(`outbound/${oldTimestamp}-old2/doc.pdf`, new Uint8Array([4, 5, 6]));
+
+    // Upload recent objects (should be kept)
+    await env.MEDIA.put(`inbound/${recentTimestamp}-new1/photo.png`, new Uint8Array([7, 8, 9]));
+    await env.MEDIA.put(`outbound/${recentTimestamp}-new2/report.pdf`, new Uint8Array([10, 11, 12]));
+
+    const deleted = await cleanupExpiredMedia(env);
+    expect(deleted).toBe(2);
+
+    // Old objects should be gone
+    expect(await env.MEDIA.get(`inbound/${oldTimestamp}-old1/file.jpg`)).toBeNull();
+    expect(await env.MEDIA.get(`outbound/${oldTimestamp}-old2/doc.pdf`)).toBeNull();
+
+    // Recent objects should remain
+    expect(await env.MEDIA.get(`inbound/${recentTimestamp}-new1/photo.png`)).not.toBeNull();
+    expect(await env.MEDIA.get(`outbound/${recentTimestamp}-new2/report.pdf`)).not.toBeNull();
+  });
+
+  it("skips keys with non-numeric or malformed timestamps", async () => {
+    // Put an object with a key that does not match the expected format
+    await env.MEDIA.put(`inbound/badkey/file.jpg`, new Uint8Array([1]));
+    await env.MEDIA.put(`inbound/NaN-abc/file.jpg`, new Uint8Array([2]));
+
+    // Should not throw, and should not delete malformed keys
+    const count = await cleanupExpiredMedia(env);
+    expect(count).toBe(0);
+
+    // Malformed keys should still be there
+    expect(await env.MEDIA.get(`inbound/badkey/file.jpg`)).not.toBeNull();
+    expect(await env.MEDIA.get(`inbound/NaN-abc/file.jpg`)).not.toBeNull();
+
+    // Cleanup
+    await env.MEDIA.delete(`inbound/badkey/file.jpg`);
+    await env.MEDIA.delete(`inbound/NaN-abc/file.jpg`);
+  });
+
+  it("returns correct count of deleted objects", async () => {
+    const now = Date.now();
+    const oldTimestamp = now - TTL_MS - 5000;
+
+    // Insert 3 old objects across both prefixes
+    await env.MEDIA.put(`inbound/${oldTimestamp}-a/x.txt`, new Uint8Array([1]));
+    await env.MEDIA.put(`inbound/${oldTimestamp}-b/y.txt`, new Uint8Array([2]));
+    await env.MEDIA.put(`outbound/${oldTimestamp}-c/z.txt`, new Uint8Array([3]));
+
+    const deleted = await cleanupExpiredMedia(env);
+    expect(deleted).toBe(3);
   });
 });

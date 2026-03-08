@@ -8,6 +8,7 @@ export interface MediaRef {
 }
 
 const MAX_UPLOAD_SIZE = 20 * 1024 * 1024; // 20MB
+const MEDIA_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -43,6 +44,38 @@ export async function handleMediaUpload(
   });
 
   return json({ ok: true, key }, 200);
+}
+
+export async function cleanupExpiredMedia(env: Env): Promise<number> {
+  const cutoff = Date.now() - MEDIA_TTL_MS;
+  let deleted = 0;
+
+  for (const prefix of ["inbound/", "outbound/"]) {
+    let cursor: string | undefined;
+    do {
+      const listed = await env.MEDIA.list({ prefix, cursor, limit: 1000 });
+      const toDelete: string[] = [];
+
+      for (const object of listed.objects) {
+        // Key format: {prefix}{timestamp}-{id}/{filename}
+        const afterPrefix = object.key.slice(prefix.length);
+        const timestampStr = afterPrefix.split("-")[0] ?? "";
+        const timestamp = parseInt(timestampStr, 10);
+        if (!isNaN(timestamp) && timestamp < cutoff) {
+          toDelete.push(object.key);
+        }
+      }
+
+      if (toDelete.length > 0) {
+        await env.MEDIA.delete(toDelete);
+        deleted += toDelete.length;
+      }
+
+      cursor = listed.truncated ? (listed as { cursor: string }).cursor : undefined;
+    } while (cursor);
+  }
+
+  return deleted;
 }
 
 export async function handleMediaGet(
