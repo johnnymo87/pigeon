@@ -42,6 +42,8 @@ Look for:
 - notification send failures
 - launch-ingest: `session started sessionId=... directory=...`
 - kill-ingest: `session terminated sessionId=...`
+- media fetch failures: `Failed to fetch media from R2` in command-ingest logs
+- media upload failures: silent (text notification still sends), but `uploadMedia` errors appear in daemon stderr
 
 ## Restart Procedure
 
@@ -52,6 +54,16 @@ systemctl status pigeon-daemon.service --no-pager
 sudo systemctl restart opencode-serve.service
 systemctl status opencode-serve.service --no-pager
 ```
+
+## Media Relay Diagnostics
+
+If media isn't arriving in Telegram or OpenCode:
+
+1. **Check worker R2 bucket exists**: `npx wrangler r2 bucket list` should show `pigeon-media`.
+2. **Check worker deploy has MEDIA binding**: deploy output should show `env.MEDIA (pigeon-media)`.
+3. **Inbound (Telegram→OpenCode)**: daemon logs will show media fetch errors if the worker URL or API key is wrong.
+4. **Outbound (OpenCode→Telegram)**: daemon uploads silently skip failures — check worker `/media/upload` auth if media never appears in Telegram.
+5. **Cron cleanup**: if media disappears before delivery, check that the 24h TTL in `cleanupExpiredMedia` is sufficient.
 
 ## Verify
 

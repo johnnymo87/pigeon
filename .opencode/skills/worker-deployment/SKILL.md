@@ -28,6 +28,24 @@ cd ~/projects/pigeon
 bun run --filter '@pigeon/worker' deploy
 ```
 
+## R2 Bucket
+
+The worker requires an R2 bucket named `pigeon-media` for media relay. This is a one-time setup:
+
+```bash
+npx wrangler r2 bucket create pigeon-media
+```
+
+The binding is configured in `wrangler.toml`:
+
+```toml
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "pigeon-media"
+```
+
+If the bucket doesn't exist, deploy will succeed but media upload/download will fail at runtime.
+
 ## Durable Object Compatibility
 
 Current production uses DO class `RouterDO`.
@@ -89,3 +107,5 @@ Expected:
 
 - health returns `ok`
 - authenticated `/sessions` returns HTTP `200`
+
+Also verify the cron trigger is active (visible in deploy output as `schedule: 0 * * * *`). This runs hourly R2 media cleanup.

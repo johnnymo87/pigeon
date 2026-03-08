@@ -52,10 +52,34 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 
 `FallbackNotifier` (in `notification-service.ts`) implements both `StopNotifier` and `QuestionNotifier`:
 
-- **Stop notifications**: plain text, no inline buttons (old Continue/Yes/No/Exit buttons were removed).
+- **Stop notifications**: plain text, no inline buttons (old Continue/Yes/No/Exit buttons were removed). May include outbound media (see Media Relay below).
 - **Question notifications**: formatted with the question text + inline keyboard buttons. Each option becomes a button with `callback_data: "cmd:TOKEN:q0"`, `cmd:TOKEN:q1"`, etc. Only the first question's options get buttons; remaining questions are shown as text and must be answered in the TUI.
 
+Both notification types display a session ID on its own line (`🆔 \`sess-abc\``) for easy copy-paste in Telegram.
+
 The notifier tries the worker path first (`WorkerNotificationService`), falling back to direct Telegram API (`TelegramNotificationService`).
+
+## Media Relay
+
+The daemon mediates bidirectional media relay between the worker's R2 bucket and OpenCode sessions.
+
+### Inbound (Telegram → OpenCode)
+
+When a worker command includes a `media: { key, mime, filename, size }` field:
+
+1. `ingestWorkerCommand` in `command-ingest.ts` fetches the binary via `GET <workerUrl>/media/<key>` (Bearer auth).
+2. Converts to a base64 data URI (`data:<mime>;base64,...`).
+3. Passes `{ mime, filename, url }` through the adapter chain to the plugin's `/pigeon/direct/execute` endpoint.
+4. On fetch failure, sends `commandResult` with `success: false` — the command is not retried.
+
+### Outbound (OpenCode → Telegram)
+
+When a stop notification includes media (files captured by the plugin):
+
+1. `WorkerNotificationService.sendStopNotification` receives `media: Array<{ mime, filename, url }>` where `url` is a data URI.
+2. For each file: base64-decodes, uploads to R2 via `POST <workerUrl>/media/upload` (multipart form) with key `outbound/<ts>-<uuid>/<filename>`.
+3. Passes `mediaKeys: Array<{ key, mime, filename }>` to `sendNotification` which includes them in the worker's `/notifications/send` body.
+4. Failed uploads are silently skipped — text notification still goes through.
 
 ## OpenCode Serve Integration
 

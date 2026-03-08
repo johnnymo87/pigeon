@@ -31,11 +31,39 @@ When the daemon sends a notification with inline buttons, the `callback_data` co
 
 If no `cmd:TOKEN:action` pattern is found in the `replyMarkup` (e.g. plain text notifications), the worker generates a fresh random token. See `extractTokenFromCallbackData()` in `notifications.ts`.
 
+## R2 Media Bucket
+
+The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional media relay between Telegram and OpenCode sessions.
+
+- Binding: `env.MEDIA` (configured in `wrangler.toml`)
+- Key format: `{direction}/{timestamp}-{id}/{filename}` where direction is `inbound` or `outbound`
+- TTL: 24 hours — expired objects cleaned by hourly cron (`cleanupExpiredMedia` in `media.ts`)
+- Max file size: 20 MB
+
+### Media Endpoints
+
+- `POST /media/upload` (Bearer) — multipart form with `key`, `mime`, `filename`, `file` fields. Returns `{ ok, key }`.
+- `GET /media/<key>` (Bearer) — returns raw binary with `Content-Type` and `Content-Disposition` from R2 metadata.
+
+### Inbound Flow (Telegram → R2)
+
+1. `extractMedia()` in `webhook.ts` detects photo/document/audio/video/voice on incoming messages.
+2. `relayMediaToR2()` calls Telegram `getFile` API, downloads the binary, stores in R2 with key `inbound/<ts>-<fileUniqueId>/<filename>`.
+3. A `MediaRef { key, mime, filename, size }` is serialized as `media_json` in the `command_queue` row.
+4. WebSocket delivery includes `media: { key, mime, filename, size }` in the command payload.
+
+### Outbound Flow (R2 → Telegram)
+
+1. Daemon uploads media via `POST /media/upload` with key `outbound/<ts>-<uuid>/<filename>`.
+2. `POST /notifications/send` accepts an optional `media: Array<{ key, mime, filename }>` field.
+3. Worker fetches each key from R2, sends as `sendPhoto` (images) or `sendDocument` (other types), each as a reply to the text notification message.
+4. Media messages are stored in the `messages` table for reply routing.
+
 ## Durable Object Tables
 
 - `sessions`: session-to-machine registry
 - `messages`: Telegram message mapping for reply routing
-- `command_queue`: pending/sent/acked command lifecycle
+- `command_queue`: pending/sent/acked command lifecycle (includes `media_json TEXT` column)
 - `seen_updates`: Telegram update deduplication
 
 ## Endpoint Contracts
@@ -44,7 +72,9 @@ If no `cmd:TOKEN:action` pattern is found in the `replyMarkup` (e.g. plain text 
 - `GET /sessions` (Bearer `CCR_API_KEY`) -> JSON list of session rows (`snake_case`)
 - `POST /sessions/register` (Bearer) -> upsert session
 - `POST /sessions/unregister` (Bearer) -> remove session
-- `POST /notifications/send` (Bearer) -> send Telegram message + store mapping
+- `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies
+- `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
+- `GET /media/<key>` (Bearer) -> download file from R2
 - `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks
 - `GET /ws?machineId=...` with upgrade + protocol `ccr,<CCR_API_KEY>` -> machine agent socket
 
@@ -84,6 +114,11 @@ Terminates a running OpenCode session.
 - At-least-once behavior through persisted queue rows
 - Alarm-driven cleanup + retry sweep runs hourly (`alarm()` in DO)
 - Retry and backoff logic lives in `packages/worker/src/command-queue.ts`
+
+## Cron
+
+- Schedule: `0 * * * *` (hourly)
+- Handler: `scheduled()` in `index.ts` calls `cleanupExpiredMedia(env)` which deletes R2 objects older than 24 hours under `inbound/` and `outbound/` prefixes
 
 ## Verify
 

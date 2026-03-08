@@ -43,7 +43,16 @@ The session ID is included in the Telegram confirmation message.
 
 ### Notifications
 
-Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name.
+Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name. Each notification includes the session ID on its own line for easy copy-paste.
+
+### Media Relay
+
+Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:
+
+- **Inbound**: Telegram media → Worker (downloads from Telegram API, stores in R2) → Daemon (fetches from R2, converts to data URI) → Plugin (sends as file part to `prompt_async`)
+- **Outbound**: OpenCode file attachments → Plugin (captures FileParts and tool attachments) → Daemon (uploads to R2) → Worker (sends as `sendPhoto`/`sendDocument` reply in Telegram)
+
+Media is stored temporarily in the `pigeon-media` R2 bucket with a 24-hour TTL, cleaned hourly by cron.
 
 Health check URLs are listed in the Quickstart section above.
 

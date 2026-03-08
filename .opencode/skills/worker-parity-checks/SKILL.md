@@ -86,6 +86,39 @@ When sending a notification with inline buttons (question notifications), verify
 
 Test: send a notification with `replyMarkup` containing `cmd:MY_TOKEN:q0` in a button's `callback_data`. The response `token` field must equal `MY_TOKEN`.
 
+## Media Relay Parity
+
+### Upload + Download Round-Trip
+
+```bash
+op run --env-file=.env.1password -- bash -lc '
+BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
+AUTH="Authorization: Bearer ${CCR_API_KEY}"
+KEY="parity/test-$(date +%s)/hello.txt"
+
+# Upload
+echo -n "parity check" > /tmp/parity-media.txt
+curl -s -o /tmp/parity_upload.json -X POST -H "$AUTH" \
+  "$BASE/media/upload" \
+  -F "key=$KEY" -F "mime=text/plain" -F "filename=hello.txt" -F "file=@/tmp/parity-media.txt"
+cat /tmp/parity_upload.json
+
+# Download
+curl -s -o /tmp/parity-download.txt -H "$AUTH" "$BASE/media/$KEY"
+cat /tmp/parity-download.txt
+'
+```
+
+Expected: upload returns `{ ok: true, key: "parity/..." }`, download returns the original content.
+
+### Notification with Media
+
+To verify end-to-end media in notifications, send a photo to the Telegram bot as a reply to an active session notification. The bot should:
+
+1. Detect the photo, relay it to R2
+2. Deliver the command (with media) to the daemon via WebSocket
+3. Daemon fetches from R2, converts to data URI, delivers to the plugin
+
 ## Plugin-Direct Variant
 
 For OpenCode sessions using the direct command channel (`backend_kind: "opencode-plugin-direct"`),
