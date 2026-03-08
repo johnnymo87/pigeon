@@ -82,7 +82,6 @@ export function formatTelegramNotification(input: NotificationInput): {
   if (input.machineId) {
     infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
   }
-  infoLine += ` · 🆔 \`${input.sessionId}\``;
 
   const text = [
     `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`,
@@ -90,6 +89,7 @@ export function formatTelegramNotification(input: NotificationInput): {
     input.summary,
     "",
     infoLine,
+    `🆔 \`${input.sessionId}\``,
     "",
     "↩️ _Swipe-reply to respond_",
   ].join("\n");
@@ -145,9 +145,9 @@ export function formatQuestionNotification(input: {
   if (input.machineId) {
     questionInfoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
   }
-  questionInfoLine += ` · 🆔 \`${input.sessionId}\``;
   lines.push("");
   lines.push(questionInfoLine);
+  lines.push(`🆔 \`${input.sessionId}\``);
 
   const hasCustom = firstQuestion?.custom !== false;
   if (hasCustom) {

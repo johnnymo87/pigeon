@@ -36,7 +36,8 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-xyz",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox · 🆔 `sess-xyz`");
+    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
+    expect(result.text).toContain("\n🆔 `sess-xyz`");
   });
 
   it("omits machine ID from info line when not provided", () => {
@@ -49,7 +50,8 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-nomachine",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon` · 🆔 `sess-nomachine`");
+    expect(result.text).toContain("📂 `projects/pigeon`");
+    expect(result.text).toContain("\n🆔 `sess-nomachine`");
     expect(result.text).not.toContain("🖥");
   });
 });
@@ -131,7 +133,8 @@ describe("formatQuestionNotification", () => {
     expect(result.text).toContain("Which database should I use?");
     expect(result.text).toContain("PostgreSQL");
     expect(result.text).toContain("SQLite");
-    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox · 🆔 `sess-q1`");
+    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
+    expect(result.text).toContain("\n🆔 `sess-q1`");
     expect(result.text).toContain("Swipe-reply for custom answer");
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(1);
