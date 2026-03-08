@@ -23,6 +23,7 @@ interface StopNotificationInput {
   event: string;
   summary: string;
   label?: string;
+  media?: Array<{ mime: string; filename: string; url: string }>;
 }
 
 export interface QuestionNotificationInput {
@@ -50,7 +51,15 @@ export interface WorkerNotificationSender {
     chatId: string,
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
+    media?: Array<{ key: string; mime: string; filename: string }>,
   ): Promise<{ ok: boolean }>;
+
+  uploadMedia?(
+    key: string,
+    data: ArrayBuffer,
+    mime: string,
+    filename: string,
+  ): Promise<{ ok: boolean; key: string }>;
 }
 
 function escapeMarkdown(text: string): string {
@@ -299,12 +308,14 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     sessionId: string,
     text: string,
     replyMarkup: { inline_keyboard: unknown[] },
+    media?: Array<{ key: string; mime: string; filename: string }>,
   ): Promise<void> {
     const result = await this.workerSender.sendNotification(
       sessionId,
       this.chatId,
       text,
       replyMarkup,
+      media,
     );
 
     if (!result.ok) {
@@ -336,10 +347,34 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       sessionId: input.session.sessionId,
     });
 
+    let mediaKeys: Array<{ key: string; mime: string; filename: string }> | undefined;
+    if (input.media && input.media.length > 0 && this.workerSender.uploadMedia) {
+      mediaKeys = [];
+      for (const file of input.media) {
+        try {
+          const base64Match = file.url.match(/^data:[^;]+;base64,(.+)$/);
+          const base64Data = base64Match?.[1];
+          if (!base64Data) continue;
+          const buffer = Buffer.from(base64Data, "base64");
+          const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+          const timestamp = Date.now();
+          const key = `outbound/${timestamp}-${crypto.randomUUID()}/${file.filename}`;
+          const result = await this.workerSender.uploadMedia(key, arrayBuffer, file.mime, file.filename);
+          if (result.ok) {
+            mediaKeys.push({ key: result.key, mime: file.mime, filename: file.filename });
+          }
+        } catch {
+          // Skip failed uploads — text notification still goes through
+          continue;
+        }
+      }
+    }
+
     await this.sendViaWorker(
       input.session.sessionId,
       notification.text,
       notification.replyMarkup,
+      mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
     );
 
     return { token };

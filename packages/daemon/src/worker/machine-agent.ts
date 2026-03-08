@@ -317,11 +317,36 @@ export class MachineAgent {
     }
   }
 
+  async uploadMedia(
+    key: string,
+    data: ArrayBuffer,
+    mime: string,
+    filename: string,
+  ): Promise<{ ok: boolean; key: string }> {
+    try {
+      const form = new FormData();
+      form.append("key", key);
+      form.append("mime", mime);
+      form.append("filename", filename);
+      form.append("file", new Blob([data], { type: mime }), filename);
+
+      const response = await this.fetchFn(`${this.config.workerUrl}/media/upload`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.config.apiKey}` },
+        body: form,
+      });
+      return await response.json() as { ok: boolean; key: string };
+    } catch {
+      return { ok: false, key: "" };
+    }
+  }
+
   async sendNotification(
     sessionId: string,
     chatId: string,
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
+    media?: Array<{ key: string; mime: string; filename: string }>,
   ): Promise<{ ok: boolean }> {
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
@@ -335,6 +360,7 @@ export class MachineAgent {
           chatId,
           text,
           replyMarkup,
+          ...(media && media.length > 0 ? { media } : {}),
         }),
       });
       return await response.json() as { ok: boolean };

@@ -3,6 +3,8 @@ import {
   formatTelegramNotification,
   formatQuestionNotification,
   TelegramNotificationService,
+  WorkerNotificationService,
+  type WorkerNotificationSender,
 } from "../src/notification-service";
 import { openStorageDb } from "../src/storage/database";
 
@@ -263,6 +265,176 @@ describe("TelegramNotificationService.sendQuestionNotification", () => {
     expect((payload.text as string)).toContain("Question");
     expect((payload.text as string)).toContain("Which DB?");
     expect((payload.text as string)).toContain("🆔 `sess-q`");
+
+    storage.db.close();
+  });
+});
+
+describe("WorkerNotificationService.sendStopNotification with media", () => {
+  it("uploads media files to R2 and passes keys to sendNotification", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-media",
+      notify: true,
+      label: "Media Test",
+      cwd: "/tmp/media",
+    }, 1_000);
+
+    const uploadMediaMock = vi.fn(async (key: string, _data: ArrayBuffer, _mime: string, _filename: string) => {
+      return { ok: true, key };
+    });
+
+    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+
+    const workerSender: WorkerNotificationSender = {
+      sendNotification: sendNotificationMock,
+      uploadMedia: uploadMediaMock,
+    };
+
+    const service = new WorkerNotificationService(
+      storage,
+      workerSender,
+      "8248645256",
+      () => 2_000,
+    );
+
+    // Create a simple data URI (PNG as base64)
+    const fakeBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const dataUri = `data:image/png;base64,${fakeBase64}`;
+
+    const result = await service.sendStopNotification({
+      session: {
+        sessionId: "sess-media",
+        label: "Media Test",
+        cwd: "/tmp/media",
+      },
+      event: "Stop",
+      summary: "Done with media",
+      media: [
+        { mime: "image/png", filename: "screenshot.png", url: dataUri },
+      ],
+    });
+
+    expect(result.token).toBeTruthy();
+
+    // uploadMedia should have been called once with correct params
+    expect(uploadMediaMock).toHaveBeenCalledTimes(1);
+    const [key, data, mime, filename] = uploadMediaMock.mock.calls[0] as [string, ArrayBuffer, string, string];
+    expect(key).toMatch(/^outbound\/\d+-[a-f0-9-]+\/screenshot\.png$/);
+    expect(data).toBeInstanceOf(ArrayBuffer);
+    expect(mime).toBe("image/png");
+    expect(filename).toBe("screenshot.png");
+
+    // sendNotification should have been called with the media keys
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+    const notifCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, Array<{ key: string; mime: string; filename: string }>];
+    const mediaKeys = notifCall[4];
+    expect(mediaKeys).toHaveLength(1);
+    expect(mediaKeys[0]!.mime).toBe("image/png");
+    expect(mediaKeys[0]!.filename).toBe("screenshot.png");
+    expect(mediaKeys[0]!.key).toMatch(/^outbound\//);
+
+    storage.db.close();
+  });
+
+  it("text notification still goes through when media upload fails", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-media-fail",
+      notify: true,
+      label: "Media Fail Test",
+      cwd: "/tmp",
+    }, 1_000);
+
+    // uploadMedia always fails
+    const uploadMediaMock = vi.fn(async () => ({ ok: false, key: "" }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+
+    const workerSender: WorkerNotificationSender = {
+      sendNotification: sendNotificationMock,
+      uploadMedia: uploadMediaMock,
+    };
+
+    const service = new WorkerNotificationService(
+      storage,
+      workerSender,
+      "8248645256",
+      () => 2_000,
+    );
+
+    const fakeBase64 = "aGVsbG8="; // "hello" in base64
+    const dataUri = `data:image/jpeg;base64,${fakeBase64}`;
+
+    const result = await service.sendStopNotification({
+      session: {
+        sessionId: "sess-media-fail",
+        label: "Media Fail Test",
+        cwd: "/tmp",
+      },
+      event: "Stop",
+      summary: "Done",
+      media: [
+        { mime: "image/jpeg", filename: "photo.jpg", url: dataUri },
+      ],
+    });
+
+    // Token should still be returned
+    expect(result.token).toBeTruthy();
+
+    // sendNotification should still be called (text goes through)
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+
+    // media keys should be undefined (upload failed, resulting array is empty)
+    const failNotifCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, unknown];
+    const failMediaKeys = failNotifCall[4];
+    expect(failMediaKeys).toBeUndefined();
+
+    storage.db.close();
+  });
+
+  it("sendNotification called without media when no media in input", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-no-media",
+      notify: true,
+      label: "No Media",
+      cwd: "/tmp",
+    }, 1_000);
+
+    const uploadMediaMock = vi.fn(async () => ({ ok: true, key: "some-key" }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+
+    const workerSender: WorkerNotificationSender = {
+      sendNotification: sendNotificationMock,
+      uploadMedia: uploadMediaMock,
+    };
+
+    const service = new WorkerNotificationService(
+      storage,
+      workerSender,
+      "8248645256",
+      () => 2_000,
+    );
+
+    await service.sendStopNotification({
+      session: {
+        sessionId: "sess-no-media",
+        label: "No Media",
+        cwd: "/tmp",
+      },
+      event: "Stop",
+      summary: "Done",
+      // no media field
+    });
+
+    // uploadMedia should NOT have been called
+    expect(uploadMediaMock).not.toHaveBeenCalled();
+
+    // sendNotification should have been called without media
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+    const noMediaCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, unknown];
+    const noMediaKeys = noMediaCall[4];
+    expect(noMediaKeys).toBeUndefined();
 
     storage.db.close();
   });

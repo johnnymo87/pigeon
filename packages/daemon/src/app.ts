@@ -226,6 +226,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const summary = typeof body.summary === "string" ? body.summary : null;
         const event = typeof body.event === "string" ? body.event : "Stop";
         const label = typeof body.label === "string" ? body.label : null;
+        const media = Array.isArray(body.media) ? body.media as Array<{ mime: string; filename: string; url: string }> : undefined;
 
         try {
           const result = await notifier.sendStopNotification({
@@ -237,6 +238,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             event,
             summary: message || summary || "Task completed",
             label: label || session.label || undefined,
+            media,
           });
 
           return Response.json({ ok: true, notified: true, ...result });
