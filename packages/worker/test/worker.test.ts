@@ -13,6 +13,8 @@ import {
   resolveMessageSession,
   resolveCallbackSession,
   generateCommandId,
+  extractMedia,
+  MAX_FILE_SIZE,
 } from "../src/webhook";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
@@ -1374,5 +1376,137 @@ describe("/kill command", () => {
     const res = await sendWebhook(makeKillMessage("unknown-session"));
 
     expect(res.status).toBe(200);
+  });
+});
+
+// ─── Telegram Media: Unit Tests ───────────────────────────────────────
+
+describe("extractMedia", () => {
+  it("returns null for text-only message", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      text: "hello world",
+    };
+    expect(extractMedia(msg)).toBeNull();
+  });
+
+  it("extracts photo file_id from largest photo size", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      photo: [
+        { file_id: "small-id", file_unique_id: "small-uid", width: 100, height: 100, file_size: 1000 },
+        { file_id: "medium-id", file_unique_id: "medium-uid", width: 320, height: 320, file_size: 5000 },
+        { file_id: "large-id", file_unique_id: "large-uid", width: 800, height: 800, file_size: 50000 },
+      ],
+    };
+    const result = extractMedia(msg);
+    expect(result).not.toBeNull();
+    expect(result!.fileId).toBe("large-id");
+    expect(result!.fileUniqueId).toBe("large-uid");
+    expect(result!.mime).toBe("image/jpeg");
+    expect(result!.filename).toBe("photo_large-uid.jpg");
+    expect(result!.size).toBe(50000);
+  });
+
+  it("extracts document metadata", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      document: {
+        file_id: "doc-file-id",
+        file_unique_id: "doc-unique-id",
+        file_name: "report.pdf",
+        mime_type: "application/pdf",
+        file_size: 102400,
+      },
+    };
+    const result = extractMedia(msg);
+    expect(result).not.toBeNull();
+    expect(result!.fileId).toBe("doc-file-id");
+    expect(result!.fileUniqueId).toBe("doc-unique-id");
+    expect(result!.mime).toBe("application/pdf");
+    expect(result!.filename).toBe("report.pdf");
+    expect(result!.size).toBe(102400);
+  });
+
+  it("uses fallback mime for document without mime_type", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      document: {
+        file_id: "doc-id",
+        file_unique_id: "doc-uid",
+      },
+    };
+    const result = extractMedia(msg);
+    expect(result!.mime).toBe("application/octet-stream");
+    expect(result!.filename).toBe("file_doc-uid");
+  });
+
+  it("extracts audio with fallback filename", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      audio: {
+        file_id: "audio-id",
+        file_unique_id: "audio-uid",
+        duration: 120,
+        mime_type: "audio/mpeg",
+        file_size: 2048000,
+      },
+    };
+    const result = extractMedia(msg);
+    expect(result).not.toBeNull();
+    expect(result!.fileId).toBe("audio-id");
+    expect(result!.mime).toBe("audio/mpeg");
+    expect(result!.size).toBe(2048000);
+  });
+
+  it("extracts video with fallback mime", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      video: {
+        file_id: "video-id",
+        file_unique_id: "video-uid",
+        duration: 30,
+      },
+    };
+    const result = extractMedia(msg);
+    expect(result!.mime).toBe("video/mp4");
+    expect(result!.filename).toBe("video_video-uid");
+  });
+
+  it("extracts voice with .ogg filename", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      voice: {
+        file_id: "voice-id",
+        file_unique_id: "voice-uid",
+        duration: 5,
+      },
+    };
+    const result = extractMedia(msg);
+    expect(result).not.toBeNull();
+    expect(result!.mime).toBe("audio/ogg");
+    expect(result!.filename).toBe("voice_voice-uid.ogg");
+  });
+
+  it("prefers photo over other media types", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      photo: [{ file_id: "photo-id", file_unique_id: "photo-uid", width: 100, height: 100 }],
+      document: { file_id: "doc-id", file_unique_id: "doc-uid" },
+    };
+    const result = extractMedia(msg);
+    expect(result!.fileId).toBe("photo-id");
+  });
+
+  it("MAX_FILE_SIZE is 20MB", () => {
+    expect(MAX_FILE_SIZE).toBe(20 * 1024 * 1024);
   });
 });

@@ -60,11 +60,59 @@ function deduplicateUpdate(sql: SqlStorage, updateId: number): boolean {
 }
 
 // Telegram update types (minimal, just what we need)
+interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+interface TelegramDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramAudio {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramVideo {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramVoice {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  mime_type?: string;
+  file_size?: number;
+}
+
 interface TelegramMessage {
   message_id: number;
   chat: { id: number };
   from?: { id: number };
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramDocument;
+  audio?: TelegramAudio;
+  video?: TelegramVideo;
+  voice?: TelegramVoice;
   reply_to_message?: { message_id: number };
 }
 
@@ -83,6 +131,66 @@ interface TelegramUpdate {
 
 const MAX_COMMAND_LENGTH = 10_000;
 const OK = () => new Response("ok", { status: 200 });
+
+interface ExtractedMedia {
+  fileId: string;
+  fileUniqueId: string;
+  mime: string;
+  filename: string;
+  size: number;
+}
+
+export const MAX_FILE_SIZE = 20 * 1024 * 1024;
+
+export function extractMedia(message: TelegramMessage): ExtractedMedia | null {
+  if (message.photo && message.photo.length > 0) {
+    const largest = message.photo[message.photo.length - 1]!;
+    return {
+      fileId: largest.file_id,
+      fileUniqueId: largest.file_unique_id,
+      mime: "image/jpeg",
+      filename: `photo_${largest.file_unique_id}.jpg`,
+      size: largest.file_size ?? 0,
+    };
+  }
+  if (message.document) {
+    return {
+      fileId: message.document.file_id,
+      fileUniqueId: message.document.file_unique_id,
+      mime: message.document.mime_type ?? "application/octet-stream",
+      filename: message.document.file_name ?? `file_${message.document.file_unique_id}`,
+      size: message.document.file_size ?? 0,
+    };
+  }
+  if (message.audio) {
+    return {
+      fileId: message.audio.file_id,
+      fileUniqueId: message.audio.file_unique_id,
+      mime: message.audio.mime_type ?? "audio/mpeg",
+      filename: message.audio.file_name ?? `audio_${message.audio.file_unique_id}`,
+      size: message.audio.file_size ?? 0,
+    };
+  }
+  if (message.video) {
+    return {
+      fileId: message.video.file_id,
+      fileUniqueId: message.video.file_unique_id,
+      mime: message.video.mime_type ?? "video/mp4",
+      filename: message.video.file_name ?? `video_${message.video.file_unique_id}`,
+      size: message.video.file_size ?? 0,
+    };
+  }
+  if (message.voice) {
+    return {
+      fileId: message.voice.file_id,
+      fileUniqueId: message.voice.file_unique_id,
+      mime: message.voice.mime_type ?? "audio/ogg",
+      filename: `voice_${message.voice.file_unique_id}.ogg`,
+      size: message.voice.file_size ?? 0,
+    };
+  }
+  return null;
+}
 
 /**
  * Send a message via the Telegram Bot API.
