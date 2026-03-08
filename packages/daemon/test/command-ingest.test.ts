@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import { ResultErrorCode } from "../src/opencode-direct/contracts";
-import type { CommandDeliveryAdapter, QuestionReplyInput } from "../src/adapters/types";
+import type { CommandDeliveryAdapter, CommandDeliveryContext, QuestionReplyInput } from "../src/adapters/types";
 
 describe("ingestWorkerCommand", () => {
   it("acks and marks command done on successful direct-channel delivery", async () => {
@@ -521,6 +521,191 @@ describe("ingestWorkerCommand", () => {
         success: false,
         error: expect.stringContaining("Invalid option index"),
       }),
+    );
+    storage.db.close();
+  });
+
+  it("fetches media from worker and passes it to adapter context", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-media-1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const fakeImageBytes = Buffer.from("fake-image-data");
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "https://worker.example.com/media/inbound/123-abc/photo.jpg") {
+        return new Response(fakeImageBytes, {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        });
+      }
+      // Plugin endpoint - return a valid ack/result
+      return new Response(JSON.stringify({
+        ack: {
+          type: "pigeon.command.ack",
+          version: 1,
+          requestId: "cmd-media-1",
+          commandId: "cmd-media-1",
+          sessionId: "sess-media-1",
+          accepted: true,
+          acceptedAt: Date.now(),
+        },
+        result: {
+          type: "pigeon.command.result",
+          version: 1,
+          requestId: "cmd-media-1",
+          commandId: "cmd-media-1",
+          sessionId: "sess-media-1",
+          success: true,
+          finishedAt: Date.now(),
+          output: "queued",
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    let capturedContext: CommandDeliveryContext | null = null;
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-media-1",
+        sessionId: "sess-media-1",
+        command: "caption text",
+        chatId: "1",
+        media: {
+          key: "inbound/123-abc/photo.jpg",
+          mime: "image/jpeg",
+          filename: "photo.jpg",
+          size: 12345,
+        },
+      },
+      { send(payload) { sent.push(payload); } },
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "test-api-key",
+        fetchFn: fetchFn as unknown as typeof fetch,
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_session, _command, context) {
+            capturedContext = context;
+            return { ok: true };
+          },
+        }),
+      },
+    );
+
+    expect(fetchFn).toHaveBeenCalledWith(
+      "https://worker.example.com/media/inbound/123-abc/photo.jpg",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-api-key" }) }),
+    );
+
+    const ctx1 = capturedContext as CommandDeliveryContext | null;
+    expect(ctx1?.media).toEqual({
+      mime: "image/jpeg",
+      filename: "photo.jpg",
+      url: `data:image/jpeg;base64,${fakeImageBytes.toString("base64")}`,
+    });
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "commandResult", commandId: "cmd-media-1", success: true }),
+    );
+    storage.db.close();
+  });
+
+  it("returns commandResult failure when R2 media fetch fails", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-media-2",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const fetchFn = vi.fn(async (_url: string, _init?: RequestInit) => {
+      return new Response("Not Found", { status: 404 });
+    });
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-media-2",
+        sessionId: "sess-media-2",
+        command: "caption text",
+        chatId: "2",
+        media: {
+          key: "inbound/123-abc/photo.jpg",
+          mime: "image/jpeg",
+          filename: "photo.jpg",
+          size: 12345,
+        },
+      },
+      { send(payload) { sent.push(payload); } },
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "test-api-key",
+        fetchFn: fetchFn as unknown as typeof fetch,
+      },
+    );
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "commandResult",
+        commandId: "cmd-media-2",
+        success: false,
+        error: expect.stringContaining("Failed to fetch media"),
+      }),
+    );
+    storage.db.close();
+  });
+
+  it("text-only command sends no media in adapter context (backward compat)", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-text-only",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    let capturedContext: CommandDeliveryContext | null = null;
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-text-only",
+        sessionId: "sess-text-only",
+        command: "just text",
+        chatId: "3",
+      },
+      { send(payload) { sent.push(payload); } },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_session, _command, context) {
+            capturedContext = context;
+            return { ok: true };
+          },
+        }),
+      },
+    );
+
+    const ctx2 = capturedContext as CommandDeliveryContext | null;
+    expect(ctx2?.media).toBeUndefined();
+    expect(sent).toContainEqual(
+      expect.objectContaining({ type: "commandResult", commandId: "cmd-text-only", success: true }),
     );
     storage.db.close();
   });

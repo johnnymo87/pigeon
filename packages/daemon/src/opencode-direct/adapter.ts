@@ -27,6 +27,11 @@ export interface OpencodeDirectExecuteInput {
   deadlineMs?: number;
   timeoutMs?: number;
   maxRetries?: number;
+  media?: {
+    mime: string;
+    filename: string;
+    url: string;
+  };
 }
 
 export interface OpencodeDirectExecuteResult {
@@ -64,6 +69,7 @@ function buildExecuteEnvelope(input: OpencodeDirectExecuteInput, now: () => numb
       ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
       ...(input.replyToken ? { replyToken: input.replyToken } : {}),
     },
+    ...(input.media ? { media: input.media } : {}),
   };
 }
 

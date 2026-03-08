@@ -1,6 +1,6 @@
 import type { StorageDb } from "../storage/database";
 import type { SessionRecord } from "../storage/types";
-import type { CommandDeliveryAdapter, CommandDeliveryResult } from "../adapters/types";
+import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult } from "../adapters/types";
 import { DirectChannelAdapter } from "../adapters/direct-channel";
 import { NvimRpcAdapter } from "../adapters/nvim-rpc";
 import {
@@ -18,6 +18,12 @@ export interface WorkerCommandMessage {
   sessionId: string;
   command: string;
   chatId?: string;
+  media?: {
+    key: string;
+    mime: string;
+    filename: string;
+    size: number;
+  };
 }
 
 export interface WorkerAckMessage {
@@ -50,6 +56,12 @@ export interface WorkerCommandIngestOptions {
     msg: WorkerCommandMessage,
     commandId: string,
   ) => Promise<OpencodeDirectExecuteResult>;
+  /** Worker base URL for fetching media from R2 (e.g. https://ccr-router.workers.dev) */
+  workerUrl?: string;
+  /** API key for authenticating media fetch requests to the worker */
+  apiKey?: string;
+  /** Override fetch for testing */
+  fetchFn?: typeof fetch;
 }
 
 const QUESTION_OPTION_RE = /^q(\d+)$/;
@@ -237,7 +249,39 @@ export async function ingestWorkerCommand(
     return;
   }
 
-  return deliverViaAdapter(adapter, session, msg, commandId, storage, callbacks);
+  // Fetch media from worker's R2 endpoint if present
+  let mediaPayload: CommandDeliveryContext["media"];
+  if (msg.media) {
+    const fetchFn = options.fetchFn ?? globalThis.fetch;
+    const workerUrl = options.workerUrl ?? "";
+    const apiKey = options.apiKey ?? "";
+    try {
+      const mediaRes = await fetchFn(`${workerUrl}/media/${msg.media.key}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!mediaRes.ok) {
+        throw new Error(`R2 fetch failed: ${mediaRes.status}`);
+      }
+      const bytes = await mediaRes.arrayBuffer();
+      const base64 = Buffer.from(bytes).toString("base64");
+      mediaPayload = {
+        mime: msg.media.mime,
+        filename: msg.media.filename,
+        url: `data:${msg.media.mime};base64,${base64}`,
+      };
+    } catch (err) {
+      callbacks.send({
+        type: "commandResult",
+        commandId,
+        success: false,
+        error: `Failed to fetch media: ${err instanceof Error ? err.message : String(err)}`,
+        chatId: msg.chatId,
+      });
+      return;
+    }
+  }
+
+  return deliverViaAdapter(adapter, session, msg, commandId, storage, callbacks, mediaPayload);
 }
 
 async function deliverViaAdapter(
@@ -247,10 +291,12 @@ async function deliverViaAdapter(
   commandId: string,
   storage: StorageDb,
   callbacks: WorkerCommandIngestCallbacks,
+  media?: CommandDeliveryContext["media"],
 ): Promise<void> {
   const result = await adapter.deliverCommand(session, msg.command, {
     commandId,
     chatId: msg.chatId,
+    ...(media ? { media } : {}),
   });
 
   if (result.ok) {

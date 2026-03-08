@@ -56,6 +56,11 @@ export interface ExecuteCommandEnvelope {
     replyToMessageId?: string;
     replyToken?: string;
   };
+  media?: {
+    mime: string;
+    filename: string;
+    url: string;
+  };
 }
 
 export interface CommandAckEnvelope {

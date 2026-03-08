@@ -276,4 +276,57 @@ describe("executeViaOpencodeDirectChannel", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toContain("correlation mismatch");
   });
+
+  it("includes media field in envelope POSTed to plugin", async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+
+    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        ack: {
+          type: OpencodeDirectMessageType.Ack,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "req-media",
+          commandId: "cmd-media",
+          sessionId: "sess-media",
+          accepted: true,
+          acceptedAt: Date.now(),
+        },
+        result: {
+          type: OpencodeDirectMessageType.Result,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "req-media",
+          commandId: "cmd-media",
+          sessionId: "sess-media",
+          success: true,
+          finishedAt: Date.now(),
+          output: "ok",
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const media = {
+      mime: "image/jpeg",
+      filename: "photo.jpg",
+      url: "data:image/jpeg;base64,ZmFrZQ==",
+    };
+
+    const result = await executeViaOpencodeDirectChannel(
+      {
+        requestId: "req-media",
+        commandId: "cmd-media",
+        sessionId: "sess-media",
+        command: "caption text",
+        endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        authToken: "tok",
+        media,
+      },
+      { fetchFn: fetchFn as unknown as typeof fetch },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(capturedBody).not.toBeNull();
+    const body = capturedBody as Record<string, unknown> | null;
+    expect(body?.media).toEqual(media);
+  });
 });

@@ -1,5 +1,5 @@
 import type { SessionRecord } from "../storage/types";
-import type { CommandDeliveryAdapter, CommandDeliveryResult, QuestionReplyInput } from "./types";
+import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult, QuestionReplyInput } from "./types";
 import {
   executeViaOpencodeDirectChannel,
   replyQuestionViaOpencodeDirectChannel,
@@ -17,7 +17,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
   async deliverCommand(
     session: SessionRecord,
     command: string,
-    context: { commandId: string; chatId?: string | number },
+    context: CommandDeliveryContext,
   ): Promise<CommandDeliveryResult> {
     const endpoint = session.backendEndpoint;
     const authToken = session.backendAuthToken;
@@ -41,6 +41,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         ...(context.chatId !== undefined
           ? { chatId: String(context.chatId) }
           : {}),
+        ...(context.media ? { media: context.media } : {}),
       },
       this.deps,
     );
@@ -75,7 +76,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
   async deliverQuestionReply(
     session: SessionRecord,
     reply: QuestionReplyInput,
-    context: { commandId: string; chatId?: string | number },
+    context: CommandDeliveryContext,
   ): Promise<CommandDeliveryResult> {
     const endpoint = session.backendEndpoint;
     const authToken = session.backendAuthToken;
