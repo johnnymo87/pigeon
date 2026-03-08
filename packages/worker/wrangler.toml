@@ -11,5 +11,12 @@ class_name = "RouterDO"
 tag = "v1"
 new_sqlite_classes = ["RouterDO"]
 
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "pigeon-media"
+
+[triggers]
+crons = ["0 * * * *"]
+
 [vars]
 ALLOWED_CHAT_IDS = "8248645256"
