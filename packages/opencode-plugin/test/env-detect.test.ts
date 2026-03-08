@@ -1,6 +1,13 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
-import * as fs from "node:fs/promises"
+import { afterEach, beforeEach, describe, expect, vi, test } from "vitest"
 import { detectEnvironment } from "../src/env-detect"
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>()
+  return { ...actual, readlink: vi.fn() }
+})
+
+import { readlink } from "node:fs/promises"
+const readlinkMock = vi.mocked(readlink)
 
 /**
  * Creates a mock PluginInput["$"] that captures shell commands.
@@ -25,19 +32,17 @@ const createPluginInput = (shellResponses: Record<string, string> = {}) =>
 const noopLog = () => {}
 
 describe("detectEnvironment tty detection", () => {
-  const readlinkSpy = spyOn(fs, "readlink")
-
   beforeEach(() => {
     delete process.env.TMUX
-    readlinkSpy.mockReset()
+    readlinkMock.mockReset()
   })
 
   afterEach(() => {
-    readlinkSpy.mockReset()
+    readlinkMock.mockReset()
   })
 
   test("returns EnvironmentInfo with tty when /proc/self/fd/0 is a PTY", async () => {
-    readlinkSpy.mockResolvedValue("/dev/pts/12" as any)
+    readlinkMock.mockResolvedValue("/dev/pts/12" as any)
 
     const info = await detectEnvironment(createPluginInput(), noopLog)
 
@@ -45,11 +50,11 @@ describe("detectEnvironment tty detection", () => {
     expect(info.ppid).toBe(process.ppid)
     expect("tty" in info).toBe(true)
     expect((info as any).tty).toBe("/dev/pts/12")
-    expect(readlinkSpy).toHaveBeenCalledWith("/proc/self/fd/0")
+    expect(readlinkMock).toHaveBeenCalledWith("/proc/self/fd/0")
   })
 
   test("falls back to /proc/<ppid>/fd/0 when self fd is not a PTY", async () => {
-    readlinkSpy.mockImplementation(async (path: any) => {
+    readlinkMock.mockImplementation(async (path: any) => {
       if (path === "/proc/self/fd/0") {
         return "pipe:[12345]" as any
       }
@@ -62,12 +67,12 @@ describe("detectEnvironment tty detection", () => {
     const info = await detectEnvironment(createPluginInput(), noopLog)
 
     expect((info as any).tty).toBe("/dev/pts/8")
-    expect(readlinkSpy).toHaveBeenNthCalledWith(1, "/proc/self/fd/0")
-    expect(readlinkSpy).toHaveBeenNthCalledWith(2, `/proc/${process.ppid}/fd/0`)
+    expect(readlinkMock).toHaveBeenNthCalledWith(1, "/proc/self/fd/0")
+    expect(readlinkMock).toHaveBeenNthCalledWith(2, `/proc/${process.ppid}/fd/0`)
   })
 
   test("sets tty to undefined when neither self nor ppid fd points to a PTY", async () => {
-    readlinkSpy.mockImplementation(async (path: any) => {
+    readlinkMock.mockImplementation(async (path: any) => {
       if (path === "/proc/self/fd/0") {
         return "/dev/null" as any
       }
@@ -80,12 +85,12 @@ describe("detectEnvironment tty detection", () => {
     const info = await detectEnvironment(createPluginInput(), noopLog)
 
     expect((info as any).tty).toBeUndefined()
-    expect(readlinkSpy).toHaveBeenNthCalledWith(1, "/proc/self/fd/0")
-    expect(readlinkSpy).toHaveBeenNthCalledWith(2, `/proc/${process.ppid}/fd/0`)
+    expect(readlinkMock).toHaveBeenNthCalledWith(1, "/proc/self/fd/0")
+    expect(readlinkMock).toHaveBeenNthCalledWith(2, `/proc/${process.ppid}/fd/0`)
   })
 
   test("only accepts tty paths matching /^\\/dev\\/(pts\\/\\d+|tty\\w*)$/", async () => {
-    readlinkSpy.mockImplementation(async (path: any) => {
+    readlinkMock.mockImplementation(async (path: any) => {
       if (path === "/proc/self/fd/0") {
         return "/dev/pts/not-a-number" as any
       }
@@ -101,7 +106,7 @@ describe("detectEnvironment tty detection", () => {
   })
 
   test("rejects pipe paths like pipe:[12345]", async () => {
-    readlinkSpy.mockResolvedValue("pipe:[12345]" as any)
+    readlinkMock.mockResolvedValue("pipe:[12345]" as any)
 
     const info = await detectEnvironment(createPluginInput(), noopLog)
 
@@ -110,17 +115,15 @@ describe("detectEnvironment tty detection", () => {
 })
 
 describe("detectEnvironment macOS tty detection (lsof fallback)", () => {
-  const readlinkSpy = spyOn(fs, "readlink")
-
   beforeEach(() => {
     delete process.env.TMUX
-    readlinkSpy.mockReset()
+    readlinkMock.mockReset()
     // Simulate macOS: /proc doesn't exist, readlink always throws
-    readlinkSpy.mockRejectedValue(new Error("ENOENT"))
+    readlinkMock.mockRejectedValue(new Error("ENOENT"))
   })
 
   afterEach(() => {
-    readlinkSpy.mockReset()
+    readlinkMock.mockReset()
   })
 
   test("detects TTY via lsof when /proc is unavailable (macOS)", async () => {

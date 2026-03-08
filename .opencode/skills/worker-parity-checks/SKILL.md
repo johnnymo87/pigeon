@@ -127,7 +127,7 @@ use the daemon parity harness with `PARITY_MODE=direct`:
 ```bash
 op run --env-file=.env.1password -- bash -lc '
   cd ~/projects/pigeon/packages/daemon
-  PARITY_MODE=direct bun run parity:harness
+  PARITY_MODE=direct npm run parity:harness
 '
 ```
 
@@ -157,4 +157,4 @@ curl -s -X POST -H "Content-Type: application/json" \
 ## Verify
 
 Run the Example Script and confirm all three pass criteria.
-For plugin-direct, also run `PARITY_MODE=direct bun run parity:harness` and confirm it passes.
+For plugin-direct, also run `PARITY_MODE=direct npm run parity:harness` and confirm it passes.

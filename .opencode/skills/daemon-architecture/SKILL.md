@@ -125,8 +125,8 @@ Both are wired through `machine-agent.ts` message handlers (alongside the existi
 ## Verify
 
 ```bash
-bun run --filter '@pigeon/daemon' typecheck
-bun run --filter '@pigeon/daemon' test
+npm run --workspace @pigeon/daemon typecheck
+npm run --workspace @pigeon/daemon test
 ```
 
 Expected:

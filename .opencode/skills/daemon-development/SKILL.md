@@ -25,10 +25,10 @@ Use this skill while adding or refactoring daemon behavior.
 ## Common Commands
 
 ```bash
-bun run --filter '@pigeon/daemon' test
-bun run --filter '@pigeon/daemon' typecheck
-bun run test
-bun run typecheck
+npm run --workspace @pigeon/daemon test
+npm run --workspace @pigeon/daemon typecheck
+npm run test
+npm run typecheck
 ```
 
 ## Adapter Pattern

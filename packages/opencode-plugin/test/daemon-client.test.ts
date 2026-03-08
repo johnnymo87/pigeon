@@ -1,32 +1,71 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test"
+import { describe, expect, test, beforeEach, afterEach } from "vitest"
+import * as http from "node:http"
 import { registerSession, notifyStop, notifyQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
 
+/** Minimal HTTP server helper replacing Bun.serve() for tests. */
+function createTestServer(handler: (req: Request) => Promise<Response> | Response): Promise<{ port: number; close: () => void }> {
+  return new Promise((resolve) => {
+    const server = http.createServer(async (nodeReq, nodeRes) => {
+      const body = await new Promise<string>((res) => {
+        let data = ""
+        nodeReq.on("data", (chunk: Buffer) => { data += chunk.toString() })
+        nodeReq.on("end", () => res(data))
+      })
+
+      const url = new URL(nodeReq.url ?? "/", `http://127.0.0.1`)
+      const request = new Request(url, {
+        method: nodeReq.method,
+        headers: nodeReq.headers as Record<string, string>,
+        body: nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? body : undefined,
+      })
+
+      try {
+        const response = await handler(request)
+        const responseBody = await response.text()
+        nodeRes.writeHead(response.status, {
+          "content-type": response.headers.get("content-type") ?? "application/json",
+        })
+        nodeRes.end(responseBody)
+      } catch (err) {
+        nodeRes.writeHead(500)
+        nodeRes.end("Internal Server Error")
+      }
+    })
+
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address() as import("node:net").AddressInfo
+      resolve({ port: addr.port, close: () => server.close() })
+    })
+  })
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 describe("daemon-client", () => {
-  let server: ReturnType<typeof Bun.serve> | undefined
+  let server: { port: number; close: () => void } | undefined
   let serverPort: number
   let requestLog: Array<{ path: string; body: any }> = []
   const mockLog = () => {}
 
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetBreakerForTesting()
     requestLog = []
-    server = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const url = new URL(req.url)
-        const body = await req.json()
-        requestLog.push({ path: url.pathname, body })
-
-        return Response.json({ ok: true, notified: true })
-      },
+    const s = await createTestServer(async (req) => {
+      const url = new URL(req.url)
+      const body = await req.json()
+      requestLog.push({ path: url.pathname, body })
+      return Response.json({ ok: true, notified: true })
     })
-    serverPort = server.port
+    server = s
+    serverPort = s.port
   })
 
   afterEach(() => {
-    server?.stop()
+    server?.close()
     server = undefined
   })
 
@@ -81,14 +120,12 @@ describe("daemon-client", () => {
 
     test("should handle timeout", async () => {
       // given - server that delays response
-      server?.stop()
-      server = Bun.serve({
-        port: serverPort,
-        async fetch(req) {
-          await Bun.sleep(2000) // Delay longer than 1000ms timeout
-          return Response.json({ ok: true })
-        },
+      server?.close()
+      server = await createTestServer(async (req) => {
+        await sleep(2000) // Delay longer than 1000ms timeout
+        return Response.json({ ok: true })
       })
+      serverPort = server.port
 
       const opts = {
         sessionId: "test-session",
@@ -109,13 +146,11 @@ describe("daemon-client", () => {
 
      test("should handle non-200 response", async () => {
        // given - server that returns error
-       server?.stop()
-       server = Bun.serve({
-         port: serverPort,
-         async fetch(req) {
-           return new Response("Internal Server Error", { status: 500 })
-         },
+       server?.close()
+       server = await createTestServer(async (req) => {
+         return new Response("Internal Server Error", { status: 500 })
        })
+       serverPort = server.port
 
        const opts = {
          sessionId: "test-session",
@@ -136,13 +171,11 @@ describe("daemon-client", () => {
 
      test("should handle 500 with JSON body", async () => {
        // given - server that returns 500 with JSON error body
-       server?.stop()
-       server = Bun.serve({
-         port: serverPort,
-         async fetch(req) {
-           return Response.json({ ok: false, error: "internal" }, { status: 500 })
-         },
+       server?.close()
+       server = await createTestServer(async (req) => {
+         return Response.json({ ok: false, error: "internal" }, { status: 500 })
        })
+       serverPort = server.port
 
        const opts = {
          sessionId: "test-session",
@@ -281,13 +314,11 @@ describe("daemon-client", () => {
   describe("circuit breaker", () => {
     test("should skip calls after failure for 30s", async () => {
       // given - server that fails
-      server?.stop()
-      server = Bun.serve({
-        port: serverPort,
-        async fetch(req) {
-          return new Response("Error", { status: 500 })
-        },
+      server?.close()
+      server = await createTestServer(async (req) => {
+        return new Response("Error", { status: 500 })
       })
+      serverPort = server.port
 
       const opts = {
         sessionId: "test-session",
@@ -315,17 +346,15 @@ describe("daemon-client", () => {
     test("should transition to half-open after timeout", async () => {
       // given - server that initially fails
       let shouldFail = true
-      server?.stop()
-      server = Bun.serve({
-        port: serverPort,
-        async fetch(req) {
-          if (shouldFail) {
-            return new Response("Error", { status: 500 })
-          }
-          const body = await req.json()
-          return Response.json({ ok: true, notified: true })
-        },
+      server?.close()
+      server = await createTestServer(async (req) => {
+        if (shouldFail) {
+          return new Response("Error", { status: 500 })
+        }
+        const body = await req.json()
+        return Response.json({ ok: true, notified: true })
       })
+      serverPort = server.port
 
       const opts = {
         sessionId: "test-session",
@@ -386,13 +415,11 @@ describe("daemon-client", () => {
       // Due to time constraints, we verify the failure path.
 
       // given - server that fails
-      server?.stop()
-      server = Bun.serve({
-        port: serverPort,
-        async fetch(req) {
-          return new Response("Error", { status: 500 })
-        },
+      server?.close()
+      server = await createTestServer(async (req) => {
+        return new Response("Error", { status: 500 })
       })
+      serverPort = server.port
 
       const opts = {
         sessionId: "test-session",

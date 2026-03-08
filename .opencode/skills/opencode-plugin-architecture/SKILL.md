@@ -76,6 +76,6 @@ When the daemon delivers an execute command with a `media` field (from a Telegra
 ## Verify
 
 ```bash
-bun run --filter '@pigeon/opencode-plugin' test
-bun run --filter '@pigeon/opencode-plugin' typecheck
+npm run --workspace @pigeon/opencode-plugin test
+npm run --workspace @pigeon/opencode-plugin typecheck
 ```

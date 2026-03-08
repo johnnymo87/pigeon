@@ -26,8 +26,8 @@ Use this while implementing plugin behavior changes.
 ## Commands
 
 ```bash
-bun run --filter '@pigeon/opencode-plugin' test
-bun run --filter '@pigeon/opencode-plugin' typecheck
+npm run --workspace @pigeon/opencode-plugin test
+npm run --workspace @pigeon/opencode-plugin typecheck
 ```
 
 ## Guardrails

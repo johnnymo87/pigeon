@@ -125,8 +125,8 @@ Terminates a running OpenCode session.
 Run:
 
 ```bash
-bun run --filter '@pigeon/worker' test
-bun run --filter '@pigeon/worker' typecheck
+npm run --workspace @pigeon/worker test
+npm run --workspace @pigeon/worker typecheck
 ```
 
 Expected:

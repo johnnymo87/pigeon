@@ -1,8 +1,7 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "moduleResolution": "node",
-    "types": ["bun"]
+    "moduleResolution": "node"
   },
   "include": [
     "src/**/*.ts",

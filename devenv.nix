@@ -1,7 +1,6 @@
 { pkgs, ... }:
 {
   packages = [
-    pkgs.bun
     pkgs.nodejs_22
     pkgs._1password-cli
   ];
@@ -11,17 +10,16 @@
 
   scripts.dev-daemon.exec = ''
     op run --account my.1password.com --env-file=.env.1password -- \
-      bun run --filter '@pigeon/daemon' dev "$@"
+      npm run --workspace @pigeon/daemon dev -- "$@"
   '';
 
   scripts.dev-worker.exec = ''
-    bun run --filter '@pigeon/worker' dev "$@"
+    npm run --workspace @pigeon/worker dev -- "$@"
   '';
 
   enterShell = ''
     echo ""
     echo "Pigeon dev environment"
-    echo "  Bun:  $(bun --version)"
     echo "  Node: $(node --version)"
     if command -v op &>/dev/null && op whoami &>/dev/null 2>&1; then
       echo "  1Password: connected"
@@ -30,9 +28,9 @@
     fi
     echo ""
     echo "Commands:"
-    echo "  bun install       - Install dependencies"
-    echo "  bun run test      - Run all tests"
-    echo "  bun run typecheck - Run typechecks"
+    echo "  npm install       - Install dependencies"
+    echo "  npm run test      - Run all tests"
+    echo "  npm run typecheck - Run typechecks"
     echo "  dev-daemon        - Start daemon (with 1Password secrets)"
     echo "  dev-worker        - Start worker dev server"
     echo ""

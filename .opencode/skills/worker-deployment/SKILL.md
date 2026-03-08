@@ -25,7 +25,7 @@ export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
 
 ```bash
 cd ~/projects/pigeon
-bun run --filter '@pigeon/worker' deploy
+npm run --workspace @pigeon/worker deploy
 ```
 
 ## R2 Bucket

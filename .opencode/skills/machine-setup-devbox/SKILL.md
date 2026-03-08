@@ -16,7 +16,7 @@ Use this for new machine onboarding or broken environment recovery.
    - `sudo nixos-rebuild switch --flake .#devbox`
 2. Ensure pigeon repo dependencies:
    - `cd ~/projects/pigeon`
-   - `bun install`
+    - `npm install`
 
 ## Service Checks
 

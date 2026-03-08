@@ -15,7 +15,7 @@ The OpenCode plugin (`packages/opencode-plugin/`) integrates Pigeon with OpenCod
 
 ### Dev Symlink (for active development)
 
-Symlink the repo source directly into the plugins directory. Bun resolves relative imports from the symlink **target** path, so the cross-package import into `daemon/src/opencode-direct/contracts` resolves correctly.
+Symlink the repo source directly into the plugins directory. The module bundler resolves relative imports from the symlink **target** path, so the cross-package import into `daemon/src/opencode-direct/contracts` resolves correctly.
 
 ```bash
 # Remove any existing plugin file/symlink
@@ -33,15 +33,16 @@ ln -s /home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts \
 
 ### Bundled Build (for stable deployment / Nix)
 
-Bundle all modules into a single file using `bun build`:
+Bundle all modules into a single file using `npx esbuild`:
 
 ```bash
-bun build packages/opencode-plugin/src/index.ts \
-  --target=bun \
+npx esbuild packages/opencode-plugin/src/index.ts \
+  --bundle \
+  --platform=node \
   --format=esm \
   --outfile=dist/opencode-pigeon.js \
-  --external='@opencode-ai/plugin' \
-  --external='@opencode-ai/sdk'
+  --external:@opencode-ai/plugin \
+  --external:@opencode-ai/sdk
 ```
 
 This produces a single `.js` file (~28KB) with all local modules and the contracts inlined. Deploy it to `~/.config/opencode/plugins/opencode-pigeon.js`.

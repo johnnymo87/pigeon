@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach } from "bun:test"
+import { describe, expect, test, beforeEach } from "vitest"
 import { MessageTail } from "../src/message-tail"
 import * as messageTailModule from "../src/message-tail"
 

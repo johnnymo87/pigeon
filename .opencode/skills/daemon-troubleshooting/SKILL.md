@@ -84,5 +84,5 @@ Use parity harness for full-path validation:
 
 ```bash
 cd ~/projects/pigeon
-bun run --filter '@pigeon/daemon' parity:harness
+npm run --workspace @pigeon/daemon parity:harness
 ```

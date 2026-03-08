@@ -18,7 +18,7 @@ One deploy covers all devices. See **worker-deployment** skill for full details.
 
 ```bash
 cd ~/projects/pigeon
-bun run --filter '@pigeon/worker' deploy
+npm run --workspace @pigeon/worker deploy
 ```
 
 ## Per-Machine Daemon Deploy
@@ -30,7 +30,7 @@ On each machine, pull latest code and restart the daemon.
 ```bash
 cd <project-path>/pigeon
 git pull
-bun install
+npm install
 ```
 
 ### 2. Restart Daemon
