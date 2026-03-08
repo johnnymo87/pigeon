@@ -10,6 +10,7 @@ import {
   type CommandWsLike,
 } from "./command-queue";
 import { verifyApiKeyFromProtocols } from "./auth";
+import { handleMediaUpload, handleMediaGet } from "./media";
 
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
@@ -159,6 +160,15 @@ export class RouterDurableObject extends DurableObject<Env> {
     }
     if (url.pathname === "/sessions/unregister" && method === "POST") {
       return handleSessionRequest(this.sql, this.env, request, "unregister");
+    }
+
+    // Media endpoints
+    if (url.pathname === "/media/upload" && method === "POST") {
+      return handleMediaUpload(this.env, request);
+    }
+    if (url.pathname.startsWith("/media/") && url.pathname !== "/media/upload" && method === "GET") {
+      const key = decodeURIComponent(url.pathname.slice("/media/".length));
+      return handleMediaGet(this.env, request, key);
     }
 
     // Notifications

@@ -1197,6 +1197,94 @@ describe("/launch command", () => {
   });
 });
 
+// ─── Media Endpoints ──────────────────────────────────────────────────
+
+describe("media endpoints", () => {
+  it("POST /media/upload rejects without API key", async () => {
+    const form = new FormData();
+    form.append("key", "inbound/test/photo.jpg");
+    form.append("mime", "image/jpeg");
+    form.append("filename", "photo.jpg");
+    form.append("file", new Blob(["fake-image-data"], { type: "image/jpeg" }));
+
+    const res = await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: form,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /media/upload returns 400 for missing fields", async () => {
+    const form = new FormData();
+    form.append("key", "test-key");
+    // Missing mime, filename, file
+
+    const res = await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: form,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /media/upload stores file and returns key", async () => {
+    const form = new FormData();
+    form.append("key", "inbound/123-abc/photo.jpg");
+    form.append("mime", "image/jpeg");
+    form.append("filename", "photo.jpg");
+    form.append("file", new Blob(["fake-image-data"], { type: "image/jpeg" }));
+
+    const res = await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: form,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; key: string };
+    expect(body.ok).toBe(true);
+    expect(body.key).toBe("inbound/123-abc/photo.jpg");
+  });
+
+  it("GET /media/:key returns 401 without API key", async () => {
+    const res = await SELF.fetch("https://worker/media/inbound/test/photo.jpg");
+    expect(res.status).toBe(401);
+  });
+
+  it("GET /media/:key returns 404 for missing key", async () => {
+    const res = await SELF.fetch("https://worker/media/nonexistent/file.jpg", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("roundtrip: upload then download returns correct file", async () => {
+    const fileContent = "test-file-content-binary";
+    const form = new FormData();
+    form.append("key", "inbound/456-def/document.pdf");
+    form.append("mime", "application/pdf");
+    form.append("filename", "document.pdf");
+    form.append("file", new Blob([fileContent], { type: "application/pdf" }));
+
+    // Upload
+    const uploadRes = await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: form,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    expect(uploadRes.status).toBe(200);
+
+    // Download
+    const downloadRes = await SELF.fetch("https://worker/media/inbound/456-def/document.pdf", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    expect(downloadRes.status).toBe(200);
+    expect(downloadRes.headers.get("Content-Type")).toBe("application/pdf");
+    expect(downloadRes.headers.get("Content-Disposition")).toContain("document.pdf");
+    const text = await downloadRes.text();
+    expect(text).toBe(fileContent);
+  });
+});
+
 // ─── /kill Command: Integration Tests ──────────────────────────────
 
 function makeKillMessage(
