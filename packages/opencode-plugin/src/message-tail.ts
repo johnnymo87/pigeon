@@ -19,12 +19,19 @@ export function stripMarkdown(text: string): string {
   return stripped.trim()
 }
 
+export type FileInfo = {
+  mime: string;
+  filename: string;
+  url: string;
+}
+
 type MessageInfo = Pick<Message, "id" | "sessionID" | "role">
 type PartInfo = Pick<Part, "id" | "sessionID" | "messageID" | "type">
 
 type SessionTail = {
   currentMessageId: string | undefined
   text: string
+  files: FileInfo[]
   seenAnyMessage: boolean
   lastSeenAt: number
 }
@@ -36,7 +43,7 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, text: "", seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, text: "", files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
@@ -53,10 +60,24 @@ export class MessageTail {
     if (tail.currentMessageId !== info.id) {
       tail.currentMessageId = info.id
       tail.text = ""
+      tail.files = []
     }
   }
 
-  onPartUpdated(part: PartInfo, delta?: string): void {
+  onPartUpdated(part: PartInfo & { mime?: string; filename?: string; url?: string }, delta?: string): void {
+    // Handle file parts
+    if (part.type === "file" && part.mime && part.url) {
+      const tail = this.getOrCreate(part.sessionID)
+      if (tail.currentMessageId === part.messageID) {
+        tail.files.push({
+          mime: part.mime,
+          filename: part.filename ?? "file",
+          url: part.url,
+        })
+      }
+      return
+    }
+
     if (part.type !== "text") return
 
     const tail = this.getOrCreate(part.sessionID)
@@ -99,6 +120,18 @@ export class MessageTail {
   getCurrentMessageId(sessionID: string): string | undefined {
     const tail = this.sessions.get(sessionID)
     return tail?.currentMessageId
+  }
+
+  getFiles(sessionID: string): FileInfo[] {
+    const tail = this.sessions.get(sessionID)
+    return tail?.files ?? []
+  }
+
+  onToolAttachments(sessionID: string, messageID: string, attachments: FileInfo[]): void {
+    const tail = this.getOrCreate(sessionID)
+    if (tail.currentMessageId === messageID) {
+      tail.files.push(...attachments)
+    }
   }
 
   clear(sessionID: string): void {

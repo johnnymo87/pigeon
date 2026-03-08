@@ -906,18 +906,248 @@ describe("MessageTail", () => {
        expect(tail.getCurrentMessageId("session-1")).toBe("msg-1")
      })
 
-     test("should update lastSeenAt on getOrCreate", () => {
-       tail.onPartUpdated(
-         {
-           id: "part-1",
-           sessionID: "session-1",
-           messageID: "msg-1",
-           type: "text",
-         },
-         "Content"
-       )
+      test("should update lastSeenAt on getOrCreate", () => {
+        tail.onPartUpdated(
+          {
+            id: "part-1",
+            sessionID: "session-1",
+            messageID: "msg-1",
+            type: "text",
+          },
+          "Content"
+        )
 
-       expect(tail.getSummary("session-1")).toBe("Content")
-     })
-   })
+        expect(tail.getSummary("session-1")).toBe("Content")
+      })
+    })
+
+  describe("FilePart capture (getFiles)", () => {
+    test("captures FilePart with image mime type", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/png",
+        filename: "screenshot.png",
+        url: "data:image/png;base64,abc123",
+      } as any)
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(1)
+      expect(files[0]).toEqual({
+        mime: "image/png",
+        filename: "screenshot.png",
+        url: "data:image/png;base64,abc123",
+      })
+    })
+
+    test("uses default filename 'file' when filename is missing", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/jpeg",
+        url: "data:image/jpeg;base64,xyz",
+      } as any)
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(1)
+      expect(files[0].filename).toBe("file")
+    })
+
+    test("does not capture file from non-current message (wrong messageID)", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-2",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      // File arriving with old messageID
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/png",
+        url: "data:image/png;base64,abc",
+      } as any)
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(0)
+    })
+
+    test("does not capture file part without mime", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        url: "data:image/png;base64,abc",
+      } as any)
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(0)
+    })
+
+    test("returns empty array when no files", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      expect(tail.getFiles("session-1")).toEqual([])
+    })
+
+    test("returns empty array for unknown session", () => {
+      expect(tail.getFiles("unknown-session")).toEqual([])
+    })
+
+    test("resets files on new assistant message", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/png",
+        url: "data:image/png;base64,old",
+      } as any)
+
+      expect(tail.getFiles("session-1")).toHaveLength(1)
+
+      // New message starts
+      tail.onMessageUpdated({
+        id: "msg-2",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      expect(tail.getFiles("session-1")).toHaveLength(0)
+    })
+
+    test("clears files on clear()", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated({
+        id: "part-1",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/png",
+        url: "data:image/png;base64,abc",
+      } as any)
+
+      expect(tail.getFiles("session-1")).toHaveLength(1)
+
+      tail.clear("session-1")
+
+      expect(tail.getFiles("session-1")).toEqual([])
+    })
+
+    test("captures tool attachments via onToolAttachments for current message", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onToolAttachments("session-1", "msg-1", [
+        { mime: "image/png", filename: "tool-output.png", url: "data:image/png;base64,tool" },
+        { mime: "image/jpeg", filename: "chart.jpg", url: "data:image/jpeg;base64,chart" },
+      ])
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(2)
+      expect(files[0].filename).toBe("tool-output.png")
+      expect(files[1].filename).toBe("chart.jpg")
+    })
+
+    test("does not capture tool attachments for wrong messageID", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-2",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onToolAttachments("session-1", "msg-1", [
+        { mime: "image/png", filename: "old.png", url: "data:image/png;base64,old" },
+      ])
+
+      const files = tail.getFiles("session-1")
+      expect(files).toHaveLength(0)
+    })
+
+    test("text parts still work alongside file parts", () => {
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-1",
+          type: "text",
+        },
+        "Here is the image:"
+      )
+
+      tail.onPartUpdated({
+        id: "part-2",
+        sessionID: "session-1",
+        messageID: "msg-1",
+        type: "file",
+        mime: "image/png",
+        filename: "result.png",
+        url: "data:image/png;base64,result",
+      } as any)
+
+      expect(tail.getSummary("session-1")).toBe("Here is the image:")
+      expect(tail.getFiles("session-1")).toHaveLength(1)
+    })
+  })
 })
