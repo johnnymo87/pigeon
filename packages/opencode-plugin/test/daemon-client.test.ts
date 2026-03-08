@@ -204,6 +204,78 @@ describe("daemon-client", () => {
       // then
       expect(result).toBeNull()
     })
+
+    test("should include media array in POST body when provided", async () => {
+      // given
+      const opts = {
+        sessionId: "test-session-media",
+        message: "Task completed with image",
+        label: "Test Session",
+        media: [
+          { mime: "image/png", filename: "screenshot.png", url: "data:image/png;base64,abc" },
+          { mime: "image/jpeg", filename: "chart.jpg", url: "data:image/jpeg;base64,xyz" },
+        ],
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      const result = await notifyStop(opts)
+
+      // then
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/stop")
+      expect(requestLog[0].body).toEqual({
+        session_id: "test-session-media",
+        event: "Stop",
+        message: "Task completed with image",
+        label: "Test Session",
+        media: [
+          { mime: "image/png", filename: "screenshot.png", url: "data:image/png;base64,abc" },
+          { mime: "image/jpeg", filename: "chart.jpg", url: "data:image/jpeg;base64,xyz" },
+        ],
+      })
+    })
+
+    test("should not include media field in POST body when media is undefined", async () => {
+      // given - no media field
+      const opts = {
+        sessionId: "test-session-no-media",
+        message: "Task completed",
+        label: "Test Session",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      const result = await notifyStop(opts)
+
+      // then
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].body).not.toHaveProperty("media")
+    })
+
+    test("should not include media field in POST body when media is empty array", async () => {
+      // given - empty media array
+      const opts = {
+        sessionId: "test-session-empty-media",
+        message: "Task completed",
+        label: "Test Session",
+        media: [],
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      const result = await notifyStop(opts)
+
+      // then
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].body).not.toHaveProperty("media")
+    })
   })
 
   describe("circuit breaker", () => {

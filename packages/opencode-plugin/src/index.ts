@@ -306,17 +306,19 @@ const plugin: Plugin = async (ctx) => {
              // Set dedup guard SYNCHRONOUSLY before async notifyStop
              sessionManager.setNotified(sessionID, currentMsgId!)
 
-             const summary = messageTail.getSummary(sessionID) || "Task completed"
-             log("sending notifyStop", { sessionID, summary: summary.slice(0, 100) })
-             notifyStop({
-               sessionId: sessionID,
-               message: summary,
-               label,
-               daemonUrl,
-               log,
-             }).catch((err) => {
-                log("notifyStop error:", serializeError(err))
-              })
+              const summary = messageTail.getSummary(sessionID) || "Task completed"
+              const files = messageTail.getFiles(sessionID)
+              log("sending notifyStop", { sessionID, summary: summary.slice(0, 100) })
+              notifyStop({
+                sessionId: sessionID,
+                message: summary,
+                label,
+                media: files.length > 0 ? files : undefined,
+                daemonUrl,
+                log,
+              }).catch((err) => {
+                 log("notifyStop error:", serializeError(err))
+               })
            }
 
            return
@@ -448,10 +450,12 @@ const plugin: Plugin = async (ctx) => {
              sessionManager.setNotified(sessionID, currentMsgId!)
              const summary = messageTail.getSummary(sessionID)
              if (summary) {
+               const files = messageTail.getFiles(sessionID)
                await notifyStop({
                  sessionId: sessionID,
                  message: summary,
                  label,
+                 media: files.length > 0 ? files : undefined,
                  daemonUrl,
                  log,
                })

@@ -15,10 +15,17 @@ type RegisterSessionOpts = {
   log: LogFn
 }
 
+type FileMedia = {
+  mime: string;
+  filename: string;
+  url: string;
+}
+
 type NotifyStopOpts = {
   sessionId: string
   message: string
   label: string
+  media?: FileMedia[]
   daemonUrl?: string
   log: LogFn
 }
@@ -140,12 +147,13 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
      const res = await fetch(`${url}/stop`, {
        method: "POST",
        headers: { "Content-Type": "application/json" },
-       body: JSON.stringify({
-         session_id: opts.sessionId,
-         event: "Stop",
-         message: opts.message,
-         label: opts.label,
-       }),
+        body: JSON.stringify({
+          session_id: opts.sessionId,
+          event: "Stop",
+          message: opts.message,
+          label: opts.label,
+          ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
+        }),
        signal: AbortSignal.timeout(1000),
      })
 
