@@ -1723,3 +1723,230 @@ describe("Telegram media webhook", () => {
     ws.close();
   });
 });
+
+// ─── Outbound Media: POST /notifications/send with media ──────────────
+
+describe("POST /notifications/send with media", () => {
+  const CHAT_ID = "8248645256";
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    // Clear any stale interceptors from previous tests
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("sends text message then photo for image mime type", async () => {
+    const now = Date.now();
+    const sessionId = `outbound-photo-session-${now}`;
+    const textMsgId = 3_000_001 + (now % 1000);
+    const photoMsgId = 3_000_002 + (now % 1000);
+    await registerSession(sessionId, "machine-outbound", "outbound-test");
+
+    // Upload a file to R2 first
+    const imageKey = `outbound/${now}-aaa/screenshot.png`;
+    const uploadForm = new FormData();
+    uploadForm.append("key", imageKey);
+    uploadForm.append("mime", "image/png");
+    uploadForm.append("filename", "screenshot.png");
+    uploadForm.append("file", new Blob(["fake-png-data"], { type: "image/png" }), "screenshot.png");
+    await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: uploadForm,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+
+    // Mock sendMessage for text
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    // Mock sendPhoto for image
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: photoMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Session completed with screenshot",
+      media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.messageId).toBe(textMsgId);
+  });
+
+  it("sends text message then document for non-image mime type", async () => {
+    const now = Date.now();
+    const sessionId = `outbound-doc-session-${now}`;
+    const textMsgId = 3_100_001 + (now % 1000);
+    const docMsgId = 3_100_002 + (now % 1000);
+    await registerSession(sessionId, "machine-outbound", "outbound-test");
+
+    const docKey = `outbound/${now}-bbb/report.pdf`;
+    const uploadForm = new FormData();
+    uploadForm.append("key", docKey);
+    uploadForm.append("mime", "application/pdf");
+    uploadForm.append("filename", "report.pdf");
+    uploadForm.append("file", new Blob(["fake-pdf-data"], { type: "application/pdf" }), "report.pdf");
+    await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: uploadForm,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+
+    // Mock sendMessage for text
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    // Mock sendDocument for non-image
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendDocument/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: docMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Session completed with document",
+      media: [{ key: docKey, mime: "application/pdf", filename: "report.pdf" }],
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.messageId).toBe(textMsgId);
+  });
+
+  it("stores media message mapping for reply routing", async () => {
+    const now = Date.now();
+    const sessionId = `outbound-map-session-${now}`;
+    const textMsgId = 3_200_001 + (now % 1000);
+    const photoMsgId = 3_200_002 + (now % 1000);
+    await registerSession(sessionId, "machine-outbound", "outbound-test");
+
+    const imgKey = `outbound/${now}-ccc/photo.jpg`;
+    const uploadForm = new FormData();
+    uploadForm.append("key", imgKey);
+    uploadForm.append("mime", "image/jpeg");
+    uploadForm.append("filename", "photo.jpg");
+    uploadForm.append("file", new Blob(["fake-jpg"], { type: "image/jpeg" }), "photo.jpg");
+    await SELF.fetch("https://worker/media/upload", {
+      method: "POST",
+      body: uploadForm,
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+
+    // Mock sendMessage + sendPhoto
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: photoMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Done with photo",
+      media: [{ key: imgKey, mime: "image/jpeg", filename: "photo.jpg" }],
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; messageId: number; token: string };
+    expect(body.ok).toBe(true);
+
+    // The media message (photoMsgId) should be stored in the messages table for reply routing
+    // Verify by querying the DB directly
+    const id = env.ROUTER.idFromName("singleton");
+    const stub = env.ROUTER.get(id);
+    const mediaMessages = await runInDurableObject(stub, async (_instance, state) => {
+      return state.storage.sql.exec(
+        "SELECT message_id, session_id FROM messages WHERE chat_id = ? AND message_id = ?",
+        CHAT_ID,
+        photoMsgId,
+      ).toArray() as Array<{ message_id: number; session_id: string }>;
+    });
+    expect(mediaMessages).toHaveLength(1);
+    expect(mediaMessages[0]!.session_id).toBe(sessionId);
+  });
+
+  it("backward compat: notification without media still works normally", async () => {
+    const now = Date.now();
+    const sessionId = `outbound-noMedia-session-${now}`;
+    const textMsgId = 3_300_001 + (now % 1000);
+    await registerSession(sessionId, "machine-outbound", "outbound-test");
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Just text, no media",
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.messageId).toBe(textMsgId);
+  });
+
+  it("continues if media key not found in R2 (best-effort)", async () => {
+    const now = Date.now();
+    const sessionId = `outbound-missing-session-${now}`;
+    const textMsgId = 3_400_001 + (now % 1000);
+    await registerSession(sessionId, "machine-outbound", "outbound-test");
+
+    // Don't upload anything — key won't exist in R2
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Text with missing media",
+      media: [{ key: "outbound/nonexistent/file.jpg", mime: "image/jpeg", filename: "file.jpg" }],
+    });
+
+    // Text notification should still succeed
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.messageId).toBe(textMsgId);
+  });
+});

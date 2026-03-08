@@ -5,6 +5,7 @@ interface SendNotificationBody {
   chatId: string | number;
   text: string;
   replyMarkup?: unknown;
+  media?: Array<{ key: string; mime: string; filename: string }>;
 }
 
 interface SessionRow {
@@ -115,6 +116,44 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
   return null;
 }
 
+async function sendTelegramPhoto(
+  env: Env,
+  chatId: string | number,
+  photoBlob: Blob,
+  filename: string,
+  replyToMessageId?: number,
+): Promise<{ ok: boolean; result?: { message_id: number } }> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", photoBlob, filename);
+  if (replyToMessageId) form.append("reply_to_message_id", String(replyToMessageId));
+
+  const res = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
+    { method: "POST", body: form },
+  );
+  return res.json() as Promise<{ ok: boolean; result?: { message_id: number } }>;
+}
+
+async function sendTelegramDocument(
+  env: Env,
+  chatId: string | number,
+  documentBlob: Blob,
+  filename: string,
+  replyToMessageId?: number,
+): Promise<{ ok: boolean; result?: { message_id: number } }> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", documentBlob, filename);
+  if (replyToMessageId) form.append("reply_to_message_id", String(replyToMessageId));
+
+  const res = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`,
+    { method: "POST", body: form },
+  );
+  return res.json() as Promise<{ ok: boolean; result?: { message_id: number } }>;
+}
+
 /**
  * Handle POST /notifications/send
  */
@@ -128,7 +167,7 @@ export async function handleSendNotification(
   }
 
   const body = (await request.json()) as SendNotificationBody;
-  const { sessionId, chatId, text, replyMarkup } = body;
+  const { sessionId, chatId, text, replyMarkup, media } = body;
 
   // Validate required fields
   if (!sessionId || !chatId || !text) {
@@ -204,6 +243,36 @@ export async function handleSendNotification(
     token,
     Date.now()
   );
+
+  // Send media as replies to the text message
+  if (media && media.length > 0) {
+    for (const item of media) {
+      try {
+        const object = await env.MEDIA.get(item.key);
+        if (!object?.body) continue;
+
+        const blob = new Blob([await object.arrayBuffer()], { type: item.mime });
+        const isImage = item.mime.startsWith("image/");
+
+        const mediaResult = isImage
+          ? await sendTelegramPhoto(env, chatId, blob, item.filename, messageId)
+          : await sendTelegramDocument(env, chatId, blob, item.filename, messageId);
+
+        if (mediaResult.ok && mediaResult.result) {
+          sql.exec(
+            "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
+            String(chatId),
+            mediaResult.result.message_id,
+            sessionId,
+            token,
+            Date.now(),
+          );
+        }
+      } catch {
+        continue; // Best-effort: text already sent
+      }
+    }
+  }
 
   return json({ ok: true, messageId, token });
 }
