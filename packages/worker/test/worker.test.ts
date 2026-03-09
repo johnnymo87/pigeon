@@ -1393,7 +1393,7 @@ describe("extractMedia", () => {
     expect(extractMedia(msg)).toBeNull();
   });
 
-  it("extracts photo file_id from largest photo size", () => {
+  it("extracts photo file_id from largest photo size within dimension limit", () => {
     const msg = {
       message_id: 1,
       chat: { id: 123 },
@@ -1410,6 +1410,35 @@ describe("extractMedia", () => {
     expect(result!.mime).toBe("image/jpeg");
     expect(result!.filename).toBe("photo_large-uid.jpg");
     expect(result!.size).toBe(50000);
+  });
+
+  it("skips oversized photo variants and picks largest within limit", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      photo: [
+        { file_id: "small-id", file_unique_id: "small-uid", width: 100, height: 100, file_size: 1000 },
+        { file_id: "fit-id", file_unique_id: "fit-uid", width: 1280, height: 960, file_size: 80000 },
+        { file_id: "oversized-id", file_unique_id: "oversized-uid", width: 2560, height: 1920, file_size: 200000 },
+      ],
+    };
+    const result = extractMedia(msg);
+    expect(result).not.toBeNull();
+    expect(result!.fileId).toBe("fit-id");
+    expect(result!.size).toBe(80000);
+  });
+
+  it("returns null when all photo variants exceed dimension limit", () => {
+    const msg = {
+      message_id: 1,
+      chat: { id: 123 },
+      photo: [
+        { file_id: "big-id", file_unique_id: "big-uid", width: 2000, height: 2000, file_size: 100000 },
+        { file_id: "bigger-id", file_unique_id: "bigger-uid", width: 3000, height: 3000, file_size: 200000 },
+      ],
+    };
+    const result = extractMedia(msg);
+    expect(result).toBeNull();
   });
 
   it("extracts document metadata", () => {

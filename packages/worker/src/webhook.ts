@@ -143,15 +143,35 @@ interface ExtractedMedia {
 
 export const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
+/**
+ * Max image dimension (px) for inbound photos. Anthropic's API limits images to
+ * 2000px per side in many-image requests (21+), and auto-resizes above 1568px
+ * adding latency. We pick the largest Telegram variant within this bound.
+ */
+export const MAX_IMAGE_DIMENSION = 1568;
+
 export function extractMedia(message: TelegramMessage): ExtractedMedia | null {
   if (message.photo && message.photo.length > 0) {
-    const largest = message.photo[message.photo.length - 1]!;
+    // Telegram sorts photo[] ascending by size. Pick the largest variant
+    // where both dimensions fit within MAX_IMAGE_DIMENSION.
+    let best: TelegramPhotoSize | null = null;
+    for (const variant of message.photo) {
+      if (variant.width <= MAX_IMAGE_DIMENSION && variant.height <= MAX_IMAGE_DIMENSION) {
+        best = variant;
+      }
+    }
+    if (!best) {
+      // Every variant exceeds the limit. This shouldn't happen in practice
+      // since Telegram always generates small thumbnails. Skip the media
+      // rather than relay an oversized image.
+      return null;
+    }
     return {
-      fileId: largest.file_id,
-      fileUniqueId: largest.file_unique_id,
+      fileId: best.file_id,
+      fileUniqueId: best.file_unique_id,
       mime: "image/jpeg",
-      filename: `photo_${largest.file_unique_id}.jpg`,
-      size: largest.file_size ?? 0,
+      filename: `photo_${best.file_unique_id}.jpg`,
+      size: best.file_size ?? 0,
     };
   }
   if (message.document) {

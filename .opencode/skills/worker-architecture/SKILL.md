@@ -48,9 +48,12 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 ### Inbound Flow (Telegram → R2)
 
 1. `extractMedia()` in `webhook.ts` detects photo/document/audio/video/voice on incoming messages.
-2. `relayMediaToR2()` calls Telegram `getFile` API, downloads the binary, stores in R2 with key `inbound/<ts>-<fileUniqueId>/<filename>`.
-3. A `MediaRef { key, mime, filename, size }` is serialized as `media_json` in the `command_queue` row.
-4. WebSocket delivery includes `media: { key, mime, filename, size }` in the command payload.
+2. For photos: picks the largest Telegram variant where both dimensions are <= `MAX_IMAGE_DIMENSION` (1568px). If no variant fits, the media is skipped entirely (text command still goes through). This avoids Anthropic's 2000px multi-image limit and the latency penalty for images above 1568px.
+3. `relayMediaToR2()` calls Telegram `getFile` API, downloads the binary, stores in R2 with key `inbound/<ts>-<fileUniqueId>/<filename>`.
+4. A `MediaRef { key, mime, filename, size }` is serialized as `media_json` in the `command_queue` row.
+5. WebSocket delivery includes `media: { key, mime, filename, size }` in the command payload.
+
+**Image sizing trade-offs:** We rely on Telegram's pre-generated photo variants (~90px, ~320px, ~800px, ~1280px) rather than resizing ourselves. The ~1280px variant is typically selected, which is high quality for most use cases. If finer control is ever needed, daemon-side resizing with `sharp` (after R2 fetch) or worker-side WASM resizing can be layered on. See `docs/plans/2026-03-08-inbound-image-sizing-design.md`.
 
 ### Outbound Flow (R2 → Telegram)
 
