@@ -20,6 +20,12 @@ export class RouterDurableObject extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.initSchema();
+
+    // Let the Cloudflare edge handle ping/pong without waking the DO from hibernation.
+    // Without this, every 30s daemon ping triggers a full DO cold-start cycle.
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'),
+    );
   }
 
   private initSchema(): void {
@@ -270,10 +276,8 @@ export class RouterDurableObject extends DurableObject<Env> {
     const msg = payload as Record<string, unknown>;
     const type = msg.type;
 
-    if (type === "ping") {
-      ws.send(JSON.stringify({ type: "pong" }));
-      return;
-    }
+    // Note: ping/pong is handled by setWebSocketAutoResponse (see constructor),
+    // so "ping" messages never reach this handler.
 
     if (type === "ack") {
       const commandId = msg.commandId;

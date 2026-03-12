@@ -1040,6 +1040,25 @@ describe("websocket machine agent", () => {
   });
 });
 
+// ─── WebSocket Hibernation ─────────────────────────────────────────────
+
+describe("websocket hibernation auto-response", () => {
+  it("configures auto-response so pings are handled at the edge without waking the DO", async () => {
+    const id = env.ROUTER.idFromName("singleton");
+    const stub = env.ROUTER.get(id);
+
+    const autoResponse = await runInDurableObject(stub, async (_instance, state) => {
+      const ar = state.getWebSocketAutoResponse();
+      if (!ar) return null;
+      return { request: ar.request, response: ar.response };
+    });
+
+    expect(autoResponse).not.toBeNull();
+    expect(autoResponse!.request).toBe('{"type":"ping"}');
+    expect(autoResponse!.response).toBe('{"type":"pong"}');
+  });
+});
+
 // ─── Webhook: Unit Tests ──────────────────────────────────────────────
 
 describe("generateCommandId", () => {
