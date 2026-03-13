@@ -157,3 +157,22 @@ describe("MachineAgent.sendNotification", () => {
     storage.db.close();
   });
 });
+
+describe("MachineAgent.handleMessage", () => {
+  it("updates lastPongAt on pong message", async () => {
+    const storage = openStorageDb(":memory:");
+
+    const agent = new MachineAgent(
+      { workerUrl: "http://localhost:8787", apiKey: "key", machineId: "test" },
+      storage,
+      { now: () => 5000 },
+    );
+
+    // handleMessage is public — verify pong is handled without error
+    await agent.handleMessage(JSON.stringify({ type: "pong" }));
+
+    expect((agent as unknown as { lastPongAt: number }).lastPongAt).toBe(5000);
+
+    storage.db.close();
+  });
+});

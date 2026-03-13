@@ -42,6 +42,8 @@ export class MachineAgent {
   private reconnectDelayMs = RECONNECT_BASE_MS;
   private stopped = false;
   private lastPongAt = 0;
+  private openedAt = 0;
+  private closeCause: string | null = null;
 
   constructor(
     private readonly config: MachineAgentConfig,
@@ -63,7 +65,10 @@ export class MachineAgent {
   stop(): void {
     this.stopped = true;
     this.clearTimers();
-    this.ws?.close();
+    if (this.ws) {
+      this.closeCause = "stopped";
+      this.ws.close();
+    }
     this.ws = null;
   }
 
@@ -80,6 +85,8 @@ export class MachineAgent {
       console.log(`[machine-agent] connected machineId=${this.config.machineId}`);
       this.reconnectDelayMs = RECONNECT_BASE_MS;
       this.lastPongAt = this.now();
+      this.openedAt = this.now();
+      this.closeCause = null;
       this.startPing();
       this.replayUnfinishedCommands();
     });
@@ -89,15 +96,19 @@ export class MachineAgent {
     });
 
     ws.addEventListener("error", () => {
-      console.warn("[machine-agent] websocket error");
+      console.warn(`[machine-agent] websocket error machineId=${this.config.machineId} ageMs=${this.now() - this.openedAt}`);
       this.clearTimers();
       this.ws?.close();
     });
 
-    ws.addEventListener("close", () => {
-      console.warn("[machine-agent] websocket closed");
+    ws.addEventListener("close", (event) => {
+      const ageMs = this.now() - this.openedAt;
+      const lastPongAgeMs = this.now() - this.lastPongAt;
+      const ev = event as { code: number; reason: string; wasClean: boolean };
+      console.warn(`[machine-agent] websocket closed code=${ev.code} reason=${ev.reason} wasClean=${ev.wasClean} ageMs=${ageMs} lastPongAgeMs=${lastPongAgeMs} cause=${this.closeCause ?? "remote"}`);
       this.clearTimers();
       this.ws = null;
+      this.closeCause = null;
       if (!this.stopped) {
         this.scheduleReconnect();
       }
@@ -114,13 +125,15 @@ export class MachineAgent {
       this.ws.send(JSON.stringify({ type: "ping" }));
 
       if (this.now() - this.lastPongAt > PONG_TIMEOUT_MS) {
-        this.ws.close();
+        this.closeCause = "heartbeat-timeout";
+        this.ws.close(4001, "heartbeat-timeout");
       }
     }, PING_INTERVAL_MS);
 
     this.pongTimer = setInterval(() => {
       if (this.now() - this.lastPongAt > PONG_TIMEOUT_MS) {
-        this.ws?.close();
+        this.closeCause = "heartbeat-timeout";
+        this.ws?.close(4001, "heartbeat-timeout");
       }
     }, 5_000);
   }
