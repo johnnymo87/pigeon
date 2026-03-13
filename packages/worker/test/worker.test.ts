@@ -1015,6 +1015,18 @@ describe("websocket machine agent", () => {
     ws.close();
   });
 
+  it("responds to heartbeat with heartbeat-ack", async () => {
+    const ws = await openMachineSocket(`machine-hb-${Date.now()}`);
+
+    // Drain the boot message first
+    await waitForWsMessage(ws);
+
+    ws.send(JSON.stringify({ type: "heartbeat" }));
+    const message = await waitForWsMessage(ws);
+    expect(JSON.parse(message)).toEqual({ type: "heartbeat-ack" });
+    ws.close();
+  });
+
   it("flushes pending queued commands to connected machine and handles ack", async () => {
     const now = Date.now();
     const machineId = `machine-flush-${now}`;
