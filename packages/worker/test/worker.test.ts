@@ -930,7 +930,7 @@ describe("command queue lifecycle", () => {
     expect(rows[0]?.next_retry_at).toBeGreaterThan(now);
   });
 
-  it("alarm logs start and completion (no throw on success)", async () => {
+  it("alarm reschedules itself after completing successfully", async () => {
     const id = env.ROUTER.idFromName("singleton");
     const stub = env.ROUTER.get(id);
 
