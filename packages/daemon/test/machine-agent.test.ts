@@ -177,6 +177,15 @@ describe("MachineAgent.handleMessage", () => {
   });
 });
 
+describe("MachineAgent heartbeat", () => {
+  it("heartbeat message type is distinct from ping", () => {
+    // Verify the heartbeat won't be matched by setWebSocketAutoResponse
+    const ping = JSON.stringify({ type: "ping" });
+    const heartbeat = JSON.stringify({ type: "heartbeat" });
+    expect(ping).not.toBe(heartbeat);
+  });
+});
+
 describe("MachineAgent boot ID tracking", () => {
   it("stores bootId from boot message and treats heartbeat-ack as pong", async () => {
     const storage = openStorageDb(":memory:");

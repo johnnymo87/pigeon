@@ -6,6 +6,7 @@ import { ingestLaunchCommand } from "./launch-ingest";
 
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
+const HEARTBEAT_INTERVAL_MS = 300_000; // 5 minutes
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -38,6 +39,7 @@ export class MachineAgent {
   private ws: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelayMs = RECONNECT_BASE_MS;
   private stopped = false;
@@ -137,6 +139,13 @@ export class MachineAgent {
         this.ws?.close(4001, "heartbeat-timeout");
       }
     }, 5_000);
+
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      this.ws.send(JSON.stringify({ type: "heartbeat" }));
+    }, HEARTBEAT_INTERVAL_MS);
   }
 
   private scheduleReconnect(): void {
@@ -170,6 +179,10 @@ export class MachineAgent {
     if (this.pongTimer) {
       clearInterval(this.pongTimer);
       this.pongTimer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
