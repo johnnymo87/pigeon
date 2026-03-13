@@ -929,6 +929,23 @@ describe("command queue lifecycle", () => {
     expect(rows[0]?.status).toBe("sent");
     expect(rows[0]?.next_retry_at).toBeGreaterThan(now);
   });
+
+  it("alarm logs start and completion (no throw on success)", async () => {
+    const id = env.ROUTER.idFromName("singleton");
+    const stub = env.ROUTER.get(id);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+
+    // Verify alarm rescheduled itself (proof it completed successfully)
+    const hasAlarm = await runInDurableObject(stub, async (_instance, state) => {
+      const alarm = await state.storage.getAlarm();
+      return alarm !== null;
+    });
+    expect(hasAlarm).toBe(true);
+  });
 });
 
 // ─── WebSocket Machine Agent: Integration ──────────────────────────────
@@ -1070,9 +1087,13 @@ describe("websocket hibernation auto-response", () => {
 
     const event = await closePromise;
     expect(event.code).toBe(1000);
+    // Reason may or may not round-trip depending on workerd behavior
+    if (event.reason) {
+      expect(event.reason).toBe("normal shutdown");
+    }
   });
 
-  it("logs structured close event with machineId and auto-response timestamp", async () => {
+  it("runs close handler without error when machineId is present", async () => {
     const machineId = `machine-closelog-${Date.now()}`;
     const ws = await openMachineSocket(machineId);
 

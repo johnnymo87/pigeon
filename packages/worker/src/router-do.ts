@@ -364,9 +364,24 @@ export class RouterDurableObject extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    cleanupCommandQueue(this.sql);
-    retrySentCommands(this.sql, (machineId) => this.getMachineWebSocket(machineId));
-
-    await this.ctx.storage.setAlarm(Date.now() + (60 * 60 * 1000));
+    const startedAt = Date.now();
+    try {
+      cleanupCommandQueue(this.sql);
+      retrySentCommands(this.sql, (machineId) => this.getMachineWebSocket(machineId));
+      await this.ctx.storage.setAlarm(Date.now() + (60 * 60 * 1000));
+      console.info(JSON.stringify({
+        ev: "alarm_ok",
+        durationMs: Date.now() - startedAt,
+      }));
+    } catch (error) {
+      console.error(JSON.stringify({
+        ev: "alarm_error",
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error
+          ? { name: error.name, message: error.message }
+          : String(error),
+      }));
+      throw error; // Preserve Cloudflare's automatic retry behavior.
+    }
   }
 }
