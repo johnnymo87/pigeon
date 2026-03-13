@@ -15,6 +15,7 @@ import { handleMediaUpload, handleMediaGet } from "./media";
 export class RouterDurableObject extends DurableObject<Env> {
   sql: SqlStorage;
   private static readonly MAX_WS_MESSAGE_BYTES = 65536;
+  private readonly bootId = crypto.randomUUID().slice(0, 8);
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -232,6 +233,8 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     this.ctx.acceptWebSocket(server, [machineId]);
     server.serializeAttachment({ machineId });
+
+    server.send(JSON.stringify({ type: "boot", bootId: this.bootId }));
 
     flushCommandQueue(this.sql, machineId, server);
 

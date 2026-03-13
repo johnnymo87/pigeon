@@ -1006,6 +1006,7 @@ describe("websocket machine agent", () => {
 
   it("responds to ping with pong", async () => {
     const ws = await openMachineSocket(`machine-ping-${Date.now()}`);
+    await waitForWsMessage(ws); // drain boot message
     ws.send(JSON.stringify({ type: "ping" }));
 
     const message = await waitForWsMessage(ws);
@@ -1032,6 +1033,7 @@ describe("websocket machine agent", () => {
     });
 
     const ws = await openMachineSocket(machineId);
+    await waitForWsMessage(ws); // drain boot message
     const inbound = await waitForWsMessage(ws);
     const commandMsg = JSON.parse(inbound) as {
       type: string;
@@ -1060,6 +1062,20 @@ describe("websocket machine agent", () => {
 // ─── WebSocket Hibernation ─────────────────────────────────────────────
 
 describe("websocket hibernation auto-response", () => {
+  it("sends boot message with bootId on WebSocket connect", async () => {
+    const machineId = `machine-boot-${Date.now()}`;
+    const ws = await openMachineSocket(machineId);
+
+    const message = await waitForWsMessage(ws);
+    const parsed = JSON.parse(message);
+
+    expect(parsed.type).toBe("boot");
+    expect(typeof parsed.bootId).toBe("string");
+    expect(parsed.bootId.length).toBe(8);
+
+    ws.close();
+  });
+
   it("configures auto-response so pings are handled at the edge without waking the DO", async () => {
     const id = env.ROUTER.idFromName("singleton");
     const stub = env.ROUTER.get(id);
@@ -1197,6 +1213,7 @@ describe("/launch command", () => {
     const machineId = `launch-ws-${now}`;
 
     const ws = await openMachineSocket(machineId);
+    await waitForWsMessage(ws); // drain boot message
 
     mockTelegramSendMessage(); // ack "Launching on ..."
 
@@ -1227,6 +1244,7 @@ describe("/launch command", () => {
     const machineId = `launch-multiword-${now}`;
 
     const ws = await openMachineSocket(machineId);
+    await waitForWsMessage(ws); // drain boot message
     mockTelegramSendMessage();
 
     // Set up listener BEFORE sending the webhook so we don't miss the message
@@ -1414,6 +1432,7 @@ describe("/kill command", () => {
     await registerSession(sessionId, machineId);
 
     const ws = await openMachineSocket(machineId);
+    await waitForWsMessage(ws); // drain boot message
     mockTelegramSendMessage(); // ack "Killing session..."
 
     const messagePromise = waitForWsMessage(ws);
@@ -1794,6 +1813,7 @@ describe("Telegram media webhook", () => {
     await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-ws-token-${now}` });
 
     const ws = await openMachineSocket(machineId);
+    await waitForWsMessage(ws); // drain boot message
 
     mockGetFile("photos/ws-test.jpg");
     mockFileDownload("fake-photo-for-ws");
