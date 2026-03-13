@@ -282,11 +282,6 @@ export class RouterDurableObject extends DurableObject<Env> {
     // Note: ping/pong is handled by setWebSocketAutoResponse (see constructor),
     // so "ping" messages never reach this handler.
 
-    if (type === "heartbeat") {
-      ws.send(JSON.stringify({ type: "heartbeat-ack" }));
-      return;
-    }
-
     if (type === "ack") {
       const commandId = msg.commandId;
       if (typeof commandId !== "string" || commandId.length > 64) {

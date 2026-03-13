@@ -177,17 +177,8 @@ describe("MachineAgent.handleMessage", () => {
   });
 });
 
-describe("MachineAgent heartbeat", () => {
-  it("heartbeat message type is distinct from ping", () => {
-    // Verify the heartbeat won't be matched by setWebSocketAutoResponse
-    const ping = JSON.stringify({ type: "ping" });
-    const heartbeat = JSON.stringify({ type: "heartbeat" });
-    expect(ping).not.toBe(heartbeat);
-  });
-});
-
 describe("MachineAgent boot ID tracking", () => {
-  it("stores bootId from boot message and treats heartbeat-ack as pong", async () => {
+  it("stores bootId from boot message", async () => {
     const storage = openStorageDb(":memory:");
 
     const agent = new MachineAgent(
@@ -198,9 +189,6 @@ describe("MachineAgent boot ID tracking", () => {
 
     await agent.handleMessage(JSON.stringify({ type: "boot", bootId: "abc12345" }));
     expect((agent as unknown as { bootId: string | null }).bootId).toBe("abc12345");
-
-    await agent.handleMessage(JSON.stringify({ type: "heartbeat-ack" }));
-    expect((agent as unknown as { lastPongAt: number }).lastPongAt).toBe(5000);
 
     storage.db.close();
   });
