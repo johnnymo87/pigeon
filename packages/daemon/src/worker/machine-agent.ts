@@ -44,6 +44,7 @@ export class MachineAgent {
   private lastPongAt = 0;
   private openedAt = 0;
   private closeCause: string | null = null;
+  private bootId: string | null = null;
 
   constructor(
     private readonly config: MachineAgentConfig,
@@ -105,7 +106,7 @@ export class MachineAgent {
       const ageMs = this.now() - this.openedAt;
       const lastPongAgeMs = this.now() - this.lastPongAt;
       const ev = event as { code: number; reason: string; wasClean: boolean };
-      console.warn(`[machine-agent] websocket closed code=${ev.code} reason=${ev.reason} wasClean=${ev.wasClean} ageMs=${ageMs} lastPongAgeMs=${lastPongAgeMs} cause=${this.closeCause ?? "remote"}`);
+      console.warn(`[machine-agent] websocket closed code=${ev.code} reason=${ev.reason} wasClean=${ev.wasClean} ageMs=${ageMs} lastPongAgeMs=${lastPongAgeMs} cause=${this.closeCause ?? "remote"} bootId=${this.bootId ?? "?"}`);
       this.clearTimers();
       this.ws = null;
       this.closeCause = null;
@@ -197,6 +198,19 @@ export class MachineAgent {
 
     const record = msg as Record<string, unknown>;
     if (record.type === "pong") {
+      this.lastPongAt = this.now();
+      return;
+    }
+
+    if (record.type === "boot") {
+      const newBootId = typeof record.bootId === "string" ? record.bootId : null;
+      const changed = this.bootId !== null && this.bootId !== newBootId;
+      console.log(`[machine-agent] boot bootId=${newBootId} prevBootId=${this.bootId} changed=${changed}`);
+      this.bootId = newBootId;
+      return;
+    }
+
+    if (record.type === "heartbeat-ack") {
       this.lastPongAt = this.now();
       return;
     }

@@ -176,3 +176,23 @@ describe("MachineAgent.handleMessage", () => {
     storage.db.close();
   });
 });
+
+describe("MachineAgent boot ID tracking", () => {
+  it("stores bootId from boot message and treats heartbeat-ack as pong", async () => {
+    const storage = openStorageDb(":memory:");
+
+    const agent = new MachineAgent(
+      { workerUrl: "http://localhost:8787", apiKey: "key", machineId: "test" },
+      storage,
+      { now: () => 5000 },
+    );
+
+    await agent.handleMessage(JSON.stringify({ type: "boot", bootId: "abc12345" }));
+    expect((agent as unknown as { bootId: string | null }).bootId).toBe("abc12345");
+
+    await agent.handleMessage(JSON.stringify({ type: "heartbeat-ack" }));
+    expect((agent as unknown as { lastPongAt: number }).lastPongAt).toBe(5000);
+
+    storage.db.close();
+  });
+});
