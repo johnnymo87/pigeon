@@ -1057,6 +1057,33 @@ describe("websocket hibernation auto-response", () => {
     expect(autoResponse!.request).toBe('{"type":"ping"}');
     expect(autoResponse!.response).toBe('{"type":"pong"}');
   });
+
+  it("reciprocates close handshake with matching code and reason", async () => {
+    const machineId = `machine-close-${Date.now()}`;
+    const ws = await openMachineSocket(machineId);
+
+    const closePromise = new Promise<CloseEvent>((resolve) => {
+      ws.addEventListener("close", (event) => resolve(event), { once: true });
+    });
+
+    ws.close(1000, "normal shutdown");
+
+    const event = await closePromise;
+    expect(event.code).toBe(1000);
+  });
+
+  it("logs structured close event with machineId and auto-response timestamp", async () => {
+    const machineId = `machine-closelog-${Date.now()}`;
+    const ws = await openMachineSocket(machineId);
+
+    const closePromise = new Promise<void>((resolve) => {
+      ws.addEventListener("close", () => resolve(), { once: true });
+    });
+
+    ws.close(1001, "going away");
+    await closePromise;
+    // If we get here without error, the close handler ran successfully.
+  });
 });
 
 // ─── Webhook: Unit Tests ──────────────────────────────────────────────

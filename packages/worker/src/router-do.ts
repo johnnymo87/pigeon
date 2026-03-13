@@ -303,12 +303,45 @@ export class RouterDurableObject extends DurableObject<Env> {
     }
   }
 
-  webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {
-    // No explicit cleanup needed; Durable Object tracks sockets by tag.
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    const machineId = this.getMachineIdFromSocket(ws);
+    let lastAutoResponseAt: string | null = null;
+
+    try {
+      const ts = this.ctx.getWebSocketAutoResponseTimestamp(ws);
+      lastAutoResponseAt = ts ? ts.toISOString() : null;
+    } catch {
+      // Socket may already be fully detached.
+    }
+
+    console.warn(JSON.stringify({
+      ev: "ws_close",
+      code,
+      reason,
+      wasClean,
+      machineId,
+      lastAutoResponseAt,
+    }));
+
+    // Required by Cloudflare to complete the close handshake.
+    // Without this, clients receive 1006 abnormal closure.
+    try {
+      ws.close(code, reason);
+    } catch {
+      // Socket may already be closed.
+    }
   }
 
-  webSocketError(_ws: WebSocket, _error: unknown): void {
-    // Keep alive; machine agent should reconnect.
+  webSocketError(ws: WebSocket, error: unknown): void {
+    const machineId = this.getMachineIdFromSocket(ws);
+
+    console.error(JSON.stringify({
+      ev: "ws_error",
+      machineId,
+      error: error instanceof Error
+        ? { name: error.name, message: error.message }
+        : String(error),
+    }));
   }
 
   private getMachineIdFromSocket(ws: WebSocket): string | null {
