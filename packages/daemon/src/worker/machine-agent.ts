@@ -1,6 +1,6 @@
 import type { OpencodeClient } from "../opencode-client";
 import type { StorageDb } from "../storage/database";
-import { ingestWorkerCommand, type WorkerCommandMessage } from "./command-ingest";
+import { ingestWorkerCommand, type WorkerCommandMessage, type WorkerCommandResultMessage } from "./command-ingest";
 import { ingestKillCommand } from "./kill-ingest";
 import { ingestLaunchCommand } from "./launch-ingest";
 
@@ -8,6 +8,7 @@ const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
+const MAX_PENDING_RESULTS = 100;
 
 export interface MachineAgentConfig {
   workerUrl: string;
@@ -45,6 +46,7 @@ export class MachineAgent {
   private openedAt = 0;
   private closeCause: string | null = null;
   private bootId: string | null = null;
+  private pendingResults: Array<WorkerCommandResultMessage> = [];
 
   constructor(
     private readonly config: MachineAgentConfig,
@@ -90,6 +92,7 @@ export class MachineAgent {
       this.closeCause = null;
       this.startPing();
       this.replayUnfinishedCommands();
+      this.flushPendingResults();
     });
 
     ws.addEventListener("message", async (event) => {
@@ -176,9 +179,22 @@ export class MachineAgent {
 
   private send(payload: unknown): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (payload && typeof payload === "object" && (payload as any).type === "commandResult") {
+        if (this.pendingResults.length >= MAX_PENDING_RESULTS) {
+          this.pendingResults.shift();
+        }
+        this.pendingResults.push(payload as WorkerCommandResultMessage);
+      }
       return;
     }
     this.ws.send(JSON.stringify(payload));
+  }
+
+  private flushPendingResults(): void {
+    const pending = this.pendingResults.splice(0);
+    for (const result of pending) {
+      this.send(result);
+    }
   }
 
   async handleMessage(raw: unknown): Promise<void> {

@@ -193,3 +193,156 @@ describe("MachineAgent boot ID tracking", () => {
     storage.db.close();
   });
 });
+
+describe("MachineAgent commandResult buffering", () => {
+  it("buffers commandResult when WS is closed and replays on reconnect", async () => {
+    const storage = openStorageDb(":memory:");
+
+    let wsOpenCallback: (() => void) | undefined;
+    const sendMock = vi.fn();
+
+    const mockWs = {
+      get readyState() {
+        return WebSocket.CLOSED;
+      },
+      send: sendMock,
+      addEventListener: vi.fn((event: string, callback: () => void) => {
+        if (event === "open") wsOpenCallback = callback;
+      }),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const createWebSocket = vi.fn(() => mockWs);
+
+    const agent = new MachineAgent(
+      { workerUrl: "http://localhost:8787", apiKey: "key", machineId: "test" },
+      storage,
+      { createWebSocket },
+    );
+
+    // Initial connect to set up listeners
+    agent.connect();
+
+    const resultMessage = {
+      type: "commandResult",
+      commandId: "cmd-123",
+      success: false,
+      error: "Plugin offline",
+    };
+
+    // Cast to access private send method
+    const testAgent = agent as unknown as { send: (payload: unknown) => void };
+    
+    // Send while closed
+    testAgent.send(resultMessage);
+    
+    // Should not have sent yet
+    expect(sendMock).not.toHaveBeenCalled();
+
+    // Simulate WS opening
+    Object.defineProperty(mockWs, "readyState", { value: WebSocket.OPEN });
+    if (wsOpenCallback) wsOpenCallback();
+
+    // Should replay the buffered message
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock).toHaveBeenCalledWith(JSON.stringify(resultMessage));
+
+    storage.db.close();
+  });
+
+  it("sends commandResult immediately when WS is open", async () => {
+    const storage = openStorageDb(":memory:");
+
+    const sendMock = vi.fn();
+
+    const mockWs = {
+      readyState: WebSocket.OPEN,
+      send: sendMock,
+      addEventListener: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const createWebSocket = vi.fn(() => mockWs);
+
+    const agent = new MachineAgent(
+      { workerUrl: "http://localhost:8787", apiKey: "key", machineId: "test" },
+      storage,
+      { createWebSocket },
+    );
+
+    agent.connect();
+
+    const resultMessage = {
+      type: "commandResult",
+      commandId: "cmd-456",
+      success: true,
+      error: null,
+    };
+
+    const testAgent = agent as unknown as { send: (payload: unknown) => void };
+    testAgent.send(resultMessage);
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock).toHaveBeenCalledWith(JSON.stringify(resultMessage));
+
+    storage.db.close();
+  });
+
+  it("limits buffer to prevent memory leaks", async () => {
+    const storage = openStorageDb(":memory:");
+
+    const sendMock = vi.fn();
+    let wsOpenCallback: (() => void) | undefined;
+
+    const mockWs = {
+      get readyState() {
+        return WebSocket.CLOSED;
+      },
+      send: sendMock,
+      addEventListener: vi.fn((event: string, callback: () => void) => {
+        if (event === "open") wsOpenCallback = callback;
+      }),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+
+    const createWebSocket = vi.fn(() => mockWs);
+
+    const agent = new MachineAgent(
+      { workerUrl: "http://localhost:8787", apiKey: "key", machineId: "test" },
+      storage,
+      { createWebSocket },
+    );
+
+    agent.connect();
+
+    const testAgent = agent as unknown as { send: (payload: unknown) => void };
+
+    // Send 105 messages (MAX_PENDING_RESULTS is 100)
+    for (let i = 0; i < 105; i++) {
+      testAgent.send({
+        type: "commandResult",
+        commandId: `cmd-${i}`,
+        success: true,
+        error: null,
+      });
+    }
+
+    expect(sendMock).not.toHaveBeenCalled();
+
+    Object.defineProperty(mockWs, "readyState", { value: WebSocket.OPEN });
+    if (wsOpenCallback) wsOpenCallback();
+
+    // Should only send the last 100 messages
+    expect(sendMock).toHaveBeenCalledTimes(100);
+    
+    // First message sent should be cmd-5
+    const firstCall = JSON.parse(sendMock.mock.calls[0]?.[0] as string) as Record<string, unknown>;
+    expect(firstCall.commandId).toBe("cmd-5");
+
+    // Last message sent should be cmd-104
+    const lastCall = JSON.parse(sendMock.mock.calls[99]?.[0] as string) as Record<string, unknown>;
+    expect(lastCall.commandId).toBe("cmd-104");
+
+    storage.db.close();
+  });
+});

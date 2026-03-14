@@ -107,6 +107,7 @@ export async function ingestWorkerCommand(
   });
 
   if (!persisted) {
+    console.log(`[command-ingest] dedup commandId=${commandId}`);
     callbacks.send({ type: "ack", commandId });
     return;
   }
@@ -115,6 +116,7 @@ export async function ingestWorkerCommand(
 
   const session = storage.sessions.get(msg.sessionId);
   if (!session) {
+    console.warn(`[command-ingest] session not found sessionId=${msg.sessionId} commandId=${commandId}`);
     callbacks.send({
       type: "commandResult",
       commandId,
@@ -128,6 +130,7 @@ export async function ingestWorkerCommand(
   // Check for pending question: if session has a pending question, route as question reply
   const pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
   if (pendingQuestion) {
+    console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
     const command = msg.command.trim();
     const optionMatch = QUESTION_OPTION_RE.exec(command);
 
@@ -173,6 +176,7 @@ export async function ingestWorkerCommand(
     );
 
     if (result.ok) {
+      console.log(`[command-ingest] question reply delivered commandId=${commandId}`);
       storage.inbox.markDone(commandId);
       storage.pendingQuestions.delete(msg.sessionId);
       callbacks.send({
@@ -185,6 +189,7 @@ export async function ingestWorkerCommand(
       return;
     }
 
+    console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
     callbacks.send({
       type: "commandResult",
       commandId,
@@ -197,6 +202,7 @@ export async function ingestWorkerCommand(
 
   // If command looks like a question option but no pending question, it's stale
   if (QUESTION_OPTION_RE.test(msg.command.trim())) {
+    console.log(`[command-ingest] stale question option commandId=${commandId}`);
     callbacks.send({
       type: "commandResult",
       commandId,
@@ -239,6 +245,7 @@ export async function ingestWorkerCommand(
     : selectAdapter(session);
 
   if (!adapter) {
+    console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
     callbacks.send({
       type: "commandResult",
       commandId,
@@ -270,6 +277,7 @@ export async function ingestWorkerCommand(
         url: `data:${msg.media.mime};base64,${base64}`,
       };
     } catch (err) {
+      console.warn(`[command-ingest] media fetch failed commandId=${commandId} key=${msg.media!.key} error=${err instanceof Error ? err.message : String(err)}`);
       callbacks.send({
         type: "commandResult",
         commandId,
@@ -300,6 +308,7 @@ async function deliverViaAdapter(
   });
 
   if (result.ok) {
+    console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId}`);
     storage.inbox.markDone(commandId);
     callbacks.send({
       type: "commandResult",
@@ -311,6 +320,7 @@ async function deliverViaAdapter(
     return;
   }
 
+  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} error=${result.error}`);
   callbacks.send({
     type: "commandResult",
     commandId,
