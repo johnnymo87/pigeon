@@ -28,6 +28,7 @@ import {
   MAX_FILE_SIZE,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
+import { handlePollNext, handleAckCommand } from "../src/poll";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -2518,5 +2519,199 @@ describe("d1-ops", () => {
       "SELECT update_id FROM seen_updates WHERE update_id = ?",
     ).bind(1002).first();
     expect(recent).not.toBeNull();
+  });
+});
+
+// ─── Poll and Ack Endpoints ────────────────────────────────────────────
+
+function makeRequest(url: string, opts: { method?: string; auth?: boolean } = {}) {
+  const headers: Record<string, string> = {};
+  if (opts.auth !== false) {
+    headers["Authorization"] = "Bearer test-api-key";
+  }
+  return new Request(url, { method: opts.method ?? "GET", headers });
+}
+
+describe("poll and ack endpoints", () => {
+  // D1 exec() does not support multi-statement SQL; run each DDL statement separately.
+  const pollSchemaStatements = [
+    `CREATE TABLE IF NOT EXISTS commands (
+      command_id    TEXT PRIMARY KEY,
+      machine_id    TEXT NOT NULL,
+      session_id    TEXT,
+      command_type  TEXT NOT NULL DEFAULT 'execute',
+      command       TEXT NOT NULL,
+      chat_id       TEXT NOT NULL,
+      directory     TEXT,
+      media_json    TEXT,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      created_at    INTEGER NOT NULL,
+      leased_at     INTEGER,
+      acked_at      INTEGER
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_commands_poll
+      ON commands (machine_id, status, created_at)`,
+    `CREATE TABLE IF NOT EXISTS machines (
+      machine_id    TEXT PRIMARY KEY,
+      last_poll_at  INTEGER NOT NULL
+    )`,
+  ];
+
+  beforeAll(async () => {
+    for (const stmt of pollSchemaStatements) {
+      await env.DB.prepare(stmt).run();
+    }
+  });
+
+  beforeEach(async () => {
+    await env.DB.exec("DELETE FROM commands");
+    await env.DB.exec("DELETE FROM machines");
+  });
+
+  // ─── handlePollNext ──────────────────────────────────────────────────
+
+  it("handlePollNext returns 401 without auth", async () => {
+    const req = makeRequest("https://worker/machines/machine-1/next", { auth: false });
+    const res = await handlePollNext(env.DB, env, req, "machine-1");
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "Unauthorized" });
+  });
+
+  it("handlePollNext returns 204 when no commands", async () => {
+    const req = makeRequest("https://worker/machines/machine-empty/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-empty");
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+  });
+
+  it("handlePollNext returns command JSON for execute type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'execute', ?, ?, 'pending', ?)`,
+    ).bind("exec-cmd-1", "machine-exec", "sess-exec-1", "echo hello", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-exec/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-exec");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("exec-cmd-1");
+    expect(body.commandType).toBe("execute");
+    expect(body.sessionId).toBe("sess-exec-1");
+    expect(body.command).toBe("echo hello");
+    expect(body.chatId).toBe("8248645256");
+  });
+
+  it("handlePollNext returns command JSON for launch type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, directory, status, created_at)
+       VALUES (?, ?, NULL, 'launch', ?, ?, ?, 'pending', ?)`,
+    ).bind("launch-cmd-1", "machine-launch", "run all tests", "8248645256", "/home/dev/project", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-launch/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-launch");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("launch-cmd-1");
+    expect(body.commandType).toBe("launch");
+    expect(body.chatId).toBe("8248645256");
+    expect(body.directory).toBe("/home/dev/project");
+    expect(body.prompt).toBe("run all tests");
+    // launch type should NOT have command or sessionId
+    expect(body.command).toBeUndefined();
+    expect(body.sessionId).toBeUndefined();
+  });
+
+  it("handlePollNext returns command JSON for kill type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'kill', '', ?, 'pending', ?)`,
+    ).bind("kill-cmd-1", "machine-kill", "sess-to-kill", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-kill/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-kill");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("kill-cmd-1");
+    expect(body.commandType).toBe("kill");
+    expect(body.chatId).toBe("8248645256");
+    expect(body.sessionId).toBe("sess-to-kill");
+  });
+
+  it("handlePollNext includes parsed media for execute with media_json", async () => {
+    const now = Date.now();
+    const mediaObj = { key: "inbound/123-abc/photo.jpg", mime: "image/jpeg", filename: "photo.jpg", size: 4096 };
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, media_json, status, created_at)
+       VALUES (?, ?, ?, 'execute', ?, ?, ?, 'pending', ?)`,
+    ).bind("media-cmd-1", "machine-media", "sess-media", "describe this", "8248645256", JSON.stringify(mediaObj), now).run();
+
+    const req = makeRequest("https://worker/machines/machine-media/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-media");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("media-cmd-1");
+    expect(body.media).toBeDefined();
+    const media = body.media as Record<string, unknown>;
+    expect(media.key).toBe("inbound/123-abc/photo.jpg");
+    expect(media.mime).toBe("image/jpeg");
+  });
+
+  it("handlePollNext updates machine last_poll_at", async () => {
+    const before = Date.now();
+    const req = makeRequest("https://worker/machines/machine-touch/next");
+    await handlePollNext(env.DB, env, req, "machine-touch");
+    const after = Date.now();
+
+    const row = await env.DB.prepare(
+      "SELECT last_poll_at FROM machines WHERE machine_id = ?",
+    ).bind("machine-touch").first<{ last_poll_at: number }>();
+
+    expect(row).not.toBeNull();
+    expect(row!.last_poll_at).toBeGreaterThanOrEqual(before);
+    expect(row!.last_poll_at).toBeLessThanOrEqual(after);
+  });
+
+  // ─── handleAckCommand ────────────────────────────────────────────────
+
+  it("handleAckCommand returns 401 without auth", async () => {
+    const req = makeRequest("https://worker/commands/some-cmd/ack", { method: "POST", auth: false });
+    const res = await handleAckCommand(env.DB, env, req, "some-cmd");
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "Unauthorized" });
+  });
+
+  it("handleAckCommand returns 200 and marks done", async () => {
+    const now = Date.now();
+    // Insert a command and lease it
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, leased_at)
+       VALUES (?, ?, NULL, 'execute', 'do something', '8248645256', 'leased', ?, ?)`,
+    ).bind("ack-target-cmd", "machine-ack-test", now - 5000, now - 5000).run();
+
+    const req = makeRequest("https://worker/commands/ack-target-cmd/ack", { method: "POST" });
+    const res = await handleAckCommand(env.DB, env, req, "ack-target-cmd");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+
+    // Verify the command is marked as acked in D1
+    const row = await env.DB.prepare(
+      "SELECT status, acked_at FROM commands WHERE command_id = ?",
+    ).bind("ack-target-cmd").first<{ status: string; acked_at: number | null }>();
+    expect(row!.status).toBe("acked");
+    expect(row!.acked_at).not.toBeNull();
+  });
+
+  it("handleAckCommand returns 404 for unknown command", async () => {
+    const req = makeRequest("https://worker/commands/nonexistent-cmd/ack", { method: "POST" });
+    const res = await handleAckCommand(env.DB, env, req, "nonexistent-cmd");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "Command not found" });
   });
 });
