@@ -6,6 +6,17 @@
  */
 import { env, SELF, fetchMock, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import {
+  generateCommandId as d1GenerateCommandId,
+  queueCommand,
+  pollNextCommand,
+  ackCommand,
+  touchMachine,
+  isMachineRecent,
+  cleanupCommands,
+  cleanupSeenUpdates,
+  MAX_QUEUE_PER_MACHINE,
+} from "../src/d1-ops";
 import { isAllowedChatId, generateToken } from "../src/notifications";
 import {
   verifyWebhookSecret,
@@ -2135,5 +2146,377 @@ describe("R2 cleanup", () => {
 
     const deleted = await cleanupExpiredMedia(env);
     expect(deleted).toBe(3);
+  });
+});
+
+// ─── D1 Ops ────────────────────────────────────────────────────────────
+
+describe("d1-ops", () => {
+  // D1 exec() does not support multi-statement SQL; run each DDL statement separately.
+  const schemaStatements = [
+    `CREATE TABLE IF NOT EXISTS commands (
+      command_id    TEXT PRIMARY KEY,
+      machine_id    TEXT NOT NULL,
+      session_id    TEXT,
+      command_type  TEXT NOT NULL DEFAULT 'execute',
+      command       TEXT NOT NULL,
+      chat_id       TEXT NOT NULL,
+      directory     TEXT,
+      media_json    TEXT,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      created_at    INTEGER NOT NULL,
+      leased_at     INTEGER,
+      acked_at      INTEGER
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_commands_poll
+      ON commands (machine_id, status, created_at)`,
+    `CREATE TABLE IF NOT EXISTS sessions (
+      session_id    TEXT PRIMARY KEY,
+      machine_id    TEXT NOT NULL,
+      label         TEXT,
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS messages (
+      chat_id       TEXT NOT NULL,
+      message_id    INTEGER NOT NULL,
+      session_id    TEXT NOT NULL,
+      token         TEXT NOT NULL,
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, message_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS seen_updates (
+      update_id     INTEGER PRIMARY KEY,
+      created_at    INTEGER NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS machines (
+      machine_id    TEXT PRIMARY KEY,
+      last_poll_at  INTEGER NOT NULL
+    )`,
+  ];
+
+  beforeAll(async () => {
+    for (const stmt of schemaStatements) {
+      await env.DB.prepare(stmt).run();
+    }
+  });
+
+  beforeEach(async () => {
+    await env.DB.exec("DELETE FROM commands");
+    await env.DB.exec("DELETE FROM machines");
+    await env.DB.exec("DELETE FROM seen_updates");
+  });
+
+  // ─── generateCommandId ───────────────────────────────────────────────
+
+  it("generateCommandId returns 32-char hex string", () => {
+    const id = d1GenerateCommandId();
+    expect(id).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("generateCommandId returns unique values", () => {
+    const ids = new Set(Array.from({ length: 50 }, () => d1GenerateCommandId()));
+    expect(ids.size).toBe(50);
+  });
+
+  // ─── queueCommand ─────────────────────────────────────────────────────
+
+  it("queueCommand inserts a row with status pending", async () => {
+    const commandId = await queueCommand(env.DB, {
+      machineId: "machine-1",
+      sessionId: "sess-abc",
+      command: "echo hello",
+      chatId: "8248645256",
+    });
+
+    expect(commandId).not.toBeNull();
+    expect(typeof commandId).toBe("string");
+
+    const result = await env.DB.prepare(
+      "SELECT * FROM commands WHERE command_id = ?",
+    ).bind(commandId).first();
+
+    expect(result).not.toBeNull();
+    expect(result!.status).toBe("pending");
+    expect(result!.machine_id).toBe("machine-1");
+    expect(result!.session_id).toBe("sess-abc");
+    expect(result!.command).toBe("echo hello");
+    expect(result!.chat_id).toBe("8248645256");
+  });
+
+  it("queueCommand returns null when queue limit reached", async () => {
+    // Insert MAX_QUEUE_PER_MACHINE commands
+    const now = Date.now();
+    const inserts = Array.from({ length: MAX_QUEUE_PER_MACHINE }, (_, i) =>
+      env.DB.prepare(
+        `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+         VALUES (?, ?, NULL, 'execute', 'echo test', '8248645256', 'pending', ?)`,
+      ).bind(`cmd-${i}`, "machine-limit", now + i),
+    );
+    await env.DB.batch(inserts);
+
+    const result = await queueCommand(env.DB, {
+      machineId: "machine-limit",
+      sessionId: null,
+      command: "one more",
+      chatId: "8248645256",
+    });
+
+    expect(result).toBeNull();
+  });
+
+  // ─── pollNextCommand ──────────────────────────────────────────────────
+
+  it("pollNextCommand returns null when no commands exist", async () => {
+    const result = await pollNextCommand(env.DB, "machine-empty");
+    expect(result).toBeNull();
+  });
+
+  it("pollNextCommand returns oldest pending command and sets status to leased", async () => {
+    const now = Date.now();
+
+    // Insert two pending commands; older one first
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'execute', ?, ?, 'pending', ?)`,
+    ).bind("old-cmd", "machine-poll", "sess-1", "old command", "8248645256", now - 1000).run();
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'execute', ?, ?, 'pending', ?)`,
+    ).bind("new-cmd", "machine-poll", "sess-2", "new command", "8248645256", now).run();
+
+    const result = await pollNextCommand(env.DB, "machine-poll", now);
+
+    expect(result).not.toBeNull();
+    expect(result!.commandId).toBe("old-cmd");
+    expect(result!.command).toBe("old command");
+    expect(result!.sessionId).toBe("sess-1");
+
+    // Check DB status was updated
+    const row = await env.DB.prepare(
+      "SELECT status, leased_at FROM commands WHERE command_id = ?",
+    ).bind("old-cmd").first();
+    expect(row!.status).toBe("leased");
+    expect(row!.leased_at).toBe(now);
+  });
+
+  it("pollNextCommand skips commands for other machines", async () => {
+    const now = Date.now();
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, NULL, 'execute', 'echo test', '8248645256', 'pending', ?)`,
+    ).bind("other-machine-cmd", "machine-other", now).run();
+
+    const result = await pollNextCommand(env.DB, "machine-mine", now);
+    expect(result).toBeNull();
+  });
+
+  it("pollNextCommand reclaims commands with expired leases", async () => {
+    const now = Date.now();
+    const expiredLeasedAt = now - 70_000; // 70s ago, past 60s lease timeout
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, leased_at)
+       VALUES (?, ?, NULL, 'execute', 'expired lease cmd', '8248645256', 'leased', ?, ?)`,
+    ).bind("expired-lease", "machine-reclaim", now - 80_000, expiredLeasedAt).run();
+
+    const result = await pollNextCommand(env.DB, "machine-reclaim", now);
+    expect(result).not.toBeNull();
+    expect(result!.commandId).toBe("expired-lease");
+  });
+
+  it("pollNextCommand does NOT reclaim commands with fresh leases", async () => {
+    const now = Date.now();
+    const freshLeasedAt = now - 10_000; // 10s ago, within 60s lease timeout
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, leased_at)
+       VALUES (?, ?, NULL, 'execute', 'fresh lease cmd', '8248645256', 'leased', ?, ?)`,
+    ).bind("fresh-lease", "machine-fresh", now - 15_000, freshLeasedAt).run();
+
+    const result = await pollNextCommand(env.DB, "machine-fresh", now);
+    expect(result).toBeNull();
+  });
+
+  // ─── ackCommand ───────────────────────────────────────────────────────
+
+  it("ackCommand marks command as done with acked_at timestamp", async () => {
+    const now = Date.now();
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, NULL, 'execute', 'ack me', '8248645256', 'leased', ?)`,
+    ).bind("ack-cmd", "machine-ack", now).run();
+
+    const result = await ackCommand(env.DB, "ack-cmd", now);
+    expect(result).toBe(true);
+
+    const row = await env.DB.prepare(
+      "SELECT status, acked_at FROM commands WHERE command_id = ?",
+    ).bind("ack-cmd").first();
+    expect(row!.status).toBe("acked");
+    expect(row!.acked_at).toBe(now);
+  });
+
+  it("ackCommand returns false for non-existent command", async () => {
+    const result = await ackCommand(env.DB, "nonexistent-cmd", Date.now());
+    expect(result).toBe(false);
+  });
+
+  // ─── touchMachine ─────────────────────────────────────────────────────
+
+  it("touchMachine inserts on first call and updates on second", async () => {
+    const t1 = Date.now();
+    const t2 = t1 + 5000;
+
+    await touchMachine(env.DB, "machine-touch", t1);
+
+    const row1 = await env.DB.prepare(
+      "SELECT last_poll_at FROM machines WHERE machine_id = ?",
+    ).bind("machine-touch").first();
+    expect(row1!.last_poll_at).toBe(t1);
+
+    await touchMachine(env.DB, "machine-touch", t2);
+
+    const row2 = await env.DB.prepare(
+      "SELECT last_poll_at FROM machines WHERE machine_id = ?",
+    ).bind("machine-touch").first();
+    expect(row2!.last_poll_at).toBe(t2);
+  });
+
+  // ─── isMachineRecent ──────────────────────────────────────────────────
+
+  it("isMachineRecent returns false for unknown machine", async () => {
+    const result = await isMachineRecent(env.DB, "unknown-machine");
+    expect(result).toBe(false);
+  });
+
+  it("isMachineRecent returns true within threshold and false outside", async () => {
+    const now = Date.now();
+    const threshold = 30_000; // 30s
+
+    // Machine polled 10s ago -- within 30s threshold
+    await env.DB.prepare(
+      "INSERT INTO machines (machine_id, last_poll_at) VALUES (?, ?)",
+    ).bind("machine-recent", now - 10_000).run();
+
+    const recentResult = await isMachineRecent(env.DB, "machine-recent", threshold, now);
+    expect(recentResult).toBe(true);
+
+    // Machine polled 60s ago -- outside 30s threshold
+    await env.DB.prepare(
+      "INSERT INTO machines (machine_id, last_poll_at) VALUES (?, ?)",
+    ).bind("machine-stale", now - 60_000).run();
+
+    const staleResult = await isMachineRecent(env.DB, "machine-stale", threshold, now);
+    expect(staleResult).toBe(false);
+  });
+
+  // ─── cleanupCommands ──────────────────────────────────────────────────
+
+  it("cleanupCommands deletes acked commands older than 1 hour", async () => {
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    // Old acked command (should be deleted)
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, acked_at)
+       VALUES (?, ?, NULL, 'execute', 'old acked', '8248645256', 'acked', ?, ?)`,
+    ).bind("old-acked", "machine-cleanup", oneHourAgo - 1000, oneHourAgo - 1000).run();
+
+    // Recent acked command (should be kept)
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, acked_at)
+       VALUES (?, ?, NULL, 'execute', 'recent acked', '8248645256', 'acked', ?, ?)`,
+    ).bind("recent-acked", "machine-cleanup", now - 1000, now - 1000).run();
+
+    const result = await cleanupCommands(env.DB, now);
+    expect(result.ackedDeleted).toBe(1);
+    expect(result.stuckDeleted).toBe(0);
+
+    // Verify old-acked was deleted
+    const old = await env.DB.prepare(
+      "SELECT command_id FROM commands WHERE command_id = ?",
+    ).bind("old-acked").first();
+    expect(old).toBeNull();
+
+    // Verify recent-acked was kept
+    const recent = await env.DB.prepare(
+      "SELECT command_id FROM commands WHERE command_id = ?",
+    ).bind("recent-acked").first();
+    expect(recent).not.toBeNull();
+  });
+
+  it("cleanupCommands deletes stuck non-done commands older than 24 hours", async () => {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+
+    // Old stuck pending command (should be deleted)
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, NULL, 'execute', 'stuck pending', '8248645256', 'pending', ?)`,
+    ).bind("old-stuck-pending", "machine-stuck", oneDayAgo - 1000).run();
+
+    // Old stuck leased command (should be deleted)
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at, leased_at)
+       VALUES (?, ?, NULL, 'execute', 'stuck leased', '8248645256', 'leased', ?, ?)`,
+    ).bind("old-stuck-leased", "machine-stuck", oneDayAgo - 1000, oneDayAgo - 1000).run();
+
+    // Recent pending command (should be kept)
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, NULL, 'execute', 'recent pending', '8248645256', 'pending', ?)`,
+    ).bind("recent-pending", "machine-stuck", now - 1000).run();
+
+    const result = await cleanupCommands(env.DB, now);
+    expect(result.stuckDeleted).toBe(2);
+
+    const stuck1 = await env.DB.prepare(
+      "SELECT command_id FROM commands WHERE command_id = ?",
+    ).bind("old-stuck-pending").first();
+    expect(stuck1).toBeNull();
+
+    const stuck2 = await env.DB.prepare(
+      "SELECT command_id FROM commands WHERE command_id = ?",
+    ).bind("old-stuck-leased").first();
+    expect(stuck2).toBeNull();
+
+    const recent = await env.DB.prepare(
+      "SELECT command_id FROM commands WHERE command_id = ?",
+    ).bind("recent-pending").first();
+    expect(recent).not.toBeNull();
+  });
+
+  // ─── cleanupSeenUpdates ───────────────────────────────────────────────
+
+  it("cleanupSeenUpdates deletes entries older than 24 hours", async () => {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+
+    // Old seen_update (should be deleted)
+    await env.DB.prepare(
+      "INSERT INTO seen_updates (update_id, created_at) VALUES (?, ?)",
+    ).bind(1001, oneDayAgo - 1000).run();
+
+    // Recent seen_update (should be kept)
+    await env.DB.prepare(
+      "INSERT INTO seen_updates (update_id, created_at) VALUES (?, ?)",
+    ).bind(1002, now - 1000).run();
+
+    const deleted = await cleanupSeenUpdates(env.DB, now);
+    expect(deleted).toBe(1);
+
+    const old = await env.DB.prepare(
+      "SELECT update_id FROM seen_updates WHERE update_id = ?",
+    ).bind(1001).first();
+    expect(old).toBeNull();
+
+    const recent = await env.DB.prepare(
+      "SELECT update_id FROM seen_updates WHERE update_id = ?",
+    ).bind(1002).first();
+    expect(recent).not.toBeNull();
   });
 });
