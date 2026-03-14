@@ -3,9 +3,21 @@ import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import { ResultErrorCode } from "../src/opencode-direct/contracts";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, QuestionReplyInput } from "../src/adapters/types";
+import type { ExecuteMessage } from "../src/worker/poller";
+
+function makeMsg(overrides: Partial<ExecuteMessage> = {}): ExecuteMessage {
+  return {
+    commandId: "cmd-1",
+    commandType: "execute",
+    sessionId: "sess-1",
+    command: "ls",
+    chatId: "1",
+    ...overrides,
+  };
+}
 
 describe("ingestWorkerCommand", () => {
-  it("acks and marks command done on successful direct-channel delivery", async () => {
+  it("marks command done on successful direct-channel delivery", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-1",
@@ -16,21 +28,9 @@ describe("ingestWorkerCommand", () => {
       backendAuthToken: "tok",
     }, 1_000);
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-1",
-        sessionId: "sess-1",
-        command: "ls",
-        chatId: "1",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-1", sessionId: "sess-1", command: "ls", chatId: "1" }),
       {
         async executeDirect() {
           return {
@@ -61,47 +61,54 @@ describe("ingestWorkerCommand", () => {
       },
     );
 
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-1" },
-      { type: "commandResult", commandId: "cmd-1", success: true, error: null, chatId: "1" },
-    ]);
-
     const unfinished = storage.inbox.listUnfinished();
     expect(unfinished).toHaveLength(0);
     storage.db.close();
   });
 
-  it("returns commandResult failure when session missing", async () => {
+  it("deduplicates commands and returns without error", async () => {
     const storage = openStorageDb(":memory:");
-    const sent: unknown[] = [];
+    storage.sessions.upsert({
+      sessionId: "sess-1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
 
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-2",
-        sessionId: "nope",
-        command: "ls",
-        chatId: "2",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
+    const deliverCount = { n: 0 };
+    const opts = {
+      createAdapter: () => ({
+        name: "mock",
+        async deliverCommand() {
+          deliverCount.n++;
+          return { ok: true as const };
         },
-      },
-    );
+      }),
+    };
 
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-2" },
-      {
-        type: "commandResult",
-        commandId: "cmd-2",
-        success: false,
-        error: "Session not found. Wait for a new notification.",
-        chatId: "2",
-      },
-    ]);
+    // First call — should deliver
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-dedup" }), opts);
+    // Second call with same commandId — should dedup
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-dedup" }), opts);
 
+    expect(deliverCount.n).toBe(1);
+    storage.db.close();
+  });
+
+  it("returns normally (Poller acks) when session is missing", async () => {
+    const storage = openStorageDb(":memory:");
+
+    // Should not throw — Poller will ack
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-2", sessionId: "nope", chatId: "2" }),
+      ),
+    ).resolves.toBeUndefined();
+
+    // Command should be in unfinished (persisted but not marked done)
     const unfinished = storage.inbox.listUnfinished();
     expect(unfinished).toHaveLength(1);
     storage.db.close();
@@ -118,23 +125,13 @@ describe("ingestWorkerCommand", () => {
       backendAuthToken: "tok",
     }, 1_000);
 
-    const sent: unknown[] = [];
+    let delivered = false;
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-direct-1",
-        sessionId: "sess-direct",
-        command: "echo hi",
-        chatId: "3",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-direct-1", sessionId: "sess-direct", command: "echo hi", chatId: "3" }),
       {
         async executeDirect() {
+          delivered = true;
           return {
             ok: true,
             status: 200,
@@ -163,15 +160,12 @@ describe("ingestWorkerCommand", () => {
       },
     );
 
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-direct-1" },
-      { type: "commandResult", commandId: "cmd-direct-1", success: true, error: null, chatId: "3" },
-    ]);
+    expect(delivered).toBe(true);
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
-  it("returns direct adapter error as commandResult failure", async () => {
+  it("returns normally (Poller acks) on direct adapter error", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-direct-fail",
@@ -182,68 +176,48 @@ describe("ingestWorkerCommand", () => {
       backendAuthToken: "tok",
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-direct-2",
-        sessionId: "sess-direct-fail",
-        command: "echo hi",
-        chatId: "4",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-direct-2", sessionId: "sess-direct-fail", command: "echo hi", chatId: "4" }),
+        {
+          async executeDirect() {
+            return {
+              ok: false,
+              status: 200,
+              attempts: 1,
+              ack: {
+                type: "pigeon.command.ack",
+                version: 1,
+                requestId: "cmd-direct-2",
+                commandId: "cmd-direct-2",
+                sessionId: "sess-direct-fail",
+                accepted: true,
+                acceptedAt: Date.now(),
+              },
+              result: {
+                type: "pigeon.command.result",
+                version: 1,
+                requestId: "cmd-direct-2",
+                commandId: "cmd-direct-2",
+                sessionId: "sess-direct-fail",
+                success: false,
+                finishedAt: Date.now(),
+                errorCode: ResultErrorCode.ExecutionError,
+                errorMessage: "plugin failed",
+              },
+              error: "plugin failed",
+            };
+          },
         },
-      },
-      {
-        async executeDirect() {
-          return {
-            ok: false,
-            status: 200,
-            attempts: 1,
-            ack: {
-              type: "pigeon.command.ack",
-              version: 1,
-              requestId: "cmd-direct-2",
-              commandId: "cmd-direct-2",
-              sessionId: "sess-direct-fail",
-              accepted: true,
-              acceptedAt: Date.now(),
-            },
-            result: {
-              type: "pigeon.command.result",
-              version: 1,
-              requestId: "cmd-direct-2",
-              commandId: "cmd-direct-2",
-              sessionId: "sess-direct-fail",
-              success: false,
-              finishedAt: Date.now(),
-              errorCode: ResultErrorCode.ExecutionError,
-              errorMessage: "plugin failed",
-            },
-            error: "plugin failed",
-          };
-        },
-      },
-    );
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-direct-2" },
-      {
-        type: "commandResult",
-        commandId: "cmd-direct-2",
-        success: false,
-        error: "plugin failed",
-        chatId: "4",
-      },
-    ]);
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("rejects opencode-plugin-direct sessions with missing endpoint", async () => {
+  it("returns normally (Poller acks) when session endpoint is incomplete", async () => {
     const storage = openStorageDb(":memory:");
     // Session has backendKind but NO endpoint or auth token — incomplete registration
     storage.sessions.upsert({
@@ -254,38 +228,18 @@ describe("ingestWorkerCommand", () => {
       // backendEndpoint and backendAuthToken intentionally omitted
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-guard-1",
-        sessionId: "sess-incomplete",
-        command: "echo test",
-        chatId: "5",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-guard-1", sessionId: "sess-incomplete", command: "echo test", chatId: "5" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-guard-1" },
-      {
-        type: "commandResult",
-        commandId: "cmd-guard-1",
-        success: false,
-        error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
-        chatId: "5",
-      },
-    ]);
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("rejects opencode-plugin-direct sessions with endpoint but missing auth token", async () => {
+  it("returns normally when session has endpoint but missing auth token", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-no-token",
@@ -296,28 +250,13 @@ describe("ingestWorkerCommand", () => {
       // backendAuthToken intentionally omitted
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-guard-2",
-        sessionId: "sess-no-token",
-        command: "echo test",
-        chatId: "6",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-guard-2", sessionId: "sess-no-token", command: "echo test", chatId: "6" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-guard-2",
-      success: false,
-    });
     storage.db.close();
   });
 
@@ -348,24 +287,16 @@ describe("ingestWorkerCommand", () => {
 
     let capturedReply: QuestionReplyInput | null = null;
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-q1",
-        sessionId: "sess-q1",
-        command: "q1",
-        chatId: "1",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-q1", sessionId: "sess-q1", command: "q1", chatId: "1" }),
       {
         createAdapter: () => ({
           name: "mock-direct",
           async deliverCommand() { return { ok: false, error: "should not be called" }; },
-          async deliverQuestionReply(_session, reply) {
+          async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
             capturedReply = reply;
-            return { ok: true };
+            return { ok: true as const };
           },
         }),
       },
@@ -375,10 +306,6 @@ describe("ingestWorkerCommand", () => {
       questionRequestId: "question_abc",
       answers: [["SQLite"]],
     });
-
-    expect(sent).toContainEqual(
-      expect.objectContaining({ type: "commandResult", commandId: "cmd-q1", success: true }),
-    );
 
     // Pending question should be cleared
     expect(storage.pendingQuestions.getBySessionId("sess-q1")).toBeNull();
@@ -409,24 +336,16 @@ describe("ingestWorkerCommand", () => {
 
     let capturedReply: QuestionReplyInput | null = null;
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-q2",
-        sessionId: "sess-q2",
-        command: "Use MongoDB instead",
-        chatId: "1",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-q2", sessionId: "sess-q2", command: "Use MongoDB instead", chatId: "1" }),
       {
         createAdapter: () => ({
           name: "mock-direct",
           async deliverCommand() { return { ok: false, error: "should not be called" }; },
-          async deliverQuestionReply(_session, reply) {
+          async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
             capturedReply = reply;
-            return { ok: true };
+            return { ok: true as const };
           },
         }),
       },
@@ -437,13 +356,10 @@ describe("ingestWorkerCommand", () => {
       answers: [["Use MongoDB instead"]],
     });
 
-    expect(sent).toContainEqual(
-      expect.objectContaining({ type: "commandResult", commandId: "cmd-q2", success: true }),
-    );
     storage.db.close();
   });
 
-  it("rejects stale question option press when no pending question", async () => {
+  it("returns normally when question option is stale (no pending question)", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-q3",
@@ -456,31 +372,17 @@ describe("ingestWorkerCommand", () => {
 
     // No pending question stored
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-q3",
-        sessionId: "sess-q3",
-        command: "q0",
-        chatId: "1",
-      },
-      { send(payload) { sent.push(payload); } },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-q3", sessionId: "sess-q3", command: "q0", chatId: "1" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toContainEqual(
-      expect.objectContaining({
-        type: "commandResult",
-        commandId: "cmd-q3",
-        success: false,
-        error: "This question has already been answered.",
-      }),
-    );
     storage.db.close();
   });
 
-  it("rejects out-of-range option index", async () => {
+  it("returns normally when option index is out of range", async () => {
     const now = Date.now();
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
@@ -502,26 +404,13 @@ describe("ingestWorkerCommand", () => {
       }],
     }, now);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-q4",
-        sessionId: "sess-q4",
-        command: "q5",
-        chatId: "1",
-      },
-      { send(payload) { sent.push(payload); } },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-q4", sessionId: "sess-q4", command: "q5", chatId: "1" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toContainEqual(
-      expect.objectContaining({
-        type: "commandResult",
-        success: false,
-        error: expect.stringContaining("Invalid option index"),
-      }),
-    );
     storage.db.close();
   });
 
@@ -569,12 +458,11 @@ describe("ingestWorkerCommand", () => {
     });
 
     let capturedContext: CommandDeliveryContext | null = null;
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
       {
-        type: "command",
         commandId: "cmd-media-1",
+        commandType: "execute",
         sessionId: "sess-media-1",
         command: "caption text",
         chatId: "1",
@@ -585,16 +473,15 @@ describe("ingestWorkerCommand", () => {
           size: 12345,
         },
       },
-      { send(payload) { sent.push(payload); } },
       {
         workerUrl: "https://worker.example.com",
         apiKey: "test-api-key",
         fetchFn: fetchFn as unknown as typeof fetch,
         createAdapter: () => ({
           name: "mock-direct",
-          async deliverCommand(_session, _command, context) {
+          async deliverCommand(_session: unknown, _command: unknown, context: CommandDeliveryContext) {
             capturedContext = context;
-            return { ok: true };
+            return { ok: true as const };
           },
         }),
       },
@@ -612,13 +499,10 @@ describe("ingestWorkerCommand", () => {
       url: `data:image/jpeg;base64,${fakeImageBytes.toString("base64")}`,
     });
 
-    expect(sent).toContainEqual(
-      expect.objectContaining({ type: "commandResult", commandId: "cmd-media-1", success: true }),
-    );
     storage.db.close();
   });
 
-  it("returns commandResult failure when R2 media fetch fails", async () => {
+  it("throws on R2 media fetch failure (transient — Poller retries)", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-media-2",
@@ -633,38 +517,30 @@ describe("ingestWorkerCommand", () => {
       return new Response("Not Found", { status: 404 });
     });
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-media-2",
-        sessionId: "sess-media-2",
-        command: "caption text",
-        chatId: "2",
-        media: {
-          key: "inbound/123-abc/photo.jpg",
-          mime: "image/jpeg",
-          filename: "photo.jpg",
-          size: 12345,
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        {
+          commandId: "cmd-media-2",
+          commandType: "execute",
+          sessionId: "sess-media-2",
+          command: "caption text",
+          chatId: "2",
+          media: {
+            key: "inbound/123-abc/photo.jpg",
+            mime: "image/jpeg",
+            filename: "photo.jpg",
+            size: 12345,
+          },
         },
-      },
-      { send(payload) { sent.push(payload); } },
-      {
-        workerUrl: "https://worker.example.com",
-        apiKey: "test-api-key",
-        fetchFn: fetchFn as unknown as typeof fetch,
-      },
-    );
+        {
+          workerUrl: "https://worker.example.com",
+          apiKey: "test-api-key",
+          fetchFn: fetchFn as unknown as typeof fetch,
+        },
+      ),
+    ).rejects.toThrow();
 
-    expect(sent).toContainEqual(
-      expect.objectContaining({
-        type: "commandResult",
-        commandId: "cmd-media-2",
-        success: false,
-        error: expect.stringContaining("Failed to fetch media"),
-      }),
-    );
     storage.db.close();
   });
 
@@ -680,23 +556,15 @@ describe("ingestWorkerCommand", () => {
     }, 1_000);
 
     let capturedContext: CommandDeliveryContext | null = null;
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-text-only",
-        sessionId: "sess-text-only",
-        command: "just text",
-        chatId: "3",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-text-only", sessionId: "sess-text-only", command: "just text", chatId: "3" }),
       {
         createAdapter: () => ({
           name: "mock-direct",
-          async deliverCommand(_session, _command, context) {
+          async deliverCommand(_session: unknown, _command: unknown, context: CommandDeliveryContext) {
             capturedContext = context;
-            return { ok: true };
+            return { ok: true as const };
           },
         }),
       },
@@ -704,9 +572,6 @@ describe("ingestWorkerCommand", () => {
 
     const ctx2 = capturedContext as CommandDeliveryContext | null;
     expect(ctx2?.media).toBeUndefined();
-    expect(sent).toContainEqual(
-      expect.objectContaining({ type: "commandResult", commandId: "cmd-text-only", success: true }),
-    );
     storage.db.close();
   });
 
@@ -721,21 +586,9 @@ describe("ingestWorkerCommand", () => {
       backendAuthToken: "tok",
     }, 1_000);
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-dead",
-        sessionId: "sess-dead",
-        command: "ls",
-        chatId: "5",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-dead", sessionId: "sess-dead", command: "ls", chatId: "5" }),
       {
         createAdapter: () => ({
           name: "mock-direct",
@@ -743,16 +596,7 @@ describe("ingestWorkerCommand", () => {
             return { ok: false, error: "fetch failed: unable to connect" };
           },
         }),
-      }
-    );
-
-    expect(sent).toContainEqual(
-      expect.objectContaining({
-        type: "commandResult",
-        commandId: "cmd-dead",
-        success: false,
-        error: "fetch failed: unable to connect",
-      })
+      },
     );
 
     // Session should be deleted from storage
@@ -771,21 +615,9 @@ describe("ingestWorkerCommand", () => {
       backendAuthToken: "tok",
     }, 1_000);
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-biz-error",
-        sessionId: "sess-biz-error",
-        command: "ls",
-        chatId: "6",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-biz-error", sessionId: "sess-biz-error", command: "ls", chatId: "6" }),
       {
         createAdapter: () => ({
           name: "mock-direct",
@@ -793,16 +625,7 @@ describe("ingestWorkerCommand", () => {
             return { ok: false, error: "Command rejected" };
           },
         }),
-      }
-    );
-
-    expect(sent).toContainEqual(
-      expect.objectContaining({
-        type: "commandResult",
-        commandId: "cmd-biz-error",
-        success: false,
-        error: "Command rejected",
-      })
+      },
     );
 
     // Session should remain in storage

@@ -11,37 +11,20 @@ describe("ingestKillCommand", () => {
         deleteSession: vi.fn().mockResolvedValue(undefined),
       } as any,
       sendTelegramReply: vi.fn().mockResolvedValue(undefined),
-      sendAck: vi.fn(),
       ...overrides,
     };
   }
 
-  it("acks immediately, deletes session, and sends success reply", async () => {
+  it("deletes session and sends success reply", async () => {
     const input = makeInput();
 
     await ingestKillCommand(input);
 
-    expect(input.sendAck).toHaveBeenCalledWith("cmd-123");
     expect(input.opencodeClient.deleteSession).toHaveBeenCalledWith("sess-abc");
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("terminated"),
     );
-  });
-
-  it("acks before attempting delete", async () => {
-    const callOrder: string[] = [];
-    const input = makeInput({
-      sendAck: vi.fn(() => { callOrder.push("ack"); }),
-      opencodeClient: {
-        deleteSession: vi.fn(async () => { callOrder.push("delete"); }),
-      } as any,
-      sendTelegramReply: vi.fn(async () => { callOrder.push("reply"); }),
-    });
-
-    await ingestKillCommand(input);
-
-    expect(callOrder).toEqual(["ack", "delete", "reply"]);
   });
 
   it("sends error reply when deleteSession fails", async () => {
@@ -53,10 +36,23 @@ describe("ingestKillCommand", () => {
 
     await ingestKillCommand(input);
 
-    expect(input.sendAck).toHaveBeenCalledWith("cmd-123");
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("Failed to kill"),
     );
+  });
+
+  it("calls delete before sending reply", async () => {
+    const callOrder: string[] = [];
+    const input = makeInput({
+      opencodeClient: {
+        deleteSession: vi.fn(async () => { callOrder.push("delete"); }),
+      } as any,
+      sendTelegramReply: vi.fn(async () => { callOrder.push("reply"); }),
+    });
+
+    await ingestKillCommand(input);
+
+    expect(callOrder).toEqual(["delete", "reply"]);
   });
 });

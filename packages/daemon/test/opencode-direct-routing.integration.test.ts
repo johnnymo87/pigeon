@@ -2,6 +2,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { startDirectChannelServer } from "../../opencode-plugin/src/direct-channel";
 import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
+import type { ExecuteMessage } from "../src/worker/poller";
+
+function makeMsg(overrides: Partial<ExecuteMessage> = {}): ExecuteMessage {
+  return {
+    commandId: "cmd-int-default",
+    commandType: "execute",
+    sessionId: "sess-int-default",
+    command: "echo test",
+    chatId: "42",
+    ...overrides,
+  };
+}
 
 describe("opencode direct-channel routing integration", () => {
   const closers: Array<() => Promise<void>> = [];
@@ -13,7 +25,7 @@ describe("opencode direct-channel routing integration", () => {
     }
   });
 
-  it("routes command through plugin direct endpoint and returns success", async () => {
+  it("routes command through plugin direct endpoint and marks inbox done on success", async () => {
     const onExecute = vi.fn(async () => ({ success: true, output: "queued" }));
     const server = await startDirectChannelServer({ onExecute });
     closers.push(server.close);
@@ -28,40 +40,17 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: server.authToken,
     }, 1_000);
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-int-1",
-        sessionId: "sess-int-1",
-        command: "echo DIRECT_OK",
-        chatId: "42",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-int-1", sessionId: "sess-int-1", command: "echo DIRECT_OK", chatId: "42" }),
     );
 
     expect(onExecute).toHaveBeenCalledTimes(1);
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-int-1" },
-      {
-        type: "commandResult",
-        commandId: "cmd-int-1",
-        success: true,
-        error: null,
-        chatId: "42",
-      },
-    ]);
-
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
-  it("returns failure when plugin direct auth token is wrong", async () => {
+  it("returns normally (Poller acks) when plugin direct auth token is wrong", async () => {
     const server = await startDirectChannelServer({
       onExecute: async () => ({ success: true }),
     });
@@ -77,38 +66,19 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: "wrong-token",
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-2",
-        sessionId: "sess-int-2",
-        command: "echo fail",
-        chatId: "99",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
-
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-2" });
-    expect(sent[1]).toEqual({
-      type: "commandResult",
-      commandId: "cmd-int-2",
-      success: false,
-      error: "UNAUTHORIZED",
-      chatId: "99",
-    });
+    // Should not throw — permanent failure, Poller acks
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-2", sessionId: "sess-int-2", command: "echo fail", chatId: "99" }),
+      ),
+    ).resolves.toBeUndefined();
 
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("propagates execution failure from plugin handler", async () => {
+  it("returns normally (Poller acks) when plugin handler returns execution failure", async () => {
     const onExecute = vi.fn(async () => ({
       success: false,
       exitCode: 1,
@@ -129,40 +99,20 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: server.authToken,
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-3",
-        sessionId: "sess-int-3",
-        command: "exit 1",
-        chatId: "50",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-3", sessionId: "sess-int-3", command: "exit 1", chatId: "50" }),
+      ),
+    ).resolves.toBeUndefined();
 
     expect(onExecute).toHaveBeenCalledTimes(1);
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-3" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-3",
-      success: false,
-      chatId: "50",
-    });
-    expect((sent[1] as Record<string, unknown>).error).toBeTruthy();
-
-    // Inbox should NOT be marked done on failure
+    // Inbox NOT marked done on failure
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("handles plugin handler throwing an exception (500 / INTERNAL)", async () => {
+  it("returns normally (Poller acks) when plugin handler throws exception (500 / INTERNAL)", async () => {
     const onExecute = vi.fn(async () => {
       throw new Error("Unexpected plugin crash");
     });
@@ -179,40 +129,20 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: server.authToken,
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-4",
-        sessionId: "sess-int-4",
-        command: "echo crash",
-        chatId: "51",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-4", sessionId: "sess-int-4", command: "echo crash", chatId: "51" }),
+      ),
+    ).resolves.toBeUndefined();
 
     // Adapter retries on 500, so onExecute is called twice (1 + 1 retry)
     expect(onExecute).toHaveBeenCalledTimes(2);
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-4" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-4",
-      success: false,
-      chatId: "51",
-    });
-    expect((sent[1] as Record<string, unknown>).error).toBeTruthy();
-
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("returns failure for unreachable plugin endpoint (network error)", async () => {
+  it("removes dead session and returns normally when plugin endpoint is unreachable", async () => {
     const storage = openStorageDb(":memory:");
     // Use a port that nothing listens on
     storage.sessions.upsert({
@@ -224,34 +154,15 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: "token-doesnt-matter",
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-5",
-        sessionId: "sess-int-5",
-        command: "echo unreachable",
-        chatId: "52",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-5", sessionId: "sess-int-5", command: "echo unreachable", chatId: "52" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-5" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-5",
-      success: false,
-      chatId: "52",
-    });
-    expect((sent[1] as Record<string, unknown>).error).toBeTruthy();
-
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Session should be cleaned up (connection error = dead session)
+    expect(storage.sessions.get("sess-int-5")).toBeNull();
     storage.db.close();
   });
 
@@ -270,33 +181,20 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: server.authToken,
     }, 1_000);
 
-    const sent: unknown[] = [];
-    const callbacks = { send(payload: unknown) { sent.push(payload); } };
-    const msg = {
-      type: "command" as const,
+    const msg = makeMsg({
       commandId: "cmd-int-6-dup",
       sessionId: "sess-int-6",
       command: "echo dedup",
       chatId: "53",
-    };
+    });
 
     // First call goes through
-    await ingestWorkerCommand(storage, msg, callbacks);
+    await ingestWorkerCommand(storage, msg);
     // Second call with same commandId is deduplicated
-    await ingestWorkerCommand(storage, msg, callbacks);
+    await ingestWorkerCommand(storage, msg);
 
-    // First call: ack + result. Second call: ack only (dedup).
+    // Adapter called only once (second call was deduped)
     expect(onExecute).toHaveBeenCalledTimes(1);
-    expect(sent).toHaveLength(3);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-6-dup" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-6-dup",
-      success: true,
-    });
-    // The dedup ack
-    expect(sent[2]).toEqual({ type: "ack", commandId: "cmd-int-6-dup" });
-
     storage.db.close();
   });
 
@@ -319,21 +217,9 @@ describe("opencode direct-channel routing integration", () => {
       backendAuthToken: server.authToken,
     }, 1_000);
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-int-7",
-        sessionId: "sess-int-7",
-        command: "continue",
-        chatId: "54",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
+      makeMsg({ commandId: "cmd-int-7", sessionId: "sess-int-7", command: "continue", chatId: "54" }),
     );
 
     expect(onExecute).toHaveBeenCalledTimes(1);
@@ -341,48 +227,26 @@ describe("opencode direct-channel routing integration", () => {
       source: "telegram-reply",
       command: "continue",
     });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      success: true,
-    });
-
     storage.db.close();
   });
 
-  it("returns session-not-found when no session exists in storage", async () => {
+  it("returns normally (Poller acks) when no session exists in storage", async () => {
     const storage = openStorageDb(":memory:");
     // No session upserted
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-8",
-        sessionId: "sess-nonexistent",
-        command: "echo ghost",
-        chatId: "55",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-8", sessionId: "sess-nonexistent", command: "echo ghost", chatId: "55" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-8" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-8",
-      success: false,
-    });
-    expect((sent[1] as Record<string, unknown>).error).toMatch(/[Ss]ession/);
-
+    // Command persisted in inbox but not marked done
+    expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 
-  it("rejects opencode-plugin-direct session with incomplete backend registration", async () => {
+  it("returns normally (Poller acks) when session has incomplete backend registration", async () => {
     const storage = openStorageDb(":memory:");
     // Session has backendKind but NO endpoint/token — incomplete registration
     storage.sessions.upsert({
@@ -393,32 +257,14 @@ describe("opencode direct-channel routing integration", () => {
       // Missing backendEndpoint and backendAuthToken
     }, 1_000);
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-int-10",
-        sessionId: "sess-int-10",
-        command: "echo should-not-deliver",
-        chatId: "99",
-      },
-      {
-        send(payload) {
-          sent.push(payload);
-        },
-      },
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-10", sessionId: "sess-int-10", command: "echo should-not-deliver", chatId: "99" }),
+      ),
+    ).resolves.toBeUndefined();
 
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-int-10" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-int-10",
-      success: false,
-    });
-    expect((sent[1] as Record<string, unknown>).error).toMatch(/not configured for command delivery/i);
-
+    expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
 });

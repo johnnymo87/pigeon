@@ -8,7 +8,10 @@ import {
 import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
-import { MachineAgent } from "./worker/machine-agent";
+import { Poller } from "./worker/poller";
+import { ingestWorkerCommand } from "./worker/command-ingest";
+import { ingestLaunchCommand } from "./worker/launch-ingest";
+import { ingestKillCommand } from "./worker/kill-ingest";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -34,28 +37,60 @@ async function sendTelegramMessage(chatId: string, text: string): Promise<void> 
   }
 }
 
-const machineAgent = config.workerUrl && config.workerApiKey && config.machineId
-  ? new MachineAgent(
+const poller = config.workerUrl && config.workerApiKey && config.machineId
+  ? new Poller(
       {
         workerUrl: config.workerUrl,
         apiKey: config.workerApiKey,
         machineId: config.machineId,
         chatId: config.telegramChatId,
       },
-      storage,
       {
-        opencodeClient,
-        sendTelegramMessage,
+        onCommand: async (msg) => {
+          await ingestWorkerCommand(storage, msg, {
+            workerUrl: config.workerUrl,
+            apiKey: config.workerApiKey,
+          });
+        },
+        onLaunch: async (msg) => {
+          if (!opencodeClient) {
+            console.warn("[pigeon-daemon] received launch command but no opencodeClient is configured");
+            return;
+          }
+          await ingestLaunchCommand({
+            commandId: msg.commandId,
+            directory: msg.directory,
+            prompt: msg.prompt,
+            chatId: msg.chatId,
+            machineId: config.machineId,
+            opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
+        },
+        onKill: async (msg) => {
+          if (!opencodeClient) {
+            console.warn("[pigeon-daemon] received kill command but no opencodeClient is configured");
+            return;
+          }
+          await ingestKillCommand({
+            commandId: msg.commandId,
+            sessionId: msg.sessionId,
+            chatId: msg.chatId,
+            machineId: config.machineId,
+            opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
+        },
       },
     )
   : undefined;
 
-if (machineAgent) {
-  machineAgent.connect();
+if (poller) {
+  poller.start();
 }
 
-const workerNotifier = machineAgent && config.telegramChatId
-  ? new WorkerNotificationService(storage, machineAgent, config.telegramChatId, Date.now, config.machineId)
+const workerNotifier = poller && config.telegramChatId
+  ? new WorkerNotificationService(storage, poller, config.telegramChatId, Date.now, config.machineId)
   : undefined;
 
 const telegramNotifier = config.telegramBotToken && config.telegramChatId
@@ -69,13 +104,13 @@ const notifier = workerNotifier && telegramNotifier
 const server = startServer(config, createApp(storage, {
   notifier,
   onSessionStart: async (sessionId, notify, label) => {
-    if (notify && machineAgent) {
-      await machineAgent.registerSession(sessionId, label ?? undefined);
+    if (notify && poller) {
+      await poller.registerSession(sessionId, label ?? undefined);
     }
   },
   onSessionDelete: async (sessionId) => {
-    if (machineAgent) {
-      await machineAgent.unregisterSession(sessionId);
+    if (poller) {
+      await poller.unregisterSession(sessionId);
     }
   },
 }));

@@ -3,6 +3,18 @@ import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import type { CommandDeliveryAdapter, CommandDeliveryResult } from "../src/adapters/types";
+import type { ExecuteMessage } from "../src/worker/poller";
+
+function makeMsg(overrides: Partial<ExecuteMessage> = {}): ExecuteMessage {
+  return {
+    commandId: "cmd-nvim-default",
+    commandType: "execute",
+    sessionId: "nvim-route-default",
+    command: "echo test",
+    chatId: "100",
+    ...overrides,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Session-model tests (via daemon HTTP API)
@@ -117,17 +129,9 @@ describe("nvim session routing — command ingest pipeline", () => {
       deliverCommand: mockDeliverCommand,
     };
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-nvim-1",
-        sessionId: "nvim-route-1",
-        command: "echo hello",
-        chatId: "100",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-nvim-1", sessionId: "nvim-route-1", command: "echo hello", chatId: "100" }),
       { createAdapter: () => mockAdapter },
     );
 
@@ -144,17 +148,8 @@ describe("nvim session routing — command ingest pipeline", () => {
     expect(calledCommand).toBe("echo hello");
     expect(calledContext).toMatchObject({ commandId: "cmd-nvim-1", chatId: "100" });
 
-    // Verify ack + success result
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-nvim-1" },
-      {
-        type: "commandResult",
-        commandId: "cmd-nvim-1",
-        success: true,
-        error: null,
-        chatId: "100",
-      },
-    ]);
+    // Inbox marked done on success
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
   });
@@ -178,17 +173,9 @@ describe("nvim session routing — command ingest pipeline", () => {
 
     let adapterNameUsed: string | null = null;
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-nvim-2",
-        sessionId: "nvim-route-2",
-        command: "echo priority",
-        chatId: "101",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-nvim-2", sessionId: "nvim-route-2", command: "echo priority", chatId: "101" }),
       {
         createAdapter: (session) => {
           // The production selectAdapter would pick direct-channel first,
@@ -220,22 +207,12 @@ describe("nvim session routing — command ingest pipeline", () => {
 
     // Direct-channel should have been chosen over nvim-rpc
     expect(adapterNameUsed).toBe("direct-channel");
-
-    expect(sent).toEqual([
-      { type: "ack", commandId: "cmd-nvim-2" },
-      {
-        type: "commandResult",
-        commandId: "cmd-nvim-2",
-        success: true,
-        error: null,
-        chatId: "101",
-      },
-    ]);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
   });
 
-  it("nvim adapter delivery failure propagates error", async () => {
+  it("nvim adapter delivery failure returns normally (Poller acks)", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert(
       {
@@ -255,29 +232,13 @@ describe("nvim session routing — command ingest pipeline", () => {
       }),
     };
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-nvim-3",
-        sessionId: "nvim-route-3",
-        command: "echo fail",
-        chatId: "102",
-      },
-      { send(payload) { sent.push(payload); } },
-      { createAdapter: () => mockAdapter },
-    );
-
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-nvim-3" });
-    expect(sent[1]).toEqual({
-      type: "commandResult",
-      commandId: "cmd-nvim-3",
-      success: false,
-      error: "instance not found",
-      chatId: "102",
-    });
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-nvim-3", sessionId: "nvim-route-3", command: "echo fail", chatId: "102" }),
+        { createAdapter: () => mockAdapter },
+      ),
+    ).resolves.toBeUndefined();
 
     // Inbox should NOT be marked done on failure
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
@@ -301,36 +262,18 @@ describe("nvim session routing — command ingest pipeline", () => {
       deliverCommand: async () => ({ ok: true }),
     };
 
-    const sent: unknown[] = [];
     await ingestWorkerCommand(
       storage,
-      {
-        type: "command",
-        commandId: "cmd-nvim-4",
-        sessionId: "nvim-route-4",
-        command: "echo success",
-        chatId: "103",
-      },
-      { send(payload) { sent.push(payload); } },
+      makeMsg({ commandId: "cmd-nvim-4", sessionId: "nvim-route-4", command: "echo success", chatId: "103" }),
       { createAdapter: () => mockAdapter },
     );
-
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-nvim-4" });
-    expect(sent[1]).toEqual({
-      type: "commandResult",
-      commandId: "cmd-nvim-4",
-      success: true,
-      error: null,
-      chatId: "103",
-    });
 
     // Inbox should be marked done on success
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
-  it("session with neither backend nor nvim gets error", async () => {
+  it("session with neither backend nor nvim returns normally (Poller acks)", async () => {
     const storage = openStorageDb(":memory:");
     // Session has no backendKind, no nvimSocket, no ptyPath
     storage.sessions.upsert(
@@ -341,30 +284,12 @@ describe("nvim session routing — command ingest pipeline", () => {
       1_000,
     );
 
-    const sent: unknown[] = [];
-    await ingestWorkerCommand(
-      storage,
-      {
-        type: "command",
-        commandId: "cmd-nvim-5",
-        sessionId: "nvim-route-5",
-        command: "echo orphan",
-        chatId: "104",
-      },
-      { send(payload) { sent.push(payload); } },
-    );
-
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toEqual({ type: "ack", commandId: "cmd-nvim-5" });
-    expect(sent[1]).toMatchObject({
-      type: "commandResult",
-      commandId: "cmd-nvim-5",
-      success: false,
-      chatId: "104",
-    });
-    expect((sent[1] as Record<string, unknown>).error).toMatch(
-      /not configured for command delivery/i,
-    );
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-nvim-5", sessionId: "nvim-route-5", command: "echo orphan", chatId: "104" }),
+      ),
+    ).resolves.toBeUndefined();
 
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();

@@ -1,5 +1,6 @@
 import os from "os";
 import type { OpencodeClient } from "../opencode-client";
+import type { LaunchMessage } from "./poller";
 
 /** Resolve leading `~` or `~/` to the user's home directory. */
 function resolveHome(dir: string): string {
@@ -16,15 +17,12 @@ export interface LaunchCommandInput {
   machineId?: string;
   opencodeClient: OpencodeClient;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
-  sendAck: (commandId: string) => void;
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
-  const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const directory = resolveHome(input.directory);
   const machineLabel = machineId ? ` on ${machineId}` : "";
-
-  sendAck(commandId);
 
   const healthy = await opencodeClient.healthCheck();
   if (!healthy) {

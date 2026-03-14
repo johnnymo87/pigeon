@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
+import type { KillMessage } from "./poller";
 
 export interface KillCommandInput {
   commandId: string;
@@ -7,14 +8,11 @@ export interface KillCommandInput {
   machineId?: string;
   opencodeClient: OpencodeClient;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
-  sendAck: (commandId: string) => void;
 }
 
 export async function ingestKillCommand(input: KillCommandInput): Promise<void> {
-  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply, sendAck } = input;
+  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
-
-  sendAck(commandId);
 
   try {
     await opencodeClient.deleteSession(sessionId);

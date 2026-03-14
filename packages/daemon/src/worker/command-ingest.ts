@@ -10,38 +10,7 @@ import {
   OpencodeDirectSource,
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "../opencode-direct/contracts";
-
-export interface WorkerCommandMessage {
-  type: "command";
-  commandId?: string;
-  id?: string;
-  sessionId: string;
-  command: string;
-  chatId?: string;
-  media?: {
-    key: string;
-    mime: string;
-    filename: string;
-    size: number;
-  };
-}
-
-export interface WorkerAckMessage {
-  type: "ack";
-  commandId: string;
-}
-
-export interface WorkerCommandResultMessage {
-  type: "commandResult";
-  commandId: string;
-  success: boolean;
-  error: string | null;
-  chatId?: string;
-}
-
-export interface WorkerCommandIngestCallbacks {
-  send: (payload: WorkerAckMessage | WorkerCommandResultMessage) => void;
-}
+import type { ExecuteMessage } from "./poller";
 
 export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
@@ -53,7 +22,7 @@ export interface WorkerCommandIngestOptions {
    */
   executeDirect?: (
     session: SessionRecord,
-    msg: WorkerCommandMessage,
+    msg: ExecuteMessage,
     commandId: string,
   ) => Promise<OpencodeDirectExecuteResult>;
   /** Worker base URL for fetching media from R2 (e.g. https://ccr-router.workers.dev) */
@@ -66,7 +35,7 @@ export interface WorkerCommandIngestOptions {
 
 const QUESTION_OPTION_RE = /^q(\d+)$/;
 
-function directSourceForMessage(msg: WorkerCommandMessage): OpencodeDirectSourceType {
+function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   const command = msg.command.trim();
   if (QUESTION_OPTION_RE.test(command)) {
     return OpencodeDirectSource.TelegramCallback;
@@ -90,16 +59,18 @@ function selectAdapter(session: SessionRecord): CommandDeliveryAdapter | null {
   return null;
 }
 
+/**
+ * Ingest an execute command from the Poller.
+ *
+ * Returns normally (Poller acks) for permanent failures.
+ * Throws for transient failures (Poller skips ack, command retries).
+ */
 export async function ingestWorkerCommand(
   storage: StorageDb,
-  msg: WorkerCommandMessage,
-  callbacks: WorkerCommandIngestCallbacks,
+  msg: ExecuteMessage,
   options: WorkerCommandIngestOptions = {},
 ): Promise<void> {
-  const commandId = msg.commandId ?? msg.id;
-  if (!commandId) {
-    return;
-  }
+  const commandId = msg.commandId;
 
   const persisted = storage.inbox.persist({
     commandId,
@@ -108,22 +79,13 @@ export async function ingestWorkerCommand(
 
   if (!persisted) {
     console.log(`[command-ingest] dedup commandId=${commandId}`);
-    callbacks.send({ type: "ack", commandId });
     return;
   }
-
-  callbacks.send({ type: "ack", commandId });
 
   const session = storage.sessions.get(msg.sessionId);
   if (!session) {
     console.warn(`[command-ingest] session not found sessionId=${msg.sessionId} commandId=${commandId}`);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: false,
-      error: "Session not found. Wait for a new notification.",
-      chatId: msg.chatId,
-    });
+    // Permanent failure: retrying won't help if the session doesn't exist
     return;
   }
 
@@ -139,13 +101,8 @@ export async function ingestWorkerCommand(
       const index = Number(optionMatch[1]);
       const firstQuestion = pendingQuestion.questions[0];
       if (!firstQuestion || index >= firstQuestion.options.length) {
-        callbacks.send({
-          type: "commandResult",
-          commandId,
-          success: false,
-          error: `Invalid option index ${index}. This question has ${firstQuestion?.options.length ?? 0} options.`,
-          chatId: msg.chatId,
-        });
+        console.warn(`[command-ingest] invalid option index ${index} for commandId=${commandId}`);
+        // Permanent failure: bad input, ack and move on
         return;
       }
       answers = [[firstQuestion.options[index]!.label]];
@@ -159,13 +116,8 @@ export async function ingestWorkerCommand(
       : selectAdapter(session);
 
     if (!adapter || !adapter.deliverQuestionReply) {
-      callbacks.send({
-        type: "commandResult",
-        commandId,
-        success: false,
-        error: "Session adapter does not support question replies",
-        chatId: msg.chatId,
-      });
+      console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
+      // Permanent failure: ack and move on
       return;
     }
 
@@ -179,37 +131,18 @@ export async function ingestWorkerCommand(
       console.log(`[command-ingest] question reply delivered commandId=${commandId}`);
       storage.inbox.markDone(commandId);
       storage.pendingQuestions.delete(msg.sessionId);
-      callbacks.send({
-        type: "commandResult",
-        commandId,
-        success: true,
-        error: null,
-        chatId: msg.chatId,
-      });
       return;
     }
 
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: false,
-      error: result.error || "Question reply delivery failed",
-      chatId: msg.chatId,
-    });
+    // Permanent failure: ack and move on
     return;
   }
 
   // If command looks like a question option but no pending question, it's stale
   if (QUESTION_OPTION_RE.test(msg.command.trim())) {
     console.log(`[command-ingest] stale question option commandId=${commandId}`);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: false,
-      error: "This question has already been answered.",
-      chatId: msg.chatId,
-    });
+    // Permanent failure: ack and move on
     return;
   }
 
@@ -237,7 +170,7 @@ export async function ingestWorkerCommand(
         return { ok: false, error, meta: { attempts: direct.attempts, status: direct.status } };
       },
     };
-    return deliverViaAdapter(legacyAdapter, session, msg, commandId, storage, callbacks);
+    return deliverViaAdapter(legacyAdapter, session, msg, commandId, storage);
   }
 
   const adapter = options.createAdapter
@@ -246,13 +179,7 @@ export async function ingestWorkerCommand(
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: false,
-      error: "Session is not configured for command delivery. Re-register with backend endpoint and auth token.",
-      chatId: msg.chatId,
-    });
+    // Permanent failure: ack and move on
     return;
   }
 
@@ -278,18 +205,12 @@ export async function ingestWorkerCommand(
       };
     } catch (err) {
       console.warn(`[command-ingest] media fetch failed commandId=${commandId} key=${msg.media!.key} error=${err instanceof Error ? err.message : String(err)}`);
-      callbacks.send({
-        type: "commandResult",
-        commandId,
-        success: false,
-        error: `Failed to fetch media: ${err instanceof Error ? err.message : String(err)}`,
-        chatId: msg.chatId,
-      });
-      return;
+      // Transient failure: throw so Poller skips ack and command retries
+      throw err;
     }
   }
 
-  return deliverViaAdapter(adapter, session, msg, commandId, storage, callbacks, mediaPayload);
+  return deliverViaAdapter(adapter, session, msg, commandId, storage, mediaPayload);
 }
 
 
@@ -311,10 +232,9 @@ function isConnectionError(error: string | undefined): boolean {
 async function deliverViaAdapter(
   adapter: CommandDeliveryAdapter,
   session: SessionRecord,
-  msg: WorkerCommandMessage,
+  msg: ExecuteMessage,
   commandId: string,
   storage: StorageDb,
-  callbacks: WorkerCommandIngestCallbacks,
   media?: CommandDeliveryContext["media"],
 ): Promise<void> {
   const result = await adapter.deliverCommand(session, msg.command, {
@@ -326,13 +246,6 @@ async function deliverViaAdapter(
   if (result.ok) {
     console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId}`);
     storage.inbox.markDone(commandId);
-    callbacks.send({
-      type: "commandResult",
-      commandId,
-      success: true,
-      error: null,
-      chatId: msg.chatId,
-    });
     return;
   }
 
@@ -345,13 +258,11 @@ async function deliverViaAdapter(
   if (isConnectionError(result.error)) {
     console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId}`);
     storage.sessions.delete(msg.sessionId);
+    // Transient-ish: session was alive but connection failed. Ack so we don't
+    // retry a command that can't be delivered (session now deleted).
+    return;
   }
 
-  callbacks.send({
-    type: "commandResult",
-    commandId,
-    success: false,
-    error: result.error || "Command delivery failed",
-    chatId: msg.chatId,
-  });
+  // Permanent failure: ack and move on
+  return;
 }

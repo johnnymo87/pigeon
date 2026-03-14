@@ -16,21 +16,12 @@ function makeInput(overrides: Partial<LaunchCommandInput> = {}): LaunchCommandIn
     chatId: "42",
     opencodeClient,
     sendTelegramReply: vi.fn().mockResolvedValue(undefined),
-    sendAck: vi.fn(),
     ...overrides,
   };
 }
 
 describe("ingestLaunchCommand", () => {
   describe("healthy server flow", () => {
-    it("calls sendAck immediately with the commandId", async () => {
-      const input = makeInput();
-
-      await ingestLaunchCommand(input);
-
-      expect(input.sendAck).toHaveBeenCalledWith("cmd-001");
-    });
-
     it("creates a session with the given directory", async () => {
       const input = makeInput();
 
@@ -112,20 +103,6 @@ describe("ingestLaunchCommand", () => {
 
       expect(input.opencodeClient.createSession).not.toHaveBeenCalled();
     });
-
-    it("still sends ack when server is down", async () => {
-      const input = makeInput({
-        opencodeClient: {
-          healthCheck: vi.fn().mockResolvedValue(false),
-          createSession: vi.fn(),
-          sendPrompt: vi.fn(),
-        } as unknown as OpencodeClient,
-      });
-
-      await ingestLaunchCommand(input);
-
-      expect(input.sendAck).toHaveBeenCalledWith("cmd-001");
-    });
   });
 
   describe("session creation fails", () => {
@@ -145,20 +122,6 @@ describe("ingestLaunchCommand", () => {
         expect.stringContaining("Failed to launch session"),
       );
     });
-
-    it("still sends ack when createSession throws", async () => {
-      const input = makeInput({
-        opencodeClient: {
-          healthCheck: vi.fn().mockResolvedValue(true),
-          createSession: vi.fn().mockRejectedValue(new Error("createSession failed: 500 Internal Server Error")),
-          sendPrompt: vi.fn(),
-        } as unknown as OpencodeClient,
-      });
-
-      await ingestLaunchCommand(input);
-
-      expect(input.sendAck).toHaveBeenCalledWith("cmd-001");
-    });
   });
 
   describe("prompt sending fails", () => {
@@ -177,51 +140,6 @@ describe("ingestLaunchCommand", () => {
         "42",
         expect.stringContaining("Failed to launch session"),
       );
-    });
-
-    it("still sends ack when sendPrompt throws", async () => {
-      const input = makeInput({
-        opencodeClient: {
-          healthCheck: vi.fn().mockResolvedValue(true),
-          createSession: vi.fn().mockResolvedValue({ id: "sess-xyz" }),
-          sendPrompt: vi.fn().mockRejectedValue(new Error("sendPrompt failed: 500 Internal Server Error")),
-        } as unknown as OpencodeClient,
-      });
-
-      await ingestLaunchCommand(input);
-
-      expect(input.sendAck).toHaveBeenCalledWith("cmd-001");
-    });
-  });
-
-  describe("ack is always sent", () => {
-    it("sends ack before any async operations (immediately)", async () => {
-      const callOrder: string[] = [];
-      const input = makeInput({
-        sendAck: vi.fn(() => {
-          callOrder.push("ack");
-        }),
-        opencodeClient: {
-          healthCheck: vi.fn(async () => {
-            callOrder.push("healthCheck");
-            return true;
-          }),
-          createSession: vi.fn(async () => {
-            callOrder.push("createSession");
-            return { id: "sess-123" };
-          }),
-          sendPrompt: vi.fn(async () => {
-            callOrder.push("sendPrompt");
-          }),
-        } as unknown as OpencodeClient,
-        sendTelegramReply: vi.fn(async () => {
-          callOrder.push("sendTelegramReply");
-        }),
-      });
-
-      await ingestLaunchCommand(input);
-
-      expect(callOrder[0]).toBe("ack");
     });
   });
 });
