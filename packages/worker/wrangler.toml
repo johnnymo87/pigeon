@@ -6,7 +6,7 @@ keep_vars = true
 [[d1_databases]]
 binding = "DB"
 database_name = "pigeon-router"
-database_id = "TODO-CREATE-D1-DATABASE"
+database_id = "082ab39f-34e4-47d9-8d2e-9b064667648e"
 
 [[r2_buckets]]
 binding = "MEDIA"
