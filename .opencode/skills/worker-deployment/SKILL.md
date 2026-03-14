@@ -46,16 +46,21 @@ bucket_name = "pigeon-media"
 
 If the bucket doesn't exist, deploy will succeed but media upload/download will fail at runtime.
 
-## Durable Object Compatibility
+## D1 Database
 
-Current production uses DO class `RouterDO`.
+The worker uses D1 (Cloudflare's serverless SQLite) for state. The database `pigeon-router` is configured in `wrangler.toml`.
 
-- Keep `packages/worker/wrangler.toml` with:
-  - `class_name = "RouterDO"`
-  - migration `new_sqlite_classes = ["RouterDO"]`
-- Keep `RouterDO` export in `packages/worker/src/index.ts`
+Schema is at `packages/worker/src/d1-schema.sql`. To apply schema changes:
 
-If this drifts, deploy can fail with Cloudflare DO class mismatch errors.
+```bash
+npx wrangler d1 execute pigeon-router --remote --file=packages/worker/src/d1-schema.sql
+```
+
+To inspect production data:
+
+```bash
+npx wrangler d1 execute pigeon-router --remote --command "SELECT * FROM machines"
+```
 
 ## Validate Deployment
 

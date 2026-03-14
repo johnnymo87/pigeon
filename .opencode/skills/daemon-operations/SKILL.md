@@ -37,8 +37,9 @@ journalctl -u opencode-serve.service -n 100 --no-pager
 
 Look for:
 
-- machine-agent connect/reconnect messages
-- worker register/unregister success
+- poller tick errors: `[poller] tick error:` or `[poller] poll failed:`
+- poller dispatch errors: `[poller] dispatch error (skipping ack)`
+- worker register/unregister success: `[poller] registerSession`
 - notification send failures
 - launch-ingest: `session started sessionId=... directory=...`
 - kill-ingest: `session terminated sessionId=...`
