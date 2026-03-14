@@ -18,6 +18,20 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
 - Deploy daemon/plugin: `git pull && npm install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
 
+## Planned: D1 + HTTP Polling Migration
+
+The current WebSocket + Durable Object relay is being replaced with D1 + HTTP short polling. See [design doc](docs/plans/2026-03-14-d1-polling-architecture-design.md).
+
+**Why:** Cloudflare migrates Durable Objects between hosts every 30-70 minutes, killing all WebSocket connections. Boot ID tracking confirmed ~100% of disconnects are DO restarts. This is platform behavior we cannot prevent. The polling architecture eliminates the entire class of connection-lifecycle problems.
+
+**Current → Planned:**
+```
+Current:  Telegram → Worker → DO ↔ WebSocket ↔ Daemon → Plugin → Claude
+Planned:  Telegram → Worker → D1 ← HTTP poll ← Daemon → Plugin → Claude
+```
+
+**Future improvement (noted, not planned):** Long polling at the Worker level (`GET /machines/:id/next?timeout=25`) to reduce polling traffic. Not needed at current scale.
+
 ## Usage
 
 Pigeon is a Telegram bot that routes commands to machines running opencode.

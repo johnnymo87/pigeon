@@ -123,6 +123,21 @@ Terminates a running OpenCode session.
 - Schedule: `0 * * * *` (hourly)
 - Handler: `scheduled()` in `index.ts` calls `cleanupExpiredMedia(env)` which deletes R2 objects older than 24 hours under `inbound/` and `outbound/` prefixes
 
+## Planned: D1 + HTTP Polling Migration
+
+The Durable Object and WebSocket layer is being replaced. See [design doc](docs/plans/2026-03-14-d1-polling-architecture-design.md).
+
+**What changes:**
+- DO removed entirely. All state moves to D1 (Cloudflare's serverless SQLite).
+- WebSocket endpoint (`/ws`) removed. Daemons poll `GET /machines/:id/next` every 5 seconds.
+- Command queue (`command-queue.ts`) removed. D1 `commands` table with lease-timeout replaces it.
+- New endpoints: `GET /machines/:id/next` (poll), `POST /commands/:id/ack` (acknowledge).
+- Cron handler updated to clean old D1 rows instead of DO alarm-driven cleanup.
+
+**What stays:** Telegram webhook handler, `/notifications/send`, R2 media endpoints, session/message tables (migrated to D1).
+
+**Future improvement (noted, not planned):** Long polling at Worker level (`GET /machines/:id/next?timeout=25`) to reduce polling traffic.
+
 ## Verify
 
 Run:

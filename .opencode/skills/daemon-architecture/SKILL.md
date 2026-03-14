@@ -122,6 +122,22 @@ Both are wired through `machine-agent.ts` message handlers (alongside the existi
 8. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
 9. If the user already answered locally, stale button presses return "This question has already been answered."
 
+## Planned: D1 + HTTP Polling Migration
+
+The WebSocket connection to the worker is being replaced with HTTP short polling. See [design doc](docs/plans/2026-03-14-d1-polling-architecture-design.md).
+
+**What changes:**
+- `MachineAgent` WebSocket client removed (or gutted to HTTP poller).
+- Heartbeat, ping/pong, reconnect backoff, boot ID tracking all removed.
+- `FallbackNotifier` dual-path logic removed. HTTP POST to worker becomes the only notification path.
+- Pending commandResult buffer removed (no disconnected state to buffer for).
+- New poller: `setInterval` calls `GET /machines/:id/next` every 5 seconds, acks via `POST /commands/:id/ack`.
+- If daemon pulls a command but fails to deliver to plugin, it simply doesn't ack. Lease expires (60s) and command becomes available again.
+
+**What stays:** Local command inbox (dedup), session storage, plugin delivery adapters, notification service (now single-path), media relay.
+
+**Future improvement (noted, not planned):** Long polling at Worker level to reduce HTTP traffic.
+
 ## Verify
 
 ```bash
