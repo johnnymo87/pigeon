@@ -292,6 +292,22 @@ export async function ingestWorkerCommand(
   return deliverViaAdapter(adapter, session, msg, commandId, storage, callbacks, mediaPayload);
 }
 
+
+
+function isConnectionError(error: string | undefined): boolean {
+  if (!error) return false;
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("unable to connect") ||
+    lower.includes("econnrefused") ||
+    lower.includes("connection refused") ||
+    lower.includes("timed out") ||
+    lower.includes("abort") ||
+    lower.includes("fetch failed") ||
+    lower.includes("network error")
+  );
+}
+
 async function deliverViaAdapter(
   adapter: CommandDeliveryAdapter,
   session: SessionRecord,
@@ -321,6 +337,16 @@ async function deliverViaAdapter(
   }
 
   console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} error=${result.error}`);
+
+  // Clean up dead sessions when delivery fails with a connection error.
+  // Network errors (connection refused, timeout, abort) indicate the plugin
+  // process is gone. Removing the session ensures subsequent commands get a
+  // clear "Session not found" error instead of repeatedly failing.
+  if (isConnectionError(result.error)) {
+    console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId}`);
+    storage.sessions.delete(msg.sessionId);
+  }
+
   callbacks.send({
     type: "commandResult",
     commandId,

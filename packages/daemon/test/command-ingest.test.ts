@@ -709,4 +709,104 @@ describe("ingestWorkerCommand", () => {
     );
     storage.db.close();
   });
+
+  it("cleans up dead sessions when delivery fails with a connection error", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-dead",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-dead",
+        sessionId: "sess-dead",
+        command: "ls",
+        chatId: "5",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false, error: "fetch failed: unable to connect" };
+          },
+        }),
+      }
+    );
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "commandResult",
+        commandId: "cmd-dead",
+        success: false,
+        error: "fetch failed: unable to connect",
+      })
+    );
+
+    // Session should be deleted from storage
+    expect(storage.sessions.get("sess-dead")).toBeNull();
+    storage.db.close();
+  });
+
+  it("does not clean up sessions on business logic errors", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-biz-error",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const sent: unknown[] = [];
+    await ingestWorkerCommand(
+      storage,
+      {
+        type: "command",
+        commandId: "cmd-biz-error",
+        sessionId: "sess-biz-error",
+        command: "ls",
+        chatId: "6",
+      },
+      {
+        send(payload) {
+          sent.push(payload);
+        },
+      },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false, error: "Command rejected" };
+          },
+        }),
+      }
+    );
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "commandResult",
+        commandId: "cmd-biz-error",
+        success: false,
+        error: "Command rejected",
+      })
+    );
+
+    // Session should remain in storage
+    expect(storage.sessions.get("sess-biz-error")).not.toBeNull();
+    storage.db.close();
+  });
 });
