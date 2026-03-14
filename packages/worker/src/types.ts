@@ -3,7 +3,7 @@
 
 declare global {
   interface Env {
-    ROUTER: DurableObjectNamespace;
+    DB: D1Database;
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_WEBHOOK_SECRET: string;
     CCR_API_KEY: string;
