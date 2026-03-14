@@ -10,11 +10,10 @@ export interface SessionRow {
   label: string | null;
   created_at: number;
   updated_at: number;
-  [key: string]: SqlStorageValue;
 }
 
 export async function handleSessionRequest(
-  sql: SqlStorage,
+  db: D1Database,
   env: Env,
   request: Request,
   action: SessionAction,
@@ -25,21 +24,21 @@ export async function handleSessionRequest(
 
   switch (action) {
     case "list":
-      return listSessions(sql);
+      return listSessions(db);
     case "register":
-      return registerSession(sql, request);
+      return registerSession(db, request);
     case "unregister":
-      return unregisterSession(sql, request);
+      return unregisterSession(db, request);
   }
 }
 
-function listSessions(sql: SqlStorage): Response {
-  const rows = sql.exec<SessionRow>("SELECT * FROM sessions").toArray();
-  return Response.json(rows);
+async function listSessions(db: D1Database): Promise<Response> {
+  const { results } = await db.prepare("SELECT * FROM sessions").all<SessionRow>();
+  return Response.json(results);
 }
 
 async function registerSession(
-  sql: SqlStorage,
+  db: D1Database,
   request: Request,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
@@ -55,42 +54,38 @@ async function registerSession(
   }
 
   // Check session limit (only for new sessions)
-  const existing = sql
-    .exec<{ session_id: string }>(
-      "SELECT session_id FROM sessions WHERE session_id = ?",
-      sessionId,
-    )
-    .toArray();
+  const existing = await db
+    .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first<{ session_id: string }>();
 
-  if (existing.length === 0) {
-    const countResult = sql
-      .exec<{ count: number }>("SELECT COUNT(*) as count FROM sessions")
-      .toArray();
-    if (countResult[0] && countResult[0].count >= MAX_SESSIONS) {
+  if (!existing) {
+    const countResult = await db
+      .prepare("SELECT COUNT(*) as count FROM sessions")
+      .first<{ count: number }>();
+    if (countResult && countResult.count >= MAX_SESSIONS) {
       return Response.json({ error: "Session limit reached" }, { status: 429 });
     }
   }
 
   const now = Date.now();
-  sql.exec(
-    `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(session_id) DO UPDATE SET
-       machine_id = excluded.machine_id,
-       label = excluded.label,
-       updated_at = excluded.updated_at`,
-    sessionId,
-    machineId,
-    label,
-    now,
-    now,
-  );
+  await db
+    .prepare(
+      `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         machine_id = excluded.machine_id,
+         label = excluded.label,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(sessionId, machineId, label, now, now)
+    .run();
 
   return Response.json({ ok: true, sessionId, machineId });
 }
 
 async function unregisterSession(
-  sql: SqlStorage,
+  db: D1Database,
   request: Request,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
@@ -100,8 +95,8 @@ async function unregisterSession(
     return Response.json({ error: "sessionId required" }, { status: 400 });
   }
 
-  sql.exec("DELETE FROM sessions WHERE session_id = ?", sessionId);
-  sql.exec("DELETE FROM messages WHERE session_id = ?", sessionId);
+  await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+  await db.prepare("DELETE FROM messages WHERE session_id = ?").bind(sessionId).run();
 
   return Response.json({ ok: true });
 }
@@ -110,26 +105,23 @@ async function unregisterSession(
  * Touch a session to keep it alive (update updated_at).
  * Used internally by notification and command routing.
  */
-export function touchSession(sql: SqlStorage, sessionId: string): void {
-  sql.exec(
-    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-    Date.now(),
-    sessionId,
-  );
+export async function touchSession(db: D1Database, sessionId: string): Promise<void> {
+  await db
+    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+    .bind(Date.now(), sessionId)
+    .run();
 }
 
 /**
  * Look up which machine a session belongs to.
  */
-export function getSessionMachine(
-  sql: SqlStorage,
+export async function getSessionMachine(
+  db: D1Database,
   sessionId: string,
-): { machine_id: string; label: string | null } | null {
-  const rows = sql
-    .exec<{ machine_id: string; label: string | null }>(
-      "SELECT machine_id, label FROM sessions WHERE session_id = ?",
-      sessionId,
-    )
-    .toArray();
-  return rows[0] ?? null;
+): Promise<{ machine_id: string; label: string | null } | null> {
+  const row = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first<{ machine_id: string; label: string | null }>();
+  return row ?? null;
 }

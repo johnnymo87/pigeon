@@ -14,7 +14,6 @@ interface SessionRow {
   label: string | null;
   created_at: number;
   updated_at: number;
-  [key: string]: SqlStorageValue;
 }
 
 interface MessageRow {
@@ -23,7 +22,6 @@ interface MessageRow {
   session_id: string;
   token: string;
   created_at: number;
-  [key: string]: SqlStorageValue;
 }
 
 const json = (body: unknown, status = 200) =>
@@ -62,33 +60,35 @@ export function generateToken(): string {
 /**
  * Look up a message by (chat_id, message_id) → session_id, token.
  */
-export function lookupMessage(
-  sql: SqlStorage,
+export async function lookupMessage(
+  db: D1Database,
   chatId: string,
-  messageId: number
-): MessageRow | null {
-  const rows = [...sql.exec<MessageRow>(
-    "SELECT chat_id, message_id, session_id, token, created_at FROM messages WHERE chat_id = ? AND message_id = ?",
-    String(chatId),
-    messageId
-  )];
-  return rows[0] ?? null;
+  messageId: number,
+): Promise<MessageRow | null> {
+  const row = await db
+    .prepare(
+      "SELECT chat_id, message_id, session_id, token, created_at FROM messages WHERE chat_id = ? AND message_id = ?",
+    )
+    .bind(String(chatId), messageId)
+    .first<MessageRow>();
+  return row ?? null;
 }
 
 /**
  * Look up a message by (token, chat_id) → session_id.
  */
-export function lookupMessageByToken(
-  sql: SqlStorage,
+export async function lookupMessageByToken(
+  db: D1Database,
   token: string,
-  chatId: string
-): MessageRow | null {
-  const rows = [...sql.exec<MessageRow>(
-    "SELECT chat_id, message_id, session_id, token, created_at FROM messages WHERE token = ? AND chat_id = ?",
-    token,
-    String(chatId)
-  )];
-  return rows[0] ?? null;
+  chatId: string,
+): Promise<MessageRow | null> {
+  const row = await db
+    .prepare(
+      "SELECT chat_id, message_id, session_id, token, created_at FROM messages WHERE token = ? AND chat_id = ?",
+    )
+    .bind(token, String(chatId))
+    .first<MessageRow>();
+  return row ?? null;
 }
 
 /**
@@ -158,9 +158,9 @@ async function sendTelegramDocument(
  * Handle POST /notifications/send
  */
 export async function handleSendNotification(
-  sql: SqlStorage,
+  db: D1Database,
   env: Env,
-  request: Request
+  request: Request,
 ): Promise<Response> {
   if (!verifyApiKey(request, env.CCR_API_KEY)) {
     return unauthorized();
@@ -175,13 +175,11 @@ export async function handleSendNotification(
   }
 
   // Verify session exists
-  const sessions = [
-    ...sql.exec<SessionRow>(
-      "SELECT * FROM sessions WHERE session_id = ?",
-      sessionId
-    ),
-  ];
-  if (sessions.length === 0) {
+  const session = await db
+    .prepare("SELECT * FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first<SessionRow>();
+  if (!session) {
     return json({ error: "Session not found" }, 404);
   }
 
@@ -191,11 +189,10 @@ export async function handleSendNotification(
   }
 
   // Touch session to prevent cleanup
-  sql.exec(
-    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-    Date.now(),
-    sessionId
-  );
+  await db
+    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+    .bind(Date.now(), sessionId)
+    .run();
 
   // Use daemon-supplied token from callback_data if present (keeps button callbacks working),
   // otherwise generate a fresh token for reply-to-message routing.
@@ -216,7 +213,7 @@ export async function handleSendNotification(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(telegramPayload),
-    }
+    },
   );
 
   const telegramResult = (await telegramResponse.json()) as {
@@ -228,21 +225,19 @@ export async function handleSendNotification(
   if (!telegramResult.ok || !telegramResult.result) {
     return json(
       { error: "Telegram API error", details: telegramResult },
-      502
+      502,
     );
   }
 
   const messageId = telegramResult.result.message_id;
 
   // Store message→session mapping for reply routing
-  sql.exec(
-    "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
-    String(chatId),
-    messageId,
-    sessionId,
-    token,
-    Date.now()
-  );
+  await db
+    .prepare(
+      "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(String(chatId), messageId, sessionId, token, Date.now())
+    .run();
 
   // Send media as replies to the text message
   if (media && media.length > 0) {
@@ -259,14 +254,12 @@ export async function handleSendNotification(
           : await sendTelegramDocument(env, chatId, blob, item.filename, messageId);
 
         if (mediaResult.ok && mediaResult.result) {
-          sql.exec(
-            "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
-            String(chatId),
-            mediaResult.result.message_id,
-            sessionId,
-            token,
-            Date.now(),
-          );
+          await db
+            .prepare(
+              "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(String(chatId), mediaResult.result.message_id, sessionId, token, Date.now())
+            .run();
         }
       } catch {
         continue; // Best-effort: text already sent

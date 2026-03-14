@@ -1,6 +1,11 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
-import { generateCommandId, type CommandType } from "./command-queue";
+import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
+
+type CommandType = "execute" | "launch" | "kill";
+
+// Re-export generateCommandId for tests
+export { generateCommandId };
 
 /**
  * Verify the Telegram webhook secret header (constant-time).
@@ -51,13 +56,24 @@ function isAllowedTelegramSource(
  * Deduplicate a Telegram update by update_id.
  * Returns true if this is a new (non-duplicate) update.
  */
-function deduplicateUpdate(sql: SqlStorage, updateId: number): boolean {
-  const result = sql.exec(
-    "INSERT OR IGNORE INTO seen_updates (update_id, created_at) VALUES (?, ?)",
-    updateId,
-    Date.now(),
-  );
-  return result.rowsWritten > 0;
+async function deduplicateUpdate(db: D1Database, updateId: number): Promise<boolean> {
+  // Check if update already exists
+  const existing = await db
+    .prepare("SELECT update_id FROM seen_updates WHERE update_id = ?")
+    .bind(updateId)
+    .first<{ update_id: number }>();
+
+  if (existing) {
+    return false; // duplicate
+  }
+
+  // Insert new entry (INSERT OR IGNORE handles race conditions gracefully)
+  await db
+    .prepare("INSERT OR IGNORE INTO seen_updates (update_id, created_at) VALUES (?, ?)")
+    .bind(updateId, Date.now())
+    .run();
+
+  return true;
 }
 
 // Telegram update types (minimal, just what we need)
@@ -295,16 +311,16 @@ async function answerCallbackQuery(
  * Tries: (1) reply-to-message lookup, (2) /cmd TOKEN format.
  * Returns { sessionId, command } or null if no session found.
  */
-function resolveMessageSession(
-  sql: SqlStorage,
+async function resolveMessageSession(
+  db: D1Database,
   message: TelegramMessage,
-): { sessionId: string; command: string } | null {
+): Promise<{ sessionId: string; command: string } | null> {
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
 
   // Try 1: reply-to-message lookup
   if (message.reply_to_message) {
-    const mapping = lookupMessage(sql, chatId, message.reply_to_message.message_id);
+    const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
       return { sessionId: mapping.session_id, command: text };
     }
@@ -314,7 +330,7 @@ function resolveMessageSession(
   const cmdMatch = text.match(/^\/cmd\s+(\S+)\s+(.+)$/s);
   if (cmdMatch) {
     const token = cmdMatch[1]!;
-    const mapping = lookupMessageByToken(sql, token, chatId);
+    const mapping = await lookupMessageByToken(db, token, chatId);
     if (mapping) {
       const command = text.replace(/^\/cmd\s+\S+\s+/, "");
       return { sessionId: mapping.session_id, command };
@@ -329,10 +345,10 @@ function resolveMessageSession(
  * Expects data format: cmd:TOKEN:ACTION
  * Returns { sessionId, command } or null.
  */
-function resolveCallbackSession(
-  sql: SqlStorage,
+async function resolveCallbackSession(
+  db: D1Database,
   callbackQuery: TelegramCallbackQuery,
-): { sessionId: string; command: string } | null {
+): Promise<{ sessionId: string; command: string } | null> {
   const chatId = callbackQuery.message?.chat?.id;
   if (!chatId) return null;
 
@@ -345,7 +361,7 @@ function resolveCallbackSession(
   const token = parts[1]!;
   const action = parts.slice(2).join(":");
 
-  const mapping = lookupMessageByToken(sql, token, String(chatId));
+  const mapping = await lookupMessageByToken(db, token, String(chatId));
   if (!mapping) return null;
 
   const command = action;
@@ -358,7 +374,7 @@ function resolveCallbackSession(
  * Returns machine info or sends an error to Telegram and returns null.
  */
 async function resolveSessionMachine(
-  sql: SqlStorage,
+  db: D1Database,
   env: Env,
   sessionId: string,
   command: string,
@@ -372,19 +388,21 @@ async function resolveSessionMachine(
   }
 
   // Look up session
-  const rows = sql.exec(
-    "SELECT machine_id, label FROM sessions WHERE session_id = ?",
-    sessionId,
-  ).toArray() as Array<{ machine_id: string; label: string | null; [key: string]: SqlStorageValue }>;
+  const session = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first<{ machine_id: string; label: string | null }>();
 
-  const session = rows[0];
   if (!session) {
     await sendTelegramMessage(env, chatId, "Session not found");
     return null;
   }
 
   // Touch session to prevent cleanup
-  sql.exec("UPDATE sessions SET updated_at = ? WHERE session_id = ?", Date.now(), sessionId);
+  await db
+    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+    .bind(Date.now(), sessionId)
+    .run();
 
   return { machineId: session.machine_id, label: session.label };
 }
@@ -396,7 +414,7 @@ const MAX_QUEUE_PER_MACHINE = 100;
  * Returns the command_id, or null if the queue is full.
  */
 async function queueCommand(
-  sql: SqlStorage,
+  db: D1Database,
   env: Env,
   machineId: string,
   sessionId: string | null,
@@ -407,28 +425,23 @@ async function queueCommand(
   directory: string | null = null,
   mediaRef: MediaRef | null = null,
 ): Promise<string | null> {
-  // Check queue size
-  const countRows = sql.exec(
-    "SELECT COUNT(*) as count FROM command_queue WHERE machine_id = ? AND status != 'acked'",
-    machineId,
-  ).toArray() as Array<{ count: number; [key: string]: SqlStorageValue }>;
-  const queueSize = countRows[0]?.count ?? 0;
-
-  if (queueSize >= MAX_QUEUE_PER_MACHINE) {
-    await sendTelegramMessage(env, chatId,
-      `Queue full for ${label || machineId} (${queueSize} commands pending).`);
-    return null;
-  }
-
-  const commandId = generateCommandId();
-  const now = Date.now();
   const mediaJson = mediaRef ? JSON.stringify(mediaRef) : null;
 
-  sql.exec(
-    `INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at, command_type, directory, media_json)
-     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
-    commandId, machineId, sessionId, command, chatId, now, now, commandType, directory, mediaJson,
-  );
+  const commandId = await d1QueueCommand(db, {
+    machineId,
+    sessionId,
+    command,
+    chatId,
+    commandType,
+    directory,
+    mediaJson,
+  });
+
+  if (commandId === null) {
+    await sendTelegramMessage(env, chatId,
+      `Queue full for ${label || machineId} (${MAX_QUEUE_PER_MACHINE} commands pending).`);
+    return null;
+  }
 
   return commandId;
 }
@@ -437,11 +450,9 @@ async function queueCommand(
  * Handle an incoming Telegram webhook request.
  */
 export async function handleTelegramWebhook(
-  sql: SqlStorage,
+  db: D1Database,
   env: Env,
   request: Request,
-  deliverNow?: (machineId: string) => void,
-  isMachineConnected?: (machineId: string) => boolean,
 ): Promise<Response> {
   // Auth: verify webhook secret
   if (!verifyWebhookSecret(request, env.TELEGRAM_WEBHOOK_SECRET)) {
@@ -452,7 +463,8 @@ export async function handleTelegramWebhook(
 
   // Dedup by update_id
   if (update.update_id) {
-    if (!deduplicateUpdate(sql, update.update_id)) {
+    const isNew = await deduplicateUpdate(db, update.update_id);
+    if (!isNew) {
       return OK();
     }
   }
@@ -476,19 +488,18 @@ export async function handleTelegramWebhook(
 
       // NOTE: No per-user machine authorization — assumes single-tenant deployment.
       // If multi-tenant is needed, validate machineId against an allowlist.
-      // Check if machine has an active WebSocket connection
-      const isConnected = isMachineConnected ? isMachineConnected(machineId) : false;
+      // Check if machine has recently polled (replacing WebSocket "connected" check)
+      const isRecent = await isMachineRecent(db, machineId);
 
-      if (!isConnected) {
-        await sendTelegramMessage(env, launchChatId, `${machineId} is not connected.`);
+      if (!isRecent) {
+        await sendTelegramMessage(env, launchChatId, `${machineId} is not recently seen.`);
         return OK();
       }
 
-      const commandId = await queueCommand(sql, env, machineId, null, prompt, String(launchChatId), null, "launch", directory);
+      const commandId = await queueCommand(db, env, machineId, null, prompt, String(launchChatId), null, "launch", directory);
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`);
-      deliverNow?.(machineId);
       return OK();
     }
 
@@ -499,28 +510,26 @@ export async function handleTelegramWebhook(
       const killChatId = update.message.chat.id;
 
       // Look up session to find its machine
-      const sessionRows = sql.exec(
-        "SELECT machine_id, label FROM sessions WHERE session_id = ?",
-        sessionId,
-      ).toArray() as Array<{ machine_id: string; label: string | null; [key: string]: SqlStorageValue }>;
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; label: string | null }>();
 
-      const session = sessionRows[0];
       if (!session) {
         await sendTelegramMessage(env, killChatId, `Session \`${sessionId}\` not found.`);
         return OK();
       }
 
-      const isConnected = isMachineConnected ? isMachineConnected(session.machine_id) : false;
-      if (!isConnected) {
-        await sendTelegramMessage(env, killChatId, `${session.machine_id} is not connected.`);
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, killChatId, `${session.machine_id} is not recently seen.`);
         return OK();
       }
 
-      const commandId = await queueCommand(sql, env, session.machine_id, sessionId, "", String(killChatId), session.label, "kill");
+      const commandId = await queueCommand(db, env, session.machine_id, sessionId, "", String(killChatId), session.label, "kill");
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\` on ${session.machine_id}...`);
-      deliverNow?.(session.machine_id);
       return OK();
     }
   }
@@ -539,7 +548,7 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    const resolved = resolveMessageSession(sql, update.message);
+    const resolved = await resolveMessageSession(db, update.message);
     if (!resolved) {
       if (chatId) {
         await sendTelegramMessage(env, chatId,
@@ -548,7 +557,7 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    const machine = await resolveSessionMachine(sql, env, resolved.sessionId, resolved.command, chatId!);
+    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, chatId!);
     if (!machine) return OK();
 
     // Relay media to R2 if present
@@ -564,10 +573,9 @@ export async function handleTelegramWebhook(
       mediaRef = { key: relayResult.key, mime: media.mime, filename: media.filename, size: media.size };
     }
 
-    const commandId = await queueCommand(sql, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef);
+    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef);
     if (!commandId) return OK();
 
-    deliverNow?.(machine.machineId);
     return OK();
   }
 
@@ -579,7 +587,7 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    const resolved = resolveCallbackSession(sql, update.callback_query);
+    const resolved = await resolveCallbackSession(db, update.callback_query);
     if (!resolved) {
       await answerCallbackQuery(env, update.callback_query.id, "Session expired");
       return OK();
@@ -588,14 +596,13 @@ export async function handleTelegramWebhook(
     const cbChatId = update.callback_query.message?.chat?.id;
     if (!cbChatId) return OK();
 
-    const machine = await resolveSessionMachine(sql, env, resolved.sessionId, resolved.command, cbChatId);
+    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, cbChatId);
     if (!machine) return OK();
 
-    const commandId = await queueCommand(sql, env, machine.machineId, resolved.sessionId, resolved.command, String(cbChatId), machine.label);
+    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(cbChatId), machine.label);
     if (!commandId) return OK();
 
     await answerCallbackQuery(env, update.callback_query.id, "Command sent");
-    deliverNow?.(machine.machineId);
     return OK();
   }
 
@@ -604,4 +611,4 @@ export async function handleTelegramWebhook(
 }
 
 // Exports for testing
-export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, generateCommandId, MAX_COMMAND_LENGTH, MAX_QUEUE_PER_MACHINE };
+export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, MAX_COMMAND_LENGTH, MAX_QUEUE_PER_MACHINE };

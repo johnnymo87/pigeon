@@ -162,13 +162,13 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     // Session management
     if (url.pathname === "/sessions" && method === "GET") {
-      return handleSessionRequest(this.sql, this.env, request, "list");
+      return handleSessionRequest(this.env.DB, this.env, request, "list");
     }
     if (url.pathname === "/sessions/register" && method === "POST") {
-      return handleSessionRequest(this.sql, this.env, request, "register");
+      return handleSessionRequest(this.env.DB, this.env, request, "register");
     }
     if (url.pathname === "/sessions/unregister" && method === "POST") {
-      return handleSessionRequest(this.sql, this.env, request, "unregister");
+      return handleSessionRequest(this.env.DB, this.env, request, "unregister");
     }
 
     // Media endpoints
@@ -182,23 +182,12 @@ export class RouterDurableObject extends DurableObject<Env> {
 
     // Notifications
     if (url.pathname === "/notifications/send" && method === "POST") {
-      return handleSendNotification(this.sql, this.env, request);
+      return handleSendNotification(this.env.DB, this.env, request);
     }
 
     // Telegram webhook
     if (url.pathname.startsWith("/webhook/telegram") && method === "POST") {
-      return handleTelegramWebhook(
-        this.sql,
-        this.env,
-        request,
-        (machineId) => {
-          const ws = this.getMachineWebSocket(machineId);
-          if (ws) {
-            flushCommandQueue(this.sql, machineId, ws);
-          }
-        },
-        (machineId) => this.getMachineWebSocket(machineId) !== null,
-      );
+      return handleTelegramWebhook(this.env.DB, this.env, request);
     }
 
     // TODO: websocket

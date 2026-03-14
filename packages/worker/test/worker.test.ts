@@ -30,6 +30,58 @@ import {
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
 
+// ─── Global D1 Schema Setup ─────────────────────────────────────────────
+
+// Initialize D1 schema once before all tests (sessions, messages, seen_updates,
+// commands, machines are all used by sessions/notifications/webhook modules).
+const d1SchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    machine_id    TEXT NOT NULL,
+    label         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_machine ON sessions(machine_id)`,
+  `CREATE TABLE IF NOT EXISTS messages (
+    chat_id       TEXT NOT NULL,
+    message_id    INTEGER NOT NULL,
+    session_id    TEXT NOT NULL,
+    token         TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS seen_updates (
+    update_id     INTEGER PRIMARY KEY,
+    created_at    INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS commands (
+    command_id    TEXT PRIMARY KEY,
+    machine_id    TEXT NOT NULL,
+    session_id    TEXT,
+    command_type  TEXT NOT NULL DEFAULT 'execute',
+    command       TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    directory     TEXT,
+    media_json    TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created_at    INTEGER NOT NULL,
+    leased_at     INTEGER,
+    acked_at      INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_commands_poll ON commands (machine_id, status, created_at)`,
+  `CREATE TABLE IF NOT EXISTS machines (
+    machine_id    TEXT PRIMARY KEY,
+    last_poll_at  INTEGER NOT NULL
+  )`,
+];
+
+beforeAll(async () => {
+  for (const stmt of d1SchemaStatements) {
+    await env.DB.prepare(stmt).run();
+  }
+});
+
 // ─── Helpers ───────────────────────────────────────────────────────────
 
 const authHeaders = {
@@ -79,38 +131,30 @@ interface QueueRow {
   media_json?: string | null;
 }
 
+// Query D1 `commands` table (used by webhook/sessions/notifications tests)
 async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
-  const id = env.ROUTER.idFromName("singleton");
-  const stub = env.ROUTER.get(id);
-
-  return runInDurableObject(stub, async (_instance, state) => {
-    return state.storage.sql.exec(
-      `SELECT command_id, machine_id, session_id, command, chat_id, status,
-              attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
-              command_type, directory, media_json
-       FROM command_queue
-       WHERE session_id = ?
-       ORDER BY created_at ASC`,
-      sessionId,
-    ).toArray() as QueueRow[];
-  });
+  const { results } = await env.DB.prepare(
+    `SELECT command_id, machine_id, session_id, command, chat_id, status,
+            0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
+            command_type, directory, media_json
+     FROM commands
+     WHERE session_id = ?
+     ORDER BY created_at ASC`,
+  ).bind(sessionId).all<QueueRow>();
+  return results;
 }
 
+// Query D1 `commands` table by machine (used by webhook tests)
 async function queryQueueByMachine(machineId: string): Promise<QueueRow[]> {
-  const id = env.ROUTER.idFromName("singleton");
-  const stub = env.ROUTER.get(id);
-
-  return runInDurableObject(stub, async (_instance, state) => {
-    return state.storage.sql.exec(
-      `SELECT command_id, machine_id, session_id, command, chat_id, status,
-              attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
-              command_type, directory, media_json
-       FROM command_queue
-       WHERE machine_id = ?
-       ORDER BY created_at ASC`,
-      machineId,
-    ).toArray() as QueueRow[];
-  });
+  const { results } = await env.DB.prepare(
+    `SELECT command_id, machine_id, session_id, command, chat_id, status,
+            0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
+            command_type, directory, media_json
+     FROM commands
+     WHERE machine_id = ?
+     ORDER BY created_at ASC`,
+  ).bind(machineId).all<QueueRow>();
+  return results;
 }
 
 async function insertQueueRow(row: {
@@ -161,20 +205,12 @@ async function insertMessageMapping(input: {
   token: string;
   createdAt?: number;
 }): Promise<void> {
-  const id = env.ROUTER.idFromName("singleton");
-  const stub = env.ROUTER.get(id);
-
-  await runInDurableObject(stub, async (_instance, state) => {
-    state.storage.sql.exec(
-      `INSERT INTO messages (chat_id, message_id, session_id, token, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      input.chatId,
-      input.messageId,
-      input.sessionId,
-      input.token,
-      input.createdAt ?? Date.now(),
-    );
-  });
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO messages (chat_id, message_id, session_id, token, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
+    .bind(input.chatId, input.messageId, input.sessionId, input.token, input.createdAt ?? Date.now())
+    .run();
 }
 
 function mockTelegramSuccess(messageId: number) {
@@ -1178,7 +1214,8 @@ describe("/launch command", () => {
     fetchMock.deactivate();
   });
 
-  it("replies with 'not connected' when machine has no WebSocket", async () => {
+  it("replies with offline error when machine has not recently polled", async () => {
+    // Machine not in D1 machines table → isMachineRecent returns false
     mockTelegramSendMessage(); // ack for error message
 
     const res = await sendWebhook(
@@ -1189,12 +1226,12 @@ describe("/launch command", () => {
     expect(await res.text()).toBe("ok");
   });
 
-  it("queues a launch command when machine is connected via WebSocket", async () => {
+  it("queues a launch command when machine has recently polled D1", async () => {
     const now = Date.now();
     const machineId = `launch-machine-${now}`;
 
-    // Connect the machine via WebSocket so isMachineConnected returns true
-    const ws = await openMachineSocket(machineId);
+    // Insert a recent machines row so isMachineRecent returns true
+    await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack "Launching on ..."
 
@@ -1205,9 +1242,8 @@ describe("/launch command", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
 
-    // Verify the launch command was queued with correct type and directory
+    // Verify the launch command was queued with correct type and directory (D1)
     const rows = await queryQueueByMachine(machineId);
-    // Filter to launch-type commands only (ignore any flushed execute commands)
     const launchRows = rows.filter((r) => r.command_type === "launch");
     expect(launchRows.length).toBeGreaterThanOrEqual(1);
     const launchRow = launchRows[launchRows.length - 1]!;
@@ -1216,51 +1252,16 @@ describe("/launch command", () => {
     expect(launchRow.command).toBe("build and test the app");
     expect(launchRow.session_id).toBeNull();
     expect(launchRow.machine_id).toBe(machineId);
-
-    ws.close();
-  });
-
-  it("sends a launch WebSocket message (not command type) to the machine", async () => {
-    const now = Date.now();
-    const machineId = `launch-ws-${now}`;
-
-    const ws = await openMachineSocket(machineId);
-    await waitForWsMessage(ws); // drain boot message
-
-    mockTelegramSendMessage(); // ack "Launching on ..."
-
-    // Set up listener BEFORE sending the webhook so we don't miss the message
-    const messagePromise = waitForWsMessage(ws);
-
-    await sendWebhook(
-      makeLaunchMessage(machineId, "/workspace/app", "run all tests"),
-    );
-
-    // The machine should receive a "launch" type message
-    const inbound = await messagePromise;
-    const msg = JSON.parse(inbound) as Record<string, unknown>;
-
-    expect(msg.type).toBe("launch");
-    expect(msg.directory).toBe("/workspace/app");
-    expect(msg.prompt).toBe("run all tests");
-    expect(msg.chatId).toBe(String(CHAT_ID_NUM));
-    expect(typeof msg.commandId).toBe("string");
-    // launch messages must NOT have sessionId
-    expect(msg.sessionId).toBeUndefined();
-
-    ws.close();
   });
 
   it("prompt captures everything after directory including spaces", async () => {
     const now = Date.now();
     const machineId = `launch-multiword-${now}`;
 
-    const ws = await openMachineSocket(machineId);
-    await waitForWsMessage(ws); // drain boot message
-    mockTelegramSendMessage();
+    // Insert a recent machines row so isMachineRecent returns true
+    await touchMachine(env.DB, machineId, now);
 
-    // Set up listener BEFORE sending the webhook so we don't miss the message
-    const messagePromise = waitForWsMessage(ws);
+    mockTelegramSendMessage();
 
     await sendWebhook({
       update_id: ++webhookUpdateCounter,
@@ -1272,28 +1273,27 @@ describe("/launch command", () => {
       },
     });
 
-    const inbound = await messagePromise;
-    const msg = JSON.parse(inbound) as Record<string, unknown>;
-
-    expect(msg.type).toBe("launch");
-    expect(msg.prompt).toBe("implement a login page with JWT auth");
-    expect(msg.directory).toBe("/tmp/proj");
-
-    ws.close();
+    // Verify the command was queued with the full prompt (D1)
+    const rows = await queryQueueByMachine(machineId);
+    const launchRows = rows.filter((r) => r.command_type === "launch");
+    expect(launchRows.length).toBeGreaterThanOrEqual(1);
+    const launchRow = launchRows[launchRows.length - 1]!;
+    expect(launchRow.command).toBe("implement a login page with JWT auth");
+    expect(launchRow.directory).toBe("/tmp/proj");
   });
 
   it("does not fall through to regular session resolution for /launch", async () => {
     // Even if there's no session for the machine, /launch should not
     // produce the "Could not find session" error message — it should only
-    // produce the "not connected" message.
-    mockTelegramSendMessage(); // exactly one Telegram call expected (not connected)
+    // produce the "not recently seen" message.
+    mockTelegramSendMessage(); // exactly one Telegram call expected (offline)
 
     const res = await sendWebhook(
       makeLaunchMessage("never-connected-machine", "/tmp", "hello"),
     );
 
     expect(res.status).toBe(200);
-    // fetchMock should have consumed exactly the one mock (not connected)
+    // fetchMock should have consumed exactly the one mock (not recently seen)
     // If it tried a second sendMessage it would throw (no more mocks).
   });
 });
@@ -1422,12 +1422,13 @@ describe("/kill command", () => {
     expect(await res.text()).toBe("ok");
   });
 
-  it("replies with 'not connected' when machine has no WebSocket", async () => {
+  it("replies with offline error when machine has not recently polled", async () => {
     const now = Date.now();
     const sessionId = `kill-offline-${now}`;
     const machineId = `kill-offline-machine-${now}`;
 
     await registerSession(sessionId, machineId);
+    // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
     const res = await sendWebhook(makeKillMessage(sessionId));
@@ -1436,37 +1437,30 @@ describe("/kill command", () => {
     expect(await res.text()).toBe("ok");
   });
 
-  it("queues a kill command and sends WebSocket message when machine is connected", async () => {
+  it("queues a kill command when machine has recently polled D1", async () => {
     const now = Date.now();
     const sessionId = `kill-connected-${now}`;
     const machineId = `kill-machine-${now}`;
 
     await registerSession(sessionId, machineId);
+    // Insert a recent machines row so isMachineRecent returns true
+    await touchMachine(env.DB, machineId, now);
 
-    const ws = await openMachineSocket(machineId);
-    await waitForWsMessage(ws); // drain boot message
     mockTelegramSendMessage(); // ack "Killing session..."
-
-    const messagePromise = waitForWsMessage(ws);
 
     const res = await sendWebhook(makeKillMessage(sessionId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
 
-    // The machine should receive a "kill" type message
-    const inbound = await messagePromise;
-    const msg = JSON.parse(inbound) as Record<string, unknown>;
-
-    expect(msg.type).toBe("kill");
-    expect(msg.sessionId).toBe(sessionId);
-    expect(msg.chatId).toBe(String(CHAT_ID_NUM));
-    expect(typeof msg.commandId).toBe("string");
-    // kill messages must NOT have command or directory
-    expect(msg.command).toBeUndefined();
-    expect(msg.directory).toBeUndefined();
-
-    ws.close();
+    // Verify the kill command was queued in D1
+    const rows = await queryQueueBySession(sessionId);
+    const killRows = rows.filter((r) => r.command_type === "kill");
+    expect(killRows.length).toBeGreaterThanOrEqual(1);
+    const killRow = killRows[killRows.length - 1]!;
+    expect(killRow.command_type).toBe("kill");
+    expect(killRow.session_id).toBe(sessionId);
+    expect(killRow.machine_id).toBe(machineId);
   });
 
   it("does not fall through to regular session resolution for /kill", async () => {
@@ -2012,16 +2006,10 @@ describe("POST /notifications/send with media", () => {
     expect(body.ok).toBe(true);
 
     // The media message (photoMsgId) should be stored in the messages table for reply routing
-    // Verify by querying the DB directly
-    const id = env.ROUTER.idFromName("singleton");
-    const stub = env.ROUTER.get(id);
-    const mediaMessages = await runInDurableObject(stub, async (_instance, state) => {
-      return state.storage.sql.exec(
-        "SELECT message_id, session_id FROM messages WHERE chat_id = ? AND message_id = ?",
-        CHAT_ID,
-        photoMsgId,
-      ).toArray() as Array<{ message_id: number; session_id: string }>;
-    });
+    // Verify by querying D1 directly
+    const { results: mediaMessages } = await env.DB.prepare(
+      "SELECT message_id, session_id FROM messages WHERE chat_id = ? AND message_id = ?",
+    ).bind(CHAT_ID, photoMsgId).all<{ message_id: number; session_id: string }>();
     expect(mediaMessages).toHaveLength(1);
     expect(mediaMessages[0]!.session_id).toBe(sessionId);
   });
