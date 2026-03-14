@@ -1,10 +1,8 @@
 /**
- * All worker tests in a single file to avoid cross-file Durable Object
- * invalidation (a known workerd limitation with SQL-backed DOs).
- *
- * @see https://github.com/cloudflare/workers-sdk/issues/11031
+ * All worker tests in a single file.
+ * The worker uses D1 + HTTP polling (no Durable Objects).
  */
-import { env, SELF, fetchMock, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
+import { env, SELF, fetchMock } from "cloudflare:test";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import {
   generateCommandId as d1GenerateCommandId,
@@ -157,45 +155,36 @@ async function queryQueueByMachine(machineId: string): Promise<QueueRow[]> {
   return results;
 }
 
-async function insertQueueRow(row: {
+async function insertCommandRow(row: {
   commandId: string;
   machineId: string;
   sessionId: string | null;
   status: string;
   createdAt: number;
-  sentAt?: number | null;
+  leasedAt?: number | null;
   ackedAt?: number | null;
-  attempts?: number;
-  nextRetryAt?: number | null;
   commandType?: string;
   directory?: string | null;
 }): Promise<void> {
-  const id = env.ROUTER.idFromName("singleton");
-  const stub = env.ROUTER.get(id);
-
-  await runInDurableObject(stub, async (_instance, state) => {
-    state.storage.sql.exec(
-      `INSERT INTO command_queue (
-         command_id, machine_id, session_id, command, chat_id,
-         status, attempts, created_at, sent_at, next_retry_at, acked_at, last_error,
-         command_type, directory
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  await env.DB.prepare(
+    `INSERT INTO commands (
+       command_id, machine_id, session_id, command_type, command, chat_id,
+       status, created_at, leased_at, acked_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
       row.commandId,
       row.machineId,
       row.sessionId,
+      row.commandType ?? "execute",
       "echo test",
       "8248645256",
       row.status,
-      row.attempts ?? 0,
       row.createdAt,
-      row.sentAt ?? null,
-      row.nextRetryAt ?? null,
+      row.leasedAt ?? null,
       row.ackedAt ?? null,
-      null,
-      row.commandType ?? "execute",
-      row.directory ?? null,
-    );
-  });
+    )
+    .run();
 }
 
 async function insertMessageMapping(input: {
@@ -243,7 +232,8 @@ describe("worker basics", () => {
   });
 
   it("has required env bindings", () => {
-    expect(env.ROUTER).toBeDefined();
+    expect(env.DB).toBeDefined();
+    expect(env.MEDIA).toBeDefined();
   });
 });
 
@@ -898,48 +888,38 @@ describe("command queue lifecycle", () => {
     expect(queueRows[0]?.command).toBe("ls -la");
   });
 
-  it("alarm deletes old acked and old stuck commands", async () => {
+  it("cleanupCommands deletes old acked and old stuck commands", async () => {
     const now = Date.now();
     const baseSession = `cleanup-session-${Date.now()}`;
     await registerSession(baseSession, MACHINE_ID);
 
-    await insertQueueRow({
+    await insertCommandRow({
       commandId: `acked-old-${now}`,
       machineId: MACHINE_ID,
       sessionId: baseSession,
       status: "acked",
-      attempts: 1,
       createdAt: now - (2 * 60 * 60 * 1000),
       ackedAt: now - (90 * 60 * 1000),
-      nextRetryAt: now - 10_000,
     });
 
-    await insertQueueRow({
+    await insertCommandRow({
       commandId: `pending-stuck-${now}`,
       machineId: MACHINE_ID,
       sessionId: baseSession,
       status: "pending",
-      attempts: 2,
       createdAt: now - (2 * 24 * 60 * 60 * 1000),
-      nextRetryAt: now - 10_000,
     });
 
-    await insertQueueRow({
+    await insertCommandRow({
       commandId: `pending-fresh-${now}`,
       machineId: MACHINE_ID,
       sessionId: baseSession,
       status: "pending",
-      attempts: 0,
       createdAt: now - (10 * 60 * 1000),
-      nextRetryAt: now - 1_000,
     });
 
-    const id = env.ROUTER.idFromName("singleton");
-    const stub = env.ROUTER.get(id);
-    await runInDurableObject(stub, async (_instance, state) => {
-      await state.storage.setAlarm(Date.now());
-    });
-    await runDurableObjectAlarm(stub);
+    // Simulate scheduled cleanup (replaces DO alarm)
+    await cleanupCommands(env.DB, now);
 
     const rows = await queryQueueBySession(baseSession);
     const ids = rows.map((row) => row.command_id);
@@ -949,225 +929,55 @@ describe("command queue lifecycle", () => {
     expect(ids).toContain(`pending-fresh-${now}`);
   });
 
-  it("alarm retries stale sent commands by scheduling backoff when machine offline", async () => {
+  it("poll and ack lifecycle: daemon polls pending command, acks it, status becomes acked", async () => {
     const now = Date.now();
-    const sessionId = `retry-session-${now}`;
-    await registerSession(sessionId, MACHINE_ID);
+    // Use a unique machine ID to avoid picking up leftover rows from other tests
+    const uniqueMachineId = `poll-ack-machine-${now}`;
+    const sessionId = `poll-ack-session-${now}`;
+    const commandId = `poll-ack-cmd-${now}`;
+    await registerSession(sessionId, uniqueMachineId);
 
-    await insertQueueRow({
-      commandId: `sent-stale-${now}`,
-      machineId: MACHINE_ID,
-      sessionId,
-      status: "sent",
-      attempts: 1,
-      createdAt: now - (2 * 60 * 1000),
-      sentAt: now - (2 * 60 * 1000),
-      nextRetryAt: now - 5_000,
-    });
-
-    const id = env.ROUTER.idFromName("singleton");
-    const stub = env.ROUTER.get(id);
-    await runInDurableObject(stub, async (_instance, state) => {
-      await state.storage.setAlarm(Date.now());
-    });
-    await runDurableObjectAlarm(stub);
-
-    const rows = await queryQueueBySession(sessionId);
-    expect(rows.length).toBe(1);
-    expect(rows[0]?.status).toBe("sent");
-    expect(rows[0]?.next_retry_at).toBeGreaterThan(now);
-  });
-
-  it("alarm reschedules itself after completing successfully", async () => {
-    const id = env.ROUTER.idFromName("singleton");
-    const stub = env.ROUTER.get(id);
-
-    await runInDurableObject(stub, async (_instance, state) => {
-      await state.storage.setAlarm(Date.now());
-    });
-    await runDurableObjectAlarm(stub);
-
-    // Verify alarm rescheduled itself (proof it completed successfully)
-    const hasAlarm = await runInDurableObject(stub, async (_instance, state) => {
-      const alarm = await state.storage.getAlarm();
-      return alarm !== null;
-    });
-    expect(hasAlarm).toBe(true);
-  });
-});
-
-// ─── WebSocket Machine Agent: Integration ──────────────────────────────
-
-async function openMachineSocket(machineId: string, apiKey = API_KEY): Promise<WebSocket> {
-  const response = await SELF.fetch(`https://worker/ws?machineId=${encodeURIComponent(machineId)}`, {
-    headers: {
-      Upgrade: "websocket",
-      "Sec-WebSocket-Protocol": `ccr,${apiKey}`,
-    },
-  });
-
-  expect(response.status).toBe(101);
-  const socket = response.webSocket;
-  expect(socket).toBeDefined();
-
-  socket!.accept();
-  return socket!;
-}
-
-async function waitForWsMessage(socket: WebSocket): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timed out waiting for websocket message")), 2000);
-    socket.addEventListener("message", (event) => {
-      clearTimeout(timeout);
-      resolve(String(event.data));
-    }, { once: true });
-  });
-}
-
-describe("websocket machine agent", () => {
-  afterEach(() => {
-    fetchMock.deactivate();
-  });
-
-  it("rejects missing websocket protocol auth", async () => {
-    const response = await SELF.fetch("https://worker/ws?machineId=machine-a", {
-      headers: {
-        Upgrade: "websocket",
-      },
-    });
-
-    expect(response.status).toBe(401);
-    expect(await response.text()).toBe("Unauthorized");
-  });
-
-  it("rejects invalid machine id", async () => {
-    const response = await SELF.fetch("https://worker/ws?machineId=bad_machine_id", {
-      headers: {
-        Upgrade: "websocket",
-        "Sec-WebSocket-Protocol": `ccr,${API_KEY}`,
-      },
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.text()).toBe("Invalid machine ID");
-  });
-
-  it("responds to ping with pong", async () => {
-    const ws = await openMachineSocket(`machine-ping-${Date.now()}`);
-    await waitForWsMessage(ws); // drain boot message
-    ws.send(JSON.stringify({ type: "ping" }));
-
-    const message = await waitForWsMessage(ws);
-    expect(JSON.parse(message)).toEqual({ type: "pong" });
-
-    ws.close();
-  });
-
-  it("flushes pending queued commands to connected machine and handles ack", async () => {
-    const now = Date.now();
-    const machineId = `machine-flush-${now}`;
-    const sessionId = `session-flush-${now}`;
-    const commandId = `cmd-${now}`;
-
-    await registerSession(sessionId, machineId);
-    await insertQueueRow({
+    await insertCommandRow({
       commandId,
-      machineId,
+      machineId: uniqueMachineId,
       sessionId,
       status: "pending",
-      attempts: 0,
       createdAt: now - 1_000,
-      nextRetryAt: now - 1,
     });
 
-    const ws = await openMachineSocket(machineId);
-    await waitForWsMessage(ws); // drain boot message
-    const inbound = await waitForWsMessage(ws);
-    const commandMsg = JSON.parse(inbound) as {
-      type: string;
-      commandId: string;
-      sessionId: string;
-      command: string;
-      chatId: string;
-    };
-
-    expect(commandMsg.type).toBe("command");
-    expect(commandMsg.commandId).toBe(commandId);
-    expect(commandMsg.sessionId).toBe(sessionId);
-
-    ws.send(JSON.stringify({ type: "ack", commandId }));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    const queueRows = await queryQueueBySession(sessionId);
-    expect(queueRows.length).toBe(1);
-    expect(queueRows[0]?.status).toBe("acked");
-    expect(queueRows[0]?.acked_at).not.toBeNull();
-
-    ws.close();
-  });
-});
-
-// ─── WebSocket Hibernation ─────────────────────────────────────────────
-
-describe("websocket hibernation auto-response", () => {
-  it("sends boot message with bootId on WebSocket connect", async () => {
-    const machineId = `machine-boot-${Date.now()}`;
-    const ws = await openMachineSocket(machineId);
-
-    const message = await waitForWsMessage(ws);
-    const parsed = JSON.parse(message);
-
-    expect(parsed.type).toBe("boot");
-    expect(typeof parsed.bootId).toBe("string");
-    expect(parsed.bootId.length).toBe(8);
-
-    ws.close();
-  });
-
-  it("configures auto-response so pings are handled at the edge without waking the DO", async () => {
-    const id = env.ROUTER.idFromName("singleton");
-    const stub = env.ROUTER.get(id);
-
-    const autoResponse = await runInDurableObject(stub, async (_instance, state) => {
-      const ar = state.getWebSocketAutoResponse();
-      if (!ar) return null;
-      return { request: ar.request, response: ar.response };
+    // Poll the command
+    const pollReq = new Request(`https://worker/machines/${uniqueMachineId}/next`, {
+      headers: { Authorization: "Bearer test-api-key" },
     });
+    const pollRes = await SELF.fetch(pollReq);
+    expect(pollRes.status).toBe(200);
+    const pollBody = (await pollRes.json()) as { commandId: string };
+    expect(pollBody.commandId).toBe(commandId);
 
-    expect(autoResponse).not.toBeNull();
-    expect(autoResponse!.request).toBe('{"type":"ping"}');
-    expect(autoResponse!.response).toBe('{"type":"pong"}');
+    // Ack the command
+    const ackReq = new Request(`https://worker/commands/${pollBody.commandId}/ack`, {
+      method: "POST",
+      headers: { Authorization: "Bearer test-api-key" },
+    });
+    const ackRes = await SELF.fetch(ackReq);
+    expect(ackRes.status).toBe(200);
+
+    // Verify status is acked in D1
+    const row = await env.DB.prepare(
+      "SELECT status, acked_at FROM commands WHERE command_id = ?",
+    ).bind(commandId).first<{ status: string; acked_at: number | null }>();
+    expect(row!.status).toBe("acked");
+    expect(row!.acked_at).not.toBeNull();
   });
 
-  it("reciprocates close handshake with matching code and reason", async () => {
-    const machineId = `machine-close-${Date.now()}`;
-    const ws = await openMachineSocket(machineId);
+  it("scheduled cleanup runs without errors", async () => {
+    // Just verify cleanupCommands and cleanupSeenUpdates don't throw
+    const commandResult = await cleanupCommands(env.DB);
+    expect(typeof commandResult.ackedDeleted).toBe("number");
+    expect(typeof commandResult.stuckDeleted).toBe("number");
 
-    const closePromise = new Promise<CloseEvent>((resolve) => {
-      ws.addEventListener("close", (event) => resolve(event), { once: true });
-    });
-
-    ws.close(1000, "normal shutdown");
-
-    const event = await closePromise;
-    expect(event.code).toBe(1000);
-    // Reason may or may not round-trip depending on workerd behavior
-    if (event.reason) {
-      expect(event.reason).toBe("normal shutdown");
-    }
-  });
-
-  it("runs close handler without error when machineId is present", async () => {
-    const machineId = `machine-closelog-${Date.now()}`;
-    const ws = await openMachineSocket(machineId);
-
-    const closePromise = new Promise<void>((resolve) => {
-      ws.addEventListener("close", () => resolve(), { once: true });
-    });
-
-    ws.close(1001, "going away");
-    await closePromise;
-    // If we get here without error, the close handler ran successfully.
+    const seenResult = await cleanupSeenUpdates(env.DB);
+    expect(typeof seenResult).toBe("number");
   });
 });
 
@@ -1809,41 +1619,33 @@ describe("Telegram media webhook", () => {
     expect(lastRow?.media_json).not.toBeNull();
   });
 
-  it("media command includes media field in WebSocket message", async () => {
+  it("media command queued in D1 with media_json (poll-based delivery)", async () => {
     const now = Date.now();
-    const machineId = `media-ws-machine-${now}`;
-    const sessionId = `media-ws-session-${now}`;
+    const machineId = `media-poll-machine-${now}`;
+    const sessionId = `media-poll-session-${now}`;
     const notifMsgId = 2_000_501 + (now % 100);
 
     await registerSession(sessionId, machineId);
-    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-ws-token-${now}` });
+    await insertMessageMapping({ chatId: String(CHAT_ID_NUM), messageId: notifMsgId, sessionId, token: `media-poll-token-${now}` });
 
-    const ws = await openMachineSocket(machineId);
-    await waitForWsMessage(ws); // drain boot message
-
-    mockGetFile("photos/ws-test.jpg");
-    mockFileDownload("fake-photo-for-ws");
-
-    const messagePromise = waitForWsMessage(ws);
+    mockGetFile("photos/poll-test.jpg");
+    mockFileDownload("fake-photo-for-poll");
 
     const res = await sendWebhook(makeMediaReply(
       notifMsgId,
-      { photo: [{ file_id: "ws-photo-id", file_unique_id: "ws-photo-uid", width: 400, height: 400, file_size: 4096 }] },
+      { photo: [{ file_id: "poll-photo-id", file_unique_id: "poll-photo-uid", width: 400, height: 400, file_size: 4096 }] },
       "check this photo",
     ));
     expect(res.status).toBe(200);
 
-    const inbound = await messagePromise;
-    const msg = JSON.parse(inbound) as Record<string, unknown>;
-
-    expect(msg.type).toBe("command");
-    expect(msg.command).toBe("check this photo");
-    expect(msg.media).toBeDefined();
-    const media = msg.media as Record<string, unknown>;
-    expect(media.key).toMatch(/^inbound\/\d+-ws-photo-uid\/photo_ws-photo-uid\.jpg$/);
+    // Verify command was queued in D1 with media_json
+    const queueRows = await queryQueueBySession(sessionId);
+    const lastRow = queueRows[queueRows.length - 1];
+    expect(lastRow?.command).toBe("check this photo");
+    expect(lastRow?.media_json).not.toBeNull();
+    const media = JSON.parse(lastRow!.media_json!);
+    expect(media.key).toMatch(/^inbound\/\d+-poll-photo-uid\/photo_poll-photo-uid\.jpg$/);
     expect(media.mime).toBe("image/jpeg");
-
-    ws.close();
   });
 });
 

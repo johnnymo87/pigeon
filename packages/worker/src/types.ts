@@ -4,7 +4,6 @@
 declare global {
   interface Env {
     DB: D1Database;
-    ROUTER: DurableObjectNamespace;
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_WEBHOOK_SECRET: string;
     CCR_API_KEY: string;
@@ -13,5 +12,4 @@ declare global {
     MEDIA: R2Bucket;
   }
 }
-
 export {};
