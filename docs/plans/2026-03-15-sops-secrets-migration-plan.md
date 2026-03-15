@@ -2,9 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Migrate five pigeon secrets from 1Password to sops, eliminating the 1Password runtime dependency.
+**Goal:** Migrate three pigeon daemon secrets from 1Password to sops, eliminating the 1Password runtime dependency.
 
-**Architecture:** Add the five pigeon secrets (CCR_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_WEBHOOK_PATH_SECRET) to each machine's sops YAML file. Update NixOS/home-manager configs to declare them as sops.secrets and read them from /run/secrets/ in the daemon ExecStart script. Remove the 1Password op run wrapper, op_service_account_token, and .env.1password.
+**Architecture:** Add the three daemon secrets (CCR_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) to each machine's sops YAML file. Update NixOS/home-manager configs to declare them as sops.secrets, add sops-nix.service dependency, and read them from /run/secrets/ in the daemon ExecStart script. Remove the 1Password op run wrapper and .env.1password. TELEGRAM_WEBHOOK_SECRET and TELEGRAM_WEBHOOK_PATH_SECRET are worker-only (Cloudflare secrets) and not part of this migration.
+
+**Status:** Chromebook is already done (branch `chromebook-pigeon-sops`). Remaining: devbox, cloudbox, macOS, pigeon repo cleanup.
 
 **Tech Stack:** sops, age, NixOS (sops-nix module), home-manager, bash
 
@@ -24,27 +26,23 @@ cd ~/projects/workstation
 SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops secrets/devbox.yaml
 ```
 
-This opens the file in your editor with decrypted values. Add these five keys (after the existing `ccr_worker_url` entry):
+This opens the file in your editor with decrypted values. Add these three keys (after the existing `ccr_worker_url` entry):
 
 ```yaml
 ccr_api_key: <your CCR API key>
 telegram_bot_token: <your Telegram bot token>
 telegram_chat_id: <your Telegram chat ID>
-telegram_webhook_secret: <your Telegram webhook secret>
-telegram_webhook_path_secret: <your Telegram webhook path secret>
 ```
-
-Remove the `op_service_account_token` entry.
 
 Save and close -- sops re-encrypts automatically.
 
 **Step 2: Verify the secrets were added**
 
 ```bash
-SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops -d secrets/devbox.yaml | grep -E "ccr_api_key|telegram_bot_token|telegram_chat_id|telegram_webhook_secret|telegram_webhook_path_secret"
+SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops -d secrets/devbox.yaml | grep -E "ccr_api_key|telegram_bot_token|telegram_chat_id"
 ```
 
-Expected: all five secrets appear with correct plaintext values.
+Expected: all three secrets appear with correct plaintext values.
 
 ---
 
@@ -59,23 +57,13 @@ The cloudbox sops file is encrypted with the cloudbox age key, not devbox. You c
 
 Alternative: Since the secrets are the same across machines, and the `.sops.yaml` creation rules already specify which age key encrypts each file, you can add the plaintext values by editing on the appropriate machine.
 
-If you have a way to edit cloudbox.yaml from devbox (e.g., shared key), add the same five keys and remove `op_service_account_token`. Otherwise, this task must be done on cloudbox.
+If you have a way to edit cloudbox.yaml from devbox (e.g., shared key), add the same three keys. Otherwise, this task must be done on cloudbox.
 
 ---
 
 ### Task 3: Add secrets to chromebook sops YAML
 
-**Files:**
-- Modify: `~/projects/workstation/secrets/chromebook.yaml`
-
-Same as Task 2 but for chromebook. The chromebook.yaml is encrypted with both devbox and chromebook keys, so it CAN be edited from devbox:
-
-```bash
-cd ~/projects/workstation
-SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops secrets/chromebook.yaml
-```
-
-Add the same five keys, remove `op_service_account_token`. Save and close.
+**DONE** -- completed on branch `chromebook-pigeon-sops`.
 
 ---
 
@@ -84,11 +72,12 @@ Add the same five keys, remove `op_service_account_token`. Save and close.
 **Files:**
 - Modify: `~/projects/workstation/hosts/devbox/configuration.nix`
 
-**Step 1: Add five new sops.secrets entries**
+**Step 1: Add three new sops.secrets entries**
 
 In the `sops.secrets` block (after `ccr_worker_url` at line ~85-89), add:
 
 ```nix
+      # Pigeon daemon secrets (replaces op run)
       ccr_api_key = {
         owner = "dev";
         group = "dev";
@@ -104,33 +93,16 @@ In the `sops.secrets` block (after `ccr_worker_url` at line ~85-89), add:
         group = "dev";
         mode = "0400";
       };
-      telegram_webhook_secret = {
-        owner = "dev";
-        group = "dev";
-        mode = "0400";
-      };
-      telegram_webhook_path_secret = {
-        owner = "dev";
-        group = "dev";
-        mode = "0400";
-      };
 ```
 
-**Step 2: Remove op_service_account_token declaration**
+**Step 2: Add sops-nix.service dependency and rewrite pigeon-daemon ExecStart**
 
-Delete lines 33-38:
+Add `"sops-nix.service"` to `after` and `requires` so secrets are decrypted before the daemon starts. Replace the ExecStart script (lines 190-197):
+
 ```nix
-      # 1Password service account token (bootstrap for CCR and other app secrets)
-      op_service_account_token = {
-        owner = "dev";
-        group = "dev";
-        mode = "0400";
-      };
+    after = [ "network-online.target" "sops-nix.service" "cloudflared-tunnel.service" ];
+    requires = [ "sops-nix.service" "cloudflared-tunnel.service" ];
 ```
-
-**Step 3: Rewrite pigeon-daemon ExecStart**
-
-Replace the ExecStart script (lines 190-197) with:
 
 ```nix
       ExecStart = "${pkgs.writeShellScript "pigeon-daemon-start" ''
@@ -139,14 +111,12 @@ Replace the ExecStart script (lines 190-197) with:
         export CCR_API_KEY="$(cat /run/secrets/ccr_api_key)"
         export TELEGRAM_BOT_TOKEN="$(cat /run/secrets/telegram_bot_token)"
         export TELEGRAM_CHAT_ID="$(cat /run/secrets/telegram_chat_id)"
-        export TELEGRAM_WEBHOOK_SECRET="$(cat /run/secrets/telegram_webhook_secret)"
-        export TELEGRAM_WEBHOOK_PATH_SECRET="$(cat /run/secrets/telegram_webhook_path_secret)"
         export OPENCODE_URL="http://127.0.0.1:4096"
         exec ${pkgs.nodejs}/bin/node /home/dev/projects/pigeon/node_modules/tsx/dist/cli.mjs /home/dev/projects/pigeon/packages/daemon/src/index.ts
       ''}";
 ```
 
-Note: `${pkgs._1password-cli}` is no longer referenced. If `allowUnfree` (line 5-6) was only needed for `_1password-cli`, update the comment. Keep `allowUnfree = true` if other unfree packages may be needed later, or remove if no other unfree packages are used.
+Note: `${pkgs._1password-cli}` is no longer referenced. If `allowUnfree` (line 5-6) was only needed for `_1password-cli`, update the comment.
 
 **Step 4: Commit**
 
@@ -163,10 +133,10 @@ git commit -m "devbox: migrate pigeon secrets from 1Password to sops"
 **Files:**
 - Modify: `~/projects/workstation/hosts/cloudbox/configuration.nix`
 
-Apply the same three changes as Task 4:
+Apply the same changes as Task 4:
 
-1. Add five `sops.secrets` entries (after existing `ccr_worker_url` declaration, around line ~100)
-2. Remove `op_service_account_token` (lines 42-47)
+1. Add three `sops.secrets` entries (after existing `ccr_worker_url` declaration, around line ~100)
+2. Add `sops-nix.service` to `after` and `requires`
 3. Rewrite `pigeon-daemon` ExecStart (lines 254-261) -- same pattern as devbox but with `CCR_MACHINE_ID=cloudbox` already in Environment
 
 ```bash
@@ -179,57 +149,7 @@ git commit -m "cloudbox: migrate pigeon secrets from 1Password to sops"
 
 ### Task 6: Update chromebook home-manager config
 
-**Files:**
-- Modify: `~/projects/workstation/users/dev/home.crostini.nix`
-
-**Step 1: Add sops.secrets entries**
-
-In the `sops.secrets` block (lines 23-28), add the five new entries. For home-manager sops, the syntax is simpler:
-
-```nix
-      ccr_api_key = {};
-      telegram_bot_token = {};
-      telegram_chat_id = {};
-      telegram_webhook_secret = {};
-      telegram_webhook_path_secret = {};
-```
-
-Remove:
-```nix
-      op_service_account_token = {};
-```
-
-**Step 2: Rewrite pigeon-daemon ExecStart**
-
-Replace lines 97-107 with:
-
-```nix
-      ExecStart = "${pkgs.writeShellScript "pigeon-daemon-start" ''
-        set -euo pipefail
-        export CCR_WORKER_URL="$(cat ${config.sops.secrets.ccr_worker_url.path})"
-        export CCR_API_KEY="$(cat ${config.sops.secrets.ccr_api_key.path})"
-        export TELEGRAM_BOT_TOKEN="$(cat ${config.sops.secrets.telegram_bot_token.path})"
-        export TELEGRAM_CHAT_ID="$(cat ${config.sops.secrets.telegram_chat_id.path})"
-        export TELEGRAM_WEBHOOK_SECRET="$(cat ${config.sops.secrets.telegram_webhook_secret.path})"
-        export TELEGRAM_WEBHOOK_PATH_SECRET="$(cat ${config.sops.secrets.telegram_webhook_path_secret.path})"
-        export OPENCODE_URL="http://127.0.0.1:4096"
-        exec ${pkgs.nodejs}/bin/node \
-          ${config.home.homeDirectory}/projects/pigeon/node_modules/tsx/dist/cli.mjs \
-          ${config.home.homeDirectory}/projects/pigeon/packages/daemon/src/index.ts
-      ''}";
-```
-
-**Step 3: Remove _1password-cli from home.packages**
-
-Remove `pkgs._1password-cli` from line 15 (unless it's used for other purposes on chromebook).
-
-**Step 4: Commit**
-
-```bash
-cd ~/projects/workstation
-git add users/dev/home.crostini.nix
-git commit -m "chromebook: migrate pigeon secrets from 1Password to sops"
-```
+**DONE** -- completed on branch `chromebook-pigeon-sops`.
 
 ---
 
@@ -254,8 +174,6 @@ Replace the script (lines 72-99) so it no longer uses `op read`. Instead, accept
           "pigeon-ccr-api-key"
           "pigeon-telegram-bot-token"
           "pigeon-telegram-chat-id"
-          "pigeon-telegram-webhook-secret"
-          "pigeon-telegram-webhook-path-secret"
         )
 
         for name in "''${secrets[@]}"; do
@@ -314,7 +232,7 @@ Replace the entire file content with:
   dotenv.enable = true;
 
   scripts.dev-daemon.exec = ''
-    for f in ccr_worker_url ccr_api_key telegram_bot_token telegram_chat_id telegram_webhook_secret telegram_webhook_path_secret; do
+    for f in ccr_worker_url ccr_api_key telegram_bot_token telegram_chat_id; do
       upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
       export "$upper"="$(cat /run/secrets/$f)"
     done
@@ -410,7 +328,7 @@ git commit -m "Update skill docs: replace 1Password references with sops /run/se
 
 **Step 1: Update managing-secrets/SKILL.md**
 
-Remove `op_service_account_token` from the secret inventory table. Add the five new pigeon secrets.
+Remove `op_service_account_token` from the secret inventory table. Add the three new pigeon daemon secrets.
 
 **Step 2: Update setting-up-cloudbox/SKILL.md**
 
@@ -426,24 +344,13 @@ git commit -m "Update skill docs: remove 1Password references for pigeon"
 
 ---
 
-### Task 11: Remove op_service_account_token from sops YAML files
+### Task 11: (Follow-up) Migrate webhook secrets and remove op_service_account_token
 
-**Files:**
-- Modify: `~/projects/workstation/secrets/devbox.yaml`
-- Modify: `~/projects/workstation/secrets/cloudbox.yaml`
-- Modify: `~/projects/workstation/secrets/chromebook.yaml`
+**Not part of this migration.** Once all machines are converted:
 
-This was partially covered in Tasks 1-3. Verify the key is removed from all three files:
-
-```bash
-cd ~/projects/workstation
-SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops -d secrets/devbox.yaml | grep op_service_account
-SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops -d secrets/chromebook.yaml | grep op_service_account
-```
-
-Expected: no output (key removed).
-
-For cloudbox.yaml, verify on cloudbox or after adding cross-machine edit capability.
+1. Add `telegram_webhook_secret` and `telegram_webhook_path_secret` to sops (used by parity harness and deployment verification scripts)
+2. Remove `op_service_account_token` from all sops YAML files and NixOS/HM configs (no remaining consumers)
+3. Remove `.env.1password` references from parity/deployment skill docs
 
 ---
 
@@ -459,10 +366,10 @@ sudo nixos-rebuild switch --flake .#devbox
 **Step 2: Verify secrets exist in /run/secrets/**
 
 ```bash
-ls -la /run/secrets/ccr_api_key /run/secrets/telegram_bot_token /run/secrets/telegram_chat_id /run/secrets/telegram_webhook_secret /run/secrets/telegram_webhook_path_secret
+ls -la /run/secrets/ccr_api_key /run/secrets/telegram_bot_token /run/secrets/telegram_chat_id
 ```
 
-Expected: all five files present, owned by dev, mode 0400.
+Expected: all three files present, owned by dev, mode 0400.
 
 **Step 3: Restart pigeon daemon**
 
@@ -506,7 +413,7 @@ home-manager switch --flake .#dev@macbook
 pigeon-setup-secrets
 ```
 
-Enter the five secret values when prompted.
+Enter the three secret values when prompted.
 
 **Step 3: Restart pigeon daemon**
 
