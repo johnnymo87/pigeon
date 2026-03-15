@@ -1,6 +1,6 @@
 ---
 name: secrets-and-auth
-description: Use when configuring or troubleshooting secrets, 1Password injection, and auth boundaries across daemon, worker, and Telegram
+description: Use when configuring or troubleshooting secrets, sops injection, and auth boundaries across daemon, worker, and Telegram
 ---
 
 # Secrets And Auth
@@ -11,9 +11,7 @@ Use this for secret setup, auth failures, or token rotation.
 
 ## Secret Model
 
-- 1Password is source-of-truth for app secrets.
-- Devbox bootstrap secret is `/run/secrets/op_service_account_token`.
-- Use `op run --env-file=/home/dev/projects/pigeon/.env.1password -- ...` for runtime injection.
+- sops-nix is source-of-truth for daemon secrets. They are decrypted to `/run/secrets/` at boot.
 
 ## Core Secrets
 
@@ -33,14 +31,13 @@ Use this for secret setup, auth failures, or token rotation.
 ## Quick Checks
 
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c 'echo ${CCR_API_KEY:+ok}'
-op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
+cat /run/secrets/ccr_api_key >/dev/null && echo ok
+curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 ## Verify
 
 Expected:
 
-- key injection works in non-interactive shell
+- secret file is readable
 - authenticated worker request returns `200`

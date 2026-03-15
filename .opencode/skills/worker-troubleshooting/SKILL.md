@@ -25,12 +25,9 @@ curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
 Authenticated endpoint check:
 
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c '
-  curl -s -o /tmp/sessions.json -w "%{http_code}" \
-    -H "Authorization: Bearer $CCR_API_KEY" \
-    "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
-'
+curl -s -o /tmp/sessions.json -w "%{http_code}" \
+  -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" \
+  "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 Expected: HTTP `200`.
@@ -38,8 +35,8 @@ Expected: HTTP `200`.
 ## Common Failures
 
 - `401` on `/sessions` or `/notifications/send`
-  - Wrong/missing `CCR_API_KEY`
-  - Check `.env.1password` mapping in `~/projects/pigeon`
+    - Wrong/missing `CCR_API_KEY`
+    - Check `/run/secrets/` files exist and are readable
 - `401 Unauthorized` on webhook route
   - `X-Telegram-Bot-Api-Secret-Token` mismatch
 - Notification send fails

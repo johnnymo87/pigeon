@@ -72,28 +72,23 @@ Expected: `ok`
 
 ## Secret-driven Auth Checks
 
-Use 1Password injection instead of storing `CCR_API_KEY` in shell history:
-
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c '
-  curl -s -H "Authorization: Bearer $CCR_API_KEY" \
-    "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
-'
+curl -s -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" \
+  "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 ## Telegram Webhook Check
 
+> **Note:** `TELEGRAM_WEBHOOK_SECRET` is a worker-only Cloudflare secret, not in sops.
+> Set it manually: `export TELEGRAM_WEBHOOK_SECRET="<value>"` before running.
+
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c '
-  curl -s -o /tmp/webhook-auth-check.txt -w "%{http_code}" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -H "X-Telegram-Bot-Api-Secret-Token: $TELEGRAM_WEBHOOK_SECRET" \
-    "https://ccr-router.jonathan-mohrbacher.workers.dev/webhook/telegram/parity" \
-    --data "{\"update_id\":999999001}"
-'
+curl -s -o /tmp/webhook-auth-check.txt -w "%{http_code}" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: $TELEGRAM_WEBHOOK_SECRET" \
+  "https://ccr-router.jonathan-mohrbacher.workers.dev/webhook/telegram/parity" \
+  --data '{"update_id":999999001}'
 ```
 
 Expected: HTTP `200`.
@@ -104,8 +99,7 @@ Run these in order:
 
 ```bash
 curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/deploy_sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
+curl -s -o /tmp/deploy_sessions.json -w "%{http_code}" -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 Expected:

@@ -30,16 +30,13 @@ curl -s http://127.0.0.1:4096/global/health
 ## Secret Checks
 
 ```bash
-test -r /run/secrets/op_service_account_token && echo ok
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c 'echo ${CCR_API_KEY:+ok}'
+cat /run/secrets/ccr_api_key >/dev/null && echo ok
 ```
 
 ## Worker Connectivity Check
 
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c 'curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $CCR_API_KEY" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"'
+curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 ## Verify

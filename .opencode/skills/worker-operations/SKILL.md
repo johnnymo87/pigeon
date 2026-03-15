@@ -30,12 +30,9 @@ Expected: `ok`
 Authenticated check:
 
 ```bash
-cd ~/projects/pigeon
-op run --env-file=.env.1password -- sh -c '
-  curl -s -o /tmp/worker_sessions.json -w "%{http_code}" \
-    -H "Authorization: Bearer $CCR_API_KEY" \
-    "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
-'
+curl -s -o /tmp/worker_sessions.json -w "%{http_code}" \
+  -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" \
+  "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 Expected: HTTP `200`
@@ -92,7 +89,7 @@ Then:
 
 - Do not rotate secrets during active incidents unless confirmed compromised.
 - Keep DO class compatibility (`RouterDO`) intact across deploys.
-- Prefer `op run --env-file=.env.1password` for secret injection over manual exports.
+- Prefer reading secrets from `/run/secrets/` files over manual exports or shell history.
 
 ## Verify
 

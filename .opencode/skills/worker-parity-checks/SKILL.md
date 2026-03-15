@@ -9,17 +9,21 @@ description: Use when validating deployed worker parity with authenticated check
 
 Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity.
 
-Run from `~/projects/pigeon` so `op run --env-file=.env.1password` can inject secrets.
+## Prerequisites
+
+Daemon secrets (`CCR_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) are in sops at `/run/secrets/`.
+`TELEGRAM_WEBHOOK_SECRET` is a worker-only Cloudflare secret, not in sops. Set it manually before running webhook checks:
+```bash
+export TELEGRAM_WEBHOOK_SECRET="<value>"
+```
 
 ## Baseline
 
 ```bash
-op run --env-file=.env.1password -- sh -c '
-  BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
-  curl -s "$BASE/health"
-  curl -s -o /tmp/parity_sessions.json -w "%{http_code}" \
-    -H "Authorization: Bearer $CCR_API_KEY" "$BASE/sessions"
-'
+BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
+curl -s "$BASE/health"
+curl -s -o /tmp/parity_sessions.json -w "%{http_code}" \
+  -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "$BASE/sessions"
 ```
 
 ## Endpoint Auth/Validation
@@ -42,10 +46,9 @@ Verify unauthorized behavior:
 ## Example Script
 
 ```bash
-op run --env-file=.env.1password -- bash -lc '
 set -euo pipefail
 BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
-AUTH="Authorization: Bearer ${CCR_API_KEY}"
+AUTH="Authorization: Bearer $(cat /run/secrets/ccr_api_key)"
 CHAT_ID="8248645256"
 SID="parity-$(date +%s)"
 
@@ -71,7 +74,6 @@ curl -s -X POST -H "Content-Type: application/json" \
 curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
   "$BASE/sessions/unregister" \
   --data "{\"sessionId\":\"$SID\"}"
-'
 ```
 
 ## Pass Criteria
@@ -91,9 +93,8 @@ Test: send a notification with `replyMarkup` containing `cmd:MY_TOKEN:q0` in a b
 ### Upload + Download Round-Trip
 
 ```bash
-op run --env-file=.env.1password -- bash -lc '
 BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
-AUTH="Authorization: Bearer ${CCR_API_KEY}"
+AUTH="Authorization: Bearer $(cat /run/secrets/ccr_api_key)"
 KEY="parity/test-$(date +%s)/hello.txt"
 
 # Upload
@@ -106,7 +107,6 @@ cat /tmp/parity_upload.json
 # Download
 curl -s -o /tmp/parity-download.txt -H "$AUTH" "$BASE/media/$KEY"
 cat /tmp/parity-download.txt
-'
 ```
 
 Expected: upload returns `{ ok: true, key: "parity/..." }`, download returns the original content.
@@ -125,10 +125,8 @@ For OpenCode sessions using the direct command channel (`backend_kind: "opencode
 use the daemon parity harness with `PARITY_MODE=direct`:
 
 ```bash
-op run --env-file=.env.1password -- bash -lc '
-  cd ~/projects/pigeon/packages/daemon
-  PARITY_MODE=direct npm run parity:harness
-'
+cd ~/projects/pigeon/packages/daemon
+PARITY_MODE=direct npm run parity:harness
 ```
 
 This variant:

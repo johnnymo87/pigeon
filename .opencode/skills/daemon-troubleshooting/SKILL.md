@@ -29,7 +29,7 @@ curl -s http://127.0.0.1:4731/health
 - service up but no worker flow
   - missing/invalid `CCR_API_KEY`, `CCR_WORKER_URL`, or `CCR_MACHINE_ID`
 - stop notifications not sent
-  - notifier configuration missing or 1Password env injection failure
+    - notifier configuration missing or sops secret decryption failure
 - reply commands not injected
   - no WS command delivery or invalid transport metadata
 - repeated command processing

@@ -111,7 +111,7 @@ Health check URLs are listed in the Quickstart section above.
 ### Cross-Cutting
 
 - [secrets-and-auth](.opencode/skills/secrets-and-auth/SKILL.md)
-  - Use for 1Password/sops secret flow, token sources, and auth boundaries.
+  - Use for sops secret flow, token sources, and auth boundaries.
 - [machine-setup-devbox](.opencode/skills/machine-setup-devbox/SKILL.md)
   - Use when onboarding or repairing devbox/macOS machine configuration.
 - [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md)
