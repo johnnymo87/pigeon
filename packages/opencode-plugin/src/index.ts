@@ -10,6 +10,17 @@ import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { SessionManager } from "./session-state"
 import { errorMessage, serializeError } from "./utils"
+import { appendFileSync } from "fs"
+
+// File-based diagnostic log -- bypasses OpenCode's SDK log stream entirely.
+// Remove after debugging question notification issue.
+const DIAG_LOG_PATH = "/tmp/pigeon-plugin-diag.log"
+const diagLog = (tag: string, data?: unknown): void => {
+  try {
+    const line = `${new Date().toISOString()} [${tag}] ${data ? JSON.stringify(data) : ""}\n`
+    appendFileSync(DIAG_LOG_PATH, line)
+  } catch {}
+}
 
 const plugin: Plugin = async (ctx) => {
   try {
@@ -243,6 +254,17 @@ const plugin: Plugin = async (ctx) => {
         const eventType = event.type as string
         const props = event.properties as Record<string, unknown> | undefined
 
+        // DIAG: Log all question-related events entering the handler
+        if (eventType.startsWith("question")) {
+          diagLog("question-event-received", {
+            eventType,
+            propsKeys: props ? Object.keys(props) : null,
+            sessionID: props?.sessionID,
+            id: props?.id,
+            questionsLen: Array.isArray(props?.questions) ? (props.questions as unknown[]).length : undefined,
+          })
+        }
+
         if (eventType === "session.created") {
           const sessionInfo = props?.info as
             | { id?: string; title?: string; parentID?: string }
@@ -306,14 +328,15 @@ const plugin: Plugin = async (ctx) => {
              // Set dedup guard SYNCHRONOUSLY before async notifyStop
              sessionManager.setNotified(sessionID, currentMsgId!)
 
-              const summary = messageTail.getSummary(sessionID) || "Task completed"
-              const files = messageTail.getFiles(sessionID)
-              log("sending notifyStop", { sessionID, summary: summary.slice(0, 100) })
-              notifyStop({
-                sessionId: sessionID,
-                message: summary,
-                label,
-                media: files.length > 0 ? files : undefined,
+               const summary = messageTail.getSummary(sessionID) || "Task completed"
+               const files = messageTail.getFiles(sessionID)
+               log("sending notifyStop", { sessionID, summary: summary.slice(0, 100) })
+               diagLog("stop-source:session.idle", { sessionID, summary: summary.slice(0, 80) })
+               notifyStop({
+                 sessionId: sessionID,
+                 message: summary,
+                 label,
+                 media: files.length > 0 ? files : undefined,
                 daemonUrl,
                 log,
               }).catch((err) => {
@@ -429,49 +452,58 @@ const plugin: Plugin = async (ctx) => {
           const requestId = questionProps?.id
           const questions = questionProps?.questions
 
-          if (!sessionID || !requestId || !questions || questions.length === 0) return
-
-          // Only notify for main sessions that are registered
-          await lateDiscoverSession(sessionID)
-          await sessionManager.awaitRegistration(sessionID)
-
-          if (
-            !sessionManager.isMainSession(sessionID) ||
-            !sessionManager.isRegistered(sessionID)
-          ) return
-
-           log("question.asked", { sessionID, requestId, questionCount: questions.length })
-
-           // Flush any unnotified assistant text as a stop notification before
-           // sending the question. Without this, text output in the same turn as
-           // a question tool call is never sent to Telegram (no session.idle fires).
-           const currentMsgId = messageTail.getCurrentMessageId(sessionID)
-           if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
-             sessionManager.setNotified(sessionID, currentMsgId!)
-             const summary = messageTail.getSummary(sessionID)
-             if (summary) {
-               const files = messageTail.getFiles(sessionID)
-               await notifyStop({
-                 sessionId: sessionID,
-                 message: summary,
-                 label,
-                 media: files.length > 0 ? files : undefined,
-                 daemonUrl,
-                 log,
-               })
-             }
+           if (!sessionID || !requestId || !questions || questions.length === 0) {
+             diagLog("question-guard-rejected", { sessionID, requestId, questionsLen: questions?.length })
+             return
            }
 
-           notifyQuestionAsked({
-            sessionId: sessionID,
-            requestId,
-            questions,
+           // Only notify for main sessions that are registered
+           await lateDiscoverSession(sessionID)
+           await sessionManager.awaitRegistration(sessionID)
+
+           const isMain = sessionManager.isMainSession(sessionID)
+           const isReg = sessionManager.isRegistered(sessionID)
+           diagLog("question-session-check", { sessionID, isMain, isReg })
+
+           if (!isMain || !isReg) return
+
+            log("question.asked", { sessionID, requestId, questionCount: questions.length })
+
+            // Flush any unnotified assistant text as a stop notification before
+            // sending the question. Without this, text output in the same turn as
+            // a question tool call is never sent to Telegram (no session.idle fires).
+            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
+            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
+              sessionManager.setNotified(sessionID, currentMsgId!)
+              const summary = messageTail.getSummary(sessionID)
+              if (summary) {
+                const files = messageTail.getFiles(sessionID)
+                diagLog("stop-source:flush-before-question", { sessionID })
+                await notifyStop({
+                  sessionId: sessionID,
+                  message: summary,
+                  label,
+                  media: files.length > 0 ? files : undefined,
+                  daemonUrl,
+                  log,
+                })
+              }
+            }
+
+            diagLog("about-to-notifyQuestion", { sessionID, requestId })
+            notifyQuestionAsked({
+             sessionId: sessionID,
+             requestId,
+             questions,
             label,
             daemonUrl,
             log,
-          }).catch((err) => {
-            log("notifyQuestionAsked error:", serializeError(err))
-          })
+           }).then((result) => {
+             diagLog("notifyQuestion-result", { sessionID, requestId, result })
+           }).catch((err) => {
+             diagLog("notifyQuestion-error", { sessionID, requestId, error: err instanceof Error ? { message: err.message, name: err.name } : String(err) })
+             log("notifyQuestionAsked error:", serializeError(err))
+           })
 
           return
         }
