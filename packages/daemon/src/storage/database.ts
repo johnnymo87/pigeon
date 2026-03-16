@@ -9,6 +9,7 @@ import {
   SessionRepository,
   SessionTokenRepository,
 } from "./repos";
+import { OutboxRepository } from "./outbox-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -17,6 +18,7 @@ export interface StorageDb {
   replyTokens: ReplyTokenRepository;
   inbox: InboxRepository;
   pendingQuestions: PendingQuestionRepository;
+  outbox: OutboxRepository;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -35,5 +37,6 @@ export function openStorageDb(path: string): StorageDb {
     replyTokens: new ReplyTokenRepository(db),
     inbox: new InboxRepository(db),
     pendingQuestions: new PendingQuestionRepository(db),
+    outbox: new OutboxRepository(db),
   };
 }
