@@ -42,13 +42,16 @@ const d1SchemaStatements = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sessions_machine ON sessions(machine_id)`,
   `CREATE TABLE IF NOT EXISTS messages (
-    chat_id       TEXT NOT NULL,
-    message_id    INTEGER NOT NULL,
-    session_id    TEXT NOT NULL,
-    token         TEXT NOT NULL,
-    created_at    INTEGER NOT NULL,
+    chat_id         TEXT NOT NULL,
+    message_id      INTEGER NOT NULL,
+    session_id      TEXT NOT NULL,
+    token           TEXT NOT NULL,
+    notification_id TEXT,
+    created_at      INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_notification_id
+    ON messages(notification_id) WHERE notification_id IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS seen_updates (
     update_id     INTEGER PRIMARY KEY,
     created_at    INTEGER NOT NULL
@@ -1969,13 +1972,16 @@ describe("d1-ops", () => {
       updated_at    INTEGER NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS messages (
-      chat_id       TEXT NOT NULL,
-      message_id    INTEGER NOT NULL,
-      session_id    TEXT NOT NULL,
-      token         TEXT NOT NULL,
-      created_at    INTEGER NOT NULL,
+      chat_id         TEXT NOT NULL,
+      message_id      INTEGER NOT NULL,
+      session_id      TEXT NOT NULL,
+      token           TEXT NOT NULL,
+      notification_id TEXT,
+      created_at      INTEGER NOT NULL,
       PRIMARY KEY (chat_id, message_id)
     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_notification_id
+      ON messages(notification_id) WHERE notification_id IS NOT NULL`,
     `CREATE TABLE IF NOT EXISTS seen_updates (
       update_id     INTEGER PRIMARY KEY,
       created_at    INTEGER NOT NULL
