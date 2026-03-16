@@ -27,13 +27,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 -- Messages: Telegram reply routing (replaces DO messages)
 CREATE TABLE IF NOT EXISTS messages (
-  chat_id       TEXT NOT NULL,
-  message_id    INTEGER NOT NULL,
-  session_id    TEXT NOT NULL,
-  token         TEXT NOT NULL,
-  created_at    INTEGER NOT NULL,
+  chat_id         TEXT NOT NULL,
+  message_id      INTEGER NOT NULL,
+  session_id      TEXT NOT NULL,
+  token           TEXT NOT NULL,
+  notification_id TEXT,
+  created_at      INTEGER NOT NULL,
   PRIMARY KEY (chat_id, message_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_notification_id
+  ON messages(notification_id) WHERE notification_id IS NOT NULL;
 
 -- Seen updates: Telegram deduplication (replaces DO seen_updates)
 CREATE TABLE IF NOT EXISTS seen_updates (

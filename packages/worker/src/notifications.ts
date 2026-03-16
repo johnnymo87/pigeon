@@ -6,6 +6,7 @@ interface SendNotificationBody {
   text: string;
   replyMarkup?: unknown;
   media?: Array<{ key: string; mime: string; filename: string }>;
+  notificationId?: string;
 }
 
 interface SessionRow {
@@ -21,6 +22,7 @@ interface MessageRow {
   message_id: number;
   session_id: string;
   token: string;
+  notification_id: string | null;
   created_at: number;
 }
 
@@ -168,6 +170,7 @@ export async function handleSendNotification(
 
   const body = (await request.json()) as SendNotificationBody;
   const { sessionId, chatId, text, replyMarkup, media } = body;
+  const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
 
   // Validate required fields
   if (!sessionId || !chatId || !text) {
@@ -186,6 +189,18 @@ export async function handleSendNotification(
   // Check chat ID allowlist
   if (!isAllowedChatId(chatId, env)) {
     return json({ error: "Chat ID not allowed" }, 403);
+  }
+
+  // Idempotency: if notificationId was provided and we already sent this notification,
+  // return the existing message data without calling Telegram again.
+  if (notificationId) {
+    const existing = await db
+      .prepare("SELECT * FROM messages WHERE notification_id = ?")
+      .bind(notificationId)
+      .first<MessageRow>();
+    if (existing) {
+      return json({ ok: true, messageId: existing.message_id, deduplicated: true });
+    }
   }
 
   // Touch session to prevent cleanup
@@ -234,9 +249,9 @@ export async function handleSendNotification(
   // Store message→session mapping for reply routing
   await db
     .prepare(
-      "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
-    .bind(String(chatId), messageId, sessionId, token, Date.now())
+    .bind(String(chatId), messageId, sessionId, token, notificationId, Date.now())
     .run();
 
   // Send media as replies to the text message
@@ -256,9 +271,9 @@ export async function handleSendNotification(
         if (mediaResult.ok && mediaResult.result) {
           await db
             .prepare(
-              "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, ?, ?)",
+              "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             )
-            .bind(String(chatId), mediaResult.result.message_id, sessionId, token, Date.now())
+            .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
             .run();
         }
       } catch {
