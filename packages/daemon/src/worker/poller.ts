@@ -206,6 +206,7 @@ export class Poller {
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
     media?: Array<{ key: string; mime: string; filename: string }>,
+    notificationId?: string,
   ): Promise<{ ok: boolean }> {
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
@@ -220,6 +221,7 @@ export class Poller {
           text,
           replyMarkup,
           ...(media && media.length > 0 ? { media } : {}),
+          ...(notificationId ? { notificationId } : {}),
         }),
       });
       return await response.json() as { ok: boolean };

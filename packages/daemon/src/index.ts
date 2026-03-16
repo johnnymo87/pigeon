@@ -8,7 +8,9 @@ import {
 import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
+import { OUTBOX_RETENTION_MS } from "./storage/schema";
 import { Poller } from "./worker/poller";
+import { OutboxSender } from "./worker/outbox-sender";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
@@ -89,6 +91,27 @@ if (poller) {
   poller.start();
 }
 
+const outboxSender = poller && config.telegramChatId
+  ? new OutboxSender({
+      storage,
+      sendNotification: (sessionId, chatId, text, replyMarkup, media, notificationId) =>
+        poller.sendNotification(sessionId, chatId, text, replyMarkup as { inline_keyboard?: unknown[] }, media as Array<{ key: string; mime: string; filename: string }> | undefined, notificationId),
+      chatId: config.telegramChatId,
+      log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
+    })
+  : undefined;
+
+if (outboxSender) {
+  outboxSender.start(5_000);
+}
+
+// Cleanup terminal outbox entries every hour
+setInterval(() => {
+  const cutoff = Date.now() - OUTBOX_RETENTION_MS;
+  const cleaned = storage.outbox.cleanupOlderThan(cutoff);
+  if (cleaned > 0) console.log(`[outbox] cleaned ${cleaned} old entries`);
+}, 60 * 60 * 1000);
+
 const workerNotifier = poller && config.telegramChatId
   ? new WorkerNotificationService(storage, poller, config.telegramChatId, Date.now, config.machineId)
   : undefined;
@@ -103,6 +126,8 @@ const notifier = workerNotifier && telegramNotifier
 
 const server = startServer(config, createApp(storage, {
   notifier,
+  chatId: config.telegramChatId,
+  machineId: config.machineId,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
       await poller.registerSession(sessionId, label ?? undefined);
