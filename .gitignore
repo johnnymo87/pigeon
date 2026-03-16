@@ -11,3 +11,6 @@ packages/daemon/data/
 .devenv/
 .devenv.flake.nix
 devenv.local.yaml
+
+# Git worktrees
+.worktrees/
