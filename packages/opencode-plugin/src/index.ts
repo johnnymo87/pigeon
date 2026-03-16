@@ -4,7 +4,8 @@ import {
   ResultErrorCode,
   type ExecuteCommandEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
-import { registerSession, notifyStop, notifyQuestionAsked, notifyQuestionAnswered } from "./daemon-client"
+import { registerSession, notifyStop, notifyQuestionAnswered, sendQuestionAsked } from "./daemon-client"
+import { QuestionDeliveryQueue } from "./question-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
@@ -45,6 +46,23 @@ const plugin: Plugin = async (ctx) => {
     const daemonUrl =
       process.env.PIGEON_DAEMON_URL ??
       `http://127.0.0.1:${process.env.TELEGRAM_WEBHOOK_PORT ?? "4731"}`
+
+    const questionQueue = new QuestionDeliveryQueue({
+      log,
+      onExpired: (sessionId, requestId) => {
+        log("WARN: question delivery permanently failed", { sessionId, requestId })
+      },
+    })
+    questionQueue.start((entry) =>
+      sendQuestionAsked({
+        sessionId: entry.sessionId,
+        requestId: entry.requestId,
+        questions: entry.questions,
+        label: entry.label,
+        daemonUrl,
+        log,
+      })
+    )
 
     const directChannel = await startDirectChannelServer({
       async onExecute(request: ExecuteCommandEnvelope) {
@@ -442,36 +460,35 @@ const plugin: Plugin = async (ctx) => {
 
            log("question.asked", { sessionID, requestId, questionCount: questions.length })
 
-           // Flush any unnotified assistant text as a stop notification before
-           // sending the question. Without this, text output in the same turn as
-           // a question tool call is never sent to Telegram (no session.idle fires).
+           // Enqueue question delivery FIRST — this bypasses the circuit breaker
+           // and retries automatically until the daemon accepts.
+           questionQueue.enqueue({
+             sessionId: sessionID,
+             requestId,
+             questions,
+             label,
+           })
+
+           // Flush any unnotified assistant text as a stop notification.
+           // Fire-and-forget: stop flush failure must NOT block question delivery.
            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
              sessionManager.setNotified(sessionID, currentMsgId!)
              const summary = messageTail.getSummary(sessionID)
              if (summary) {
                const files = messageTail.getFiles(sessionID)
-               await notifyStop({
+               notifyStop({
                  sessionId: sessionID,
                  message: summary,
                  label,
                  media: files.length > 0 ? files : undefined,
                  daemonUrl,
                  log,
+               }).catch((err) => {
+                 log("stop flush before question failed (non-blocking):", serializeError(err))
                })
              }
            }
-
-           notifyQuestionAsked({
-            sessionId: sessionID,
-            requestId,
-            questions,
-            label,
-            daemonUrl,
-            log,
-          }).catch((err) => {
-            log("notifyQuestionAsked error:", serializeError(err))
-          })
 
           return
         }
