@@ -60,6 +60,8 @@ The session ID is included in the Telegram confirmation message.
 
 Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name. Each notification includes the session ID on its own line for easy copy-paste.
 
+**Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout. The daemon accepts the question durably (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers the notification to Telegram every 5s, retrying with backoff on failure. The worker deduplicates notifications by `notificationId` so retries are safe.
+
 ### Media Relay
 
 Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:

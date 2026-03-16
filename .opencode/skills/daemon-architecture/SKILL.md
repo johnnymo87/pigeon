@@ -24,7 +24,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `POST /sessions/enable-notify`
 - `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`
 - `POST /stop`
-- `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question + sends Telegram notification with inline option buttons
+- `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question
 - `POST /cleanup`
 
@@ -35,6 +35,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
 - `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint.
+- `outbox`: durable notification delivery queue. Keyed by `notification_id`, state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour.
 
 ## Worker Integration: HTTP Polling
 
@@ -121,16 +122,22 @@ Both are dispatched by the Poller's `onLaunch` and `onKill` callbacks. Acking is
 ### Question Flow
 
 1. AI calls the `question` tool in OpenCode.
-2. Plugin receives `question.asked` event, POSTs to daemon `/question-asked`.
-3. Daemon stores pending question in `pending_questions` table and sends Telegram notification with inline option buttons.
-4. User taps a button (`cmd:TOKEN:q0`) or swipe-replies with custom text.
-5. Telegram webhook hits worker, which resolves session and queues command in D1.
-6. Daemon polls, receives command. Command-ingest detects a pending question for the session:
-   - Button press (`q0`, `q1`, ...): translates index to the original option label.
-   - Custom text: uses the raw text as the answer.
-7. Daemon delivers the answer to the plugin via `DirectChannelAdapter.deliverQuestionReply()`.
-8. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
-9. If the user already answered locally, stale button presses return "This question has already been answered."
+2. Plugin receives `question.asked` event, enqueues in-memory retry queue (bypasses circuit breaker), calls `sendQuestionAsked` with 3s timeout.
+3. Plugin POSTs to daemon `/question-asked` with `session_id`, `request_id`, `questions`.
+4. Daemon generates stable `notification_id = q:{sessionId}:{requestId}`.
+5. Daemon stores pending question, mints session token, creates outbox row (all in one SQLite operation).
+6. Daemon returns 202 `{ok: true, deliveryState: "accepted", notificationId}` immediately.
+7. Background OutboxSender (5s interval) reads queued entries, sends via worker's `/notifications/send` with `notificationId` for idempotency.
+8. On success: marks `sent`. On failure: retries with backoff (5s, 10s, 30s, 60s, 120s). Terminal failure after 10 attempts or 15 minutes.
+9. Worker deduplicates by `notificationId` -- if already delivered, returns `{ok: true, deduplicated: true}` without calling Telegram again.
+10. User taps a button (`cmd:TOKEN:q0`) or swipe-replies with custom text.
+11. Telegram webhook hits worker, which resolves session and queues command in D1.
+12. Daemon polls, receives command. Command-ingest detects a pending question for the session:
+    - Button press (`q0`, `q1`, ...): translates index to the original option label.
+    - Custom text: uses the raw text as the answer.
+13. Daemon delivers the answer to the plugin via `DirectChannelAdapter.deliverQuestionReply()`.
+14. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
+15. If the user already answered locally, stale button presses return "This question has already been answered."
 
 ## Future Improvement: Long Polling
 

@@ -68,7 +68,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 
 - `commands`: command delivery queue with lease-based polling (pending/leased/done lifecycle)
 - `sessions`: session-to-machine registry
-- `messages`: Telegram message mapping for reply routing
+- `messages`: Telegram message mapping for reply routing. Includes `notification_id TEXT` (nullable, unique index where not null) for idempotent notification delivery -- if a `notificationId` is provided on `/notifications/send` and already exists in this table, the request is deduplicated without calling Telegram again.
 - `seen_updates`: Telegram update deduplication
 - `machines`: daemon last-poll-at tracking for online detection
 
@@ -80,7 +80,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `GET /sessions` (Bearer) -> JSON list of session rows
 - `POST /sessions/register` (Bearer) -> upsert session
 - `POST /sessions/unregister` (Bearer) -> remove session
-- `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies
+- `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
 - `GET /media/<key>` (Bearer) -> download file from R2
 - `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks

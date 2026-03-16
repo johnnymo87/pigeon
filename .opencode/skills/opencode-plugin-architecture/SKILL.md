@@ -20,7 +20,7 @@ Use this before changing plugin event handling or daemon payload contracts.
 2. Plugin registers main sessions with daemon (`/session-start`).
 3. Message updates feed summary extraction.
 4. Idle/stop events send final notification payload to daemon (`/stop`).
-5. `question.asked` events send question details to daemon (`/question-asked`).
+5. `question.asked` events enqueue question in in-memory retry queue (bypasses circuit breaker) → `sendQuestionAsked` with 3s timeout → daemon `/question-asked`.
 6. `question.replied` / `question.rejected` events notify daemon the question is resolved (`/question-answered`).
 
 ## Important Behavior
@@ -28,7 +28,17 @@ Use this before changing plugin event handling or daemon payload contracts.
 - head-first message capture for summary fidelity
 - dedup to avoid repeated notifications
 - environment detection for local transport metadata (tty)
-- circuit-breaker around daemon HTTP calls
+- circuit-breaker around daemon HTTP calls (does NOT apply to question delivery)
+
+## Question Delivery (Reliability Design)
+
+Question notifications use a dedicated path that bypasses the circuit breaker to avoid question delivery being blocked by unrelated daemon HTTP failures:
+
+- **QuestionDeliveryQueue**: in-memory retry queue initialized at plugin startup. When `question.asked` fires, the question is enqueued immediately (synchronous) and delivered asynchronously with retries.
+- **`sendQuestionAsked`**: calls daemon `/question-asked` with a 3s timeout. Does not affect circuit breaker state -- success or failure is recorded only in the retry queue.
+- **Decoupled stop flush**: before enqueuing the question, any pending stop notification is fire-and-forgot (not awaited). This prevents a slow stop flush from delaying question delivery.
+- **Backward-compatible response**: the daemon returns `{ok: true, deliveryState: "accepted", notificationId}` (HTTP 202). The plugin handles both this format and the legacy `{notified: true}` (HTTP 200) shape.
+- **`notifyQuestionAsked` from daemon-client is no longer used for question events.** It remains available but the plugin routes question delivery through `sendQuestionAsked` instead.
 
 ## Question Reply (Direct Channel)
 
@@ -70,7 +80,7 @@ When the daemon delivers an execute command with a `media` field (from a Telegra
 
 - `/session-start` payload includes session/process/transport context.
 - `/stop` payload includes event + summary/message, label context, and optional `media: Array<{ mime, filename, url }>` (data URIs from captured files).
-- `/question-asked` payload includes `session_id`, `request_id`, `questions[]` (with `question`, `header`, `options[]`, `custom?`, `multiple?`), and `label`.
+- `/question-asked` payload includes `session_id`, `request_id`, `questions[]` (with `question`, `header`, `options[]`, `custom?`, `multiple?`), and `label`. Response: HTTP 202 `{ok: true, deliveryState: "accepted", notificationId}`. Daemon stores durably in SQLite outbox and returns immediately; background OutboxSender delivers to Telegram.
 - `/question-answered` payload includes `session_id`.
 
 ## Verify
