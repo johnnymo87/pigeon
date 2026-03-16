@@ -314,14 +314,13 @@ describe("createApp", () => {
     expect(await stop.json()).toEqual({ ok: true, notified: false, error: "telegram down" });
   });
 
-  it("POST /question-asked stores pending question and notifies", async () => {
-    const questionNotifier: StopNotifier & QuestionNotifier = {
-      sendStopNotification: vi.fn(async () => ({ token: "t" })),
-      sendQuestionNotification: vi.fn(async () => ({ token: "qtok-1" })),
-    };
-
+  it("POST /question-asked stores pending question and returns 202 accepted (durable)", async () => {
     storage = openStorageDb(":memory:");
-    const app = createApp(storage, { nowFn: () => 50_000, notifier: questionNotifier });
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -346,12 +345,103 @@ describe("createApp", () => {
       }),
     }));
 
+    expect(response.status).toBe(202);
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.ok).toBe(true);
+    expect(json.deliveryState).toBe("accepted");
+    expect(typeof json.notificationId).toBe("string");
+    expect(json.notificationId).toBe("q:sess-q:question_abc");
+
+    // Outbox row should be created
+    const outboxRow = storage!.outbox.getByNotificationId("q:sess-q:question_abc");
+    expect(outboxRow).toBeTruthy();
+    expect(outboxRow?.kind).toBe("question");
+    expect(outboxRow?.state).toBe("queued");
+    expect(outboxRow?.sessionId).toBe("sess-q");
+    expect(outboxRow?.requestId).toBe("question_abc");
+
+    // Pending question should be stored
+    const pq = storage!.pendingQuestions.getBySessionId("sess-q", 50_001);
+    expect(pq).toBeTruthy();
+    expect(pq?.requestId).toBe("question_abc");
+
+    // Session token should be minted
+    const token = outboxRow?.token;
+    expect(token).toBeTruthy();
+  });
+
+  it("POST /question-asked returns 202 queued on idempotent retry", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-q2", notify: true }),
+    }));
+
+    const body = JSON.stringify({
+      session_id: "sess-q2",
+      request_id: "question_dup",
+      questions: [{ question: "Retry?", header: "H", options: [] }],
+    });
+
+    // First call
+    const first = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+    expect(first.status).toBe(202);
+    const firstJson = await first.json() as Record<string, unknown>;
+    expect(firstJson.deliveryState).toBe("accepted");
+
+    // Second call with same session_id + request_id
+    const second = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+    expect(second.status).toBe(202);
+    const secondJson = await second.json() as Record<string, unknown>;
+    expect(secondJson.ok).toBe(true);
+    expect(secondJson.deliveryState).toBe("queued");
+    expect(secondJson.notificationId).toBe("q:sess-q2:question_dup");
+
+    // Only one outbox row should exist
+    const outboxRow = storage!.outbox.getByNotificationId("q:sess-q2:question_dup");
+    expect(outboxRow).toBeTruthy();
+  });
+
+  it("POST /question-asked returns notified=false when notify=false", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-nonotify", notify: false }),
+    }));
+
+    const response = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-nonotify",
+        request_id: "question_nn",
+        questions: [{ question: "Skip?", header: "H", options: [] }],
+      }),
+    }));
+
     expect(response.status).toBe(200);
     const json = await response.json() as Record<string, unknown>;
     expect(json.ok).toBe(true);
-    expect(json.notified).toBe(true);
-    expect(json.token).toBe("qtok-1");
-    expect(questionNotifier.sendQuestionNotification).toHaveBeenCalledTimes(1);
+    expect(json.notified).toBe(false);
+    expect(json.reason).toBe("notify=false");
   });
 
   it("POST /question-asked returns 400 for missing fields", async () => {

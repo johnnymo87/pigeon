@@ -1,5 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
+import { generateToken, formatQuestionNotification } from "./notification-service";
 import type { QuestionInfoData } from "./storage/types";
 
 interface LegacySession {
@@ -76,6 +77,8 @@ interface AppOptions {
   notifier?: StopNotifier & Partial<QuestionNotifier>;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
+  chatId?: string;
+  machineId?: string;
 }
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
@@ -83,6 +86,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
   const notifier = options.notifier;
   const onSessionStart = options.onSessionStart;
   const onSessionDelete = options.onSessionDelete;
+  const opts = options;
 
   return async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -274,29 +278,68 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ ok: true, notified: false, reason: "notify=false" });
         }
 
-        if (!notifier || !("sendQuestionNotification" in notifier) || typeof notifier.sendQuestionNotification !== "function") {
-          return Response.json({ ok: true, notified: false, reason: "no question notification handler" });
-        }
-
         const label = typeof body.label === "string" ? body.label : null;
+        const now = nowFn();
 
-        try {
-          const result = await notifier.sendQuestionNotification({
-            session: {
-              sessionId: session.sessionId,
-              label: session.label,
-              cwd: session.cwd,
-            },
-            questionRequestId: requestId,
-            questions,
-            label: label || session.label || undefined,
-          });
+        // Generate stable notification ID for idempotency
+        const notificationId = `q:${sessionId}:${requestId}`;
 
-          return Response.json({ ok: true, notified: true, ...result });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          return Response.json({ ok: true, notified: false, error: errorMessage });
+        // Check if already in outbox (idempotent)
+        const existing = storage.outbox.getByNotificationId(notificationId);
+        if (existing) {
+          return Response.json(
+            { ok: true, deliveryState: existing.state === "sent" ? "sent" : "queued", notificationId },
+            { status: existing.state === "sent" ? 200 : 202 },
+          );
         }
+
+        // Generate token for Telegram inline buttons
+        const token = generateToken();
+
+        // Store pending question
+        storage.pendingQuestions.store({
+          sessionId,
+          requestId,
+          questions,
+          token,
+        }, now);
+
+        // Mint session token
+        storage.sessionTokens.mint({
+          token,
+          sessionId,
+          chatId: opts.chatId ?? "",
+          context: { type: "question", questionRequestId: requestId },
+        }, now);
+
+        // Format the notification payload for the outbox
+        const notification = formatQuestionNotification({
+          label: label || session.label || sessionId.slice(0, 8),
+          questions,
+          cwd: session.cwd,
+          token,
+          machineId: opts.machineId,
+          sessionId,
+        });
+
+        // Store in outbox — background sender will deliver to Telegram
+        storage.outbox.upsert({
+          notificationId,
+          sessionId,
+          requestId,
+          kind: "question",
+          payload: JSON.stringify({
+            text: notification.text,
+            replyMarkup: notification.replyMarkup,
+            notificationId,
+          }),
+          token,
+        }, now);
+
+        return Response.json(
+          { ok: true, deliveryState: "accepted", notificationId },
+          { status: 202 },
+        );
       }
 
       if (request.method === "POST" && url.pathname === "/question-answered") {

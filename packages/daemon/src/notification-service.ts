@@ -177,7 +177,7 @@ export function formatQuestionNotification(input: {
   };
 }
 
-function generateToken(): string {
+export function generateToken(): string {
   return randomBytes(16).toString("base64url");
 }
 
