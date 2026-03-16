@@ -30,7 +30,7 @@ curl -s http://127.0.0.1:4096/global/health
 ## Secret Checks
 
 ```bash
-cat /run/secrets/ccr_api_key >/dev/null && echo ok
+test -r /run/secrets/ccr_api_key && echo ok
 ```
 
 ## Worker Connectivity Check

@@ -35,8 +35,8 @@ Expected: HTTP `200`.
 ## Common Failures
 
 - `401` on `/sessions` or `/notifications/send`
-    - Wrong/missing `CCR_API_KEY`
-    - Check `/run/secrets/` files exist and are readable
+    - Wrong/missing CCR_API_KEY
+    - Check /run/secrets/ccr_api_key exists and is readable
 - `401 Unauthorized` on webhook route
   - `X-Telegram-Bot-Api-Secret-Token` mismatch
 - Notification send fails

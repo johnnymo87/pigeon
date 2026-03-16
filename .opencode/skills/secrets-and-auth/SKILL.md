@@ -11,7 +11,7 @@ Use this for secret setup, auth failures, or token rotation.
 
 ## Secret Model
 
-- sops-nix is source-of-truth for daemon secrets. They are decrypted to `/run/secrets/` at boot.
+- sops-nix is source-of-truth for Linux machines. macOS uses Keychain. They are decrypted to `/run/secrets/` at boot on Linux.
 
 ## Core Secrets
 
@@ -31,8 +31,8 @@ Use this for secret setup, auth failures, or token rotation.
 ## Quick Checks
 
 ```bash
-cat /run/secrets/ccr_api_key >/dev/null && echo ok
-curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
+cat /run/secrets/ccr_api_key | head -c5 && echo "...ok"
+curl -s -o /tmp/sessions.json -w "%{http_code}" -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
 ## Verify
