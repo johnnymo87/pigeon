@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from "vitest"
 import * as http from "node:http"
-import { registerSession, notifyStop, notifyQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
+import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
 
@@ -584,6 +584,108 @@ describe("daemon-client", () => {
       // then - only question sent
       expect(requestLog).toHaveLength(1)
       expect(requestLog[0].path).toBe("/question-asked")
+    })
+  })
+
+  describe("sendQuestionAsked (no circuit breaker)", () => {
+    test("sends question even when breaker is open", async () => {
+      // given - trip the breaker by failing against an unreachable port
+      const unreachableOpts = {
+        sessionId: "trip-breaker",
+        message: "done",
+        label: "test",
+        daemonUrl: "http://127.0.0.1:1", // unreachable
+        log: mockLog,
+      }
+      await notifyStop(unreachableOpts) // trips the breaker
+      requestLog = []
+
+      // verify breaker is open: a normal notifyStop should be blocked
+      const blockedResult = await notifyStop({ ...unreachableOpts, daemonUrl: `http://127.0.0.1:${serverPort}` })
+      expect(blockedResult).toBeNull()
+      expect(requestLog).toHaveLength(0) // breaker blocked the request
+
+      // when - sendQuestionAsked bypasses the breaker
+      const result = await sendQuestionAsked({
+        sessionId: "sess-direct",
+        requestId: "req-direct",
+        questions: [{ question: "Bypass?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+
+      // then - still sent successfully, bypassing the open breaker
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/question-asked")
+    })
+
+    test("uses 3s timeout instead of 1s", async () => {
+      // given - slow server that takes 2s to respond (would fail with 1s timeout)
+      server?.close()
+      server = await createTestServer(async (req) => {
+        await sleep(2000) // 2s delay - more than 1s but less than 3s
+        return Response.json({ ok: true, notified: true })
+      })
+      serverPort = server.port
+
+      // when - sendQuestionAsked should succeed because it has 3s timeout
+      const result = await sendQuestionAsked({
+        sessionId: "sess-slow",
+        requestId: "req-slow",
+        questions: [{ question: "Slow?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+
+      // then - succeeds despite 2s delay (3s timeout allows it)
+      expect(result).toEqual({ ok: true, notified: true })
+    }, 10000)
+
+    test("throws on failure instead of returning null", async () => {
+      // given - unreachable server
+      // when - sendQuestionAsked against unreachable port should throw
+      await expect(
+        sendQuestionAsked({
+          sessionId: "sess-fail",
+          requestId: "req-fail",
+          questions: [{ question: "Fail?", header: "Check", options: [], custom: true }],
+          label: "test",
+          daemonUrl: "http://127.0.0.1:1", // unreachable
+          log: mockLog,
+        })
+      ).rejects.toThrow()
+    })
+
+    test("does not affect breaker state on failure", async () => {
+      // given - reset breaker (it's clean)
+      _resetBreakerForTesting()
+
+      // when - sendQuestionAsked fails against unreachable port
+      await expect(
+        sendQuestionAsked({
+          sessionId: "sess-no-breaker",
+          requestId: "req-no-breaker",
+          questions: [{ question: "Fail?", header: "Check", options: [], custom: true }],
+          label: "test",
+          daemonUrl: "http://127.0.0.1:1", // unreachable
+          log: mockLog,
+        })
+      ).rejects.toThrow()
+
+      // then - breaker should still be closed (notifyStop should work normally)
+      requestLog = []
+      const result = await notifyStop({
+        sessionId: "sess-check",
+        message: "done",
+        label: "test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1) // request went through - breaker is still closed
     })
   })
 })

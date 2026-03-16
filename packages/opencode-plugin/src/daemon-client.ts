@@ -58,7 +58,7 @@ type NotifyQuestionAnsweredOpts = {
   log: LogFn
 }
 
-type DaemonResult = { ok: boolean; notified?: boolean } | null
+type DaemonResult = { ok: boolean; deliveryState?: string; notified?: boolean } | null
 
 const BreakerState = { Closed: 0, Open: 1, HalfOpen: 2 } as const
 type BreakerState = (typeof BreakerState)[keyof typeof BreakerState]
@@ -237,6 +237,31 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
     opts.log("notifyQuestionAnswered failed:", err instanceof Error ? { message: err.message } : String(err))
     return null
   }
+}
+
+export async function sendQuestionAsked(opts: NotifyQuestionAskedOpts): Promise<DaemonResult> {
+  const url = getDaemonUrl(opts.daemonUrl)
+
+  const res = await fetch(`${url}/question-asked`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: opts.sessionId,
+      request_id: opts.requestId,
+      questions: opts.questions,
+      label: opts.label,
+    }),
+    signal: AbortSignal.timeout(3000),
+  })
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    opts.log("daemon returned error for question-asked (direct)", { status: res.status, body: text })
+    throw new Error(`daemon error: ${res.status}`)
+  }
+
+  const data = (await res.json()) as { ok: boolean; deliveryState?: string; notified?: boolean }
+  return data
 }
 
 export function _resetBreakerForTesting(): void {
