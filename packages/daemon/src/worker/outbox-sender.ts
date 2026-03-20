@@ -105,16 +105,17 @@ export class OutboxSender {
         }
 
         // Parse payload
-        let text: string;
+        let texts: string[];
         let replyMarkup: unknown;
         let notificationId: string | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
-            text: string;
+            text?: string;
+            texts?: string[];
             replyMarkup: unknown;
             notificationId?: string;
           };
-          text = parsed.text;
+          texts = parsed.texts ?? (parsed.text ? [parsed.text] : []);
           replyMarkup = parsed.replyMarkup;
           notificationId = parsed.notificationId;
         } catch (err) {
@@ -126,31 +127,45 @@ export class OutboxSender {
           continue;
         }
 
-        // Attempt delivery
-        try {
-          const result = await this.sendNotification(
-            entry.sessionId,
-            this.chatId,
-            text,
-            replyMarkup,
-            undefined,
-            notificationId,
-          );
+        if (texts.length === 0) {
+          this.storage.outbox.markFailed(entry.notificationId, now);
+          continue;
+        }
 
-          if (result.ok) {
+        // Attempt delivery — send each chunk
+        try {
+          let allOk = true;
+          for (let i = 0; i < texts.length; i++) {
+            const isLast = i === texts.length - 1;
+            const result = await this.sendNotification(
+              entry.sessionId,
+              this.chatId,
+              texts[i]!,
+              isLast ? replyMarkup : { inline_keyboard: [] },
+              undefined,
+              isLast ? notificationId : undefined,
+            );
+
+            if (!result.ok) {
+              allOk = false;
+              const backoff = getBackoff(entry.attempts);
+              this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+              this.log("outbox entry delivery failed, scheduling retry", {
+                notificationId: entry.notificationId,
+                sessionId: entry.sessionId,
+                attempts: entry.attempts + 1,
+                nextRetryIn: backoff,
+              });
+              break;
+            }
+          }
+
+          if (allOk) {
             this.storage.outbox.markSent(entry.notificationId, now);
             this.log("outbox entry sent", {
               notificationId: entry.notificationId,
               sessionId: entry.sessionId,
-            });
-          } else {
-            const backoff = getBackoff(entry.attempts);
-            this.storage.outbox.markRetry(entry.notificationId, now, backoff);
-            this.log("outbox entry delivery failed, scheduling retry", {
-              notificationId: entry.notificationId,
-              sessionId: entry.sessionId,
-              attempts: entry.attempts + 1,
-              nextRetryIn: backoff,
+              chunks: texts.length,
             });
           }
         } catch (err) {

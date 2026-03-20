@@ -187,6 +187,43 @@ describe("OutboxSender.processOnce()", () => {
     expect(sendNotification).toHaveBeenCalledTimes(5);
   });
 
+  it("sends multiple messages for payload with texts array", async () => {
+    // Upsert an outbox entry with texts array
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      payload: JSON.stringify({
+        texts: ["Message 1", "Message 2", "Message 3"],
+        replyMarkup: { inline_keyboard: [[{ text: "OK", callback_data: "cmd:tok:q0" }]] },
+        notificationId: "notif-1",
+      }),
+    }, 1_000);
+
+    const sendFn = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: sendFn,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(3);
+    const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
+    // First two calls have empty replyMarkup
+    expect((calls[0] as any)[3]).toEqual({ inline_keyboard: [] });
+    expect((calls[1] as any)[3]).toEqual({ inline_keyboard: [] });
+    // Last call has the real replyMarkup
+    expect((calls[2] as any)[3]).toEqual({ inline_keyboard: [[{ text: "OK", callback_data: "cmd:tok:q0" }]] });
+    // Text content
+    expect((calls[0] as any)[2]).toBe("Message 1");
+    expect((calls[1] as any)[2]).toBe("Message 2");
+    expect((calls[2] as any)[2]).toBe("Message 3");
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record?.state).toBe("sent");
+  });
+
   it("does not call sendNotification when chatId is not configured", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
