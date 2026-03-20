@@ -336,7 +336,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       chatId: this.chatId,
       context: {
         event: input.event,
-        summary: input.summary,
+        summary: input.summary.slice(0, 200),
       },
     }, now);
 
