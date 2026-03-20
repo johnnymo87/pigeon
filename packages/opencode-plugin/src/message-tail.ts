@@ -1,8 +1,5 @@
 import type { Message, Part } from "@opencode-ai/sdk"
 
-const MAX_TEXT_BYTES = 4096
-const SUMMARY_MAX_CHARS = 3800
-
 export function stripMarkdown(text: string): string {
   let stripped = text
 
@@ -108,18 +105,10 @@ export class MessageTail {
     if (tail.currentMessageId !== part.messageID) return
 
     if (delta !== undefined) {
-      if (tail.text.length < MAX_TEXT_BYTES) {
-        tail.text += delta
-        if (tail.text.length > MAX_TEXT_BYTES) {
-          tail.text = tail.text.slice(0, MAX_TEXT_BYTES)
-        }
-      }
+      tail.text += delta
     } else {
       const textPart = part as PartInfo & { text?: string }
       tail.text = textPart.text ?? ""
-      if (tail.text.length > MAX_TEXT_BYTES) {
-        tail.text = tail.text.slice(0, MAX_TEXT_BYTES)
-      }
     }
   }
 
@@ -129,9 +118,7 @@ export class MessageTail {
 
     const text = stripMarkdown(tail.text)
     if (!text) return ""
-    if (text.length <= SUMMARY_MAX_CHARS) return text
-
-    return text.slice(0, SUMMARY_MAX_CHARS)
+    return text
   }
 
   getCurrentMessageId(sessionID: string): string | undefined {

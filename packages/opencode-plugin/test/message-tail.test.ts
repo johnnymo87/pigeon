@@ -2,7 +2,6 @@ import { describe, expect, test, beforeEach } from "vitest"
 import { MessageTail } from "../src/message-tail"
 import * as messageTailModule from "../src/message-tail"
 
-const EXPECTED_SUMMARY_MAX_CHARS = 3800
 const stripMarkdown = (messageTailModule as Record<string, unknown>).stripMarkdown as
   | ((value: string) => string)
   | undefined
@@ -364,7 +363,7 @@ describe("MessageTail", () => {
       expect(tail.getSummary("session-1")).toBe(shortText)
     })
 
-    test("should return first N chars when text exceeds limit", () => {
+    test("should return full text regardless of length", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -384,28 +383,8 @@ describe("MessageTail", () => {
 
       const summary = tail.getSummary("session-1")
       expect(summary).toContain("START")
-      expect(summary).not.toContain("END")
-    })
-
-    test("should never exceed SUMMARY_MAX_CHARS", () => {
-      tail.onMessageUpdated({
-        id: "msg-1",
-        sessionID: "session-1",
-        role: "assistant",
-      })
-
-      tail.onPartUpdated(
-        {
-          id: "part-1",
-          sessionID: "session-1",
-          messageID: "msg-1",
-          type: "text",
-        },
-        "x".repeat(10000)
-      )
-
-      const summary = tail.getSummary("session-1")
-      expect(summary.length).toBeLessThanOrEqual(EXPECTED_SUMMARY_MAX_CHARS)
+      expect(summary).toContain("END")
+      expect(summary.length).toBe(longText.length)
     })
 
     test("should trim whitespace", () => {
@@ -443,8 +422,8 @@ describe("MessageTail", () => {
     })
   })
 
-  describe("4KB cap and truncation", () => {
-    test("should cap text at 4096 bytes", () => {
+  describe("no artificial cap on text length", () => {
+    test("should accumulate text beyond 4096 bytes", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -465,10 +444,10 @@ describe("MessageTail", () => {
       }
 
       const summary = tail.getSummary("session-1")
-      expect(summary.length).toBeLessThanOrEqual(4096)
+      expect(summary.length).toBe(10000)
     })
 
-    test("should preserve head content when exceeding 4KB", () => {
+    test("should preserve all content including tail", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -508,8 +487,7 @@ describe("MessageTail", () => {
 
       const summary = tail.getSummary("session-1")
       expect(summary).toContain("START")
-      expect(summary).not.toContain("END")
-      expect(summary.length).toBeLessThanOrEqual(4096)
+      expect(summary).toContain("END")
     })
   })
 
