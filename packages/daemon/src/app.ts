@@ -274,6 +274,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "Session not found" }, { status: 404 });
         }
 
+        storage.sessions.touch(sessionId, nowFn());
+
         if (!session.notify) {
           return Response.json({ ok: true, notified: false, reason: "notify=false" });
         }

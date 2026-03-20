@@ -469,6 +469,39 @@ describe("createApp", () => {
     expect(noQuestions.status).toBe(400);
   });
 
+  it("touches session last_seen on /question-asked", async () => {
+    let now = 100_000;
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => now,
+      chatId: "42",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-q-touch", notify: true }),
+    }));
+
+    const sessionBefore = storage.sessions.get("sess-q-touch");
+    expect(sessionBefore!.lastSeen).toBe(100_000);
+
+    now = 200_000;
+
+    await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q-touch",
+        request_id: "req-1",
+        questions: [{ type: "text", question: "Continue?", options: [] }],
+      }),
+    }));
+
+    const sessionAfter = storage.sessions.get("sess-q-touch");
+    expect(sessionAfter!.lastSeen).toBe(200_000);
+  });
+
   it("POST /question-answered clears pending question", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });
