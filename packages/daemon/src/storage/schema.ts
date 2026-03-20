@@ -1,6 +1,6 @@
 import type BetterSqlite3 from "better-sqlite3";
 
-export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const REPLY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const INBOX_DONE_RETENTION_MS = 60 * 60 * 1000;

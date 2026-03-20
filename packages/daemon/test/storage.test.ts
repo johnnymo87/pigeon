@@ -34,7 +34,8 @@ describe("storage schema and repositories", () => {
     expect(touched?.lastSeen).toBe(2_000);
 
     expect(storage.sessions.cleanupExpired(2_000)).toBe(0);
-    expect(storage.sessions.cleanupExpired(2_000 + 24 * 60 * 60 * 1000 + 1)).toBe(1);
+    expect(storage.sessions.cleanupExpired(2_000 + 24 * 60 * 60 * 1000 + 1)).toBe(0);
+    expect(storage.sessions.cleanupExpired(2_000 + 7 * 24 * 60 * 60 * 1000 + 1)).toBe(1);
     expect(storage.sessions.get("sess-1")).toBeNull();
 
     storage.db.close();
