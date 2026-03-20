@@ -147,6 +147,22 @@ describe("storage schema and repositories", () => {
     storage.db.close();
   });
 
+  it("lists stale sessions by last_seen cutoff", () => {
+    const storage = createStorage();
+
+    storage.sessions.upsert({ sessionId: "fresh", notify: true }, 10_000);
+    storage.sessions.upsert({ sessionId: "stale", notify: true }, 1_000);
+
+    const stale = storage.sessions.listStale(5_000);
+    expect(stale).toHaveLength(1);
+    expect(stale[0]?.sessionId).toBe("stale");
+
+    const none = storage.sessions.listStale(500);
+    expect(none).toHaveLength(0);
+
+    storage.db.close();
+  });
+
   it("replaces pending question for same session on re-store", () => {
     const storage = createStorage();
 

@@ -150,6 +150,13 @@ export class SessionRepository {
     return rows.map(asSession);
   }
 
+  listStale(cutoff: number): SessionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM sessions WHERE last_seen < ?")
+      .all(cutoff) as SqlRow[];
+    return rows.map(asSession);
+  }
+
   touch(sessionId: string, now = Date.now(), ttlMs = SESSION_TTL_MS): boolean {
     const result = this.db
       .prepare("UPDATE sessions SET updated_at = ?, last_seen = ?, expires_at = ? WHERE session_id = ?")
