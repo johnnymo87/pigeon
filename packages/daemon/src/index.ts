@@ -14,6 +14,7 @@ import { OutboxSender } from "./worker/outbox-sender";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
+import { startSessionReaper } from "./session-reaper";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -111,6 +112,16 @@ setInterval(() => {
   const cleaned = storage.outbox.cleanupOlderThan(cutoff);
   if (cleaned > 0) console.log(`[outbox] cleaned ${cleaned} old entries`);
 }, 60 * 60 * 1000);
+
+// Reap stale sessions every hour
+if (opencodeClient && poller) {
+  startSessionReaper({
+    storage,
+    deleteSession: (sessionId) => opencodeClient.deleteSession(sessionId),
+    unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
+    log: (msg) => console.log(`[reaper] ${msg}`),
+  });
+}
 
 const workerNotifier = poller && config.telegramChatId
   ? new WorkerNotificationService(storage, poller, config.telegramChatId, Date.now, config.machineId)
