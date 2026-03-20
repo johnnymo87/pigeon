@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
+import { splitTelegramMessage } from "./split-message";
 
 interface NotificationInput {
   event: string;
@@ -74,7 +75,7 @@ function eventEmoji(event: string): string {
 }
 
 export function formatTelegramNotification(input: NotificationInput): {
-  text: string;
+  texts: string[];
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
@@ -83,19 +84,19 @@ export function formatTelegramNotification(input: NotificationInput): {
     infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
   }
 
-  const text = [
-    `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`,
-    "",
-    input.summary,
-    "",
+  const header = `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`;
+
+  const footer = [
     infoLine,
     `🆔 \`${input.sessionId}\``,
     "",
     "↩️ _Swipe-reply to respond_",
   ].join("\n");
 
+  const texts = splitTelegramMessage(header, input.summary, footer);
+
   return {
-    text,
+    texts,
     replyMarkup: {
       inline_keyboard: [],
     },
@@ -230,7 +231,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       chatId: this.chatId,
       context: {
         event: input.event,
-        summary: input.summary,
+        summary: input.summary.slice(0, 200),
       },
     }, now);
 
@@ -244,12 +245,14 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       sessionId: input.session.sessionId,
     });
 
-    await this.sendTelegramMessage(
-      input.session.sessionId,
-      notification.text,
-      notification.replyMarkup,
-      token,
-    );
+    for (const text of notification.texts) {
+      await this.sendTelegramMessage(
+        input.session.sessionId,
+        text,
+        notification.replyMarkup,
+        token,
+      );
+    }
 
     return { token };
   }
@@ -370,12 +373,16 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       }
     }
 
-    await this.sendViaWorker(
-      input.session.sessionId,
-      notification.text,
-      notification.replyMarkup,
-      mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
-    );
+    const texts = notification.texts;
+    for (let i = 0; i < texts.length; i++) {
+      const isLast = i === texts.length - 1;
+      await this.sendViaWorker(
+        input.session.sessionId,
+        texts[i]!,
+        isLast ? notification.replyMarkup : { inline_keyboard: [] },
+        isLast && mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
+      );
+    }
 
     return { token };
   }

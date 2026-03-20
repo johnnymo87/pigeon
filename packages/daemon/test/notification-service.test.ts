@@ -19,9 +19,10 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-abc123",
     });
 
-    expect(result.text).toContain("*Stop*: my\\_\\[label\\]\\*");
-    expect(result.text).toContain("📂 `projects/pigeon`");
-    expect(result.text).toContain("🆔 `sess-abc123`");
+    expect(result.texts).toHaveLength(1);
+    expect(result.texts[0]).toContain("*Stop*: my\\_\\[label\\]\\*");
+    expect(result.texts[0]).toContain("📂 `projects/pigeon`");
+    expect(result.texts[0]).toContain("🆔 `sess-abc123`");
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
@@ -36,8 +37,8 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-xyz",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
-    expect(result.text).toContain("\n🆔 `sess-xyz`");
+    expect(result.texts[0]).toContain("📂 `projects/pigeon` · 🖥 devbox");
+    expect(result.texts[0]).toContain("\n🆔 `sess-xyz`");
   });
 
   it("omits machine ID from info line when not provided", () => {
@@ -50,9 +51,29 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-nomachine",
     });
 
-    expect(result.text).toContain("📂 `projects/pigeon`");
-    expect(result.text).toContain("\n🆔 `sess-nomachine`");
-    expect(result.text).not.toContain("🖥");
+    expect(result.texts[0]).toContain("📂 `projects/pigeon`");
+    expect(result.texts[0]).toContain("\n🆔 `sess-nomachine`");
+    expect(result.texts[0]).not.toContain("🖥");
+  });
+
+  it("splits long summary into multiple messages with header/footer on each", () => {
+    // Generate a summary that exceeds 4096 chars when combined with header+footer overhead (~71 chars)
+    const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i} content here.`).join("\n\n");
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "test",
+      summary: longSummary,
+      cwd: "/tmp",
+      token: "tok-long",
+      sessionId: "sess-long",
+    });
+
+    expect(result.texts.length).toBeGreaterThan(1);
+    for (const text of result.texts) {
+      expect(text.length).toBeLessThanOrEqual(4096);
+      expect(text).toContain("*Stop*");
+      expect(text).toContain("🆔 `sess-long`");
+    }
   });
 });
 
@@ -105,6 +126,48 @@ describe("TelegramNotificationService", () => {
     expect(payload.parse_mode).toBe("Markdown");
     expect(payload.chat_id).toBe("8248645256");
     expect((payload.text as string)).toContain("🆔 `sess-1`");
+
+    storage.db.close();
+  });
+
+  it("sends multiple Telegram messages for long summaries", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-long",
+      notify: true,
+      label: "Long Test",
+      cwd: "/tmp",
+    }, 1_000);
+
+    let msgIdCounter = 100;
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: msgIdCounter++ } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const service = new TelegramNotificationService(
+      storage, "bot-token", "8248645256", () => 2_000, fetchMock,
+    );
+
+    // Generate a summary that exceeds 4096 chars when combined with header+footer overhead (~70 chars)
+    const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i}: ${"x".repeat(60)}`).join("\n\n");
+
+    const result = await service.sendStopNotification({
+      session: { sessionId: "sess-long", label: "Long Test", cwd: "/tmp" },
+      event: "Stop",
+      summary: longSummary,
+    });
+
+    expect(result.token).toBeTruthy();
+    expect((fetchMock as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+
+    // All sent messages should map to the same token via reply routing
+    const mapped100 = storage.replyTokens.lookup("8248645256", "100", 2_001);
+    const mapped101 = storage.replyTokens.lookup("8248645256", "101", 2_001);
+    expect(mapped100).toBe(result.token);
+    expect(mapped101).toBe(result.token);
 
     storage.db.close();
   });
