@@ -245,11 +245,13 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       sessionId: input.session.sessionId,
     });
 
-    for (const text of notification.texts) {
+    const { texts, replyMarkup } = notification;
+    for (let i = 0; i < texts.length; i++) {
+      const isLast = i === texts.length - 1;
       await this.sendTelegramMessage(
         input.session.sessionId,
-        text,
-        notification.replyMarkup,
+        texts[i]!,
+        isLast ? replyMarkup : { inline_keyboard: [] },
         token,
       );
     }
@@ -373,13 +375,13 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       }
     }
 
-    const texts = notification.texts;
+    const { texts, replyMarkup } = notification;
     for (let i = 0; i < texts.length; i++) {
       const isLast = i === texts.length - 1;
       await this.sendViaWorker(
         input.session.sessionId,
         texts[i]!,
-        isLast ? notification.replyMarkup : { inline_keyboard: [] },
+        isLast ? replyMarkup : { inline_keyboard: [] },
         isLast && mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
       );
     }

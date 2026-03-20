@@ -151,7 +151,6 @@ describe("TelegramNotificationService", () => {
       storage, "bot-token", "8248645256", () => 2_000, fetchMock,
     );
 
-    // Generate a summary that exceeds 4096 chars when combined with header+footer overhead (~70 chars)
     const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i}: ${"x".repeat(60)}`).join("\n\n");
 
     const result = await service.sendStopNotification({
@@ -501,6 +500,69 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
     const noMediaCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, unknown];
     const noMediaKeys = noMediaCall[4];
     expect(noMediaKeys).toBeUndefined();
+
+    storage.db.close();
+  });
+
+  it("attaches media to last chunk only for long summaries", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-media-long",
+      notify: true,
+      label: "Media Long Test",
+      cwd: "/tmp/media",
+    }, 1_000);
+
+    const uploadMediaMock = vi.fn(async (key: string, _data: ArrayBuffer, _mime: string, _filename: string) => {
+      return { ok: true, key };
+    });
+
+    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+
+    const workerSender: WorkerNotificationSender = {
+      sendNotification: sendNotificationMock,
+      uploadMedia: uploadMediaMock,
+    };
+
+    const service = new WorkerNotificationService(
+      storage,
+      workerSender,
+      "8248645256",
+      () => 2_000,
+    );
+
+    const fakeBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const dataUri = `data:image/png;base64,${fakeBase64}`;
+
+    const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i}: ${"x".repeat(60)}`).join("\n\n");
+
+    await service.sendStopNotification({
+      session: {
+        sessionId: "sess-media-long",
+        label: "Media Long Test",
+        cwd: "/tmp/media",
+      },
+      event: "Stop",
+      summary: longSummary,
+      media: [
+        { mime: "image/png", filename: "screenshot.png", url: dataUri },
+      ],
+    });
+
+    // Multiple chunks should have been sent
+    const callCount = (sendNotificationMock as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(callCount).toBeGreaterThan(1);
+
+    // Only the last call should have media
+    for (let i = 0; i < callCount; i++) {
+      const call = (sendNotificationMock as ReturnType<typeof vi.fn>).mock.calls[i] as unknown as [string, string, string, unknown, unknown];
+      const media = call[4];
+      if (i < callCount - 1) {
+        expect(media).toBeUndefined();
+      } else {
+        expect(media).toHaveLength(1);
+      }
+    }
 
     storage.db.close();
   });
