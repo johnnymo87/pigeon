@@ -64,7 +64,6 @@ export class OpencodeClient {
   async getSessionMessages(sessionId: string): Promise<unknown[]> {
     const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/message`, {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) {
       const body = await res.text();

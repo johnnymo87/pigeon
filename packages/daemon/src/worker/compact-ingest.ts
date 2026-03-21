@@ -1,4 +1,4 @@
-import type { OpencodeClient } from "../opencode-client.js";
+import type { OpencodeClient } from "../opencode-client";
 
 export interface CompactCommandInput {
   commandId: string;
@@ -9,8 +9,13 @@ export interface CompactCommandInput {
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
 }
 
+interface MessageWithModel {
+  role: string;
+  model?: { providerID?: string; modelID?: string };
+}
+
 export async function ingestCompactCommand(input: CompactCommandInput): Promise<void> {
-  const { sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
+  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   try {
@@ -19,7 +24,10 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
     // Find the last user message to extract the current model
     const lastUserMessage = [...messages]
       .reverse()
-      .find((m: any) => m.role === "user" && m.model?.providerID && m.model?.modelID) as any;
+      .find((m): m is MessageWithModel => {
+        const msg = m as MessageWithModel;
+        return msg.role === "user" && !!msg.model?.providerID && !!msg.model?.modelID;
+      });
 
     if (!lastUserMessage) {
       await sendTelegramReply(
@@ -29,8 +37,9 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
       return;
     }
 
-    const { providerID, modelID } = lastUserMessage.model;
-    await opencodeClient.summarize(sessionId, providerID, modelID);
+    const { providerID, modelID } = lastUserMessage.model!;
+    await opencodeClient.summarize(sessionId, providerID!, modelID!);
+    console.log(`[compact-ingest] session compacted commandId=${commandId} sessionId=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sendTelegramReply(chatId, `Failed to compact session${machineLabel}: ${message}`);
