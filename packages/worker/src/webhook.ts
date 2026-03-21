@@ -2,7 +2,7 @@ import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 
-type CommandType = "execute" | "launch" | "kill";
+type CommandType = "execute" | "launch" | "kill" | "compact";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -530,6 +530,44 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\` on ${session.machine_id}...`);
+      return OK();
+    }
+
+    // Handle /compact command (reply-based)
+    if (/^\/compact$/.test(update.message.text)) {
+      const compactChatId = update.message.chat.id;
+
+      if (!update.message.reply_to_message) {
+        await sendTelegramMessage(env, compactChatId, "Reply to a session notification to compact it.");
+        return OK();
+      }
+
+      const mapping = await lookupMessage(db, String(compactChatId), update.message.reply_to_message.message_id);
+      if (!mapping) {
+        await sendTelegramMessage(env, compactChatId, "Could not find a session for that message.");
+        return OK();
+      }
+
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(mapping.session_id)
+        .first<{ machine_id: string; label: string | null }>();
+
+      if (!session) {
+        await sendTelegramMessage(env, compactChatId, `Session \`${mapping.session_id}\` not found.`);
+        return OK();
+      }
+
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, compactChatId, `${session.machine_id} is not recently seen.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(db, env, session.machine_id, mapping.session_id, "", String(compactChatId), session.label, "compact");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, compactChatId, `Compacting session \`${mapping.session_id}\` on ${session.machine_id}...`);
       return OK();
     }
   }

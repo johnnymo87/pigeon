@@ -38,6 +38,8 @@ export async function handlePollNext(
     body.prompt = result.command;
   } else if (result.commandType === "kill") {
     body.sessionId = result.sessionId;
+  } else if (result.commandType === "compact") {
+    body.sessionId = result.sessionId;
   } else {
     // "execute" -- regular command
     body.sessionId = result.sessionId;
