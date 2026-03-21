@@ -60,4 +60,28 @@ export class OpencodeClient {
       throw new Error(`deleteSession failed: ${response.status} ${response.statusText}`);
     }
   }
+
+  async getSessionMessages(sessionId: string): Promise<unknown[]> {
+    const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/message`, {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`getSessionMessages failed (${res.status}): ${body}`);
+    }
+    return res.json();
+  }
+
+  async summarize(sessionId: string, providerID: string, modelID: string): Promise<void> {
+    const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/summarize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerID, modelID, auto: false }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`summarize failed (${res.status}): ${body}`);
+    }
+  }
 }

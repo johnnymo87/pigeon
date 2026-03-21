@@ -161,4 +161,78 @@ describe("OpencodeClient", () => {
       );
     });
   });
+
+  describe("getSessionMessages", () => {
+    it("calls GET /session/:id/message and returns parsed JSON array", async () => {
+      const messages = [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi there" },
+      ];
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(messages), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.getSessionMessages("sess-abc");
+
+      expect(result).toEqual(messages);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc/message",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("throws on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("session not found", { status: 404 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.getSessionMessages("sess-abc")).rejects.toThrow(
+        "getSessionMessages failed (404): session not found",
+      );
+    });
+  });
+
+  describe("summarize", () => {
+    it("calls POST /session/:id/summarize with correct body", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.summarize("sess-abc", "anthropic", "claude-3-5-sonnet");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc/summarize",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ providerID: "anthropic", modelID: "claude-3-5-sonnet", auto: false }),
+        }),
+      );
+    });
+
+    it("throws on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("summarize error", { status: 500 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.summarize("sess-abc", "anthropic", "claude-3-5-sonnet")).rejects.toThrow(
+        "summarize failed (500): summarize error",
+      );
+    });
+  });
 });

@@ -38,12 +38,20 @@ export interface KillMessage {
   chatId: string;
 }
 
-export type WorkerMessage = ExecuteMessage | LaunchMessage | KillMessage;
+export interface CompactMessage {
+  commandId: string;
+  commandType: "compact";
+  sessionId: string;
+  chatId: string;
+}
+
+export type WorkerMessage = ExecuteMessage | LaunchMessage | KillMessage | CompactMessage;
 
 export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
   onLaunch: (msg: LaunchMessage) => Promise<void>;
   onKill: (msg: KillMessage) => Promise<void>;
+  onCompact: (msg: CompactMessage) => Promise<void>;
 }
 
 export interface PollerDeps {
@@ -140,6 +148,8 @@ export class Poller {
         await this.callbacks.onLaunch(msg);
       } else if (msg.commandType === "kill") {
         await this.callbacks.onKill(msg);
+      } else if (msg.commandType === "compact") {
+        await this.callbacks.onCompact(msg);
       } else {
         console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
         return;

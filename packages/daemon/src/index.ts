@@ -14,6 +14,7 @@ import { OutboxSender } from "./worker/outbox-sender";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
+import { ingestCompactCommand } from "./worker/compact-ingest";
 import { startSessionReaper } from "./session-reaper";
 
 const config = loadConfig();
@@ -76,6 +77,20 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             return;
           }
           await ingestKillCommand({
+            commandId: msg.commandId,
+            sessionId: msg.sessionId,
+            chatId: msg.chatId,
+            machineId: config.machineId,
+            opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
+        },
+        onCompact: async (msg) => {
+          if (!opencodeClient) {
+            console.warn("[pigeon-daemon] received compact command but no opencodeClient is configured");
+            return;
+          }
+          await ingestCompactCommand({
             commandId: msg.commandId,
             sessionId: msg.sessionId,
             chatId: msg.chatId,
