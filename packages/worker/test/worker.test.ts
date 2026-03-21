@@ -1286,6 +1286,152 @@ describe("/kill command", () => {
   });
 });
 
+// ─── /compact Command: Integration Tests ─────────────────────────────
+
+function makeCompactMessage(updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: "/compact",
+    },
+  };
+}
+
+function makeCompactReply(
+  replyToMessageId: number,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: "/compact",
+      reply_to_message: { message_id: replyToMessageId },
+    },
+  };
+}
+
+describe("/compact command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("replies with 'reply to a session notification' when no reply_to_message", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeCompactMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("replies with 'could not find a session' when reply_to_message has no mapping", async () => {
+    mockTelegramSendMessage();
+
+    // Reply to a message ID that has no mapping in the messages table
+    const res = await sendWebhook(makeCompactReply(99998));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("replies with session not found when session mapping exists but session is deleted", async () => {
+    const now = Date.now();
+    const orphanedSessionId = `compact-orphan-${now}`;
+    const notifMsgId = 4_000_001 + (now % 100);
+
+    // Insert a message mapping pointing to a session that doesn't exist in sessions table
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId: orphanedSessionId,
+      token: `compact-orphan-token-${now}`,
+    });
+
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeCompactReply(notifMsgId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // No command should have been queued
+    const rows = await queryQueueBySession(orphanedSessionId);
+    expect(rows.length).toBe(0);
+  });
+
+  it("replies with offline error when machine has not recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `compact-offline-${now}`;
+    const machineId = `compact-offline-machine-${now}`;
+    const notifMsgId = 4_001_001 + (now % 100);
+
+    await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `compact-offline-token-${now}`,
+    });
+    // No touchMachine call → isMachineRecent returns false
+
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeCompactReply(notifMsgId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // No compact command should be queued
+    const rows = await queryQueueBySession(sessionId);
+    const compactRows = rows.filter((r) => r.command_type === "compact");
+    expect(compactRows.length).toBe(0);
+  });
+
+  it("queues a compact command when machine has recently polled D1", async () => {
+    const now = Date.now();
+    const sessionId = `compact-connected-${now}`;
+    const machineId = `compact-machine-${now}`;
+    const notifMsgId = 4_002_001 + (now % 100);
+
+    await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `compact-token-${now}`,
+    });
+    // Insert a recent machines row so isMachineRecent returns true
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack "Compacting session..."
+
+    const res = await sendWebhook(makeCompactReply(notifMsgId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Verify the compact command was queued in D1 with correct command_type
+    const rows = await queryQueueBySession(sessionId);
+    const compactRows = rows.filter((r) => r.command_type === "compact");
+    expect(compactRows.length).toBeGreaterThanOrEqual(1);
+    const compactRow = compactRows[compactRows.length - 1]!;
+    expect(compactRow.command_type).toBe("compact");
+    expect(compactRow.session_id).toBe(sessionId);
+    expect(compactRow.machine_id).toBe(machineId);
+  });
+});
+
 // ─── Telegram Media: Unit Tests ───────────────────────────────────────
 
 describe("extractMedia", () => {
