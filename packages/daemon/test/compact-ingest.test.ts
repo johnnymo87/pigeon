@@ -18,7 +18,7 @@ describe("ingestCompactCommand", () => {
 
   it("fetches messages, extracts model from last user message, and calls summarize", async () => {
     const messages = [
-      { role: "user", model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" } },
+      { info: { role: "user", model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" } }, parts: [] },
     ];
     const input = makeInput({
       opencodeClient: {
@@ -39,9 +39,9 @@ describe("ingestCompactCommand", () => {
 
   it("uses the LAST user message's model, not the first", async () => {
     const messages = [
-      { role: "user", model: { providerID: "openai", modelID: "gpt-4" } },
-      { role: "assistant", content: "response" },
-      { role: "user", model: { providerID: "anthropic", modelID: "claude-3-7-sonnet" } },
+      { info: { role: "user", model: { providerID: "openai", modelID: "gpt-4" } }, parts: [] },
+      { info: { role: "assistant" }, parts: [] },
+      { info: { role: "user", model: { providerID: "anthropic", modelID: "claude-3-7-sonnet" } }, parts: [] },
     ];
     const input = makeInput({
       opencodeClient: {
@@ -61,7 +61,7 @@ describe("ingestCompactCommand", () => {
 
   it("sends error reply when no user messages are found, does not call summarize", async () => {
     const messages = [
-      { role: "assistant", content: "a response" },
+      { info: { role: "assistant" }, parts: [] },
     ];
     const input = makeInput({
       opencodeClient: {
@@ -81,7 +81,7 @@ describe("ingestCompactCommand", () => {
 
   it("sends error reply when summarize throws", async () => {
     const messages = [
-      { role: "user", model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" } },
+      { info: { role: "user", model: { providerID: "anthropic", modelID: "claude-3-5-sonnet" } }, parts: [] },
     ];
     const input = makeInput({
       opencodeClient: {

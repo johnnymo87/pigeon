@@ -9,9 +9,13 @@ export interface CompactCommandInput {
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
 }
 
-interface MessageWithModel {
-  role: string;
-  model?: { providerID?: string; modelID?: string };
+/** Shape returned by opencode GET /session/:id/message (MessageV2.WithParts) */
+interface SessionMessage {
+  info: {
+    role: string;
+    model?: { providerID?: string; modelID?: string };
+  };
+  parts: unknown[];
 }
 
 export async function ingestCompactCommand(input: CompactCommandInput): Promise<void> {
@@ -19,15 +23,15 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   try {
-    const messages = await opencodeClient.getSessionMessages(sessionId);
+    const messages = (await opencodeClient.getSessionMessages(sessionId)) as SessionMessage[];
 
     // Find the last user message to extract the current model
     const lastUserMessage = [...messages]
       .reverse()
-      .find((m): m is MessageWithModel => {
-        const msg = m as MessageWithModel;
-        return msg.role === "user" && !!msg.model?.providerID && !!msg.model?.modelID;
-      });
+      .find(
+        (m): m is SessionMessage & { info: { role: "user"; model: { providerID: string; modelID: string } } } =>
+          m.info.role === "user" && !!m.info.model?.providerID && !!m.info.model?.modelID,
+      );
 
     if (!lastUserMessage) {
       await sendTelegramReply(
@@ -37,8 +41,8 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
       return;
     }
 
-    const { providerID, modelID } = lastUserMessage.model!;
-    await opencodeClient.summarize(sessionId, providerID!, modelID!);
+    const { providerID, modelID } = lastUserMessage.info.model;
+    await opencodeClient.summarize(sessionId, providerID, modelID);
     console.log(`[compact-ingest] session compacted commandId=${commandId} sessionId=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
