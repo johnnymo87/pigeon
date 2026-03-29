@@ -314,6 +314,9 @@ function asPendingQuestion(row: SqlRow): PendingQuestionRecord {
     token: (row.token as string | null) ?? null,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
+    currentStep: Number(row.current_step ?? 0),
+    answers: JSON.parse(String(row.answers_json_v2 ?? "[]")) as string[][],
+    version: Number(row.version ?? 0),
   };
 }
 
@@ -324,8 +327,9 @@ export class PendingQuestionRepository {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO pending_questions
-         (session_id, request_id, questions_json, token, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         (session_id, request_id, questions_json, token, created_at, expires_at,
+          current_step, answers_json_v2, version)
+         VALUES (?, ?, ?, ?, ?, ?, 0, '[]', 0)`,
       )
       .run(
         input.sessionId,
@@ -349,6 +353,18 @@ export class PendingQuestionRepository {
       .prepare("DELETE FROM pending_questions WHERE session_id = ?")
       .run(sessionId);
     return result.changes > 0;
+  }
+
+  advanceStep(sessionId: string, answer: string[], now = Date.now()): PendingQuestionRecord | null {
+    const current = this.getBySessionId(sessionId, now);
+    if (!current) return null;
+    const newAnswers = [...current.answers, answer];
+    const newStep = current.currentStep + 1;
+    const newVersion = current.version + 1;
+    this.db.prepare(
+      `UPDATE pending_questions SET current_step = ?, answers_json_v2 = ?, version = ? WHERE session_id = ?`,
+    ).run(newStep, JSON.stringify(newAnswers), newVersion, sessionId);
+    return { ...current, currentStep: newStep, answers: newAnswers, version: newVersion };
   }
 
   cleanupExpired(now = Date.now()): number {

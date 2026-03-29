@@ -64,6 +64,9 @@ export interface PendingQuestionRecord {
   token: string | null;
   createdAt: number;
   expiresAt: number;
+  currentStep: number;
+  answers: string[][];
+  version: number;
 }
 
 export interface StorePendingQuestionInput {

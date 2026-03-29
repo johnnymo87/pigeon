@@ -184,4 +184,43 @@ describe("storage schema and repositories", () => {
 
     storage.db.close();
   });
+
+  describe("PendingQuestionRepository wizard state", () => {
+    const q1 = { question: "Which DB?", header: "DB", options: [{ label: "PostgreSQL", description: "Relational" }] };
+    const q2 = { question: "Which ORM?", header: "ORM", options: [{ label: "Prisma", description: "TypeScript ORM" }] };
+
+    it("stores with default wizard state (step=0, answers=[], version=0)", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" });
+      const record = storage.pendingQuestions.getBySessionId("s1")!;
+      expect(record.currentStep).toBe(0);
+      expect(record.answers).toEqual([]);
+      expect(record.version).toBe(0);
+      storage.db.close();
+    });
+
+    it("advanceStep records answer and bumps version", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" });
+      const updated = storage.pendingQuestions.advanceStep("s1", ["PostgreSQL"]);
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["PostgreSQL"]]);
+      expect(updated!.version).toBe(1);
+      storage.db.close();
+    });
+
+    it("advanceStep returns null for missing session", () => {
+      const storage = createStorage();
+      expect(storage.pendingQuestions.advanceStep("missing", ["x"])).toBeNull();
+      storage.db.close();
+    });
+
+    it("advanceStep returns null for expired session", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" }, 1000, 100);
+      expect(storage.pendingQuestions.advanceStep("s1", ["x"], 2000)).toBeNull();
+      storage.db.close();
+    });
+  });
 });

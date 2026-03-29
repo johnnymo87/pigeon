@@ -106,6 +106,9 @@ export function initSchema(db: BetterSqlite3.Database): void {
     "ALTER TABLE sessions ADD COLUMN backend_endpoint TEXT",
     "ALTER TABLE sessions ADD COLUMN backend_auth_token TEXT",
     "ALTER TABLE sessions ADD COLUMN nvim_socket TEXT DEFAULT NULL",
+    "ALTER TABLE pending_questions ADD COLUMN current_step INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE pending_questions ADD COLUMN answers_json_v2 TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE pending_questions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
   ];
 
   for (const statement of additiveColumns) {
