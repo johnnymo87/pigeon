@@ -213,7 +213,7 @@ export async function ingestWorkerCommand(
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-      // Permanent failure: ack and move on
+      storage.inbox.markDone(commandId);
       return;
     }
 
@@ -231,14 +231,14 @@ export async function ingestWorkerCommand(
     }
 
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
-    // Permanent failure: ack and move on
+    storage.inbox.markDone(commandId);
     return;
   }
 
   // If command looks like a question option but no pending question, it's stale
-  if (QUESTION_OPTION_RE.test(msg.command.trim())) {
-    console.log(`[command-ingest] stale question option commandId=${commandId}`);
-    // Permanent failure: ack and move on
+  if (QUESTION_OPTION_RE.test(msg.command.trim()) || WIZARD_OPTION_RE.test(msg.command.trim())) {
+    console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);
+    storage.inbox.markDone(commandId);
     return;
   }
 

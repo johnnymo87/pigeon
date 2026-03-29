@@ -359,7 +359,7 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
-  it("returns normally when question option is stale (no pending question)", async () => {
+  it("marks inbox done when question option is stale (no pending question)", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
       sessionId: "sess-q3",
@@ -379,6 +379,31 @@ describe("ingestWorkerCommand", () => {
       ),
     ).resolves.toBeUndefined();
 
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    storage.db.close();
+  });
+
+  it("marks inbox done when wizard-format question option is stale (no pending question)", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q3w",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    // No pending question stored — wizard-format v0:q0 should also be caught
+
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-q3w", sessionId: "sess-q3w", command: "v0:q0", chatId: "1" }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
