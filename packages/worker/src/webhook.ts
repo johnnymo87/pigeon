@@ -2,7 +2,7 @@ import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 
-type CommandType = "execute" | "launch" | "kill" | "compact";
+type CommandType = "execute" | "launch" | "kill" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -568,6 +568,145 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, compactChatId, `Compacting session \`${mapping.session_id}\` on ${session.machine_id}...`);
+      return OK();
+    }
+
+    // Handle /mcp list <SESSION_ID>
+    const mcpListMatch = update.message.text.match(/^\/mcp\s+list\s+(\S+)$/);
+    if (mcpListMatch) {
+      const sessionId = mcpListMatch[1]!;
+      const mcpChatId = update.message.chat.id;
+
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; label: string | null }>();
+
+      if (!session) {
+        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
+        return OK();
+      }
+
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(db, env, session.machine_id, sessionId, "", String(mcpChatId), session.label, "mcp_list");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${sessionId}\` on ${session.machine_id}...`);
+      return OK();
+    }
+
+    // Handle /mcp enable <SERVER> <SESSION_ID>
+    const mcpEnableMatch = update.message.text.match(/^\/mcp\s+enable\s+(\S+)\s+(\S+)$/);
+    if (mcpEnableMatch) {
+      const serverName = mcpEnableMatch[1]!;
+      const sessionId = mcpEnableMatch[2]!;
+      const mcpChatId = update.message.chat.id;
+
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; label: string | null }>();
+
+      if (!session) {
+        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
+        return OK();
+      }
+
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(db, env, session.machine_id, sessionId, serverName, String(mcpChatId), session.label, "mcp_enable");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+      return OK();
+    }
+
+    // Handle /mcp disable <SERVER> <SESSION_ID>
+    const mcpDisableMatch = update.message.text.match(/^\/mcp\s+disable\s+(\S+)\s+(\S+)$/);
+    if (mcpDisableMatch) {
+      const serverName = mcpDisableMatch[1]!;
+      const sessionId = mcpDisableMatch[2]!;
+      const mcpChatId = update.message.chat.id;
+
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; label: string | null }>();
+
+      if (!session) {
+        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
+        return OK();
+      }
+
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(db, env, session.machine_id, sessionId, serverName, String(mcpChatId), session.label, "mcp_disable");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+      return OK();
+    }
+
+    // Handle /model <SESSION_ID> (list) or /model <PROVIDER/MODEL> <SESSION_ID> (set)
+    const modelMatch = update.message.text.match(/^\/model\s+(\S+)(?:\s+(\S+))?$/);
+    if (modelMatch) {
+      const firstArg = modelMatch[1]!;
+      const secondArg = modelMatch[2];
+      const modelChatId = update.message.chat.id;
+
+      let sessionId: string;
+      let commandType: CommandType;
+      let modelCode: string | undefined;
+
+      if (firstArg.includes("/") && secondArg) {
+        // /model <PROVIDER/MODEL> <SESSION_ID> → model_set
+        modelCode = firstArg;
+        sessionId = secondArg;
+        commandType = "model_set";
+      } else {
+        // /model <SESSION_ID> → model_list
+        sessionId = firstArg;
+        commandType = "model_list";
+      }
+
+      const session = await db
+        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; label: string | null }>();
+
+      if (!session) {
+        await sendTelegramMessage(env, modelChatId, `Session \`${sessionId}\` not found.`);
+        return OK();
+      }
+
+      const isRecent = await isMachineRecent(db, session.machine_id);
+      if (!isRecent) {
+        await sendTelegramMessage(env, modelChatId, `${session.machine_id} is not recently seen.`);
+        return OK();
+      }
+
+      const command = modelCode ?? "";
+      const commandId = await queueCommand(db, env, session.machine_id, sessionId, command, String(modelChatId), session.label, commandType);
+      if (!commandId) return OK();
+
+      if (commandType === "model_set") {
+        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+      } else {
+        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${sessionId}\` on ${session.machine_id}...`);
+      }
       return OK();
     }
   }

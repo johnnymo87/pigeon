@@ -40,6 +40,14 @@ export async function handlePollNext(
     body.sessionId = result.sessionId;
   } else if (result.commandType === "compact") {
     body.sessionId = result.sessionId;
+  } else if (result.commandType === "mcp_list" || result.commandType === "model_list") {
+    body.sessionId = result.sessionId;
+  } else if (result.commandType === "mcp_enable" || result.commandType === "mcp_disable") {
+    body.sessionId = result.sessionId;
+    body.serverName = result.command; // server name stored in command column
+  } else if (result.commandType === "model_set") {
+    body.sessionId = result.sessionId;
+    body.model = result.command; // model code stored in command column
   } else {
     // "execute" -- regular command
     body.sessionId = result.sessionId;

@@ -2806,4 +2806,409 @@ describe("poll and ack endpoints", () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "Command not found" });
   });
+
+  // ─── handlePollNext: new command types ──────────────────────────────
+
+  it("handlePollNext returns sessionId for mcp_list type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'mcp_list', '', ?, 'pending', ?)`,
+    ).bind("mcp-list-cmd-1", "machine-mcp", "sess-mcp-1", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-mcp/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-mcp");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("mcp-list-cmd-1");
+    expect(body.commandType).toBe("mcp_list");
+    expect(body.sessionId).toBe("sess-mcp-1");
+    expect(body.chatId).toBe("8248645256");
+    expect(body.command).toBeUndefined();
+    expect(body.serverName).toBeUndefined();
+  });
+
+  it("handlePollNext returns sessionId for model_list type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'model_list', '', ?, 'pending', ?)`,
+    ).bind("model-list-cmd-1", "machine-model", "sess-model-1", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-model/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-model");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("model-list-cmd-1");
+    expect(body.commandType).toBe("model_list");
+    expect(body.sessionId).toBe("sess-model-1");
+    expect(body.chatId).toBe("8248645256");
+    expect(body.command).toBeUndefined();
+    expect(body.model).toBeUndefined();
+  });
+
+  it("handlePollNext returns sessionId and serverName for mcp_enable type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'mcp_enable', ?, ?, 'pending', ?)`,
+    ).bind("mcp-enable-cmd-1", "machine-mcp-en", "sess-mcp-en-1", "my-server", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-mcp-en/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-mcp-en");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("mcp-enable-cmd-1");
+    expect(body.commandType).toBe("mcp_enable");
+    expect(body.sessionId).toBe("sess-mcp-en-1");
+    expect(body.serverName).toBe("my-server");
+    expect(body.chatId).toBe("8248645256");
+  });
+
+  it("handlePollNext returns sessionId and serverName for mcp_disable type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'mcp_disable', ?, ?, 'pending', ?)`,
+    ).bind("mcp-disable-cmd-1", "machine-mcp-dis", "sess-mcp-dis-1", "my-server", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-mcp-dis/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-mcp-dis");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("mcp-disable-cmd-1");
+    expect(body.commandType).toBe("mcp_disable");
+    expect(body.sessionId).toBe("sess-mcp-dis-1");
+    expect(body.serverName).toBe("my-server");
+    expect(body.chatId).toBe("8248645256");
+  });
+
+  it("handlePollNext returns sessionId and model for model_set type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'model_set', ?, ?, 'pending', ?)`,
+    ).bind("model-set-cmd-1", "machine-model-set", "sess-model-set-1", "anthropic/claude-sonnet-4-5", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-model-set/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-model-set");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("model-set-cmd-1");
+    expect(body.commandType).toBe("model_set");
+    expect(body.sessionId).toBe("sess-model-set-1");
+    expect(body.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(body.chatId).toBe("8248645256");
+  });
+});
+
+// ─── /mcp Command: Integration Tests ─────────────────────────────────
+
+function makeMcpListMessage(sessionId: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/mcp list ${sessionId}`,
+    },
+  };
+}
+
+function makeMcpEnableMessage(serverName: string, sessionId: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/mcp enable ${serverName} ${sessionId}`,
+    },
+  };
+}
+
+function makeMcpDisableMessage(serverName: string, sessionId: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/mcp disable ${serverName} ${sessionId}`,
+    },
+  };
+}
+
+describe("/mcp command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("/mcp list replies with 'not found' when session does not exist", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpListMessage("nonexistent-session"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/mcp list replies with offline error when machine has not recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `mcp-list-offline-${now}`;
+    const machineId = `mcp-list-offline-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    // No touchMachine call → isMachineRecent returns false
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpListMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/mcp list queues an mcp_list command when machine has recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `mcp-list-connected-${now}`;
+    const machineId = `mcp-list-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack confirmation
+
+    const res = await sendWebhook(makeMcpListMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Verify the mcp_list command was queued in D1
+    const rows = await queryQueueBySession(sessionId);
+    const mcpRows = rows.filter((r) => r.command_type === "mcp_list");
+    expect(mcpRows.length).toBeGreaterThanOrEqual(1);
+    const mcpRow = mcpRows[mcpRows.length - 1]!;
+    expect(mcpRow.command_type).toBe("mcp_list");
+    expect(mcpRow.session_id).toBe(sessionId);
+    expect(mcpRow.machine_id).toBe(machineId);
+  });
+
+  it("/mcp enable queues an mcp_enable command with server name in command field", async () => {
+    const now = Date.now();
+    const sessionId = `mcp-enable-connected-${now}`;
+    const machineId = `mcp-enable-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack confirmation
+
+    const res = await sendWebhook(makeMcpEnableMessage("my-server", sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueBySession(sessionId);
+    const mcpRows = rows.filter((r) => r.command_type === "mcp_enable");
+    expect(mcpRows.length).toBeGreaterThanOrEqual(1);
+    const mcpRow = mcpRows[mcpRows.length - 1]!;
+    expect(mcpRow.command_type).toBe("mcp_enable");
+    expect(mcpRow.session_id).toBe(sessionId);
+    expect(mcpRow.machine_id).toBe(machineId);
+    expect(mcpRow.command).toBe("my-server");
+  });
+
+  it("/mcp disable queues an mcp_disable command with server name in command field", async () => {
+    const now = Date.now();
+    const sessionId = `mcp-disable-connected-${now}`;
+    const machineId = `mcp-disable-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack confirmation
+
+    const res = await sendWebhook(makeMcpDisableMessage("my-server", sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueBySession(sessionId);
+    const mcpRows = rows.filter((r) => r.command_type === "mcp_disable");
+    expect(mcpRows.length).toBeGreaterThanOrEqual(1);
+    const mcpRow = mcpRows[mcpRows.length - 1]!;
+    expect(mcpRow.command_type).toBe("mcp_disable");
+    expect(mcpRow.session_id).toBe(sessionId);
+    expect(mcpRow.machine_id).toBe(machineId);
+    expect(mcpRow.command).toBe("my-server");
+  });
+
+  it("/mcp enable replies with 'not found' when session does not exist", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpEnableMessage("my-server", "nonexistent-session"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/mcp disable replies with offline error when machine has not recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `mcp-disable-offline-${now}`;
+    const machineId = `mcp-disable-offline-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    // No touchMachine call → isMachineRecent returns false
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpDisableMessage("some-server", sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+});
+
+// ─── /model Command: Integration Tests ───────────────────────────────
+
+function makeModelListMessage(sessionId: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/model ${sessionId}`,
+    },
+  };
+}
+
+function makeModelSetMessage(model: string, sessionId: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/model ${model} ${sessionId}`,
+    },
+  };
+}
+
+describe("/model command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("/model list replies with 'not found' when session does not exist", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeModelListMessage("nonexistent-session"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/model list replies with offline error when machine has not recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `model-list-offline-${now}`;
+    const machineId = `model-list-offline-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    // No touchMachine call → isMachineRecent returns false
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeModelListMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/model list queues a model_list command when machine has recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `model-list-connected-${now}`;
+    const machineId = `model-list-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack confirmation
+
+    const res = await sendWebhook(makeModelListMessage(sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueBySession(sessionId);
+    const modelRows = rows.filter((r) => r.command_type === "model_list");
+    expect(modelRows.length).toBeGreaterThanOrEqual(1);
+    const modelRow = modelRows[modelRows.length - 1]!;
+    expect(modelRow.command_type).toBe("model_list");
+    expect(modelRow.session_id).toBe(sessionId);
+    expect(modelRow.machine_id).toBe(machineId);
+  });
+
+  it("/model set queues a model_set command with model code in command field", async () => {
+    const now = Date.now();
+    const sessionId = `model-set-connected-${now}`;
+    const machineId = `model-set-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack confirmation
+
+    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-opus-4-5", sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueBySession(sessionId);
+    const modelRows = rows.filter((r) => r.command_type === "model_set");
+    expect(modelRows.length).toBeGreaterThanOrEqual(1);
+    const modelRow = modelRows[modelRows.length - 1]!;
+    expect(modelRow.command_type).toBe("model_set");
+    expect(modelRow.session_id).toBe(sessionId);
+    expect(modelRow.machine_id).toBe(machineId);
+    expect(modelRow.command).toBe("anthropic/claude-opus-4-5");
+  });
+
+  it("/model set replies with 'not found' when session does not exist", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-sonnet-4-5", "nonexistent-session"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/model set replies with offline error when machine has not recently polled", async () => {
+    const now = Date.now();
+    const sessionId = `model-set-offline-${now}`;
+    const machineId = `model-set-offline-machine-${now}`;
+
+    await registerSession(sessionId, machineId);
+    // No touchMachine call → isMachineRecent returns false
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-opus-4-5", sessionId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
 });
