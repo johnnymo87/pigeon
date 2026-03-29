@@ -467,6 +467,50 @@ describe("Poller.uploadMedia()", () => {
 });
 
 // ============================================================
+// editNotification
+// ============================================================
+
+describe("Poller.editNotification()", () => {
+  it("editNotification calls worker /notifications/edit", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    ) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    const result = await poller.editNotification("q:sess:req", "new text", { inline_keyboard: [] });
+
+    expect(result.ok).toBe(true);
+    const [url, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/notifications/edit");
+    expect(init.method).toBe("POST");
+    expect(String(init.body)).toContain('"notificationId":"q:sess:req"');
+  });
+
+  it("editNotification sends correct body fields", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    ) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    await poller.editNotification("notif-id", "updated text", { inline_keyboard: [[]] });
+
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.notificationId).toBe("notif-id");
+    expect(body.text).toBe("updated text");
+    expect(body.replyMarkup).toEqual({ inline_keyboard: [[]] });
+  });
+
+  it("editNotification returns ok:false on network error", async () => {
+    const fetchFn = vi.fn().mockRejectedValue(new Error("network error")) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    const result = await poller.editNotification("q:sess:req", "text", { inline_keyboard: [] });
+    expect(result.ok).toBe(false);
+  });
+});
+
+// ============================================================
 // getConfiguredChatId
 // ============================================================
 

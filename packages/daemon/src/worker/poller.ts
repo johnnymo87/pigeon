@@ -240,6 +240,26 @@ export class Poller {
     }
   }
 
+  async editNotification(
+    notificationId: string,
+    text: string,
+    replyMarkup: { inline_keyboard?: unknown[] },
+  ): Promise<{ ok: boolean }> {
+    try {
+      const response = await this.fetchFn(`${this.config.workerUrl}/notifications/edit`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ notificationId, text, replyMarkup }),
+      });
+      return await response.json() as { ok: boolean };
+    } catch {
+      return { ok: false };
+    }
+  }
+
   async uploadMedia(
     key: string,
     data: Uint8Array | ArrayBuffer,
