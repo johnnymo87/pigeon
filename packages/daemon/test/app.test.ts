@@ -502,6 +502,100 @@ describe("createApp", () => {
     expect(sessionAfter!.lastSeen).toBe(200_000);
   });
 
+  it("POST /question-asked with multiple questions formats wizard step 1", async () => {
+    const sessionId = "sess-wiz";
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-wiz",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, notify: true }),
+    }));
+
+    const res = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        request_id: "req-wiz",
+        questions: [
+          { question: "Q1", header: "H1", options: [{ label: "A", description: "" }] },
+          { question: "Q2", header: "H2", options: [{ label: "B", description: "" }] },
+        ],
+        label: "pigeon",
+      }),
+    }));
+
+    expect(res.status).toBe(202);
+
+    // Verify pending question stored with wizard state (pass now to avoid TTL expiry)
+    const pq = storage.pendingQuestions.getBySessionId(sessionId, 50_001);
+    expect(pq).not.toBeNull();
+    expect(pq!.currentStep).toBe(0);
+    expect(pq!.answers).toEqual([]);
+    expect(pq!.version).toBe(0);
+
+    // Verify outbox entry contains wizard step 1 format
+    const notificationId = `q:${sessionId}:req-wiz`;
+    const outbox = storage.outbox.getByNotificationId(notificationId);
+    expect(outbox).not.toBeNull();
+    const payload = JSON.parse(outbox!.payload);
+    expect(payload.text).toContain("Question 1 of 2");
+    expect(payload.text).toContain("H1");
+    // Buttons should be present (wizard mode)
+    expect(payload.replyMarkup.inline_keyboard.length).toBeGreaterThan(0);
+    // Buttons should have versioned callback_data
+    expect(payload.replyMarkup.inline_keyboard[0][0].callback_data).toContain(":v0:");
+  });
+
+  it("POST /question-asked with single question uses standard format (no wizard)", async () => {
+    const sessionId = "sess-single-fmt";
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-single",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, notify: true }),
+    }));
+
+    const res = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        request_id: "req-single",
+        questions: [
+          { question: "Which DB?", header: "DB Choice", options: [{ label: "PostgreSQL", description: "Relational" }] },
+        ],
+        label: "pigeon",
+      }),
+    }));
+
+    expect(res.status).toBe(202);
+
+    const notificationId = `q:${sessionId}:req-single`;
+    const outbox = storage.outbox.getByNotificationId(notificationId);
+    expect(outbox).not.toBeNull();
+    const payload = JSON.parse(outbox!.payload);
+    // Single question should NOT use wizard format
+    expect(payload.text).not.toContain("Question 1 of");
+    expect(payload.text).toContain("DB Choice");
+    // Buttons should still be present for single-question
+    expect(payload.replyMarkup.inline_keyboard.length).toBeGreaterThan(0);
+    // Single-question buttons do NOT have versioned ":v0:" callback_data
+    expect(payload.replyMarkup.inline_keyboard[0][0].callback_data).not.toContain(":v0:");
+  });
+
   it("POST /question-answered clears pending question", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });

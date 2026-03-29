@@ -1,6 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
-import { generateToken, formatQuestionNotification } from "./notification-service";
+import { generateToken, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import type { QuestionInfoData } from "./storage/types";
 
 interface LegacySession {
@@ -315,14 +315,41 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }, now);
 
         // Format the notification payload for the outbox
-        const notification = formatQuestionNotification({
-          label: label || session.label || sessionId.slice(0, 8),
-          questions,
-          cwd: session.cwd,
-          token,
-          machineId: opts.machineId,
-          sessionId,
-        });
+        let notificationPayload: { text: string; replyMarkup: unknown; notificationId: string };
+
+        if (questions.length > 1) {
+          // Multi-question: wizard mode — show step 1
+          const notification = formatQuestionWizardStep({
+            label: label || session.label || sessionId.slice(0, 8),
+            questions,
+            currentStep: 0,
+            cwd: session.cwd,
+            token,
+            version: 0,
+            machineId: opts.machineId,
+            sessionId,
+          });
+          notificationPayload = {
+            text: notification.text,
+            replyMarkup: notification.replyMarkup,
+            notificationId,
+          };
+        } else {
+          // Single-question: existing behavior
+          const notification = formatQuestionNotification({
+            label: label || session.label || sessionId.slice(0, 8),
+            questions,
+            cwd: session.cwd,
+            token,
+            machineId: opts.machineId,
+            sessionId,
+          });
+          notificationPayload = {
+            text: notification.text,
+            replyMarkup: notification.replyMarkup,
+            notificationId,
+          };
+        }
 
         // Store in outbox — background sender will deliver to Telegram
         storage.outbox.upsert({
@@ -330,11 +357,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           sessionId,
           requestId,
           kind: "question",
-          payload: JSON.stringify({
-            text: notification.text,
-            replyMarkup: notification.replyMarkup,
-            notificationId,
-          }),
+          payload: JSON.stringify(notificationPayload),
           token,
         }, now);
 
