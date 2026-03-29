@@ -284,3 +284,73 @@ export async function handleSendNotification(
 
   return json({ ok: true, messageId, token });
 }
+
+/**
+ * Handle POST /notifications/edit
+ *
+ * Edits an existing Telegram message identified by notificationId.
+ * Looks up (chat_id, message_id) from the messages table.
+ */
+export async function handleEditNotification(
+  db: D1Database,
+  env: Env,
+  request: Request,
+): Promise<Response> {
+  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+    return unauthorized();
+  }
+
+  const body = (await request.json()) as {
+    notificationId?: string;
+    text?: string;
+    replyMarkup?: unknown;
+    parseMode?: string;
+  };
+
+  const { notificationId, text, replyMarkup, parseMode } = body;
+  if (!notificationId || !text) {
+    return json({ error: "notificationId and text are required" }, 400);
+  }
+
+  // Look up the original message
+  const row = await db
+    .prepare("SELECT chat_id, message_id FROM messages WHERE notification_id = ?")
+    .bind(notificationId)
+    .first<{ chat_id: string; message_id: number }>();
+
+  if (!row) {
+    return json({ error: "Message not found for notificationId" }, 404);
+  }
+
+  const telegramPayload: Record<string, unknown> = {
+    chat_id: row.chat_id,
+    message_id: row.message_id,
+    text,
+  };
+  if (parseMode) {
+    telegramPayload.parse_mode = parseMode;
+  }
+  if (replyMarkup) {
+    telegramPayload.reply_markup = replyMarkup;
+  }
+
+  const telegramResponse = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(telegramPayload),
+    },
+  );
+
+  const telegramResult = (await telegramResponse.json()) as {
+    ok: boolean;
+    description?: string;
+  };
+
+  if (!telegramResult.ok) {
+    return json({ error: "Telegram API error", details: telegramResult }, 502);
+  }
+
+  return json({ ok: true });
+}

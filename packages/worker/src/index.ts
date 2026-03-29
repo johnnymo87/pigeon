@@ -1,5 +1,5 @@
 import { handleSessionRequest } from "./sessions";
-import { handleSendNotification } from "./notifications";
+import { handleSendNotification, handleEditNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
@@ -51,6 +51,9 @@ export default {
     // Notifications
     if (path === "/notifications/send" && request.method === "POST") {
       return handleSendNotification(db, env, request);
+    }
+    if (path === "/notifications/edit" && request.method === "POST") {
+      return handleEditNotification(db, env, request);
     }
 
     // Telegram webhook

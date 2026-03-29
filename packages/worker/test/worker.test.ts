@@ -2464,6 +2464,156 @@ describe("d1-ops", () => {
   });
 });
 
+// ─── POST /notifications/edit ─────────────────────────────────────────
+
+describe("POST /notifications/edit", () => {
+  const SESSION_ID = "edit-notif-session";
+  const CHAT_ID = "8248645256";
+  const NOTIFICATION_ID = "edit-notif-id-001";
+
+  beforeEach(async () => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    await registerSession(SESSION_ID, "machine-edit", "edit-test");
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  async function editNotification(body: Record<string, unknown>): Promise<Response> {
+    return SELF.fetch("https://worker/notifications/edit", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("returns 401 for unauthenticated requests", async () => {
+    const res = await SELF.fetch("https://worker/notifications/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ notificationId: NOTIFICATION_ID, text: "new text" }),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 400 when notificationId is missing", async () => {
+    const res = await editNotification({ text: "new text" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("notificationId and text are required");
+  });
+
+  it("returns 400 when text is missing", async () => {
+    const res = await editNotification({ notificationId: NOTIFICATION_ID });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("notificationId and text are required");
+  });
+
+  it("returns 404 for unknown notificationId", async () => {
+    const res = await editNotification({
+      notificationId: "nonexistent-notification-id",
+      text: "updated text",
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("Message not found for notificationId");
+  });
+
+  it("edits a message by notificationId and returns ok", async () => {
+    // First, send a notification to store a message in the messages table
+    mockTelegramSuccess(555);
+    const notifRes = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "original text",
+      notificationId: NOTIFICATION_ID,
+    });
+    expect(notifRes.status).toBe(200);
+    const notifBody = (await notifRes.json()) as { messageId: number };
+    expect(notifBody.messageId).toBe(555);
+
+    // Now mock editMessageText
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: 555 } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const editRes = await editNotification({
+      notificationId: NOTIFICATION_ID,
+      text: "updated text",
+    });
+
+    expect(editRes.status).toBe(200);
+    const editBody = (await editRes.json()) as { ok: boolean };
+    expect(editBody.ok).toBe(true);
+  });
+
+  it("passes replyMarkup to editMessageText when provided", async () => {
+    const uniqueNotifId = `edit-markup-notif-${Date.now()}`;
+    mockTelegramSuccess(556);
+    const notifRes = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "original with markup",
+      notificationId: uniqueNotifId,
+    });
+    expect(notifRes.status).toBe(200);
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: 556 } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const markup = { inline_keyboard: [[{ text: "Next step", callback_data: "next" }]] };
+    const editRes = await editNotification({
+      notificationId: uniqueNotifId,
+      text: "updated with markup",
+      replyMarkup: markup,
+    });
+
+    expect(editRes.status).toBe(200);
+    const editBody = (await editRes.json()) as { ok: boolean };
+    expect(editBody.ok).toBe(true);
+  });
+
+  it("returns 502 when Telegram editMessageText API fails", async () => {
+    const uniqueNotifId = `edit-fail-notif-${Date.now()}`;
+    mockTelegramSuccess(557);
+    await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "original text",
+      notificationId: uniqueNotifId,
+    });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
+      .reply(
+        200,
+        JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message not modified" }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const editRes = await editNotification({
+      notificationId: uniqueNotifId,
+      text: "same or bad text",
+    });
+
+    expect(editRes.status).toBe(502);
+    const editBody = (await editRes.json()) as { error: string };
+    expect(editBody.error).toBe("Telegram API error");
+  });
+});
+
 // ─── Poll and Ack Endpoints ────────────────────────────────────────────
 
 function makeRequest(url: string, opts: { method?: string; auth?: boolean } = {}) {
