@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import {
   formatTelegramNotification,
   formatQuestionNotification,
+  formatQuestionWizardStep,
   TelegramNotificationService,
   WorkerNotificationService,
   type WorkerNotificationSender,
 } from "../src/notification-service";
+import type { QuestionInfoData } from "../src/storage/types";
 import { openStorageDb } from "../src/storage/database";
 
 describe("formatTelegramNotification", () => {
@@ -169,6 +171,90 @@ describe("TelegramNotificationService", () => {
     expect(mapped101).toBe(result.token);
 
     storage.db.close();
+  });
+});
+
+describe("formatQuestionWizardStep", () => {
+  const questions: QuestionInfoData[] = [
+    { question: "Which DB?", header: "Database", options: [
+      { label: "PostgreSQL", description: "Relational" },
+      { label: "SQLite", description: "File-based" },
+    ]},
+    { question: "Which ORM?", header: "ORM", options: [
+      { label: "Prisma", description: "" },
+      { label: "Drizzle", description: "" },
+      { label: "None", description: "" },
+    ]},
+  ];
+
+  it("renders step 1 of 2 with progress header", () => {
+    const result = formatQuestionWizardStep({
+      label: "pigeon",
+      questions,
+      currentStep: 0,
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok-wiz",
+      version: 0,
+      sessionId: "sess-wiz",
+      machineId: "devbox",
+    });
+
+    expect(result.text).toContain("Question 1 of 2");
+    expect(result.text).toContain("*Database*");
+    expect(result.text).toContain("Which DB?");
+    expect(result.text).toContain("PostgreSQL");
+    expect(result.text).toContain("SQLite");
+    expect(result.text).not.toContain("ORM"); // future question not shown
+  });
+
+  it("includes versioned callback_data on buttons", () => {
+    const result = formatQuestionWizardStep({
+      label: "test", questions, currentStep: 0,
+      cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
+    });
+
+    const buttons = result.replyMarkup.inline_keyboard.flat();
+    expect(buttons[0]!.callback_data).toBe("cmd:tok-wiz:v0:q0");
+    expect(buttons[1]!.callback_data).toBe("cmd:tok-wiz:v0:q1");
+  });
+
+  it("renders step 2 of 2", () => {
+    const result = formatQuestionWizardStep({
+      label: "test", questions, currentStep: 1,
+      cwd: "/tmp", token: "tok-wiz", version: 1, sessionId: "s1",
+    });
+
+    expect(result.text).toContain("Question 2 of 2");
+    expect(result.text).toContain("*ORM*");
+    expect(result.text).toContain("Which ORM?");
+    expect(result.text).not.toContain("Database");
+  });
+
+  it("does NOT include a Cancel button (no opencode API to reject questions)", () => {
+    const result = formatQuestionWizardStep({
+      label: "test", questions, currentStep: 0,
+      cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
+    });
+
+    const allButtons = result.replyMarkup.inline_keyboard.flat();
+    expect(allButtons.every((b: { callback_data: string }) => !b.callback_data.includes("cancel"))).toBe(true);
+  });
+
+  it("includes swipe-reply hint when custom is enabled", () => {
+    const result = formatQuestionWizardStep({
+      label: "test", questions, currentStep: 0,
+      cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
+    });
+    expect(result.text).toContain("Swipe-reply for custom answer");
+  });
+
+  it("hides swipe-reply hint when custom=false", () => {
+    const qs = [{ ...questions[0]!, custom: false }, questions[1]!];
+    const result = formatQuestionWizardStep({
+      label: "test", questions: qs, currentStep: 0,
+      cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
+    });
+    expect(result.text).not.toContain("Swipe-reply");
   });
 });
 

@@ -188,6 +188,78 @@ export function formatQuestionNotification(input: {
   };
 }
 
+export function formatQuestionWizardStep(input: {
+  label: string;
+  questions: QuestionInfoData[];
+  currentStep: number;
+  cwd: string | null;
+  token: string;
+  version: number;
+  sessionId: string;
+  machineId?: string;
+}): {
+  text: string;
+  replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+} {
+  const totalSteps = input.questions.length;
+  const currentQuestion = input.questions[input.currentStep]!;
+  const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
+
+  const lines = [
+    `❓ *Question ${input.currentStep + 1} of ${totalSteps}*: ${escapeMarkdown(input.label)}`,
+    "",
+  ];
+
+  if (currentQuestion.header) {
+    lines.push(`*${escapeMarkdown(currentQuestion.header)}*`);
+  }
+  lines.push(escapeMarkdown(currentQuestion.question));
+
+  if (currentQuestion.options.length > 0) {
+    lines.push("");
+    currentQuestion.options.forEach((opt, i) => {
+      const desc = opt.description ? ` — ${escapeMarkdown(opt.description)}` : "";
+      lines.push(`${i + 1}\\. ${escapeMarkdown(opt.label)}${desc}`);
+    });
+  }
+
+  // Info line
+  let infoLine = `📂 \`${cwdShort}\``;
+  if (input.machineId) {
+    infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+  }
+  lines.push("");
+  lines.push(infoLine);
+  lines.push(`🆔 \`${input.sessionId}\``);
+
+  const hasCustom = currentQuestion.custom !== false;
+  if (hasCustom) {
+    lines.push("");
+    lines.push("↩️ _Swipe-reply for custom answer_");
+  }
+
+  // Option buttons with versioned callback data
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  const options = currentQuestion.options;
+  for (let i = 0; i < options.length; i += 3) {
+    rows.push(
+      options.slice(i, i + 3).map((opt, j) => ({
+        text: opt.label,
+        callback_data: `cmd:${input.token}:v${input.version}:q${i + j}`,
+      })),
+    );
+  }
+
+  // No Cancel button: opencode has no API to reject/dismiss a pending question
+  // and no question timeout. Cancelling would leave opencode permanently stuck,
+  // requiring the user to go back to the TUI.
+
+  return {
+    text: lines.join("\n"),
+    replyMarkup: { inline_keyboard: rows },
+  };
+}
+
 export function generateToken(): string {
   return randomBytes(16).toString("base64url");
 }
