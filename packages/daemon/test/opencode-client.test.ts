@@ -235,4 +235,178 @@ describe("OpencodeClient", () => {
       );
     });
   });
+
+  describe("mcpStatus", () => {
+    it("calls GET /mcp and returns parsed status map", async () => {
+      const statusMap = {
+        "filesystem": { status: "connected" },
+        "github": { status: "error", error: "auth failed" },
+      };
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(statusMap), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.mcpStatus();
+
+      expect(result).toEqual(statusMap);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("throws on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("internal error", { status: 500 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.mcpStatus()).rejects.toThrow("mcpStatus failed (500): internal error");
+    });
+  });
+
+  describe("mcpConnect", () => {
+    it("calls POST /mcp/:name/connect and returns true on success", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.mcpConnect("filesystem");
+
+      expect(result).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/filesystem/connect",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    it("URL-encodes the server name", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpConnect("my server");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/my%20server/connect",
+        expect.anything(),
+      );
+    });
+
+    it("returns false on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.mcpConnect("filesystem");
+
+      expect(result).toBe(false);
+    });
+  });
+
+  describe("mcpDisconnect", () => {
+    it("calls POST /mcp/:name/disconnect and returns true on success", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.mcpDisconnect("filesystem");
+
+      expect(result).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/filesystem/disconnect",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    it("URL-encodes the server name", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpDisconnect("my server");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/my%20server/disconnect",
+        expect.anything(),
+      );
+    });
+
+    it("returns false on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.mcpDisconnect("filesystem");
+
+      expect(result).toBe(false);
+    });
+  });
+
+  describe("listProviders", () => {
+    it("calls GET /provider and returns parsed provider list", async () => {
+      const providerData = {
+        all: [
+          { id: "anthropic", models: { "claude-3-5-sonnet": {} } },
+          { id: "openai", models: { "gpt-4": {} } },
+        ],
+        default: { anthropic: "claude-3-5-sonnet" },
+        connected: ["anthropic"],
+      };
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(providerData), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const result = await client.listProviders();
+
+      expect(result).toEqual(providerData);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/provider",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("throws on non-ok response", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("not authorized", { status: 401 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.listProviders()).rejects.toThrow("listProviders failed (401): not authorized");
+    });
+  });
 });

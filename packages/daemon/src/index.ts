@@ -101,6 +101,21 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             sendTelegramReply: sendTelegramMessage,
           });
         },
+        onMcpList: async (msg) => {
+          console.warn("[pigeon-daemon] received mcp_list command but handler not yet implemented", msg.commandId);
+        },
+        onMcpEnable: async (msg) => {
+          console.warn("[pigeon-daemon] received mcp_enable command but handler not yet implemented", msg.commandId);
+        },
+        onMcpDisable: async (msg) => {
+          console.warn("[pigeon-daemon] received mcp_disable command but handler not yet implemented", msg.commandId);
+        },
+        onModelList: async (msg) => {
+          console.warn("[pigeon-daemon] received model_list command but handler not yet implemented", msg.commandId);
+        },
+        onModelSet: async (msg) => {
+          console.warn("[pigeon-daemon] received model_set command but handler not yet implemented", msg.commandId);
+        },
       },
     )
   : undefined;

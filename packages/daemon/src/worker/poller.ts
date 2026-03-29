@@ -45,13 +45,65 @@ export interface CompactMessage {
   chatId: string;
 }
 
-export type WorkerMessage = ExecuteMessage | LaunchMessage | KillMessage | CompactMessage;
+export interface McpListMessage {
+  commandId: string;
+  commandType: "mcp_list";
+  sessionId: string;
+  chatId: string;
+}
+
+export interface McpEnableMessage {
+  commandId: string;
+  commandType: "mcp_enable";
+  sessionId: string;
+  chatId: string;
+  serverName: string;
+}
+
+export interface McpDisableMessage {
+  commandId: string;
+  commandType: "mcp_disable";
+  sessionId: string;
+  chatId: string;
+  serverName: string;
+}
+
+export interface ModelListMessage {
+  commandId: string;
+  commandType: "model_list";
+  sessionId: string;
+  chatId: string;
+}
+
+export interface ModelSetMessage {
+  commandId: string;
+  commandType: "model_set";
+  sessionId: string;
+  chatId: string;
+  model: string;
+}
+
+export type WorkerMessage =
+  | ExecuteMessage
+  | LaunchMessage
+  | KillMessage
+  | CompactMessage
+  | McpListMessage
+  | McpEnableMessage
+  | McpDisableMessage
+  | ModelListMessage
+  | ModelSetMessage;
 
 export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
   onLaunch: (msg: LaunchMessage) => Promise<void>;
   onKill: (msg: KillMessage) => Promise<void>;
   onCompact: (msg: CompactMessage) => Promise<void>;
+  onMcpList: (msg: McpListMessage) => Promise<void>;
+  onMcpEnable: (msg: McpEnableMessage) => Promise<void>;
+  onMcpDisable: (msg: McpDisableMessage) => Promise<void>;
+  onModelList: (msg: ModelListMessage) => Promise<void>;
+  onModelSet: (msg: ModelSetMessage) => Promise<void>;
 }
 
 export interface PollerDeps {
@@ -150,6 +202,16 @@ export class Poller {
         await this.callbacks.onKill(msg);
       } else if (msg.commandType === "compact") {
         await this.callbacks.onCompact(msg);
+      } else if (msg.commandType === "mcp_list") {
+        await this.callbacks.onMcpList(msg);
+      } else if (msg.commandType === "mcp_enable") {
+        await this.callbacks.onMcpEnable(msg);
+      } else if (msg.commandType === "mcp_disable") {
+        await this.callbacks.onMcpDisable(msg);
+      } else if (msg.commandType === "model_list") {
+        await this.callbacks.onModelList(msg);
+      } else if (msg.commandType === "model_set") {
+        await this.callbacks.onModelSet(msg);
       } else {
         console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
         return;

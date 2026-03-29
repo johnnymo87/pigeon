@@ -83,4 +83,48 @@ export class OpencodeClient {
       throw new Error(`summarize failed (${res.status}): ${body}`);
     }
   }
+
+  async mcpStatus(): Promise<Record<string, { status: string; error?: string }>> {
+    const res = await this.fetchFn(`${this.baseUrl}/mcp`, {
+      method: "GET",
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`mcpStatus failed (${res.status}): ${body}`);
+    }
+    return res.json() as Promise<Record<string, { status: string; error?: string }>>;
+  }
+
+  async mcpConnect(name: string): Promise<boolean> {
+    const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`, {
+      method: "POST",
+    });
+    return res.ok;
+  }
+
+  async mcpDisconnect(name: string): Promise<boolean> {
+    const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`, {
+      method: "POST",
+    });
+    return res.ok;
+  }
+
+  async listProviders(): Promise<{
+    all: Array<{ id: string; models: Record<string, unknown> }>;
+    default: Record<string, string>;
+    connected: string[];
+  }> {
+    const res = await this.fetchFn(`${this.baseUrl}/provider`, {
+      method: "GET",
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`listProviders failed (${res.status}): ${body}`);
+    }
+    return res.json() as Promise<{
+      all: Array<{ id: string; models: Record<string, unknown> }>;
+      default: Record<string, string>;
+      connected: string[];
+    }>;
+  }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type CompactMessage } from "../src/worker/poller";
+import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -56,6 +56,64 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
     onLaunch: vi.fn().mockResolvedValue(undefined),
     onKill: vi.fn().mockResolvedValue(undefined),
     onCompact: vi.fn().mockResolvedValue(undefined),
+    onMcpList: vi.fn().mockResolvedValue(undefined),
+    onMcpEnable: vi.fn().mockResolvedValue(undefined),
+    onMcpDisable: vi.fn().mockResolvedValue(undefined),
+    onModelList: vi.fn().mockResolvedValue(undefined),
+    onModelSet: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
+
+function makeMcpListMsg(overrides?: Partial<McpListMessage>): McpListMessage {
+  return {
+    commandId: "cmd-5",
+    commandType: "mcp_list",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    ...overrides,
+  };
+}
+
+function makeMcpEnableMsg(overrides?: Partial<McpEnableMessage>): McpEnableMessage {
+  return {
+    commandId: "cmd-6",
+    commandType: "mcp_enable",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    serverName: "filesystem",
+    ...overrides,
+  };
+}
+
+function makeMcpDisableMsg(overrides?: Partial<McpDisableMessage>): McpDisableMessage {
+  return {
+    commandId: "cmd-7",
+    commandType: "mcp_disable",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    serverName: "filesystem",
+    ...overrides,
+  };
+}
+
+function makeModelListMsg(overrides?: Partial<ModelListMessage>): ModelListMessage {
+  return {
+    commandId: "cmd-8",
+    commandType: "model_list",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    ...overrides,
+  };
+}
+
+function makeModelSetMsg(overrides?: Partial<ModelSetMessage>): ModelSetMessage {
+  return {
+    commandId: "cmd-9",
+    commandType: "model_set",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    model: "anthropic/claude-3-5-sonnet",
     ...overrides,
   };
 }
@@ -524,5 +582,151 @@ describe("Poller.getConfiguredChatId()", () => {
     const { chatId: _chatId, ...configWithoutChatId } = BASE_CONFIG;
     const poller = new Poller(configWithoutChatId, makeCallbacks(), {});
     expect(poller.getConfiguredChatId()).toBeUndefined();
+  });
+});
+
+// ============================================================
+// New message type dispatch tests (MCP/Model)
+// ============================================================
+
+describe("Poller dispatch — mcp_list", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches mcp_list commands to onMcpList callback", async () => {
+    const msg = makeMcpListMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onMcpList).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onLaunch).not.toHaveBeenCalled();
+    expect(callbacks.onKill).not.toHaveBeenCalled();
+    expect(callbacks.onCompact).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
+describe("Poller dispatch — mcp_enable", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches mcp_enable commands to onMcpEnable callback", async () => {
+    const msg = makeMcpEnableMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onMcpEnable).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onLaunch).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
+describe("Poller dispatch — mcp_disable", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches mcp_disable commands to onMcpDisable callback", async () => {
+    const msg = makeMcpDisableMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onMcpDisable).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onMcpEnable).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
+describe("Poller dispatch — model_list", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches model_list commands to onModelList callback", async () => {
+    const msg = makeModelListMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onModelList).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onMcpList).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
+describe("Poller dispatch — model_set", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches model_set commands to onModelSet callback", async () => {
+    const msg = makeModelSetMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onModelSet).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onModelList).not.toHaveBeenCalled();
+    poller.stop();
   });
 });
