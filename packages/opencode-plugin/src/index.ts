@@ -139,13 +139,21 @@ const plugin: Plugin = async (ctx) => {
             serverUrl: String(ctx.serverUrl),
             replyUrl: replyUrl.toString(),
             questionRequestId: request.questionRequestId,
+            directory: ctx.directory,
           })
           // Build a Request object — the in-process Hono fetch expects
           // a Request, not a bare URL object.
+          // CRITICAL: include x-opencode-directory so the server resolves
+          // the correct Instance context (where the pending question lives).
+          // Without this, opencode serve falls back to process.cwd() which
+          // is the wrong project, causing "reply for unknown request".
           const res = await internalFetch(
             new Request(replyUrl.toString(), {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                "x-opencode-directory": ctx.directory,
+              },
               body: JSON.stringify({ answers: request.answers }),
               signal: AbortSignal.timeout(10_000),
             }),
