@@ -632,4 +632,283 @@ describe("ingestWorkerCommand", () => {
     expect(storage.sessions.get("sess-biz-error")).not.toBeNull();
     storage.db.close();
   });
+
+  describe("multi-question wizard routing", () => {
+    const twoQuestions = [
+      {
+        question: "Q1",
+        header: "H1",
+        options: [
+          { label: "A", description: "" },
+          { label: "B", description: "" },
+        ],
+      },
+      {
+        question: "Q2",
+        header: "H2",
+        options: [
+          { label: "X", description: "" },
+          { label: "Y", description: "" },
+        ],
+      },
+    ];
+
+    function makeWizardStorage(sessionId: string) {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+      return { storage, now };
+    }
+
+    it("routes v0:q1 to advance wizard from step 0 to step 1", async () => {
+      const { storage, now } = makeWizardStorage("sess-wiz-1");
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-1",
+        requestId: "req-wiz-1",
+        questions: twoQuestions,
+        token: "tok-wiz-1",
+      }, now);
+
+      const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
+      let deliverQuestionReplyCalled = false;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-wiz-1", sessionId: "sess-wiz-1", command: "v0:q1", chatId: "1" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              deliverQuestionReplyCalled = true;
+              return { ok: true as const };
+            },
+          }),
+          editNotification: async (notificationId, text, replyMarkup) => {
+            editCalls.push({ notificationId, text, replyMarkup });
+            return { ok: true };
+          },
+        },
+      );
+
+      // Verify wizard advanced: currentStep=1, answers=[["B"]], version=1
+      const updated = storage.pendingQuestions.getBySessionId("sess-wiz-1");
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["B"]]);
+      expect(updated!.version).toBe(1);
+
+      // editNotification called with "Question 2 of 2" text
+      expect(editCalls).toHaveLength(1);
+      expect(editCalls[0]!.text).toContain("Question 2 of 2");
+
+      // adapter.deliverQuestionReply NOT called yet
+      expect(deliverQuestionReplyCalled).toBe(false);
+
+      // inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("routes v1:q0 on final step to deliver all answers to opencode", async () => {
+      const { storage, now } = makeWizardStorage("sess-wiz-2");
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-2",
+        requestId: "req-wiz-2",
+        questions: twoQuestions,
+        token: "tok-wiz-2",
+      }, now);
+
+      // Advance to step 1 manually (simulates answering Q1 with "A")
+      storage.pendingQuestions.advanceStep("sess-wiz-2", ["A"]);
+
+      const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
+      let capturedReply: QuestionReplyInput | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-wiz-2", sessionId: "sess-wiz-2", command: "v1:q0", chatId: "1" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+          editNotification: async (notificationId, text, replyMarkup) => {
+            editCalls.push({ notificationId, text, replyMarkup });
+            return { ok: true };
+          },
+        },
+      );
+
+      // adapter.deliverQuestionReply called with answers: [["A"], ["X"]]
+      expect(capturedReply).not.toBeNull();
+      expect(capturedReply!.answers).toEqual([["A"], ["X"]]);
+      expect(capturedReply!.questionRequestId).toBe("req-wiz-2");
+
+      // pendingQuestion deleted
+      expect(storage.pendingQuestions.getBySessionId("sess-wiz-2")).toBeNull();
+
+      // editNotification called with "All answers submitted" text
+      expect(editCalls).toHaveLength(1);
+      expect(editCalls[0]!.text).toContain("All answers submitted");
+
+      // inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("ignores stale version (v0 when wizard is at v1)", async () => {
+      const { storage, now } = makeWizardStorage("sess-wiz-3");
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-3",
+        requestId: "req-wiz-3",
+        questions: twoQuestions,
+        token: "tok-wiz-3",
+      }, now);
+
+      // Advance to step 1 (version=1)
+      storage.pendingQuestions.advanceStep("sess-wiz-3", ["A"]);
+
+      let adapterCalled = false;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-wiz-3", sessionId: "sess-wiz-3", command: "v0:q0", chatId: "1" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              adapterCalled = true;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // pendingQuestion unchanged (still step 1, version 1)
+      const unchanged = storage.pendingQuestions.getBySessionId("sess-wiz-3");
+      expect(unchanged).not.toBeNull();
+      expect(unchanged!.currentStep).toBe(1);
+      expect(unchanged!.version).toBe(1);
+
+      // adapter NOT called
+      expect(adapterCalled).toBe(false);
+
+      // inbox marked done (acked, not retried)
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("routes custom text reply as answer for current wizard step", async () => {
+      const { storage, now } = makeWizardStorage("sess-wiz-4");
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-4",
+        requestId: "req-wiz-4",
+        questions: twoQuestions,
+        token: "tok-wiz-4",
+      }, now);
+
+      const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-wiz-4", sessionId: "sess-wiz-4", command: "Use MongoDB", chatId: "1" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() { return { ok: true as const }; },
+          }),
+          editNotification: async (notificationId, text, replyMarkup) => {
+            editCalls.push({ notificationId, text, replyMarkup });
+            return { ok: true };
+          },
+        },
+      );
+
+      // wizard advanced: currentStep=1, answers=[["Use MongoDB"]]
+      const updated = storage.pendingQuestions.getBySessionId("sess-wiz-4");
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["Use MongoDB"]]);
+
+      // editNotification called
+      expect(editCalls).toHaveLength(1);
+      expect(editCalls[0]!.text).toContain("Question 2 of 2");
+
+      storage.db.close();
+    });
+
+    it("single-question still works with legacy q0 format", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-wiz-legacy",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-legacy",
+        requestId: "req-wiz-legacy",
+        questions: [{
+          question: "Q1",
+          header: "H1",
+          options: [
+            { label: "A", description: "" },
+            { label: "B", description: "" },
+          ],
+        }],
+      }, now);
+
+      let capturedReply: QuestionReplyInput | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-wiz-legacy", sessionId: "sess-wiz-legacy", command: "q0", chatId: "1" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // adapter.deliverQuestionReply called with answers: [["A"]]
+      expect(capturedReply).not.toBeNull();
+      expect(capturedReply!.answers).toEqual([["A"]]);
+      expect(capturedReply!.questionRequestId).toBe("req-wiz-legacy");
+
+      // pendingQuestion deleted
+      expect(storage.pendingQuestions.getBySessionId("sess-wiz-legacy")).toBeNull();
+
+      storage.db.close();
+    });
+  });
 });

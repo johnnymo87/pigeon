@@ -11,6 +11,7 @@ import {
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "../opencode-direct/contracts";
 import type { ExecuteMessage } from "./poller";
+import { formatQuestionWizardStep } from "../notification-service";
 
 export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
@@ -31,9 +32,14 @@ export interface WorkerCommandIngestOptions {
   apiKey?: string;
   /** Override fetch for testing */
   fetchFn?: typeof fetch;
+  /** Edit an existing Telegram notification (for wizard step transitions) */
+  editNotification?: (notificationId: string, text: string, replyMarkup: unknown) => Promise<{ ok: boolean }>;
+  /** Machine ID for formatting wizard steps */
+  machineId?: string;
 }
 
 const QUESTION_OPTION_RE = /^q(\d+)$/;
+const WIZARD_OPTION_RE = /^v(\d+):q(\d+)$/;
 
 function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   const command = msg.command.trim();
@@ -94,22 +100,112 @@ export async function ingestWorkerCommand(
   if (pendingQuestion) {
     console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
     const command = msg.command.trim();
-    const optionMatch = QUESTION_OPTION_RE.exec(command);
+    const wizardMatch = WIZARD_OPTION_RE.exec(command);
+    const legacyMatch = !wizardMatch ? QUESTION_OPTION_RE.exec(command) : null;
+    const isWizard = pendingQuestion.questions.length > 1;
 
-    let answers: string[][];
-    if (optionMatch) {
-      const index = Number(optionMatch[1]);
-      const firstQuestion = pendingQuestion.questions[0];
-      if (!firstQuestion || index >= firstQuestion.options.length) {
-        console.warn(`[command-ingest] invalid option index ${index} for commandId=${commandId}`);
-        // Permanent failure: bad input, ack and move on
+    // Validate wizard version if wizard match found and this is a wizard question
+    if (wizardMatch && isWizard) {
+      const incomingVersion = Number(wizardMatch[1]);
+      if (incomingVersion !== pendingQuestion.version) {
+        console.log(`[command-ingest] stale wizard version incoming=${incomingVersion} current=${pendingQuestion.version} commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
         return;
       }
-      answers = [[firstQuestion.options[index]!.label]];
+    }
+
+    // Determine which question we're answering (current step for wizard, first for single)
+    const currentQuestion = isWizard
+      ? pendingQuestion.questions[pendingQuestion.currentStep]
+      : pendingQuestion.questions[0];
+
+    // Resolve the step answer
+    let stepAnswer: string;
+    if (wizardMatch || legacyMatch) {
+      // Option button press
+      const match = wizardMatch ?? legacyMatch!;
+      const optionIndexStr = wizardMatch ? wizardMatch[2] : match[1];
+      const index = Number(optionIndexStr);
+      if (!currentQuestion || index >= currentQuestion.options.length) {
+        console.warn(`[command-ingest] invalid option index ${index} for commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
+        return;
+      }
+      stepAnswer = currentQuestion.options[index]!.label;
     } else {
       // Custom text answer
-      answers = [[command]];
+      stepAnswer = command;
     }
+
+    if (isWizard) {
+      const isLastStep = pendingQuestion.currentStep === pendingQuestion.questions.length - 1;
+
+      if (!isLastStep) {
+        // Advance wizard to next step
+        const updated = storage.pendingQuestions.advanceStep(msg.sessionId, [stepAnswer]);
+        if (!updated) {
+          console.warn(`[command-ingest] wizard advance failed commandId=${commandId}`);
+          storage.inbox.markDone(commandId);
+          return;
+        }
+
+        // Format next step
+        const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
+        const label = session.label || session.sessionId.slice(0, 8);
+        const { text, replyMarkup } = formatQuestionWizardStep({
+          label,
+          questions: pendingQuestion.questions,
+          currentStep: updated.currentStep,
+          cwd: session.cwd,
+          token: pendingQuestion.token ?? "",
+          version: updated.version,
+          sessionId: msg.sessionId,
+          machineId: options.machineId,
+        });
+
+        await options.editNotification?.(notificationId, text, replyMarkup);
+
+        console.log(`[command-ingest] wizard advanced to step ${updated.currentStep} commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
+        return;
+      }
+
+      // Final step: collect all answers and deliver to opencode
+      const allAnswers = [...pendingQuestion.answers, [stepAnswer]];
+
+      const adapter = options.createAdapter
+        ? options.createAdapter(session)
+        : selectAdapter(session);
+
+      if (!adapter || !adapter.deliverQuestionReply) {
+        console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
+        return;
+      }
+
+      const result = await adapter.deliverQuestionReply(
+        session,
+        { questionRequestId: pendingQuestion.requestId, answers: allAnswers },
+        { commandId, chatId: msg.chatId },
+      );
+
+      if (result.ok) {
+        console.log(`[command-ingest] wizard complete, all answers delivered commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
+        storage.pendingQuestions.delete(msg.sessionId);
+
+        const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
+        await options.editNotification?.(notificationId, "All answers submitted ✅", { inline_keyboard: [] });
+        return;
+      }
+
+      console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
+      storage.inbox.markDone(commandId);
+      return;
+    }
+
+    // Single-question path (existing behavior)
+    const answers: string[][] = [[stepAnswer]];
 
     const adapter = options.createAdapter
       ? options.createAdapter(session)
