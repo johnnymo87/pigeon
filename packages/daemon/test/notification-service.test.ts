@@ -230,23 +230,62 @@ describe("formatQuestionNotification", () => {
     expect(result.replyMarkup.inline_keyboard[1]![0]!.callback_data).toBe("cmd:tok-wrap:q3");
   });
 
-  it("hides buttons for multi-question requests", () => {
+  it("renders all questions for multi-question requests (no buttons)", () => {
     const result = formatQuestionNotification({
       label: "test",
       questions: [
-        { question: "Q1", header: "H1", options: [{ label: "A", description: "" }] },
-        { question: "Q2", header: "H2", options: [{ label: "B", description: "" }] },
+        { question: "Q1 text", header: "H1", options: [{ label: "A", description: "desc A" }] },
+        { question: "Q2 text", header: "H2", options: [{ label: "B", description: "desc B" }] },
       ],
       cwd: "/tmp",
       token: "tok-multi",
       sessionId: "sess-multi",
     });
 
-    // Shows only first question
-    expect(result.text).toContain("Q1");
-    expect(result.text).toContain("+1 more question");
-    // No inline buttons for multi-question
+    // Shows BOTH questions with (X/N) prefix
+    expect(result.text).toContain("(1/2) *H1*");
+    expect(result.text).toContain("Q1 text");
+    expect(result.text).toContain("A");
+    expect(result.text).toContain("(2/2) *H2*");
+    expect(result.text).toContain("Q2 text");
+    expect(result.text).toContain("B");
+    // Fallback hint
+    expect(result.text).toContain("answer in app");
+    // No inline buttons for multi-question (wizard will change this later)
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
+  });
+
+  it("emits (X/N) ordinal prefix even when multi-question has no header", () => {
+    const result = formatQuestionNotification({
+      label: "test",
+      questions: [
+        { question: "Q1 text", header: "", options: [] },
+        { question: "Q2 text", header: "", options: [] },
+      ],
+      cwd: "/tmp",
+      token: "tok-noheader",
+      sessionId: "sess-noheader",
+    });
+
+    expect(result.text).toContain("(1/2)");
+    expect(result.text).toContain("(2/2)");
+    expect(result.text).toContain("Q1 text");
+    expect(result.text).toContain("Q2 text");
+  });
+
+  it("shows swipe-reply hint when any question in multi-question allows custom", () => {
+    const result = formatQuestionNotification({
+      label: "test",
+      questions: [
+        { question: "Q1", header: "H1", options: [], custom: false },
+        { question: "Q2", header: "H2", options: [] }, // custom defaults to true
+      ],
+      cwd: "/tmp",
+      token: "tok-multicustom",
+      sessionId: "sess-multicustom",
+    });
+
+    expect(result.text).toContain("Swipe-reply");
   });
 
   it("hides swipe-reply hint when custom=false", () => {

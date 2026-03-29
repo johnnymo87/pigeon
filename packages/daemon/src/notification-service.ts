@@ -115,6 +115,7 @@ export function formatQuestionNotification(input: {
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
+  // firstQuestion is still used below for: single-question button generation
   const firstQuestion = input.questions[0];
 
   const lines = [
@@ -122,24 +123,33 @@ export function formatQuestionNotification(input: {
     "",
   ];
 
-  if (firstQuestion) {
-    if (firstQuestion.header) {
-      lines.push(`*${escapeMarkdown(firstQuestion.header)}*`);
-    }
-    lines.push(escapeMarkdown(firstQuestion.question));
+  const isMulti = input.questions.length > 1;
 
-    if (firstQuestion.options.length > 0) {
+  input.questions.forEach((q, idx) => {
+    if (idx > 0) {
       lines.push("");
-      firstQuestion.options.forEach((opt, i) => {
+    }
+    if (q.header) {
+      lines.push(isMulti
+        ? `(${idx + 1}/${input.questions.length}) *${escapeMarkdown(q.header)}*`
+        : `*${escapeMarkdown(q.header)}*`);
+    } else if (isMulti) {
+      lines.push(`(${idx + 1}/${input.questions.length})`);
+    }
+    lines.push(escapeMarkdown(q.question));
+
+    if (q.options.length > 0) {
+      lines.push("");
+      q.options.forEach((opt, i) => {
         const desc = opt.description ? ` — ${escapeMarkdown(opt.description)}` : "";
         lines.push(`${i + 1}\\. ${escapeMarkdown(opt.label)}${desc}`);
       });
     }
-  }
+  });
 
-  if (input.questions.length > 1) {
+  if (isMulti) {
     lines.push("");
-    lines.push(`_\\+${input.questions.length - 1} more question(s) — answer in app_`);
+    lines.push(`_answer in app or wait for wizard buttons_`);
   }
 
   let questionInfoLine = `📂 \`${cwdShort}\``;
@@ -150,7 +160,7 @@ export function formatQuestionNotification(input: {
   lines.push(questionInfoLine);
   lines.push(`🆔 \`${input.sessionId}\``);
 
-  const hasCustom = firstQuestion?.custom !== false;
+  const hasCustom = input.questions.some(q => q.custom !== false);
   if (hasCustom) {
     lines.push("");
     lines.push("↩️ _Swipe-reply for custom answer_");
