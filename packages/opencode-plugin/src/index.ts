@@ -93,14 +93,25 @@ const plugin: Plugin = async (ctx) => {
             parts.push({ type: "text", text: "" })
           }
 
+          const modelOverride = request.metadata?.model as string | undefined
+
+          const promptBody: Record<string, unknown> = {
+            parts,
+            noReply: false,
+          }
+
+          if (modelOverride) {
+            const slashIndex = modelOverride.indexOf("/")
+            const providerID = slashIndex >= 0 ? modelOverride.slice(0, slashIndex) : modelOverride
+            const modelID = slashIndex >= 0 ? modelOverride.slice(slashIndex + 1) : ""
+            promptBody.model = { providerID, modelID }
+          }
+
           const res = await internalFetch(
             new Request(promptUrl.toString(), {
               method: "POST",
               headers,
-              body: JSON.stringify({
-                parts,
-                noReply: false,
-              }),
+              body: JSON.stringify(promptBody),
               signal: AbortSignal.timeout(10_000),
             }),
           )

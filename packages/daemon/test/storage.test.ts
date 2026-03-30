@@ -185,6 +185,51 @@ describe("storage schema and repositories", () => {
     storage.db.close();
   });
 
+  describe("SessionRepository model override", () => {
+    it("setModelOverride stores a model override for a session", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({ sessionId: "sess-model", notify: false }, 1_000);
+
+      storage.sessions.setModelOverride("sess-model", "anthropic/claude-opus-4-6");
+
+      const model = storage.sessions.getModelOverride("sess-model");
+      expect(model).toBe("anthropic/claude-opus-4-6");
+
+      storage.db.close();
+    });
+
+    it("getModelOverride returns null when no override is set", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({ sessionId: "sess-no-model", notify: false }, 1_000);
+
+      const model = storage.sessions.getModelOverride("sess-no-model");
+      expect(model).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("getModelOverride returns null for non-existent session", () => {
+      const storage = createStorage();
+
+      const model = storage.sessions.getModelOverride("nonexistent-session");
+      expect(model).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("setModelOverride can update an existing model override", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({ sessionId: "sess-update-model", notify: false }, 1_000);
+
+      storage.sessions.setModelOverride("sess-update-model", "anthropic/claude-sonnet-4-5");
+      storage.sessions.setModelOverride("sess-update-model", "openai/gpt-4o");
+
+      expect(storage.sessions.getModelOverride("sess-update-model")).toBe("openai/gpt-4o");
+
+      storage.db.close();
+    });
+  });
+
   describe("PendingQuestionRepository wizard state", () => {
     const q1 = { question: "Which DB?", header: "DB", options: [{ label: "PostgreSQL", description: "Relational" }] };
     const q2 = { question: "Which ORM?", header: "ORM", options: [{ label: "Prisma", description: "TypeScript ORM" }] };

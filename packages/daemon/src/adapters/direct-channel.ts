@@ -41,6 +41,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         ...(context.chatId !== undefined
           ? { chatId: String(context.chatId) }
           : {}),
+        ...(context.modelOverride ? { modelOverride: context.modelOverride } : {}),
         ...(context.media ? { media: context.media } : {}),
       },
       this.deps,

@@ -15,6 +15,8 @@ import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
+import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
+import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { startSessionReaper } from "./session-reaper";
 
 const config = loadConfig();
@@ -102,19 +104,42 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onMcpList: async (msg) => {
-          console.warn("[pigeon-daemon] received mcp_list command but handler not yet implemented", msg.commandId);
+          if (!opencodeClient) { console.warn("[index] onMcpList: no opencodeClient configured"); return; }
+          await ingestMcpListCommand({
+            commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
+            machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
+          });
         },
         onMcpEnable: async (msg) => {
-          console.warn("[pigeon-daemon] received mcp_enable command but handler not yet implemented", msg.commandId);
+          if (!opencodeClient) { console.warn("[index] onMcpEnable: no opencodeClient configured"); return; }
+          await ingestMcpEnableCommand({
+            commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
+            serverName: msg.serverName, machineId: config.machineId, opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
         },
         onMcpDisable: async (msg) => {
-          console.warn("[pigeon-daemon] received mcp_disable command but handler not yet implemented", msg.commandId);
+          if (!opencodeClient) { console.warn("[index] onMcpDisable: no opencodeClient configured"); return; }
+          await ingestMcpDisableCommand({
+            commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
+            serverName: msg.serverName, machineId: config.machineId, opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
         },
         onModelList: async (msg) => {
-          console.warn("[pigeon-daemon] received model_list command but handler not yet implemented", msg.commandId);
+          if (!opencodeClient) { console.warn("[index] onModelList: no opencodeClient configured"); return; }
+          await ingestModelListCommand({
+            commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
+            machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
+          });
         },
         onModelSet: async (msg) => {
-          console.warn("[pigeon-daemon] received model_set command but handler not yet implemented", msg.commandId);
+          if (!opencodeClient) { console.warn("[index] onModelSet: no opencodeClient configured"); return; }
+          await ingestModelSetCommand({
+            commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
+            model: msg.model, machineId: config.machineId, opencodeClient,
+            storage, sendTelegramReply: sendTelegramMessage,
+          });
         },
       },
     )

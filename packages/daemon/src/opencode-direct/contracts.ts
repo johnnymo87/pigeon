@@ -55,6 +55,7 @@ export interface ExecuteCommandEnvelope {
     chatId?: string;
     replyToMessageId?: string;
     replyToken?: string;
+    model?: string;
   };
   media?: {
     mime: string;

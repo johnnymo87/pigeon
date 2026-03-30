@@ -176,6 +176,19 @@ export class SessionRepository {
     return result.changes > 0;
   }
 
+  setModelOverride(sessionId: string, model: string): void {
+    this.db
+      .prepare("UPDATE sessions SET model_override = ? WHERE session_id = ?")
+      .run(model, sessionId);
+  }
+
+  getModelOverride(sessionId: string): string | null {
+    const row = this.db
+      .prepare("SELECT model_override FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { model_override: string | null } | null;
+    return row?.model_override ?? null;
+  }
+
   cleanupExpired(now = Date.now()): number {
     const result = this.db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now);
     return result.changes;

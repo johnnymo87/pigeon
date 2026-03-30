@@ -333,9 +333,12 @@ async function deliverViaAdapter(
   storage: StorageDb,
   media?: CommandDeliveryContext["media"],
 ): Promise<void> {
+  const modelOverride = storage.sessions.getModelOverride(session.sessionId) ?? undefined;
+
   const result = await adapter.deliverCommand(session, msg.command, {
     commandId,
     chatId: msg.chatId,
+    ...(modelOverride ? { modelOverride } : {}),
     ...(media ? { media } : {}),
   });
 

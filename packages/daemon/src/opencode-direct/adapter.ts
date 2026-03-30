@@ -24,6 +24,7 @@ export interface OpencodeDirectExecuteInput {
   chatId?: string;
   replyToMessageId?: string;
   replyToken?: string;
+  modelOverride?: string;
   deadlineMs?: number;
   timeoutMs?: number;
   maxRetries?: number;
@@ -68,6 +69,7 @@ function buildExecuteEnvelope(input: OpencodeDirectExecuteInput, now: () => numb
       ...(input.chatId ? { chatId: input.chatId } : {}),
       ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
       ...(input.replyToken ? { replyToken: input.replyToken } : {}),
+      ...(input.modelOverride ? { model: input.modelOverride } : {}),
     },
     ...(input.media ? { media: input.media } : {}),
   };

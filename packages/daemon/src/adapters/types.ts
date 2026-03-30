@@ -15,6 +15,7 @@ export interface QuestionReplyInput {
 export interface CommandDeliveryContext {
   commandId: string;
   chatId?: string | number;
+  modelOverride?: string;
   media?: {
     mime: string;
     filename: string;

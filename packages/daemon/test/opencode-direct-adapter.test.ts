@@ -277,6 +277,89 @@ describe("executeViaOpencodeDirectChannel", () => {
     expect(result.error).toContain("correlation mismatch");
   });
 
+  it("includes model in envelope metadata when modelOverride is provided", async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+
+    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        ack: {
+          type: OpencodeDirectMessageType.Ack,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "req-model",
+          commandId: "cmd-model",
+          sessionId: "sess-model",
+          accepted: true,
+          acceptedAt: Date.now(),
+        },
+        result: {
+          type: OpencodeDirectMessageType.Result,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "req-model",
+          commandId: "cmd-model",
+          sessionId: "sess-model",
+          success: true,
+          finishedAt: Date.now(),
+          output: "ok",
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await executeViaOpencodeDirectChannel(
+      {
+        requestId: "req-model",
+        commandId: "cmd-model",
+        sessionId: "sess-model",
+        command: "do something",
+        endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        authToken: "tok",
+        modelOverride: "anthropic/claude-opus-4-6",
+      },
+      { fetchFn: fetchFn as unknown as typeof fetch },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(capturedBody).not.toBeNull();
+    const body = capturedBody as Record<string, unknown> | null;
+    const metadata = body?.metadata as Record<string, unknown> | undefined;
+    expect(metadata?.model).toBe("anthropic/claude-opus-4-6");
+  });
+
+  it("does not include model in envelope metadata when modelOverride is absent", async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+
+    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        ack: {
+          type: OpencodeDirectMessageType.Ack,
+          version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+          requestId: "req-no-model",
+          commandId: "cmd-no-model",
+          sessionId: "sess-no-model",
+          accepted: true,
+          acceptedAt: Date.now(),
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    await executeViaOpencodeDirectChannel(
+      {
+        requestId: "req-no-model",
+        commandId: "cmd-no-model",
+        sessionId: "sess-no-model",
+        command: "echo hi",
+        endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        authToken: "tok",
+      },
+      { fetchFn: fetchFn as unknown as typeof fetch },
+    );
+
+    const body = capturedBody as Record<string, unknown> | null;
+    const metadata = body?.metadata as Record<string, unknown> | undefined;
+    expect(metadata?.model).toBeUndefined();
+  });
+
   it("includes media field in envelope POSTed to plugin", async () => {
     let capturedBody: Record<string, unknown> | null = null;
 
