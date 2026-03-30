@@ -23,6 +23,7 @@ type FileMedia = {
 
 type NotifyStopOpts = {
   sessionId: string
+  event?: string
   message: string
   label: string
   media?: FileMedia[]
@@ -152,7 +153,7 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: opts.sessionId,
-          event: "Stop",
+          event: opts.event ?? "Stop",
           message: opts.message,
           label: opts.label,
           ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),

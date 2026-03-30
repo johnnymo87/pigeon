@@ -512,6 +512,37 @@ const plugin: Plugin = async (ctx) => {
           return
         }
 
+        if (eventType === "session.status") {
+          const sessionID = props?.sessionID as string | undefined
+          const status = props?.status as { type?: string; attempt?: number; message?: string; next?: number } | undefined
+
+          if (!sessionID || !status || status.type !== "retry") return
+
+          // Only notify for main sessions that are registered
+          await sessionManager.awaitRegistration(sessionID)
+          if (
+            !sessionManager.isMainSession(sessionID) ||
+            !sessionManager.isRegistered(sessionID)
+          ) return
+
+          const retryMsg = `Retry #${status.attempt ?? "?"}: ${status.message ?? "unknown error"}`
+          const nextAt = status.next ? new Date(status.next).toLocaleTimeString() : "unknown"
+          log("session retry detected", { sessionID, attempt: status.attempt, message: status.message, next: nextAt })
+
+          notifyStop({
+            sessionId: sessionID,
+            event: "Retry",
+            message: `${retryMsg}\nNext attempt at ${nextAt}`,
+            label,
+            daemonUrl,
+            log,
+          }).catch((err) => {
+            log("retry notification error:", serializeError(err))
+          })
+
+          return
+        }
+
         if (eventType === "question.replied" || eventType === "question.rejected") {
           const sessionID = props?.sessionID as string | undefined
 
