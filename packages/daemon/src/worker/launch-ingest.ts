@@ -36,7 +36,7 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
     await sendTelegramReply(
       chatId,
-      `Session started${machineLabel}: \`${session.id}\`\nDirectory: \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,
+      `Session started${machineLabel}:\n🆔 \`${session.id}\`\n📂 \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -36,7 +36,7 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
     if (!lastUserMessage) {
       await sendTelegramReply(
         chatId,
-        `No user messages found in session \`${sessionId}\`. Cannot determine model for compaction.`,
+        `No user messages found. Cannot determine model for compaction.\n🆔 \`${sessionId}\``,
       );
       return;
     }
