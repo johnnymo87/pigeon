@@ -44,6 +44,45 @@ describe("ingestLaunchCommand", () => {
       );
     });
 
+    it("expands a single word directory to ~/projects/<word>", async () => {
+      const input = makeInput({ directory: "pigeon" });
+
+      await ingestLaunchCommand(input);
+
+      const homeDir = require("os").homedir();
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith(`${homeDir}/projects/pigeon`);
+      expect(input.opencodeClient.sendPrompt).toHaveBeenCalledWith(
+        "sess-123",
+        `${homeDir}/projects/pigeon`,
+        "Write a hello world program",
+      );
+    });
+
+    it("does not expand multi-word paths containing slashes", async () => {
+      const input = makeInput({ directory: "foo/bar" });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith("foo/bar");
+    });
+
+    it("does not expand absolute paths", async () => {
+      const input = makeInput({ directory: "/opt/myproject" });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith("/opt/myproject");
+    });
+
+    it("does not expand tilde paths as shorthand", async () => {
+      const input = makeInput({ directory: "~/myproject" });
+
+      await ingestLaunchCommand(input);
+
+      const homeDir = require("os").homedir();
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith(`${homeDir}/myproject`);
+    });
+
     it("sends the prompt to the created session with directory and prompt", async () => {
       const input = makeInput();
 

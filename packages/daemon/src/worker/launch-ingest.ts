@@ -2,6 +2,12 @@ import os from "os";
 import type { OpencodeClient } from "../opencode-client";
 import type { LaunchMessage } from "./poller";
 
+/** Treat a bare word (no slashes, no ~) as ~/projects/<word>. */
+function expandShorthand(dir: string): string {
+  if (!dir.includes("/") && !dir.startsWith("~")) return `~/projects/${dir}`;
+  return dir;
+}
+
 /** Resolve leading `~` or `~/` to the user's home directory. */
 function resolveHome(dir: string): string {
   if (dir === "~") return os.homedir();
@@ -21,7 +27,7 @@ export interface LaunchCommandInput {
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
   const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply } = input;
-  const directory = resolveHome(input.directory);
+  const directory = resolveHome(expandShorthand(input.directory));
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   const healthy = await opencodeClient.healthCheck();
