@@ -45,7 +45,7 @@ Expected: HTTP `200`
    - wrong secret -> `401`
    - correct secret -> `200`
 4. Confirm notification path with a test session.
-5. Confirm WebSocket clients are connected (if command delivery issues).
+5. Confirm daemon is polling (check `machines` table for recent `last_poll_at`).
 
 ## Logs
 
@@ -88,7 +88,7 @@ Then:
 ## Guardrails
 
 - Do not rotate secrets during active incidents unless confirmed compromised.
-- Keep DO class compatibility (`RouterDO`) intact across deploys.
+- Keep D1 schema migrations backward-compatible across deploys.
 - Prefer reading secrets from `/run/secrets/` files over manual exports or shell history.
 
 ## Verify

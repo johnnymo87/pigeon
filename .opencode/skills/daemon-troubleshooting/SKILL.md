@@ -31,7 +31,7 @@ curl -s http://127.0.0.1:4731/health
 - stop notifications not sent
     - notifier configuration missing or sops secret decryption failure
 - reply commands not injected
-  - no WS command delivery or invalid transport metadata
+  - adapter delivery failure or invalid transport metadata (check `backend_endpoint` on session)
 - repeated command processing
   - inspect `inbox` status transitions and ack handling
 

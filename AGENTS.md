@@ -34,17 +34,29 @@ Telegram → Webhook → Worker → D1 (SQLite)
 
 Messages flow: Telegram → Worker (Cloudflare) → D1 ← Daemon (polls every 5s) → opencode serve.
 
-The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon short-polls for commands via HTTP. No WebSocket, no Durable Objects, no long-lived connections. If the worker restarts, the next poll succeeds against the new instance. If the daemon restarts, pending commands wait in D1 until it comes back.
+The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon short-polls for commands via HTTP. No long-lived connections. If the worker restarts, the next poll succeeds against the new instance. If the daemon restarts, pending commands wait in D1 until it comes back.
 
 **Future improvement (noted, not planned):** Long polling at the Worker level (`GET /machines/:id/next?timeout=25`) to reduce polling traffic. Not needed at current scale. See [design doc](docs/plans/2026-03-14-d1-polling-architecture-design.md).
+
+### Model Override
+
+The `/model` command sets a per-session model override stored in the daemon's SQLite `sessions` table. When a command is delivered, the override is read and passed through the adapter to the plugin, which includes it in the `prompt_async` request body. The override persists until the session ends or a new `/model` command changes it.
 
 ### Commands
 
 | Command | Example | What it does |
 |---------|---------|--------------|
 | *(plain message)* | `fix the failing test in src/auth.ts` | Executes in the current opencode TUI session via the plugin |
-| `/launch <machine> <dir> <prompt>` | `/launch devbox ~/projects/pigeon "say hello"` | Starts a headless opencode session on the specified machine |
+| `/launch <machine> <dir> <prompt>` | `/launch devbox pigeon "say hello"` | Starts a headless opencode session on the specified machine |
 | `/kill <session-id>` | `/kill sess-abc123` | Terminates a headless session (machine looked up automatically) |
+| `/compact` | *(reply to a session notification)* | Summarizes (compacts) the session's conversation to reduce context |
+| `/mcp list <session-id>` | `/mcp list sess-abc123` | Lists MCP servers with connection status |
+| `/mcp enable <server> <session-id>` | `/mcp enable slack sess-abc123` | Connects (or reconnects) an MCP server |
+| `/mcp disable <server> <session-id>` | `/mcp disable slack sess-abc123` | Disconnects an MCP server |
+| `/model <session-id>` | `/model sess-abc123` | Lists available models from allowed providers |
+| `/model <provider/model> <session-id>` | `/model anthropic/claude-sonnet-4-20250514 sess-abc123` | Sets model override for the session |
+
+**`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 
 ### Attaching to a headless session
 
@@ -60,7 +72,15 @@ The session ID is included in the Telegram confirmation message.
 
 Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name. Each notification includes the session ID on its own line for easy copy-paste.
 
-**Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout. The daemon accepts the question durably (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers the notification to Telegram every 5s, retrying with backoff on failure. The worker deduplicates notifications by `notificationId` so retries are safe.
+**Durable notification delivery:** Both stop and question notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
+
+**Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
+
+**Multi-question wizard:** When a question has multiple sub-questions, the daemon renders them one at a time in a single Telegram message that is edited in-place as the user answers each step. Button callbacks include a version number (`cmd:TOKEN:v{version}:q{index}`) to prevent stale presses. On the final step, all accumulated answers are delivered to the plugin as a single reply.
+
+**Rate limit retry notifications:** When OpenCode hits a rate limit and retries, the plugin detects `session.status` events of type `"retry"` and sends a notification with the attempt number, error message, and next retry time.
+
+**Message splitting:** When a notification body exceeds Telegram's 4096-character limit, it is split into multiple messages at natural boundaries (paragraph breaks, line breaks, sentence ends). Reply markup is attached only to the last chunk.
 
 ### Media Relay
 
@@ -70,6 +90,14 @@ Photos, documents, audio, video, and voice messages sent to the Telegram bot are
 - **Outbound**: OpenCode file attachments → Plugin (captures FileParts and tool attachments) → Daemon (uploads to R2) → Worker (sends as `sendPhoto`/`sendDocument` reply in Telegram)
 
 Media is stored temporarily in the `pigeon-media` R2 bucket with a 24-hour TTL, cleaned hourly by cron.
+
+### Session Reaper
+
+A background hourly timer in the daemon cleans up stale sessions. Sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week) are deleted from opencode serve, removed from local storage, and unregistered from the worker.
+
+### Dead Session Cleanup
+
+When command delivery fails with a connection error (ECONNREFUSED, timeout, etc.), the daemon automatically removes the session from local storage. This prevents repeated delivery attempts to a dead plugin process.
 
 Health check URLs are listed in the Quickstart section above.
 

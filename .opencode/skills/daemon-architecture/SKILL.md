@@ -34,8 +34,9 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `session_tokens`: reply/command token validation state
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
-- `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint.
-- `outbox`: durable notification delivery queue. Keyed by `notification_id`, state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour.
+- `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint. Wizard columns: `current_step`, `answers_json_v2`, `version` for multi-question flows.
+- `outbox`: durable notification delivery queue for both question and stop notifications. Keyed by `notification_id`, `kind` field (`"question"` or `"stop"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour.
+- `model_override`: nullable TEXT column on `sessions` table. Stores `provider/model` string (e.g. `anthropic/claude-sonnet-4-20250514`). Read by `command-ingest.ts` and passed through the adapter to the plugin.
 
 ## Worker Integration: HTTP Polling
 
@@ -45,7 +46,7 @@ The daemon connects to the worker via HTTP short polling (no WebSocket, no long-
 - Polls `GET /machines/:machineId/next` every 5 seconds with Bearer auth
 - On command received: dispatches to the appropriate callback, then acks via `POST /commands/:commandId/ack`
 - On dispatch failure: does not ack -- the lease expires (60s) and the command becomes available again
-- Also handles outbound HTTP: `registerSession`, `unregisterSession`, `sendNotification`, `uploadMedia`
+- Also handles outbound HTTP: `registerSession`, `unregisterSession`, `sendNotification`, `editNotification`, `uploadMedia`
 
 ## Command Delivery Adapters
 
@@ -63,8 +64,10 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 
 `FallbackNotifier` (in `notification-service.ts`) implements both `StopNotifier` and `QuestionNotifier`:
 
-- **Stop notifications**: plain text, no inline buttons. May include outbound media (see Media Relay below).
-- **Question notifications**: formatted with the question text + inline keyboard buttons. Each option becomes a button with `callback_data: "cmd:TOKEN:q0"`, `cmd:TOKEN:q1"`, etc. Only the first question's options get buttons; remaining questions are shown as text and must be answered in the TUI.
+- **Stop notifications**: plain text with inline "reply" button. May include outbound media (see Media Relay below). Routed through the durable outbox (same as questions).
+- **Question notifications (single)**: formatted with the question text + inline keyboard buttons. Each option becomes a button with `callback_data: "cmd:TOKEN:q0"`, `"cmd:TOKEN:q1"`, etc.
+- **Question notifications (multi/wizard)**: when multiple questions exist, rendered one at a time in a single Telegram message. Buttons use versioned callback data (`cmd:TOKEN:v{version}:q{index}`). As the user answers each step, the message is edited in-place via `POST /notifications/edit` to show the next question. On completion, the message is edited to "All answers submitted".
+- **Message splitting**: when a notification body exceeds Telegram's 4096-character limit, `splitTelegramMessage()` splits it into multiple messages at natural boundaries (paragraph, line, sentence). Reply markup is attached only to the last chunk.
 
 Both notification types display a session ID on its own line for easy copy-paste in Telegram.
 
@@ -98,16 +101,19 @@ The daemon communicates with a local `opencode serve` instance for headless sess
 
 - `OPENCODE_URL` env var (e.g. `http://127.0.0.1:4096`) -- no authentication (localhost-only, single-user)
 - `OpencodeClient` class in `packages/daemon/src/opencode-client.ts`
-- Methods: `healthCheck()`, `createSession(directory)`, `sendPrompt(sessionId, directory, prompt)`, `deleteSession(sessionId)`
+- Methods: `healthCheck()`, `createSession(directory)`, `sendPrompt(sessionId, directory, prompt)`, `deleteSession(sessionId)`, `getSessionMessages(sessionId)`, `summarize(sessionId, providerID, modelID)`, `mcpStatus()`, `mcpConnect(name)`, `mcpDisconnect(name)`, `listProviders()`
 
 ### Launch / Kill Ingest
 
 Worker commands of type `"launch"` and `"kill"` are handled by dedicated ingest modules in `packages/daemon/src/worker/`:
 
-- `launch-ingest.ts`: checks opencode health, creates session, sends prompt, replies to Telegram with session ID
+- `launch-ingest.ts`: checks opencode health, creates session, sends prompt, replies to Telegram with session ID. Supports bare project name expansion (e.g. `pigeon` → `~/projects/pigeon`).
 - `kill-ingest.ts`: calls `DELETE /session/<id>`, replies to Telegram with result
+- `compact-ingest.ts`: fetches session messages, extracts the model from the last user message, calls `summarize()`
+- `mcp-ingest.ts`: handles `mcp_list` (calls `mcpStatus()`), `mcp_enable` (calls `mcpConnect()`), `mcp_disable` (calls `mcpDisconnect()`)
+- `model-ingest.ts`: handles `model_list` (calls `listProviders()`, filters to allowed providers) and `model_set` (validates model, stores as `model_override` on session)
 
-Both are dispatched by the Poller's `onLaunch` and `onKill` callbacks. Acking is handled by the Poller after successful dispatch.
+All are dispatched by the Poller's command-type callbacks. Acking is handled by the Poller after successful dispatch.
 
 ## Integration Flow
 
@@ -115,9 +121,12 @@ Both are dispatched by the Poller's `onLaunch` and `onKill` callbacks. Acking is
 
 1. Session start hits daemon route and writes session row.
 2. Daemon registers session with worker (via Poller's `registerSession`).
-3. Stop event sends notification and mints token.
-4. Worker delivers reply/callback as a command queued in D1.
-5. Daemon polls, receives command, routes through adapter.
+3. Plugin POSTs to daemon `/stop` with `session_id`, `event`, `message`, `summary`.
+4. Daemon generates stable `notification_id = s:{sessionId}:{now}`.
+5. Daemon mints token, formats notification, stores in outbox with `kind: "stop"`. Returns HTTP 202.
+6. Background OutboxSender delivers to Telegram with retry (same as question flow).
+7. Worker delivers reply/callback as a command queued in D1.
+8. Daemon polls, receives command, routes through adapter.
 
 ### Question Flow
 
@@ -135,9 +144,22 @@ Both are dispatched by the Poller's `onLaunch` and `onKill` callbacks. Acking is
 12. Daemon polls, receives command. Command-ingest detects a pending question for the session:
     - Button press (`q0`, `q1`, ...): translates index to the original option label.
     - Custom text: uses the raw text as the answer.
-13. Daemon delivers the answer to the plugin via `DirectChannelAdapter.deliverQuestionReply()`.
-14. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
-15. If the user already answered locally, stale button presses return "This question has already been answered."
+13. **Single-question path**: daemon delivers the answer to the plugin via `DirectChannelAdapter.deliverQuestionReply()`.
+14. **Multi-question wizard path**: daemon advances the wizard step, edits the Telegram message in-place to show the next question (via `POST /notifications/edit`). On the final step, all accumulated answers are delivered as a single `deliverQuestionReply` call with `answers: string[][]`.
+15. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
+16. If the user already answered locally, stale button presses return "This question has already been answered." Stale wizard versions (button from a previous step) are silently dropped.
+
+### Session Reaper
+
+A background hourly timer (`session-reaper.ts`, started in `index.ts`) cleans up stale sessions:
+
+1. Lists sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week).
+2. For each: deletes from opencode serve (`deleteSession`), removes from local storage, unregisters from worker.
+3. Runs `cleanupExpired` for fully expired session records.
+
+### Dead Session Cleanup
+
+When `command-ingest.ts` detects a connection error (ECONNREFUSED, timeout, fetch failed, etc.) during command delivery, it removes the session from local storage. This prevents repeated delivery attempts to a dead plugin process -- subsequent commands get a clear "Session not found" instead.
 
 ## Future Improvement: Long Polling
 

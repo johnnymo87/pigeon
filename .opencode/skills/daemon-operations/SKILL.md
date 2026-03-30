@@ -43,6 +43,12 @@ Look for:
 - notification send failures
 - launch-ingest: `session started sessionId=... directory=...`
 - kill-ingest: `session terminated sessionId=...`
+- compact-ingest: `session compacted commandId=... sessionId=...`
+- mcp-ingest: `enable commandId=... server=... session=...` or `disable commandId=...`
+- model-ingest: `set commandId=... model=... session=...`
+- session reaper: `[reaper] reaped stale session ...` or `[reaper] cleaned N expired session records`
+- dead session cleanup: `[command-ingest] removing dead session sessionId=...` (connection error)
+- wizard advancement: `[command-ingest] wizard advanced to step N`
 - media fetch failures: `Failed to fetch media from R2` in command-ingest logs
 - media upload failures: silent (text notification still sends), but `uploadMedia` errors appear in daemon stderr
 

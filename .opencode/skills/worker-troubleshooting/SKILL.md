@@ -58,7 +58,7 @@ wrangler tail --format=pretty
   - `message.reply_to_message.message_id`, or
   - `/cmd <token> <command>`, or
   - callback data `cmd:<token>:<action>`
-- Confirm machine agent connects to `/ws?machineId=<id>` with protocol `ccr,<CCR_API_KEY>`
+- Confirm machine is polling recently (`machines` table `last_poll_at` within 30s)
 
 ## Question Button Callbacks
 
@@ -68,13 +68,6 @@ If button presses return "Session expired":
 - The stored token doesn't match the callback_data token.
 - Verify `extractTokenFromCallbackData()` is parsing the `replyMarkup` correctly.
 - Check the `messages` table has the daemon token, not a worker-generated one.
-
-## Durable Object Mismatch on Deploy
-
-If deploy fails with DO class mismatch, verify:
-
-- `wrangler.toml` uses `RouterDO`
-- `src/index.ts` exports `RouterDO`
 
 ## Verify
 

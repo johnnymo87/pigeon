@@ -81,6 +81,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `POST /sessions/register` (Bearer) -> upsert session
 - `POST /sessions/unregister` (Bearer) -> remove session
 - `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
+- `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions.
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
 - `GET /media/<key>` (Bearer) -> download file from R2
 - `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks
@@ -108,13 +109,47 @@ Terminates a running OpenCode session.
 4. Daemon picks it up. Poll response: `{ commandType: "kill", commandId, sessionId, chatId }`
 5. Daemon's `kill-ingest.ts` calls `OpencodeClient.deleteSession()` and replies to Telegram with the result.
 
+### `/compact` (reply-based)
+
+Summarizes a session's conversation to reduce context.
+
+1. User replies `/compact` to any session notification in Telegram.
+2. Worker resolves the session from the replied-to message via `messages` table lookup.
+3. Queues a `"compact"` type command in D1.
+4. Daemon's `compact-ingest.ts` fetches session messages, finds the last user message's model, and calls `OpencodeClient.summarize()`.
+
+### `/mcp list|enable|disable <args>`
+
+Manages MCP server connections for a session.
+
+- `/mcp list <session-id>`: lists all MCP servers with status (connected, disabled, failed, needs_auth).
+- `/mcp enable <server> <session-id>`: connects (or reconnects if already connected) an MCP server.
+- `/mcp disable <server> <session-id>`: disconnects an MCP server.
+
+All three variants check the session exists and the machine is online before queuing. Daemon's `mcp-ingest.ts` calls `OpencodeClient.mcpStatus()`, `mcpConnect()`, or `mcpDisconnect()`.
+
+### `/model <args>`
+
+Lists or sets the model for a session.
+
+- `/model <session-id>`: lists available models from allowed providers (anthropic, openai, google, vertex) with the current default.
+- `/model <provider/model> <session-id>`: validates the model exists, then stores it as a `model_override` on the session in daemon SQLite.
+
+The override is applied on subsequent command deliveries -- `command-ingest.ts` reads it and passes it through the adapter as `metadata.model`. The plugin includes it in the `prompt_async` request body.
+
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill"` (in `d1-ops.ts`)
+`CommandType = "execute" | "launch" | "kill" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set"` (in `webhook.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt
 - `kill`: terminate an existing session via opencode API
+- `compact`: summarize/compact a session's conversation
+- `mcp_list`: list MCP servers with connection status
+- `mcp_enable`: connect (or reconnect) an MCP server
+- `mcp_disable`: disconnect an MCP server
+- `model_list`: list available models from allowed providers
+- `model_set`: set a per-session model override
 
 ## Command Delivery (Lease-Based)
 
