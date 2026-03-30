@@ -242,8 +242,12 @@ describe("createApp", () => {
     expect(await stop.json()).toEqual({ ok: true, notified: false, reason: "notify=false" });
   });
 
-  it("returns no-notifier response when notify=true but handler missing", async () => {
-    const app = newApp(50_000);
+  it("queues stop notification in outbox even when no notifier configured", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-123",
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -257,16 +261,27 @@ describe("createApp", () => {
       body: JSON.stringify({ session_id: "sess-stop-2", event: "Stop", message: "Done" }),
     }));
 
-    expect(stop.status).toBe(200);
-    expect(await stop.json()).toEqual({ ok: true, notified: false, reason: "no notification handler" });
+    expect(stop.status).toBe(202);
+    const json = await stop.json();
+    expect(json.ok).toBe(true);
+    expect(json.deliveryState).toBe("queued");
+    expect(json.notificationId).toMatch(/^s:sess-stop-2:/);
+
+    // Verify outbox entry was created
+    const outboxEntry = storage.outbox.getByNotificationId(json.notificationId);
+    expect(outboxEntry).not.toBeNull();
+    expect(outboxEntry!.kind).toBe("stop");
+    expect(outboxEntry!.sessionId).toBe("sess-stop-2");
+    expect(outboxEntry!.state).toBe("queued");
   });
 
-  it("uses notifier and returns token for stop notifications", async () => {
-    const notifier: StopNotifier = {
-      sendStopNotification: vi.fn(async () => ({ token: "tok-1" })),
-    };
-
-    const app = newApp(60_000, notifier);
+  it("queues stop notification in outbox for delivery by OutboxSender", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 60_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -284,19 +299,27 @@ describe("createApp", () => {
       }),
     }));
 
-    expect(stop.status).toBe(200);
-    expect(await stop.json()).toEqual({ ok: true, notified: true, token: "tok-1" });
-    expect((notifier.sendStopNotification as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    expect(stop.status).toBe(202);
+    const json = await stop.json();
+    expect(json.ok).toBe(true);
+    expect(json.deliveryState).toBe("queued");
+
+    // Verify outbox payload contains formatted notification
+    const outboxEntry = storage.outbox.getByNotificationId(json.notificationId);
+    expect(outboxEntry).not.toBeNull();
+    const payload = JSON.parse(outboxEntry!.payload);
+    expect(payload.texts).toBeDefined();
+    expect(payload.texts.length).toBeGreaterThan(0);
+    expect(payload.texts[0]).toContain("Stop");
   });
 
-  it("returns notified=false when notifier throws", async () => {
-    const notifier: StopNotifier = {
-      sendStopNotification: vi.fn(async () => {
-        throw new Error("telegram down");
-      }),
-    };
-
-    const app = newApp(70_000, notifier);
+  it("returns existing outbox entry on duplicate stop request", async () => {
+    storage = openStorageDb(":memory:");
+    const fixedNow = 70_000;
+    const app = createApp(storage, {
+      nowFn: () => fixedNow,
+      chatId: "chat-123",
+    });
 
     await app(new Request("http://localhost/session-start", {
       method: "POST",
@@ -304,14 +327,23 @@ describe("createApp", () => {
       body: JSON.stringify({ session_id: "sess-stop-4", notify: true }),
     }));
 
-    const stop = await app(new Request("http://localhost/stop", {
+    // First call queues
+    const stop1 = await app(new Request("http://localhost/stop", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: "sess-stop-4", message: "Done" }),
     }));
+    expect(stop1.status).toBe(202);
 
-    expect(stop.status).toBe(200);
-    expect(await stop.json()).toEqual({ ok: true, notified: false, error: "telegram down" });
+    // Second call with same timestamp returns existing
+    const stop2 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-4", message: "Done" }),
+    }));
+    expect(stop2.status).toBe(202);
+    const json = await stop2.json();
+    expect(json.deliveryState).toBe("queued");
   });
 
   it("POST /question-asked stores pending question and returns 202 accepted (durable)", async () => {

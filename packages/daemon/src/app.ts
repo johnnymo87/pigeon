@@ -1,6 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
-import { generateToken, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
+import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import type { QuestionInfoData } from "./storage/types";
 
 interface LegacySession {
@@ -208,48 +208,79 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const body = await readJsonBody(request);
         const sessionId = typeof body.session_id === "string" ? body.session_id : "";
         if (!sessionId) {
+          console.log(`[stop] rejected: missing session_id`);
           return Response.json({ error: "session_id is required" }, { status: 400 });
         }
 
         const session = storage.sessions.get(sessionId);
         if (!session) {
+          console.log(`[stop] rejected: session not found sessionId=${sessionId}`);
           return Response.json({ error: "Session not found" }, { status: 404 });
         }
 
         storage.sessions.touch(sessionId, nowFn());
 
         if (!session.notify) {
+          console.log(`[stop] skipped: notify=false sessionId=${sessionId}`);
           return Response.json({ ok: true, notified: false, reason: "notify=false" });
-        }
-
-        if (!notifier) {
-          return Response.json({ ok: true, notified: false, reason: "no notification handler" });
         }
 
         const message = typeof body.message === "string" ? body.message : null;
         const summary = typeof body.summary === "string" ? body.summary : null;
         const event = typeof body.event === "string" ? body.event : "Stop";
         const label = typeof body.label === "string" ? body.label : null;
-        const media = Array.isArray(body.media) ? body.media as Array<{ mime: string; filename: string; url: string }> : undefined;
 
-        try {
-          const result = await notifier.sendStopNotification({
-            session: {
-              sessionId: session.sessionId,
-              label: session.label,
-              cwd: session.cwd,
-            },
-            event,
-            summary: message || summary || "Task completed",
-            label: label || session.label || undefined,
-            media,
-          });
+        const now = nowFn();
+        const notificationId = `s:${sessionId}:${now}`;
 
-          return Response.json({ ok: true, notified: true, ...result });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          return Response.json({ ok: true, notified: false, error: errorMessage });
+        // Check if already queued (idempotent within same timestamp)
+        const existing = storage.outbox.getByNotificationId(notificationId);
+        if (existing) {
+          console.log(`[stop] already queued sessionId=${sessionId} notificationId=${notificationId}`);
+          return Response.json(
+            { ok: true, deliveryState: existing.state === "sent" ? "sent" : "queued", notificationId },
+            { status: existing.state === "sent" ? 200 : 202 },
+          );
         }
+
+        // Generate token for reply routing
+        const token = generateToken();
+        storage.sessionTokens.mint({
+          token,
+          sessionId,
+          chatId: opts.chatId ?? "",
+          context: { event, summary: (message || summary || "Task completed").slice(0, 200) },
+        }, now);
+
+        // Format notification for the outbox
+        const notification = formatTelegramNotification({
+          event,
+          label: label || session.label || sessionId.slice(0, 8),
+          summary: message || summary || "Task completed",
+          cwd: session.cwd,
+          token,
+          machineId: opts.machineId,
+          sessionId,
+        });
+
+        const notificationPayload = {
+          texts: notification.texts,
+          replyMarkup: notification.replyMarkup,
+          notificationId,
+        };
+
+        // Queue in outbox — OutboxSender will deliver with retry
+        storage.outbox.upsert({
+          notificationId,
+          sessionId,
+          requestId: `stop-${now}`,
+          kind: "stop",
+          payload: JSON.stringify(notificationPayload),
+          token,
+        }, now);
+
+        console.log(`[stop] queued sessionId=${sessionId} notificationId=${notificationId} label=${label || session.label}`);
+        return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
       }
 
       if (request.method === "POST" && url.pathname === "/question-asked") {

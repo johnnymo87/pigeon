@@ -139,7 +139,10 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
 }
 
 export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
-  if (!checkBreaker()) return null
+  if (!checkBreaker()) {
+    opts.log("notifyStop blocked by circuit breaker", { sessionId: opts.sessionId, breakerState, breakerOpenUntil })
+    return null
+  }
 
   const url = getDaemonUrl(opts.daemonUrl)
 
@@ -154,17 +157,18 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
           label: opts.label,
           ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
         }),
-       signal: AbortSignal.timeout(1000),
+       signal: AbortSignal.timeout(3000),
      })
 
      if (!res.ok) {
        const text = await res.text().catch(() => "")
-       opts.log("daemon returned error", { status: res.status, body: text })
+       opts.log("notifyStop daemon returned error", { sessionId: opts.sessionId, status: res.status, body: text })
        onFailure()
        return null
      }
 
-     const data = (await res.json()) as { ok: boolean; notified?: boolean }
+     const data = (await res.json()) as { ok: boolean; deliveryState?: string; notified?: boolean }
+     opts.log("notifyStop daemon response", { sessionId: opts.sessionId, ...data })
      onSuccess()
      return data
   } catch (err) {
