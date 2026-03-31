@@ -11,7 +11,7 @@ type SessionEntry = {
 
 export class SessionManager {
   private sessions = new Map<string, SessionEntry>()
-  private mainSessionId: string | undefined = undefined
+  private mainSessionIds = new Set<string>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
 
   onSessionCreated(sessionID: string, parentID?: string): void {
@@ -26,7 +26,7 @@ export class SessionManager {
     })
 
     if (!parentID) {
-      this.mainSessionId = sessionID
+      this.mainSessionIds.add(sessionID)
     }
   }
 
@@ -68,13 +68,11 @@ export class SessionManager {
     this.cleanupSession(sessionID)
     this.sessions.delete(sessionID)
 
-    if (this.mainSessionId === sessionID) {
-      this.mainSessionId = undefined
-    }
+    this.mainSessionIds.delete(sessionID)
   }
 
   isMainSession(sessionID: string): boolean {
-    return this.mainSessionId === sessionID
+    return this.mainSessionIds.has(sessionID)
   }
 
   isKnown(sessionID: string): boolean {
@@ -132,9 +130,7 @@ export class SessionManager {
 
       for (const id of idsToDelete) {
         this.sessions.delete(id)
-        if (this.mainSessionId === id) {
-          this.mainSessionId = undefined
-        }
+        this.mainSessionIds.delete(id)
       }
     }, intervalMs)
 

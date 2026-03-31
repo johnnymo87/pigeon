@@ -23,13 +23,50 @@ describe("SessionManager", () => {
       expect(manager.isMainSession("subagent-session")).toBe(false)
     })
 
-    test("should update main session when new session without parent is created", () => {
+    test("should treat multiple concurrent parentless sessions as main", () => {
       manager.onSessionCreated("first-session")
       expect(manager.isMainSession("first-session")).toBe(true)
 
       manager.onSessionCreated("second-session")
-      expect(manager.isMainSession("first-session")).toBe(false)
+      expect(manager.isMainSession("first-session")).toBe(true)
       expect(manager.isMainSession("second-session")).toBe(true)
+    })
+
+    test("should treat three concurrent parentless sessions as main", () => {
+      manager.onSessionCreated("session-a")
+      manager.onSessionCreated("session-b")
+      manager.onSessionCreated("session-c")
+
+      expect(manager.isMainSession("session-a")).toBe(true)
+      expect(manager.isMainSession("session-b")).toBe(true)
+      expect(manager.isMainSession("session-c")).toBe(true)
+    })
+
+    test("should remove only deleted session from main set", () => {
+      manager.onSessionCreated("session-a")
+      manager.onSessionCreated("session-b")
+      manager.onSessionCreated("session-c")
+
+      manager.onDeleted("session-b")
+
+      expect(manager.isMainSession("session-a")).toBe(true)
+      expect(manager.isMainSession("session-b")).toBe(false)
+      expect(manager.isMainSession("session-c")).toBe(true)
+    })
+
+    test("should allow each main session to independently notify", () => {
+      manager.onSessionCreated("session-a")
+      manager.onRegistered("session-a")
+      manager.onSessionCreated("session-b")
+      manager.onRegistered("session-b")
+
+      expect(manager.shouldNotify("session-a", "msg-a1")).toBe(true)
+      expect(manager.shouldNotify("session-b", "msg-b1")).toBe(true)
+
+      manager.setNotified("session-a", "msg-a1")
+
+      expect(manager.shouldNotify("session-a", "msg-a1")).toBe(false)
+      expect(manager.shouldNotify("session-b", "msg-b1")).toBe(true)
     })
 
     test("should clear main session on deletion", () => {
@@ -38,6 +75,16 @@ describe("SessionManager", () => {
 
       manager.onDeleted("main-session")
       expect(manager.isMainSession("main-session")).toBe(false)
+    })
+
+    test("should not treat subagent sessions created after multiple mains as main", () => {
+      manager.onSessionCreated("main-1")
+      manager.onSessionCreated("main-2")
+      manager.onSessionCreated("sub-1", "main-1")
+
+      expect(manager.isMainSession("main-1")).toBe(true)
+      expect(manager.isMainSession("main-2")).toBe(true)
+      expect(manager.isMainSession("sub-1")).toBe(false)
     })
   })
 
