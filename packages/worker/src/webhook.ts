@@ -309,12 +309,17 @@ async function answerCallbackQuery(
 /**
  * Resolve a session from an incoming Telegram message.
  * Tries: (1) reply-to-message lookup, (2) /cmd TOKEN format.
- * Returns { sessionId, command } or null if no session found.
+ * Returns { sessionId, command, questionRequestId? } or null if no session found.
+ *
+ * When the looked-up message has a notification_id starting with `q:`, the
+ * requestId is extracted (format: `q:{sessionId}:{requestId}`) and returned as
+ * questionRequestId so that swipe-replies to question notifications can be
+ * identified by the daemon.
  */
 async function resolveMessageSession(
   db: D1Database,
   message: TelegramMessage,
-): Promise<{ sessionId: string; command: string } | null> {
+): Promise<{ sessionId: string; command: string; questionRequestId?: string } | null> {
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
 
@@ -322,7 +327,18 @@ async function resolveMessageSession(
   if (message.reply_to_message) {
     const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
-      return { sessionId: mapping.session_id, command: text };
+      const result: { sessionId: string; command: string; questionRequestId?: string } = {
+        sessionId: mapping.session_id,
+        command: text,
+      };
+      // Detect question notification replies: notification_id format is q:{sessionId}:{requestId}
+      if (mapping.notification_id && mapping.notification_id.startsWith("q:")) {
+        const parts = mapping.notification_id.split(":");
+        if (parts.length >= 3) {
+          result.questionRequestId = parts.slice(2).join(":");
+        }
+      }
+      return result;
     }
   }
 
@@ -424,6 +440,7 @@ async function queueCommand(
   commandType: CommandType = "execute",
   directory: string | null = null,
   mediaRef: MediaRef | null = null,
+  metadataJson: string | null = null,
 ): Promise<string | null> {
   const mediaJson = mediaRef ? JSON.stringify(mediaRef) : null;
 
@@ -435,6 +452,7 @@ async function queueCommand(
     commandType,
     directory,
     mediaJson,
+    metadataJson,
   });
 
   if (commandId === null) {
@@ -750,7 +768,10 @@ export async function handleTelegramWebhook(
       mediaRef = { key: relayResult.key, mime: media.mime, filename: media.filename, size: media.size };
     }
 
-    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef);
+    const metadataJson = resolved.questionRequestId
+      ? JSON.stringify({ questionRequestId: resolved.questionRequestId })
+      : null;
+    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef, metadataJson);
     if (!commandId) return OK();
 
     return OK();

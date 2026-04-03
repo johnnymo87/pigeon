@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS commands (
   chat_id       TEXT NOT NULL,
   directory     TEXT,
   media_json    TEXT,
+  metadata_json TEXT,
   status        TEXT NOT NULL DEFAULT 'pending',
   created_at    INTEGER NOT NULL,
   leased_at     INTEGER,

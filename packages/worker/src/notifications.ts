@@ -69,7 +69,7 @@ export async function lookupMessage(
 ): Promise<MessageRow | null> {
   const row = await db
     .prepare(
-      "SELECT chat_id, message_id, session_id, token, created_at FROM messages WHERE chat_id = ? AND message_id = ?",
+      "SELECT chat_id, message_id, session_id, token, notification_id, created_at FROM messages WHERE chat_id = ? AND message_id = ?",
     )
     .bind(String(chatId), messageId)
     .first<MessageRow>();

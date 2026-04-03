@@ -59,6 +59,13 @@ export async function handlePollNext(
         // Ignore malformed media JSON
       }
     }
+    if (result.metadataJson) {
+      try {
+        body.metadata = JSON.parse(result.metadataJson);
+      } catch {
+        // Ignore malformed metadata JSON
+      }
+    }
   }
 
   return Response.json(body);

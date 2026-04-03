@@ -40,6 +40,7 @@ export async function queueCommand(
     commandType?: string;
     directory?: string | null;
     mediaJson?: string | null;
+    metadataJson?: string | null;
   },
 ): Promise<string | null> {
   const {
@@ -50,6 +51,7 @@ export async function queueCommand(
     commandType = "execute",
     directory = null,
     mediaJson = null,
+    metadataJson = null,
   } = opts;
 
   // Check queue depth
@@ -72,10 +74,10 @@ export async function queueCommand(
     .prepare(
       `INSERT INTO commands
          (command_id, machine_id, session_id, command_type, command, chat_id,
-          directory, media_json, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          directory, media_json, metadata_json, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     )
-    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, now)
+    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, metadataJson, now)
     .run();
 
   return commandId;
@@ -91,6 +93,7 @@ export interface PollResult {
   commandType: string;
   directory: string | null;
   mediaJson: string | null;
+  metadataJson: string | null;
 }
 
 // ─── pollNextCommand ──────────────────────────────────────────────────────────
@@ -115,7 +118,7 @@ export async function pollNextCommand(
   // either pending, or leased-but-expired
   const row = await db
     .prepare(
-      `SELECT command_id, session_id, command, chat_id, command_type, directory, media_json
+      `SELECT command_id, session_id, command, chat_id, command_type, directory, media_json, metadata_json
        FROM commands
        WHERE machine_id = ?
          AND (
@@ -134,6 +137,7 @@ export async function pollNextCommand(
       command_type: string;
       directory: string | null;
       media_json: string | null;
+      metadata_json: string | null;
     }>();
 
   if (!row) {
@@ -158,6 +162,7 @@ export async function pollNextCommand(
     commandType: row.command_type,
     directory: row.directory,
     mediaJson: row.media_json,
+    metadataJson: row.metadata_json,
   };
 }
 
