@@ -242,34 +242,32 @@ export async function ingestWorkerCommand(
   if (msg.metadata?.questionRequestId) {
     console.warn(`[command-ingest] question-reply via metadata fallback sessionId=${msg.sessionId} commandId=${commandId} requestId=${msg.metadata.questionRequestId}`);
 
-    const adapter = options.createAdapter
+    const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
       : selectAdapter(session);
 
-    if (!adapter || !adapter.deliverQuestionReply) {
-      console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}`);
-      storage.inbox.markDone(commandId);
-      return;
+    if (fallbackAdapter?.deliverQuestionReply) {
+      const answers: string[][] = [[msg.command.trim()]];
+      const result = await fallbackAdapter.deliverQuestionReply(
+        session,
+        { questionRequestId: msg.metadata.questionRequestId, answers },
+        { commandId, chatId: msg.chatId },
+      );
+
+      if (result.ok) {
+        console.log(`[command-ingest] metadata fallback question reply delivered commandId=${commandId}`);
+        storage.inbox.markDone(commandId);
+        // Clean up any stale pending question just in case
+        storage.pendingQuestions.delete(msg.sessionId);
+        return;
+      }
+
+      // If question reply fails (e.g., 404 question not found), fall through to
+      // regular command delivery so the user's text isn't lost.
+      console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery`);
+    } else {
+      console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}, falling through to regular delivery`);
     }
-
-    const answers: string[][] = [[msg.command.trim()]];
-    const result = await adapter.deliverQuestionReply(
-      session,
-      { questionRequestId: msg.metadata.questionRequestId, answers },
-      { commandId, chatId: msg.chatId },
-    );
-
-    if (result.ok) {
-      console.log(`[command-ingest] metadata fallback question reply delivered commandId=${commandId}`);
-      storage.inbox.markDone(commandId);
-      // Clean up any stale pending question just in case
-      storage.pendingQuestions.delete(msg.sessionId);
-      return;
-    }
-
-    // If question reply fails (e.g., 404 question not found), fall through to
-    // regular command delivery so the user's text isn't lost.
-    console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery`);
   }
 
   // If command looks like a question option but no pending question, it's stale

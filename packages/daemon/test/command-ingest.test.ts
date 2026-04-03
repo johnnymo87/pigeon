@@ -807,6 +807,50 @@ describe("ingestWorkerCommand", () => {
 
       storage.db.close();
     });
+
+    it("falls through to regular command delivery when metadata fallback question reply fails", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-ff",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // No pending question stored
+      let deliverCommandCalled = false;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-ff",
+          sessionId: "sess-meta-ff",
+          command: "some text",
+          chatId: "1",
+          metadata: { questionRequestId: "req-gone" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              deliverCommandCalled = true;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "Question not found" };
+            },
+          }),
+        },
+      );
+
+      expect(deliverCommandCalled).toBe(true);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
   });
 
   describe("multi-question wizard routing", () => {
