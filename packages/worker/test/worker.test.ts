@@ -3215,3 +3215,114 @@ describe("/model command", () => {
     expect(await res.text()).toBe("ok");
   });
 });
+
+// ─── Swipe-Reply to Question Notification: Integration Tests ──────────
+
+describe("swipe-reply to question notification", () => {
+  const CHAT_ID = "8248645256";
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("tags the command with questionRequestId when replying to a question notification", async () => {
+    const now = Date.now();
+    const sessionId = `sess-swipe-q-${now}`;
+    const machineId = `swipe-q-machine-${now}`;
+    // Use a high, timestamp-based message ID to avoid collisions with other tests
+    const questionMsgId = 5_000_001 + (now % 10_000);
+
+    // Step 1: Register a session with machine
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    // Step 2: Send a question notification with notificationId "q:{sessionId}:req-123"
+    // and inline_keyboard buttons including callback_data "cmd:tok-swipe:q0"
+    mockTelegramSuccess(questionMsgId);
+    const notifRes = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Which database should we use?",
+      notificationId: `q:${sessionId}:req-123`,
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: "MongoDB", callback_data: "cmd:tok-swipe:q0" },
+            { text: "PostgreSQL", callback_data: "cmd:tok-swipe:q1" },
+          ],
+        ],
+      },
+    });
+    expect(notifRes.status).toBe(200);
+    const notifBody = (await notifRes.json()) as { ok: boolean; messageId: number; token: string };
+    expect(notifBody.ok).toBe(true);
+    const messageId = notifBody.messageId;
+
+    // Step 3: Swipe-reply to that message with text "Use MongoDB"
+    mockTelegramSendMessage(); // for the "ok" webhook acknowledgement
+    const webhookRes = await sendWebhook(makeTextReply("Use MongoDB", messageId));
+    expect(webhookRes.status).toBe(200);
+
+    // Step 4: Poll for the command
+    const pollRes = await SELF.fetch(`https://worker/machines/${machineId}/next`, {
+      headers: { Authorization: "Bearer test-api-key" },
+    });
+    expect(pollRes.status).toBe(200);
+
+    // Step 5: Verify the command has the correct metadata
+    const pollBody = (await pollRes.json()) as Record<string, unknown>;
+    expect(pollBody.commandType).toBe("execute");
+    expect(pollBody.sessionId).toBe(sessionId);
+    expect(pollBody.command).toBe("Use MongoDB");
+    expect(pollBody.metadata).toEqual({ questionRequestId: "req-123" });
+  });
+
+  it("does not tag command with questionRequestId when replying to a non-question notification", async () => {
+    const now = Date.now();
+    const sessionId = `sess-swipe-nq-${now}`;
+    const machineId = `swipe-nq-machine-${now}`;
+    // Use a high, timestamp-based message ID to avoid collisions with other tests
+    const stopMsgId = 5_100_001 + (now % 10_000);
+
+    // Step 1: Register a session with machine
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    // Step 2: Send a regular notification with notificationId "stop:{sessionId}:xyz" (no q: prefix, no buttons)
+    mockTelegramSuccess(stopMsgId);
+    const notifRes = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Session stopped.",
+      notificationId: `stop:${sessionId}:xyz`,
+    });
+    expect(notifRes.status).toBe(200);
+    const notifBody = (await notifRes.json()) as { ok: boolean; messageId: number; token: string };
+    expect(notifBody.ok).toBe(true);
+    const messageId = notifBody.messageId;
+
+    // Step 3: Swipe-reply to that message
+    mockTelegramSendMessage(); // for the "ok" webhook acknowledgement
+    const webhookRes = await sendWebhook(makeTextReply("Continue please", messageId));
+    expect(webhookRes.status).toBe(200);
+
+    // Step 4: Poll for the command
+    const pollRes = await SELF.fetch(`https://worker/machines/${machineId}/next`, {
+      headers: { Authorization: "Bearer test-api-key" },
+    });
+    expect(pollRes.status).toBe(200);
+
+    // Step 5: Verify metadata is undefined
+    const pollBody = (await pollRes.json()) as Record<string, unknown>;
+    expect(pollBody.commandType).toBe("execute");
+    expect(pollBody.sessionId).toBe(sessionId);
+    expect(pollBody.command).toBe("Continue please");
+    expect(pollBody.metadata).toBeUndefined();
+  });
+});
