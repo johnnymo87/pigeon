@@ -235,6 +235,43 @@ export async function ingestWorkerCommand(
     return;
   }
 
+  // Metadata fallback: if no pending question found locally but command has
+  // question metadata from the worker, route as a question reply anyway.
+  // This handles the case where the daemon's pending_questions state is stale
+  // (e.g., daemon restarted, TTL expired, race with question-answered event).
+  if (msg.metadata?.questionRequestId) {
+    console.warn(`[command-ingest] question-reply via metadata fallback sessionId=${msg.sessionId} commandId=${commandId} requestId=${msg.metadata.questionRequestId}`);
+
+    const adapter = options.createAdapter
+      ? options.createAdapter(session)
+      : selectAdapter(session);
+
+    if (!adapter || !adapter.deliverQuestionReply) {
+      console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}`);
+      storage.inbox.markDone(commandId);
+      return;
+    }
+
+    const answers: string[][] = [[msg.command.trim()]];
+    const result = await adapter.deliverQuestionReply(
+      session,
+      { questionRequestId: msg.metadata.questionRequestId, answers },
+      { commandId, chatId: msg.chatId },
+    );
+
+    if (result.ok) {
+      console.log(`[command-ingest] metadata fallback question reply delivered commandId=${commandId}`);
+      storage.inbox.markDone(commandId);
+      // Clean up any stale pending question just in case
+      storage.pendingQuestions.delete(msg.sessionId);
+      return;
+    }
+
+    // If question reply fails (e.g., 404 question not found), fall through to
+    // regular command delivery so the user's text isn't lost.
+    console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery`);
+  }
+
   // If command looks like a question option but no pending question, it's stale
   if (QUESTION_OPTION_RE.test(msg.command.trim()) || WIZARD_OPTION_RE.test(msg.command.trim())) {
     console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);

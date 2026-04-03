@@ -21,6 +21,7 @@ export interface ExecuteMessage {
   command: string;
   chatId: string;
   media?: { key: string; mime: string; filename: string; size: number };
+  metadata?: { questionRequestId?: string };
 }
 
 export interface LaunchMessage {

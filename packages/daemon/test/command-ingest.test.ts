@@ -658,6 +658,157 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
+  describe("metadata fallback for question swipe-replies", () => {
+    it("routes text as question reply using metadata fallback when no pending question in storage", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-1",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // No pending question stored — metadata fallback should kick in
+
+      let capturedReply: QuestionReplyInput | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-1",
+          sessionId: "sess-meta-1",
+          command: "Use PostgreSQL",
+          chatId: "1",
+          metadata: { questionRequestId: "req-meta-abc" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      expect(capturedReply).toEqual({
+        questionRequestId: "req-meta-abc",
+        answers: [["Use PostgreSQL"]],
+      });
+
+      // inbox should be marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("prefers pending question over metadata fallback (happy path unchanged)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-2",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Pending question with a different requestId
+      storage.pendingQuestions.store({
+        sessionId: "sess-meta-2",
+        requestId: "req-pending",
+        questions: [{
+          question: "Which DB?",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now);
+
+      let capturedReply: QuestionReplyInput | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-2",
+          sessionId: "sess-meta-2",
+          command: "Use MongoDB",
+          chatId: "1",
+          // metadata has a stale requestId — pending question should win
+          metadata: { questionRequestId: "req-stale" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // Must use pending question's requestId, NOT the metadata's
+      expect(capturedReply).not.toBeNull();
+      expect(capturedReply!.questionRequestId).toBe("req-pending");
+      expect(capturedReply!.answers).toEqual([["Use MongoDB"]]);
+
+      storage.db.close();
+    });
+
+    it("delivers as regular command when no pending question and no metadata", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-3",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // No pending question, no metadata
+      let deliverCommandCalled = false;
+      let deliverQuestionReplyCalled = false;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-3",
+          sessionId: "sess-meta-3",
+          command: "just a regular command",
+          chatId: "1",
+          // no metadata
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              deliverCommandCalled = true;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              deliverQuestionReplyCalled = true;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      expect(deliverCommandCalled).toBe(true);
+      expect(deliverQuestionReplyCalled).toBe(false);
+
+      storage.db.close();
+    });
+  });
+
   describe("multi-question wizard routing", () => {
     const twoQuestions = [
       {
