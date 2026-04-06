@@ -70,13 +70,13 @@ export async function ingestModelSetCommand(input: ModelSetCommandInput): Promis
     if (!modelExists) {
       await sendTelegramReply(
         chatId,
-        `Model \`${model}\` not found. Use \`/model ${sessionId}\` to see available models.`,
+        `Model \`${model}\` not found. Use \`/model ${sessionId}\` to see available models.\n🆔 \`${sessionId}\``,
       );
       return;
     }
 
     storage.sessions.setModelOverride(sessionId, model);
-    await sendTelegramReply(chatId, `🤖 Model set to \`${model}\` for session \`${sessionId}\``);
+    await sendTelegramReply(chatId, `🤖 Model set to \`${model}\`\n🆔 \`${sessionId}\``);
     console.log(`[model-ingest] set commandId=${input.commandId} model=${model} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

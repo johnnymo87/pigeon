@@ -172,7 +172,7 @@ describe("ingestModelSetCommand", () => {
     expect(setModelOverride).toHaveBeenCalledWith("sess-abc", "anthropic/claude-opus-4-6");
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
-      expect.stringContaining("🤖 Model set to `anthropic/claude-opus-4-6` for session `sess-abc`"),
+      expect.stringContaining("🤖 Model set to `anthropic/claude-opus-4-6`\n🆔 `sess-abc`"),
     );
   });
 
