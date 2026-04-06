@@ -84,9 +84,12 @@ export class OpencodeClient {
     }
   }
 
-  async mcpStatus(): Promise<Record<string, { status: string; error?: string }>> {
+  async mcpStatus(directory?: string): Promise<Record<string, { status: string; error?: string }>> {
+    const headers: Record<string, string> = {};
+    if (directory) headers["x-opencode-directory"] = directory;
     const res = await this.fetchFn(`${this.baseUrl}/mcp`, {
       method: "GET",
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -95,16 +98,22 @@ export class OpencodeClient {
     return res.json() as Promise<Record<string, { status: string; error?: string }>>;
   }
 
-  async mcpConnect(name: string): Promise<boolean> {
+  async mcpConnect(name: string, directory?: string): Promise<boolean> {
+    const headers: Record<string, string> = {};
+    if (directory) headers["x-opencode-directory"] = directory;
     const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`, {
       method: "POST",
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
     return res.ok;
   }
 
-  async mcpDisconnect(name: string): Promise<boolean> {
+  async mcpDisconnect(name: string, directory?: string): Promise<boolean> {
+    const headers: Record<string, string> = {};
+    if (directory) headers["x-opencode-directory"] = directory;
     const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`, {
       method: "POST",
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
     return res.ok;
   }

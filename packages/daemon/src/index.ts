@@ -105,24 +105,27 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         },
         onMcpList: async (msg) => {
           if (!opencodeClient) { console.warn("[index] onMcpList: no opencodeClient configured"); return; }
+          const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
+            directory, machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
           });
         },
         onMcpEnable: async (msg) => {
           if (!opencodeClient) { console.warn("[index] onMcpEnable: no opencodeClient configured"); return; }
+          const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpEnableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            serverName: msg.serverName, machineId: config.machineId, opencodeClient,
+            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onMcpDisable: async (msg) => {
           if (!opencodeClient) { console.warn("[index] onMcpDisable: no opencodeClient configured"); return; }
+          const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpDisableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            serverName: msg.serverName, machineId: config.machineId, opencodeClient,
+            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient,
             sendTelegramReply: sendTelegramMessage,
           });
         },

@@ -261,6 +261,30 @@ describe("OpencodeClient", () => {
       );
     });
 
+    it("sends x-opencode-directory header when directory is provided", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpStatus("/home/dev/projects/eternal-machinery");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp",
+        expect.objectContaining({
+          method: "GET",
+          headers: expect.objectContaining({
+            "x-opencode-directory": "/home/dev/projects/eternal-machinery",
+          }),
+        }),
+      );
+    });
+
     it("throws on non-ok response", async () => {
       fetchMock.mockResolvedValueOnce(new Response("internal error", { status: 500 }));
 
@@ -304,6 +328,27 @@ describe("OpencodeClient", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "http://localhost:4320/mcp/my%20server/connect",
         expect.anything(),
+      );
+    });
+
+    it("sends x-opencode-directory header when directory is provided", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpConnect("tec", "/home/dev/projects/eternal-machinery");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/tec/connect",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "x-opencode-directory": "/home/dev/projects/eternal-machinery",
+          }),
+        }),
       );
     });
 
@@ -352,6 +397,27 @@ describe("OpencodeClient", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "http://localhost:4320/mcp/my%20server/disconnect",
         expect.anything(),
+      );
+    });
+
+    it("sends x-opencode-directory header when directory is provided", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpDisconnect("tec", "/home/dev/projects/eternal-machinery");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp/tec/disconnect",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "x-opencode-directory": "/home/dev/projects/eternal-machinery",
+          }),
+        }),
       );
     });
 

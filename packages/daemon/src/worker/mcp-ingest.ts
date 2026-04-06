@@ -4,6 +4,7 @@ export interface McpListCommandInput {
   commandId: string;
   sessionId: string;
   chatId: string;
+  directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus">;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
@@ -14,6 +15,7 @@ export interface McpEnableCommandInput {
   sessionId: string;
   chatId: string;
   serverName: string;
+  directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus" | "mcpConnect" | "mcpDisconnect">;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
@@ -24,6 +26,7 @@ export interface McpDisableCommandInput {
   sessionId: string;
   chatId: string;
   serverName: string;
+  directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpDisconnect">;
   sendTelegramReply: (chatId: string, text: string) => Promise<void>;
@@ -42,10 +45,10 @@ function statusEmoji(status: string): string {
 }
 
 export async function ingestMcpListCommand(input: McpListCommandInput): Promise<void> {
-  const { sessionId, chatId, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, directory, opencodeClient, sendTelegramReply } = input;
 
   try {
-    const servers = await opencodeClient.mcpStatus();
+    const servers = await opencodeClient.mcpStatus(directory);
     const entries = Object.entries(servers);
 
     let body = `🔌 *MCP Servers:*\n🆔 \`${sessionId}\`\n\n`;
@@ -73,10 +76,10 @@ export async function ingestMcpListCommand(input: McpListCommandInput): Promise<
 }
 
 export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Promise<void> {
-  const { sessionId, chatId, serverName, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, serverName, directory, opencodeClient, sendTelegramReply } = input;
 
   try {
-    const servers = await opencodeClient.mcpStatus();
+    const servers = await opencodeClient.mcpStatus(directory);
 
     if (!(serverName in servers)) {
       const available = Object.keys(servers).join(", ");
@@ -89,11 +92,11 @@ export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Prom
 
     const serverInfo = servers[serverName];
     if (serverInfo && serverInfo.status === "connected") {
-      await opencodeClient.mcpDisconnect(serverName);
-      await opencodeClient.mcpConnect(serverName);
+      await opencodeClient.mcpDisconnect(serverName, directory);
+      await opencodeClient.mcpConnect(serverName, directory);
       await sendTelegramReply(chatId, `🔌 \`${serverName}\` reconnected ✅`);
     } else {
-      await opencodeClient.mcpConnect(serverName);
+      await opencodeClient.mcpConnect(serverName, directory);
       await sendTelegramReply(chatId, `🔌 \`${serverName}\` connected ✅`);
     }
 
@@ -105,10 +108,10 @@ export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Prom
 }
 
 export async function ingestMcpDisableCommand(input: McpDisableCommandInput): Promise<void> {
-  const { sessionId, chatId, serverName, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, serverName, directory, opencodeClient, sendTelegramReply } = input;
 
   try {
-    await opencodeClient.mcpDisconnect(serverName);
+    await opencodeClient.mcpDisconnect(serverName, directory);
     await sendTelegramReply(chatId, `🔌 \`${serverName}\` disconnected`);
     console.log(`[mcp-ingest] disable commandId=${input.commandId} server=${serverName} session=${sessionId}`);
   } catch (err) {

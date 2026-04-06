@@ -103,6 +103,18 @@ describe("ingestMcpListCommand", () => {
       expect.stringContaining("Failed to list MCP servers: server unreachable"),
     );
   });
+
+  it("passes directory to mcpStatus when provided", async () => {
+    const mcpStatusMock = vi.fn().mockResolvedValue({ tec: { status: "connected" } });
+    const input = makeInput({
+      directory: "/home/dev/projects/eternal-machinery",
+      opencodeClient: { mcpStatus: mcpStatusMock },
+    });
+
+    await ingestMcpListCommand(input);
+
+    expect(mcpStatusMock).toHaveBeenCalledWith("/home/dev/projects/eternal-machinery");
+  });
 });
 
 describe("ingestMcpEnableCommand", () => {
@@ -134,7 +146,7 @@ describe("ingestMcpEnableCommand", () => {
 
     await ingestMcpEnableCommand(input);
 
-    expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("slack");
+    expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("slack", undefined);
     expect(input.opencodeClient.mcpDisconnect).not.toHaveBeenCalled();
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
@@ -154,7 +166,7 @@ describe("ingestMcpEnableCommand", () => {
 
     await ingestMcpEnableCommand(input);
 
-    expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("browser");
+    expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("browser", undefined);
     expect(input.opencodeClient.mcpDisconnect).not.toHaveBeenCalled();
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
@@ -176,8 +188,8 @@ describe("ingestMcpEnableCommand", () => {
 
     await ingestMcpEnableCommand(input);
 
-    expect(disconnectMock).toHaveBeenCalledWith("filesystem");
-    expect(connectMock).toHaveBeenCalledWith("filesystem");
+    expect(disconnectMock).toHaveBeenCalledWith("filesystem", undefined);
+    expect(connectMock).toHaveBeenCalledWith("filesystem", undefined);
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("🔌 `filesystem` reconnected ✅"),
@@ -226,6 +238,27 @@ describe("ingestMcpEnableCommand", () => {
       expect.stringContaining("Failed to enable `filesystem`: API error"),
     );
   });
+
+  it("passes directory to mcpStatus, mcpConnect, and mcpDisconnect", async () => {
+    const mcpStatusMock = vi.fn().mockResolvedValue({ tec: { status: "connected" } });
+    const mcpConnectMock = vi.fn().mockResolvedValue(true);
+    const mcpDisconnectMock = vi.fn().mockResolvedValue(true);
+    const input = makeInput({
+      serverName: "tec",
+      directory: "/home/dev/projects/eternal-machinery",
+      opencodeClient: {
+        mcpStatus: mcpStatusMock,
+        mcpConnect: mcpConnectMock,
+        mcpDisconnect: mcpDisconnectMock,
+      },
+    });
+
+    await ingestMcpEnableCommand(input);
+
+    expect(mcpStatusMock).toHaveBeenCalledWith("/home/dev/projects/eternal-machinery");
+    expect(mcpDisconnectMock).toHaveBeenCalledWith("tec", "/home/dev/projects/eternal-machinery");
+    expect(mcpConnectMock).toHaveBeenCalledWith("tec", "/home/dev/projects/eternal-machinery");
+  });
 });
 
 describe("ingestMcpDisableCommand", () => {
@@ -248,7 +281,7 @@ describe("ingestMcpDisableCommand", () => {
 
     await ingestMcpDisableCommand(input);
 
-    expect(input.opencodeClient.mcpDisconnect).toHaveBeenCalledWith("slack");
+    expect(input.opencodeClient.mcpDisconnect).toHaveBeenCalledWith("slack", undefined);
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("🔌 `slack` disconnected"),
@@ -269,5 +302,18 @@ describe("ingestMcpDisableCommand", () => {
       "12345",
       expect.stringContaining("Failed to disable `filesystem`: disconnect failed"),
     );
+  });
+
+  it("passes directory to mcpDisconnect when provided", async () => {
+    const mcpDisconnectMock = vi.fn().mockResolvedValue(true);
+    const input = makeInput({
+      serverName: "tec",
+      directory: "/home/dev/projects/eternal-machinery",
+      opencodeClient: { mcpDisconnect: mcpDisconnectMock },
+    });
+
+    await ingestMcpDisableCommand(input);
+
+    expect(mcpDisconnectMock).toHaveBeenCalledWith("tec", "/home/dev/projects/eternal-machinery");
   });
 });
