@@ -217,7 +217,6 @@ export async function handleSendNotification(
   const telegramPayload: Record<string, unknown> = {
     chat_id: chatId,
     text,
-    parse_mode: "Markdown",
   };
   if (replyMarkup) {
     telegramPayload.reply_markup = replyMarkup;
