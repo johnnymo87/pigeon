@@ -33,7 +33,7 @@ async function sendTelegramMessage(chatId: string, text: string): Promise<void> 
     const res = await fetch(`${apiBase}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+      body: JSON.stringify({ chat_id: chatId, text }),
     });
     if (!res.ok) {
       console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status}`);

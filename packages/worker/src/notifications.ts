@@ -7,6 +7,7 @@ interface SendNotificationBody {
   replyMarkup?: unknown;
   media?: Array<{ key: string; mime: string; filename: string }>;
   notificationId?: string;
+  entities?: unknown[];
 }
 
 interface SessionRow {
@@ -169,7 +170,7 @@ export async function handleSendNotification(
   }
 
   const body = (await request.json()) as SendNotificationBody;
-  const { sessionId, chatId, text, replyMarkup, media } = body;
+  const { sessionId, chatId, text, replyMarkup, media, entities } = body;
   const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
 
   // Validate required fields
@@ -218,6 +219,9 @@ export async function handleSendNotification(
     chat_id: chatId,
     text,
   };
+  if (entities && entities.length > 0) {
+    telegramPayload.entities = entities;
+  }
   if (replyMarkup) {
     telegramPayload.reply_markup = replyMarkup;
   }
@@ -304,10 +308,10 @@ export async function handleEditNotification(
     notificationId?: string;
     text?: string;
     replyMarkup?: unknown;
-    parseMode?: string;
+    entities?: unknown[];
   };
 
-  const { notificationId, text, replyMarkup, parseMode } = body;
+  const { notificationId, text, replyMarkup, entities } = body;
   if (!notificationId || !text) {
     return json({ error: "notificationId and text are required" }, 400);
   }
@@ -327,8 +331,8 @@ export async function handleEditNotification(
     message_id: row.message_id,
     text,
   };
-  if (parseMode) {
-    telegramPayload.parse_mode = parseMode;
+  if (entities && entities.length > 0) {
+    telegramPayload.entities = entities;
   }
   if (replyMarkup) {
     telegramPayload.reply_markup = replyMarkup;

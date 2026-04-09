@@ -54,6 +54,7 @@ export interface WorkerNotificationSender {
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
     media?: Array<{ key: string; mime: string; filename: string }>,
+    notificationId?: string,
     entities?: TgEntity[],
   ): Promise<{ ok: boolean }>;
 
@@ -397,6 +398,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       text,
       replyMarkup,
       media,
+      undefined,
       entities,
     );
 
