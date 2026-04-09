@@ -57,3 +57,16 @@ export class TgMessageBuilder {
     return this;
   }
 }
+
+export function concatMessages(messages: TgMessage[]): TgMessage {
+  let text = "";
+  const entities: TgEntity[] = [];
+  for (const msg of messages) {
+    const offset = text.length;
+    text += msg.text;
+    for (const e of msg.entities) {
+      entities.push({ offset: e.offset + offset, length: e.length, type: e.type });
+    }
+  }
+  return { text, entities };
+}

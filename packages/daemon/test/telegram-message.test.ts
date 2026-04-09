@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TgMessageBuilder, type TgMessage, type TgEntity } from "../src/telegram-message";
+import { TgMessageBuilder, concatMessages, type TgMessage, type TgEntity } from "../src/telegram-message";
 
 describe("TgMessageBuilder", () => {
   it("builds plain text with no entities", () => {
@@ -77,5 +77,44 @@ describe("TgMessageBuilder", () => {
     const msg = new TgMessageBuilder().build();
     expect(msg.text).toBe("");
     expect(msg.entities).toHaveLength(0);
+  });
+});
+
+describe("concatMessages", () => {
+  it("concatenates text and adjusts entity offsets", () => {
+    const a: TgMessage = {
+      text: "Hello ",
+      entities: [{ offset: 0, length: 5, type: "bold" }],
+    };
+    const b: TgMessage = {
+      text: "world",
+      entities: [{ offset: 0, length: 5, type: "italic" }],
+    };
+    const result = concatMessages([a, b]);
+    expect(result.text).toBe("Hello world");
+    expect(result.entities).toEqual([
+      { offset: 0, length: 5, type: "bold" },
+      { offset: 6, length: 5, type: "italic" },
+    ]);
+  });
+
+  it("handles empty messages in the array", () => {
+    const a: TgMessage = { text: "hi", entities: [] };
+    const b: TgMessage = { text: "", entities: [] };
+    const c: TgMessage = {
+      text: "there",
+      entities: [{ offset: 0, length: 5, type: "code" }],
+    };
+    const result = concatMessages([a, b, c]);
+    expect(result.text).toBe("hithere");
+    expect(result.entities).toEqual([
+      { offset: 2, length: 5, type: "code" },
+    ]);
+  });
+
+  it("returns empty message for empty array", () => {
+    const result = concatMessages([]);
+    expect(result.text).toBe("");
+    expect(result.entities).toHaveLength(0);
   });
 });
