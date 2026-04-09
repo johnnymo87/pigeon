@@ -56,7 +56,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
             apiKey: config.workerApiKey,
-            editNotification: (nid, text, rm) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }),
+            editNotification: (nid, text, rm, entities) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }, entities as unknown[] | undefined),
             machineId: config.machineId,
           });
         },

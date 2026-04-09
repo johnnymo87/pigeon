@@ -33,7 +33,7 @@ export interface WorkerCommandIngestOptions {
   /** Override fetch for testing */
   fetchFn?: typeof fetch;
   /** Edit an existing Telegram notification (for wizard step transitions) */
-  editNotification?: (notificationId: string, text: string, replyMarkup: unknown) => Promise<{ ok: boolean }>;
+  editNotification?: (notificationId: string, text: string, replyMarkup: unknown, entities?: unknown[]) => Promise<{ ok: boolean }>;
   /** Machine ID for formatting wizard steps */
   machineId?: string;
 }
@@ -152,7 +152,7 @@ export async function ingestWorkerCommand(
         // Format next step
         const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
         const label = session.label || session.sessionId.slice(0, 8);
-        const { text, replyMarkup } = formatQuestionWizardStep({
+        const { message, replyMarkup } = formatQuestionWizardStep({
           label,
           questions: pendingQuestion.questions,
           currentStep: updated.currentStep,
@@ -163,7 +163,7 @@ export async function ingestWorkerCommand(
           machineId: options.machineId,
         });
 
-        await options.editNotification?.(notificationId, text, replyMarkup);
+        await options.editNotification?.(notificationId, message.text, replyMarkup, message.entities);
 
         console.log(`[command-ingest] wizard advanced to step ${updated.currentStep} commandId=${commandId}`);
         storage.inbox.markDone(commandId);

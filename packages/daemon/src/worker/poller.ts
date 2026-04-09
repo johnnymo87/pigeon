@@ -280,6 +280,7 @@ export class Poller {
     replyMarkup: { inline_keyboard?: unknown[] },
     media?: Array<{ key: string; mime: string; filename: string }>,
     notificationId?: string,
+    entities?: unknown[],
   ): Promise<{ ok: boolean }> {
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
@@ -295,6 +296,7 @@ export class Poller {
           replyMarkup,
           ...(media && media.length > 0 ? { media } : {}),
           ...(notificationId ? { notificationId } : {}),
+          ...(entities && entities.length > 0 ? { entities } : {}),
         }),
       });
       return await response.json() as { ok: boolean };
@@ -307,6 +309,7 @@ export class Poller {
     notificationId: string,
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
+    entities?: unknown[],
   ): Promise<{ ok: boolean }> {
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/edit`, {
@@ -315,7 +318,12 @@ export class Poller {
           Authorization: `Bearer ${this.config.apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ notificationId, text, replyMarkup }),
+        body: JSON.stringify({
+          notificationId,
+          text,
+          replyMarkup,
+          ...(entities && entities.length > 0 ? { entities } : {}),
+        }),
       });
       return await response.json() as { ok: boolean };
     } catch {
