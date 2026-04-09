@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
+import { TgMessageBuilder, type TgMessage } from "./telegram-message";
 
 interface NotificationInput {
   event: string;
@@ -63,10 +64,6 @@ export interface WorkerNotificationSender {
   ): Promise<{ ok: boolean; key: string }>;
 }
 
-function escapeMarkdown(text: string): string {
-  return text.replace(/[_*[\]]/g, "\\$&");
-}
-
 function eventEmoji(event: string): string {
   if (event === "SubagentStop") return "🔧";
   if (event === "Question") return "❓";
@@ -75,31 +72,39 @@ function eventEmoji(event: string): string {
 }
 
 export function formatTelegramNotification(input: NotificationInput): {
-  texts: string[];
+  header: TgMessage;
+  body: TgMessage;
+  footer: TgMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
-  let infoLine = `📂 \`${cwdShort}\``;
+
+  const headerBuilder = new TgMessageBuilder()
+    .append(`${eventEmoji(input.event)} `)
+    .appendBold(input.event)
+    .append(`: ${input.label}`);
+
+  const bodyBuilder = new TgMessageBuilder().append(input.summary);
+
+  const footerBuilder = new TgMessageBuilder()
+    .append("📂 ")
+    .appendCode(cwdShort);
   if (input.machineId) {
-    infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+    footerBuilder.append(` · 🖥 ${input.machineId}`);
   }
-
-  const header = `${eventEmoji(input.event)} *${input.event}*: ${escapeMarkdown(input.label)}`;
-
-  const footer = [
-    infoLine,
-    `🆔 \`${input.sessionId}\``,
-    "",
-    "↩️ _Swipe-reply to respond_",
-  ].join("\n");
-
-  const texts = splitTelegramMessage(header, input.summary, footer);
+  footerBuilder
+    .newline()
+    .append("🆔 ")
+    .appendCode(input.sessionId)
+    .newline(2)
+    .append("↩️ ")
+    .appendItalic("Swipe-reply to respond");
 
   return {
-    texts,
-    replyMarkup: {
-      inline_keyboard: [],
-    },
+    header: headerBuilder.build(),
+    body: bodyBuilder.build(),
+    footer: footerBuilder.build(),
+    replyMarkup: { inline_keyboard: [] },
   };
 }
 
@@ -111,67 +116,60 @@ export function formatQuestionNotification(input: {
   sessionId: string;
   machineId?: string;
 }): {
-  text: string;
+  message: TgMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
-  // firstQuestion is still used below for: single-question button generation
   const firstQuestion = input.questions[0];
-
-  const lines = [
-    `❓ *Question*: ${escapeMarkdown(input.label)}`,
-    "",
-  ];
-
   const isMulti = input.questions.length > 1;
 
-  input.questions.forEach((q, idx) => {
-    if (idx > 0) {
-      lines.push("");
-    }
-    if (q.header) {
-      lines.push(isMulti
-        ? `(${idx + 1}/${input.questions.length}) *${escapeMarkdown(q.header)}*`
-        : `*${escapeMarkdown(q.header)}*`);
-    } else if (isMulti) {
-      lines.push(`(${idx + 1}/${input.questions.length})`);
-    }
-    lines.push(escapeMarkdown(q.question));
+  const b = new TgMessageBuilder()
+    .append("❓ ")
+    .appendBold("Question")
+    .append(`: ${input.label}`)
+    .newline(2);
 
+  input.questions.forEach((q, idx) => {
+    if (idx > 0) b.newline(2);
+    if (q.header) {
+      if (isMulti) {
+        b.append(`(${idx + 1}/${input.questions.length}) `).appendBold(q.header);
+      } else {
+        b.appendBold(q.header);
+      }
+      b.newline();
+    } else if (isMulti) {
+      b.append(`(${idx + 1}/${input.questions.length})`).newline();
+    }
+    b.append(q.question);
     if (q.options.length > 0) {
-      lines.push("");
+      b.newline(2);
       q.options.forEach((opt, i) => {
-        const desc = opt.description ? ` — ${escapeMarkdown(opt.description)}` : "";
-        lines.push(`${i + 1}\\. ${escapeMarkdown(opt.label)}${desc}`);
+        if (i > 0) b.newline();
+        const desc = opt.description ? ` — ${opt.description}` : "";
+        b.append(`${i + 1}. ${opt.label}${desc}`);
       });
     }
   });
 
   if (isMulti) {
-    lines.push("");
-    lines.push(`_answer in app or wait for wizard buttons_`);
+    b.newline(2).appendItalic("answer in app or wait for wizard buttons");
   }
 
-  let questionInfoLine = `📂 \`${cwdShort}\``;
+  b.newline(2).append("📂 ").appendCode(cwdShort);
   if (input.machineId) {
-    questionInfoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+    b.append(` · 🖥 ${input.machineId}`);
   }
-  lines.push("");
-  lines.push(questionInfoLine);
-  lines.push(`🆔 \`${input.sessionId}\``);
+  b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const hasCustom = input.questions.some(q => q.custom !== false);
   if (hasCustom) {
-    lines.push("");
-    lines.push("↩️ _Swipe-reply for custom answer_");
+    b.newline(2).append("↩️ ").appendItalic("Swipe-reply for custom answer");
   }
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
-
-  // Only provide buttons for single-question requests
   if (input.questions.length === 1 && firstQuestion && firstQuestion.options.length > 0) {
     const options = firstQuestion.options;
-    // Put up to 3 per row
     for (let i = 0; i < options.length; i += 3) {
       rows.push(
         options.slice(i, i + 3).map((opt, j) => ({
@@ -182,10 +180,7 @@ export function formatQuestionNotification(input: {
     }
   }
 
-  return {
-    text: lines.join("\n"),
-    replyMarkup: { inline_keyboard: rows },
-  };
+  return { message: b.build(), replyMarkup: { inline_keyboard: rows } };
 }
 
 export function formatQuestionWizardStep(input: {
@@ -198,47 +193,44 @@ export function formatQuestionWizardStep(input: {
   sessionId: string;
   machineId?: string;
 }): {
-  text: string;
+  message: TgMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const totalSteps = input.questions.length;
   const currentQuestion = input.questions[input.currentStep]!;
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
 
-  const lines = [
-    `❓ *Question ${input.currentStep + 1} of ${totalSteps}*: ${escapeMarkdown(input.label)}`,
-    "",
-  ];
+  const b = new TgMessageBuilder()
+    .append("❓ ")
+    .appendBold(`Question ${input.currentStep + 1} of ${totalSteps}`)
+    .append(`: ${input.label}`)
+    .newline(2);
 
   if (currentQuestion.header) {
-    lines.push(`*${escapeMarkdown(currentQuestion.header)}*`);
+    b.appendBold(currentQuestion.header).newline();
   }
-  lines.push(escapeMarkdown(currentQuestion.question));
+  b.append(currentQuestion.question);
 
   if (currentQuestion.options.length > 0) {
-    lines.push("");
+    b.newline(2);
     currentQuestion.options.forEach((opt, i) => {
-      const desc = opt.description ? ` — ${escapeMarkdown(opt.description)}` : "";
-      lines.push(`${i + 1}\\. ${escapeMarkdown(opt.label)}${desc}`);
+      if (i > 0) b.newline();
+      const desc = opt.description ? ` — ${opt.description}` : "";
+      b.append(`${i + 1}. ${opt.label}${desc}`);
     });
   }
 
-  // Info line
-  let infoLine = `📂 \`${cwdShort}\``;
+  b.newline(2).append("📂 ").appendCode(cwdShort);
   if (input.machineId) {
-    infoLine += ` · 🖥 ${escapeMarkdown(input.machineId)}`;
+    b.append(` · 🖥 ${input.machineId}`);
   }
-  lines.push("");
-  lines.push(infoLine);
-  lines.push(`🆔 \`${input.sessionId}\``);
+  b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const hasCustom = currentQuestion.custom !== false;
   if (hasCustom) {
-    lines.push("");
-    lines.push("↩️ _Swipe-reply for custom answer_");
+    b.newline(2).append("↩️ ").appendItalic("Swipe-reply for custom answer");
   }
 
-  // Option buttons with versioned callback data
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   const options = currentQuestion.options;
   for (let i = 0; i < options.length; i += 3) {
@@ -250,14 +242,7 @@ export function formatQuestionWizardStep(input: {
     );
   }
 
-  // No Cancel button: opencode has no API to reject/dismiss a pending question
-  // and no question timeout. Cancelling would leave opencode permanently stuck,
-  // requiring the user to go back to the TUI.
-
-  return {
-    text: lines.join("\n"),
-    replyMarkup: { inline_keyboard: rows },
-  };
+  return { message: b.build(), replyMarkup: { inline_keyboard: rows } };
 }
 
 export function generateToken(): string {
@@ -327,12 +312,13 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       sessionId: input.session.sessionId,
     });
 
-    const { texts, replyMarkup } = notification;
-    for (let i = 0; i < texts.length; i++) {
-      const isLast = i === texts.length - 1;
+    const { header, body, footer, replyMarkup } = notification;
+    const chunks = splitTelegramMessage(header, body, footer);
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
       await this.sendTelegramMessage(
         input.session.sessionId,
-        texts[i]!,
+        chunks[i]!.text,
         isLast ? replyMarkup : { inline_keyboard: [] },
         token,
       );
@@ -373,7 +359,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
 
     await this.sendTelegramMessage(
       input.session.sessionId,
-      notification.text,
+      notification.message.text,
       notification.replyMarkup,
       token,
     );
@@ -457,12 +443,13 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       }
     }
 
-    const { texts, replyMarkup } = notification;
-    for (let i = 0; i < texts.length; i++) {
-      const isLast = i === texts.length - 1;
+    const { header, body, footer, replyMarkup } = notification;
+    const chunks = splitTelegramMessage(header, body, footer);
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
       await this.sendViaWorker(
         input.session.sessionId,
-        texts[i]!,
+        chunks[i]!.text,
         isLast ? replyMarkup : { inline_keyboard: [] },
         isLast && mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
       );
@@ -503,7 +490,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
 
     await this.sendViaWorker(
       input.session.sessionId,
-      notification.text,
+      notification.message.text,
       notification.replyMarkup,
     );
 

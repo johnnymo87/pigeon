@@ -11,7 +11,7 @@ import type { QuestionInfoData } from "../src/storage/types";
 import { openStorageDb } from "../src/storage/database";
 
 describe("formatTelegramNotification", () => {
-  it("formats markdown body with no inline buttons", () => {
+  it("formats body as TgMessage with no inline buttons", () => {
     const result = formatTelegramNotification({
       event: "Stop",
       label: "my_[label]*",
@@ -21,14 +21,32 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-abc123",
     });
 
-    expect(result.texts).toHaveLength(1);
-    expect(result.texts[0]).toContain("*Stop*: my\\_\\[label\\]\\*");
-    expect(result.texts[0]).toContain("📂 `projects/pigeon`");
-    expect(result.texts[0]).toContain("🆔 `sess-abc123`");
+    // Returns header, body, footer as TgMessage objects
+    expect(result.header).toBeDefined();
+    expect(result.body).toBeDefined();
+    expect(result.footer).toBeDefined();
+
+    // Header contains event (bold) and label (plain - no escaping needed)
+    expect(result.header.text).toContain("Stop");
+    expect(result.header.text).toContain("my_[label]*");
+    // Header should have a bold entity for "Stop"
+    const boldEntity = result.header.entities.find(e => e.type === "bold");
+    expect(boldEntity).toBeDefined();
+
+    // Body is the summary
+    expect(result.body.text).toBe("Done");
+
+    // Footer contains cwd, sessionId
+    expect(result.footer.text).toContain("projects/pigeon");
+    expect(result.footer.text).toContain("sess-abc123");
+    // Footer should have code entities for cwd and sessionId
+    const codeEntities = result.footer.entities.filter(e => e.type === "code");
+    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
-  it("includes machine ID in info line when provided", () => {
+  it("includes machine ID in footer when provided", () => {
     const result = formatTelegramNotification({
       event: "Stop",
       label: "test",
@@ -39,11 +57,12 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-xyz",
     });
 
-    expect(result.texts[0]).toContain("📂 `projects/pigeon` · 🖥 devbox");
-    expect(result.texts[0]).toContain("\n🆔 `sess-xyz`");
+    expect(result.footer.text).toContain("projects/pigeon");
+    expect(result.footer.text).toContain("devbox");
+    expect(result.footer.text).toContain("sess-xyz");
   });
 
-  it("omits machine ID from info line when not provided", () => {
+  it("omits machine ID from footer when not provided", () => {
     const result = formatTelegramNotification({
       event: "Stop",
       label: "test",
@@ -53,13 +72,12 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-nomachine",
     });
 
-    expect(result.texts[0]).toContain("📂 `projects/pigeon`");
-    expect(result.texts[0]).toContain("\n🆔 `sess-nomachine`");
-    expect(result.texts[0]).not.toContain("🖥");
+    expect(result.footer.text).toContain("projects/pigeon");
+    expect(result.footer.text).toContain("sess-nomachine");
+    expect(result.footer.text).not.toContain("🖥");
   });
 
-  it("splits long summary into multiple messages with header/footer on each", () => {
-    // Generate a summary that exceeds 4096 chars when combined with header+footer overhead (~71 chars)
+  it("returns separate header, body, footer for callers to split themselves", () => {
     const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i} content here.`).join("\n\n");
     const result = formatTelegramNotification({
       event: "Stop",
@@ -70,12 +88,11 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-long",
     });
 
-    expect(result.texts.length).toBeGreaterThan(1);
-    for (const text of result.texts) {
-      expect(text.length).toBeLessThanOrEqual(4096);
-      expect(text).toContain("*Stop*");
-      expect(text).toContain("🆔 `sess-long`");
-    }
+    // Caller is responsible for splitting — formatter just returns parts
+    expect(result.header).toBeDefined();
+    expect(result.body.text).toBe(longSummary);
+    expect(result.footer).toBeDefined();
+    expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 });
 
@@ -125,9 +142,8 @@ describe("TelegramNotificationService", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, options] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
-    expect(payload.parse_mode).toBe("Markdown");
     expect(payload.chat_id).toBe("8248645256");
-    expect((payload.text as string)).toContain("🆔 `sess-1`");
+    expect((payload.text as string)).toContain("sess-1");
 
     storage.db.close();
   });
@@ -199,12 +215,16 @@ describe("formatQuestionWizardStep", () => {
       machineId: "devbox",
     });
 
-    expect(result.text).toContain("Question 1 of 2");
-    expect(result.text).toContain("*Database*");
-    expect(result.text).toContain("Which DB?");
-    expect(result.text).toContain("PostgreSQL");
-    expect(result.text).toContain("SQLite");
-    expect(result.text).not.toContain("ORM"); // future question not shown
+    expect(result.message.text).toContain("Question 1 of 2");
+    expect(result.message.text).toContain("Database");
+    expect(result.message.text).toContain("Which DB?");
+    expect(result.message.text).toContain("PostgreSQL");
+    expect(result.message.text).toContain("SQLite");
+    expect(result.message.text).not.toContain("ORM"); // future question not shown
+
+    // "Question 1 of 2" should be bold
+    const boldEntity = result.message.entities.find(e => e.type === "bold");
+    expect(boldEntity).toBeDefined();
   });
 
   it("includes versioned callback_data on buttons", () => {
@@ -224,10 +244,10 @@ describe("formatQuestionWizardStep", () => {
       cwd: "/tmp", token: "tok-wiz", version: 1, sessionId: "s1",
     });
 
-    expect(result.text).toContain("Question 2 of 2");
-    expect(result.text).toContain("*ORM*");
-    expect(result.text).toContain("Which ORM?");
-    expect(result.text).not.toContain("Database");
+    expect(result.message.text).toContain("Question 2 of 2");
+    expect(result.message.text).toContain("ORM");
+    expect(result.message.text).toContain("Which ORM?");
+    expect(result.message.text).not.toContain("Database");
   });
 
   it("does NOT include a Cancel button (no opencode API to reject questions)", () => {
@@ -245,7 +265,10 @@ describe("formatQuestionWizardStep", () => {
       label: "test", questions, currentStep: 0,
       cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
     });
-    expect(result.text).toContain("Swipe-reply for custom answer");
+    expect(result.message.text).toContain("Swipe-reply for custom answer");
+    // "Swipe-reply for custom answer" should be italic
+    const italicEntity = result.message.entities.find(e => e.type === "italic");
+    expect(italicEntity).toBeDefined();
   });
 
   it("hides swipe-reply hint when custom=false", () => {
@@ -254,7 +277,7 @@ describe("formatQuestionWizardStep", () => {
       label: "test", questions: qs, currentStep: 0,
       cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
     });
-    expect(result.text).not.toContain("Swipe-reply");
+    expect(result.message.text).not.toContain("Swipe-reply");
   });
 });
 
@@ -276,14 +299,28 @@ describe("formatQuestionNotification", () => {
       machineId: "devbox",
     });
 
-    expect(result.text).toContain("❓ *Question*: pigeon");
-    expect(result.text).toContain("*Database Choice*");
-    expect(result.text).toContain("Which database should I use?");
-    expect(result.text).toContain("PostgreSQL");
-    expect(result.text).toContain("SQLite");
-    expect(result.text).toContain("📂 `projects/pigeon` · 🖥 devbox");
-    expect(result.text).toContain("\n🆔 `sess-q1`");
-    expect(result.text).toContain("Swipe-reply for custom answer");
+    expect(result.message.text).toContain("Question");
+    expect(result.message.text).toContain("pigeon");
+    expect(result.message.text).toContain("Database Choice");
+    expect(result.message.text).toContain("Which database should I use?");
+    expect(result.message.text).toContain("PostgreSQL");
+    expect(result.message.text).toContain("SQLite");
+    expect(result.message.text).toContain("projects/pigeon");
+    expect(result.message.text).toContain("devbox");
+    expect(result.message.text).toContain("sess-q1");
+    expect(result.message.text).toContain("Swipe-reply for custom answer");
+
+    // "Question" should be bold
+    const boldEntity = result.message.entities.find(e => e.type === "bold");
+    expect(boldEntity).toBeDefined();
+
+    // sessionId and cwd should be code entities
+    const codeEntities = result.message.entities.filter(e => e.type === "code");
+    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+
+    // "Swipe-reply for custom answer" should be italic
+    const italicEntity = result.message.entities.find(e => e.type === "italic");
+    expect(italicEntity).toBeDefined();
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(1);
     expect(result.replyMarkup.inline_keyboard[0]).toHaveLength(2);
@@ -329,14 +366,16 @@ describe("formatQuestionNotification", () => {
     });
 
     // Shows BOTH questions with (X/N) prefix
-    expect(result.text).toContain("(1/2) *H1*");
-    expect(result.text).toContain("Q1 text");
-    expect(result.text).toContain("A");
-    expect(result.text).toContain("(2/2) *H2*");
-    expect(result.text).toContain("Q2 text");
-    expect(result.text).toContain("B");
+    expect(result.message.text).toContain("(1/2)");
+    expect(result.message.text).toContain("H1");
+    expect(result.message.text).toContain("Q1 text");
+    expect(result.message.text).toContain("A");
+    expect(result.message.text).toContain("(2/2)");
+    expect(result.message.text).toContain("H2");
+    expect(result.message.text).toContain("Q2 text");
+    expect(result.message.text).toContain("B");
     // Fallback hint
-    expect(result.text).toContain("answer in app");
+    expect(result.message.text).toContain("answer in app");
     // No inline buttons for multi-question (wizard will change this later)
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
@@ -353,10 +392,10 @@ describe("formatQuestionNotification", () => {
       sessionId: "sess-noheader",
     });
 
-    expect(result.text).toContain("(1/2)");
-    expect(result.text).toContain("(2/2)");
-    expect(result.text).toContain("Q1 text");
-    expect(result.text).toContain("Q2 text");
+    expect(result.message.text).toContain("(1/2)");
+    expect(result.message.text).toContain("(2/2)");
+    expect(result.message.text).toContain("Q1 text");
+    expect(result.message.text).toContain("Q2 text");
   });
 
   it("shows swipe-reply hint when any question in multi-question allows custom", () => {
@@ -371,7 +410,7 @@ describe("formatQuestionNotification", () => {
       sessionId: "sess-multicustom",
     });
 
-    expect(result.text).toContain("Swipe-reply");
+    expect(result.message.text).toContain("Swipe-reply");
   });
 
   it("hides swipe-reply hint when custom=false", () => {
@@ -388,7 +427,7 @@ describe("formatQuestionNotification", () => {
       sessionId: "sess-nocustom",
     });
 
-    expect(result.text).not.toContain("Swipe-reply");
+    expect(result.message.text).not.toContain("Swipe-reply");
   });
 });
 
@@ -451,10 +490,9 @@ describe("TelegramNotificationService.sendQuestionNotification", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, options] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
-    expect(payload.parse_mode).toBe("Markdown");
     expect((payload.text as string)).toContain("Question");
     expect((payload.text as string)).toContain("Which DB?");
-    expect((payload.text as string)).toContain("🆔 `sess-q`");
+    expect((payload.text as string)).toContain("sess-q");
 
     storage.db.close();
   });
