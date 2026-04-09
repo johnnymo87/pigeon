@@ -144,6 +144,10 @@ describe("TelegramNotificationService", () => {
     const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
     expect(payload.chat_id).toBe("8248645256");
     expect((payload.text as string)).toContain("sess-1");
+    // Entities instead of parse_mode
+    expect(payload.parse_mode).toBeUndefined();
+    expect(Array.isArray(payload.entities)).toBe(true);
+    expect((payload.entities as unknown[]).length).toBeGreaterThan(0);
 
     storage.db.close();
   });
@@ -493,6 +497,9 @@ describe("TelegramNotificationService.sendQuestionNotification", () => {
     expect((payload.text as string)).toContain("Question");
     expect((payload.text as string)).toContain("Which DB?");
     expect((payload.text as string)).toContain("sess-q");
+    // Entities instead of parse_mode
+    expect(payload.parse_mode).toBeUndefined();
+    expect(Array.isArray(payload.entities)).toBe(true);
 
     storage.db.close();
   });

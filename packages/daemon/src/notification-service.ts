@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
-import { TgMessageBuilder, type TgMessage } from "./telegram-message";
+import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
 
 interface NotificationInput {
   event: string;
@@ -54,6 +54,7 @@ export interface WorkerNotificationSender {
     text: string,
     replyMarkup: { inline_keyboard?: unknown[] },
     media?: Array<{ key: string; mime: string; filename: string }>,
+    entities?: TgEntity[],
   ): Promise<{ ok: boolean }>;
 
   uploadMedia?(
@@ -268,20 +269,24 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
     text: string,
     replyMarkup: { inline_keyboard: unknown[] },
     token: string,
+    entities?: TgEntity[],
   ): Promise<void> {
+    const payload: Record<string, unknown> = {
+      chat_id: this.chatId,
+      text,
+      reply_markup: replyMarkup,
+    };
+    if (entities && entities.length > 0) {
+      payload.entities = entities;
+    }
     const response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: this.chatId,
-        text,
-        parse_mode: "Markdown",
-        reply_markup: replyMarkup,
-      }),
+      body: JSON.stringify(payload),
     });
 
-    const payload = await response.json() as { result?: { message_id?: number } };
-    const messageId = payload?.result?.message_id;
+    const result = await response.json() as { result?: { message_id?: number } };
+    const messageId = result?.result?.message_id;
 
     if (messageId) {
       this.storage.replyTokens.store(this.chatId, String(messageId), token, this.nowFn());
@@ -321,6 +326,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
         chunks[i]!.text,
         isLast ? replyMarkup : { inline_keyboard: [] },
         token,
+        chunks[i]!.entities,
       );
     }
 
@@ -362,6 +368,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
       notification.message.text,
       notification.replyMarkup,
       token,
+      notification.message.entities,
     );
 
     return { token };
@@ -382,6 +389,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     text: string,
     replyMarkup: { inline_keyboard: unknown[] },
     media?: Array<{ key: string; mime: string; filename: string }>,
+    entities?: TgEntity[],
   ): Promise<void> {
     const result = await this.workerSender.sendNotification(
       sessionId,
@@ -389,6 +397,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       text,
       replyMarkup,
       media,
+      entities,
     );
 
     if (!result.ok) {
@@ -452,6 +461,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
         chunks[i]!.text,
         isLast ? replyMarkup : { inline_keyboard: [] },
         isLast && mediaKeys && mediaKeys.length > 0 ? mediaKeys : undefined,
+        chunks[i]!.entities,
       );
     }
 
@@ -492,6 +502,8 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       input.session.sessionId,
       notification.message.text,
       notification.replyMarkup,
+      undefined,
+      notification.message.entities,
     );
 
     return { token };
