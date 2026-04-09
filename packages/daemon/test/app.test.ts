@@ -308,9 +308,10 @@ describe("createApp", () => {
     const outboxEntry = storage.outbox.getByNotificationId(json.notificationId);
     expect(outboxEntry).not.toBeNull();
     const payload = JSON.parse(outboxEntry!.payload);
-    expect(payload.texts).toBeDefined();
-    expect(payload.texts.length).toBeGreaterThan(0);
-    expect(payload.texts[0]).toContain("Stop");
+    expect(payload.messages).toBeDefined();
+    expect(payload.messages.length).toBeGreaterThan(0);
+    expect(payload.messages[0].text).toContain("Stop");
+    expect(Array.isArray(payload.messages[0].entities)).toBe(true);
   });
 
   it("returns existing outbox entry on duplicate stop request", async () => {
@@ -577,8 +578,9 @@ describe("createApp", () => {
     const outbox = storage.outbox.getByNotificationId(notificationId);
     expect(outbox).not.toBeNull();
     const payload = JSON.parse(outbox!.payload);
-    expect(payload.text).toContain("Question 1 of 2");
-    expect(payload.text).toContain("H1");
+    expect(payload.message.text).toContain("Question 1 of 2");
+    expect(payload.message.text).toContain("H1");
+    expect(Array.isArray(payload.message.entities)).toBe(true);
     // Buttons should be present (wizard mode)
     expect(payload.replyMarkup.inline_keyboard.length).toBeGreaterThan(0);
     // Buttons should have versioned callback_data
@@ -620,8 +622,9 @@ describe("createApp", () => {
     expect(outbox).not.toBeNull();
     const payload = JSON.parse(outbox!.payload);
     // Single question should NOT use wizard format
-    expect(payload.text).not.toContain("Question 1 of");
-    expect(payload.text).toContain("DB Choice");
+    expect(payload.message.text).not.toContain("Question 1 of");
+    expect(payload.message.text).toContain("DB Choice");
+    expect(Array.isArray(payload.message.entities)).toBe(true);
     // Buttons should still be present for single-question
     expect(payload.replyMarkup.inline_keyboard.length).toBeGreaterThan(0);
     // Single-question buttons do NOT have versioned ":v0:" callback_data

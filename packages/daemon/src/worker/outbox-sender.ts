@@ -15,6 +15,7 @@ export type SendNotificationFn = (
   replyMarkup: unknown,
   media?: unknown,
   notificationId?: string,
+  entities?: unknown[],
 ) => Promise<{ ok: boolean }>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
@@ -105,17 +106,17 @@ export class OutboxSender {
         }
 
         // Parse payload
-        let texts: string[];
+        let messages: Array<{ text: string; entities?: unknown[] }>;
         let replyMarkup: unknown;
         let notificationId: string | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
-            text?: string;
-            texts?: string[];
+            messages?: Array<{ text: string; entities?: unknown[] }>;
+            message?: { text: string; entities?: unknown[] };
             replyMarkup: unknown;
             notificationId?: string;
           };
-          texts = parsed.texts ?? (parsed.text ? [parsed.text] : []);
+          messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
           notificationId = parsed.notificationId;
         } catch (err) {
@@ -127,7 +128,7 @@ export class OutboxSender {
           continue;
         }
 
-        if (texts.length === 0) {
+        if (messages.length === 0) {
           this.storage.outbox.markFailed(entry.notificationId, now);
           continue;
         }
@@ -135,15 +136,17 @@ export class OutboxSender {
         // Attempt delivery — send each chunk
         try {
           let allOk = true;
-          for (let i = 0; i < texts.length; i++) {
-            const isLast = i === texts.length - 1;
+          for (let i = 0; i < messages.length; i++) {
+            const isLast = i === messages.length - 1;
+            const msg = messages[i]!;
             const result = await this.sendNotification(
               entry.sessionId,
               this.chatId,
-              texts[i]!,
+              msg.text,
               isLast ? replyMarkup : { inline_keyboard: [] },
               undefined,
               isLast ? notificationId : undefined,
+              msg.entities,
             );
 
             if (!result.ok) {
@@ -165,7 +168,7 @@ export class OutboxSender {
             this.log("outbox entry sent", {
               notificationId: entry.notificationId,
               sessionId: entry.sessionId,
-              chunks: texts.length,
+              chunks: messages.length,
             });
           }
         } catch (err) {

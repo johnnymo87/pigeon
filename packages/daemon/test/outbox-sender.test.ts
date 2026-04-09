@@ -9,7 +9,7 @@ const BASE_OUTBOX_INPUT = {
   sessionId: "sess-1",
   requestId: "req-1",
   kind: "question",
-  payload: JSON.stringify({ text: "Which option?", replyMarkup: { inline_keyboard: [] }, notificationId: "notif-1" }),
+  payload: JSON.stringify({ message: { text: "Which option?", entities: [{ offset: 0, length: 5, type: "bold" }] }, replyMarkup: { inline_keyboard: [] }, notificationId: "notif-1" }),
   token: "tok-abc",
 };
 
@@ -49,6 +49,7 @@ describe("OutboxSender.processOnce()", () => {
       { inline_keyboard: [] },
       undefined,
       "notif-1",
+      [{ offset: 0, length: 5, type: "bold" }],
     );
 
     const record = storage.outbox.getByNotificationId("notif-1");
@@ -187,12 +188,16 @@ describe("OutboxSender.processOnce()", () => {
     expect(sendNotification).toHaveBeenCalledTimes(5);
   });
 
-  it("sends multiple messages for payload with texts array", async () => {
-    // Upsert an outbox entry with texts array
+  it("sends multiple messages for payload with messages array", async () => {
+    // Upsert an outbox entry with messages array
     storage.outbox.upsert({
       ...BASE_OUTBOX_INPUT,
       payload: JSON.stringify({
-        texts: ["Message 1", "Message 2", "Message 3"],
+        messages: [
+          { text: "Message 1", entities: [] },
+          { text: "Message 2", entities: [] },
+          { text: "Message 3", entities: [{ offset: 0, length: 7, type: "bold" }] },
+        ],
         replyMarkup: { inline_keyboard: [[{ text: "OK", callback_data: "cmd:tok:q0" }]] },
         notificationId: "notif-1",
       }),

@@ -1,6 +1,7 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
+import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
 
 interface LegacySession {
@@ -263,8 +264,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           sessionId,
         });
 
+        const chunks = splitTelegramMessage(notification.header, notification.body, notification.footer);
         const notificationPayload = {
-          texts: notification.texts,
+          messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
           replyMarkup: notification.replyMarkup,
           notificationId,
         };
@@ -346,7 +348,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }, now);
 
         // Format the notification payload for the outbox
-        let notificationPayload: { text: string; replyMarkup: unknown; notificationId: string };
+        let notificationPayload: { message: { text: string; entities: unknown[] }; replyMarkup: unknown; notificationId: string };
 
         if (questions.length > 1) {
           // Multi-question: wizard mode — show step 1
@@ -361,7 +363,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             sessionId,
           });
           notificationPayload = {
-            text: notification.text,
+            message: { text: notification.message.text, entities: notification.message.entities },
             replyMarkup: notification.replyMarkup,
             notificationId,
           };
@@ -376,7 +378,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             sessionId,
           });
           notificationPayload = {
-            text: notification.text,
+            message: { text: notification.message.text, entities: notification.message.entities },
             replyMarkup: notification.replyMarkup,
             notificationId,
           };
