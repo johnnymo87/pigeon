@@ -465,6 +465,48 @@ async function queueCommand(
 }
 
 /**
+ * Resolve a session from a reply-to-message.
+ * Used by /kill, /compact, /mcp, /model commands.
+ * Returns session info or sends an error to Telegram and returns null.
+ */
+async function resolveReplySession(
+  db: D1Database,
+  env: Env,
+  message: TelegramMessage,
+): Promise<{ sessionId: string; machineId: string; label: string | null } | null> {
+  const chatId = message.chat.id;
+
+  if (!message.reply_to_message) {
+    await sendTelegramMessage(env, chatId, "Reply to a session notification to use this command.");
+    return null;
+  }
+
+  const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
+  if (!mapping) {
+    await sendTelegramMessage(env, chatId, "Could not find a session for that message.");
+    return null;
+  }
+
+  const session = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(mapping.session_id)
+    .first<{ machine_id: string; label: string | null }>();
+
+  if (!session) {
+    await sendTelegramMessage(env, chatId, `Session \`${mapping.session_id}\` not found.`);
+    return null;
+  }
+
+  const isRecent = await isMachineRecent(db, session.machine_id);
+  if (!isRecent) {
+    await sendTelegramMessage(env, chatId, `${session.machine_id} is not recently seen.`);
+    return null;
+  }
+
+  return { sessionId: mapping.session_id, machineId: session.machine_id, label: session.label };
+}
+
+/**
  * Handle an incoming Telegram webhook request.
  */
 export async function handleTelegramWebhook(
@@ -521,33 +563,17 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    // Handle /kill command
-    const killMatch = update.message.text.match(/^\/kill\s+(\S+)$/);
-    if (killMatch) {
-      const sessionId = killMatch[1]!;
+    // Handle /kill command (reply-based)
+    if (/^\/kill$/.test(update.message.text)) {
       const killChatId = update.message.chat.id;
 
-      // Look up session to find its machine
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(sessionId)
-        .first<{ machine_id: string; label: string | null }>();
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
 
-      if (!session) {
-        await sendTelegramMessage(env, killChatId, `Session \`${sessionId}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, killChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, session.machine_id, sessionId, "", String(killChatId), session.label, "kill");
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(killChatId), resolved.label, "kill");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, killChatId, `Killing session \`${sessionId}\` on ${session.machine_id}...`);
+      await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 
@@ -555,175 +581,91 @@ export async function handleTelegramWebhook(
     if (/^\/compact$/.test(update.message.text)) {
       const compactChatId = update.message.chat.id;
 
-      if (!update.message.reply_to_message) {
-        await sendTelegramMessage(env, compactChatId, "Reply to a session notification to compact it.");
-        return OK();
-      }
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
 
-      const mapping = await lookupMessage(db, String(compactChatId), update.message.reply_to_message.message_id);
-      if (!mapping) {
-        await sendTelegramMessage(env, compactChatId, "Could not find a session for that message.");
-        return OK();
-      }
-
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(mapping.session_id)
-        .first<{ machine_id: string; label: string | null }>();
-
-      if (!session) {
-        await sendTelegramMessage(env, compactChatId, `Session \`${mapping.session_id}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, compactChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, session.machine_id, mapping.session_id, "", String(compactChatId), session.label, "compact");
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(compactChatId), resolved.label, "compact");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, compactChatId, `Compacting session \`${mapping.session_id}\` on ${session.machine_id}...`);
+      await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 
-    // Handle /mcp list <SESSION_ID>
-    const mcpListMatch = update.message.text.match(/^\/mcp\s+list\s+(\S+)$/);
-    if (mcpListMatch) {
-      const sessionId = mcpListMatch[1]!;
+    // Handle /mcp list (reply-based)
+    if (/^\/mcp\s+list$/.test(update.message.text)) {
       const mcpChatId = update.message.chat.id;
 
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(sessionId)
-        .first<{ machine_id: string; label: string | null }>();
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
 
-      if (!session) {
-        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, session.machine_id, sessionId, "", String(mcpChatId), session.label, "mcp_list");
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(mcpChatId), resolved.label, "mcp_list");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${sessionId}\` on ${session.machine_id}...`);
+      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 
-    // Handle /mcp enable <SERVER> <SESSION_ID>
-    const mcpEnableMatch = update.message.text.match(/^\/mcp\s+enable\s+(\S+)\s+(\S+)$/);
+    // Handle /mcp enable <SERVER> (reply-based)
+    const mcpEnableMatch = update.message.text.match(/^\/mcp\s+enable\s+(\S+)$/);
     if (mcpEnableMatch) {
       const serverName = mcpEnableMatch[1]!;
-      const sessionId = mcpEnableMatch[2]!;
       const mcpChatId = update.message.chat.id;
 
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(sessionId)
-        .first<{ machine_id: string; label: string | null }>();
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
 
-      if (!session) {
-        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, session.machine_id, sessionId, serverName, String(mcpChatId), session.label, "mcp_enable");
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_enable");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 
-    // Handle /mcp disable <SERVER> <SESSION_ID>
-    const mcpDisableMatch = update.message.text.match(/^\/mcp\s+disable\s+(\S+)\s+(\S+)$/);
+    // Handle /mcp disable <SERVER> (reply-based)
+    const mcpDisableMatch = update.message.text.match(/^\/mcp\s+disable\s+(\S+)$/);
     if (mcpDisableMatch) {
       const serverName = mcpDisableMatch[1]!;
-      const sessionId = mcpDisableMatch[2]!;
       const mcpChatId = update.message.chat.id;
 
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(sessionId)
-        .first<{ machine_id: string; label: string | null }>();
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
 
-      if (!session) {
-        await sendTelegramMessage(env, mcpChatId, `Session \`${sessionId}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, mcpChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, session.machine_id, sessionId, serverName, String(mcpChatId), session.label, "mcp_disable");
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_disable");
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 
-    // Handle /model <SESSION_ID> (list) or /model <PROVIDER/MODEL> <SESSION_ID> (set)
-    const modelMatch = update.message.text.match(/^\/model\s+(\S+)(?:\s+(\S+))?$/);
+    // Handle /model (list) or /model <PROVIDER/MODEL> (set) — reply-based
+    const modelMatch = update.message.text.match(/^\/model(?:\s+(\S+))?$/);
     if (modelMatch) {
-      const firstArg = modelMatch[1]!;
-      const secondArg = modelMatch[2];
       const modelChatId = update.message.chat.id;
+      const firstArg = modelMatch[1];
 
-      let sessionId: string;
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
+
       let commandType: CommandType;
       let modelCode: string | undefined;
 
-      if (firstArg.includes("/") && secondArg) {
-        // /model <PROVIDER/MODEL> <SESSION_ID> → model_set
+      if (firstArg && firstArg.includes("/")) {
+        // /model <PROVIDER/MODEL> → model_set
         modelCode = firstArg;
-        sessionId = secondArg;
         commandType = "model_set";
       } else {
-        // /model <SESSION_ID> → model_list
-        sessionId = firstArg;
+        // /model → model_list
         commandType = "model_list";
       }
 
-      const session = await db
-        .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-        .bind(sessionId)
-        .first<{ machine_id: string; label: string | null }>();
-
-      if (!session) {
-        await sendTelegramMessage(env, modelChatId, `Session \`${sessionId}\` not found.`);
-        return OK();
-      }
-
-      const isRecent = await isMachineRecent(db, session.machine_id);
-      if (!isRecent) {
-        await sendTelegramMessage(env, modelChatId, `${session.machine_id} is not recently seen.`);
-        return OK();
-      }
-
       const command = modelCode ?? "";
-      const commandId = await queueCommand(db, env, session.machine_id, sessionId, command, String(modelChatId), session.label, commandType);
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, command, String(modelChatId), resolved.label, commandType);
       if (!commandId) return OK();
 
       if (commandType === "model_set") {
-        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${sessionId}\` on ${session.machine_id}...`);
+        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       } else {
-        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${sessionId}\` on ${session.machine_id}...`);
+        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       }
       return OK();
     }

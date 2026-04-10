@@ -48,13 +48,13 @@ The `/model` command sets a per-session model override stored in the daemon's SQ
 |---------|---------|--------------|
 | *(plain message)* | `fix the failing test in src/auth.ts` | Executes in the current opencode TUI session via the plugin |
 | `/launch <machine> <dir> <prompt>` | `/launch devbox pigeon "say hello"` | Starts a headless opencode session on the specified machine |
-| `/kill <session-id>` | `/kill sess-abc123` | Terminates a headless session (machine looked up automatically) |
+| `/kill` | *(reply to a session notification)* | Terminates the session (resolved from replied-to message) |
 | `/compact` | *(reply to a session notification)* | Summarizes (compacts) the session's conversation to reduce context |
-| `/mcp list <session-id>` | `/mcp list sess-abc123` | Lists MCP servers with connection status |
-| `/mcp enable <server> <session-id>` | `/mcp enable slack sess-abc123` | Connects (or reconnects) an MCP server |
-| `/mcp disable <server> <session-id>` | `/mcp disable slack sess-abc123` | Disconnects an MCP server |
-| `/model <session-id>` | `/model sess-abc123` | Lists available models from allowed providers |
-| `/model <provider/model> <session-id>` | `/model anthropic/claude-sonnet-4-20250514 sess-abc123` | Sets model override for the session |
+| `/mcp list` | *(reply to a session notification)* | Lists MCP servers with connection status |
+| `/mcp enable <server>` | *(reply to a session notification)* | Connects (or reconnects) an MCP server |
+| `/mcp disable <server>` | *(reply to a session notification)* | Disconnects an MCP server |
+| `/model` | *(reply to a session notification)* | Lists available models from allowed providers |
+| `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 

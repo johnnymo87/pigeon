@@ -1202,8 +1202,8 @@ describe("media endpoints", () => {
 
 // ─── /kill Command: Integration Tests ──────────────────────────────
 
-function makeKillMessage(
-  sessionId: string,
+function makeKillReply(
+  replyToMessageId: number,
   updateId?: number,
 ): Record<string, unknown> {
   return {
@@ -1212,7 +1212,20 @@ function makeKillMessage(
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/kill ${sessionId}`,
+      text: "/kill",
+      reply_to_message: { message_id: replyToMessageId },
+    },
+  };
+}
+
+function makeKillMessage(updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: "/kill",
     },
   };
 }
@@ -1227,10 +1240,19 @@ describe("/kill command", () => {
     fetchMock.deactivate();
   });
 
-  it("replies with 'not found' when session does not exist", async () => {
+  it("replies with 'reply to a session notification' when no reply_to_message", async () => {
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeKillMessage("nonexistent-session"));
+    const res = await sendWebhook(makeKillMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("replies with 'could not find a session' when reply_to_message has no mapping", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeKillReply(99997));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -1240,12 +1262,19 @@ describe("/kill command", () => {
     const now = Date.now();
     const sessionId = `kill-offline-${now}`;
     const machineId = `kill-offline-machine-${now}`;
+    const notifMsgId = 6_000_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `kill-offline-token-${now}`,
+    });
     // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeKillMessage(sessionId));
+    const res = await sendWebhook(makeKillReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -1255,14 +1284,20 @@ describe("/kill command", () => {
     const now = Date.now();
     const sessionId = `kill-connected-${now}`;
     const machineId = `kill-machine-${now}`;
+    const notifMsgId = 6_001_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
-    // Insert a recent machines row so isMachineRecent returns true
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `kill-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack "Killing session..."
 
-    const res = await sendWebhook(makeKillMessage(sessionId));
+    const res = await sendWebhook(makeKillReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -1275,15 +1310,6 @@ describe("/kill command", () => {
     expect(killRow.command_type).toBe("kill");
     expect(killRow.session_id).toBe(sessionId);
     expect(killRow.machine_id).toBe(machineId);
-  });
-
-  it("does not fall through to regular session resolution for /kill", async () => {
-    // /kill with unknown session should produce "not found", not "Could not find session"
-    mockTelegramSendMessage(); // exactly one Telegram call expected
-
-    const res = await sendWebhook(makeKillMessage("unknown-session"));
-
-    expect(res.status).toBe(200);
   });
 });
 
@@ -2912,38 +2938,65 @@ describe("poll and ack endpoints", () => {
 
 // ─── /mcp Command: Integration Tests ─────────────────────────────────
 
-function makeMcpListMessage(sessionId: string, updateId?: number): Record<string, unknown> {
+function makeMcpListReply(replyToMessageId: number, updateId?: number): Record<string, unknown> {
   return {
     update_id: updateId ?? ++webhookUpdateCounter,
     message: {
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/mcp list ${sessionId}`,
+      text: "/mcp list",
+      reply_to_message: { message_id: replyToMessageId },
     },
   };
 }
 
-function makeMcpEnableMessage(serverName: string, sessionId: string, updateId?: number): Record<string, unknown> {
+function makeMcpListMessage(updateId?: number): Record<string, unknown> {
   return {
     update_id: updateId ?? ++webhookUpdateCounter,
     message: {
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/mcp enable ${serverName} ${sessionId}`,
+      text: "/mcp list",
     },
   };
 }
 
-function makeMcpDisableMessage(serverName: string, sessionId: string, updateId?: number): Record<string, unknown> {
+function makeMcpEnableReply(serverName: string, replyToMessageId: number, updateId?: number): Record<string, unknown> {
   return {
     update_id: updateId ?? ++webhookUpdateCounter,
     message: {
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/mcp disable ${serverName} ${sessionId}`,
+      text: `/mcp enable ${serverName}`,
+      reply_to_message: { message_id: replyToMessageId },
+    },
+  };
+}
+
+function makeMcpEnableMessage(serverName: string, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/mcp enable ${serverName}`,
+    },
+  };
+}
+
+function makeMcpDisableReply(serverName: string, replyToMessageId: number, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/mcp disable ${serverName}`,
+      reply_to_message: { message_id: replyToMessageId },
     },
   };
 }
@@ -2958,10 +3011,19 @@ describe("/mcp command", () => {
     fetchMock.deactivate();
   });
 
-  it("/mcp list replies with 'not found' when session does not exist", async () => {
+  it("/mcp list replies with 'reply to a session notification' when no reply_to_message", async () => {
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeMcpListMessage("nonexistent-session"));
+    const res = await sendWebhook(makeMcpListMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("/mcp list replies with 'could not find a session' when reply_to_message has no mapping", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpListReply(99996));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -2971,12 +3033,19 @@ describe("/mcp command", () => {
     const now = Date.now();
     const sessionId = `mcp-list-offline-${now}`;
     const machineId = `mcp-list-offline-machine-${now}`;
+    const notifMsgId = 7_000_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `mcp-list-offline-token-${now}`,
+    });
     // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeMcpListMessage(sessionId));
+    const res = await sendWebhook(makeMcpListReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -2986,13 +3055,20 @@ describe("/mcp command", () => {
     const now = Date.now();
     const sessionId = `mcp-list-connected-${now}`;
     const machineId = `mcp-list-machine-${now}`;
+    const notifMsgId = 7_001_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `mcp-list-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack confirmation
 
-    const res = await sendWebhook(makeMcpListMessage(sessionId));
+    const res = await sendWebhook(makeMcpListReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3007,17 +3083,33 @@ describe("/mcp command", () => {
     expect(mcpRow.machine_id).toBe(machineId);
   });
 
+  it("/mcp enable replies with 'reply to a session notification' when no reply_to_message", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeMcpEnableMessage("my-server"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
   it("/mcp enable queues an mcp_enable command with server name in command field", async () => {
     const now = Date.now();
     const sessionId = `mcp-enable-connected-${now}`;
     const machineId = `mcp-enable-machine-${now}`;
+    const notifMsgId = 7_002_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `mcp-enable-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack confirmation
 
-    const res = await sendWebhook(makeMcpEnableMessage("my-server", sessionId));
+    const res = await sendWebhook(makeMcpEnableReply("my-server", notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3036,13 +3128,20 @@ describe("/mcp command", () => {
     const now = Date.now();
     const sessionId = `mcp-disable-connected-${now}`;
     const machineId = `mcp-disable-machine-${now}`;
+    const notifMsgId = 7_003_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `mcp-disable-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack confirmation
 
-    const res = await sendWebhook(makeMcpDisableMessage("my-server", sessionId));
+    const res = await sendWebhook(makeMcpDisableReply("my-server", notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3057,25 +3156,23 @@ describe("/mcp command", () => {
     expect(mcpRow.command).toBe("my-server");
   });
 
-  it("/mcp enable replies with 'not found' when session does not exist", async () => {
-    mockTelegramSendMessage();
-
-    const res = await sendWebhook(makeMcpEnableMessage("my-server", "nonexistent-session"));
-
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe("ok");
-  });
-
   it("/mcp disable replies with offline error when machine has not recently polled", async () => {
     const now = Date.now();
     const sessionId = `mcp-disable-offline-${now}`;
     const machineId = `mcp-disable-offline-machine-${now}`;
+    const notifMsgId = 7_004_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `mcp-disable-offline-token-${now}`,
+    });
     // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeMcpDisableMessage("some-server", sessionId));
+    const res = await sendWebhook(makeMcpDisableReply("some-server", notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3084,26 +3181,40 @@ describe("/mcp command", () => {
 
 // ─── /model Command: Integration Tests ───────────────────────────────
 
-function makeModelListMessage(sessionId: string, updateId?: number): Record<string, unknown> {
+function makeModelListReply(replyToMessageId: number, updateId?: number): Record<string, unknown> {
   return {
     update_id: updateId ?? ++webhookUpdateCounter,
     message: {
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/model ${sessionId}`,
+      text: "/model",
+      reply_to_message: { message_id: replyToMessageId },
     },
   };
 }
 
-function makeModelSetMessage(model: string, sessionId: string, updateId?: number): Record<string, unknown> {
+function makeModelListMessage(updateId?: number): Record<string, unknown> {
   return {
     update_id: updateId ?? ++webhookUpdateCounter,
     message: {
       message_id: ++webhookUpdateCounter,
       chat: { id: CHAT_ID_NUM },
       from: { id: CHAT_ID_NUM },
-      text: `/model ${model} ${sessionId}`,
+      text: "/model",
+    },
+  };
+}
+
+function makeModelSetReply(model: string, replyToMessageId: number, updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: `/model ${model}`,
+      reply_to_message: { message_id: replyToMessageId },
     },
   };
 }
@@ -3118,10 +3229,10 @@ describe("/model command", () => {
     fetchMock.deactivate();
   });
 
-  it("/model list replies with 'not found' when session does not exist", async () => {
+  it("/model list replies with 'reply to a session notification' when no reply_to_message", async () => {
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeModelListMessage("nonexistent-session"));
+    const res = await sendWebhook(makeModelListMessage());
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3131,12 +3242,19 @@ describe("/model command", () => {
     const now = Date.now();
     const sessionId = `model-list-offline-${now}`;
     const machineId = `model-list-offline-machine-${now}`;
+    const notifMsgId = 8_000_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `model-list-offline-token-${now}`,
+    });
     // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeModelListMessage(sessionId));
+    const res = await sendWebhook(makeModelListReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3146,13 +3264,20 @@ describe("/model command", () => {
     const now = Date.now();
     const sessionId = `model-list-connected-${now}`;
     const machineId = `model-list-machine-${now}`;
+    const notifMsgId = 8_001_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `model-list-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack confirmation
 
-    const res = await sendWebhook(makeModelListMessage(sessionId));
+    const res = await sendWebhook(makeModelListReply(notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3170,13 +3295,20 @@ describe("/model command", () => {
     const now = Date.now();
     const sessionId = `model-set-connected-${now}`;
     const machineId = `model-set-machine-${now}`;
+    const notifMsgId = 8_002_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `model-set-connected-token-${now}`,
+    });
     await touchMachine(env.DB, machineId, now);
 
     mockTelegramSendMessage(); // ack confirmation
 
-    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-opus-4-5", sessionId));
+    const res = await sendWebhook(makeModelSetReply("anthropic/claude-opus-4-5", notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3191,10 +3323,18 @@ describe("/model command", () => {
     expect(modelRow.command).toBe("anthropic/claude-opus-4-5");
   });
 
-  it("/model set replies with 'not found' when session does not exist", async () => {
+  it("/model set replies with 'reply to a session notification' when no reply_to_message", async () => {
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-sonnet-4-5", "nonexistent-session"));
+    const res = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/model anthropic/claude-sonnet-4-5",
+      },
+    });
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -3204,12 +3344,19 @@ describe("/model command", () => {
     const now = Date.now();
     const sessionId = `model-set-offline-${now}`;
     const machineId = `model-set-offline-machine-${now}`;
+    const notifMsgId = 8_003_001 + (now % 100);
 
     await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `model-set-offline-token-${now}`,
+    });
     // No touchMachine call → isMachineRecent returns false
     mockTelegramSendMessage();
 
-    const res = await sendWebhook(makeModelSetMessage("anthropic/claude-opus-4-5", sessionId));
+    const res = await sendWebhook(makeModelSetReply("anthropic/claude-opus-4-5", notifMsgId));
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
