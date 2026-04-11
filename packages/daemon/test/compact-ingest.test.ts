@@ -73,9 +73,15 @@ describe("ingestCompactCommand", () => {
     await ingestCompactCommand(input);
 
     expect(input.opencodeClient.summarize).not.toHaveBeenCalled();
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
-      "99999",
-      expect.stringContaining("No user messages found"),
+    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(chatId).toBe("99999");
+    expect(text).toContain("No user messages found");
+    expect(text).toContain("sess-xyz");
+    expect(text).not.toContain("`");
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "code" }),
+      ]),
     );
   });
 

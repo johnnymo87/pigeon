@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
+import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 
 export interface McpListCommandInput {
   commandId: string;
@@ -7,7 +8,7 @@ export interface McpListCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus">;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 export interface McpEnableCommandInput {
@@ -18,7 +19,7 @@ export interface McpEnableCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus" | "mcpConnect" | "mcpDisconnect">;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 export interface McpDisableCommandInput {
@@ -29,7 +30,7 @@ export interface McpDisableCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpDisconnect">;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 const STATUS_EMOJI: Record<string, string> = {
@@ -51,24 +52,34 @@ export async function ingestMcpListCommand(input: McpListCommandInput): Promise<
     const servers = await opencodeClient.mcpStatus(directory);
     const entries = Object.entries(servers);
 
-    let body = `🔌 *MCP Servers:*\n🆔 \`${sessionId}\`\n\n`;
+    const b = new TgMessageBuilder()
+      .append("🔌 ")
+      .appendBold("MCP Servers:")
+      .append("\n🆔 ")
+      .appendCode(sessionId)
+      .newline(2);
 
     if (entries.length === 0) {
-      body += "No MCP servers configured\n";
+      b.append("No MCP servers configured\n");
     } else {
       for (const [name, info] of entries) {
         const emoji = statusEmoji(info.status);
+        b.append(`${emoji} `).appendCode(name);
         if (info.status === "failed" && info.error) {
-          body += `${emoji} \`${name}\` — ${info.status}: ${info.error}\n`;
+          b.append(` — ${info.status}: ${info.error}`);
         } else {
-          body += `${emoji} \`${name}\` — ${info.status}\n`;
+          b.append(` — ${info.status}`);
         }
+        b.newline();
       }
     }
 
-    body += `\n\`/mcp enable <server> ${sessionId}\`\n\`/mcp disable <server> ${sessionId}\``;
+    b.newline();
+    b.appendCode("/mcp enable <server>").newline();
+    b.appendCode("/mcp disable <server>");
 
-    await sendTelegramReply(chatId, body);
+    const msg = b.build();
+    await sendTelegramReply(chatId, msg.text, msg.entities);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sendTelegramReply(chatId, `Failed to list MCP servers: ${message}`);
@@ -83,10 +94,12 @@ export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Prom
 
     if (!(serverName in servers)) {
       const available = Object.keys(servers).join(", ");
-      await sendTelegramReply(
-        chatId,
-        `MCP server \`${serverName}\` not found. Available: ${available}`,
-      );
+      const notFound = new TgMessageBuilder()
+        .append("MCP server ")
+        .appendCode(serverName)
+        .append(` not found. Available: ${available}`)
+        .build();
+      await sendTelegramReply(chatId, notFound.text, notFound.entities);
       return;
     }
 
@@ -94,16 +107,31 @@ export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Prom
     if (serverInfo && serverInfo.status === "connected") {
       await opencodeClient.mcpDisconnect(serverName, directory);
       await opencodeClient.mcpConnect(serverName, directory);
-      await sendTelegramReply(chatId, `🔌 \`${serverName}\` reconnected ✅`);
+      const msg = new TgMessageBuilder()
+        .append("🔌 ")
+        .appendCode(serverName)
+        .append(" reconnected ✅")
+        .build();
+      await sendTelegramReply(chatId, msg.text, msg.entities);
     } else {
       await opencodeClient.mcpConnect(serverName, directory);
-      await sendTelegramReply(chatId, `🔌 \`${serverName}\` connected ✅`);
+      const msg = new TgMessageBuilder()
+        .append("🔌 ")
+        .appendCode(serverName)
+        .append(" connected ✅")
+        .build();
+      await sendTelegramReply(chatId, msg.text, msg.entities);
     }
 
     console.log(`[mcp-ingest] enable commandId=${input.commandId} server=${serverName} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to enable \`${serverName}\`: ${message}`);
+    const errMsg = new TgMessageBuilder()
+      .append("Failed to enable ")
+      .appendCode(serverName)
+      .append(`: ${message}`)
+      .build();
+    await sendTelegramReply(chatId, errMsg.text, errMsg.entities);
   }
 }
 
@@ -112,10 +140,20 @@ export async function ingestMcpDisableCommand(input: McpDisableCommandInput): Pr
 
   try {
     await opencodeClient.mcpDisconnect(serverName, directory);
-    await sendTelegramReply(chatId, `🔌 \`${serverName}\` disconnected`);
+    const msg = new TgMessageBuilder()
+      .append("🔌 ")
+      .appendCode(serverName)
+      .append(" disconnected")
+      .build();
+    await sendTelegramReply(chatId, msg.text, msg.entities);
     console.log(`[mcp-ingest] disable commandId=${input.commandId} server=${serverName} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to disable \`${serverName}\`: ${message}`);
+    const errMsg = new TgMessageBuilder()
+      .append("Failed to disable ")
+      .appendCode(serverName)
+      .append(`: ${message}`)
+      .build();
+    await sendTelegramReply(chatId, errMsg.text, errMsg.entities);
   }
 }

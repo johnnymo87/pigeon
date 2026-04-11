@@ -1,5 +1,6 @@
 import os from "os";
 import type { OpencodeClient } from "../opencode-client";
+import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import type { LaunchMessage } from "./poller";
 
 /** Treat a bare word (no slashes, no ~) as ~/projects/<word>. */
@@ -22,7 +23,7 @@ export interface LaunchCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: OpencodeClient;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
@@ -40,10 +41,14 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     const session = await opencodeClient.createSession(directory);
     await opencodeClient.sendPrompt(session.id, directory, prompt);
     console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
-    await sendTelegramReply(
-      chatId,
-      `Session started${machineLabel}:\n🆔 \`${session.id}\`\n📂 \`${directory}\`\n\nThe pigeon plugin will notify you when the session stops or has questions.`,
-    );
+    const msg = new TgMessageBuilder()
+      .append(`Session started${machineLabel}:\n🆔 `)
+      .appendCode(session.id)
+      .append("\n📂 ")
+      .appendCode(directory)
+      .append("\n\nThe pigeon plugin will notify you when the session stops or has questions.")
+      .build();
+    await sendTelegramReply(chatId, msg.text, msg.entities);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await sendTelegramReply(chatId, `Failed to launch session${machineLabel}: ${message}`);

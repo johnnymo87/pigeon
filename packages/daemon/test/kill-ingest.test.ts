@@ -15,15 +15,21 @@ describe("ingestKillCommand", () => {
     };
   }
 
-  it("deletes session and sends success reply", async () => {
+  it("deletes session and sends success reply with entities", async () => {
     const input = makeInput();
 
     await ingestKillCommand(input);
 
     expect(input.opencodeClient.deleteSession).toHaveBeenCalledWith("sess-abc");
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
-      "12345",
-      expect.stringContaining("terminated"),
+    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(chatId).toBe("12345");
+    expect(text).toContain("terminated");
+    expect(text).toContain("sess-abc");
+    expect(text).not.toContain("`");
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "code" }),
+      ]),
     );
   });
 

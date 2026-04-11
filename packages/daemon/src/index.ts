@@ -18,6 +18,7 @@ import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { startSessionReaper } from "./session-reaper";
+import type { TgEntity } from "./telegram-message";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -26,14 +27,18 @@ const opencodeClient = config.opencodeUrl
   ? new OpencodeClient({ baseUrl: config.opencodeUrl })
   : undefined;
 
-async function sendTelegramMessage(chatId: string, text: string): Promise<void> {
+async function sendTelegramMessage(chatId: string, text: string, entities?: TgEntity[]): Promise<void> {
   if (!config.telegramBotToken) return;
   try {
     const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
+    const payload: Record<string, unknown> = { chat_id: chatId, text };
+    if (entities && entities.length > 0) {
+      payload.entities = entities;
+    }
     const res = await fetch(`${apiBase}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status}`);

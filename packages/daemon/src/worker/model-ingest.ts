@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
+import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 
 const ALLOWED_PROVIDERS = new Set(["anthropic", "openai", "google", "vertex"]);
 
@@ -8,7 +9,7 @@ export interface ModelListCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "listProviders">;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 export interface ModelSetCommandInput {
@@ -23,7 +24,7 @@ export interface ModelSetCommandInput {
       setModelOverride: (sessionId: string, model: string) => void;
     };
   };
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 export async function ingestModelListCommand(input: ModelListCommandInput): Promise<void> {
@@ -34,20 +35,26 @@ export async function ingestModelListCommand(input: ModelListCommandInput): Prom
 
     const allowedProviders = result.all.filter((p) => ALLOWED_PROVIDERS.has(p.id));
 
-    let body = `🤖 *Available models:*\n🆔 \`${sessionId}\`\n\n`;
+    const b = new TgMessageBuilder()
+      .append("🤖 ")
+      .appendBold("Available models:")
+      .append("\n🆔 ")
+      .appendCode(sessionId)
+      .newline(2);
 
     for (const provider of allowedProviders) {
-      body += `*${provider.id}*\n`;
+      b.appendBold(provider.id).newline();
       for (const modelId of Object.keys(provider.models)) {
-        body += `\`${provider.id}/${modelId}\`\n`;
+        b.appendCode(`${provider.id}/${modelId}`).newline();
       }
-      body += "\n";
+      b.newline();
     }
 
-    body += `Current: \`${result.default.code}\`\n\n`;
-    body += `Reply: \`/model <code> ${sessionId}\``;
+    b.append("Current: ").appendCode(result.default.code ?? "unknown").newline(2);
+    b.append("Reply: ").appendCode("/model <code>");
 
-    await sendTelegramReply(chatId, body);
+    const msg = b.build();
+    await sendTelegramReply(chatId, msg.text, msg.entities);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sendTelegramReply(chatId, `Failed to list models: ${message}`);
@@ -68,15 +75,26 @@ export async function ingestModelSetCommand(input: ModelSetCommandInput): Promis
     const modelExists = provider && modelID in provider.models;
 
     if (!modelExists) {
-      await sendTelegramReply(
-        chatId,
-        `Model \`${model}\` not found. Use \`/model ${sessionId}\` to see available models.\n🆔 \`${sessionId}\``,
-      );
+      const notFound = new TgMessageBuilder()
+        .append("Model ")
+        .appendCode(model)
+        .append(" not found. Use ")
+        .appendCode("/model")
+        .append(" to see available models.\n🆔 ")
+        .appendCode(sessionId)
+        .build();
+      await sendTelegramReply(chatId, notFound.text, notFound.entities);
       return;
     }
 
     storage.sessions.setModelOverride(sessionId, model);
-    await sendTelegramReply(chatId, `🤖 Model set to \`${model}\`\n🆔 \`${sessionId}\``);
+    const confirmation = new TgMessageBuilder()
+      .append("🤖 Model set to ")
+      .appendCode(model)
+      .append("\n🆔 ")
+      .appendCode(sessionId)
+      .build();
+    await sendTelegramReply(chatId, confirmation.text, confirmation.entities);
     console.log(`[model-ingest] set commandId=${input.commandId} model=${model} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

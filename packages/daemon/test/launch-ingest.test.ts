@@ -95,19 +95,22 @@ describe("ingestLaunchCommand", () => {
       );
     });
 
-    it("sends a confirmation Telegram reply containing the session id and directory", async () => {
+    it("sends a confirmation Telegram reply containing the session id and directory with entities", async () => {
       const input = makeInput();
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
-        "42",
-        expect.stringContaining("sess-123"),
+      const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+      expect(chatId).toBe("42");
+      expect(text).toContain("sess-123");
+      expect(text).toContain("/home/user/project");
+      expect(entities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "code" }),
+        ]),
       );
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
-        "42",
-        expect.stringContaining("/home/user/project"),
-      );
+      // Session ID and directory should be code entities (no backtick wrappers)
+      expect(text).not.toContain("`");
     });
   });
 

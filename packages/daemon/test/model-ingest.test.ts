@@ -24,7 +24,7 @@ describe("ingestModelListCommand", () => {
     };
   }
 
-  it("lists models grouped by allowed providers", async () => {
+  it("lists models grouped by allowed providers with entities", async () => {
     const input = makeInput({
       opencodeClient: {
         listProviders: vi.fn().mockResolvedValue({
@@ -51,25 +51,35 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, reply] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
-    expect(reply).toContain("🤖 *Available models:*");
-    expect(reply).toContain("*anthropic*");
-    expect(reply).toContain("`anthropic/claude-opus-4-6`");
-    expect(reply).toContain("`anthropic/claude-sonnet-4-5`");
-    expect(reply).toContain("*openai*");
-    expect(reply).toContain("`openai/gpt-5.4`");
+    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(text).toContain("🤖 ");
+    expect(text).toContain("Available models:");
+    expect(text).toContain("anthropic");
+    expect(text).toContain("anthropic/claude-opus-4-6");
+    expect(text).toContain("anthropic/claude-sonnet-4-5");
+    expect(text).toContain("openai");
+    expect(text).toContain("openai/gpt-5.4");
+    expect(text).not.toContain("`");
+    expect(text).not.toContain("*");
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "bold" }),
+        expect.objectContaining({ type: "code" }),
+      ]),
+    );
   });
 
-  it("includes session ID in reply", async () => {
+  it("includes session ID in reply as code entity", async () => {
     const input = makeInput({ sessionId: "sess-xyz" });
 
     await ingestModelListCommand(input);
 
-    const [, reply] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
-    expect(reply).toContain("`sess-xyz`");
+    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(text).toContain("sess-xyz");
+    expect(text).not.toContain("`");
   });
 
-  it("shows current model and reply hint", async () => {
+  it("shows current model and reply hint without session ID", async () => {
     const input = makeInput({
       sessionId: "sess-abc",
       opencodeClient: {
@@ -83,9 +93,12 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, reply] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
-    expect(reply).toContain("Current: `anthropic/claude-opus-4-6`");
-    expect(reply).toContain("/model <code> sess-abc");
+    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    expect(text).toContain("Current: ");
+    expect(text).toContain("anthropic/claude-opus-4-6");
+    expect(text).toContain("/model <code>");
+    // session ID removed from command hint (swipe-reply)
+    expect(text).not.toMatch(/\/model <code> sess-abc/);
   });
 
   it("filters out non-allowed providers", async () => {
@@ -105,15 +118,15 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, reply] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
-    expect(reply).toContain("anthropic");
-    expect(reply).not.toContain("somecustom");
-    expect(reply).not.toContain("mistral");
-    expect(reply).not.toContain("custom-model");
-    expect(reply).not.toContain("mistral-7b");
+    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    expect(text).toContain("anthropic");
+    expect(text).not.toContain("somecustom");
+    expect(text).not.toContain("mistral");
+    expect(text).not.toContain("custom-model");
+    expect(text).not.toContain("mistral-7b");
   });
 
-  it("sends error reply when listProviders throws", async () => {
+  it("sends error reply when listProviders throws (plain text, no entities)", async () => {
     const input = makeInput({
       opencodeClient: {
         listProviders: vi.fn().mockRejectedValue(new Error("API unavailable")),
@@ -124,7 +137,7 @@ describe("ingestModelListCommand", () => {
 
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
-      expect.stringContaining("Failed to list models: API unavailable"),
+      "Failed to list models: API unavailable",
     );
   });
 });
@@ -158,7 +171,7 @@ describe("ingestModelSetCommand", () => {
     };
   }
 
-  it("validates model, calls setModelOverride, and sends confirmation", async () => {
+  it("validates model, calls setModelOverride, and sends confirmation with entities", async () => {
     const setModelOverride = vi.fn();
     const input = makeInput({
       model: "anthropic/claude-opus-4-6",
@@ -170,13 +183,20 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(setModelOverride).toHaveBeenCalledWith("sess-abc", "anthropic/claude-opus-4-6");
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
-      "12345",
-      expect.stringContaining("🤖 Model set to `anthropic/claude-opus-4-6`\n🆔 `sess-abc`"),
+    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(chatId).toBe("12345");
+    expect(text).toContain("🤖 Model set to ");
+    expect(text).toContain("anthropic/claude-opus-4-6");
+    expect(text).toContain("sess-abc");
+    expect(text).not.toContain("`");
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "code" }),
+      ]),
     );
   });
 
-  it("sends not found message when model does not exist", async () => {
+  it("sends not found message when model does not exist, with entities", async () => {
     const input = makeInput({
       model: "anthropic/claude-nonexistent",
       opencodeClient: {
@@ -193,15 +213,22 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
-      "12345",
-      expect.stringContaining("Model `anthropic/claude-nonexistent` not found"),
+    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(chatId).toBe("12345");
+    expect(text).toContain("anthropic/claude-nonexistent");
+    expect(text).toContain("not found");
+    expect(text).toContain("/model");
+    expect(text).not.toContain("`");
+    // session ID removed from command hint (swipe-reply)
+    expect(text).not.toMatch(/\/model sess-abc/);
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "code" }),
+      ]),
     );
-    const [, reply] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
-    expect(reply).toContain("/model sess-abc");
   });
 
-  it("sends not found when provider does not exist", async () => {
+  it("sends not found when provider does not exist, with entities", async () => {
     const input = makeInput({
       model: "unknownprovider/some-model",
       opencodeClient: {
@@ -216,13 +243,18 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
-      "12345",
-      expect.stringContaining("Model `unknownprovider/some-model` not found"),
+    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    expect(text).toContain("unknownprovider/some-model");
+    expect(text).toContain("not found");
+    expect(text).not.toContain("`");
+    expect(entities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "code" }),
+      ]),
     );
   });
 
-  it("sends error reply when listProviders throws", async () => {
+  it("sends error reply when listProviders throws (plain text, no entities)", async () => {
     const input = makeInput({
       opencodeClient: {
         listProviders: vi.fn().mockRejectedValue(new Error("connection refused")),
@@ -234,7 +266,7 @@ describe("ingestModelSetCommand", () => {
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
     expect(input.sendTelegramReply).toHaveBeenCalledWith(
       "12345",
-      expect.stringContaining("Failed to set model: connection refused"),
+      "Failed to set model: connection refused",
     );
   });
 });

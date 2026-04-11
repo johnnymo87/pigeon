@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
+import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 
 export interface CompactCommandInput {
   commandId: string;
@@ -6,7 +7,7 @@ export interface CompactCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "getSessionMessages" | "summarize">;
-  sendTelegramReply: (chatId: string, text: string) => Promise<void>;
+  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
 /** Shape returned by opencode GET /session/:id/message (MessageV2.WithParts) */
@@ -34,10 +35,11 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
       );
 
     if (!lastUserMessage) {
-      await sendTelegramReply(
-        chatId,
-        `No user messages found. Cannot determine model for compaction.\n🆔 \`${sessionId}\``,
-      );
+      const msg = new TgMessageBuilder()
+        .append("No user messages found. Cannot determine model for compaction.\n🆔 ")
+        .appendCode(sessionId)
+        .build();
+      await sendTelegramReply(chatId, msg.text, msg.entities);
       return;
     }
 
