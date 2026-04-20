@@ -87,10 +87,19 @@ export class ProviderCache {
     if (this.limits.has(key)) return this.limits.get(key)
     const wasLoaded = this.loaded
     if (!wasLoaded) {
+      // Cold start: one refresh, no fallthrough. (Fallthrough would double-fetch
+      // when the model isn't in the response.) Concurrent callers at cold start
+      // may each trigger their own refresh; that's tolerable since `loaded`
+      // flips true on first success and subsequent callers short-circuit via
+      // the cache-hit fast path above.
       await this.refresh(client)
       return this.limits.get(key)
     }
-    // Already loaded once; try a refresh in case providers list changed
+    // Already loaded but key missing: the providers list may have changed since
+    // startup, so try one more refresh. Worst case is one extra HTTP call per
+    // stop notification for a persistently-unknown model — acceptable given the
+    // low call rate (one per turn) and that providerID/modelID originate from
+    // the same server that serves providers().
     await this.refresh(client)
     return this.limits.get(key)
   }
@@ -107,6 +116,8 @@ export class ProviderCache {
           }
         }
       }
+      // Only set on success; transient failures fall through to `catch` and
+      // leave `loaded` false so the next call retries.
       this.loaded = true
     } catch (err) {
       if (!this.failureLogged) {
