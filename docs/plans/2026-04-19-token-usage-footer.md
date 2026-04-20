@@ -21,7 +21,7 @@ If you're picking this up fresh:
 | Task | Status | Commit |
 |------|--------|--------|
 | 1. `formatTokenCount` helper | ✅ done | d730782 |
-| 2. `TokenTracker.onMessageUpdated` + `getSnapshot` | ⏳ not started | — |
+| 2. `TokenTracker.onMessageUpdated` + `getSnapshot` | ✅ done | 903677a (+583503b tests) |
 | 3. `ProviderCache` for context-limit lookups | ⏳ not started | — |
 | 4. `TokenTracker.getFooter` | ⏳ not started | — |
 | 5. Wire `TokenTracker` into the plugin | ⏳ not started | — |
