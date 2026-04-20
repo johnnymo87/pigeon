@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { formatTokenCount } from "../src/token-tracker"
+import { formatTokenCount, TokenTracker } from "../src/token-tracker"
 
 describe("formatTokenCount", () => {
   test("returns plain number under 1000", () => {
@@ -27,8 +27,6 @@ describe("formatTokenCount", () => {
   })
 })
 
-import { TokenTracker } from "../src/token-tracker"
-
 describe("TokenTracker.onMessageUpdated", () => {
   test("ignores non-assistant messages", () => {
     const t = new TokenTracker()
@@ -54,6 +52,39 @@ describe("TokenTracker.onMessageUpdated", () => {
       modelID: "claude-sonnet-4-5",
     })
     expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+
+  test("ignores assistant message with no tokens field", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+
+  test("ignores assistant message missing providerID or modelID", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: "claude-sonnet-4-5",
+    })
+    expect(t.getSnapshot("s1")).toBeUndefined()
+
+    t.onMessageUpdated({
+      id: "m2",
+      sessionID: "s2",
+      role: "assistant",
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+    })
+    expect(t.getSnapshot("s2")).toBeUndefined()
   })
 
   test("captures latest assistant message with output>0", () => {
