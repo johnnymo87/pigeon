@@ -42,21 +42,27 @@ npm install
 | **macbook** | `launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon` |
 | **chromebook** | `systemctl --user restart pigeon-daemon.service` |
 
-### 3. Restart opencode-serve (devbox only)
+### 3. Restart opencode-serve
 
-```bash
-sudo systemctl restart opencode-serve.service
-```
+All four machines run opencode-serve. Restart using the same service-manager pattern as the daemon on each machine.
 
-No other machine runs opencode-serve.
+| Machine | Command |
+|---------|---------|
+| **devbox** | `sudo systemctl restart opencode-serve.service` |
+| **cloudbox** | `sudo systemctl restart opencode-serve.service` |
+| **macbook** | `launchctl stop org.nix-community.home.opencode-serve && launchctl start org.nix-community.home.opencode-serve` |
+| **chromebook** | `systemctl --user restart opencode-serve.service` |
+
+If a command fails because a service name doesn't match, confirm the exact label with `systemctl list-units '*opencode*'` (Linux) or `launchctl list | grep opencode` (macOS) and adjust.
 
 ### 4. Verify
 
 ```bash
-curl -s http://127.0.0.1:4731/health
-# devbox only:
-curl -s http://127.0.0.1:4096/global/health
+curl -s http://127.0.0.1:4731/health          # pigeon-daemon
+curl -s http://127.0.0.1:4096/global/health   # opencode-serve
 ```
+
+Both should return JSON with `"ok":true` / `"healthy":true`.
 
 ## Nix Service Changes
 
@@ -73,12 +79,14 @@ Service definitions live in `~/projects/workstation`.
 
 ## Machine Reference
 
-| Machine | OS | Project path | Daemon service | CCR_MACHINE_ID |
-|---------|-----|-------------|----------------|----------------|
+| Machine | OS | Project path | Service manager | CCR_MACHINE_ID |
+|---------|-----|-------------|-----------------|----------------|
 | devbox | NixOS | `~/projects/pigeon` | systemd (system) | `devbox` |
 | cloudbox | NixOS | `~/projects/pigeon` | systemd (system) | `cloudbox` |
 | macbook | macOS | `~/Code/pigeon` | launchd (user agent) | `macbook` |
 | chromebook | Crostini | `~/projects/pigeon` | systemd (user) | `chromebook` |
+
+All four machines run both `pigeon-daemon` and `opencode-serve` under their service manager.
 
 ## Daemon Logs
 
