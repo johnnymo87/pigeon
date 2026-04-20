@@ -57,3 +57,63 @@ export class TokenTracker {
     this.snapshots.delete(sessionID)
   }
 }
+
+type ConfigProvidersResponse = {
+  data?: {
+    providers: Array<{
+      id: string
+      models: Record<string, { limit?: { context?: number } }>
+    }>
+  }
+}
+
+type SdkLike = {
+  config: {
+    providers: () => Promise<ConfigProvidersResponse>
+  }
+}
+
+type LogFn = (message: string) => void
+
+export class ProviderCache {
+  private limits = new Map<string, number>() // key = `${providerID}/${modelID}`
+  private loaded = false
+  private failureLogged = false
+
+  constructor(private log: LogFn = () => {}) {}
+
+  async getContextLimit(client: SdkLike, providerID: string, modelID: string): Promise<number | undefined> {
+    const key = `${providerID}/${modelID}`
+    if (this.limits.has(key)) return this.limits.get(key)
+    const wasLoaded = this.loaded
+    if (!wasLoaded) {
+      await this.refresh(client)
+      return this.limits.get(key)
+    }
+    // Already loaded once; try a refresh in case providers list changed
+    await this.refresh(client)
+    return this.limits.get(key)
+  }
+
+  private async refresh(client: SdkLike): Promise<void> {
+    try {
+      const res = await client.config.providers()
+      const providers = res?.data?.providers ?? []
+      for (const p of providers) {
+        for (const [modelID, model] of Object.entries(p.models ?? {})) {
+          const ctx = model?.limit?.context
+          if (typeof ctx === "number" && ctx > 0) {
+            this.limits.set(`${p.id}/${modelID}`, ctx)
+          }
+        }
+      }
+      this.loaded = true
+    } catch (err) {
+      if (!this.failureLogged) {
+        this.failureLogged = true
+        const msg = err instanceof Error ? err.message : String(err)
+        this.log(`token-tracker: provider list fetch failed: ${msg}`)
+      }
+    }
+  }
+}

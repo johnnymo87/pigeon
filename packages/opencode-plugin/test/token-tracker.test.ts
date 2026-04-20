@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { formatTokenCount, TokenTracker } from "../src/token-tracker"
+import { formatTokenCount, TokenTracker, ProviderCache } from "../src/token-tracker"
 
 describe("formatTokenCount", () => {
   test("returns plain number under 1000", () => {
@@ -166,5 +166,66 @@ describe("TokenTracker.onMessageUpdated", () => {
     })
     t.clear("s1")
     expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+})
+
+describe("ProviderCache.getContextLimit", () => {
+  function makeFakeClient(providers: Array<{
+    id: string
+    models: Record<string, { limit: { context: number; output: number } }>
+  }>, opts: { fail?: boolean } = {}) {
+    let calls = 0
+    return {
+      calls: () => calls,
+      client: {
+        config: {
+          providers: async () => {
+            calls += 1
+            if (opts.fail) throw new Error("network down")
+            return { data: { providers, default: {} } }
+          },
+        },
+      },
+    }
+  }
+
+  test("returns context limit for known model", async () => {
+    const fake = makeFakeClient([
+      { id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: 200_000, output: 8_000 } } } },
+    ])
+    const cache = new ProviderCache()
+    const limit = await cache.getContextLimit(fake.client as any, "anthropic", "claude-sonnet-4-5")
+    expect(limit).toBe(200_000)
+  })
+
+  test("caches result across calls", async () => {
+    const fake = makeFakeClient([
+      { id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: 200_000, output: 8_000 } } } },
+    ])
+    const cache = new ProviderCache()
+    await cache.getContextLimit(fake.client as any, "anthropic", "claude-sonnet-4-5")
+    await cache.getContextLimit(fake.client as any, "anthropic", "claude-sonnet-4-5")
+    expect(fake.calls()).toBe(1)
+  })
+
+  test("returns undefined for unknown model after one refresh attempt", async () => {
+    const fake = makeFakeClient([
+      { id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: 200_000, output: 8_000 } } } },
+    ])
+    const cache = new ProviderCache()
+    const limit = await cache.getContextLimit(fake.client as any, "anthropic", "claude-opus-4-5")
+    expect(limit).toBeUndefined()
+    expect(fake.calls()).toBe(1)
+  })
+
+  test("returns undefined and logs once when fetch fails", async () => {
+    const fake = makeFakeClient([], { fail: true })
+    const logs: string[] = []
+    const cache = new ProviderCache((msg) => logs.push(msg))
+    const limit1 = await cache.getContextLimit(fake.client as any, "anthropic", "claude-sonnet-4-5")
+    const limit2 = await cache.getContextLimit(fake.client as any, "anthropic", "claude-sonnet-4-5")
+    expect(limit1).toBeUndefined()
+    expect(limit2).toBeUndefined()
+    expect(logs.length).toBe(1)
   })
 })
