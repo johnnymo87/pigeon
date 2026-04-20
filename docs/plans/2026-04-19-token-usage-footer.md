@@ -20,7 +20,7 @@ If you're picking this up fresh:
 
 | Task | Status | Commit |
 |------|--------|--------|
-| 1. `formatTokenCount` helper | ⏳ not started | — |
+| 1. `formatTokenCount` helper | ✅ done | d730782 |
 | 2. `TokenTracker.onMessageUpdated` + `getSnapshot` | ⏳ not started | — |
 | 3. `ProviderCache` for context-limit lookups | ⏳ not started | — |
 | 4. `TokenTracker.getFooter` | ⏳ not started | — |
