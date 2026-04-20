@@ -38,6 +38,8 @@ export async function handlePollNext(
     body.prompt = result.command;
   } else if (result.commandType === "kill") {
     body.sessionId = result.sessionId;
+  } else if (result.commandType === "interrupt") {
+    body.sessionId = result.sessionId;
   } else if (result.commandType === "compact") {
     body.sessionId = result.sessionId;
   } else if (result.commandType === "mcp_list" || result.commandType === "model_list") {

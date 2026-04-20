@@ -39,6 +39,13 @@ export interface KillMessage {
   chatId: string;
 }
 
+export interface InterruptMessage {
+  commandId: string;
+  commandType: "interrupt";
+  sessionId: string;
+  chatId: string;
+}
+
 export interface CompactMessage {
   commandId: string;
   commandType: "compact";
@@ -88,6 +95,7 @@ export type WorkerMessage =
   | ExecuteMessage
   | LaunchMessage
   | KillMessage
+  | InterruptMessage
   | CompactMessage
   | McpListMessage
   | McpEnableMessage
@@ -99,6 +107,7 @@ export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
   onLaunch: (msg: LaunchMessage) => Promise<void>;
   onKill: (msg: KillMessage) => Promise<void>;
+  onInterrupt: (msg: InterruptMessage) => Promise<void>;
   onCompact: (msg: CompactMessage) => Promise<void>;
   onMcpList: (msg: McpListMessage) => Promise<void>;
   onMcpEnable: (msg: McpEnableMessage) => Promise<void>;
@@ -201,6 +210,8 @@ export class Poller {
         await this.callbacks.onLaunch(msg);
       } else if (msg.commandType === "kill") {
         await this.callbacks.onKill(msg);
+      } else if (msg.commandType === "interrupt") {
+        await this.callbacks.onInterrupt(msg);
       } else if (msg.commandType === "compact") {
         await this.callbacks.onCompact(msg);
       } else if (msg.commandType === "mcp_list") {

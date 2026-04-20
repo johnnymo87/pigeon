@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage } from "../src/worker/poller";
+import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -40,6 +40,16 @@ function makeKillMsg(overrides?: Partial<KillMessage>): KillMessage {
   };
 }
 
+function makeInterruptMsg(overrides?: Partial<InterruptMessage>): InterruptMessage {
+  return {
+    commandId: "cmd-interrupt",
+    commandType: "interrupt",
+    sessionId: "sess-1",
+    chatId: "chat-1",
+    ...overrides,
+  };
+}
+
 function makeCompactMsg(overrides?: Partial<CompactMessage>): CompactMessage {
   return {
     commandId: "cmd-4",
@@ -55,6 +65,7 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
     onCommand: vi.fn().mockResolvedValue(undefined),
     onLaunch: vi.fn().mockResolvedValue(undefined),
     onKill: vi.fn().mockResolvedValue(undefined),
+    onInterrupt: vi.fn().mockResolvedValue(undefined),
     onCompact: vi.fn().mockResolvedValue(undefined),
     onMcpList: vi.fn().mockResolvedValue(undefined),
     onMcpEnable: vi.fn().mockResolvedValue(undefined),
@@ -299,6 +310,24 @@ describe("Poller start/stop", () => {
     expect(callbacks.onKill).toHaveBeenCalledWith(msg);
     expect(callbacks.onCommand).not.toHaveBeenCalled();
     expect(callbacks.onLaunch).not.toHaveBeenCalled();
+    poller.stop();
+  });
+
+  it("dispatches interrupt commands to onInterrupt callback", async () => {
+    const msg = makeInterruptMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onInterrupt).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    expect(callbacks.onKill).not.toHaveBeenCalled();
     poller.stop();
   });
 

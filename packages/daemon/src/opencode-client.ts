@@ -61,6 +61,16 @@ export class OpencodeClient {
     }
   }
 
+  async abortSession(sessionId: string): Promise<void> {
+    const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/abort`, {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      throw new Error(`abortSession failed: ${response.status} ${response.statusText}`);
+    }
+  }
+
   async getSessionMessages(sessionId: string): Promise<unknown[]> {
     const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/message`, {
       method: "GET",

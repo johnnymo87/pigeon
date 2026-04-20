@@ -162,6 +162,37 @@ describe("OpencodeClient", () => {
     });
   });
 
+  describe("abortSession", () => {
+    it("sends POST to /session/:id/abort and resolves on success", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("true", { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.abortSession("sess-abc");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc/abort",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+
+    it("throws when response is non-OK", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404, statusText: "Not Found" }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.abortSession("sess-abc")).rejects.toThrow(
+        "abortSession failed: 404 Not Found",
+      );
+    });
+  });
+
   describe("getSessionMessages", () => {
     it("calls GET /session/:id/message and returns parsed JSON array", async () => {
       const messages = [

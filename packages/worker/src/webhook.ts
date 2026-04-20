@@ -2,7 +2,7 @@ import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 
-type CommandType = "execute" | "launch" | "kill" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
+type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -574,6 +574,20 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      return OK();
+    }
+
+    // Handle /interrupt command (reply-based) — interrupts in-flight processing without destroying the session
+    if (/^\/interrupt$/.test(update.message.text)) {
+      const interruptChatId = update.message.chat.id;
+
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
+
+      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(interruptChatId), resolved.label, "interrupt");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, interruptChatId, `Interrupting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
       return OK();
     }
 

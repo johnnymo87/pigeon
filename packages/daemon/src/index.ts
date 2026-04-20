@@ -14,6 +14,7 @@ import { OutboxSender } from "./worker/outbox-sender";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
+import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
@@ -86,6 +87,20 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             return;
           }
           await ingestKillCommand({
+            commandId: msg.commandId,
+            sessionId: msg.sessionId,
+            chatId: msg.chatId,
+            machineId: config.machineId,
+            opencodeClient,
+            sendTelegramReply: sendTelegramMessage,
+          });
+        },
+        onInterrupt: async (msg) => {
+          if (!opencodeClient) {
+            console.warn("[pigeon-daemon] received interrupt command but no opencodeClient is configured");
+            return;
+          }
+          await ingestInterruptCommand({
             commandId: msg.commandId,
             sessionId: msg.sessionId,
             chatId: msg.chatId,

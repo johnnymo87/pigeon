@@ -49,6 +49,7 @@ The `/model` command sets a per-session model override stored in the daemon's SQ
 | *(plain message)* | `fix the failing test in src/auth.ts` | Executes in the current opencode TUI session via the plugin |
 | `/launch <machine> <dir> <prompt>` | `/launch devbox pigeon "say hello"` | Starts a headless opencode session on the specified machine |
 | `/kill` | *(reply to a session notification)* | Terminates the session (resolved from replied-to message) |
+| `/interrupt` | *(reply to a session notification)* | Interrupts in-flight processing without destroying the session (like Ctrl-C) |
 | `/compact` | *(reply to a session notification)* | Summarizes (compacts) the session's conversation to reduce context |
 | `/mcp list` | *(reply to a session notification)* | Lists MCP servers with connection status |
 | `/mcp enable <server>` | *(reply to a session notification)* | Connects (or reconnects) an MCP server |

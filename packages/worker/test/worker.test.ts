@@ -1313,6 +1313,97 @@ describe("/kill command", () => {
   });
 });
 
+// ─── /interrupt Command: Integration Tests ──────────────────────────────
+
+function makeInterruptReply(
+  replyToMessageId: number,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: "/interrupt",
+      reply_to_message: { message_id: replyToMessageId },
+    },
+  };
+}
+
+function makeInterruptMessage(updateId?: number): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: "/interrupt",
+    },
+  };
+}
+
+describe("/interrupt command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("replies with 'reply to a session notification' when no reply_to_message", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeInterruptMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("replies with 'could not find a session' when reply_to_message has no mapping", async () => {
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeInterruptReply(99996));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
+  it("queues an interrupt command when machine has recently polled D1", async () => {
+    const now = Date.now();
+    const sessionId = `interrupt-connected-${now}`;
+    const machineId = `interrupt-machine-${now}`;
+    const notifMsgId = 6_002_001 + (now % 100);
+
+    await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `interrupt-connected-token-${now}`,
+    });
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSendMessage(); // ack "Interrupting session..."
+
+    const res = await sendWebhook(makeInterruptReply(notifMsgId));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Verify the interrupt command was queued in D1
+    const rows = await queryQueueBySession(sessionId);
+    const interruptRows = rows.filter((r) => r.command_type === "interrupt");
+    expect(interruptRows.length).toBeGreaterThanOrEqual(1);
+    const interruptRow = interruptRows[interruptRows.length - 1]!;
+    expect(interruptRow.command_type).toBe("interrupt");
+    expect(interruptRow.session_id).toBe(sessionId);
+    expect(interruptRow.machine_id).toBe(machineId);
+  });
+});
+
 // ─── /compact Command: Integration Tests ─────────────────────────────
 
 function makeCompactMessage(updateId?: number): Record<string, unknown> {
@@ -2762,6 +2853,24 @@ describe("poll and ack endpoints", () => {
     expect(body.commandType).toBe("kill");
     expect(body.chatId).toBe("8248645256");
     expect(body.sessionId).toBe("sess-to-kill");
+  });
+
+  it("handlePollNext returns command JSON for interrupt type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'interrupt', '', ?, 'pending', ?)`,
+    ).bind("interrupt-cmd-1", "machine-interrupt", "sess-to-interrupt", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-interrupt/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-interrupt");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("interrupt-cmd-1");
+    expect(body.commandType).toBe("interrupt");
+    expect(body.chatId).toBe("8248645256");
+    expect(body.sessionId).toBe("sess-to-interrupt");
   });
 
   it("handlePollNext includes parsed media for execute with media_json", async () => {
