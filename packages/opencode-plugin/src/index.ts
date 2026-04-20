@@ -9,7 +9,7 @@ import { QuestionDeliveryQueue } from "./question-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
-import { TokenTracker, ProviderCache } from "./token-tracker"
+import { TokenTracker, ProviderCache, type MessageTokenInfo } from "./token-tracker"
 import { SessionManager } from "./session-state"
 import { errorMessage, serializeError } from "./utils"
 
@@ -45,7 +45,7 @@ const plugin: Plugin = async (ctx) => {
     }
 
     const tokenTracker = new TokenTracker()
-    const providerCache = new ProviderCache((msg) => log(msg))
+    const providerCache = new ProviderCache(log)
 
     const daemonUrl =
       process.env.PIGEON_DAEMON_URL ??
@@ -384,15 +384,7 @@ const plugin: Plugin = async (ctx) => {
               })
 
               if (role === "assistant") {
-                const assistantInfo = props?.info as {
-                  id: string
-                  sessionID: string
-                  role: string
-                  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
-                  providerID?: string
-                  modelID?: string
-                }
-                tokenTracker.onMessageUpdated(assistantInfo)
+                tokenTracker.onMessageUpdated(props?.info as MessageTokenInfo)
               }
             }
 
@@ -514,22 +506,27 @@ const plugin: Plugin = async (ctx) => {
            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
              sessionManager.setNotified(sessionID, currentMsgId!)
-              const summary = messageTail.getSummary(sessionID)
-              if (summary) {
-                const files = messageTail.getFiles(sessionID)
-                const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
-                const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
-                notifyStop({
-                  sessionId: sessionID,
-                  message: messageWithFooter,
-                  label,
-                  media: files.length > 0 ? files : undefined,
-                  daemonUrl,
-                  log,
-                }).catch((err) => {
-                  log("stop flush before question failed (non-blocking):", serializeError(err))
-                })
-              }
+             const summary = messageTail.getSummary(sessionID)
+             if (summary) {
+               const files = messageTail.getFiles(sessionID)
+               // Fully detach: don't await the footer fetch inside the handler
+               void (async () => {
+                 try {
+                   const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+                   const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
+                   await notifyStop({
+                     sessionId: sessionID,
+                     message: messageWithFooter,
+                     label,
+                     media: files.length > 0 ? files : undefined,
+                     daemonUrl,
+                     log,
+                   })
+                 } catch (err) {
+                   log("stop flush before question failed (non-blocking):", serializeError(err))
+                 }
+               })()
+             }
            }
 
           return
