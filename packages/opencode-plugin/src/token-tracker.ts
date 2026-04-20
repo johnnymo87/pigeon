@@ -59,11 +59,11 @@ export class TokenTracker {
 
   async getFooter(sessionID: string, client: SdkLike, cache: ProviderCache): Promise<string> {
     const snap = this.snapshots.get(sessionID)
-    if (!snap || snap.total <= 0) return ""
+    if (!snap || !Number.isFinite(snap.total) || snap.total <= 0) return ""
 
     const tokens = formatTokenCount(snap.total)
     const limit = await cache.getContextLimit(client, snap.providerID, snap.modelID)
-    if (!limit || limit <= 0) {
+    if (limit === undefined) {
       return `📊 ${tokens} tokens`
     }
     const percent = Math.round((snap.total / limit) * 100)
@@ -80,7 +80,7 @@ type ConfigProvidersResponse = {
   }
 }
 
-type SdkLike = {
+export type SdkLike = {
   config: {
     providers: () => Promise<ConfigProvidersResponse>
   }

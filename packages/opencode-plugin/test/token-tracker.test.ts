@@ -316,4 +316,18 @@ describe("TokenTracker.getFooter", () => {
     const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
     expect(footer).toBe("📊 7.0K tokens · 4%")
   })
+
+  test("returns empty string when snapshot total is NaN", async () => {
+    const t = new TokenTracker()
+    // Inject a NaN-total snapshot directly; guards against a pathological SDK
+    // payload even though onMessageUpdated wouldn't normally create one.
+    ;(t as any).snapshots.set("s1", {
+      messageId: "m1",
+      total: NaN,
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    const footer = await t.getFooter("s1", makeFakeClient(200_000), new ProviderCache())
+    expect(footer).toBe("")
+  })
 })
