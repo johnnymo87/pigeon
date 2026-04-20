@@ -75,6 +75,8 @@ Opencode events (stop, question, error) are sent back to Telegram as replies, ta
 
 **Durable notification delivery:** Both stop and question notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
 
+**Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7%` footer showing the cumulative context-window usage reported by the latest assistant message and its percentage of the model's context window. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved.
+
 **Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
 
 **Multi-question wizard:** When a question has multiple sub-questions, the daemon renders them one at a time in a single Telegram message that is edited in-place as the user answers each step. Button callbacks include a version number (`cmd:TOKEN:v{version}:q{index}`) to prevent stale presses. On the final step, all accumulated answers are delivered to the plugin as a single reply.

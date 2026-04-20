@@ -25,7 +25,7 @@ If you're picking this up fresh:
 | 3. `ProviderCache` for context-limit lookups | ✅ done | 3840fe4 (+595fd96 docs) |
 | 4. `TokenTracker.getFooter` | ✅ done | 6100b46 (+91d4a3b hardening) |
 | 5. Wire `TokenTracker` into the plugin | ✅ done | 4d8526e (+760f46e review) |
-| 6. End-to-end verification + `AGENTS.md` docs | ⏳ not started | — |
+| 6. End-to-end verification + `AGENTS.md` docs | ✅ done | (see AGENTS.md commit) |
 
 Update this table as tasks complete (e.g. `✅ done` + short SHA).
 
