@@ -26,3 +26,114 @@ describe("formatTokenCount", () => {
     expect(formatTokenCount(NaN)).toBe("0")
   })
 })
+
+import { TokenTracker } from "../src/token-tracker"
+
+describe("TokenTracker.onMessageUpdated", () => {
+  test("ignores non-assistant messages", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "user",
+      tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+
+  test("ignores assistant messages with output=0", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+
+  test("captures latest assistant message with output>0", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 10, write: 5 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    const snap = t.getSnapshot("s1")
+    expect(snap).toEqual({
+      messageId: "m1",
+      total: 165,
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+  })
+
+  test("replaces snapshot when newer assistant message arrives", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    t.onMessageUpdated({
+      id: "m2",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 200, output: 100, reasoning: 5, cache: { read: 20, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-opus-4-5",
+    })
+    expect(t.getSnapshot("s1")).toEqual({
+      messageId: "m2",
+      total: 325,
+      providerID: "anthropic",
+      modelID: "claude-opus-4-5",
+    })
+  })
+
+  test("scopes snapshots per session", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    t.onMessageUpdated({
+      id: "m2",
+      sessionID: "s2",
+      role: "assistant",
+      tokens: { input: 20, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-opus-4-5",
+    })
+    expect(t.getSnapshot("s1")?.total).toBe(15)
+    expect(t.getSnapshot("s2")?.total).toBe(30)
+  })
+
+  test("clear removes session", () => {
+    const t = new TokenTracker()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    t.clear("s1")
+    expect(t.getSnapshot("s1")).toBeUndefined()
+  })
+})
