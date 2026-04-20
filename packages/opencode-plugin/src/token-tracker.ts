@@ -82,7 +82,9 @@ type ConfigProvidersResponse = {
 
 export type SdkLike = {
   config: {
-    providers: () => Promise<ConfigProvidersResponse>
+    // Widened to accept the SDK's RequestResult return type (which extends Promise)
+    // and optional call-site arguments (e.g. options?: Options<...>).
+    providers: (...args: any[]) => Promise<any>
   }
 }
 
@@ -122,7 +124,7 @@ export class ProviderCache {
       const res = await client.config.providers()
       const providers = res?.data?.providers ?? []
       for (const p of providers) {
-        for (const [modelID, model] of Object.entries(p.models ?? {})) {
+        for (const [modelID, model] of Object.entries(p.models ?? {}) as Array<[string, any]>) {
           const ctx = model?.limit?.context
           if (typeof ctx === "number" && ctx > 0) {
             this.limits.set(`${p.id}/${modelID}`, ctx)

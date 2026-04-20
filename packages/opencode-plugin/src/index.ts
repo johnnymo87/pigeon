@@ -9,6 +9,7 @@ import { QuestionDeliveryQueue } from "./question-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
+import { TokenTracker, ProviderCache } from "./token-tracker"
 import { SessionManager } from "./session-state"
 import { errorMessage, serializeError } from "./utils"
 
@@ -42,6 +43,9 @@ const plugin: Plugin = async (ctx) => {
         })
       } catch {}
     }
+
+    const tokenTracker = new TokenTracker()
+    const providerCache = new ProviderCache((msg) => log(msg))
 
     const daemonUrl =
       process.env.PIGEON_DAEMON_URL ??
@@ -345,10 +349,12 @@ const plugin: Plugin = async (ctx) => {
 
               const summary = messageTail.getSummary(sessionID) || "Task completed"
               const files = messageTail.getFiles(sessionID)
-              log("sending notifyStop", { sessionID, summary: summary.slice(0, 100) })
+              const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+              const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
+              log("sending notifyStop", { sessionID, summary: summary.slice(0, 100), hasTokenFooter: !!tokenFooter })
               notifyStop({
                 sessionId: sessionID,
-                message: summary,
+                message: messageWithFooter,
                 label,
                 media: files.length > 0 ? files : undefined,
                 daemonUrl,
@@ -376,6 +382,18 @@ const plugin: Plugin = async (ctx) => {
                 sessionID: info.sessionID,
                 role,
               })
+
+              if (role === "assistant") {
+                const assistantInfo = props?.info as {
+                  id: string
+                  sessionID: string
+                  role: string
+                  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+                  providerID?: string
+                  modelID?: string
+                }
+                tokenTracker.onMessageUpdated(assistantInfo)
+              }
             }
 
             if (info.sessionID) {
@@ -404,6 +422,7 @@ const plugin: Plugin = async (ctx) => {
           if (sessionID) {
             sessionManager.onDeleted(sessionID)
             messageTail.clear(sessionID)
+            tokenTracker.clear(sessionID)
           }
 
           return
@@ -422,6 +441,7 @@ const plugin: Plugin = async (ctx) => {
               if (!sessionManager.shouldNotify(sessionID, errorMarker)) {
                 sessionManager.onDeleted(sessionID)
                 messageTail.clear(sessionID)
+                tokenTracker.clear(sessionID)
                 return
               }
 
@@ -444,6 +464,7 @@ const plugin: Plugin = async (ctx) => {
 
             sessionManager.onDeleted(sessionID)
             messageTail.clear(sessionID)
+            tokenTracker.clear(sessionID)
           }
 
           return
@@ -493,20 +514,22 @@ const plugin: Plugin = async (ctx) => {
            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
              sessionManager.setNotified(sessionID, currentMsgId!)
-             const summary = messageTail.getSummary(sessionID)
-             if (summary) {
-               const files = messageTail.getFiles(sessionID)
-               notifyStop({
-                 sessionId: sessionID,
-                 message: summary,
-                 label,
-                 media: files.length > 0 ? files : undefined,
-                 daemonUrl,
-                 log,
-               }).catch((err) => {
-                 log("stop flush before question failed (non-blocking):", serializeError(err))
-               })
-             }
+              const summary = messageTail.getSummary(sessionID)
+              if (summary) {
+                const files = messageTail.getFiles(sessionID)
+                const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+                const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
+                notifyStop({
+                  sessionId: sessionID,
+                  message: messageWithFooter,
+                  label,
+                  media: files.length > 0 ? files : undefined,
+                  daemonUrl,
+                  log,
+                }).catch((err) => {
+                  log("stop flush before question failed (non-blocking):", serializeError(err))
+                })
+              }
            }
 
           return
