@@ -22,7 +22,7 @@ If you're picking this up fresh:
 |------|--------|--------|
 | 1. `formatTokenCount` helper | ✅ done | d730782 |
 | 2. `TokenTracker.onMessageUpdated` + `getSnapshot` | ✅ done | 903677a (+583503b tests) |
-| 3. `ProviderCache` for context-limit lookups | ⏳ not started | — |
+| 3. `ProviderCache` for context-limit lookups | ✅ done | 3840fe4 (+595fd96 docs) |
 | 4. `TokenTracker.getFooter` | ⏳ not started | — |
 | 5. Wire `TokenTracker` into the plugin | ⏳ not started | — |
 | 6. End-to-end verification + `AGENTS.md` docs | ⏳ not started | — |
