@@ -14,3 +14,9 @@ devenv.local.yaml
 
 # Git worktrees
 .worktrees/
+
+# Editor sessions
+Session.vim
+.session.vim
+*.swp
+*.swo
