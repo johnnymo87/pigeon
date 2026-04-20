@@ -56,6 +56,19 @@ export class TokenTracker {
   clear(sessionID: string): void {
     this.snapshots.delete(sessionID)
   }
+
+  async getFooter(sessionID: string, client: SdkLike, cache: ProviderCache): Promise<string> {
+    const snap = this.snapshots.get(sessionID)
+    if (!snap || snap.total <= 0) return ""
+
+    const tokens = formatTokenCount(snap.total)
+    const limit = await cache.getContextLimit(client, snap.providerID, snap.modelID)
+    if (!limit || limit <= 0) {
+      return `📊 ${tokens} tokens`
+    }
+    const percent = Math.round((snap.total / limit) * 100)
+    return `📊 ${tokens} tokens · ${percent}%`
+  }
 }
 
 type ConfigProvidersResponse = {

@@ -229,3 +229,91 @@ describe("ProviderCache.getContextLimit", () => {
     expect(logs.length).toBe(1)
   })
 })
+
+describe("TokenTracker.getFooter", () => {
+  function makeFakeClient(contextLimit: number | undefined) {
+    return {
+      config: {
+        providers: async () => ({
+          data: {
+            providers: contextLimit !== undefined
+              ? [{ id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: contextLimit, output: 8_000 } } } }]
+              : [],
+            default: {},
+          },
+        }),
+      },
+    } as any
+  }
+
+  test("returns empty string when no snapshot", async () => {
+    const t = new TokenTracker()
+    const cache = new ProviderCache()
+    const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
+    expect(footer).toBe("")
+  })
+
+  test("returns tokens + percent when limit known", async () => {
+    const t = new TokenTracker()
+    const cache = new ProviderCache()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 12_000, output: 300, reasoning: 0, cache: { read: 45, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
+    expect(footer).toBe("📊 12.3K tokens · 6%")
+  })
+
+  test("returns tokens-only when model unknown", async () => {
+    const t = new TokenTracker()
+    const cache = new ProviderCache()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 12_000, output: 300, reasoning: 0, cache: { read: 45, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    const footer = await t.getFooter("s1", makeFakeClient(undefined), cache)
+    expect(footer).toBe("📊 12.3K tokens")
+  })
+
+  test("returns tokens-only when provider fetch throws", async () => {
+    const t = new TokenTracker()
+    const cache = new ProviderCache()
+    const failing = {
+      config: { providers: async () => { throw new Error("boom") } },
+    } as any
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 12_000, output: 300, reasoning: 0, cache: { read: 45, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    const footer = await t.getFooter("s1", failing, cache)
+    expect(footer).toBe("📊 12.3K tokens")
+  })
+
+  test("rounds percent to nearest integer", async () => {
+    const t = new TokenTracker()
+    const cache = new ProviderCache()
+    t.onMessageUpdated({
+      id: "m1",
+      sessionID: "s1",
+      role: "assistant",
+      tokens: { input: 7_000, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+    })
+    // 7001 / 200000 = 3.5005% → rounds to 4
+    const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
+    expect(footer).toBe("📊 7.0K tokens · 4%")
+  })
+})
