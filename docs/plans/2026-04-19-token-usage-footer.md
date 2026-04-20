@@ -1,6 +1,44 @@
 # Token Usage Footer Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Execution is **in the current session** (not a parallel session).
+
+## Resumption Checklist (post-compaction)
+
+If you're picking this up fresh:
+
+1. **Read this whole plan file first**, top to bottom.
+2. **Read the design doc** at `docs/plans/2026-04-19-token-usage-footer-design.md` for the "why".
+3. **Check progress**: `git log --oneline origin/main..HEAD` — each completed task has its own commit.
+4. **Check working tree**: `git status` should be clean when resuming between tasks.
+5. **Working branch**: `main` (user explicitly chose to work on main, no feature branch — do NOT create one unless asked).
+6. **Execution method**: subagent-driven-development skill. Dispatch one `implementer` subagent per task, then `spec-reviewer`, then `code-quality-reviewer`. Templates in `~/.config/opencode/skills/superpowers/subagent-driven-development/*.md`.
+7. **Subagent type to use**: `general` (project has `general`, `explore`, `oracle`, `code-reviewer`, `implementer`, etc. — `implementer` or `general` both acceptable for implementer role; `code-reviewer` for quality review).
+8. **Pass full task text to each subagent** — do not make them read the plan file. Copy the task's step-by-step text directly into the prompt.
+9. **Stage only feature-related files** when committing. There are no other pending unrelated changes right now (tree was cleaned up before compaction), but stay disciplined.
+
+### Progress tracker
+
+| Task | Status | Commit |
+|------|--------|--------|
+| 1. `formatTokenCount` helper | ⏳ not started | — |
+| 2. `TokenTracker.onMessageUpdated` + `getSnapshot` | ⏳ not started | — |
+| 3. `ProviderCache` for context-limit lookups | ⏳ not started | — |
+| 4. `TokenTracker.getFooter` | ⏳ not started | — |
+| 5. Wire `TokenTracker` into the plugin | ⏳ not started | — |
+| 6. End-to-end verification + `AGENTS.md` docs | ⏳ not started | — |
+
+Update this table as tasks complete (e.g. `✅ done` + short SHA).
+
+### Key context (non-obvious)
+
+- **`ctx.client.config.providers()`** is the SDK method used to resolve model context limits. Returns `{ data: { providers: Array<{id, models: {[modelID]: {limit: {context, output}}}}> } }`. Plugin already has `ctx.client` in scope.
+- **TUI reference implementation** lives at `~/projects/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/context.tsx`. Matches the token formula exactly: `input + output + reasoning + cache.read + cache.write`, capture latest assistant message with `output > 0`.
+- **Task 3 has a subtle test/impl mismatch**: the unknown-model test expects `calls() === 1`, and the plan's FIRST implementation sketch would make it `2`. The plan explicitly includes a correction under "Note on the 'one more refresh' behavior" — use the FINAL version in that task, not the first sketch.
+- **Daemon side has zero changes**. Footer is appended plugin-side into the `message` field of `notifyStop`. Daemon already relays `body.message` straight to `formatTelegramNotification`.
+- **Two `notifyStop` call sites** in `packages/opencode-plugin/src/index.ts`: the main stop flow (near line 346) AND the question.asked stop flush (near line 496). BOTH need the footer appended.
+- **User preference**: keep it minimal. No cost tracking, no thresholds, no color. Just `📊 12.3K tokens · 7%`.
+
+---
 
 **Goal:** Append a compact `📊 12.3K tokens · 7%` footer to OpenCode stop notifications relayed to Telegram, mirroring the TUI sidebar context display.
 
