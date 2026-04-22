@@ -1,8 +1,16 @@
+import { randomUUID } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
+
+function makeMsgId(): string {
+  // Sortable-ish by createdAt: timestamp prefix in base36 + short random suffix.
+  // The inbox `since` cursor relies on lexicographic msg_id order to approximate
+  // arrival order; the timestamp prefix gives us that for free.
+  return `msg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+}
 
 interface LegacySession {
   session_id: string;
@@ -95,6 +103,52 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     try {
       if (request.method === "GET" && url.pathname === "/health") {
         return Response.json({ ok: true, service: "pigeon-daemon" });
+      }
+
+      if (request.method === "POST" && url.pathname === "/swarm/send") {
+        const body = await readJsonBody(request);
+        const from = typeof body.from === "string" ? body.from : "";
+        const to = typeof body.to === "string" ? body.to : null;
+        const channel = typeof body.channel === "string" ? body.channel : null;
+        const kind = typeof body.kind === "string" ? body.kind : "chat";
+        const priority = (typeof body.priority === "string" ? body.priority : "normal") as "urgent" | "normal" | "low";
+        const replyTo = typeof body.reply_to === "string" ? body.reply_to : null;
+        const payload = typeof body.payload === "string" ? body.payload : "";
+        const callerMsgId = typeof body.msg_id === "string" ? body.msg_id : null;
+
+        if (!from) return Response.json({ error: "from is required" }, { status: 400 });
+        if (!to && !channel) return Response.json({ error: "to or channel is required" }, { status: 400 });
+        if (to && channel) return Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 });
+        if (!payload) return Response.json({ error: "payload is required" }, { status: 400 });
+
+        const msgId = callerMsgId ?? makeMsgId();
+        storage.swarm.insert(
+          { msgId, fromSession: from, toSession: to, channel, kind, priority, replyTo, payload },
+          nowFn(),
+        );
+
+        return Response.json({ accepted: true, msg_id: msgId }, { status: 202 });
+      }
+
+      if (request.method === "GET" && url.pathname === "/swarm/inbox") {
+        const sessionId = url.searchParams.get("session");
+        if (!sessionId) return Response.json({ error: "session is required" }, { status: 400 });
+        const since = url.searchParams.get("since");
+        const messages = storage.swarm.getInbox(sessionId, since);
+        return Response.json({
+          messages: messages.map((m) => ({
+            msg_id: m.msgId,
+            from: m.fromSession,
+            to: m.toSession,
+            channel: m.channel,
+            kind: m.kind,
+            priority: m.priority,
+            reply_to: m.replyTo,
+            payload: m.payload,
+            created_at: m.createdAt,
+            handed_off_at: m.handedOffAt,
+          })),
+        });
       }
 
       if (request.method === "POST" && url.pathname === "/session-start") {
