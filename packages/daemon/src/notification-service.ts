@@ -39,8 +39,18 @@ interface NotificationResult {
   token: string;
 }
 
+export type AlertSeverity = "info" | "warning" | "error";
+
 export interface StopNotifier {
   sendStopNotification(input: StopNotificationInput): Promise<NotificationResult>;
+  /**
+   * Optional: send a free-form text alert (no inline_keyboard, no token,
+   * no session binding). Used by external services (e.g. lgtm) that want
+   * to surface a one-shot operational message via the existing Telegram
+   * bot. Implementations may omit this method; callers must check for
+   * its presence and degrade gracefully.
+   */
+  sendPlainAlert?(text: string, severity: AlertSeverity): Promise<void>;
 }
 
 export interface QuestionNotifier {
@@ -374,6 +384,22 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
 
     return { token };
   }
+
+  async sendPlainAlert(text: string, severity: AlertSeverity): Promise<void> {
+    const prefix =
+      severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
+    const response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: this.chatId,
+        text: `${prefix}${text}`,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram sendMessage returned ${response.status}`);
+    }
+  }
 }
 
 export class WorkerNotificationService implements StopNotifier, QuestionNotifier {
@@ -531,6 +557,20 @@ export class FallbackNotifier implements StopNotifier, QuestionNotifier {
       return await this.primary.sendQuestionNotification(input);
     } catch {
       return this.fallback.sendQuestionNotification(input);
+    }
+  }
+
+  async sendPlainAlert(text: string, severity: AlertSeverity): Promise<void> {
+    if (this.primary.sendPlainAlert) {
+      try {
+        await this.primary.sendPlainAlert(text, severity);
+        return;
+      } catch {
+        // fall through to fallback
+      }
+    }
+    if (this.fallback.sendPlainAlert) {
+      await this.fallback.sendPlainAlert(text, severity);
     }
   }
 }
