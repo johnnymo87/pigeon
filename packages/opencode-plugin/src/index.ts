@@ -11,6 +11,7 @@ import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { TokenTracker, ProviderCache, type MessageTokenInfo } from "./token-tracker"
 import { SessionManager } from "./session-state"
+import { createSwarmReadTool } from "./swarm-tool"
 import { errorMessage, serializeError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
@@ -278,6 +279,9 @@ const plugin: Plugin = async (ctx) => {
       }
 
     return {
+      tool: {
+        "swarm.read": createSwarmReadTool(daemonUrl),
+      },
       event: async (input) => {
         const { event } = input
         // Widen event.type to string to support newer event types (question.*) not yet in SDK
