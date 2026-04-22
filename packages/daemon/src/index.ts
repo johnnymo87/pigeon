@@ -11,6 +11,8 @@ import { openStorageDb } from "./storage/database";
 import { OUTBOX_RETENTION_MS } from "./storage/schema";
 import { Poller } from "./worker/poller";
 import { OutboxSender } from "./worker/outbox-sender";
+import { SwarmArbiter } from "./swarm/arbiter";
+import { SessionDirectoryRegistry } from "./swarm/registry";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
@@ -184,6 +186,29 @@ const outboxSender = poller && config.telegramChatId
 
 if (outboxSender) {
   outboxSender.start(5_000);
+}
+
+// Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
+// serve via prompt_async with at-most-one in-flight per target session.
+// Requires opencode-client (so config.opencodeUrl must be set).
+const swarmArbiter = opencodeClient && config.opencodeUrl
+  ? new SwarmArbiter({
+      storage,
+      opencodeClient,
+      registry: new SessionDirectoryRegistry({
+        baseUrl: config.opencodeUrl,
+        ttlMs: 5 * 60 * 1000,
+      }),
+      log: (msg, fields) =>
+        console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (swarmArbiter) {
+  swarmArbiter.start(500);
+  console.log("[pigeon-daemon] swarm arbiter started (interval=500ms)");
+} else {
+  console.log("[pigeon-daemon] swarm arbiter NOT started (no opencodeUrl in config)");
 }
 
 // Cleanup terminal outbox entries every hour
