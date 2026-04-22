@@ -16,6 +16,10 @@ function makeInput(overrides: Partial<LaunchCommandInput> = {}): LaunchCommandIn
     chatId: "42",
     opencodeClient,
     sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+    spawn: vi.fn(() => ({
+      unref: vi.fn(),
+      on: vi.fn(),
+    } as unknown as ReturnType<typeof import("child_process").spawn>)),
     ...overrides,
   };
 }
@@ -182,6 +186,132 @@ describe("ingestLaunchCommand", () => {
         "42",
         expect.stringContaining("Failed to launch session"),
       );
+    });
+  });
+
+  describe("auto-attach", () => {
+    function makeChildStub(): { unref: ReturnType<typeof vi.fn>; on: ReturnType<typeof vi.fn>; emit: (event: string, ...args: unknown[]) => void } {
+      // Minimal EventEmitter-shaped child stub for tests.
+      const handlers: Record<string, Array<(...args: unknown[]) => void>> = {};
+      return {
+        unref: vi.fn(),
+        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+          (handlers[event] ??= []).push(handler);
+        }),
+        emit: (event: string, ...args: unknown[]) => {
+          (handlers[event] ?? []).forEach((h) => h(...args));
+        },
+      };
+    }
+
+    it("spawns oc-auto-attach with the session id after sendPrompt succeeds", async () => {
+      const spawnFn = vi.fn(() => makeChildStub() as unknown as ReturnType<typeof import("child_process").spawn>);
+      const input = makeInput({ spawn: spawnFn });
+
+      await ingestLaunchCommand(input);
+
+      expect(spawnFn).toHaveBeenCalledWith(
+        "oc-auto-attach",
+        ["sess-123"],
+        expect.objectContaining({ stdio: "ignore", detached: true }),
+      );
+    });
+
+    it("calls unref on the spawned child", async () => {
+      const child = makeChildStub();
+      const input = makeInput({
+        spawn: vi.fn(() => child as unknown as ReturnType<typeof import("child_process").spawn>),
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(child.unref).toHaveBeenCalledOnce();
+    });
+
+    it("attaches an error listener to the spawned child", async () => {
+      const child = makeChildStub();
+      const input = makeInput({
+        spawn: vi.fn(() => child as unknown as ReturnType<typeof import("child_process").spawn>),
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(child.on).toHaveBeenCalledWith("error", expect.any(Function));
+    });
+
+    it("swallows ENOENT emitted asynchronously when oc-auto-attach is missing", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const child = makeChildStub();
+        const input = makeInput({
+          spawn: vi.fn(() => child as unknown as ReturnType<typeof import("child_process").spawn>),
+        });
+
+        await ingestLaunchCommand(input);
+
+        // Simulate Node's async ENOENT emission AFTER ingest returns.
+        const err = Object.assign(new Error("spawn oc-auto-attach ENOENT"), { code: "ENOENT" });
+        expect(() => child.emit("error", err)).not.toThrow();
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("logs but does not throw on non-ENOENT async errors", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const child = makeChildStub();
+        const input = makeInput({
+          spawn: vi.fn(() => child as unknown as ReturnType<typeof import("child_process").spawn>),
+        });
+
+        await ingestLaunchCommand(input);
+
+        const err = Object.assign(new Error("permission denied"), { code: "EACCES" });
+        expect(() => child.emit("error", err)).not.toThrow();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining("auto-attach spawn failed (async)"),
+          err,
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("logs but does not throw on synchronous spawn failures", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const input = makeInput({
+          spawn: vi.fn(() => {
+            throw new Error("EACCES: permission denied");
+          }),
+        });
+
+        await expect(ingestLaunchCommand(input)).resolves.toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining("auto-attach spawn failed (sync)"),
+          expect.any(Error),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("does not spawn auto-attach when sendPrompt throws", async () => {
+      const spawn = vi.fn();
+      const input = makeInput({
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockResolvedValue({ id: "sess-fail" }),
+          sendPrompt: vi.fn().mockRejectedValue(new Error("send failed")),
+        } as unknown as import("../src/opencode-client").OpencodeClient,
+        spawn,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(spawn).not.toHaveBeenCalled();
     });
   });
 });
