@@ -26,6 +26,8 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `POST /stop`
 - `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question
+- `POST /swarm/send` -- enqueue a cross-session swarm message; daemon writes to `swarm_messages` and returns 202 with `msg_id`. Background SwarmArbiter delivers via opencode serve `prompt_async`. See `swarm-architecture` skill.
+- `GET /swarm/inbox?session=<id>[&since=<msg_id>]` -- read messages already delivered (`state='handed_off'`) to a target session, optionally cursor-paginated.
 - `POST /cleanup`
 
 ## Storage Domains
@@ -37,6 +39,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint. Wizard columns: `current_step`, `answers_json_v2`, `version` for multi-question flows.
 - `outbox`: durable notification delivery queue for both question and stop notifications. Keyed by `notification_id`, `kind` field (`"question"` or `"stop"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour.
 - `model_override`: nullable TEXT column on `sessions` table. Stores `provider/model` string (e.g. `anthropic/claude-sonnet-4-20250514`). Read by `command-ingest.ts` and passed through the adapter to the plugin.
+- `swarm_messages`: durable cross-session message queue. Keyed by `msg_id` (idempotency key), state machine `queued → handed_off | failed`. Per-target serialized delivery via `SwarmArbiter`. Schema and column-level details in the `swarm-architecture` skill.
 
 ## Worker Integration: HTTP Polling
 
@@ -115,6 +118,26 @@ Worker commands of type `"launch"` and `"kill"` are handled by dedicated ingest 
 
 All are dispatched by the Poller's command-type callbacks. Acking is handled by the Poller after successful dispatch.
 
+## Swarm IPC
+
+Cross-session messaging between opencode sessions on the same machine, fixing the prompt_async race architecturally by making the daemon the single writer per target.
+
+- `packages/daemon/src/storage/swarm-schema.ts` -- `swarm_messages` table + indexes
+- `packages/daemon/src/storage/swarm-repo.ts` -- `SwarmRepository`, exposed as `storage.swarm`
+- `packages/daemon/src/swarm/envelope.ts` -- `<swarm_message v="1">` XML renderer that the receiving session sees in its transcript
+- `packages/daemon/src/swarm/registry.ts` -- `SessionDirectoryRegistry` (5min TTL cache of `sessionId → directory` from opencode serve)
+- `packages/daemon/src/swarm/arbiter.ts` -- `SwarmArbiter`: per-target queue with at-most-one in-flight `prompt_async`, retry/backoff (`[1s, 2s, 5s, 15s, 60s]`, MAX_ATTEMPTS=10)
+
+The arbiter ticks every 500ms, finds targets with ready (`queued`, `next_retry_at <= now`) messages, drains each in parallel but each target serialized internally via an in-process `inflight: Map<target, Promise>`. On success: `markHandedOff`. On failure: `markRetry` (or `markFailed` after MAX_ATTEMPTS).
+
+Boots conditionally on `opencodeClient && config.opencodeUrl` in `index.ts`. Without `opencodeUrl`, the routes still accept POSTs (messages accumulate in `state='queued'`) but no arbiter drains them.
+
+The opencode-plugin exposes a companion tool (`swarm.read`) that calls `GET /swarm/inbox` on behalf of the calling session — see `opencode-plugin-architecture`.
+
+Senders use `~/.local/bin/pigeon-send` (provisioned by workstation `users/dev/home.base.nix`); the legacy `~/.local/bin/opencode-send` auto-routes `ses_*` targets through `pigeon-send` with `--direct` as the escape hatch.
+
+Full details in the `swarm-architecture` skill (schema columns, route bodies, arbiter algorithm, race-fix proof).
+
 ## Integration Flow
 
 ### Stop Flow
@@ -148,6 +171,17 @@ All are dispatched by the Poller's command-type callbacks. Acking is handled by 
 14. **Multi-question wizard path**: daemon advances the wizard step, edits the Telegram message in-place to show the next question (via `POST /notifications/edit`). On the final step, all accumulated answers are delivered as a single `deliverQuestionReply` call with `answers: string[][]`.
 15. Plugin calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
 16. If the user already answered locally, stale button presses return "This question has already been answered." Stale wizard versions (button from a previous step) are silently dropped.
+
+### Swarm Send Flow
+
+1. Sender (some `bash` shell, often a sub-shell of an opencode session) runs `pigeon-send <to> <payload>` (or `opencode-send <ses_*> <payload>` which auto-routes).
+2. `pigeon-send` POSTs to daemon `/swarm/send` with `{from, to, kind, priority, payload, [reply_to], [msg_id]}`.
+3. Daemon validates, mints `msg_id` if not caller-supplied, calls `storage.swarm.insert(...)`, returns HTTP 202 `{accepted: true, msg_id}` immediately.
+4. Background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
+5. For each ready target (in parallel), `drainTarget` collapses concurrent calls onto a single in-flight promise (the at-most-one-in-flight invariant per target).
+6. Inside the per-target drain: pop one ready msg → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
+7. On failure: `storage.swarm.markRetry` with exponential backoff (or `markFailed` after MAX_ATTEMPTS=10).
+8. Receiver agent sees the next user-message turn as the `<swarm_message>` XML envelope. It can also call the `swarm.read` opencode tool to fetch its full inbox (`GET /swarm/inbox?session=<own-id>[&since=<msg_id>]`).
 
 ### Session Reaper
 

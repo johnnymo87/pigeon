@@ -55,6 +55,30 @@ const internalFetch: typeof fetch = sdkClientConfig?.fetch ?? globalThis.fetch
 
 The `onQuestionReply` handler uses `internalFetch` (with a `new Request(...)`) to call the OpenCode API. Using raw `globalThis.fetch` would fail with "Unable to connect" because no HTTP server is running.
 
+## Swarm IPC Tool (`swarm.read`)
+
+The plugin registers `swarm.read` as an opencode tool the LLM can call to fetch its swarm inbox from the local pigeon daemon. This is the receiver side of the swarm IPC subsystem (sender side is `pigeon-send`; full subsystem in `swarm-architecture`).
+
+- `packages/opencode-plugin/src/swarm-tool.ts`:
+  - `swarmRead({daemonBaseUrl, sessionId, fetchFn?}, since?)` -- pure helper. `GET /swarm/inbox?session=<id>[&since=<msg_id>]`. Returns the parsed messages array.
+  - `formatInbox(messages)` -- renders the messages as compact text blocks for the LLM.
+  - `createSwarmReadTool(daemonBaseUrl)` -- returns a `ToolDefinition` that captures `daemonBaseUrl` from closure and reads `sessionID` from `ToolContext` at execute-time.
+
+Registered in `index.ts` via the `Hooks.tool` map:
+
+```ts
+return {
+  tool: {
+    "swarm.read": createSwarmReadTool(daemonUrl),
+  },
+  event: async (input) => { ... },
+}
+```
+
+`Hooks.tool` is `{ [key: string]: ToolDefinition }` from `@opencode-ai/plugin/tool`. The `tool({description, args, execute})` factory accepts zod-described args via `tool.schema.string().optional()`. The execute callback receives `(args, ToolContext)` where `ToolContext.sessionID` is the calling session — so the tool always reads its OWN inbox, no spoofing.
+
+**Critical: import from `@opencode-ai/plugin/tool` (subpath), NOT `@opencode-ai/plugin`.** The upstream package's compiled JS uses extensionless ESM imports (`import "./tool"`) which Node ESM rejects, but the explicit `./tool` subpath export resolves correctly. See `opencode-plugin-development` for the gotcha details.
+
 ## Media Handling
 
 ### Outbound (OpenCode → Telegram)

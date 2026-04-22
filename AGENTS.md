@@ -15,6 +15,7 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
 - Daemon health (local): `curl http://127.0.0.1:4731/health`
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
+- Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
 - Deploy daemon/plugin: `git pull && npm install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
 
@@ -41,6 +42,12 @@ The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon sh
 ### Model Override
 
 The `/model` command sets a per-session model override stored in the daemon's SQLite `sessions` table. When a command is delivered, the override is read and passed through the adapter to the plugin, which includes it in the `prompt_async` request body. The override persists until the session ends or a new `/model` command changes it.
+
+### Swarm IPC
+
+Cross-session messaging between opencode sessions on the same machine. Senders POST to daemon `/swarm/send` (typically via `~/.local/bin/pigeon-send` from workstation, or transparently via `opencode-send <ses_*>` which auto-routes). The daemon persists in `swarm_messages` and returns 202 immediately. A background `SwarmArbiter` (500ms tick, at-most-one-in-flight per target) delivers via opencode serve `prompt_async`, with the message wrapped in a `<swarm_message v="1" ...>` XML envelope so the receiving agent can structurally distinguish swarm traffic from user prompts. Receivers can also call the `swarm.read` opencode tool (registered by the plugin) to fetch their inbox via `GET /swarm/inbox`.
+
+This fixes the prompt_async race architecturally — the daemon is the single writer to opencode serve for cross-session messages, so the "concurrent prompt_async from different `x-opencode-directory` headers bypasses the busy guard" race that bit COPS-6107 cannot occur for daemon-routed traffic. See the `swarm-architecture` skill for tables/routes/algorithm and `swarm-operations` for ops + debugging.
 
 ### Commands
 
@@ -140,6 +147,15 @@ Health check URLs are listed in the Quickstart section above.
   - Use when changing plugin handlers, tests, or daemon payload fields.
 - [opencode-plugin-deployment](.opencode/skills/opencode-plugin-deployment/SKILL.md)
   - Use when deploying or updating the OpenCode plugin on devbox or via Nix.
+
+### Swarm IPC
+
+- [swarm-architecture](.opencode/skills/swarm-architecture/SKILL.md)
+  - Use for swarm tables, routes, the per-target arbiter, the session→directory registry, and the wire envelope.
+- [swarm-development](.opencode/skills/swarm-development/SKILL.md)
+  - Use when adding swarm features (kinds, channels, plugin tools, schema changes) with TDD.
+- [swarm-operations](.opencode/skills/swarm-operations/SKILL.md)
+  - Use for swarm health checks, inspecting messages, debugging stuck deliveries, and reading the arbiter log.
 
 ### Cross-Cutting
 
