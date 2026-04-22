@@ -1,10 +1,16 @@
 /**
- * swarm.read — opencode tool that fetches the current session's swarm
+ * swarm_read — opencode tool that fetches the current session's swarm
  * inbox from pigeon. Receivers call this when they want to see backlog
  * or check for messages they haven't seen pushed yet.
  *
  * The tool gets the calling sessionID from ToolContext. The daemon URL
  * is injected at registration time (closed-over from the plugin entry).
+ *
+ * NOTE on naming: the tool used to be registered as "swarm.read", but
+ * Anthropic's API rejects tool names containing characters outside
+ * `^[a-zA-Z0-9_-]{1,128}$`. Periods are not allowed, so the original
+ * name produced a 400 error on every fresh opencode session that loaded
+ * the plugin. The name is now an underscore-joined identifier.
  *
  * Args:
  *   since: optional msg_id cursor; if omitted, returns from the start
@@ -12,6 +18,14 @@
  */
 
 import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+
+/**
+ * Registration name for the swarm-inbox replay tool. Must satisfy
+ * Anthropic's tool-name regex `^[a-zA-Z0-9_-]{1,128}$` (no periods,
+ * no slashes, no spaces). Exported so the plugin entry point and tests
+ * share a single source of truth.
+ */
+export const SWARM_READ_TOOL_NAME = "swarm_read" as const
 
 export interface SwarmReadOptions {
   daemonBaseUrl: string // e.g. http://127.0.0.1:4731
@@ -46,7 +60,7 @@ export async function swarmRead(
   const res = await fetchFn(url.toString())
   if (!res.ok) {
     const body = await res.text().catch(() => "")
-    throw new Error(`swarm.read failed: ${res.status} ${body}`)
+    throw new Error(`swarm_read failed: ${res.status} ${body}`)
   }
   const body = (await res.json()) as { messages: SwarmInboxMessage[] }
   return body.messages
@@ -73,7 +87,7 @@ export function formatInbox(messages: SwarmInboxMessage[]): string {
 }
 
 /**
- * Build a `ToolDefinition` registered as `swarm.read` in the plugin's
+ * Build a `ToolDefinition` registered as `swarm_read` in the plugin's
  * `tool` map. The factory captures `daemonBaseUrl` so the runtime call
  * only needs `since` from the LLM and `sessionID` from ToolContext.
  */

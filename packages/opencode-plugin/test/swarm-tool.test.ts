@@ -4,6 +4,7 @@ import {
   swarmRead,
   formatInbox,
   createSwarmReadTool,
+  SWARM_READ_TOOL_NAME,
   type SwarmInboxMessage,
 } from "../src/swarm-tool"
 
@@ -134,7 +135,7 @@ describe("swarmRead (pure helper)", () => {
         sessionId: "ses_target",
         fetchFn,
       }),
-    ).rejects.toThrow(/swarm\.read failed: 404 session unknown/)
+    ).rejects.toThrow(/swarm_read failed: 404 session unknown/)
   })
 
   test("works against a real HTTP server", async () => {
@@ -243,5 +244,22 @@ describe("createSwarmReadTool", () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+})
+
+describe("SWARM_READ_TOOL_NAME (Anthropic compatibility)", () => {
+  // Anthropic's API rejects tool names that don't match this regex with
+  // "tools.N.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'"
+  // and a 400 error that crashes every fresh opencode session.
+  // Notably, '.' (period) is NOT allowed -- so the original "swarm.read"
+  // registration broke every fresh session that loaded the plugin.
+  const ANTHROPIC_TOOL_NAME_REGEX = /^[a-zA-Z0-9_-]{1,128}$/
+
+  test("registration name matches Anthropic's tool-name regex", () => {
+    expect(SWARM_READ_TOOL_NAME).toMatch(ANTHROPIC_TOOL_NAME_REGEX)
+  })
+
+  test("registration name does not contain a period (the original bug)", () => {
+    expect(SWARM_READ_TOOL_NAME).not.toContain(".")
   })
 })

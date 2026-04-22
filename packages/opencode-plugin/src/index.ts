@@ -11,7 +11,7 @@ import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { TokenTracker, ProviderCache, type MessageTokenInfo } from "./token-tracker"
 import { SessionManager } from "./session-state"
-import { createSwarmReadTool } from "./swarm-tool"
+import { createSwarmReadTool, SWARM_READ_TOOL_NAME } from "./swarm-tool"
 import { errorMessage, serializeError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
@@ -280,7 +280,10 @@ const plugin: Plugin = async (ctx) => {
 
     return {
       tool: {
-        "swarm.read": createSwarmReadTool(daemonUrl),
+        // Anthropic rejects tool names with characters outside
+        // ^[a-zA-Z0-9_-]{1,128}$ -- so this MUST stay underscore-joined.
+        // See SWARM_READ_TOOL_NAME comment in swarm-tool.ts for history.
+        [SWARM_READ_TOOL_NAME]: createSwarmReadTool(daemonUrl),
       },
       event: async (input) => {
         const { event } = input
