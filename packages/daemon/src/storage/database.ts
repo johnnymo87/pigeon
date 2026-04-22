@@ -10,6 +10,8 @@ import {
   SessionTokenRepository,
 } from "./repos";
 import { OutboxRepository } from "./outbox-repo";
+import { initSwarmSchema } from "./swarm-schema";
+import { SwarmRepository } from "./swarm-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -19,6 +21,7 @@ export interface StorageDb {
   inbox: InboxRepository;
   pendingQuestions: PendingQuestionRepository;
   outbox: OutboxRepository;
+  swarm: SwarmRepository;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -29,6 +32,7 @@ export function openStorageDb(path: string): StorageDb {
   const db = new BetterSqlite3(path);
   db.exec("PRAGMA foreign_keys = ON;");
   initSchema(db);
+  initSwarmSchema(db);
 
   return {
     db,
@@ -38,5 +42,6 @@ export function openStorageDb(path: string): StorageDb {
     inbox: new InboxRepository(db),
     pendingQuestions: new PendingQuestionRepository(db),
     outbox: new OutboxRepository(db),
+    swarm: new SwarmRepository(db),
   };
 }
