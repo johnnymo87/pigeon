@@ -105,6 +105,29 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         return Response.json({ ok: true, service: "pigeon-daemon" });
       }
 
+      if (request.method === "POST" && url.pathname === "/alert") {
+        const body = await readJsonBody(request);
+        const text = typeof body.text === "string" ? body.text : "";
+        const severityRaw = typeof body.severity === "string" ? body.severity : "info";
+        const severity: "info" | "warning" | "error" =
+          severityRaw === "error" || severityRaw === "warning" ? severityRaw : "info";
+
+        if (!text) {
+          return Response.json({ error: "text is required" }, { status: 400 });
+        }
+
+        if (!notifier?.sendPlainAlert) {
+          return Response.json({ error: "alerting not configured" }, { status: 503 });
+        }
+
+        try {
+          await notifier.sendPlainAlert(text, severity);
+          return new Response(null, { status: 204 });
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 502 });
+        }
+      }
+
       if (request.method === "POST" && url.pathname === "/swarm/send") {
         const body = await readJsonBody(request);
         const from = typeof body.from === "string" ? body.from : "";
