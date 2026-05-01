@@ -205,16 +205,43 @@ describe("ingestLaunchCommand", () => {
     }
 
     it("spawns oc-auto-attach with the session id after sendPrompt succeeds", async () => {
-      const spawnFn = vi.fn(() => makeChildStub() as unknown as ReturnType<typeof import("child_process").spawn>);
-      const input = makeInput({ spawn: spawnFn });
+      const prev = process.env.OC_AUTO_ATTACH_BIN;
+      delete process.env.OC_AUTO_ATTACH_BIN;
+      try {
+        const spawnFn = vi.fn(() => makeChildStub() as unknown as ReturnType<typeof import("child_process").spawn>);
+        const input = makeInput({ spawn: spawnFn });
 
-      await ingestLaunchCommand(input);
+        await ingestLaunchCommand(input);
 
-      expect(spawnFn).toHaveBeenCalledWith(
-        "oc-auto-attach",
-        ["sess-123"],
-        expect.objectContaining({ stdio: "ignore", detached: true }),
-      );
+        expect(spawnFn).toHaveBeenCalledWith(
+          "oc-auto-attach",
+          ["sess-123"],
+          expect.objectContaining({ stdio: "ignore", detached: true }),
+        );
+      } finally {
+        if (prev === undefined) delete process.env.OC_AUTO_ATTACH_BIN;
+        else process.env.OC_AUTO_ATTACH_BIN = prev;
+      }
+    });
+
+    it("uses OC_AUTO_ATTACH_BIN env var when set (so systemd services with locked-down PATH can pin an absolute path)", async () => {
+      const prev = process.env.OC_AUTO_ATTACH_BIN;
+      process.env.OC_AUTO_ATTACH_BIN = "/nix/store/abc-oc-auto-attach/bin/oc-auto-attach";
+      try {
+        const spawnFn = vi.fn(() => makeChildStub() as unknown as ReturnType<typeof import("child_process").spawn>);
+        const input = makeInput({ spawn: spawnFn });
+
+        await ingestLaunchCommand(input);
+
+        expect(spawnFn).toHaveBeenCalledWith(
+          "/nix/store/abc-oc-auto-attach/bin/oc-auto-attach",
+          ["sess-123"],
+          expect.objectContaining({ stdio: "ignore", detached: true }),
+        );
+      } finally {
+        if (prev === undefined) delete process.env.OC_AUTO_ATTACH_BIN;
+        else process.env.OC_AUTO_ATTACH_BIN = prev;
+      }
     });
 
     it("calls unref on the spawned child", async () => {

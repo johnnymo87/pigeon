@@ -50,9 +50,16 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     // on the child's 'error' event — we MUST listen for it or node crashes.
     // The synchronous try/catch handles rare cases like invalid arguments
     // that throw immediately.
+    //
+    // OC_AUTO_ATTACH_BIN env var lets systemd-managed deployments pin an
+    // absolute path to the binary. Required on hosts (e.g. cloudbox) where
+    // the daemon's PATH is a locked-down nix-store list that does NOT
+    // include ~/.nix-profile/bin — without it, spawn would silently ENOENT
+    // and the auto-attach to nvim+tmux for telegram /launch would never run.
     try {
       const spawnFn = input.spawn ?? nodeSpawn;
-      const child = spawnFn("oc-auto-attach", [session.id], {
+      const bin = process.env.OC_AUTO_ATTACH_BIN ?? "oc-auto-attach";
+      const child = spawnFn(bin, [session.id], {
         stdio: "ignore",
         detached: true,
       });
