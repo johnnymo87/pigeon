@@ -119,6 +119,65 @@ describe("POST /swarm/send", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it("rejects `to` that is not a session id (no ses_ prefix) and persists nothing", async () => {
+    const { app, storage: s } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "lgtm",
+          kind: "chat",
+          payload: "hello",
+        }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/ses_/);
+
+    // Nothing should have been persisted: the swarm_messages table is empty.
+    const row = s.db
+      .prepare("SELECT COUNT(*) AS n FROM swarm_messages")
+      .get() as { n: number };
+    expect(row.n).toBe(0);
+  });
+
+  it("accepts a `to` that has the ses_ prefix", async () => {
+    const { app } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_21970dafaffeIWgipwpNH87Y2r",
+          kind: "chat",
+          payload: "hello",
+        }),
+      }),
+    );
+    expect(res.status).toBe(202);
+  });
+
+  it("does not require ses_ prefix when using `channel` instead of `to`", async () => {
+    const { app } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          channel: "workers",
+          kind: "chat",
+          payload: "hello",
+        }),
+      }),
+    );
+    expect(res.status).toBe(202);
+  });
 });
 
 describe("GET /swarm/inbox", () => {

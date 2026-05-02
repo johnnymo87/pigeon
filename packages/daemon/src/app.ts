@@ -142,6 +142,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!from) return Response.json({ error: "from is required" }, { status: 400 });
         if (!to && !channel) return Response.json({ error: "to or channel is required" }, { status: 400 });
         if (to && channel) return Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 });
+        // Cheap shape check: a `to` target must be an opencode session id
+        // (matches opencode-serve's own zod prefix check). This catches typos
+        // and category errors (e.g. passing a coordinator name like "lgtm")
+        // before we burn ~7 minutes of arbiter retries against a 400 from
+        // opencode-serve. We do NOT validate that the session exists — that
+        // is a different problem (real sessions become unreachable when
+        // opencode-serve restarts).
+        if (to && !/^ses_[A-Za-z0-9_-]+$/.test(to)) {
+          return Response.json(
+            { error: "to must be a session id starting with 'ses_'" },
+            { status: 400 },
+          );
+        }
         if (!payload) return Response.json({ error: "payload is required" }, { status: 400 });
 
         const msgId = callerMsgId ?? makeMsgId();
