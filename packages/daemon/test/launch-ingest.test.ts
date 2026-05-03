@@ -216,7 +216,7 @@ describe("ingestLaunchCommand", () => {
         expect(spawnFn).toHaveBeenCalledWith(
           "oc-auto-attach",
           ["sess-123"],
-          expect.objectContaining({ stdio: "ignore", detached: true }),
+          expect.objectContaining({ detached: true }),
         );
       } finally {
         if (prev === undefined) delete process.env.OC_AUTO_ATTACH_BIN;
@@ -236,12 +236,40 @@ describe("ingestLaunchCommand", () => {
         expect(spawnFn).toHaveBeenCalledWith(
           "/nix/store/abc-oc-auto-attach/bin/oc-auto-attach",
           ["sess-123"],
-          expect.objectContaining({ stdio: "ignore", detached: true }),
+          expect.objectContaining({ detached: true }),
         );
       } finally {
         if (prev === undefined) delete process.env.OC_AUTO_ATTACH_BIN;
         else process.env.OC_AUTO_ATTACH_BIN = prev;
       }
+    });
+
+    it("captures child stdout and stderr into /tmp/oc-auto-attach.log so silent failures are debuggable", async () => {
+      // We don't want stdio: "ignore" any more — when the daemon spawns
+      // oc-auto-attach with discarded stdio, ANY internal failure of the
+      // shell script (e.g. a missing tool in PATH under `set -o pipefail`)
+      // is invisible. Route stdio to /tmp/oc-auto-attach.log instead, so
+      // the same log file the home.base.nix wrapper writes to gets daemon
+      // launches too.
+      const spawnFn = vi.fn(() => makeChildStub() as unknown as ReturnType<typeof import("child_process").spawn>);
+      const input = makeInput({ spawn: spawnFn });
+
+      await ingestLaunchCommand(input);
+
+      expect(spawnFn).toHaveBeenCalledTimes(1);
+      const callArgs = spawnFn.mock.calls[0] as unknown as [string, string[], { stdio?: unknown; detached?: boolean }];
+      const stdio = callArgs[2]?.stdio;
+      // stdio must be an array of length 3: [stdin, stdout, stderr].
+      // stdin should be discarded ("ignore"), stdout/stderr should both
+      // be a numeric file descriptor pointing at the log file.
+      expect(Array.isArray(stdio)).toBe(true);
+      const stdioArr = stdio as Array<unknown>;
+      expect(stdioArr).toHaveLength(3);
+      expect(stdioArr[0]).toBe("ignore");
+      expect(typeof stdioArr[1]).toBe("number");
+      expect(typeof stdioArr[2]).toBe("number");
+      // Same fd reused for both stdout and stderr (single open() call).
+      expect(stdioArr[1]).toBe(stdioArr[2]);
     });
 
     it("calls unref on the spawned child", async () => {

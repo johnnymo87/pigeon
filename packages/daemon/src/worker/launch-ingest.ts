@@ -1,8 +1,12 @@
 import os from "os";
+import { openSync } from "fs";
 import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 import type { OpencodeClient } from "../opencode-client";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import type { LaunchMessage } from "./poller";
+
+/** Path of the log file shared with the home.base.nix shell wrapper. */
+const AUTO_ATTACH_LOG_PATH = "/tmp/oc-auto-attach.log";
 
 /** Treat a bare word (no slashes, no ~) as ~/projects/<word>. */
 function expandShorthand(dir: string): string {
@@ -26,7 +30,7 @@ export interface LaunchCommandInput {
   opencodeClient: OpencodeClient;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
   /** Injected for tests; defaults to node child_process.spawn. */
-  spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe"; detached?: boolean }) => ChildProcess;
+  spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe" | Array<"ignore" | "inherit" | "pipe" | number>; detached?: boolean }) => ChildProcess;
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
@@ -56,11 +60,29 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     // the daemon's PATH is a locked-down nix-store list that does NOT
     // include ~/.nix-profile/bin — without it, spawn would silently ENOENT
     // and the auto-attach to nvim+tmux for telegram /launch would never run.
+    //
+    // We route the child's stdout AND stderr to /tmp/oc-auto-attach.log
+    // (the same log file the home.base.nix shell wrapper uses). Without
+    // this, daemon-spawned launches would discard the script's logs and
+    // any internal failure (e.g. a missing tool in the script's PATH
+    // under `set -o pipefail`) would be completely invisible. We hit
+    // exactly that on cloudbox: oc-auto-attach silently failed for a
+    // /launch into a project without an existing tmux window because
+    // `awk` was missing from the script's hard-coded PATH.
+    //
+    // openSync failure (e.g. /tmp not writable) is swallowed — we'd
+    // rather lose logs than crash the launcher.
     try {
       const spawnFn = input.spawn ?? nodeSpawn;
       const bin = process.env.OC_AUTO_ATTACH_BIN ?? "oc-auto-attach";
+      let logFd: number | "ignore" = "ignore";
+      try {
+        logFd = openSync(AUTO_ATTACH_LOG_PATH, "a");
+      } catch (logErr: unknown) {
+        console.warn(`[launch-ingest] could not open ${AUTO_ATTACH_LOG_PATH}:`, logErr);
+      }
       const child = spawnFn(bin, [session.id], {
-        stdio: "ignore",
+        stdio: ["ignore", logFd, logFd],
         detached: true,
       });
       child.on?.("error", (err: NodeJS.ErrnoException) => {
