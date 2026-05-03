@@ -66,6 +66,8 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             apiKey: config.workerApiKey,
             editNotification: (nid, text, rm, entities) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }, entities as unknown[] | undefined),
             machineId: config.machineId,
+            ...(opencodeClient ? { opencodeClient } : {}),
+            sendTelegramReply: sendTelegramMessage,
           });
         },
         onLaunch: async (msg) => {
