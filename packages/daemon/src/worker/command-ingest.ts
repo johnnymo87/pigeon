@@ -12,6 +12,7 @@ import {
 } from "../opencode-direct/contracts";
 import type { ExecuteMessage } from "./poller";
 import { formatQuestionWizardStep } from "../notification-service";
+import { reviveAndDeliver, type ReviveAndDeliverDeps } from "./revive-and-deliver";
 
 export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
@@ -36,6 +37,12 @@ export interface WorkerCommandIngestOptions {
   editNotification?: (notificationId: string, text: string, replyMarkup: unknown, entities?: unknown[]) => Promise<{ ok: boolean }>;
   /** Machine ID for formatting wizard steps */
   machineId?: string;
+  /** OpenCode client for plugin-free fallback delivery on plugin death. */
+  opencodeClient?: ReviveAndDeliverDeps["opencodeClient"];
+  /** Send a reply to Telegram (used for revive-on-reply error notifications). */
+  sendTelegramReply?: (chatId: string, text: string) => Promise<void>;
+  /** Injected spawn for testing (passed through to reviveAndDeliver). */
+  spawn?: ReviveAndDeliverDeps["spawn"];
 }
 
 const QUESTION_OPTION_RE = /^q(\d+)$/;
@@ -301,7 +308,7 @@ export async function ingestWorkerCommand(
         return { ok: false, error, meta: { attempts: direct.attempts, status: direct.status } };
       },
     };
-    return deliverViaAdapter(legacyAdapter, session, msg, commandId, storage);
+    return deliverViaAdapter(legacyAdapter, session, msg, commandId, storage, options);
   }
 
   const adapter = options.createAdapter
@@ -341,7 +348,7 @@ export async function ingestWorkerCommand(
     }
   }
 
-  return deliverViaAdapter(adapter, session, msg, commandId, storage, mediaPayload);
+  return deliverViaAdapter(adapter, session, msg, commandId, storage, options, mediaPayload);
 }
 
 
@@ -366,6 +373,7 @@ async function deliverViaAdapter(
   msg: ExecuteMessage,
   commandId: string,
   storage: StorageDb,
+  options: WorkerCommandIngestOptions,
   media?: CommandDeliveryContext["media"],
 ): Promise<void> {
   const modelOverride = storage.sessions.getModelOverride(session.sessionId) ?? undefined;
@@ -385,15 +393,76 @@ async function deliverViaAdapter(
 
   console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} error=${result.error}`);
 
-  // Clean up dead sessions when delivery fails with a connection error.
-  // Network errors (connection refused, timeout, abort) indicate the plugin
-  // process is gone. Removing the session ensures subsequent commands get a
-  // clear "Session not found" error instead of repeatedly failing.
   if (isConnectionError(result.error)) {
-    console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId}`);
+    // Plugin endpoint is dead. If we have an opencodeClient, try the
+    // plugin-free fallback (revive-on-reply). Otherwise fall back to the
+    // original behavior of deleting the session.
+    if (options.opencodeClient) {
+      const revived = await reviveAndDeliver(
+        storage,
+        msg.sessionId,
+        msg.command,
+        {
+          opencodeClient: options.opencodeClient,
+          ...(options.spawn ? { spawn: options.spawn } : {}),
+        },
+      );
+
+      if (revived.ok) {
+        console.log(`[command-ingest] revived sessionId=${msg.sessionId} commandId=${commandId} (plugin-free fallback)`);
+        storage.inbox.markDone(commandId);
+        return;
+      }
+
+      switch (revived.reason) {
+        case "sessionGone": {
+          console.warn(`[command-ingest] session gone in opencode-serve sessionId=${msg.sessionId}`);
+          storage.sessions.delete(msg.sessionId);
+          await options.sendTelegramReply?.(
+            msg.chatId,
+            `Session no longer exists. The opencode session was deleted from this machine.`,
+          );
+          storage.inbox.markDone(commandId);
+          return;
+        }
+        case "serveUnreachable": {
+          console.warn(`[command-ingest] opencode-serve unreachable for revival sessionId=${msg.sessionId}: ${revived.error}`);
+          await options.sendTelegramReply?.(
+            msg.chatId,
+            `opencode-serve is unreachable. Try again in a moment.`,
+          );
+          storage.inbox.markDone(commandId);
+          return;
+        }
+        case "deliveryFailed": {
+          console.warn(`[command-ingest] revival delivery failed sessionId=${msg.sessionId}: ${revived.error}`);
+          await options.sendTelegramReply?.(
+            msg.chatId,
+            `Delivery failed: ${revived.error}`,
+          );
+          storage.inbox.markDone(commandId);
+          return;
+        }
+        case "sessionMissing": {
+          // Storage row vanished between the lookup at line 91 and now. Defensive
+          // no-op — the worker will see no session and future commands will fail
+          // with "session not found".
+          console.warn(`[command-ingest] revive-and-deliver: session row missing sessionId=${msg.sessionId}`);
+          storage.inbox.markDone(commandId);
+          return;
+        }
+        default: {
+          const _exhaustive: never = revived;
+          console.warn(`[command-ingest] unexpected revive result: ${JSON.stringify(_exhaustive)}`);
+          storage.inbox.markDone(commandId);
+          return;
+        }
+      }
+    }
+
+    // No opencodeClient — preserve the original "delete dead session" behavior.
+    console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId} (no opencodeClient for revival)`);
     storage.sessions.delete(msg.sessionId);
-    // Transient-ish: session was alive but connection failed. Ack so we don't
-    // retry a command that can't be delivered (session now deleted).
     return;
   }
 

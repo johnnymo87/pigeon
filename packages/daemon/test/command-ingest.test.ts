@@ -1,9 +1,11 @@
+import { spawn } from "child_process";
 import { describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import { ResultErrorCode } from "../src/opencode-direct/contracts";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, QuestionReplyInput } from "../src/adapters/types";
 import type { ExecuteMessage } from "../src/worker/poller";
+import type { ReviveAndDeliverDeps } from "../src/worker/revive-and-deliver";
 
 function makeMsg(overrides: Partial<ExecuteMessage> = {}): ExecuteMessage {
   return {
@@ -600,33 +602,271 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
-  it("cleans up dead sessions when delivery fails with a connection error", async () => {
-    const storage = openStorageDb(":memory:");
-    storage.sessions.upsert({
-      sessionId: "sess-dead",
-      notify: true,
-      backendKind: "opencode-plugin-direct",
-      backendProtocolVersion: 1,
-      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
-      backendAuthToken: "tok",
-    }, 1_000);
+  describe("connection-error fallback (revive-on-reply)", () => {
+    const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as ReviveAndDeliverDeps["spawn"];
+    it("revives via opencode-serve, keeps session row, clears backendEndpoint, acks", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-revive",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
 
-    await ingestWorkerCommand(
-      storage,
-      makeMsg({ commandId: "cmd-dead", sessionId: "sess-dead", command: "ls", chatId: "5" }),
-      {
-        createAdapter: () => ({
-          name: "mock-direct",
-          async deliverCommand() {
-            return { ok: false, error: "fetch failed: unable to connect" };
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-revive", sessionId: "sess-revive", command: "fix the bug", chatId: "5" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-revive", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
           },
-        }),
-      },
-    );
+          spawn: mockSpawn,
+        },
+      );
 
-    // Session should be deleted from storage
-    expect(storage.sessions.get("sess-dead")).toBeNull();
-    storage.db.close();
+      // Session kept, endpoint cleared
+      const row = storage.sessions.get("sess-revive");
+      expect(row).not.toBeNull();
+      expect(row!.backendEndpoint).toBeNull();
+      expect(row!.backendAuthToken).toBeNull();
+
+      // Fallback delivery happened
+      expect(sendPromptCalls).toEqual([{ sid: "sess-revive", dir: "/tmp/proj", prompt: "fix the bug" }]);
+
+      // Command acked (no unfinished inbox entries)
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("deletes session and notifies user when opencode-serve says 404", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-gone",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-gone", sessionId: "sess-gone", command: "hello", chatId: "9" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return null; },
+            async sendPrompt() { throw new Error("should not be called"); },
+          },
+          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          spawn: mockSpawn,
+        },
+      );
+
+      // Session deleted (matches old behavior for the truly-gone case)
+      expect(storage.sessions.get("sess-gone")).toBeNull();
+
+      // User notified
+      expect(tgCalls).toHaveLength(1);
+      expect(tgCalls[0]!.chatId).toBe("9");
+      expect(tgCalls[0]!.text).toMatch(/no longer exists|gone/i);
+
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("notifies user and keeps session when opencode-serve is unreachable", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-unreach",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-unreach", sessionId: "sess-unreach", command: "hi", chatId: "10" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { throw new Error("ECONNREFUSED"); },
+            async sendPrompt() { throw new Error("should not be called"); },
+          },
+          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          spawn: mockSpawn,
+        },
+      );
+
+      // Session kept (we don't know if it's gone or just unreachable)
+      const row = storage.sessions.get("sess-unreach");
+      expect(row).not.toBeNull();
+      // Endpoint preserved for diagnosis
+      expect(row!.backendEndpoint).toBe("http://127.0.0.1:7777/pigeon/direct/execute");
+
+      // User notified
+      expect(tgCalls).toHaveLength(1);
+      expect(tgCalls[0]!.text).toMatch(/unreachable|opencode-serve/i);
+
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("notifies user and keeps session when sendPrompt itself fails", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-deliv-fail",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-deliv-fail", sessionId: "sess-deliv-fail", command: "hi", chatId: "11" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-deliv-fail", directory: "/tmp" }; },
+            async sendPrompt() { throw new Error("opencode-serve 500"); },
+          },
+          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          spawn: mockSpawn,
+        },
+      );
+
+      // Session kept
+      expect(storage.sessions.get("sess-deliv-fail")).not.toBeNull();
+      // User notified with error
+      expect(tgCalls).toHaveLength(1);
+      expect(tgCalls[0]!.text).toMatch(/opencode-serve 500|delivery failed/i);
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+      storage.db.close();
+    });
+
+it("acks but does not notify when reviveAndDeliver returns sessionMissing", async () => {
+      const storage = openStorageDb(":memory:");
+      // Note: NOT inserting a session row, so reviveAndDeliver will return
+      // { ok: false, reason: "sessionMissing" } from its first guard.
+      // The worker's command-ingest path normally guarantees the session
+      // exists by the time we hit this branch, so this is a defensive
+      // safety net.
+
+      // To hit the fallback branch, we must trick the top-level lookup
+      // into succeeding, but fail inside the fallback.
+      storage.sessions.upsert({
+        sessionId: "sess-missing",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-missing", sessionId: "sess-missing", command: "hi", chatId: "13" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              // Delete the session during the async gap so reviveAndDeliver doesn't find it
+              storage.sessions.delete("sess-missing");
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { throw new Error("should not be called"); },
+            async sendPrompt() { throw new Error("should not be called"); },
+          },
+          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          spawn: mockSpawn,
+        },
+      );
+
+      // No Telegram notification (silent defensive no-op)
+      expect(tgCalls).toHaveLength(0);
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not attempt revival when opencodeClient is not provided (graceful degradation to old behavior)", async () => {
+      // If the daemon is configured without OPENCODE_URL, opencodeClient is
+      // undefined. Fall back to the original behavior: delete the dead session.
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-no-client",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-no-client", sessionId: "sess-no-client", command: "hi", chatId: "12" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          // No opencodeClient — simulates daemon without OPENCODE_URL
+        },
+      );
+
+      // Old behavior preserved: session deleted
+      expect(storage.sessions.get("sess-no-client")).toBeNull();
+      storage.db.close();
+    });
   });
 
   it("does not clean up sessions on business logic errors", async () => {
