@@ -36,6 +36,30 @@ export class OpencodeClient {
     return response.json() as Promise<{ id: string }>;
   }
 
+  /**
+   * Look up a session by id. Returns null on 404 (session truly gone),
+   * throws on other failures (network error, 5xx). The 404 vs throw split
+   * lets callers distinguish "session deleted from opencode-serve" from
+   * "opencode-serve is unreachable."
+   */
+  async getSession(sessionId: string): Promise<{ id: string; directory: string } | null> {
+    const response = await this.fetchFn(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
+      method: "GET",
+    });
+
+    if (response.status === 404) return null;
+
+    if (!response.ok) {
+      throw new Error(`getSession failed: ${response.status} ${response.statusText}`);
+    }
+
+    const body = (await response.json()) as { id?: string; directory?: string };
+    if (!body || !body.id || !body.directory) {
+      throw new Error(`getSession response missing id or directory: ${JSON.stringify(body)}`);
+    }
+    return { id: body.id, directory: body.directory };
+  }
+
   async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
     const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
       method: "POST",

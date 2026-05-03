@@ -506,4 +506,70 @@ describe("OpencodeClient", () => {
       await expect(client.listProviders()).rejects.toThrow("listProviders failed (401): not authorized");
     });
   });
+  describe("getSession", () => {
+    it("returns session when opencode-serve responds 200 with a directory", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ id: "ses_abc", directory: "/home/dev/projects/pigeon" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      const result = await client.getSession("ses_abc");
+
+      expect(result).toEqual({ id: "ses_abc", directory: "/home/dev/projects/pigeon" });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4096/session/ses_abc",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("returns null when opencode-serve responds 404", async () => {
+      const fetchMock = vi.fn(async () => new Response("not found", { status: 404 }));
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      expect(await client.getSession("ses_gone")).toBeNull();
+    });
+
+    it("throws on other non-OK statuses (so caller can distinguish from 404)", async () => {
+      const fetchMock = vi.fn(async () => new Response("oops", { status: 500 }));
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.getSession("ses_x")).rejects.toThrow(/getSession failed.*500/);
+    });
+
+    it("throws on network error (so caller can distinguish from 404)", async () => {
+      const fetchMock = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.getSession("ses_x")).rejects.toThrow(/ECONNREFUSED/);
+    });
+
+    it("returns the directory even when other fields are missing", async () => {
+      // Defensive: opencode-serve's response shape isn't formally pinned by us;
+      // we only depend on { id, directory } being present.
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ id: "ses_x", directory: "/tmp", extra: "stuff" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      expect((await client.getSession("ses_x"))?.directory).toBe("/tmp");
+    });
+
+    it("throws when 200 response is missing id or directory", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ id: "ses_x" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.getSession("ses_x")).rejects.toThrow(/missing id or directory/);
+    });
+  });
 });
