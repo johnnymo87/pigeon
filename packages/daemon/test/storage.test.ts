@@ -230,6 +230,45 @@ describe("storage schema and repositories", () => {
     });
   });
 
+  describe("SessionRepository clearBackendEndpoint", () => {
+    it("clears backend endpoint and auth token but preserves other fields", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-clear",
+        cwd: "/tmp",
+        label: "demo",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const updated = storage.sessions.clearBackendEndpoint("sess-clear", 2_000);
+      expect(updated).toBe(true);
+
+      const session = storage.sessions.get("sess-clear");
+      expect(session).not.toBeNull();
+      expect(session!.backendEndpoint).toBeNull();
+      expect(session!.backendAuthToken).toBeNull();
+      expect(session!.backendKind).toBe("opencode-plugin-direct");
+      expect(session!.backendProtocolVersion).toBe(1);
+      expect(session!.cwd).toBe("/tmp");
+      expect(session!.label).toBe("demo");
+      expect(session!.notify).toBe(true);
+      expect(session!.updatedAt).toBe(2_000);
+
+      storage.db.close();
+    });
+
+    it("returns false when no row matched", () => {
+      const storage = createStorage();
+      const updated = storage.sessions.clearBackendEndpoint("nope", 2_000);
+      expect(updated).toBe(false);
+      storage.db.close();
+    });
+  });
+
   describe("PendingQuestionRepository wizard state", () => {
     const q1 = { question: "Which DB?", header: "DB", options: [{ label: "PostgreSQL", description: "Relational" }] };
     const q2 = { question: "Which ORM?", header: "ORM", options: [{ label: "Prisma", description: "TypeScript ORM" }] };

@@ -176,6 +176,29 @@ export class SessionRepository {
     return result.changes > 0;
   }
 
+  /**
+   * Null out the cached plugin endpoint/auth token without deleting the
+   * session row. Used by the revive-on-reply fallback after a successful
+   * plugin-free delivery: the dead endpoint values would force every
+   * subsequent reply to re-try the dead port, so we clear them and let the
+   * plugin's lateDiscoverSession path repopulate them on the next event.
+   * `backend_kind` and `backend_protocol_version` are preserved so the
+   * upsert keeps the same routing semantics.
+   *
+   * Returns true if a row was updated, false if the session did not exist.
+   *
+   * The optional `now` parameter exists for test determinism; production
+   * callers should omit it to use the current wall-clock time.
+   */
+  clearBackendEndpoint(sessionId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        "UPDATE sessions SET backend_endpoint = NULL, backend_auth_token = NULL, updated_at = ? WHERE session_id = ?",
+      )
+      .run(now, sessionId);
+    return result.changes > 0;
+  }
+
   setModelOverride(sessionId: string, model: string): void {
     this.db
       .prepare("UPDATE sessions SET model_override = ? WHERE session_id = ?")
