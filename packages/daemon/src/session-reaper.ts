@@ -3,7 +3,8 @@ import { SESSION_TTL_MS } from "./storage/schema";
 
 interface ReapDeps {
   storage: StorageDb;
-  deleteSession: (sessionId: string) => Promise<void>;
+  // Stale Pigeon routing state is not the same as stale opencode history.
+  deleteSession?: (sessionId: string) => Promise<void>;
   unregisterSession: (sessionId: string) => Promise<void>;
   nowFn?: () => number;
   log?: (msg: string) => void;
@@ -23,12 +24,6 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
 
   let reaped = 0;
   for (const session of stale) {
-    try {
-      await deps.deleteSession(session.sessionId);
-    } catch {
-      // Best-effort — session may already be gone
-    }
-
     deps.storage.sessions.delete(session.sessionId);
 
     try {

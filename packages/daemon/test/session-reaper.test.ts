@@ -13,7 +13,7 @@ describe("reapStaleSessions", () => {
     }
   });
 
-  it("deletes sessions older than the TTL and calls cleanup callbacks", async () => {
+  it("cleans stale Pigeon registry entries without deleting opencode transcripts", async () => {
     storage = openStorageDb(":memory:");
     const now = SESSION_TTL_MS + 50_000;
 
@@ -33,13 +33,13 @@ describe("reapStaleSessions", () => {
     });
 
     expect(result.reaped).toBe(1);
-    expect(deleteSession).toHaveBeenCalledWith("stale-1");
+    expect(deleteSession).not.toHaveBeenCalled();
     expect(unregisterSession).toHaveBeenCalledWith("stale-1");
     expect(storage.sessions.get("stale-1")).toBeNull();
     expect(storage.sessions.get("fresh-1")).not.toBeNull();
   });
 
-  it("still cleans up records when deleteSession fails", async () => {
+  it("does not require opencode deleteSession to clean stale records", async () => {
     storage = openStorageDb(":memory:");
     const now = SESSION_TTL_MS + 50_000;
 
@@ -56,6 +56,7 @@ describe("reapStaleSessions", () => {
     });
 
     expect(result.reaped).toBe(1);
+    expect(deleteSession).not.toHaveBeenCalled();
     expect(storage.sessions.get("stale-2")).toBeNull();
     expect(unregisterSession).toHaveBeenCalledWith("stale-2");
   });

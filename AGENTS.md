@@ -103,7 +103,7 @@ Media is stored temporarily in the `pigeon-media` R2 bucket with a 24-hour TTL, 
 
 ### Session Reaper
 
-A background hourly timer in the daemon cleans up stale sessions. Sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week) are deleted from opencode serve, removed from local storage, and unregistered from the worker.
+A background hourly timer in the daemon cleans up stale Pigeon routing state. Sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week) are removed from local storage and unregistered from the worker, but their opencode transcripts are preserved. `opencode-serve` is restarted separately for process hygiene.
 
 ### Dead Session Cleanup
 

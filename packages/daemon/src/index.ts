@@ -220,11 +220,11 @@ setInterval(() => {
   if (cleaned > 0) console.log(`[outbox] cleaned ${cleaned} old entries`);
 }, 60 * 60 * 1000);
 
-// Reap stale sessions every hour
-if (opencodeClient && poller) {
+// Reap stale Pigeon registry entries every hour. This must not delete opencode
+// session history; opencode-serve is restarted separately for process hygiene.
+if (poller) {
   startSessionReaper({
     storage,
-    deleteSession: (sessionId) => opencodeClient.deleteSession(sessionId),
     unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
