@@ -12,7 +12,20 @@ type SessionEntry = {
 export class SessionManager {
   private sessions = new Map<string, SessionEntry>()
   private mainSessionIds = new Set<string>()
+  private discoveryPromises = new Map<string, Promise<void>>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
+
+  getDiscoveryPromise(sessionID: string): Promise<void> | undefined {
+    return this.discoveryPromises.get(sessionID)
+  }
+
+  setDiscoveryPromise(sessionID: string, promise: Promise<void>): void {
+    this.discoveryPromises.set(sessionID, promise)
+  }
+
+  clearDiscoveryPromise(sessionID: string): void {
+    this.discoveryPromises.delete(sessionID)
+  }
 
   onSessionCreated(sessionID: string, parentID?: string): void {
     this.cleanupSession(sessionID)

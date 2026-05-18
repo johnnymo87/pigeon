@@ -211,17 +211,53 @@ const plugin: Plugin = async (ctx) => {
      const lateDiscoverSession = async (sessionID: string) => {
        if (sessionManager.isKnown(sessionID)) return
 
-       log("late session discovery", { sessionID })
+       let promise = sessionManager.getDiscoveryPromise(sessionID)
+       if (promise) {
+         await promise
+         return
+       }
 
-       const envInfo = await envInfoP
+       promise = (async () => {
+         log("late session discovery", { sessionID })
 
-       try {
-         const session = await ctx.client.session.get({ path: { id: sessionID } })
-         const parentID = session.data?.parentID
+         const envInfo = await envInfoP
 
-         sessionManager.onSessionCreated(sessionID, parentID)
+         try {
+           const session = await ctx.client.session.get({ path: { id: sessionID } })
+           const parentID = session.data?.parentID
 
-          if (!parentID) {
+           sessionManager.onSessionCreated(sessionID, parentID)
+
+            if (!parentID) {
+              const regPromise = registerSession({
+                sessionId: sessionID,
+                cwd: ctx.directory,
+                label,
+                pid: envInfo.pid,
+                ppid: envInfo.ppid,
+                tty: envInfo.tty,
+                backendKind: "opencode-plugin-direct",
+                backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+                backendEndpoint: directChannel.endpoint,
+                backendAuthToken: directChannel.authToken,
+                daemonUrl,
+                log,
+              })
+               .then((result) => {
+                 log("registerSession result", { sessionID, result })
+                 if (result?.ok) {
+                   sessionManager.onRegistered(sessionID)
+                 }
+               })
+               .catch((err) => {
+                 log("registerSession error:", serializeError(err))
+               })
+             sessionManager.setRegistrationPromise(sessionID, regPromise)
+           }
+         } catch (err) {
+           // Fallback: register without parentID
+           log("session.get failed, registering without parentID", serializeError(err))
+           sessionManager.onSessionCreated(sessionID, undefined)
             const regPromise = registerSession({
               sessionId: sessionID,
               cwd: ctx.directory,
@@ -236,47 +272,26 @@ const plugin: Plugin = async (ctx) => {
               daemonUrl,
               log,
             })
-             .then((result) => {
-               log("registerSession result", { sessionID, result })
-               if (result?.ok) {
-                 sessionManager.onRegistered(sessionID)
-               }
-             })
-             .catch((err) => {
-               log("registerSession error:", serializeError(err))
-             })
-           sessionManager.setRegistrationPromise(sessionID, regPromise)
+              .then((result) => {
+                log("registerSession result", { sessionID, result })
+                if (result?.ok) {
+                  sessionManager.onRegistered(sessionID)
+                }
+              })
+              .catch((err) => {
+                log("registerSession error:", serializeError(err))
+              })
+            sessionManager.setRegistrationPromise(sessionID, regPromise)
          }
-       } catch (err) {
-         // Fallback: register without parentID
-         log("session.get failed, registering without parentID", serializeError(err))
-         sessionManager.onSessionCreated(sessionID, undefined)
-          const regPromise = registerSession({
-            sessionId: sessionID,
-            cwd: ctx.directory,
-            label,
-            pid: envInfo.pid,
-            ppid: envInfo.ppid,
-            tty: envInfo.tty,
-            backendKind: "opencode-plugin-direct",
-            backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
-            backendEndpoint: directChannel.endpoint,
-            backendAuthToken: directChannel.authToken,
-            daemonUrl,
-            log,
-          })
-            .then((result) => {
-              log("registerSession result", { sessionID, result })
-              if (result?.ok) {
-                sessionManager.onRegistered(sessionID)
-              }
-            })
-            .catch((err) => {
-              log("registerSession error:", serializeError(err))
-            })
-          sessionManager.setRegistrationPromise(sessionID, regPromise)
-        }
-      }
+       })()
+
+       sessionManager.setDiscoveryPromise(sessionID, promise)
+       try {
+         await promise
+       } finally {
+         sessionManager.clearDiscoveryPromise(sessionID)
+       }
+     }
 
     return {
       tool: {
@@ -341,15 +356,30 @@ const plugin: Plugin = async (ctx) => {
 
            if (!sessionID) return
 
+           log("DEBUG session.idle received", { sessionID })
+
+           // Ensure discovery completes before checking registration
+           await lateDiscoverSession(sessionID)
+
            // Await pending registration before checking isRegistered
            await sessionManager.awaitRegistration(sessionID)
+
+           log("DEBUG session.idle after awaitRegistration", {
+             sessionID,
+             isMain: sessionManager.isMainSession(sessionID),
+             isRegistered: sessionManager.isRegistered(sessionID),
+             currentMsgId: messageTail.getCurrentMessageId(sessionID),
+           })
 
            if (
              sessionManager.isMainSession(sessionID) &&
              sessionManager.isRegistered(sessionID)
            ) {
              const currentMsgId = messageTail.getCurrentMessageId(sessionID)
-             if (!sessionManager.shouldNotify(sessionID, currentMsgId)) return
+             if (!sessionManager.shouldNotify(sessionID, currentMsgId)) {
+               log("DEBUG session.idle shouldNotify=false; returning", { sessionID, currentMsgId })
+               return
+             }
 
              // Set dedup guard SYNCHRONOUSLY before async notifyStop
              sessionManager.setNotified(sessionID, currentMsgId!)
@@ -380,7 +410,7 @@ const plugin: Plugin = async (ctx) => {
             | undefined
 
           if (info?.id && info?.sessionID && info?.role) {
-            lateDiscoverSession(info.sessionID)
+            lateDiscoverSession(info.sessionID).catch(() => {})
 
             const role = info.role as string
             if (role === "user" || role === "assistant") {
@@ -432,6 +462,9 @@ const plugin: Plugin = async (ctx) => {
           const error = props?.error
 
           if (sessionID) {
+            await lateDiscoverSession(sessionID)
+            await sessionManager.awaitRegistration(sessionID)
+
             if (
               sessionManager.isMainSession(sessionID) &&
               sessionManager.isRegistered(sessionID)
@@ -546,6 +579,7 @@ const plugin: Plugin = async (ctx) => {
           if (!sessionID || !status || status.type !== "retry") return
 
           // Only notify for main sessions that are registered
+          await lateDiscoverSession(sessionID)
           await sessionManager.awaitRegistration(sessionID)
           if (
             !sessionManager.isMainSession(sessionID) ||
