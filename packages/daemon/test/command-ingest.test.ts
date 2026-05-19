@@ -361,6 +361,69 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
+  it("leaves pending question replies retryable when direct-channel delivery has a connection error", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q-retry",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-q-retry",
+      requestId: "question_retry",
+      questions: [{
+        question: "Which DB?",
+        header: "DB",
+        options: [{ label: "PostgreSQL", description: "" }],
+      }],
+    }, now);
+
+    let attempts = 0;
+    let capturedReply: QuestionReplyInput | null = null;
+    const msg = makeMsg({
+      commandId: "cmd-q-retry",
+      sessionId: "sess-q-retry",
+      command: "option one",
+      chatId: "1",
+      metadata: { questionRequestId: "question_retry" },
+    });
+    const opts = {
+      createAdapter: () => ({
+        name: "mock-direct",
+        async deliverCommand() { return { ok: false as const, error: "should not be called" }; },
+        async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+          attempts++;
+          if (attempts === 1) {
+            return { ok: false as const, error: "fetch failed" };
+          }
+          capturedReply = reply;
+          return { ok: true as const };
+        },
+      }),
+    };
+
+    await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow(/fetch failed/);
+
+    expect(storage.inbox.listUnfinished().map((row) => row.commandId)).toEqual(["cmd-q-retry"]);
+    expect(storage.pendingQuestions.getBySessionId("sess-q-retry")).not.toBeNull();
+
+    await ingestWorkerCommand(storage, msg, opts);
+
+    expect(attempts).toBe(2);
+    expect(capturedReply).toEqual({
+      questionRequestId: "question_retry",
+      answers: [["option one"]],
+    });
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    expect(storage.pendingQuestions.getBySessionId("sess-q-retry")).toBeNull();
+    storage.db.close();
+  });
+
   it("marks inbox done when question option is stale (no pending question)", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
@@ -1088,6 +1151,49 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
 
       expect(deliverCommandCalled).toBe(true);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not fall through to regular command delivery when metadata fallback hits a connection error", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-retry",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      let deliverCommandCalled = false;
+
+      await expect(ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-retry",
+          sessionId: "sess-meta-retry",
+          command: "custom answer",
+          chatId: "1",
+          metadata: { questionRequestId: "req-meta-retry" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              deliverCommandCalled = true;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "fetch failed" };
+            },
+          }),
+        },
+      )).rejects.toThrow(/fetch failed/);
+
+      expect(deliverCommandCalled).toBe(false);
+      expect(storage.inbox.listUnfinished().map((row) => row.commandId)).toEqual(["cmd-meta-retry"]);
 
       storage.db.close();
     });

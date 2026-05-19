@@ -91,8 +91,12 @@ export async function ingestWorkerCommand(
   });
 
   if (!persisted) {
-    console.log(`[command-ingest] dedup commandId=${commandId}`);
-    return;
+    const existing = storage.inbox.get(commandId);
+    if (!existing || existing.status === "done") {
+      console.log(`[command-ingest] dedup commandId=${commandId}`);
+      return;
+    }
+    console.log(`[command-ingest] retry unfinished commandId=${commandId}`);
   }
 
   const session = storage.sessions.get(msg.sessionId);
@@ -206,6 +210,7 @@ export async function ingestWorkerCommand(
         return;
       }
 
+      throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
       storage.inbox.markDone(commandId);
       return;
@@ -237,6 +242,7 @@ export async function ingestWorkerCommand(
       return;
     }
 
+    throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
     storage.inbox.markDone(commandId);
     return;
@@ -268,6 +274,8 @@ export async function ingestWorkerCommand(
         storage.pendingQuestions.delete(msg.sessionId);
         return;
       }
+
+      throwIfTransientQuestionReplyFailure(result, commandId);
 
       // If question reply fails (e.g., 404 question not found), fall through to
       // regular command delivery so the user's text isn't lost.
@@ -365,6 +373,13 @@ function isConnectionError(error: string | undefined): boolean {
     lower.includes("fetch failed") ||
     lower.includes("network error")
   );
+}
+
+function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
+  if (!isConnectionError(result.error)) return;
+  const error = result.error ?? "Question reply delivery failed with a connection error";
+  console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}`);
+  throw new Error(error);
 }
 
 async function deliverViaAdapter(

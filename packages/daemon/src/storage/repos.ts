@@ -320,6 +320,13 @@ export class InboxRepository {
     return result.changes > 0;
   }
 
+  get(commandId: string): InboxRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM inbox WHERE command_id = ?")
+      .get(commandId) as SqlRow | null;
+    return row ? asInbox(row) : null;
+  }
+
   markDone(commandId: string, now = Date.now()): boolean {
     const result = this.db
       .prepare("UPDATE inbox SET status = 'done', updated_at = ? WHERE command_id = ?")
