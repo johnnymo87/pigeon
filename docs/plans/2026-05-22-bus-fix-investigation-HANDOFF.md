@@ -19,12 +19,55 @@ The partition is deterministic (not race-y) in the post-restart run. Likely caus
 
 See bead `ccr-mu1` for the full updated root cause writeup. Original 2026-05-22 hypothesis (lazy subscribe race) is **incomplete** — kept for history.
 
-## Fix options (current best understanding)
+## Upstream search (2026-05-23): the fix is PR #28051 already in v1.15.5+
 
-1. **Pigeon plugin workaround (lowest risk):** stuff `messageTail` + `sessionManager` + `tokenTracker` in a `globalThis.__pigeonState` Map keyed by `ctx.directory` so both plugin instances share state. No opencode changes needed.
-2. **opencode-patched deeper fix:** make `InstanceState.make`'s `ScopedCache.make.lookup` actually single-flight per directory (via `Effect.cached` or explicit mutex), OR make `publish()` fan out to all known wildcard PubSubs across cached InstanceStates.
+Searched sst/opencode for the same symptom — **no existing issues match the dual-plugin-instance / event partition signature.** Closest cluster of related bugs is the SSE `/event` endpoint instance-context family (#27391, #27023, #26697, #26635, all closed by #27425 + #27959 + #28051). Of those, only #27959 is currently in our patched build.
 
-Recommended starting point: option 1 plus a workstation-side issue filed upstream describing option 2.
+**PR #28051 "fix: preserve bus instance context" (merged 2026-05-17, shipped v1.15.5)** by Dax is the exact fix. Description: "Thread instance context through `Bus.publish` so event publication preserves `InstanceRef`. Update file watcher and LSP update events to publish with the active instance context." The bus/index.ts diff threads `ctx: InstanceContext` through `publish()` and uses `Effect.provideService(InstanceRef, ctx)` so subscribers and publishers resolve to the same `s={wildcard, typed}` bus state.
+
+This maps 1:1 to our empirical finding: publishers in different code paths (session-mgmt vs message-mgmt fibers) had different `InstanceRef` context → resolved to different cached bus InstanceStates → routed events to disjoint plugin instances.
+
+## Chosen path: Option 2 — rebase opencode-patched to v1.15.5
+
+User chose Option 2 over a #28051-only cherry-pick.
+
+**Why v1.15.5 specifically (not v1.15.10):**
+- v1.15.5 is the first release containing BOTH #27959 (bus eager-subscribe) and #28051 (bus instance context). Both are needed to fully close the event-loss family.
+- v1.15.5 → v1.15.10 is 243 more commits (6 days), most of which are unrelated UI/desktop/TUI work. Going to v1.15.10 adds risk without resolving the bug differently than v1.15.5 does.
+- Going further forward (v1.16+) when it lands is a separate, future decision.
+
+**v1.15.0 → v1.15.5 scope: 142 commits over 2 days.** Many internal refactors (`refactor(repository): add cache service`, `refactor(reference): split materialization state`, etc.) that may invalidate our existing patch stack. Concrete migration risk:
+- Our `cache-aligned-compaction.patch`, `prompt-loop-cache.patch` touch `session/prompt.ts` and `session/compaction.ts` — both heavily refactored in v1.15.0..v1.15.5 (e.g. `refactor(session): extract prompt tool resolution (#28204)`, `refactor(session): extract reference prompt helpers (#28197)`, `refactor(session): move prompt reminders out of core loop (#28082)`). Expect rework.
+- `bus-eager-subscribe.patch` will become a NO-OP / conflict — drop it (already upstream as #27959).
+- `prefill-fix.patch`, `gemini-empty-parts.patch`, `tool-fix.patch`, `mcp-reconnect.patch` etc. need re-evaluation against the new base.
+
+### Execution plan (post-compaction)
+
+Operate in `/home/dev/projects/opencode-patched`. Steps:
+
+1. **Branch the work.** Don't commit straight to main; `git checkout -b v1.15.5-rebase`.
+2. **Update `patches/apply.sh`** to target v1.15.5 instead of v1.15.0. Update README sunset/version refs.
+3. **For each existing patch in `patches/*.patch`**, in apply.sh order:
+   a. Try `git apply --check $PATCH` against v1.15.5 — if clean, no work needed.
+   b. If conflicts, regenerate the patch by:
+      - Cherry-picking the corresponding upstream commit (if applicable) — preferred when the patch is an upstream backport.
+      - Otherwise manually rebase: apply against v1.15.0 first, then carry the diff forward to v1.15.5 via three-way merge.
+4. **Drop `bus-eager-subscribe.patch` entirely** — it's superseded by #27959 in v1.15.5 base.
+5. **Add no new patch for #28051** — also already in v1.15.5 base.
+6. **Update `.github/workflows/check-sunset.yml`**: PR #27959 and PR #28051 are now CLOSED-AS-MERGED in the base, so remove their monitors. Add sunset criterion for the next layer of patches if any.
+7. **Update `.github/workflows/build-release.yml`** version tag scheme: `v1.15.5-patched.1`.
+8. **Push branch, trigger CI, validate the build artifacts on all 4 platforms.**
+9. **Update workstation `home.base.nix`** with `upstreamVersion="1.15.5"`, `patchedRevision="1"`, new SRI hashes from CI.
+10. **Deploy to cloudbox via home-manager-switch**, restart opencode-serve, run the smoke test (`/launch cloudbox pigeon hi pigeon`), expect a real Telegram notification.
+
+### Validation criteria
+
+End-to-end smoke test fully passes only when:
+- `/launch cloudbox pigeon hi pigeon` from Telegram produces a Telegram reply when the session reaches idle (not silent).
+- Plugin log shows `type=* subscribing` firing exactly **ONCE** per directory at startup (not 2x — the partition behavior is gone).
+- Plugin log shows `messageTail.onMessageUpdated done` followed by `session.idle` with `currentMsgId` populated, leading to `sending notifyStop` then `notifyStop daemon response`.
+
+Do NOT claim "fixed" before all three are observed in the live log.
 
 ----
 
