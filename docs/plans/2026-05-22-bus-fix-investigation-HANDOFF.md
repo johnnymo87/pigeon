@@ -1,5 +1,35 @@
 # Bus race fix: deployed, but symptom NOT fixed — investigation handoff
 
+**Update 2026-05-23 ~08:43 EDT**: Root cause empirically identified — **dual plugin instance per directory with event-type partitioning**. See "Root cause confirmed" section at top. Bus #27959 fix is necessary but not sufficient. Don't revert it.
+
+## Root cause confirmed (2026-05-23)
+
+opencode-serve loads TWO pigeon plugin instances per directory. Per-instance `instanceId` tagging in the plugin (uncommitted, see `stash@{0}`) shows a strict partitioning across all observed sessions:
+
+| Instance | message.updated events | session.idle events |
+|----------|------------------------|----------------------|
+| pigeon i=onfylxgl | 49 | 0 |
+| pigeon i=3xw2dzab | 0 | 1 |
+| mono i=1r6zgdfs | 33 | 0 |
+| mono i=zxksf4ui | 0 | 1 |
+
+The instance that builds the MessageTail is NEVER the one that handles session.idle. So `getCurrentMessageId(sessionID)` returns undefined → `shouldNotify=false` → bail → no notification.
+
+The partition is deterministic (not race-y) in the post-restart run. Likely cause: `Bus.layer`'s `InstanceState.make` creates TWO `{wildcard, typed}` state objects per directory, and `publish()` writes to one or the other based on the publishing fiber's `InstanceState.context`. Different code paths (session-mgmt fibers vs message-mgmt fibers) consistently observe different state objects.
+
+See bead `ccr-mu1` for the full updated root cause writeup. Original 2026-05-22 hypothesis (lazy subscribe race) is **incomplete** — kept for history.
+
+## Fix options (current best understanding)
+
+1. **Pigeon plugin workaround (lowest risk):** stuff `messageTail` + `sessionManager` + `tokenTracker` in a `globalThis.__pigeonState` Map keyed by `ctx.directory` so both plugin instances share state. No opencode changes needed.
+2. **opencode-patched deeper fix:** make `InstanceState.make`'s `ScopedCache.make.lookup` actually single-flight per directory (via `Effect.cached` or explicit mutex), OR make `publish()` fan out to all known wildcard PubSubs across cached InstanceStates.
+
+Recommended starting point: option 1 plus a workstation-side issue filed upstream describing option 2.
+
+----
+
+## (Old 2026-05-22) Bus race fix: deployed, but symptom NOT fixed
+
 **Status as of 2026-05-22 ~21:00 EDT, cloudbox**: Patch deployed end-to-end (opencode-patched v1.15.0-patched.1 built + released, workstation Nix flake updated, opencode-serve restarted twice). User-visible symptom is **unchanged**: `/launch cloudbox pigeon hi pigeon` at ~21:00 spawned `ses_1acf75778ffeetvtWL5NhRCOHN`, the TUI shows the session running fine, but no Telegram reply came back when it reached idle.
 
 My initial root-cause hypothesis (PR #27959 / commit `cb3549324` — lazy `bus.subscribeAll()` losing events) is at minimum incomplete and probably wrong. The patch IS applied (verified — see below), but plugin behavior is identical: every `session.idle` still bails with `shouldNotify=false; returning` because `messageTail.currentMessageId` is still `undefined`.
