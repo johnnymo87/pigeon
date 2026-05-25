@@ -35,32 +35,57 @@ User chose Option 2. Target version updated from v1.15.5 → **v1.15.10** on 202
 - v1.15.10 contains both #27959 and #28051 (since they shipped in v1.15.5+).
 - Going to v1.15.10 vs v1.15.5 adds 5 days of incremental fixes (mostly TUI/desktop/native-llm refactors and a handful of fix-PRs) for the same risk profile against our patch stack — none of the v1.15.5..v1.15.10 commits touch the files our patches edit. The marginal cost of v1.15.10 over v1.15.5 is essentially zero.
 
-### Pre-execution verification (in flight 2026-05-25)
+### Pre-execution verification (completed 2026-05-25)
 
-Before executing the rebase, a verification subagent was launched to answer:
-**"Does PR #28051 actually fix the dual-plugin-instance / event-partition bug?"**
+A verification subagent (`ses_19eb9b736ffev5kBSnfqqHq1xV`, vertex opus 4.7) ran a
+read-only investigation in `~/projects/pigeon` and produced a full report at
+`docs/plans/2026-05-25-28051-verification-report.md`.
 
-Rationale: while initially I assumed #28051 fixes this bug 1:1, deeper code reading
-showed the bug's main publisher path (`event-v2-bridge.ts:73-76 → bus.publish(...)`
-on the Service interface) is NOT one of the #28051-touched callers. #28051 only
-updates the module-level `Bus.publish(...)` callers (`cli/upgrade.ts`,
-`config/agent.ts`, `config/command.ts`, `file/watcher.ts`, `lsp/lsp.ts`), none of
-which emit `message.updated` or `session.idle`. If the verification shows #28051
-is insufficient, rebasing to v1.15.10 is wasted effort.
+**Verdict: v1.15.5+ DOES fix the bug. High confidence on symptom, medium on
+mechanism. The load-bearing fix is NOT #28051 — it's PR #27825 ("fix(sync):
+publish events on injected project bus"), with #27757, #28051, and #28187 as
+supporting changes.**
 
-**Verifier session**: `ses_19eb9b736ffev5kBSnfqqHq1xV` running on cloudbox with
-model `google-vertex-anthropic/claude-opus-4-7@default` in `~/projects/pigeon`.
-Report destination: `docs/plans/2026-05-25-28051-verification-report.md`.
-Investigation prompt at `/tmp/verifier-prompt.txt`.
+Key corrections to the earlier analysis in this doc:
 
-**Decision tree based on verifier verdict:**
+- The `message.updated` publisher path in v1.15.0 IS using the module-level
+  `ProjectBus.publish`, but indirectly: `Session.updateMessage` →
+  `sync.run(MessageV2.Event.Updated, ...)` → `Database.effect(fn)` →
+  `InstanceState.bind(fn)` (ALS bridge) → `process()` →
+  `ProjectBus.publish(def, data, {id})` at `sync/index.ts:351` (v1.15.0). The
+  module-level publish uses a SEPARATE `ManagedRuntime` (`bus/index.ts:179`),
+  and the round-trip through `Instance.restore` (ALS) and `attach()` is where
+  context gets lost / divergent.
+- `session.idle` publisher path is different: stays in Effect-land entirely,
+  via `SessionStatus.set` → injected `bus.publish(Event.Idle, ...)` on the same
+  `Bus.Service`. Path looks clean by itself.
+- The deterministic by-event-type partition (49/0 vs 0/1) is consistent with
+  there being TWO `state` cache entries in the bus's per-directory ScopedCache
+  — one each path populates as it resolves `InstanceState.directory`. The
+  mechanism for how `ScopedCache` ends up with two entries for the same key
+  remains hypothetical (the verifier could not locate the definitive code
+  path), but it's the only hypothesis that fits the data.
+- **#28051-only cherry-pick onto v1.15.0 is NOT VIABLE** — it would not even
+  compile, because #27825 must land first to remove the `sync/index.ts:351`
+  call to `ProjectBus.publish(def, ...)` that uses the old (no-`ctx`)
+  signature. The two PRs are a pair.
 
-| Verifier verdict | Next action |
-|------------------|-------------|
-| v1.15.10 fixes the bug (high confidence) | Execute rebase below. |
-| v1.15.10 fixes the bug (medium confidence) | Execute rebase, but front-load the smoke test (deploy + test before claiming patches done). |
-| v1.15.10 does NOT fix the bug | Pause rebase. Reassess: file upstream issue, build a different patch, or rebuild plugin host. |
-| Insufficient evidence | Run a focused experiment (e.g. add MORE diagnostic instrumentation against current build to nail down the exact divergence point). |
+**v1.15.5+ collectively eliminates every plausible context-divergence
+mechanism:**
+- **#27825** removes the ALS-bridged separate-runtime publish path that was the
+  most likely culprit for context divergence in `message.updated`.
+- **#27757** removes the `Instance.current` ALS fallback entirely — `InstanceState.directory`
+  now has exactly ONE source of truth (`InstanceRef`).
+- **#28051** forces remaining direct-publish callsites to thread `ctx` explicitly.
+- **#28187** captures full `Effect.context()` at bridge time, so the publish
+  fiber inherits the entire publisher context.
+
+**Validation must include the dual-plugin-instance check.** Beyond the original
+three criteria, post-deploy we must verify with the diagnostic instrumentation
+(uncommitted at `packages/opencode-plugin/src/index.ts`, also `git stash@{0}`)
+that exactly ONE `instanceId` is logged per directory at startup. If two
+instances per directory still exist, the partition theory is wrong and we need
+to investigate further even if notifications work.
 
 ### Execution plan (post-verification)
 
