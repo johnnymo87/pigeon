@@ -27,38 +27,66 @@ Searched sst/opencode for the same symptom — **no existing issues match the du
 
 This maps 1:1 to our empirical finding: publishers in different code paths (session-mgmt vs message-mgmt fibers) had different `InstanceRef` context → resolved to different cached bus InstanceStates → routed events to disjoint plugin instances.
 
-## Chosen path: Option 2 — rebase opencode-patched to v1.15.5
+## Chosen path: Option 2 — rebase opencode-patched to v1.15.10
 
-User chose Option 2 over a #28051-only cherry-pick.
+User chose Option 2. Target version updated from v1.15.5 → **v1.15.10** on 2026-05-25 after a re-fetch confirmed:
+- v1.15.10 (published 2026-05-23) is the latest tagged release. No release since.
+- 60 commits on `upstream/dev` since v1.15.10 — none in bus/instance/plugin/event paths. Nothing tagged.
+- v1.15.10 contains both #27959 and #28051 (since they shipped in v1.15.5+).
+- Going to v1.15.10 vs v1.15.5 adds 5 days of incremental fixes (mostly TUI/desktop/native-llm refactors and a handful of fix-PRs) for the same risk profile against our patch stack — none of the v1.15.5..v1.15.10 commits touch the files our patches edit. The marginal cost of v1.15.10 over v1.15.5 is essentially zero.
 
-**Why v1.15.5 specifically (not v1.15.10):**
-- v1.15.5 is the first release containing BOTH #27959 (bus eager-subscribe) and #28051 (bus instance context). Both are needed to fully close the event-loss family.
-- v1.15.5 → v1.15.10 is 243 more commits (6 days), most of which are unrelated UI/desktop/TUI work. Going to v1.15.10 adds risk without resolving the bug differently than v1.15.5 does.
-- Going further forward (v1.16+) when it lands is a separate, future decision.
+### Pre-execution verification (in flight 2026-05-25)
 
-**v1.15.0 → v1.15.5 scope: 142 commits over 2 days.** Many internal refactors (`refactor(repository): add cache service`, `refactor(reference): split materialization state`, etc.) that may invalidate our existing patch stack. Concrete migration risk:
+Before executing the rebase, a verification subagent was launched to answer:
+**"Does PR #28051 actually fix the dual-plugin-instance / event-partition bug?"**
+
+Rationale: while initially I assumed #28051 fixes this bug 1:1, deeper code reading
+showed the bug's main publisher path (`event-v2-bridge.ts:73-76 → bus.publish(...)`
+on the Service interface) is NOT one of the #28051-touched callers. #28051 only
+updates the module-level `Bus.publish(...)` callers (`cli/upgrade.ts`,
+`config/agent.ts`, `config/command.ts`, `file/watcher.ts`, `lsp/lsp.ts`), none of
+which emit `message.updated` or `session.idle`. If the verification shows #28051
+is insufficient, rebasing to v1.15.10 is wasted effort.
+
+**Verifier session**: `ses_19eb9b736ffev5kBSnfqqHq1xV` running on cloudbox with
+model `google-vertex-anthropic/claude-opus-4-7@default` in `~/projects/pigeon`.
+Report destination: `docs/plans/2026-05-25-28051-verification-report.md`.
+Investigation prompt at `/tmp/verifier-prompt.txt`.
+
+**Decision tree based on verifier verdict:**
+
+| Verifier verdict | Next action |
+|------------------|-------------|
+| v1.15.10 fixes the bug (high confidence) | Execute rebase below. |
+| v1.15.10 fixes the bug (medium confidence) | Execute rebase, but front-load the smoke test (deploy + test before claiming patches done). |
+| v1.15.10 does NOT fix the bug | Pause rebase. Reassess: file upstream issue, build a different patch, or rebuild plugin host. |
+| Insufficient evidence | Run a focused experiment (e.g. add MORE diagnostic instrumentation against current build to nail down the exact divergence point). |
+
+### Execution plan (post-verification)
+
+**v1.15.0 → v1.15.10 scope: 385 commits over 8 days.** Many internal refactors (`refactor(repository): add cache service`, `refactor(reference): split materialization state`, etc.) that may invalidate our existing patch stack. Concrete migration risk:
 - Our `cache-aligned-compaction.patch`, `prompt-loop-cache.patch` touch `session/prompt.ts` and `session/compaction.ts` — both heavily refactored in v1.15.0..v1.15.5 (e.g. `refactor(session): extract prompt tool resolution (#28204)`, `refactor(session): extract reference prompt helpers (#28197)`, `refactor(session): move prompt reminders out of core loop (#28082)`). Expect rework.
-- `bus-eager-subscribe.patch` will become a NO-OP / conflict — drop it (already upstream as #27959).
+- `bus-eager-subscribe.patch` will become a NO-OP / conflict — drop it (already upstream as #27959 in v1.15.5+).
 - `prefill-fix.patch`, `gemini-empty-parts.patch`, `tool-fix.patch`, `mcp-reconnect.patch` etc. need re-evaluation against the new base.
-
-### Execution plan (post-compaction)
+- The `caching.patch` lives in a separate repo (`opencode-cached`, at `/home/dev/projects/opencode-cached`) — needs its own rebase to v1.15.10 before our `opencode-patched` rebase can succeed. Confirmed conflicts on `config/agent.ts`, `provider/transform.ts`, `session/prompt.ts`.
 
 Operate in `/home/dev/projects/opencode-patched`. Steps:
 
-1. **Branch the work.** Don't commit straight to main; `git checkout -b v1.15.5-rebase`.
-2. **Update `patches/apply.sh`** to target v1.15.5 instead of v1.15.0. Update README sunset/version refs.
-3. **For each existing patch in `patches/*.patch`**, in apply.sh order:
-   a. Try `git apply --check $PATCH` against v1.15.5 — if clean, no work needed.
+1. **Rebase `opencode-cached`/`caching.patch` to v1.15.10 first.** This is the upstream dependency of our apply.sh. Different repo, different commit, different push.
+2. **Branch the work** in opencode-patched. Don't commit straight to main; `git checkout -b v1.15.10-rebase`.
+3. **Update `patches/apply.sh`** to target v1.15.10 instead of v1.15.0. Update README sunset/version refs.
+4. **For each existing patch in `patches/*.patch`**, in apply.sh order:
+   a. Try `git apply --check $PATCH` against v1.15.10 — if clean, no work needed.
    b. If conflicts, regenerate the patch by:
       - Cherry-picking the corresponding upstream commit (if applicable) — preferred when the patch is an upstream backport.
-      - Otherwise manually rebase: apply against v1.15.0 first, then carry the diff forward to v1.15.5 via three-way merge.
-4. **Drop `bus-eager-subscribe.patch` entirely** — it's superseded by #27959 in v1.15.5 base.
-5. **Add no new patch for #28051** — also already in v1.15.5 base.
-6. **Update `.github/workflows/check-sunset.yml`**: PR #27959 and PR #28051 are now CLOSED-AS-MERGED in the base, so remove their monitors. Add sunset criterion for the next layer of patches if any.
-7. **Update `.github/workflows/build-release.yml`** version tag scheme: `v1.15.5-patched.1`.
-8. **Push branch, trigger CI, validate the build artifacts on all 4 platforms.**
-9. **Update workstation `home.base.nix`** with `upstreamVersion="1.15.5"`, `patchedRevision="1"`, new SRI hashes from CI.
-10. **Deploy to cloudbox via home-manager-switch**, restart opencode-serve, run the smoke test (`/launch cloudbox pigeon hi pigeon`), expect a real Telegram notification.
+      - Otherwise manually rebase: apply against v1.15.0 first, then carry the diff forward to v1.15.10 via three-way merge.
+5. **Drop `bus-eager-subscribe.patch` entirely** — it's superseded by #27959 in v1.15.5+ base.
+6. **Add no new patch for #28051** — also already in v1.15.5+ base.
+7. **Update `.github/workflows/check-sunset.yml`**: PR #27959 and PR #28051 are now CLOSED-AS-MERGED in the base, so remove their monitors. Add sunset criterion for the next layer of patches if any.
+8. **Update `.github/workflows/build-release.yml`** version tag scheme: `v1.15.10-patched.1`.
+9. **Push branch, trigger CI, validate the build artifacts on all 4 platforms.**
+10. **Update workstation `home.base.nix`** with `upstreamVersion="1.15.10"`, `patchedRevision="1"`, new SRI hashes from CI.
+11. **Deploy to cloudbox via home-manager-switch**, restart opencode-serve, run the smoke test (`/launch cloudbox pigeon hi pigeon`), expect a real Telegram notification.
 
 ### Validation criteria
 
