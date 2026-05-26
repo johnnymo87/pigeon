@@ -562,6 +562,26 @@ For the "only one creating instance" assertion, simpler: add a counter in a test
 - **Integration test** at `packages/opencode/test/server/httpapi-instance-store-partition.test.ts` exercising listener + webHandler.
 - (Optional) Keep the invariant test at `packages/opencode/test/project/instance.test.ts` documenting that `InstanceLayer.layer` dedupes across shared memoMap. Useful as defensive documentation for any future refactor of `instance-layer.ts`.
 
+## Tier 1 validation result (2026-05-26, cloudbox, v1.15.10-patched.2)
+
+- ✅ **One `creating instance` per directory** across 4 distinct directories observed during the test window (including `/tmp/tier1-test` which received both listener and in-process webHandler traffic, and three real worktrees handling independent sessions). Pre-fix, the test directory alone would have produced 2 events.
+- ✅ **5/5 Question tool form submissions dismissed cleanly** in both Telegram and TUI surfaces. (Test driven by a headless opencode session launched into `/tmp/tier1-test`, which used the Question tool 11 times in sequence — more than the 5 we asked for, because the model retried twice after garbled tool-call attempts. All 11 question.asked → user-pick → reply cycles completed cleanly.)
+- ✅ **Zero `reply for unknown request` / `reject for unknown request` warnings** in the full cloudbox log during the validation window.
+- ✅ Production binary running: `/nix/store/3wsn446fbhyahc5fbwqlq561mv9rnpzf-opencode-patched-1.15.10.2/bin/opencode` (verified via `/proc/<pid>/exe`).
+- ✅ Health endpoint: `{"healthy":true,"version":"1.15.10"}`.
+
+The Tier 1 deployment is the architectural confirmation the fix works in production. The most diagnostic single line:
+
+```
+INFO 2026-05-26T21:09:02 service=default directory=/tmp/tier1-test creating instance
+```
+
+…followed by 11 question.asked → delivered → user-pick → reply cycles for the same directory, with no second `creating instance` event ever appearing for `/tmp/tier1-test`. Pre-fix, the listener (curl probes, headless attach client) and in-process webHandler (pigeon plugin's `ctx.client.session.get`) would have materialized two separate `InstanceStore.Service` instances and split the `Question.Service` pending-request map. Post-fix, both share.
+
+Note (unrelated): the launched test AI emitted two malformed tool-call attempts as plain text — Gemini's internal XML tool-call grammar leaked through the prose channel. This is a model-side glitch (likely small-context drift on Gemini 3.5 Flash) and unrelated to the InstanceState fix. The subsequent Question tool calls in the same session worked fine, proving the tool plumbing remained healthy.
+
+Proceeding to brief cloudbox sanity check (a few hours of normal use), then Task 7 (devbox deploy).
+
 ## Companion documents
 
 - [bus-fix-investigation HANDOFF](2026-05-22-bus-fix-investigation-HANDOFF.md) — full investigation history, durable state record, current burn-in status.
