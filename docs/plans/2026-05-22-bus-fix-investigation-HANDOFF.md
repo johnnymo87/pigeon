@@ -203,3 +203,130 @@ I left a verification recipe at `/tmp/post-cutover-verification.md` written befo
 ## Files modified in this session (uncommitted!)
 
 - `/home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts` — added `log("DEBUG message.updated raw", ...)` instrumentation. **Uncommitted.** Should stay uncommitted until the bug is actually identified and a real fix lands.
+
+---
+
+## 2026-05-25 ~23:00 EDT — Post-cutover burn-in (in progress)
+
+### Cutover status: SHIPPED, NOT VALIDATED
+
+The v1.15.10 cutover completed on cloudbox:
+- `opencode-serve` running `opencode-patched-1.15.10.1`, both health endpoints green.
+- workstation `home.base.nix` bumped to `upstreamVersion = "1.15.10"`, all 4 SRI hashes refreshed (commit `e525d02`, pushed to workstation main).
+- `opencode-patched` main @ `051f7c2` (9 patches rebased to v1.15.10, `bus-eager-subscribe.patch` deleted as #27959 ships upstream from v1.15.5).
+- `opencode-cached` main @ `6e5d1c0` (caching.patch rebased to v1.15.10).
+- Release `v1.15.10-patched.1` published with all 4 platform assets.
+
+**Devbox is intentionally NOT updated.** Still on v1.15.0 as a known-good fallback while cloudbox burns in.
+
+### Empirical observations under light traffic
+
+| Criterion | Result | Notes |
+|-----------|--------|-------|
+| (a) Telegram reply on stop notification | **✅ user confirmed** | "they indeed ring on my phone" — multiple stop notifications during this session |
+| (b) `bus type=* subscribing` fires once per directory | **❌** | Still fires twice (once per plugin instance) |
+| (c) `message.updated` + `session.idle` + `notifyStop` in same instance per session | **✅** | Each session sticks to one instance end-to-end, no cross-instance partition |
+| (d) One `instanceId` per directory | **❌** | Two instances (`qpoj5ido`, `hwdykzwf`) materialize per `/home/dev/projects/pigeon` |
+
+**Key finding:** The dual-plugin-instance materialization is STILL happening in v1.15.10 — same empirical signature as v1.15.0. BUT v1.15.10's bus fix (#27825/#28051) ensures both instances receive both event types via `attachWith` sync publish, so each session's events route to a single instance consistently. The cross-instance EVENT PARTITION is gone even though the dual instance materialization itself persists.
+
+### What we did NOT prove
+
+The original bug as the user described it was **intermittent under load** — random Telegram messages dropping during heavy/concurrent activity. What we observed today is light-traffic delivery success. That doesn't refute the bug exists nor prove v1.15.10 fixes it. v1.15.0 could likely have delivered the same two light-traffic notifications.
+
+### Burn-in plan (CURRENT STATE)
+
+**Verdict status: PENDING. Burn-in in progress.**
+
+- **Cloudbox**: v1.15.10 in normal use. Diagnostic instrumentation REMAINS in `packages/opencode-plugin/src/index.ts` (uncommitted). Watch for Telegram drops over 3-5 days of normal use.
+- **Devbox**: stays on v1.15.0. Update procedure when ready (after cloudbox burn-in passes):
+  1. `cd ~/projects/workstation && git pull` (picks up `e525d02`).
+  2. `home-manager switch --flake .#dev@devbox` (or applicable flake target).
+  3. `sudo systemctl restart opencode-serve`.
+  4. Verify `curl http://127.0.0.1:4096/global/health` returns `"version":"1.15.10"`.
+  5. See `cross-device-deployment` skill for the careful version.
+
+### Burn-in success criteria
+
+- ✅ No random Telegram drops over 3-5 days of normal pigeon use under varied load (single sessions, multiple parallel sessions, fast follow-ups).
+- ✅ No new regressions introduced by v1.15.10 (model selection, MCP, vim mode, cache behavior).
+- ✅ No upstream patch-incompatibility issues surface.
+
+If all pass: revert diagnostic instrumentation (`git checkout -- packages/opencode-plugin/src/index.ts`), then update devbox.
+
+### Burn-in failure modes to watch for
+
+If drops happen during burn-in, **immediately** grab the active log from `~/.local/share/opencode/log/` before it rotates (logs rotate on opencode-serve restart). The instrumentation will capture:
+- `[i=<id> d=<dir>]` tag on every plugin log line.
+- `DEBUG event entry` for every event the plugin sees.
+- `DEBUG message.updated raw` showing `hasInfo`, `role`, `propsKeys`.
+- `DEBUG messageTail.onMessageUpdated done` showing `msgId`, `tailCurrent`.
+- `DEBUG session.idle received` and `DEBUG session.idle after awaitRegistration` showing `currentMsgId`.
+
+If a session shows `message.updated` going to one `instanceId` and `session.idle` going to a different `instanceId`, the partition theory is right and v1.15.10 didn't fix it. If both go to the same `instanceId` but `currentMsgId` is undefined or `notifyStop` is never sent, there's a different bug.
+
+### Open beads / tracking
+
+- `ccr-mu1` was claimed in the resumption prompt as the durable tracker but **does not exist** in `.beads/beads.left.jsonl` (only `ccr-mud` and unrelated IDs found 2026-05-25). This HANDOFF doc is the authoritative tracker for now. If beads come back online, file a fresh bead pointing at this doc.
+
+### Known TUI bug investigated 2026-05-25 23:08 EDT — **NOT** a TUI bug
+
+User reported a form-submit hang: after answering a question via the `Question` tool, the form stays up; cannot submit a different answer; cannot escape; cannot Ctrl-C. Recovery requires killing the parent terminal.
+
+**Investigation (2026-05-25 23:08 EDT) found this is the SAME bug as the Telegram-stop notification race.** Same root cause (`InstanceState` partition across fibers), different symptom.
+
+#### Evidence
+
+Server log `2026-05-26T025259.log` for question `que_e623a2ff20011WCv63s7EeQW9X`:
+
+```
+03:00:41  service=question id=que_e623a2ff... questions=1 asking            ← Question.ask creates pending entry in InstanceState A
+03:00:41  service=opencode-pigeon ... question.asked (i=hwdykzwf)            ← bus event fires
+03:00:49  service=question requestID=que_e623a2ff... reply for unknown request  ← user picks option → Question.reply runs in fiber that resolves to InstanceState B → pending.get returns undefined
+03:01:23  service=question requestID=que_e623a2ff... reply for unknown request  ← user retries submit → same NotFound
+03:01:41  service=question requestID=que_e623a2ff... reject for unknown request ← user mashes Esc
+03:01:42  (3 more rejects in 700ms)
+03:01:57–03:02:09  (15 more rejects over ~12s — user mashing keys, all NotFound)
+```
+
+22 rejects over 30s, all returning "not found" for a question that exists in *some* InstanceState. The TUI form stays up because no `question.replied`/`question.rejected` bus event ever publishes — the server's `Deferred` in InstanceState A is never resolved.
+
+#### Root cause
+
+`packages/opencode/src/question/index.ts` uses `InstanceState.make<State>` (line 136) and `InstanceState.get(state)` (lines 160, 186, 203, 219) to access the pending map. When `Question.ask` runs from a tool-execution fiber and `Question.reply` runs from an HTTP-handler fiber, they resolve `InstanceRef` from their respective fiber contexts. These can resolve to DIFFERENT InstanceState objects when multiple plugin instances materialize per directory (the same dual-instance materialization confirmed in instrumentation).
+
+PR #27825/#28051 in v1.15.10 only patched `Bus.publish` to thread `InstanceContext`. They did NOT patch other services that call `InstanceState.get` from fibers different than the `InstanceState.make` site. Any such service can hit the same partition.
+
+The Question service is currently the most visible victim. Other services with the same pattern (Permission, Session, etc.) are likely affected too but produce less user-visible symptoms.
+
+#### Implication for v1.15.10 burn-in
+
+The "bus race fix" we just deployed is **incomplete**. v1.15.10 fixes ONE symptom (cross-instance event partition in `bus.publish`) but does NOT fix the underlying InstanceState partition. The Telegram stop notifications happen to work in v1.15.10 because that specific code path goes through `bus.publish`, which now threads context.
+
+Question dialogs and any other code path that calls `InstanceState.get` from a non-tool, non-session fiber is still broken.
+
+**The Telegram drop bug user remembers MAY return** if any plugin event handler reaches for `InstanceState.get`-backed services from a context-mismatched fiber. The current passing test (notifications worked under light load today) is not conclusive — we'd need to know whether under heavy load the bus.publish path is still the *only* hop, or whether additional InstanceState-dependent code paths get exercised.
+
+#### Upstream status
+
+- v1.15.10 already includes PR #28693 "fix(httpapi): return request not found errors" (Dax, 2026-05-22) which is the surface fix. It does NOT fix the root cause; it just maps `Question.NotFoundError` → `QuestionNotFoundError` HTTP error properly. The TUI doesn't react to that error specifically.
+- `git log v1.15.10..upstream/dev -i --grep=instance` shows no pending root-cause fixes on `dev`. None of the 28 commits since v1.15.10 touch `instance-state.ts` or `question/index.ts`.
+- This bug has not been reported upstream (or is hidden in the existing instance-context cluster #27391/#27023/#26697/#26635/#27425/#27959/#28051). Worth filing.
+
+#### Test for "is this fixed?"
+
+A reliable repro test: ask a single-option question (single, not multiple) and immediately pick an option. If the form dismisses cleanly, the InstanceState partition is gone for the question path. If "reply for unknown request" appears in the server log, the bug persists.
+
+This is a STRONGER test than the Telegram-drop test because:
+- Deterministic — fails on first picky-question hang.
+- Symptom is immediate and obvious (form hangs).
+- Requires no load.
+
+#### Next-step options
+
+1. Live with it — workaround is kill terminal + re-attach. Not great but not catastrophic.
+2. File upstream issue with reproducible log evidence. Push for a real `InstanceState` fix.
+3. Patch our `opencode-patched` to thread `InstanceContext` through more services (mirror what #27825 did for bus). High effort, high risk of upstream patch conflicts later.
+4. Wait for upstream — they're aware of the instance-context cluster and may converge on a deeper fix.
+
+Recommended: **2 + 1**. File upstream with full evidence; live with it locally until they ship a real fix.
