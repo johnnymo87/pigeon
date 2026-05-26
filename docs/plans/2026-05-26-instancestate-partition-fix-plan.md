@@ -14,7 +14,7 @@
 
 Three repositories are involved:
 
-- **`/home/dev/projects/opencode`** — Upstream `sst/opencode` checkout, currently `HEAD detached at v1.15.10`. Read-only source of truth for upstream code. Run tests here with `bun test`.
+- **`/home/dev/projects/opencode`** — Upstream `anomalyco/opencode` checkout (origin), with `sst/opencode` as the `upstream` remote (the original). Currently `HEAD detached at v1.15.10`. Read-only source of truth. Run tests here with `bun test`. PRs (#27825, #28051, etc.) referenced throughout this plan are anomalyco/opencode PR numbers; Tasks 10+11 file the upstream issue and PR at `anomalyco/opencode`.
 - **`/home/dev/projects/opencode-patched`** — Our local fork with `patches/*.patch` and `apply.sh`. Builds release tarballs uploaded to GitHub releases. Currently at `main` commit `051f7c2` (v1.15.10 rebase). All new patches go here.
 - **`/home/dev/projects/pigeon`** — This repo. Holds the design + plan, the pigeon plugin source, and `home.base.nix` references through the workstation repo. Logs and burn-in evidence live here.
 - **`/home/dev/projects/workstation`** — Nix configuration. `users/dev/home.base.nix` pins `opencode-patched` version + SRI hashes. `home-manager switch` deploys.
@@ -945,7 +945,7 @@ Reference: pigeon project's design + plan docs for this fix at [link to commit o
 ### Step 10.2: File the issue
 
 ```bash
-gh issue create --repo sst/opencode \
+gh issue create --repo anomalyco/opencode \
   --title "Bug: InstanceStore.Service materializes twice per directory, causing Question tool to hang on submit" \
   --body-file /tmp/upstream-issue.md
 ```
@@ -975,14 +975,14 @@ git cherry-pick <commit-hash-of-task-4>
 ### Step 11.2: Push the branch to a fork
 
 ```bash
-gh repo fork sst/opencode --remote --remote-name fork
+gh repo fork anomalyco/opencode --remote --remote-name fork
 git push fork fix/instance-state-partition
 ```
 
 ### Step 11.3: Open the PR
 
 ```bash
-gh pr create --repo sst/opencode \
+gh pr create --repo anomalyco/opencode \
   --title "fix(instance): eliminate dual InstanceStore.Service materialization per directory" \
   --body-file /tmp/upstream-pr.md \
   --head fork:fix/instance-state-partition

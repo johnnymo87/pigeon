@@ -328,9 +328,11 @@ This is upstream-courteous and gives Dax / sst maintainers the chance to redirec
 - Opinions on how `InstanceState`-using services should be redesigned. Scope creep.
 - Speculation about other partition-victim services. If asked, answer "likely affected by the same mechanism but I haven't reproduced symptoms on them — happy to follow up if confirmed."
 
-### Why this shape suits sst/opencode
+### Why this shape suits anomalyco/opencode
 
 Recent merged fixes (#27825, #28051, #28693, #28187) are small, targeted, include tests, reference each other. Dax prefers tight diffs with clear cause-effect over architectural overhauls. Our planned fix matches that style.
+
+(All "upstream" references in this design \u2014 issue + PR filing in Section 6 \u2014 target `anomalyco/opencode`, the fork our opencode-patched tracks. v1.15.10 itself originated in `sst/opencode` and is mirrored at the same commit hash into anomalyco; the active PR space lives in anomalyco.)
 
 ### Carrying the patch until upstream merges
 
