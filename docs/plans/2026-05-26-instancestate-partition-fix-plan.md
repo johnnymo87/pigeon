@@ -303,83 +303,175 @@ Note: don't actually deploy this yet — we'll deploy the real fix in a single b
 
 ---
 
-## Task 3: Write the regression test (TDD)
+## Task 3: Write the regression test (TDD, Option A integration test)
 
 **Goal:** Add a failing test that proves the dual-boot bug exists, will pass once the fix lands.
 
-**Files:**
-- Modify: `/home/dev/projects/opencode/packages/opencode/test/project/instance.test.ts`
+**Background:** The empirical investigation in Task 2 ruled out Hypothesis A (`Layer.unwrap` memoMap-hostility). The actual bug is purely **Issue 2** — the TCP listener and the in-process `Default` webHandler use SEPARATE memoMaps, so they materialize two separate `InstanceStore.Service` instances. The regression test must exercise both pipelines and assert they share state.
 
-### Step 3.1: Read the existing test file
+**Files:**
+- Create: `/home/dev/projects/opencode/packages/opencode/test/server/httpapi-instance-store-partition.test.ts`
+- (Optional) Modify: `/home/dev/projects/opencode/packages/opencode/test/project/instance.test.ts` — add an invariant test documenting the post-fix behavior. Skip if it duplicates the integration test.
+
+### Step 3.1: Study `httpapi-instance-context.test.ts` as a model
+
+That file already spins up a real HTTP listener via `NodeHttpServer.layerTest` and probes the instance-context middleware. Our test mirrors its shape.
 
 ```bash
-sed -n '1,50p' /home/dev/projects/opencode/packages/opencode/test/project/instance.test.ts
+cat /home/dev/projects/opencode/packages/opencode/test/server/httpapi-instance-context.test.ts | head -100
 ```
 
-Understand the test framework used (`testEffect`, `it.live`, `it.instance` from `test/lib/effect.ts`).
+Key takeaways:
+- Use `testEffect` (or `testEffectShared` if shared-memoMap identity matters) to get an `it.live` helper.
+- Pull in `testStateLayer`, `NodeHttpServer.layerTest`, `NodeServices.layer`, `InstanceLayer.layer`, `Project.defaultLayer`, and a workspace layer.
+- Probe pattern: `HttpRouter.add("GET", "/probe", probeEffect).pipe(Layer.provide(instanceContextTestLayer), HttpRouter.serve, Layer.build)`.
 
-### Step 3.2: Write the failing test
+### Step 3.2: Write the integration test
 
-Add a new `it.live` block to the existing `describe("InstanceStore", ...)` block. Test name depends on hypothesis:
+The test must exercise BOTH the listener pipeline and the in-process `webHandler` pipeline, then assert they observe the same `InstanceContext` for the same directory.
 
-**For Hypothesis A** ("memoMap dedup failure"):
+Two ways to assert "same InstanceStore.Service":
+
+- **Bootstrap counter** (preferred): a noop bootstrap that increments a counter. If both pipelines share the same store, the counter is 1; if not, the counter is 2.
+- **InstanceContext identity**: if both pipelines hit the same store, `load(dir)` returns the same `InstanceContext` reference.
+
+Counter approach is more robust because it works even if the test framework caches contexts differently. Sketch:
 
 ```typescript
-it.live("dedupes InstanceStore.Service across runtimes sharing memoMap", () =>
-  Effect.gen(function* () {
-    const dir = yield* tmpdirScoped({ git: true })
-    let initialized = 0
+import { NodeHttpServer, NodeServices } from "@effect/platform-node"
+import { describe, expect } from "bun:test"
+import { Effect, Layer } from "effect"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServerResponse } from "effect/unstable/http"
+import * as Socket from "effect/unstable/socket/Socket"
+import { InstanceRef } from "../../src/effect/instance-ref"
+import { InstanceBootstrap } from "../../src/project/bootstrap-service"
+import { InstanceLayer } from "../../src/project/instance-layer"
+import { InstanceStore } from "../../src/project/instance-store"
+import { Project } from "../../src/project/project"
+import { instanceRouterMiddleware } from "../../src/server/routes/instance/httpapi/middleware/instance-context"
+import { workspaceRouterMiddleware } from "../../src/server/routes/instance/httpapi/middleware/workspace-routing"
+import { resetDatabase } from "../fixture/db"
+import { disposeAllInstances, tmpdirScoped } from "../fixture/fixture"
+import { workspaceLayerWithRuntimeFlags } from "../fixture/workspace"
+import { testEffect } from "../lib/effect"
 
-    yield* setBootstrap(
-      Effect.sync(() => {
-        initialized++
-      }),
-    )
-
-    // Build the layer twice via two ManagedRuntimes both using the shared memoMap.
-    // This mirrors how AppRuntime and the HTTP webHandler both use memoMap.
-    const { memoMap } = await import("@opencode-ai/core/effect/memo-map")
-    const { ManagedRuntime } = await import("effect")
-    const rt1 = ManagedRuntime.make(InstanceStore.defaultLayer.pipe(Layer.provide(noopBootstrap)), { memoMap })
-    const rt2 = ManagedRuntime.make(InstanceStore.defaultLayer.pipe(Layer.provide(noopBootstrap)), { memoMap })
-
-    const ctx1 = await rt1.runPromise(InstanceStore.Service.use((s) => s.load({ directory: dir })))
-    const ctx2 = await rt2.runPromise(InstanceStore.Service.use((s) => s.load({ directory: dir })))
-
-    expect(ctx1).toBe(ctx2)
-    expect(initialized).toBe(1)
-
-    await rt1.dispose()
-    await rt2.dispose()
+// Shared mutable counter — incremented every time InstanceBootstrap.run fires.
+// Reset before each test via the testStateLayer finalizer.
+let bootstrapCalls = 0
+const countingBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({
+    run: Effect.sync(() => {
+      bootstrapCalls++
+    }),
   }),
 )
+
+const testStateLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    bootstrapCalls = 0
+    yield* Effect.promise(() => resetDatabase())
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(async () => {
+        await disposeAllInstances()
+        await resetDatabase()
+      }),
+    )
+  }),
+)
+
+const it = testEffect(
+  Layer.mergeAll(
+    testStateLayer,
+    NodeHttpServer.layerTest,
+    NodeServices.layer,
+    InstanceLayer.layer.pipe(Layer.provide(countingBootstrap)), // override real bootstrap
+    Project.defaultLayer,
+    workspaceLayerWithRuntimeFlags({ experimentalWorkspaces: true }),
+  ),
+)
+
+const probe = HttpRouter.add(
+  "GET",
+  "/probe",
+  Effect.gen(function* () {
+    const instance = yield* InstanceRef
+    return yield* HttpServerResponse.json({ directory: instance?.directory })
+  }),
+).pipe(
+  Layer.provide(
+    instanceRouterMiddleware
+      .combine(workspaceRouterMiddleware)
+      .layer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal)),
+  ),
+)
+
+describe("InstanceStore partition between HTTP pipelines", () => {
+  it.live("listener and Default webHandler share the same InstanceStore.Service", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+
+      // Probe 1: through the listener (real HTTP via NodeHttpServer.layerTest).
+      yield* HttpRouter.serve(probe).pipe(Layer.build)
+      const listenerResp = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(dir)}`)
+      expect(listenerResp.status).toBe(200)
+      expect((yield* listenerResp.json) as { directory: string }).toEqual({ directory: dir })
+
+      // Probe 2: through the in-process Default webHandler.
+      // (Exact wire-up of `HttpApiApp.Default` in tests needs investigation;
+      //  may need to construct a separate webHandler instance over the same
+      //  `routes` layer.)
+      // ...
+
+      // After the fix: bootstrap ran exactly once across both probes.
+      expect(bootstrapCalls).toBe(1)
+
+      // Before the fix: bootstrap ran twice (one per pipeline).
+      // The test FAILS with bootstrapCalls === 2.
+    }),
+  )
+})
 ```
 
-**For Hypothesis B / C:** Adapt the test to whatever the diagnostic showed. The pattern is the same: exercise the production code path that currently causes the dual boot, assert one bootstrap call and identical InstanceContext.
+**Open items in the test sketch** (resolve when implementing):
+
+- How to invoke `HttpApiApp.Default` from inside the test. The simplest path: import `HttpApiApp.Default` directly and call `.app.fetch(request)`. But that uses the production `routes` Layer, which provides the full opencode service graph. May need a stripped-down equivalent that uses the same `createRoutes` skeleton + our `countingBootstrap` override.
+- Whether `NodeHttpServer.layerTest`'s listener and the in-process Default share enough state for the test to be representative. The production bug is that they DON'T share; we want the test to detect that.
+- Whether bootstrap counter is the right assertion vs InstanceContext identity. Test both if possible.
 
 ### Step 3.3: Run the test and verify it fails
 
 ```bash
 cd /home/dev/projects/opencode
-bun test test/project/instance.test.ts -t "dedupes InstanceStore.Service"
+bun test test/server/httpapi-instance-store-partition.test.ts
 ```
 
-Expected: FAIL with mismatched contexts or `initialized=2`.
+Expected: FAIL with `bootstrapCalls === 2` (or similar).
+
+If the test passes (i.e., bootstrap was called once), STOP — the bug isn't manifesting in the test setup. Investigate why before proceeding. Possible causes:
+- Test fixture provides services through a single memoMap by accident, so listener+webHandler unintentionally share state.
+- The test's `HttpApiApp.Default` wire-up doesn't actually go through a separate webHandler runtime.
 
 ### Step 3.4: Commit the failing test
 
 ```bash
 cd /home/dev/projects/opencode
-git add packages/opencode/test/project/instance.test.ts
-git commit -m "test(instance-store): regression test for dual-service materialization
+git add packages/opencode/test/server/httpapi-instance-store-partition.test.ts
+git commit -m "test(server): regression test for listener/webHandler InstanceStore partition
 
-Asserts InstanceStore.Service is deduped across runtimes sharing memoMap,
-and that the bootstrap init runs once per directory. Currently FAILS on
-v1.15.10 — see pigeon/docs/plans/2026-05-26-instancestate-partition-fix-design.md
-Section 4."
+Reproduces the dual InstanceStore.Service materialization that causes
+the Question tool to hang on submit. The TCP listener uses Layer.makeMemoMapUnsafe()
+(server.ts:129) while the in-process Default webHandler uses the shared
+memoMap (server.ts:247); both layers depend on InstanceStore.Service via
+InstanceLayer.layer. With distinct memoMaps, two distinct Services
+materialize.
+
+Currently FAILS on v1.15.10. See:
+pigeon/docs/plans/2026-05-26-instancestate-partition-fix-design.md
+(Diagnostic finding revised)."
 ```
 
-Don't push yet. This commit will be part of the upstream PR; lives in `opencode/`, not `opencode-patched/`.
+Don't push yet — this commit lands in the upstream PR together with the fix in Task 4.
 
 ---
 
@@ -388,93 +480,90 @@ Don't push yet. This commit will be part of the upstream PR; lives in `opencode/
 **Goal:** Make the regression test pass.
 
 **Files:**
-- Modify: depends on hypothesis. See design Section 4 for the exact diff per hypothesis.
+- Modify: `/home/dev/projects/opencode/packages/opencode/src/server/server.ts` — one-line change (plus an import).
 
-### Step 4.1: Apply the fix from design Section 4
+### Step 4.1: Apply the one-line fix
 
-**For Hypothesis A:**
-
-Modify `/home/dev/projects/opencode/packages/opencode/src/project/instance-layer.ts`. Try Option 1 first (eager import); if it causes an import cycle, fall back to Option 2 (lazy with memoization).
-
-Option 1 attempt:
+Edit `packages/opencode/src/server/server.ts`. Add the import at the top:
 
 ```typescript
-import { Effect, Layer } from "effect"
-import { InstanceStore } from "./instance-store"
-import { InstanceBootstrap } from "./bootstrap"
-
-export const layer = InstanceStore.defaultLayer.pipe(Layer.provide(InstanceBootstrap.defaultLayer))
-
-export * as InstanceLayer from "./instance-layer"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 ```
 
-```bash
-cd /home/dev/projects/opencode
-bun run typecheck  # or whatever the typecheck command is
-```
-
-If it fails with import-cycle errors, revert and apply Option 2:
+Change line 129 from:
 
 ```typescript
-import { Effect, Layer } from "effect"
-import { lazy } from "@/util/lazy"
-import { InstanceStore } from "./instance-store"
-
-const resolveLayer = lazy(async () => {
-  const { InstanceBootstrap } = await import("./bootstrap")
-  return InstanceStore.defaultLayer.pipe(Layer.provide(InstanceBootstrap.defaultLayer))
-})
-
-export const layer = Layer.unwrap(Effect.promise(resolveLayer))
-
-export * as InstanceLayer from "./instance-layer"
+return Layer.buildWithMemoMap(listenerLayer(opts, port), Layer.makeMemoMapUnsafe(), scope).pipe(
 ```
 
-**For Hypothesis B/C:** Apply the matching fix from design Section 4.
+to:
 
-### Step 4.2: Run the regression test (expect pass)
+```typescript
+return Layer.buildWithMemoMap(listenerLayer(opts, port), memoMap, scope).pipe(
+```
+
+That's the entire code change. No modifications to `instance-layer.ts`, `instance-store.ts`, or any other file.
+
+### Step 4.2: Typecheck
 
 ```bash
 cd /home/dev/projects/opencode
-bun test test/project/instance.test.ts -t "dedupes InstanceStore.Service"
+bun run typecheck 2>&1 | tail -20
 ```
 
-Expected: PASS.
+Expected: zero errors. The import path `@opencode-ai/core/effect/memo-map` already resolves elsewhere in the file (verify with `grep "from \"@opencode-ai/core/effect/memo-map\"" packages/opencode/src/`).
 
-### Step 4.3: Run the full existing test file
+### Step 4.3: Run the regression test (expect pass)
 
 ```bash
 cd /home/dev/projects/opencode
-bun test test/project/instance.test.ts
+bun test test/server/httpapi-instance-store-partition.test.ts
 ```
 
-Expected: ALL pass. The pre-existing tests (`loads instance context`, `caches loaded instance context by directory`, `dedupes concurrent loads while init is in flight`, etc.) must still pass.
+Expected: PASS. `bootstrapCalls === 1` means both pipelines now share the same `InstanceStore.Service`.
 
-### Step 4.4: Run broader regression tests
+### Step 4.4: Run the full server + project test suites
 
 ```bash
 cd /home/dev/projects/opencode
+bun test test/server/
 bun test test/project/
 bun test test/effect/instance-state.test.ts
-bun test test/server/httpapi-event-diagnostics.test.ts
 ```
 
-All should pass.
+All should pass. Particular attention to:
+- `test/server/httpapi-instance-context.test.ts` — must still pass; this exercises the listener directly.
+- `test/server/httpapi-event-diagnostics.test.ts` — exercises the bus, which sits adjacent to the InstanceStore layer.
+- `test/server/auth.test.ts` — server lifecycle is touched by the fix.
+
+If any pre-existing test starts failing, STOP. The fresh-per-listener memoMap may be load-bearing somewhere we didn't anticipate. Investigate before committing.
 
 ### Step 4.5: Commit the fix
 
 ```bash
 cd /home/dev/projects/opencode
-git add packages/opencode/src/project/instance-layer.ts
-# include any other files that the diagnosed hypothesis required touching
-git commit -m "fix(instance): eliminate dual InstanceStore.Service materialization
+git add packages/opencode/src/server/server.ts
+git commit -m "fix(server): share memoMap between TCP listener and in-process webHandler
 
-[explain the root cause and the precise fix in 3-5 sentences. Reference
-PR #27825 which fixed the bus.publish symptom of the same partition.]
+The TCP listener at startListener was built via Layer.makeMemoMapUnsafe(),
+creating a fresh memoMap per listener. The in-process Default webHandler
+at toWebHandler used the shared @opencode-ai/core/effect/memo-map. Because
+both pipelines depend on InstanceStore.Service via InstanceLayer.layer,
+the distinct memoMaps caused two InstanceStore.Service instances to
+materialize for the same directory, splitting Question.Service pending-
+request maps and causing the Question tool to hang on submit.
 
-Closes the upstream PR (to be opened): [link added later]
-Resolves the Question tool hang reproduced in test/project/instance.test.ts.
-Pigeon project burn-in plan in pigeon/docs/plans/2026-05-26-instancestate-partition-fix-design.md."
+Switch the listener to the shared memoMap. Both pipelines now materialize
+exactly one InstanceStore.Service per directory.
+
+Related: PR #27825 (sync events on injected bus) fixed the bus.publish
+symptom of this partition for the SessionEvent bus, but did not address
+the InstanceStore-level cause that bites every InstanceState-using
+service. Resolves the Question tool hang reproduced in
+test/server/httpapi-instance-store-partition.test.ts.
+
+See pigeon/docs/plans/2026-05-26-instancestate-partition-fix-design.md
+(Diagnostic finding revised) for the empirical investigation."
 ```
 
 ---
@@ -490,16 +579,23 @@ Pigeon project burn-in plan in pigeon/docs/plans/2026-05-26-instancestate-partit
 
 ### Step 5.1: Generate the patch file
 
+The fix is a one-line change to `server.ts` plus an import line. Capture both lines AND the test file from Task 3:
+
 ```bash
 cd /home/dev/projects/opencode
-git diff HEAD~1 HEAD -- packages/opencode/src/project/instance-layer.ts > /tmp/instance-state-partition.patch
+# The fix commit (Task 4.5) touched server.ts; the test commit (Task 3.4) created the regression test.
+# The patch for opencode-patched needs both: the test file is part of the upstream PR but
+# also useful for local verification.
+git diff HEAD~2 HEAD -- packages/opencode/src/server/server.ts \
+                       packages/opencode/test/server/httpapi-instance-store-partition.test.ts \
+  > /tmp/instance-state-partition.patch
 # Verify the patch
 cat /tmp/instance-state-partition.patch
 # Move into opencode-patched
 mv /tmp/instance-state-partition.patch /home/dev/projects/opencode-patched/patches/
 ```
 
-If multiple files changed in Task 4's fix commit, include all of them in the patch by widening the `git diff` arguments.
+Adjust `HEAD~2 HEAD` if Task 3 + Task 4 didn't land as exactly two commits (e.g., if Task 4 needed multiple iteration commits — squash before generating the patch).
 
 ### Step 5.2: Add to `apply.sh`
 

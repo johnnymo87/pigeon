@@ -410,7 +410,7 @@ These two pipelines fundamentally cannot share `InstanceStore.Service` as curren
 
 `Question.ask` from a tool-execution fiber runs inside whatever runtime hosts the tool (typically the listener runtime if the user triggered it via `opencode attach`). `Question.reply` from an HTTP-handler fiber runs inside the runtime that received the reply HTTP request (could be the listener OR the webHandler depending on caller). If the two end up on different pipelines, they reach different `Question.Service` instances and therefore different pending-request maps. The reply is rejected as `reply for unknown request`.
 
-### Implications for the fix
+### Implications for the fix (SUPERSEDED — see "Diagnostic finding revised" below)
 
 The "Option 1: eager import" / "Option 2: lazy with memoization" sketches in Section 4 fix **half** the problem — they make `InstanceLayer.layer` memoMap-friendly. That eliminates the dedup failure WITHIN a single pipeline that uses the shared memoMap (e.g., AppRuntime + webHandler).
 
@@ -422,11 +422,145 @@ But the listener still uses its own fresh memoMap (server.ts:129). To unify the 
 
 **Risk note:** changing the listener's memoMap from per-listener to shared has implications if anything in the codebase deliberately relies on per-listener isolation. Need to audit before committing. The current behavior of using a fresh memoMap per `startListener` appears intentional (a fresh `ConfigProvider` is also installed per listener at server.ts:116), so there may be reasons. To minimize risk, the regression test in Task 3 should exercise both pipelines and verify they share `InstanceStore.Service`.
 
-### Fix to build
+### Fix to build (SUPERSEDED — see "Diagnostic finding revised" below)
 
 - File: `packages/opencode/src/project/instance-layer.ts` — switch to eager import (Option 1 from Section 4).
 - File: `packages/opencode/src/server/server.ts:129` — `Layer.buildWithMemoMap(..., memoMap, scope)` using the shared memoMap import.
 - Test: extend `test/project/instance.test.ts` to assert that two ManagedRuntimes sharing the same memoMap produce the same `InstanceStore.Service` for the same directory. Also assert: that two distinct pipelines built via the production-shape composition (one via webHandler, one via listener-shape `HttpRouter.serve`) produce the same `InstanceStore.Service` when sharing the same memoMap.
+
+## Diagnostic finding revised (2026-05-26 ~17:00 EDT)
+
+The original finding above (Hypothesis A "with architectural twist") is partly wrong. Empirical testing revealed Issue 1 (the `Layer.unwrap(Effect.promise(...))` memoMap-hostility) **does not actually manifest**. Effect's memoMap dedupes `InstanceLayer.layer` correctly within a single shared memoMap. The dual-boot in production is caused **entirely by Issue 2** — the listener and webHandler use SEPARATE memoMaps.
+
+### What changed my mind
+
+While writing the regression test for Task 3, I wrote a minimal test that builds `InstanceLayer.layer` twice through the same `memoMap` and asserts the resulting `InstanceStore.Service` is the same reference:
+
+```typescript
+test("InstanceLayer.layer deduplicates across runtimes sharing memoMap", async () => {
+  const a = await Effect.runPromise(buildIntoFreshScope())
+  const b = await Effect.runPromise(buildIntoFreshScope())
+  expect(a.store).toBe(b.store)
+})
+```
+
+Running this against unmodified v1.15.10 (no fix applied):
+
+```
+ 1 pass, 0 fail, 1 expect() calls
+```
+
+The test PASSED. So `Layer.unwrap(Effect.promise(...))` IS memoMap-friendly when builds share the memoMap. memoMap caches the *build result* (Context) keyed by Layer reference; the outer `Layer.unwrap(...)` is a stable top-level binding, so memoMap returns the cached Context on the second build. The inner Layer re-evaluation inside the unwrap closure doesn't matter because it's not re-executed once memoMap has a hit.
+
+### Corrected mechanism
+
+The production bug is purely **Issue 2: listener vs webHandler use separate memoMaps.**
+
+- `packages/opencode/src/server/server.ts:129`: `Layer.buildWithMemoMap(listenerLayer(opts, port), Layer.makeMemoMapUnsafe(), scope)` — listener has its OWN fresh memoMap.
+- `packages/opencode/src/server/server.ts:247-253`: `webHandler = lazy(() => HttpRouter.toWebHandler(routes, { memoMap, ... }))` — webHandler uses the SHARED memoMap from `@opencode-ai/core/effect/memo-map`.
+
+Two memoMaps → two memoization caches → two `InstanceStore.Service` instances for the same directory.
+
+External HTTP traffic (`opencode attach`) goes through the listener. In-process traffic (pigeon plugin's `ctx.client.session.get(...)`, per the plugin source comment at `pigeon/packages/opencode-plugin/src/index.ts:21-26`) goes through `Server.App().fetch()` which is the webHandler. Different pipelines, different Services, split state.
+
+### Why the form hangs (unchanged from above)
+
+The mechanism is the same: `Question.ask` (called from a tool fiber, hosted by whichever pipeline routed the original prompt) and `Question.reply` (called from an HTTP-handler fiber, hosted by whichever pipeline received the reply) end up on different `Question.Service` instances because the two pipelines have different `InstanceStore.Service` → different `InstanceState` ScopedCaches → different per-question pending-request maps. The reply is rejected as `reply for unknown request`.
+
+### Revised fix shape
+
+**One-line code change.** At `packages/opencode/src/server/server.ts:129`:
+
+```typescript
+// Before:
+return Layer.buildWithMemoMap(listenerLayer(opts, port), Layer.makeMemoMapUnsafe(), scope).pipe(
+
+// After:
+return Layer.buildWithMemoMap(listenerLayer(opts, port), memoMap, scope).pipe(
+```
+
+(plus an import: `import { memoMap } from "@opencode-ai/core/effect/memo-map"` at the top of `server.ts`).
+
+No change to `instance-layer.ts`. No change to `instance-store.ts`.
+
+### Risk assessment for the one-line fix
+
+The current per-listener `Layer.makeMemoMapUnsafe()` IS deliberate in spirit — server.ts also installs a fresh `ConfigProvider` per listener (line 116) for env-isolation reasons. So this isn't an accidental bug; it's a design choice that has the side effect of partitioning `InstanceStore.Service`.
+
+Risks of moving the listener to the shared memoMap:
+- **Service identity bleeding across listeners** — if anything depends on "fresh services per listener," it'll regress. The codebase has very few callers of `startListener` (it's the entrypoint), so this seems unlikely to break. But worth a careful audit.
+- **Lifecycle / disposal subtleties** — services built via the shared memoMap are owned by the shared memoMap's lifecycle, not the per-listener scope. Disposing a listener shouldn't dispose services held by the shared memoMap. The current code at server.ts uses `Scope.makeUnsafe()` per listener; the scope finalizer would still run for listener-specific things, but services pulled from the shared memoMap survive. This MIGHT be the intended behavior or might break expectations.
+
+Mitigation: the regression test (Option A integration test, see below) exercises both pipelines end-to-end and verifies dual-boot is gone. Tier 1 + Tier 2 burn-in catches any breakage we missed.
+
+### Revised regression test approach (Option A — integration test)
+
+The narrow unit test ("InstanceLayer.layer deduplicates ... shared memoMap") passes both before and after the fix, so it's an invariant test, not a regression. Useful to keep, but doesn't catch the actual bug.
+
+The real regression test exercises the production-shape architecture: instantiate a real HTTP listener (via `NodeHttpServer.layerTest`, like `httpapi-instance-context.test.ts` does) AND access the in-process `webHandler` (`HttpApiApp.Default` / `Server.App().fetch()`). Trigger a directory load through both. Assert they observe the same `InstanceContext`.
+
+**Test location:** `packages/opencode/test/server/httpapi-instance-store-partition.test.ts` (new file).
+
+**Sketch:**
+
+```typescript
+import { NodeHttpServer, NodeServices } from "@effect/platform-node"
+import { describe, expect } from "bun:test"
+import { Effect, Layer } from "effect"
+import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
+import { Server } from "../../src/server/server"
+import { testEffectShared } from "../lib/effect"
+// ... fixtures
+
+describe("InstanceStore partition (listener vs in-process webHandler)", () => {
+  it.live("listener and Default webHandler share the same InstanceStore.Service for the same directory", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+
+      // Start a real HTTP listener.
+      const listener = yield* Effect.promise(() =>
+        Server.listen({ port: 0, hostname: "127.0.0.1" }),
+      )
+
+      // Probe 1: hit the listener over real HTTP.
+      const listenerResponse = yield* HttpClientRequest.get(`${listener.url.toString()}probe`).pipe(
+        HttpClientRequest.setHeader("x-opencode-directory", dir),
+        HttpClient.execute,
+      )
+
+      // Probe 2: hit the Default in-process webHandler.
+      const inProcessHandler = HttpApiApp.Default
+      const inProcessResponse = yield* Effect.promise(() =>
+        inProcessHandler.app.fetch(
+          new Request(`http://localhost/probe`, {
+            headers: { "x-opencode-directory": dir },
+          }),
+        ),
+      )
+
+      // Both probes return the same project ID → both saw the same
+      // InstanceContext → both reached the same InstanceStore.Service.
+      const listenerJson = yield* listenerResponse.json
+      const inProcessJson = yield* Effect.promise(() => inProcessResponse.json())
+      expect(listenerJson.projectID).toBe(inProcessJson.projectID)
+
+      // Also check the log for only ONE "creating instance" event for this dir.
+      // (Need to either pipe the logger to a buffer, or instrument differently.)
+    }),
+  )
+})
+```
+
+The exact wire-up (probe route, logger capture, listener lifecycle) needs investigation; this is the spec. Before the fix, the listener and webHandler use different `InstanceStore.Service` instances, so the same `dir` is loaded twice — same `projectID` (because project lookup is deterministic) but two different `InstanceContext` references. After the fix, both share.
+
+For the "only one creating instance" assertion, simpler: add a counter in a test-only `bootstrap.run` and assert it's called once.
+
+### Revised fix to build
+
+- **One-line code change** to `packages/opencode/src/server/server.ts:129` (use shared memoMap).
+- **Integration test** at `packages/opencode/test/server/httpapi-instance-store-partition.test.ts` exercising listener + webHandler.
+- (Optional) Keep the invariant test at `packages/opencode/test/project/instance.test.ts` documenting that `InstanceLayer.layer` dedupes across shared memoMap. Useful as defensive documentation for any future refactor of `instance-layer.ts`.
 
 ## Companion documents
 
