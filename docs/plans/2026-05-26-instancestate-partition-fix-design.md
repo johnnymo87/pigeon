@@ -350,6 +350,84 @@ We keep carrying it. Worst case: rebase conflict on a future version. The fix's 
 - **2026-05-26 ~22:00 EDT** — Hypothesis identification deferred to implementation step 1 (diagnostic patch). Design records all three candidate fixes so the decision tree is preserved.
 - **2026-05-26 ~22:00 EDT** — Upstream PR filing gated on Tier 3 completion (3-5 days of multi-machine burn-in).
 
+## Diagnostic finding (2026-05-26 ~15:30 EDT)
+
+### Verdict
+
+**Hypothesis A confirmed, with an architectural twist.** The fundamental cause is `InstanceLayer.layer = Layer.unwrap(Effect.promise(...))` defeating memoMap dedup — which by itself would cause Hypothesis A. But the production environment additionally has **two independent HTTP-handling pipelines** (the TCP listener and the in-process `Default` webHandler used by the SDK client's "internal fetch"), each with its own runtime and memoMap. Even a memoMap-friendly `InstanceLayer` wouldn't fully unify them.
+
+### Evidence
+
+The diagnostic patch was deployed on cloudbox at 2026-05-26 15:30:25 EDT (post-`systemctl restart opencode-serve`). Log file: `~/.local/share/opencode/log/2026-05-26T153025.log`. Within 4 seconds of boot, two `creating instance` events fired for the same directory:
+
+```
+INFO 2026-05-26T15:30:33 +3913ms service=default
+  stack=Error |     at <anonymous> (/$bunfs/root/chunk-8zr1qt7x.js:2:2488)
+        |     at ~effect/Effect/successCont (/$bunfs/root/chunk-qv8cq7ep.js:25:7808)
+        |     at runLoop (/$bunfs/root/chunk-qv8cq7ep.js:25:2045)
+        |     ...
+        |     at emit (node:events:98:22)
+        |     at onNodeHTTPRequest (node:_http_server:373:22)
+  cacheSizeBefore=0 cacheHadBefore=false
+  serviceId=cy5eoxd9
+  directory=/home/dev/projects/pigeon
+  creating instance
+
+INFO 2026-05-26T15:30:33 +3ms service=default
+  stack=Error |     at <anonymous> (/$bunfs/root/chunk-8zr1qt7x.js:2:2488)
+        |     ...
+        |     at fetch (/$bunfs/root/chunk-wv3z9c79.js:657:9882)
+        |     at <anonymous> (/$bunfs/root/chunk-wv3z9c79.js:402:6271)
+        |     at async <anonymous> (/home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts:231:53)
+        |     at async <anonymous> (/home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts:295:16)
+        |     at async <anonymous> (/home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts:376:18)
+        |     at processTicksAndRejections (native:7:39)
+  cacheSizeBefore=0 cacheHadBefore=false
+  serviceId=uabp6bnk
+  directory=/home/dev/projects/pigeon
+  creating instance
+```
+
+**Two distinct serviceIds**: `cy5eoxd9` and `uabp6bnk`. **Both saw empty cache** (`cacheHadBefore=false`, `cacheSizeBefore=0`). Same directory.
+
+### Mechanism
+
+Three relevant code sites:
+
+1. **`packages/opencode/src/project/instance-layer.ts:4`** — `InstanceLayer.layer = Layer.unwrap(Effect.promise(async () => { ... }))`. Every time this layer is built, the unwrap re-evaluates the async closure, producing a fresh `InstanceStore.defaultLayer.pipe(Layer.provide(InstanceBootstrap.defaultLayer))` — a NEW Layer object identity. memoMap keys by Layer reference, so it can't dedupe.
+
+2. **`packages/opencode/src/server/server.ts:104,129`** — The TCP listener uses `HttpRouter.serve(createRoutes(opts), {...})` built with `Layer.makeMemoMapUnsafe()` (a fresh per-listener memoMap). External HTTP requests (e.g. `opencode attach` reconnecting) hit this pipeline.
+
+3. **`packages/opencode/src/server/server.ts:247-253`** — A separate `webHandler = lazy(() => HttpRouter.toWebHandler(routes, { memoMap, ... }))` uses the SHARED `memoMap` (the one from `@opencode-ai/core/effect/memo-map`). This is what `Server.App().fetch()` resolves to. The plugin's `ctx.client.session.get(...)` doesn't make a real network call — per the plugin source at `pigeon/packages/opencode-plugin/src/index.ts:21-26`, the SDK client uses a "custom in-process fetch that calls `Server.App().fetch()` directly (no network I/O)". So plugin-originated requests go through the webHandler pipeline, NOT the listener pipeline.
+
+Event 1 (cy5eoxd9, short stack ending at `onNodeHTTPRequest`) is the **listener** materializing its `InstanceStore.Service` on its first request. Event 2 (uabp6bnk, plugin stack ending in `fetch`) is the **webHandler** materializing its `InstanceStore.Service` when the plugin's first in-process SDK call hits it.
+
+These two pipelines fundamentally cannot share `InstanceStore.Service` as currently structured, because:
+- They use different memoMaps (fresh-per-listener vs shared).
+- Even with shared memoMaps, `InstanceLayer.layer`'s `Layer.unwrap(Effect.promise(...))` produces fresh inner Layers, defeating dedup.
+
+### Why the form hangs (mechanism reaffirmed)
+
+`Question.ask` from a tool-execution fiber runs inside whatever runtime hosts the tool (typically the listener runtime if the user triggered it via `opencode attach`). `Question.reply` from an HTTP-handler fiber runs inside the runtime that received the reply HTTP request (could be the listener OR the webHandler depending on caller). If the two end up on different pipelines, they reach different `Question.Service` instances and therefore different pending-request maps. The reply is rejected as `reply for unknown request`.
+
+### Implications for the fix
+
+The "Option 1: eager import" / "Option 2: lazy with memoization" sketches in Section 4 fix **half** the problem — they make `InstanceLayer.layer` memoMap-friendly. That eliminates the dedup failure WITHIN a single pipeline that uses the shared memoMap (e.g., AppRuntime + webHandler).
+
+But the listener still uses its own fresh memoMap (server.ts:129). To unify the listener and webHandler we need either:
+- **Fix B-1:** Switch the listener to use the shared memoMap. One-line change: `Layer.buildWithMemoMap(listenerLayer(opts, port), memoMap, scope)` where `memoMap` is imported from `@opencode-ai/core/effect/memo-map`. Combined with the InstanceLayer fix, this should produce ONE `InstanceStore.Service` shared by both pipelines.
+- **Fix B-2:** Extract `InstanceStore.Service` to a process-wide singleton outside the Effect layer system. Heavier surgery.
+
+**Recommended fix path:** Combine "Option 1: eager import" for `InstanceLayer.layer` + "Fix B-1: switch listener to shared memoMap". Together they ensure both pipelines materialize ONE `InstanceStore.Service` that any directory load operation can see.
+
+**Risk note:** changing the listener's memoMap from per-listener to shared has implications if anything in the codebase deliberately relies on per-listener isolation. Need to audit before committing. The current behavior of using a fresh memoMap per `startListener` appears intentional (a fresh `ConfigProvider` is also installed per listener at server.ts:116), so there may be reasons. To minimize risk, the regression test in Task 3 should exercise both pipelines and verify they share `InstanceStore.Service`.
+
+### Fix to build
+
+- File: `packages/opencode/src/project/instance-layer.ts` — switch to eager import (Option 1 from Section 4).
+- File: `packages/opencode/src/server/server.ts:129` — `Layer.buildWithMemoMap(..., memoMap, scope)` using the shared memoMap import.
+- Test: extend `test/project/instance.test.ts` to assert that two ManagedRuntimes sharing the same memoMap produce the same `InstanceStore.Service` for the same directory. Also assert: that two distinct pipelines built via the production-shape composition (one via webHandler, one via listener-shape `HttpRouter.serve`) produce the same `InstanceStore.Service` when sharing the same memoMap.
+
 ## Companion documents
 
 - [bus-fix-investigation HANDOFF](2026-05-22-bus-fix-investigation-HANDOFF.md) — full investigation history, durable state record, current burn-in status.
