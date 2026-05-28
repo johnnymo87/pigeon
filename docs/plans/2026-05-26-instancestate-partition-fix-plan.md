@@ -1156,7 +1156,7 @@ To be filled in as the plan executes:
 - [ ] Devbox deploy date: ____
 - [ ] Tier 2 pass date: ____
 - [ ] Tier 3 pass date: ____
-- [ ] Upstream issue URL: ____
-- [ ] Upstream PR URL: ____
+- [x] Upstream issue URL: https://github.com/anomalyco/opencode/issues/29772
+- [x] Upstream PR URL: https://github.com/anomalyco/opencode/pull/29773
 - [ ] Upstream merge date: ____
 - [ ] Local patch dropped date: ____

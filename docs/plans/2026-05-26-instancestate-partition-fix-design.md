@@ -582,6 +582,26 @@ Note (unrelated): the launched test AI emitted two malformed tool-call attempts 
 
 Proceeding to brief cloudbox sanity check (a few hours of normal use), then Task 7 (devbox deploy).
 
+## Upstream issue + PR opened (2026-05-28)
+
+The fix has been submitted upstream against `anomalyco/opencode` after rebasing the work over the current `anomalyco/opencode:dev` branch.
+
+- Issue: https://github.com/anomalyco/opencode/issues/29772
+- PR: https://github.com/anomalyco/opencode/pull/29773
+- PR base/head: `anomalyco/opencode:dev` <- `johnnymo87:fix/instance-state-partition`
+- PR branch contents: code-only two-commit stack, with the prep-doc commit deliberately omitted.
+- Fork wip branch retained: `johnnymo87/opencode:wip/instance-state-partition` still includes the ephemeral `.upstream-pr-prep/` commit for reference.
+
+Verification before opening the PR:
+
+- `bun run typecheck` from `packages/opencode` passed with Bun `1.3.14`.
+- `bun test test/project/` passed on rerun: 80 pass, 1 skip, 0 fail.
+- `bun test test/server/httpapi-instance-context.test.ts test/server/httpapi-promptasync-context.test.ts` passed: 10 pass, 0 fail.
+- Pre-push hook `bun turbo typecheck` passed: 19 successful, 19 total.
+- GitHub checks on PR #29773 passed: `check-duplicates`, `check-standards`, `check-compliance`, `add-contributor-label`.
+
+Note: one `test/project/` run hit a transient 5s timeout in `InstanceStore.provide runs InstanceBootstrap before effect`; the test passed in isolation immediately afterward, and the full project suite passed on rerun. Treat recurrence in CI as an actual investigation target, but the observed local timeout was not reproducible.
+
 ## Companion documents
 
 - [bus-fix-investigation HANDOFF](2026-05-22-bus-fix-investigation-HANDOFF.md) — full investigation history, durable state record, current burn-in status.
