@@ -1,9 +1,9 @@
 # Triple-Injection Fix: Idempotent Command Delivery Over At-Least-Once Transport
 
 **Date:** 2026-06-03
-**Status:** Phase 1 implemented + committed (`39fd2f0`, on `main`, not yet deployed). Phase 2 APPROVED for implementation.
+**Status:** Phase 1 implemented + committed (`39fd2f0`, on `main`). Phase 2 core (2a + 2b) implemented (not yet deployed). Optional 2c/2d/2e deferred.
 
-> **For Claude:** Phase 1 is done (commit `39fd2f0`). Phase 2 is approved — implement it task-by-task with TDD (`superpowers:test-driven-development`). Read the "linchpin insight" and "at-least-once invariant" in the Phase 2 section before coding: at-least-once (never drop) is a hard constraint, and the plugin-side `commandId` dedup is the core mechanism (a daemon-only ledger does NOT fix the 2× because revive bypasses the plugin).
+> **For Claude:** Phase 1 is done (commit `39fd2f0`). Phase 2 core is done — see "Phase 2 implementation log" at the end. Read the "linchpin insight" and "at-least-once invariant" before touching this: at-least-once (never drop) is a hard constraint, and the plugin-side `commandId` dedup is the core mechanism (a daemon-only ledger does NOT fix the 2× because revive bypasses the plugin).
 
 ## Problem
 
@@ -279,3 +279,46 @@ Route question replies through the same idempotency so the
 2. Validate Phase 1: reply to a **busy** session; confirm ≤ 2× and never 0×.
 3. Phase 2: plugin + daemon changes → deploy both. Validate: reply to a busy
    session → exactly 1× in the common (plugin-alive) case; never 0×.
+
+---
+
+## Phase 2 implementation log (2026-06-03)
+
+Built the **core** (2a + 2b). Optional 2c/2d/2e were **not** built (see below).
+
+### What landed
+
+**2a — plugin execute sink idempotent on `commandId`:**
+- New `packages/opencode-plugin/src/execute-dedup.ts` → `withExecuteDedup(onExecute, { ttlMs?, now? })`. In-memory `Map<commandId, in_flight|succeeded>`; records the in-flight entry **synchronously before** invoking `onExecute` (deferred-promise pattern) so concurrent duplicate POSTs piggyback on one injection. Caches **successes only** (TTL default 1h); failures and throws are evicted so retries re-attempt (at-least-once). A repeat of a `succeeded` key returns the cached result with `output: "duplicate"`.
+- Wired in `startDirectChannelServer` (`direct-channel.ts`) so the sink is idempotent by construction for every caller (plugin `index.ts` and tests). New optional `DirectChannelOptions.executeDedup`.
+- Tests: `packages/opencode-plugin/test/execute-dedup.test.ts` (7 unit cases) + an HTTP-boundary case in `test/direct-channel.test.ts` (same `commandId` twice over the wire → `onExecute` once, 2nd response `output:"duplicate"`).
+- **Did not touch `index.ts`** (the uncommitted DEBUG instrumentation lives there). Wiring the dedup into `startDirectChannelServer` covers `index.ts`'s `onExecute` for free.
+
+**2b — re-enable the adapter retry (now safe):**
+- `packages/daemon/src/adapters/direct-channel.ts`: `maxRetries: 0` → `maxRetries: 1`. Small N (≤2×15s) keeps a single command under the worker's 60s lease and minimises blocking of the sequential poller. The retry carries the same `commandId`; the now-idempotent plugin dedups it → a landed-but-slow first attempt collapses to 1×.
+- Tests: new `packages/daemon/test/direct-channel-adapter.test.ts` (abort on attempt 1 → success on attempt 2 → `ok`, 2 fetches). Updated the integration "plugin handler throws exception (500)" case to expect **2** `onExecute` calls (throws aren't deduped → retried for at-least-once).
+
+### Deliberate deviations from the design above
+
+- **No `classifyDeliveryFailure` in `command-ingest`.** Under the at-least-once
+  constraint, both `ambiguous` (timeout) and `definitely_not_delivered`
+  (ECONNREFUSED) ultimately revive on persistent failure, so classification
+  would not change behaviour. The adapter's bounded idempotent retry handles the
+  ambiguous case; `command-ingest`'s existing `isConnectionError → revive` stays
+  as the last-resort safety net (unchanged). Adding a classifier would be dead
+  complexity. **`command-ingest.ts` was not modified.**
+- **2c (durable ledger), 2d (single sink + lint), 2e (question-reply path) not
+  built.** They are hardening for cross-restart dedup and sink-drift prevention;
+  the inbox + plugin dedup cover the common cases. Revisit only if cross-restart
+  duplicates show up in practice.
+
+### Resulting guarantee
+
+- **Common case (plugin alive):** busy-session reply → **1×** (adapter retry hits
+  the idempotent plugin).
+- **At-least-once preserved:** a turn that stays busy across both adapter attempts
+  falls through to the last-resort revive (possible 2×, **never 0×**). Plugin
+  death (ECONNREFUSED) → revive (1×, nothing landed).
+- **Residual:** plugin dedup is in-memory → a timeout followed by an
+  opencode-serve restart before the retry can still duplicate (revive bypasses
+  the plugin). Shrunk, not eliminated; only opencode-core idempotency removes it.

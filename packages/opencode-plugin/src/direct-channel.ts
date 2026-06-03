@@ -13,6 +13,7 @@ import {
   type ReplyQuestionEnvelope,
   type QuestionReplyResultEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
+import { withExecuteDedup, type ExecuteDedupOptions } from "./execute-dedup"
 
 export interface ExecuteResult {
   success: boolean
@@ -40,6 +41,13 @@ export interface DirectChannelOptions {
   host?: string
   port?: number
   authToken?: string
+  /**
+   * Tuning for the per-`commandId` execute dedup (Phase 2 idempotency). The
+   * execute path injects a non-idempotent prompt, so the server dedups by
+   * commandId to make the daemon's at-least-once retries effectively-once.
+   * See docs/plans/2026-06-03-triple-injection-idempotency-design.md (§2a).
+   */
+  executeDedup?: ExecuteDedupOptions
 }
 
 function bearerToken(req: IncomingMessage): string | null {
@@ -84,6 +92,11 @@ export async function startDirectChannelServer(options: DirectChannelOptions): P
   const host = options.host ?? "127.0.0.1"
   const port = options.port ?? 0
   const authToken = options.authToken ?? randomUUID()
+
+  // Make the execute sink idempotent on commandId so the daemon's at-least-once
+  // retries (and worker re-leases) inject at most once. This is the Phase 2
+  // linchpin — the plugin is the only place that can dedup the injection.
+  const onExecute = withExecuteDedup(options.onExecute, options.executeDedup)
 
   const server: Server = createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/pigeon/direct/health") {
@@ -170,7 +183,7 @@ export async function startDirectChannelServer(options: DirectChannelOptions): P
     }
 
     try {
-      const execution = await options.onExecute(payload)
+      const execution = await onExecute(payload)
       const result: CommandResultEnvelope = {
         type: OpencodeDirectMessageType.Result,
         version: OPENCODE_DIRECT_PROTOCOL_VERSION,

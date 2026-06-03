@@ -136,11 +136,12 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // The execute path is non-idempotent, so the direct-channel adapter makes a
-    // single attempt (maxRetries: 0). A retry on 500 could re-inject the prompt
-    // (the triple-injection bug), so onExecute is called exactly once.
-    // See docs/plans/2026-06-03-triple-injection-idempotency-design.md.
-    expect(onExecute).toHaveBeenCalledTimes(1);
+    // Phase 2: the adapter retries again (maxRetries: 1). A thrown handler is
+    // NOT cached by the plugin's commandId dedup (only successes are), so the
+    // retry re-invokes onExecute — correct for at-least-once, since a crash
+    // means nothing was injected. Hence onExecute is called twice.
+    // See docs/plans/2026-06-03-triple-injection-idempotency-design.md (§2b).
+    expect(onExecute).toHaveBeenCalledTimes(2);
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });

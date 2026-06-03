@@ -133,6 +133,46 @@ describe("direct channel server", () => {
     expect(body.result.errorMessage).toContain("boom")
   })
 
+  it("deduplicates execute by commandId: a repeated commandId injects only once", async () => {
+    const onExecute = vi.fn(async () => ({ success: true, output: "queued" }))
+    const server = await startDirectChannelServer({ onExecute })
+    closers.push(server.close)
+
+    const request = {
+      type: OpencodeDirectMessageType.Execute,
+      version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+      requestId: "req-dup",
+      commandId: "cmd-dup",
+      sessionId: "sess-dup",
+      command: "fix the bug",
+      source: OpencodeDirectSource.TelegramReply,
+      issuedAt: Date.now(),
+    }
+
+    const post = () =>
+      fetch(server.endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${server.authToken}`,
+        },
+        body: JSON.stringify(request),
+      })
+
+    const first = await post()
+    const firstBody = (await first.json()) as { result: { success: boolean; output?: string } }
+    const second = await post()
+    const secondBody = (await second.json()) as { result: { success: boolean; output?: string } }
+
+    // The non-idempotent injection ran exactly once...
+    expect(onExecute).toHaveBeenCalledTimes(1)
+    // ...but both requests get a successful ack/result (daemon can safely retry).
+    expect(firstBody.result.success).toBe(true)
+    expect(firstBody.result.output).toBe("queued")
+    expect(secondBody.result.success).toBe(true)
+    expect(secondBody.result.output).toBe("duplicate")
+  })
+
   it("passes media field from envelope to onExecute callback", async () => {
     let capturedRequest: { command?: string; media?: { mime: string; filename: string; url: string } } | null = null
     const onExecute = vi.fn(async (req: any) => {
