@@ -409,9 +409,13 @@ async function deliverViaAdapter(
   console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} error=${result.error}`);
 
   if (isConnectionError(result.error)) {
-    // Plugin endpoint is dead. If we have an opencodeClient, try the
-    // plugin-free fallback (revive-on-reply). Otherwise fall back to the
-    // original behavior of deleting the session.
+    // The plugin endpoint did not confirm delivery (connection refused, or a
+    // timeout where the plugin was alive but busy). We cannot tell whether the
+    // prompt was injected, so to guarantee at-least-once delivery we revive via
+    // opencode-serve directly. This may produce a duplicate when the original
+    // attempt did land — that is the accepted trade-off until Phase 2 adds an
+    // idempotency key. We must never drop the message.
+    // See docs/plans/2026-06-03-triple-injection-idempotency-design.md.
     if (options.opencodeClient) {
       const revived = await reviveAndDeliver(
         storage,

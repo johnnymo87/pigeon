@@ -38,6 +38,12 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         endpoint,
         authToken,
         source: OpencodeDirectSource.TelegramReply,
+        // The execute path injects a non-idempotent prompt (prompt_async). A
+        // retry after an ambiguous timeout/5xx could re-inject the same prompt
+        // (the triple-injection bug), so make a single attempt. Safe retries
+        // can return once delivery is idempotent (Phase 2). See
+        // docs/plans/2026-06-03-triple-injection-idempotency-design.md.
+        maxRetries: 0,
         ...(context.chatId !== undefined
           ? { chatId: String(context.chatId) }
           : {}),

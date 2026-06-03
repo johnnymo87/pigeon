@@ -932,6 +932,51 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
     });
   });
 
+  describe("at-least-once delivery on ambiguous timeout (never drop)", () => {
+    const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as ReviveAndDeliverDeps["spawn"];
+
+    it("still delivers via revive on a timeout — never drops a message (at-least-once)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-timeout",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-timeout", sessionId: "sess-timeout", command: "fix the bug", chatId: "7" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "Request timed out after 15000ms" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-timeout", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+        },
+      );
+
+      // A timeout is ambiguous: the plugin may not have injected. To guarantee
+      // at-least-once delivery we still revive — accepting a possible duplicate
+      // over a dropped message. (Exactly-once requires Phase 2 idempotency.)
+      expect(sendPromptCalls).toEqual([{ sid: "sess-timeout", dir: "/tmp/proj", prompt: "fix the bug" }]);
+      // Command acked (no unfinished inbox entries).
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+  });
+
   it("does not clean up sessions on business logic errors", async () => {
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
