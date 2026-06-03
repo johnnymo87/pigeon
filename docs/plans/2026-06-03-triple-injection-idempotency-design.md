@@ -1,9 +1,9 @@
 # Triple-Injection Fix: Idempotent Command Delivery Over At-Least-Once Transport
 
 **Date:** 2026-06-03
-**Status:** Design — Phase 1 approved for implementation; Phase 2 forward-looking
+**Status:** Phase 1 implemented + committed (`39fd2f0`, on `main`, not yet deployed). Phase 2 APPROVED for implementation.
 
-> **For Claude:** Phase 1 is implemented task-by-task with TDD (see `superpowers:test-driven-development`). Phase 2 is a forward-looking design captured here and tracked in beads; do **not** implement Phase 2 unless explicitly asked.
+> **For Claude:** Phase 1 is done (commit `39fd2f0`). Phase 2 is approved — implement it task-by-task with TDD (`superpowers:test-driven-development`). Read the "linchpin insight" and "at-least-once invariant" in the Phase 2 section before coding: at-least-once (never drop) is a hard constraint, and the plugin-side `commandId` dedup is the core mechanism (a daemon-only ledger does NOT fix the 2× because revive bypasses the plugin).
 
 ## Problem
 
@@ -152,26 +152,94 @@ key, not by dropping.
 
 ---
 
-## Phase 2 — Durable effectively-once (forward-looking; do NOT build yet)
+## Phase 2 — Effectively-once without dropping (APPROVED for implementation)
 
-Goal: make injection effectively-once across **both** sinks and across daemon /
-opencode-serve restarts, so we can safely re-enable retries.
+> **Status (2026-06-03):** Owner approved building Phase 2. Implement with TDD.
+> At-least-once is still the **hard invariant** — Phase 2 must never introduce a
+> drop. Goal: collapse the Phase-1 worst case (2×) to **1× in the common case
+> (plugin alive)** while preserving at-least-once.
 
-### 2a. One idempotent sink
+### The linchpin insight (read before coding)
 
-Introduce a single `injectUserCommandOnce({ commandId, sessionId, text, ... })`
-in the daemon. It is the **only** code allowed to call the plugin execute path or
-`reviveAndDeliver`/`sendPrompt`. Ban direct calls elsewhere (lint/code-review
-rule). This kills sink drift structurally.
+Phase 1 leaves a 2× because the timeout fallback **revives via
+`sendPrompt`, which bypasses the plugin**. A daemon-side dedup ledger ALONE does
+**not** fix this: on a timeout the daemon does not know the first attempt landed,
+so it cannot dedup its own fallback. The only place that can recognise "I already
+injected commandId X" on the retry is **the sink that performed the first
+injection** — i.e. the **plugin** (which owns `prompt_async`).
 
-### 2b. Durable idempotency ledger (better-sqlite3)
+Therefore the core of Phase 2 is **two coupled changes**:
+
+1. **Make the plugin execute path idempotent on `commandId`** (the sink dedups).
+2. **On an ambiguous timeout, retry through the (now idempotent) plugin instead
+   of reviving via `sendPrompt`.** Reserve revive for `definitely_not_delivered`
+   (ECONNREFUSED), where nothing was injected so there's nothing to duplicate.
+
+`commandId` is already globally unique per Telegram command (minted by the
+worker) and already travels in the execute envelope — no new key needed.
+
+### At-least-once invariant (the rule that prevents regressions)
+
+**Never skip or drop delivery based on uncertainty. Only the plugin may no-op,
+and only when it has positively recorded that `commandId` was already injected.**
+
+- Daemon side: keep retrying an ambiguous timeout (bounded) through the plugin.
+  If retries are exhausted and we still have no confirmation, fall back to revive
+  (`sendPrompt`) — accepting a possible duplicate — rather than dropping.
+- The existing `inbox` table already dedups worker **re-lease** of a command
+  whose status is `done` (`InboxRepository.persist` = `INSERT OR IGNORE`; skip if
+  `done`). Do not regress that.
+
+### 2a. Plugin-side idempotency on `commandId` (`packages/opencode-plugin/src/direct-channel.ts` / `index.ts`)
+
+In `onExecute`, before calling `prompt_async`:
+- Maintain `Map<commandId, { status: "in_flight" | "succeeded"; result?; expiresAt }>`.
+- **Record the entry synchronously BEFORE the first `await`** (prevents two
+  concurrent duplicate POSTs from both injecting).
+- If `commandId` already present:
+  - `succeeded` → return the cached success (`result.status = "duplicate"`), do
+    NOT call `prompt_async`.
+  - `in_flight` → await the in-flight promise (or return `duplicate` accepted).
+- After `prompt_async` resolves OK → mark `succeeded` (cache result).
+- TTL-evict entries (≈1h; must exceed the daemon's bounded-retry window). In-memory
+  only — lost on opencode-serve restart (see residual).
+- Tests (`packages/opencode-plugin/test/…` — mirror existing direct-channel tests):
+  same `commandId` twice → `prompt_async` called **once**; concurrent duplicates →
+  one injection; different `commandId` → two injections.
+
+### 2b. Daemon: retry-through-plugin on ambiguous, revive only on dead plugin
+
+Reintroduce `classifyDeliveryFailure(error)` →
+`"definitely_not_delivered" | "ambiguous" | "terminal"` (the version from the
+reverted Phase-1 Change C — see git history of this file / commit 39fd2f0's parent
+discussion). In `command-ingest.ts` `deliverViaAdapter`:
+- `ambiguous` (timeout/reset) → re-attempt via the **plugin** adapter, bounded
+  (e.g. up to N attempts with backoff, total < 60s worker lease). The plugin
+  dedups, so a landed-first-attempt yields 1×. On success → `markDone`. If all
+  attempts remain ambiguous → revive via `sendPrompt` as last resort (possible
+  dup, never drop) → `markDone`.
+- `definitely_not_delivered` (ECONNREFUSED/DNS/`fetch failed`) → revive
+  immediately (existing path; safe, nothing landed).
+- `terminal` → unchanged (ack, move on).
+- Re-enable the adapter retry for execute **only** once the plugin is idempotent
+  (i.e. revert Phase-1 `maxRetries: 0` to a small N), OR drive retries from
+  `command-ingest`. Pick one layer; don't double-retry.
+- Tests: ambiguous timeout where plugin "already saw commandId" → exactly one
+  injection end-to-end; ambiguous where plugin never got it → redelivered;
+  ECONNREFUSED → revive; nothing ever dropped.
+
+### 2c. (Optional hardening) durable injection ledger (better-sqlite3)
+
+Only needed to dedup across **daemon restarts** and to record `unknown` for
+later reconciliation. The inbox + plugin dedup cover the common cases; add this
+only if cross-restart duplicates prove to matter in practice.
 
 ```sql
 CREATE TABLE IF NOT EXISTS injection_idempotency (
   idempotency_key   TEXT PRIMARY KEY,   -- 'opencode-inject:v1:<machineId>:<commandId>'
   command_id        TEXT NOT NULL,
   session_id        TEXT NOT NULL,
-  payload_hash      TEXT NOT NULL,      -- sha256(sessionId + '\0' + text); reuse-with-different-payload = loud error
+  payload_hash      TEXT NOT NULL,      -- sha256(sessionId + '\0' + text); reuse w/ different payload = loud error
   status            TEXT NOT NULL,      -- 'in_flight' | 'succeeded' | 'failed_terminal' | 'unknown'
   first_attempt_at  INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL,
@@ -179,45 +247,35 @@ CREATE TABLE IF NOT EXISTS injection_idempotency (
   result_json       TEXT
 );
 ```
+**Skip delivery ONLY when status = `succeeded`.** `in_flight`/`unknown`/absent →
+deliver (at-least-once). TTL ≥ 24h (must exceed the full replay horizon, not just
+the 60s lease).
 
-Flow: `INSERT OR IGNORE` the key as `in_flight` **before** injecting. If the row
-already exists → skip (duplicate) and ack. After injecting, set `succeeded`.
-On ambiguous failure → `unknown` (hold for reconciliation; do not blind-retry).
-On terminal → `failed_terminal`. TTL ≥ 24h (must exceed the full replay horizon:
-worker 60s lease + daemon retry + restart/recovery + manual replay + D1
-retention), **not** just the 60s lease.
+### 2d. (Optional) one idempotent sink + lint guard
 
-### 2c. Plugin-side in-memory dedup (defense-in-depth)
+Funnel the plugin path and `reviveAndDeliver` through a single
+`injectUserCommandOnce({ commandId, sessionId, text })` and ban direct
+`prompt_async`/`sendPrompt` calls elsewhere, so the two sinks can't drift again.
 
-Record the key **synchronously before the first `await`** (in-flight map) so two
-duplicate POSTs racing into the plugin can't both inject. Returns cached result
-on repeat. In-memory only — a shield, not the source of truth (lost on restart).
+### 2e. (Optional) question-reply path
 
-### 2d. Re-enable safe retries + ack semantics
-
-Once the sink is idempotent, retrying ambiguous timeouts becomes safe (the retry
-carries the key). The plugin should ack on **durable acceptance**, distinguishing
-transport-ack / side-effect-result / agent-result. Response shape: `result.status`
-∈ `queued | duplicate`.
-
-### 2e. Also covers the question-reply path
-
-Route question replies through the same ledger so the
+Route question replies through the same idempotency so the
 `throwIfTransientQuestionReplyFailure` → worker re-lease loop can't double-deliver
-(currently mostly masked by opencode's "already answered" behavior).
+(currently mostly masked by opencode's "already answered" response).
 
-### Long term
+### Residual / long term
 
-If opencode ever accepts an idempotency key / metadata on a user message, move
-the dedup boundary into opencode's transcript append — the only place that can
-make injection *truly* effectively-once.
+- Plugin dedup is in-memory: a timeout followed by an opencode-serve **restart**
+  before the daemon's retry can still duplicate (new plugin has no memory; revive
+  bypasses it). Durable plugin dedup (2c) or reconciliation shrinks this; only
+  opencode-core accepting an idempotency key on message-append removes it fully.
 
 ---
 
 ## Rollout
 
-1. Phase 1 lands on `main`, deploy daemon per `cross-device-deployment`. No worker
-   or plugin changes required for Phase 1 (daemon-only).
-2. Validate with the bug repro: reply to a busy session; confirm a single
-   injection and a clean ack.
-3. Phase 2 scheduled separately (beads).
+1. Phase 1 (commit `39fd2f0`) lands on `main`; deploy daemon per
+   `cross-device-deployment` (daemon-only; no worker/plugin changes).
+2. Validate Phase 1: reply to a **busy** session; confirm ≤ 2× and never 0×.
+3. Phase 2: plugin + daemon changes → deploy both. Validate: reply to a busy
+   session → exactly 1× in the common (plugin-alive) case; never 0×.
