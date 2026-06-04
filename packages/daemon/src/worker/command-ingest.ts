@@ -43,7 +43,26 @@ export interface WorkerCommandIngestOptions {
   sendTelegramReply?: (chatId: string, text: string) => Promise<void>;
   /** Injected spawn for testing (passed through to reviveAndDeliver). */
   spawn?: ReviveAndDeliverDeps["spawn"];
+  /**
+   * Total wall-clock budget for retrying an *ambiguous* (plugin-alive-but-busy)
+   * delivery through the idempotent plugin before falling back to revive.
+   * Kept under the worker's 60s lease. Defaults to {@link DEFAULT_DELIVERY_BUDGET_MS}.
+   */
+  deliveryBudgetMs?: number;
+  /** Injectable clock for testing the delivery budget. */
+  now?: () => number;
+  /** Injectable sleep for testing the retry backoff. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * How long we keep retrying an ambiguous delivery through the idempotent plugin
+ * before reviving. Each ambiguous attempt can take ~15s (the adapter's abort
+ * timeout), so ~40s allows up to ~3 attempts and still leaves headroom under the
+ * 60s lease for the revive + ack. The plugin dedups on commandId, so these
+ * retries collapse a landed-but-slow first attempt to a single injection.
+ */
+export const DEFAULT_DELIVERY_BUDGET_MS = 40_000;
 
 const QUESTION_OPTION_RE = /^q(\d+)$/;
 const WIZARD_OPTION_RE = /^v(\d+):q(\d+)$/;
@@ -361,18 +380,43 @@ export async function ingestWorkerCommand(
 
 
 
-function isConnectionError(error: string | undefined): boolean {
-  if (!error) return false;
+/**
+ * Classify a failed delivery so we can decide whether retrying *through the
+ * plugin* can help, vs. going straight to the revive fallback, vs. giving up.
+ *
+ * - `ambiguous`: a timeout/abort. The plugin may be alive but busy (event-loop
+ *   starved mid-turn); the injection may or may not have landed. Retrying
+ *   through the idempotent plugin can still produce a clean 1× delivery, so we
+ *   retry within the budget before reviving.
+ * - `definitely_not_delivered`: a connection-level failure (refused/DNS/network).
+ *   The plugin process is unreachable, so retrying it is pointless — revive now.
+ * - `terminal`: anything else (e.g. the plugin actively rejected the command).
+ *   Ack and move on; neither retry nor revive would help.
+ */
+type DeliveryFailureKind = "ambiguous" | "definitely_not_delivered" | "terminal";
+
+function classifyDeliveryFailure(error: string | undefined): DeliveryFailureKind {
+  if (!error) return "terminal";
   const lower = error.toLowerCase();
-  return (
+  if (lower.includes("timed out") || lower.includes("abort")) {
+    return "ambiguous";
+  }
+  if (
     lower.includes("unable to connect") ||
     lower.includes("econnrefused") ||
     lower.includes("connection refused") ||
-    lower.includes("timed out") ||
-    lower.includes("abort") ||
     lower.includes("fetch failed") ||
     lower.includes("network error")
-  );
+  ) {
+    return "definitely_not_delivered";
+  }
+  return "terminal";
+}
+
+function isConnectionError(error: string | undefined): boolean {
+  // Both ambiguous (timeout) and definitely-not-delivered failures warrant the
+  // revive fallback; only terminal failures do not.
+  return classifyDeliveryFailure(error) !== "terminal";
 }
 
 function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
@@ -392,21 +436,46 @@ async function deliverViaAdapter(
   media?: CommandDeliveryContext["media"],
 ): Promise<void> {
   const modelOverride = storage.sessions.getModelOverride(session.sessionId) ?? undefined;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const budgetMs = options.deliveryBudgetMs ?? DEFAULT_DELIVERY_BUDGET_MS;
 
-  const result = await adapter.deliverCommand(session, msg.command, {
-    commandId,
-    chatId: msg.chatId,
-    ...(modelOverride ? { modelOverride } : {}),
-    ...(media ? { media } : {}),
-  });
+  const deliver = () =>
+    adapter.deliverCommand(session, msg.command, {
+      commandId,
+      chatId: msg.chatId,
+      ...(modelOverride ? { modelOverride } : {}),
+      ...(media ? { media } : {}),
+    });
+
+  const startedAt = now();
+  let result = await deliver();
+  let attempts = 1;
+
+  // Retry an *ambiguous* failure (plugin alive but busy) through the idempotent
+  // plugin until the budget is exhausted. The plugin dedups on commandId, so a
+  // landed-but-slow first attempt collapses to a single injection (1×) instead
+  // of falling through to the revive fallback (which bypasses the plugin dedup
+  // and would duplicate). definitely_not_delivered / terminal failures skip this
+  // loop — retrying a dead/​rejecting plugin can't help.
+  while (
+    !result.ok &&
+    classifyDeliveryFailure(result.error) === "ambiguous" &&
+    now() - startedAt < budgetMs
+  ) {
+    await sleep(Math.min(1_000 * attempts, 5_000));
+    if (now() - startedAt >= budgetMs) break;
+    result = await deliver();
+    attempts++;
+  }
 
   if (result.ok) {
-    console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId}`);
+    console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts}`);
     storage.inbox.markDone(commandId);
     return;
   }
 
-  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} error=${result.error}`);
+  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}`);
 
   if (isConnectionError(result.error)) {
     // The plugin endpoint did not confirm delivery (connection refused, or a

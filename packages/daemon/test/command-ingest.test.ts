@@ -963,6 +963,9 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
             async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
           },
           spawn: mockSpawn,
+          // Budget 0 = no plugin retries: exercise the "budget exhausted → revive"
+          // last-resort path directly (the retry path is covered separately below).
+          deliveryBudgetMs: 0,
         },
       );
 
@@ -1013,10 +1016,105 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
             async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
           },
           spawn: mockSpawn,
+          deliveryBudgetMs: 0,
         },
       );
 
       expect(sendPromptCalls).toEqual([{ sid: "sess-internal", dir: "/tmp/proj", prompt: "fix the bug" }]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("retries an ambiguous failure through the plugin within budget, then succeeds (no revive)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-retry-ok",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+      let calls = 0;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-retry-ok", sessionId: "sess-retry-ok", command: "fix the bug", chatId: "7" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              calls++;
+              // Busy first (ambiguous timeout), then the plugin frees up and the
+              // idempotent retry returns success.
+              if (calls === 1) return { ok: false, error: "Request timed out after 15000ms" };
+              return { ok: true };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-retry-ok", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+          deliveryBudgetMs: 40_000,
+          sleep: async () => {},
+        },
+      );
+
+      // Retried through the plugin and succeeded — no revive (no duplicate).
+      expect(calls).toBe(2);
+      expect(sendPromptCalls).toHaveLength(0);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("retries within budget then revives when the plugin stays busy (never drops)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-retry-revive",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+      let calls = 0;
+      // Deterministic clock: each read advances 30ms; with a 100ms budget the
+      // loop runs a couple of retries before the budget is exhausted.
+      let clock = 0;
+      const now = () => { clock += 30; return clock; };
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-retry-revive", sessionId: "sess-retry-revive", command: "fix the bug", chatId: "7" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              calls++;
+              return { ok: false, error: "Request timed out after 15000ms" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-retry-revive", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+          deliveryBudgetMs: 100,
+          now,
+          sleep: async () => {},
+        },
+      );
+
+      // Retried through the plugin more than once, then revived as a last resort.
+      expect(calls).toBeGreaterThan(1);
+      expect(sendPromptCalls).toEqual([{ sid: "sess-retry-revive", dir: "/tmp/proj", prompt: "fix the bug" }]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();

@@ -43,21 +43,16 @@ function successResponse(): Response {
   );
 }
 
-describe("DirectChannelAdapter execute retry (Phase 2)", () => {
-  // Phase 1 set maxRetries: 0 on the execute path because a retry re-injected a
-  // non-idempotent prompt. Phase 2 makes the plugin sink idempotent on
-  // commandId, so the adapter may safely retry an ambiguous timeout again — the
-  // retry carries the same commandId and the plugin dedups it.
+describe("DirectChannelAdapter execute (Phase 2)", () => {
+  // The execute path makes a SINGLE attempt per call. Retrying a non-idempotent
+  // injection is the responsibility of command-ingest's deadline-aware budget
+  // loop (which retries ambiguous timeouts through the now-idempotent plugin),
+  // so the retry lives in exactly one layer. Here we lock that the adapter does
+  // NOT retry on its own (an ambiguous timeout returns a single-attempt failure).
   // See docs/plans/2026-06-03-triple-injection-idempotency-design.md (§2b).
-  it("retries the execute path on an ambiguous timeout and succeeds", async () => {
-    let calls = 0;
+  it("makes a single attempt and does not retry on an ambiguous timeout", async () => {
     const fetchFn = vi.fn(async () => {
-      calls++;
-      if (calls === 1) {
-        // Simulate the daemon aborting a slow plugin (ambiguous timeout).
-        throw new Error("The operation was aborted");
-      }
-      return successResponse();
+      throw new Error("The operation was aborted");
     });
 
     const adapter = new DirectChannelAdapter({
@@ -70,8 +65,25 @@ describe("DirectChannelAdapter execute retry (Phase 2)", () => {
       chatId: "5",
     });
 
+    expect(result.ok).toBe(false);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect((result.meta as { attempts?: number } | undefined)?.attempts).toBe(1);
+  });
+
+  it("succeeds on a single attempt when the plugin responds ok", async () => {
+    const fetchFn = vi.fn(async () => successResponse());
+
+    const adapter = new DirectChannelAdapter({
+      fetchFn: fetchFn as unknown as typeof fetch,
+      sleep: async () => {},
+    });
+
+    const result = await adapter.deliverCommand(makeSession(), "fix the bug", {
+      commandId: "c1",
+      chatId: "5",
+    });
+
     expect(result.ok).toBe(true);
-    expect(fetchFn).toHaveBeenCalledTimes(2);
-    expect((result.meta as { attempts?: number } | undefined)?.attempts).toBe(2);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });

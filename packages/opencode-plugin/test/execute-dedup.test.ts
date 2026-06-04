@@ -8,7 +8,10 @@ import {
 import type { ExecuteResult } from "../src/direct-channel"
 import { withExecuteDedup } from "../src/execute-dedup"
 
-function makeEnvelope(commandId: string): ExecuteCommandEnvelope {
+function makeEnvelope(
+  commandId: string,
+  overrides: Partial<ExecuteCommandEnvelope> = {},
+): ExecuteCommandEnvelope {
   return {
     type: OpencodeDirectMessageType.Execute,
     version: OPENCODE_DIRECT_PROTOCOL_VERSION,
@@ -18,6 +21,7 @@ function makeEnvelope(commandId: string): ExecuteCommandEnvelope {
     command: "do thing",
     source: OpencodeDirectSource.TelegramReply,
     issuedAt: 0,
+    ...overrides,
   }
 }
 
@@ -130,6 +134,48 @@ describe("withExecuteDedup", () => {
     await wrapped(makeEnvelope("c1"))
     t += 101
     await wrapped(makeEnvelope("c1"))
+
+    expect(onExecute).toHaveBeenCalledTimes(2)
+  })
+
+  it("treats a reused commandId with a DIFFERENT payload as a distinct delivery (never drops it)", async () => {
+    const onExecute = vi.fn(async (req: ExecuteCommandEnvelope): Promise<ExecuteResult> => ({
+      success: true,
+      output: `queued:${req.command}`,
+    }))
+    const log = vi.fn()
+    const wrapped = withExecuteDedup(onExecute, { log })
+
+    const r1 = await wrapped(makeEnvelope("c1", { command: "first message" }))
+    const r2 = await wrapped(makeEnvelope("c1", { command: "SECOND, different message" }))
+
+    // The second (different) payload must be delivered, not silently deduped to
+    // the first's cached success — that would drop a user message.
+    expect(onExecute).toHaveBeenCalledTimes(2)
+    expect(r1.output).toBe("queued:first message")
+    expect(r2.output).toBe("queued:SECOND, different message")
+    expect(r2.output).not.toBe("duplicate")
+    // ...and the anomaly is surfaced loudly for operators.
+    expect(log).toHaveBeenCalled()
+  })
+
+  it("still dedups a reused commandId with the SAME payload", async () => {
+    const onExecute = vi.fn(async (): Promise<ExecuteResult> => ({ success: true, output: "queued" }))
+    const wrapped = withExecuteDedup(onExecute)
+
+    await wrapped(makeEnvelope("c1", { command: "same text", media: { mime: "image/png", filename: "a.png", url: "data:image/png;base64,AAAA" } }))
+    const r2 = await wrapped(makeEnvelope("c1", { command: "same text", media: { mime: "image/png", filename: "a.png", url: "data:image/png;base64,AAAA" } }))
+
+    expect(onExecute).toHaveBeenCalledTimes(1)
+    expect(r2.output).toBe("duplicate")
+  })
+
+  it("treats a reused commandId with different media as a distinct delivery", async () => {
+    const onExecute = vi.fn(async (): Promise<ExecuteResult> => ({ success: true, output: "queued" }))
+    const wrapped = withExecuteDedup(onExecute)
+
+    await wrapped(makeEnvelope("c1", { command: "look", media: { mime: "image/png", filename: "a.png", url: "data:image/png;base64,AAAA" } }))
+    await wrapped(makeEnvelope("c1", { command: "look", media: { mime: "image/png", filename: "b.png", url: "data:image/png;base64,BBBB" } }))
 
     expect(onExecute).toHaveBeenCalledTimes(2)
   })

@@ -136,12 +136,12 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // Phase 2: the adapter retries again (maxRetries: 1). A thrown handler is
-    // NOT cached by the plugin's commandId dedup (only successes are), so the
-    // retry re-invokes onExecute — correct for at-least-once, since a crash
-    // means nothing was injected. Hence onExecute is called twice.
+    // The adapter makes a single attempt; a plugin crash surfaces as a 500
+    // result which command-ingest classifies as terminal (no connection
+    // keywords) → acked, not retried/revived. (Retrying happens only for
+    // *ambiguous* timeouts, in command-ingest's budget loop.) onExecute once.
     // See docs/plans/2026-06-03-triple-injection-idempotency-design.md (§2b).
-    expect(onExecute).toHaveBeenCalledTimes(2);
+    expect(onExecute).toHaveBeenCalledTimes(1);
     expect(storage.inbox.listUnfinished()).toHaveLength(1);
     storage.db.close();
   });
