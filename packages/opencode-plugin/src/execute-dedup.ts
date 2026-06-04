@@ -71,7 +71,20 @@ export function withExecuteDedup(
     })
     cache.set(key, { status: "in_flight", promise, expiresAt: t + ttlMs })
 
-    onExecute(request).then(
+    // Invoke onExecute synchronously (so concurrent duplicates coalesce on the
+    // in-flight entry), but guard against a *synchronous* throw — otherwise it
+    // would escape this function and leave the in-flight entry permanently stuck
+    // until TTL eviction, hanging every duplicate in the meantime.
+    let execution: Promise<ExecuteResult>
+    try {
+      execution = onExecute(request)
+    } catch (error) {
+      cache.delete(key)
+      rejectOuter(error)
+      return promise
+    }
+
+    execution.then(
       (result) => {
         if (result.success) {
           cache.set(key, { status: "succeeded", result, expiresAt: now() + ttlMs })

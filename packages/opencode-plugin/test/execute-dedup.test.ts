@@ -93,6 +93,34 @@ describe("withExecuteDedup", () => {
     expect(onExecute).toHaveBeenCalledTimes(2)
   })
 
+  it("converts a synchronous onExecute throw into a rejection and recovers (no stuck in-flight)", async () => {
+    const onExecute = vi
+      .fn<() => Promise<ExecuteResult>>()
+      .mockImplementationOnce(() => {
+        throw new Error("sync boom")
+      })
+      .mockImplementationOnce(async () => ({ success: true, output: "queued" }))
+    const wrapped = withExecuteDedup(onExecute)
+
+    // The wrapper must REJECT, not throw synchronously (a sync throw escapes the
+    // returned function and leaves the in-flight entry permanently stuck).
+    let threwSync = false
+    let p: Promise<ExecuteResult>
+    try {
+      p = wrapped(makeEnvelope("c1"))
+    } catch (err) {
+      threwSync = true
+      p = Promise.reject(err)
+    }
+    expect(threwSync).toBe(false)
+    await expect(p).rejects.toThrow("sync boom")
+
+    // A second call must re-attempt (the stuck in-flight entry must be cleared).
+    const r2 = await wrapped(makeEnvelope("c1"))
+    expect(r2.success).toBe(true)
+    expect(onExecute).toHaveBeenCalledTimes(2)
+  })
+
   it("re-attempts after the dedup entry expires (TTL)", async () => {
     let t = 1_000
     const now = () => t

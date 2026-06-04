@@ -975,6 +975,52 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
 
       storage.db.close();
     });
+
+    // The plugin's onExecute returns { success: false } (HTTP 200) when its own
+    // POST to prompt_async times out / aborts internally (opencode-serve busy).
+    // The adapter surfaces that as a non-retryable failure carrying the abort
+    // message. This must still be treated as ambiguous → revive (never a
+    // terminal drop). Regression guard for the Phase 2 review (2026-06-03).
+    it.each([
+      "The operation timed out",
+      "This operation was aborted",
+      "prompt_async failed: AbortError",
+    ])("revives on an ambiguous plugin-internal failure: %s", async (errorMessage) => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-internal",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-internal", sessionId: "sess-internal", command: "fix the bug", chatId: "8" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: errorMessage };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-internal", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+        },
+      );
+
+      expect(sendPromptCalls).toEqual([{ sid: "sess-internal", dir: "/tmp/proj", prompt: "fix the bug" }]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
   });
 
   it("does not clean up sessions on business logic errors", async () => {
