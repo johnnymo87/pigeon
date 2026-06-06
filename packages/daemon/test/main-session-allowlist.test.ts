@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { enumerateMainSessionSids, type AllowlistDeps } from "../src/main-session-allowlist";
+import {
+  enumerateMainSessionSids,
+  type AllowlistDeps,
+  parsePids,
+} from "../src/main-session-allowlist";
 
 interface MockDepsOptions {
   mainPanePids?: number[];
@@ -213,5 +217,45 @@ describe("enumerateMainSessionSids", () => {
     });
     const result = await enumerateMainSessionSids(deps);
     expect(result).toEqual([]);
+  });
+
+  it("yields session from wrapped binary name in argv attach branch", async () => {
+    const deps = makeDeps({
+      mainPanePids: [1000],
+      cmdlines: {
+        1000: "/nix/store/xxx/bin/.opencode-wrapped attach http://127.0.0.1:4096 --session ses_ABC --dir /p",
+      },
+    });
+    const result = await enumerateMainSessionSids(deps);
+    expect(result).toEqual(["ses_ABC"]);
+  });
+
+  it("yields session from wrapped binary name in bare TUI branch", async () => {
+    const deps = makeDeps({
+      mainPanePids: [1000],
+      cmdlines: {
+        1000: "/nix/store/xxx/bin/.opencode-wrapped",
+      },
+      cwds: {
+        1000: "/home/dev/projects/pigeon",
+      },
+      sidsByDir: {
+        "/home/dev/projects/pigeon": "ses_XYZ",
+      },
+    });
+    const result = await enumerateMainSessionSids(deps);
+    expect(result).toEqual(["ses_XYZ"]);
+  });
+});
+
+describe("parsePids", () => {
+  it("parses lines of numeric strings into an array of PIDs", () => {
+    const input = "1000\n2000\n  \n3000  \nfoo\n4000\n";
+    expect(parsePids(input)).toEqual([1000, 2000, 3000, 4000]);
+  });
+
+  it("returns empty array for empty or whitespace-only input", () => {
+    expect(parsePids("")).toEqual([]);
+    expect(parsePids("   \n  \n")).toEqual([]);
   });
 });

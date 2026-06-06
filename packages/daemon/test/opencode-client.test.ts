@@ -572,4 +572,123 @@ describe("OpencodeClient", () => {
       await expect(client.getSession("ses_x")).rejects.toThrow(/missing id or directory/);
     });
   });
+
+  describe("getSessionInfo", () => {
+    it("returns session info when opencode-serve responds 200 with directory, title, and times", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({
+          id: "ses_abc",
+          title: "My Session",
+          directory: "/home/dev/projects/pigeon",
+          time: { created: 12345678, updated: 12345679 }
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      const result = await client.getSessionInfo("ses_abc");
+
+      expect(result).toEqual({
+        id: "ses_abc",
+        title: "My Session",
+        directory: "/home/dev/projects/pigeon",
+        time: { created: 12345678, updated: 12345679 }
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4096/session/ses_abc",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("returns null when response is 404", async () => {
+      const fetchMock = vi.fn(async () => new Response("not found", { status: 404 }));
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      expect(await client.getSessionInfo("ses_gone")).toBeNull();
+    });
+
+    it("throws on other non-OK statuses", async () => {
+      const fetchMock = vi.fn(async () => new Response("oops", { status: 500 }));
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.getSessionInfo("ses_x")).rejects.toThrow(/getSessionInfo failed.*500/);
+    });
+
+    it("defaults missing title and times", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({
+          id: "ses_abc",
+          directory: "/home/dev/projects/pigeon"
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      const result = await client.getSessionInfo("ses_abc");
+
+      expect(result).toEqual({
+        id: "ses_abc",
+        title: "",
+        directory: "/home/dev/projects/pigeon",
+        time: { created: 0, updated: 0 }
+      });
+    });
+
+    it("throws when response is missing id or directory", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ id: "ses_abc" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.getSessionInfo("ses_abc")).rejects.toThrow(/missing id or directory/);
+    });
+  });
+
+  describe("listSessionsByDirectory", () => {
+    it("calls GET /session with directory, roots=true, limit=1 and returns parsed array", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify([{ id: "ses_abc", title: "My Session" }]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      const result = await client.listSessionsByDirectory("/home/user/project");
+
+      expect(result).toEqual([{ id: "ses_abc", title: "My Session" }]);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4096/session?directory=%2Fhome%2Fuser%2Fproject&roots=true&limit=1",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("returns empty array when no session is found", async () => {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      const result = await client.listSessionsByDirectory("/home/user/project");
+
+      expect(result).toEqual([]);
+    });
+
+    it("throws on non-OK status", async () => {
+      const fetchMock = vi.fn(async () => new Response("internal error", { status: 500 }));
+      const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
+
+      await expect(client.listSessionsByDirectory("/home/user/project")).rejects.toThrow(/listSessionsByDirectory failed.*500/);
+    });
+  });
 });
