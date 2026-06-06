@@ -154,3 +154,54 @@ for `/launch`, so socket access is a solved problem (same process env). If a
   `reset-workspace`. If the "main TUI" definition churns, both must change. If
   this becomes a maintenance burden, lift the scan into a shared
   `main-session-sids` workstation binary (the rejected Approach B).
+
+## Post-launch revision (2026-06-06): drop the bare-cwd branch
+
+**Status: APPROVED by user, NOT YET IMPLEMENTED.** The feature shipped and
+deployed (pigeon `origin/main` @ `b001fb3`; workstation `43aa691`; worker
+`ccr-router` v`a92b5348`; daemon restarted with `TMUX_BIN`/`PGREP_BIN`). A live
+run surfaced a lot of automation-session noise (lgtm dispatch, morning-agent /
+"context enrichment", review sessions).
+
+**Root cause (debugged on cloudbox):** the **bare-cwd branch** is the noise
+source. Bare `opencode` TUIs (`:te opencode`, no `--session`, genuine TUIs under
+nvim panes in `main`) cd'd into broad project-root dirs resolve via
+`GET /session?directory=<cwd>&roots=true&limit=1` to whatever root session most
+recently ran in that dir — frequently automation (lgtm in `~/projects/lgtm`,
+morning-agent in `~/projects/workstation`). Session metadata gives NO clean
+filter signal: lgtm/morning-agent and real work are all `agent:"build"`,
+`parentID:null`, random slugs. The morning-agent session lives in
+`~/projects/workstation` (a real work dir), so a directory denylist can't remove
+it without hiding workstation work. The structural signal is the branch itself:
+the argv `--session` branch is deterministic and matches sessions the user's
+tooling (oc-auto-attach / `/launch` / swarm) deliberately attached.
+
+**Decision:** DROP the bare-cwd branch. `/current-state` shows only TUIs with an
+explicit `--session ses_xxx` in argv. (The orphaned lgtm `--session` TUI whose
+session 404s is already handled: counted "unreadable", no card.)
+
+**Exact changes (TDD; one focused commit):**
+1. `packages/daemon/src/main-session-allowlist.ts`: remove the bare branch from
+   `enumerateMainSessionSids` (keep the argv `--session` branch, subtree walk,
+   exe filter, regexes, `parsePids`). Remove `readCwd` and `resolveSidByDir` from
+   `AllowlistDeps`. `makeLiveDeps` no longer builds those and no longer needs the
+   opencodeClient arg → `makeLiveDeps(): AllowlistDeps`.
+2. `packages/daemon/test/main-session-allowlist.test.ts`: invert/remove the
+   bare-branch tests — a bare `…/opencode` TUI (no `--session`) now yields NO sid.
+   Drop `readCwd`/`resolveSidByDir` from the mock deps. Keep argv / subtree /
+   dedupe / empty / `-wrapped` / serve-excluded / sid-charset tests. The
+   tail/vim/serve "contributes nothing" assertions still hold.
+3. `packages/daemon/src/opencode-client.ts`: remove `listSessionsByDirectory`
+   (added in Task 5 solely for `resolveSidByDir`; grep to confirm no other user).
+4. `packages/daemon/test/opencode-client.test.ts`: remove its tests.
+5. `packages/daemon/src/index.ts`: `makeLiveDeps(opencodeClient)` →
+   `makeLiveDeps()`.
+6. `current-state-enrich.ts` / `current-state-ingest.ts` / formatters: unchanged
+   (`getSessionInfo` + `getSessionMessages` still used).
+
+**Verify:** `npm run typecheck` + `npm run --workspace @pigeon/daemon test` green.
+**Deploy (no Nix change this time):** push pigeon; on cloudbox
+`cd ~/projects/pigeon && git pull` then `sudo systemctl restart
+pigeon-daemon.service` (tsx reloads source; the unit is unchanged so NO
+nixos-rebuild). Worker is unaffected (no worker change). Then user re-tests
+`/current-state`.
