@@ -157,7 +157,9 @@ for `/launch`, so socket access is a solved problem (same process env). If a
 
 ## Post-launch revision (2026-06-06): drop the bare-cwd branch
 
-**Status: APPROVED by user, NOT YET IMPLEMENTED.** The feature shipped and
+**Status: IMPLEMENTED & DEPLOYED** (pigeon `origin/main` @ `aff936c`; daemon
+restarted on cloudbox 2026-06-06; live enumeration confirmed the lgtm/morning-agent
+noise is gone — only deterministic `--session` sessions remain). The feature shipped and
 deployed (pigeon `origin/main` @ `b001fb3`; workstation `43aa691`; worker
 `ccr-router` v`a92b5348`; daemon restarted with `TMUX_BIN`/`PGREP_BIN`). A live
 run surfaced a lot of automation-session noise (lgtm dispatch, morning-agent /
