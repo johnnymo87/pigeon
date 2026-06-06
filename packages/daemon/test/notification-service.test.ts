@@ -6,6 +6,9 @@ import {
   TelegramNotificationService,
   WorkerNotificationService,
   type WorkerNotificationSender,
+  relativeTime,
+  formatStateCard,
+  formatCurrentStateIndex,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";
 import { openStorageDb } from "../src/storage/database";
@@ -735,5 +738,163 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
     }
 
     storage.db.close();
+  });
+});
+
+describe("current-state formatting helpers", () => {
+  describe("relativeTime", () => {
+    it("handles boundary cases correctly", () => {
+      const now = 10000000;
+      // Future
+      expect(relativeTime(now + 1, now)).toBe("just now");
+      expect(relativeTime(now + 100000, now)).toBe("just now");
+      // Just now (< 60_000)
+      expect(relativeTime(now, now)).toBe("just now");
+      expect(relativeTime(now - 1, now)).toBe("just now");
+      expect(relativeTime(now - 59999, now)).toBe("just now");
+      // Minutes (< 3_600_000)
+      expect(relativeTime(now - 60000, now)).toBe("1m ago");
+      expect(relativeTime(now - 119000, now)).toBe("1m ago");
+      expect(relativeTime(now - 120000, now)).toBe("2m ago");
+      expect(relativeTime(now - 3599000, now)).toBe("59m ago");
+      // Hours (< 86_400_000)
+      expect(relativeTime(now - 3600000, now)).toBe("1h ago");
+      expect(relativeTime(now - 7199000, now)).toBe("1h ago");
+      expect(relativeTime(now - 7200000, now)).toBe("2h ago");
+      expect(relativeTime(now - 86399000, now)).toBe("23h ago");
+      // Days (>= 86_400_000)
+      expect(relativeTime(now - 86400000, now)).toBe("1d ago");
+      expect(relativeTime(now - 172799000, now)).toBe("1d ago");
+      expect(relativeTime(now - 172800000, now)).toBe("2d ago");
+    });
+  });
+
+  describe("formatStateCard", () => {
+    const now = 10000000;
+
+    it("formats active status with snippet and lastActivity", () => {
+      const card = formatStateCard({
+        title: "Active Session",
+        status: "active",
+        dir: "/home/dev/projects/workstation",
+        sid: "sess-active",
+        snippet: "Working on some feature...",
+        lastActivity: now - 120000, // 2m ago
+        machineId: "devbox",
+      }, now);
+
+      expect(card.text).toContain("🟢 Active Session");
+      expect(card.text).toContain("Working on some feature...");
+      expect(card.text).toContain("📂 projects/workstation · 🖥 devbox");
+      expect(card.text).toContain("🆔 sess-active");
+      expect(card.text).toContain("Swipe-reply to respond · 2m ago");
+      expect(card.text).toContain("🆔 sess-active\n↩️ Swipe-reply to respond · 2m ago");
+
+      // Verify entities
+      const bold = card.entities.find(e => e.type === "bold");
+      expect(bold).toBeDefined();
+      expect(card.text.slice(bold!.offset, bold!.offset + bold!.length)).toBe("Active Session");
+
+      const codeEntities = card.entities.filter(e => e.type === "code");
+      expect(codeEntities).toHaveLength(2);
+      expect(card.text.slice(codeEntities[0]!.offset, codeEntities[0]!.offset + codeEntities[0]!.length)).toBe("projects/workstation");
+      expect(card.text.slice(codeEntities[1]!.offset, codeEntities[1]!.offset + codeEntities[1]!.length)).toBe("sess-active");
+
+      const italic = card.entities.find(e => e.type === "italic");
+      expect(italic).toBeDefined();
+      expect(card.text.slice(italic!.offset, italic!.offset + italic!.length)).toBe("Swipe-reply to respond");
+    });
+
+    it("formats idle status without snippet or lastActivity", () => {
+      const card = formatStateCard({
+        title: "Idle Session",
+        status: "idle",
+        dir: "/home/dev/projects/workstation",
+        sid: "sess-idle",
+        snippet: "",
+        lastActivity: null,
+        machineId: "cloudbox",
+      }, now);
+
+      expect(card.text).toContain("⚪ Idle Session");
+      expect(card.text).not.toContain("Working on");
+      expect(card.text).toContain("📂 projects/workstation · 🖥 cloudbox");
+      expect(card.text).toContain("🆔 sess-idle");
+      expect(card.text).toContain("Swipe-reply to respond");
+      expect(card.text).toContain("🆔 sess-idle\n↩️ Swipe-reply to respond");
+      expect(card.text).not.toContain("· just now");
+      expect(card.text).not.toContain("· 2m ago");
+
+      // Verify no stray blank lines in place of snippet
+      // Expect exactly: ⚪ Idle Session\n\n📂 ...
+      expect(card.text).toContain("⚪ Idle Session\n\n📂");
+
+      const italic = card.entities.find(e => e.type === "italic");
+      expect(italic).toBeDefined();
+      expect(card.text.slice(italic!.offset, italic!.offset + italic!.length)).toBe("Swipe-reply to respond");
+    });
+
+    it("handles null dir gracefully by rendering 'unknown'", () => {
+      const card = formatStateCard({
+        title: "Null Dir Session",
+        status: "idle",
+        dir: null,
+        sid: "sess-null-dir",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+      }, now);
+
+      expect(card.text).toContain("📂 unknown · 🖥 devbox");
+      const codeEntities = card.entities.filter(e => e.type === "code");
+      expect(card.text.slice(codeEntities[0]!.offset, codeEntities[0]!.offset + codeEntities[0]!.length)).toBe("unknown");
+    });
+  });
+
+  describe("formatCurrentStateIndex", () => {
+    it("formats correct index details with mixed statuses and unreadable session count", () => {
+      const index = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [
+          { title: "Session A", status: "active" },
+          { title: "Session B", status: "idle" },
+          { title: "Session C", status: "active" },
+        ],
+        unreadable: 2,
+      });
+
+      expect(index.text).toContain("📋 Current state — devbox");
+      expect(index.text).toContain("3 main session(s) · 2 🟢 active · 1 ⚪ idle · 2 unreadable");
+      expect(index.text).toContain("1. Session A 🟢");
+      expect(index.text).toContain("2. Session B ⚪");
+      expect(index.text).toContain("3. Session C 🟢");
+
+      // Verify bold 'Current state'
+      const bold = index.entities.find(e => e.type === "bold");
+      expect(bold).toBeDefined();
+      expect(index.text.slice(bold!.offset, bold!.offset + bold!.length)).toBe("Current state");
+    });
+
+    it("formats state index when unreadable is 0 or undefined", () => {
+      const index = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [
+          { title: "Session A", status: "idle" },
+        ],
+      });
+
+      expect(index.text).toContain("1 main session(s) · 0 🟢 active · 1 ⚪ idle");
+      expect(index.text).not.toContain("unreadable");
+    });
+
+    it("formats empty sessions list gracefully", () => {
+      const index = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [],
+      });
+
+      expect(index.text).toBe("📋 Current state — devbox\n0 main session(s) · 0 🟢 active · 0 ⚪ idle");
+      expect(index.entities).toHaveLength(1);
+    });
   });
 });

@@ -3,6 +3,7 @@ import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
+import type { Activity } from "./current-state-enrich";
 
 interface NotificationInput {
   event: string;
@@ -259,6 +260,105 @@ export function formatQuestionWizardStep(input: {
 
 export function generateToken(): string {
   return randomBytes(16).toString("base64url");
+}
+
+export function relativeTime(ms: number, now: number): string {
+  const diff = now - ms;
+  if (diff < 0 || diff < 60_000) {
+    return "just now";
+  }
+  if (diff < 3_600_000) {
+    return `${Math.floor(diff / 60_000)}m ago`;
+  }
+  if (diff < 86_400_000) {
+    return `${Math.floor(diff / 3_600_000)}h ago`;
+  }
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+export function formatStateCard(
+  input: {
+    title: string;
+    status: Activity;
+    dir: string | null;
+    sid: string;
+    snippet: string;
+    lastActivity: number | null;
+    machineId: string;
+  },
+  now?: number,
+): TgMessage {
+  const currentTime = now ?? Date.now();
+  const dirShort = input.dir ? input.dir.split("/").slice(-2).join("/") : "unknown";
+
+  const builder = new TgMessageBuilder()
+    .append(input.status === "active" ? "🟢" : "⚪")
+    .append(" ")
+    .appendBold(input.title);
+
+  if (input.snippet) {
+    builder.newline().append(input.snippet);
+  }
+
+  builder
+    .newline(2)
+    .append("📂 ")
+    .appendCode(dirShort)
+    .append(` · 🖥 ${input.machineId}`)
+    .newline()
+    .append("🆔 ")
+    .appendCode(input.sid)
+    .newline()
+    .append("↩️ ")
+    .appendItalic("Swipe-reply to respond");
+
+  if (input.lastActivity !== null) {
+    builder.append(` · ${relativeTime(input.lastActivity, currentTime)}`);
+  }
+
+  return builder.build();
+}
+
+export function formatCurrentStateIndex(
+  input: {
+    machineId: string;
+    sessions: Array<{ title: string; status: Activity }>;
+    unreadable?: number;
+  },
+): TgMessage {
+  const builder = new TgMessageBuilder()
+    .append("📋 ")
+    .appendBold("Current state")
+    .append(` — ${input.machineId}`)
+    .newline();
+
+  let active = 0;
+  let idle = 0;
+  for (const s of input.sessions) {
+    if (s.status === "active") {
+      active++;
+    } else if (s.status === "idle") {
+      idle++;
+    }
+  }
+
+  builder.append(`${input.sessions.length} main session(s) · ${active} 🟢 active · ${idle} ⚪ idle`);
+  if (input.unreadable && input.unreadable > 0) {
+    builder.append(` · ${input.unreadable} unreadable`);
+  }
+
+  if (input.sessions.length > 0) {
+    builder.newline(2);
+    input.sessions.forEach((s, idx) => {
+      if (idx > 0) {
+        builder.newline();
+      }
+      const emoji = s.status === "active" ? "🟢" : "⚪";
+      builder.append(`${idx + 1}. ${s.title} ${emoji}`);
+    });
+  }
+
+  return builder.build();
 }
 
 export class TelegramNotificationService implements StopNotifier, QuestionNotifier {
