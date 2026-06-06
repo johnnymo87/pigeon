@@ -98,19 +98,6 @@ export class OpencodeClient {
     };
   }
 
-  async listSessionsByDirectory(directory: string): Promise<Array<{ id: string; title?: string }>> {
-    const url = `${this.baseUrl}/session?directory=${encodeURIComponent(directory)}&roots=true&limit=1`;
-    const response = await this.fetchFn(url, {
-      method: "GET",
-    });
-
-    if (!response.ok) {
-      throw new Error(`listSessionsByDirectory failed: ${response.status} ${response.statusText}`);
-    }
-
-    return response.json() as Promise<Array<{ id: string; title?: string }>>;
-  }
-
   async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
     const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
       method: "POST",

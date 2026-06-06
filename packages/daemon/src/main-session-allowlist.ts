@@ -12,8 +12,6 @@ export interface AllowlistDeps {
   listMainPanePids: () => Promise<number[]>;
   childrenOf: (pid: number) => Promise<number[]>;
   readCmdline: (pid: number) => Promise<string>;
-  readCwd: (pid: number) => Promise<string | null>;
-  resolveSidByDir: (dir: string) => Promise<string | null>;
 }
 
 export function parsePids(stdout: string): number[] {
@@ -28,13 +26,11 @@ export function parsePids(stdout: string): number[] {
 /**
  * Builds the real/live dependencies for session allowlist resolution.
  * Note: This implementation is Linux-only because it relies on Linux's
- * procfs filesystem (/proc/<pid>/{exe,cmdline,cwd}). On non-Linux platforms
+ * procfs filesystem (/proc/<pid>/{exe,cmdline}). On non-Linux platforms
  * (e.g., macOS), the readers cleanly error-swallow, returning empty/null results,
  * and the AllowlistDeps interface can be swapped later with a macOS impl (using ps/lsof).
  */
-export function makeLiveDeps(opencodeClient: {
-  listSessionsByDirectory: (dir: string) => Promise<Array<{ id: string }>>;
-}): AllowlistDeps {
+export function makeLiveDeps(): AllowlistDeps {
   return {
     listMainPanePids: async () => {
       try {
@@ -66,21 +62,6 @@ export function makeLiveDeps(opencodeClient: {
         return "";
       }
     },
-    readCwd: async (pid: number) => {
-      try {
-        return await readlink(`/proc/${pid}/cwd`);
-      } catch {
-        return null;
-      }
-    },
-    resolveSidByDir: async (dir: string) => {
-      try {
-        const rows = await opencodeClient.listSessionsByDirectory(dir);
-        return rows[0]?.id ?? null;
-      } catch {
-        return null;
-      }
-    },
   };
 }
 
@@ -109,16 +90,6 @@ export async function enumerateMainSessionSids(deps: AllowlistDeps): Promise<str
       if (m) {
         sids.add(m[1]!);
         continue;
-      }
-    }
-    // bare-cwd branch: a `…/opencode` TUI with no subcommand/--session
-    if (/^(?:\S*\/)?\.?opencode(?:-wrapped)?(?:\s|$)/.test(cmd) && !/^(?:\S*\/)?\.?opencode(?:-wrapped)?\s+\S/.test(cmd)) {
-      const cwd = await deps.readCwd(pid);
-      if (cwd) {
-        const sid = await deps.resolveSidByDir(cwd);
-        if (sid && /^ses_[A-Za-z0-9_-]+$/.test(sid)) {
-          sids.add(sid);
-        }
       }
     }
   }

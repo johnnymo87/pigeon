@@ -178,7 +178,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             machineId: config.machineId!,
             opencodeClient,
             enumerate: enumerateMainSessionSids,
-            allowlistDeps: makeLiveDeps(opencodeClient),
+            allowlistDeps: makeLiveDeps(),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
             sendCard: (sid, text, entities) =>
               poller!.sendNotification(sid, msg.chatId, text, { inline_keyboard: [] }, undefined, undefined, entities)
