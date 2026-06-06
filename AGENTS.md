@@ -63,6 +63,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/mcp disable <server>` | *(reply to a session notification)* | Disconnects an MCP server |
 | `/model` | *(reply to a session notification)* | Lists available models from allowed providers |
 | `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
+| `/current-state [machine]` | `/current-state cloudbox` | Surveys the machine's `main` tmux opencode TUIs and replies with an index plus one swipe-reply card per session (🟢 active / ⚪ idle). Machine defaults to `cloudbox` |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 
