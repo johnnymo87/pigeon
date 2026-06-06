@@ -3157,6 +3157,25 @@ describe("poll and ack endpoints", () => {
     expect(body.model).toBe("anthropic/claude-sonnet-4-5");
     expect(body.chatId).toBe("8248645256");
   });
+
+  it("handlePollNext returns correct minimal JSON for current_state type", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, NULL, 'current_state', '', ?, 'pending', ?)`,
+    ).bind("cs-cmd-1", "machine-cs", "8248645256", now).run();
+
+    const req = makeRequest("https://worker/machines/machine-cs/next");
+    const res = await handlePollNext(env.DB, env, req, "machine-cs");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as Record<string, unknown>;
+    expect(body).toEqual({
+      commandId: "cs-cmd-1",
+      commandType: "current_state",
+      chatId: "8248645256",
+    });
+  });
 });
 
 // ─── /mcp Command: Integration Tests ─────────────────────────────────

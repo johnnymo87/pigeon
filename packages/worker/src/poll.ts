@@ -50,6 +50,8 @@ export async function handlePollNext(
   } else if (result.commandType === "model_set") {
     body.sessionId = result.sessionId;
     body.model = result.command; // model code stored in command column
+  } else if (result.commandType === "current_state") {
+    // No extra fields beyond the common ones (commandId, commandType, chatId)
   } else {
     // "execute" -- regular command
     body.sessionId = result.sessionId;
