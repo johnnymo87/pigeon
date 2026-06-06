@@ -20,6 +20,8 @@ import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
+import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
+import { enumerateMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
 
@@ -168,8 +170,25 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             storage, sendTelegramReply: sendTelegramMessage,
           });
         },
-        onCurrentState: async () => {
-          // TODO(task 8): wire ingest
+        onCurrentState: async (msg) => {
+          if (!opencodeClient) { console.warn("[index] onCurrentState: no opencodeClient configured"); return; }
+          await ingestCurrentStateCommand({
+            commandId: msg.commandId,
+            chatId: msg.chatId,
+            machineId: config.machineId!,
+            opencodeClient,
+            enumerate: enumerateMainSessionSids,
+            allowlistDeps: makeLiveDeps(opencodeClient),
+            registerSession: (sid, label) => poller!.registerSession(sid, label),
+            sendCard: (sid, text, entities) =>
+              poller!.sendNotification(sid, msg.chatId, text, { inline_keyboard: [] }, undefined, undefined, entities)
+                .then((res) => {
+                  if (!res.ok) {
+                    throw new Error("sendNotification returned ok=false");
+                  }
+                }),
+            sendPlainText: (text, entities) => sendTelegramMessage(msg.chatId, text, entities),
+          });
         },
       },
     )
