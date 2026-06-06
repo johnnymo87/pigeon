@@ -2,7 +2,7 @@ import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 
-type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
+type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "current_state";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -560,6 +560,25 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`);
+      return OK();
+    }
+
+    // Handle /current-state command
+    const currentStateMatch = update.message.text.match(/^\/current-state(?:\s+(\S+))?$/);
+    if (currentStateMatch) {
+      const machineId = currentStateMatch[1] ?? "cloudbox";
+      const csChatId = update.message.chat.id;
+
+      const isRecent = await isMachineRecent(db, machineId);
+      if (!isRecent) {
+        await sendTelegramMessage(env, csChatId, `${machineId} is not recently seen.`);
+        return OK();
+      }
+
+      const commandId = await queueCommand(db, env, machineId, null, "", String(csChatId), null, "current_state");
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, csChatId, `Fetching current state on ${machineId}...`);
       return OK();
     }
 

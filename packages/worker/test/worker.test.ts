@@ -1112,6 +1112,120 @@ describe("/launch command", () => {
   });
 });
 
+// ─── /current-state Command: Integration Tests ─────────────────────────
+
+function makeCurrentStateMessage(
+  machineId?: string,
+  updateId?: number,
+): Record<string, unknown> {
+  return {
+    update_id: updateId ?? ++webhookUpdateCounter,
+    message: {
+      message_id: ++webhookUpdateCounter,
+      chat: { id: CHAT_ID_NUM },
+      from: { id: CHAT_ID_NUM },
+      text: machineId !== undefined ? `/current-state ${machineId}` : `/current-state`,
+    },
+  };
+}
+
+describe("/current-state command", () => {
+  beforeEach(async () => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    await env.DB.exec("DELETE FROM commands");
+    await env.DB.exec("DELETE FROM machines");
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("replies with offline error when default machine (cloudbox) has not recently polled", async () => {
+    mockTelegramSendMessage(); // expects 1 Telegram send message call for offline error
+
+    const res = await sendWebhook(makeCurrentStateMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // We should also assert that NO commands were queued
+    const rows = await queryQueueByMachine("cloudbox");
+    expect(rows.length).toBe(0);
+  });
+
+  it("replies with offline error when explicitly provided machine has not recently polled", async () => {
+    mockTelegramSendMessage(); // expects 1 Telegram send message call for offline error
+
+    const res = await sendWebhook(makeCurrentStateMessage("devbox"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueByMachine("devbox");
+    expect(rows.length).toBe(0);
+  });
+
+  it("queues current_state command for default machine (cloudbox) when recent", async () => {
+    const now = Date.now();
+    await touchMachine(env.DB, "cloudbox", now);
+
+    mockTelegramSendMessage(); // ack message "Fetching current state..."
+
+    const res = await sendWebhook(makeCurrentStateMessage());
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueByMachine("cloudbox");
+    const csRows = rows.filter((r) => r.command_type === "current_state");
+    expect(csRows.length).toBeGreaterThanOrEqual(1);
+    const csRow = csRows[csRows.length - 1]!;
+    expect(csRow.command_type).toBe("current_state");
+    expect(csRow.command).toBe("");
+    expect(csRow.session_id).toBeNull();
+    expect(csRow.machine_id).toBe("cloudbox");
+  });
+
+  it("queues current_state command for explicitly provided machine (devbox) when recent", async () => {
+    const now = Date.now();
+    await touchMachine(env.DB, "devbox", now);
+
+    mockTelegramSendMessage(); // ack message "Fetching current state..."
+
+    const res = await sendWebhook(makeCurrentStateMessage("devbox"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueByMachine("devbox");
+    const csRows = rows.filter((r) => r.command_type === "current_state");
+    expect(csRows.length).toBeGreaterThanOrEqual(1);
+    const csRow = csRows[csRows.length - 1]!;
+    expect(csRow.command_type).toBe("current_state");
+    expect(csRow.command).toBe("");
+    expect(csRow.session_id).toBeNull();
+    expect(csRow.machine_id).toBe("devbox");
+  });
+
+  it("rejects when trailing arguments are present", async () => {
+    const now = Date.now();
+    await touchMachine(env.DB, "cloudbox", now);
+
+    mockTelegramSendMessage(); // for the fallback error reply
+
+    const res = await sendWebhook(makeCurrentStateMessage("cloudbox extra_arg"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Assert that NO commands were queued
+    const rows = await queryQueueByMachine("cloudbox");
+    const csRows = rows.filter((r) => r.command_type === "current_state");
+    expect(csRows.length).toBe(0);
+  });
+});
+
 // ─── Media Endpoints ──────────────────────────────────────────────────
 
 describe("media endpoints", () => {
