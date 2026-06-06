@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage } from "../src/worker/poller";
+import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type CurrentStateMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -72,6 +72,7 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
     onMcpDisable: vi.fn().mockResolvedValue(undefined),
     onModelList: vi.fn().mockResolvedValue(undefined),
     onModelSet: vi.fn().mockResolvedValue(undefined),
+    onCurrentState: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -125,6 +126,15 @@ function makeModelSetMsg(overrides?: Partial<ModelSetMessage>): ModelSetMessage 
     sessionId: "sess-1",
     chatId: "chat-1",
     model: "anthropic/claude-3-5-sonnet",
+    ...overrides,
+  };
+}
+
+function makeCurrentStateMsg(overrides?: Partial<CurrentStateMessage>): CurrentStateMessage {
+  return {
+    commandId: "cmd-current-state",
+    commandType: "current_state",
+    chatId: "chat-123",
     ...overrides,
   };
 }
@@ -756,6 +766,38 @@ describe("Poller dispatch — model_set", () => {
     expect(callbacks.onModelSet).toHaveBeenCalledWith(msg);
     expect(callbacks.onCommand).not.toHaveBeenCalled();
     expect(callbacks.onModelList).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
+describe("Poller dispatch — current_state", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("dispatches current_state commands to onCurrentState callback and acks on success", async () => {
+    const msg = makeCurrentStateMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onCurrentState).toHaveBeenCalledWith(msg);
+    
+    // Ensure the ACK happens
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string]>;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]![0]).toBe(`http://localhost:8787/commands/${msg.commandId}/ack`);
+    
     poller.stop();
   });
 });

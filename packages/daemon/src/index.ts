@@ -168,6 +168,9 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             storage, sendTelegramReply: sendTelegramMessage,
           });
         },
+        onCurrentState: async () => {
+          // TODO(task 8): wire ingest
+        },
       },
     )
   : undefined;
