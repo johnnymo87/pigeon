@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { ingestCurrentStateCommand, type CurrentStateIngestInput } from "../src/worker/current-state-ingest";
-import type { AllowlistDeps } from "../src/main-session-allowlist";
 
 describe("current-state-ingest TDD tests", () => {
   it("1. Happy path / ordering / no cap", async () => {
@@ -37,8 +36,7 @@ describe("current-state-ingest TDD tests", () => {
       }),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -46,7 +44,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -102,8 +99,7 @@ describe("current-state-ingest TDD tests", () => {
       }),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -111,7 +107,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -142,8 +137,7 @@ describe("current-state-ingest TDD tests", () => {
       getSessionMessages: vi.fn().mockRejectedValue(new Error("not called")),
     };
 
-    const enumerate = vi.fn().mockResolvedValue([]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: [], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -151,7 +145,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -177,7 +170,6 @@ describe("current-state-ingest TDD tests", () => {
     };
 
     const enumerate = vi.fn().mockRejectedValue(new Error("not called"));
-    const allowlistDeps = {} as AllowlistDeps;
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -185,7 +177,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -230,8 +221,7 @@ describe("current-state-ingest TDD tests", () => {
       }),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -239,7 +229,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -263,8 +252,7 @@ describe("current-state-ingest TDD tests", () => {
       getSessionMessages: vi.fn().mockResolvedValue([]),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -272,7 +260,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -314,8 +301,7 @@ describe("current-state-ingest TDD tests", () => {
       }),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -323,7 +309,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -373,8 +358,7 @@ describe("current-state-ingest TDD tests", () => {
       }),
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -382,7 +366,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -418,8 +401,7 @@ describe("current-state-ingest TDD tests", () => {
       getSessionMessages: vi.fn().mockResolvedValue([]), // both have null lastActivityFromMessages, info.time.updated is identical
     };
 
-    const enumerate = vi.fn().mockResolvedValue(["ses_A", "ses_B"]);
-    const allowlistDeps = {} as AllowlistDeps;
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
 
     const input: CurrentStateIngestInput = {
       commandId: "cmd-123",
@@ -427,7 +409,6 @@ describe("current-state-ingest TDD tests", () => {
       machineId: "devbox",
       opencodeClient,
       enumerate,
-      allowlistDeps,
       registerSession,
       sendCard,
       sendPlainText,
@@ -437,5 +418,86 @@ describe("current-state-ingest TDD tests", () => {
 
     expect(registerSession).toHaveBeenCalledTimes(2);
     expect(sendCard).toHaveBeenCalledTimes(2);
+  });
+
+  it("10. homeScreenCount threads into index", async () => {
+    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const sendPlainText = vi.fn().mockResolvedValue(undefined);
+
+    const opencodeClient = {
+      healthCheck: vi.fn().mockResolvedValue(true),
+      getSessionInfo: vi.fn().mockImplementation(async (sid: string) => {
+        if (sid === "ses_A") {
+          return { id: "ses_A", title: "Session A", directory: "/home/dev/a", time: { created: 500, updated: 1000 } };
+        }
+        return null;
+      }),
+      getSessionMessages: vi.fn().mockImplementation(async (sid: string) => {
+        if (sid === "ses_A") {
+          return [{ info: { role: "user", time: { completed: 1000 } } }];
+        }
+        return [];
+      }),
+    };
+
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A"], homeScreenCount: 2 });
+
+    const input: CurrentStateIngestInput = {
+      commandId: "cmd-123",
+      chatId: "chat-456",
+      machineId: "devbox",
+      opencodeClient,
+      enumerate,
+      registerSession,
+      sendCard,
+      sendPlainText,
+      now: 2500,
+    };
+
+    await ingestCurrentStateCommand(input);
+
+    expect(sendPlainText).toHaveBeenCalledTimes(1);
+    const indexText = (sendPlainText.mock.calls[0]?.[0] as string) ?? "";
+    expect(indexText).toContain("2 on home screen");
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(sendCard).toHaveBeenCalledTimes(1);
+  });
+
+  it("11. only home-screen TUIs (no sessions)", async () => {
+    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const sendPlainText = vi.fn().mockResolvedValue(undefined);
+
+    const opencodeClient = {
+      healthCheck: vi.fn().mockResolvedValue(true),
+      getSessionInfo: vi.fn().mockRejectedValue(new Error("not called")),
+      getSessionMessages: vi.fn().mockRejectedValue(new Error("not called")),
+    };
+
+    const enumerate = vi.fn().mockResolvedValue({ sids: [], homeScreenCount: 3 });
+
+    const input: CurrentStateIngestInput = {
+      commandId: "cmd-123",
+      chatId: "chat-456",
+      machineId: "devbox",
+      opencodeClient,
+      enumerate,
+      registerSession,
+      sendCard,
+      sendPlainText,
+    };
+
+    await ingestCurrentStateCommand(input);
+
+    // It should NOT send "No main-session TUIs found"
+    expect(sendPlainText).toHaveBeenCalledTimes(1);
+    const indexText = (sendPlainText.mock.calls[0]?.[0] as string) ?? "";
+    expect(indexText).not.toContain("No main-session TUIs found");
+    expect(indexText).toContain("0 main session(s)");
+    expect(indexText).toContain("3 on home screen");
+
+    expect(registerSession).not.toHaveBeenCalled();
+    expect(sendCard).not.toHaveBeenCalled();
   });
 });

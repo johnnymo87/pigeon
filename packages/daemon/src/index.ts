@@ -21,7 +21,7 @@ import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
-import { enumerateMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
+import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
 
@@ -177,8 +177,10 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId!,
             opencodeClient,
-            enumerate: enumerateMainSessionSids,
-            allowlistDeps: makeLiveDeps(),
+            enumerate: () => resolveMainSessionSids(
+              makeLiveDeps(),
+              () => storage.sessions.list({ active: true }).map(s => ({ sessionId: s.sessionId, pid: s.pid, lastSeen: s.lastSeen })),
+            ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
             sendCard: (sid, text, entities) =>
               poller!.sendNotification(sid, msg.chatId, text, { inline_keyboard: [] }, undefined, undefined, entities)

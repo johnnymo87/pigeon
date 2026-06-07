@@ -1,4 +1,3 @@
-import type { AllowlistDeps } from "../main-session-allowlist";
 import type { TgEntity } from "../telegram-message";
 import {
   classifyActivity,
@@ -19,8 +18,7 @@ export interface CurrentStateIngestInput {
     getSessionInfo: (sid: string) => Promise<{ id: string; title: string; directory: string; time: { created: number; updated: number } } | null>;
     getSessionMessages: (sid: string) => Promise<unknown[]>;
   };
-  enumerate: (deps: AllowlistDeps) => Promise<string[]>;   // inject enumerateMainSessionSids for testability
-  allowlistDeps: AllowlistDeps;
+  enumerate: () => Promise<{ sids: string[]; homeScreenCount: number }>;
   registerSession: (sid: string, label: string) => Promise<void>;
   sendCard: (sid: string, text: string, entities: TgEntity[] | undefined) => Promise<void>;
   sendPlainText: (text: string, entities?: TgEntity[]) => Promise<void>;
@@ -34,8 +32,8 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
     return;
   }
 
-  const sids = await input.enumerate(input.allowlistDeps);
-  if (sids.length === 0) {
+  const { sids, homeScreenCount } = await input.enumerate();
+  if (sids.length === 0 && homeScreenCount === 0) {
     await input.sendPlainText(`No main-session TUIs found on ${input.machineId}.`);
     return;
   }
@@ -86,6 +84,7 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
     machineId: input.machineId,
     sessions: records.map(r => ({ title: r.title, status: r.status })),
     unreadable,
+    homeScreen: homeScreenCount,
   });
   await input.sendPlainText(index.text, index.entities);
 
