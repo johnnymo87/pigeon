@@ -69,7 +69,7 @@ export function makeLiveDeps(): AllowlistDeps {
 const SID_RE = /(?:^|\s)--session\s+(ses_[A-Za-z0-9_-]+)(?:\s|$)/;
 const ATTACH_RE = /^(?:\S*\/)?\.?opencode(?:-wrapped)?\s+attach(?:\s|$)/;
 
-export async function enumerateMainSessionSids(deps: AllowlistDeps): Promise<string[]> {
+export async function collectMainSubtreeOpencodePids(deps: AllowlistDeps): Promise<number[]> {
   const seen = new Set<number>();
   const stack = await deps.listMainPanePids();
   const subtree: number[] = [];
@@ -81,8 +81,25 @@ export async function enumerateMainSessionSids(deps: AllowlistDeps): Promise<str
     const children = await deps.childrenOf(pid);
     stack.push(...children);
   }
-  const sids = new Set<string>();
+
+  const opencodePids: number[] = [];
   for (const pid of subtree) {
+    const cmd = await deps.readCmdline(pid);
+    if (cmd) {
+      const firstWord = cmd.trim().split(/\s+/)[0] ?? "";
+      const base = path.basename(firstWord);
+      if (/^\.?opencode(-wrapped)?$/.test(base)) {
+        opencodePids.push(pid);
+      }
+    }
+  }
+  return opencodePids;
+}
+
+export async function enumerateMainSessionSids(deps: AllowlistDeps): Promise<string[]> {
+  const opencodePids = await collectMainSubtreeOpencodePids(deps);
+  const sids = new Set<string>();
+  for (const pid of opencodePids) {
     const cmd = await deps.readCmdline(pid);
     if (!cmd) continue;
     if (ATTACH_RE.test(cmd)) {

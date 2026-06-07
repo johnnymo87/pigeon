@@ -3,6 +3,7 @@ import {
   enumerateMainSessionSids,
   type AllowlistDeps,
   parsePids,
+  collectMainSubtreeOpencodePids,
 } from "../src/main-session-allowlist";
 
 interface MockDepsOptions {
@@ -184,5 +185,21 @@ describe("parsePids", () => {
   it("returns empty array for empty or whitespace-only input", () => {
     expect(parsePids("")).toEqual([]);
     expect(parsePids("   \n  \n")).toEqual([]);
+  });
+});
+
+describe("collectMainSubtreeOpencodePids", () => {
+  it("collectMainSubtreeOpencodePids returns opencode pids in the main subtree", async () => {
+    const deps = makeDeps({
+      mainPanePids: [1000],
+      children: { 1000: [1001, 1002] },
+      cmdlines: {
+        1000: "bash",                                   // not opencode -> excluded
+        1001: "/home/dev/.nix-profile/bin/opencode",    // opencode -> included
+        1002: "/home/dev/.nix-profile/bin/opencode attach --session ses_A", // included
+      },
+    });
+    const pids = await collectMainSubtreeOpencodePids(deps);
+    expect(pids.sort()).toEqual([1001, 1002]);
   });
 });
