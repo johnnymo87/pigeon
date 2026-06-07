@@ -112,3 +112,53 @@ export async function enumerateMainSessionSids(deps: AllowlistDeps): Promise<str
   }
   return [...sids];
 }
+
+export interface RegistrySession {
+  sessionId: string;
+  pid: number | null;
+  lastSeen: number;
+}
+
+export async function resolveMainSessionSids(
+  deps: AllowlistDeps,
+  listActiveSessions: () => RegistrySession[],
+): Promise<{ sids: string[]; homeScreenCount: number }> {
+  const activeSessions = listActiveSessions();
+  const byPidNewest = new Map<number, RegistrySession>();
+  for (const session of activeSessions) {
+    if (session.pid === null) continue;
+    const existing = byPidNewest.get(session.pid);
+    if (!existing || session.lastSeen > existing.lastSeen) {
+      byPidNewest.set(session.pid, session);
+    }
+  }
+
+  const opencodePids = await collectMainSubtreeOpencodePids(deps);
+  const sidsSet = new Set<string>();
+  let homeScreenCount = 0;
+
+  for (const pid of opencodePids) {
+    let resolvedSid: string | undefined;
+
+    const registrySession = byPidNewest.get(pid);
+    if (registrySession) {
+      resolvedSid = registrySession.sessionId;
+    } else {
+      const cmd = await deps.readCmdline(pid);
+      if (cmd && ATTACH_RE.test(cmd)) {
+        const match = cmd.match(SID_RE);
+        if (match) {
+          resolvedSid = match[1];
+        }
+      }
+    }
+
+    if (resolvedSid) {
+      sidsSet.add(resolvedSid);
+    } else {
+      homeScreenCount++;
+    }
+  }
+
+  return { sids: Array.from(sidsSet), homeScreenCount };
+}
