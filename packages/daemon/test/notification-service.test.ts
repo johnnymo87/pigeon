@@ -896,5 +896,41 @@ describe("current-state formatting helpers", () => {
       expect(index.text).toBe("📋 Current state — devbox\n0 main session(s) · 0 🟢 active · 0 ⚪ idle");
       expect(index.entities).toHaveLength(1);
     });
+
+    it("formats state index with homeScreen count when homeScreen > 0", () => {
+      const index = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [
+          { title: "Session A", status: "active" },
+        ],
+        unreadable: 2,
+        homeScreen: 3,
+      });
+
+      expect(index.text).toContain("1 main session(s) · 1 🟢 active · 0 ⚪ idle · 2 unreadable · 3 on home screen");
+    });
+
+    it("formats state index when homeScreen is 0 or undefined", () => {
+      const index1 = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [
+          { title: "Session A", status: "idle" },
+        ],
+        homeScreen: 0,
+      });
+
+      expect(index1.text).toContain("1 main session(s) · 0 🟢 active · 1 ⚪ idle");
+      expect(index1.text).not.toContain("on home screen");
+
+      const index2 = formatCurrentStateIndex({
+        machineId: "devbox",
+        sessions: [
+          { title: "Session A", status: "idle" },
+        ],
+      });
+
+      expect(index2.text).toContain("1 main session(s) · 0 🟢 active · 1 ⚪ idle");
+      expect(index2.text).not.toContain("on home screen");
+    });
   });
 });

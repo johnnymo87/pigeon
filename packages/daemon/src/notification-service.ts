@@ -324,6 +324,7 @@ export function formatCurrentStateIndex(
     machineId: string;
     sessions: Array<{ title: string; status: Activity }>;
     unreadable?: number;
+    homeScreen?: number;
   },
 ): TgMessage {
   const builder = new TgMessageBuilder()
@@ -345,6 +346,9 @@ export function formatCurrentStateIndex(
   builder.append(`${input.sessions.length} main session(s) · ${active} 🟢 active · ${idle} ⚪ idle`);
   if (input.unreadable && input.unreadable > 0) {
     builder.append(` · ${input.unreadable} unreadable`);
+  }
+  if (input.homeScreen && input.homeScreen > 0) {
+    builder.append(` · ${input.homeScreen} on home screen`);
   }
 
   if (input.sessions.length > 0) {
