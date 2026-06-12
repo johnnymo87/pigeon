@@ -26,3 +26,6 @@ Session.vim
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# beads tracker (git-free/stealth: data in dolt remote refs/dolt/data)
+.beads/
