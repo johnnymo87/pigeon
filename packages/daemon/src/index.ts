@@ -27,6 +27,7 @@ import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
+import { OpencodeClientFactory } from "./routing/client-factory";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -57,6 +58,11 @@ if (ingressRouter) {
 const opencodeClient = config.opencodeUrl
   ? new OpencodeClient({ baseUrl: config.opencodeUrl })
   : undefined;
+
+const clientFactory = ingressRouter ? new OpencodeClientFactory(ingressRouter) : undefined;
+// Resolve the owning-serve client for a session; falls back to the legacy single client when routing is unconfigured.
+const clientForSession = (sessionId: string): OpencodeClient | undefined =>
+  clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
 
 async function sendTelegramMessage(chatId: string, text: string, entities?: TgEntity[]): Promise<void> {
   if (!config.telegramBotToken) return;
@@ -114,8 +120,9 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onKill: async (msg) => {
-          if (!opencodeClient) {
-            console.warn("[pigeon-daemon] received kill command but no opencodeClient is configured");
+          const client = clientForSession(msg.sessionId);
+          if (!client) {
+            console.warn(`[index] onKill: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
             return;
           }
           await ingestKillCommand({
@@ -123,13 +130,14 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             sessionId: msg.sessionId,
             chatId: msg.chatId,
             machineId: config.machineId,
-            opencodeClient,
+            opencodeClient: client,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onInterrupt: async (msg) => {
-          if (!opencodeClient) {
-            console.warn("[pigeon-daemon] received interrupt command but no opencodeClient is configured");
+          const client = clientForSession(msg.sessionId);
+          if (!client) {
+            console.warn(`[index] onInterrupt: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
             return;
           }
           await ingestInterruptCommand({
@@ -137,13 +145,14 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             sessionId: msg.sessionId,
             chatId: msg.chatId,
             machineId: config.machineId,
-            opencodeClient,
+            opencodeClient: client,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onCompact: async (msg) => {
-          if (!opencodeClient) {
-            console.warn("[pigeon-daemon] received compact command but no opencodeClient is configured");
+          const client = clientForSession(msg.sessionId);
+          if (!client) {
+            console.warn(`[index] onCompact: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
             return;
           }
           await ingestCompactCommand({
@@ -151,48 +160,53 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             sessionId: msg.sessionId,
             chatId: msg.chatId,
             machineId: config.machineId,
-            opencodeClient,
+            opencodeClient: client,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onMcpList: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onMcpList: no opencodeClient configured"); return; }
+          const client = clientForSession(msg.sessionId);
+          if (!client) { console.warn(`[index] onMcpList: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            directory, machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
+            directory, machineId: config.machineId, opencodeClient: client, sendTelegramReply: sendTelegramMessage,
           });
         },
         onMcpEnable: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onMcpEnable: no opencodeClient configured"); return; }
+          const client = clientForSession(msg.sessionId);
+          if (!client) { console.warn(`[index] onMcpEnable: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpEnableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient,
+            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onMcpDisable: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onMcpDisable: no opencodeClient configured"); return; }
+          const client = clientForSession(msg.sessionId);
+          if (!client) { console.warn(`[index] onMcpDisable: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpDisableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient,
+            serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
             sendTelegramReply: sendTelegramMessage,
           });
         },
         onModelList: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onModelList: no opencodeClient configured"); return; }
+          const client = clientForSession(msg.sessionId);
+          if (!client) { console.warn(`[index] onModelList: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           await ingestModelListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            machineId: config.machineId, opencodeClient, sendTelegramReply: sendTelegramMessage,
+            machineId: config.machineId, opencodeClient: client, sendTelegramReply: sendTelegramMessage,
           });
         },
         onModelSet: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onModelSet: no opencodeClient configured"); return; }
+          const client = clientForSession(msg.sessionId);
+          if (!client) { console.warn(`[index] onModelSet: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           await ingestModelSetCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            model: msg.model, machineId: config.machineId, opencodeClient,
+            model: msg.model, machineId: config.machineId, opencodeClient: client,
             storage, sendTelegramReply: sendTelegramMessage,
           });
         },
