@@ -239,17 +239,21 @@ export class SessionLeaseRepo {
   ): boolean {
     const res = this.db
       .prepare(
-        `INSERT INTO session_lease
-           (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch)
-         VALUES (@sid, @serve, @uuid, @gen, @exp, @now, @epoch)
+        `INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch)
+         SELECT @sid, @serve, @uuid, sa.owner_generation, @now + @ttlMs, @now, rm.binary_epoch
+         FROM session_assignment sa JOIN routing_meta rm ON rm.id = 1
+         WHERE sa.session_id=@sid AND sa.desired_serve_id=@serve AND sa.owner_generation=@gen AND rm.binary_epoch=@epoch
          ON CONFLICT(session_id) DO UPDATE SET
-           serve_id=@serve, instance_uuid=@uuid, owner_generation=@gen,
-           lease_expires_at=@exp, heartbeat_at=@now, binary_epoch=@epoch
-         WHERE session_lease.owner_generation < @gen
-            OR (session_lease.owner_generation = @gen AND (
-                 session_lease.lease_expires_at <= @now
-                 OR (session_lease.serve_id = @serve AND session_lease.instance_uuid = @uuid)
-               ))`,
+           serve_id=excluded.serve_id, instance_uuid=excluded.instance_uuid, owner_generation=excluded.owner_generation,
+           lease_expires_at=excluded.lease_expires_at, heartbeat_at=excluded.heartbeat_at, binary_epoch=excluded.binary_epoch
+         WHERE EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
+                       WHERE sa.session_id=excluded.session_id AND sa.desired_serve_id=excluded.serve_id
+                         AND sa.owner_generation=excluded.owner_generation AND rm.binary_epoch=excluded.binary_epoch)
+           AND ( session_lease.binary_epoch < excluded.binary_epoch
+                 OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation < excluded.owner_generation)
+                 OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation = excluded.owner_generation
+                     AND (session_lease.lease_expires_at <= @now
+                          OR (session_lease.serve_id = excluded.serve_id AND session_lease.instance_uuid = excluded.instance_uuid))) )`,
       )
       .run({
         sid: i.sessionId,
@@ -257,8 +261,8 @@ export class SessionLeaseRepo {
         uuid: i.instanceUuid,
         gen: i.ownerGeneration,
         epoch: i.binaryEpoch,
-        exp: now + ttlMs,
         now,
+        ttlMs,
       });
     return res.changes > 0;
   }
@@ -268,26 +272,49 @@ export class SessionLeaseRepo {
     serveId: string,
     instanceUuid: string,
     ownerGeneration: number,
+    binaryEpoch: number,
     now: number,
     ttlMs: number,
   ): boolean {
     const res = this.db
       .prepare(
-        `UPDATE session_lease
-         SET lease_expires_at = ?, heartbeat_at = ?
-         WHERE session_id = ?
-           AND serve_id = ?
-           AND instance_uuid = ?
-           AND owner_generation = ?`,
+        `UPDATE session_lease SET lease_expires_at=@now+@ttlMs, heartbeat_at=@now
+         WHERE session_id=@sid AND serve_id=@serve AND instance_uuid=@uuid AND owner_generation=@gen AND binary_epoch=@epoch
+           AND EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
+                       WHERE sa.session_id=@sid AND sa.desired_serve_id=@serve AND sa.owner_generation=@gen AND rm.binary_epoch=@epoch)`,
       )
-      .run(now + ttlMs, now, sessionId, serveId, instanceUuid, ownerGeneration);
+      .run({
+        sid: sessionId,
+        serve: serveId,
+        uuid: instanceUuid,
+        gen: ownerGeneration,
+        epoch: binaryEpoch,
+        now,
+        ttlMs,
+      });
     return res.changes > 0;
   }
 
-  release(sessionId: string): void {
-    this.db
-      .prepare("DELETE FROM session_lease WHERE session_id = ?")
-      .run(sessionId);
+  release(
+    sessionId: string,
+    serveId: string,
+    instanceUuid: string,
+    ownerGeneration: number,
+    binaryEpoch: number,
+  ): boolean {
+    const res = this.db
+      .prepare(
+        `DELETE FROM session_lease
+         WHERE session_id=@sid AND serve_id=@serve AND instance_uuid=@uuid AND owner_generation=@gen AND binary_epoch=@epoch`,
+      )
+      .run({
+        sid: sessionId,
+        serve: serveId,
+        uuid: instanceUuid,
+        gen: ownerGeneration,
+        epoch: binaryEpoch,
+      });
+    return res.changes > 0;
   }
 
   listExpired(now: number): LeaseRecord[] {

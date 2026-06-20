@@ -506,13 +506,10 @@ describe("IngressRouter Service Logic", () => {
     });
 
     // Force lease row on serve-2 at generation 2 (unexpired)
-    s.leases.acquireCAS({
-      sessionId: "session-contended",
-      serveId: "serve-2",
-      instanceUuid: "uuid-2",
-      ownerGeneration: 2,
-      binaryEpoch: 0,
-    }, now, 5000);
+    s.db.prepare(
+      `INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run("session-contended", "serve-2", "uuid-2", 2, now + 5000, now, 0);
 
     // Verify lease row exists with serve-2 and gen 2
     const forcedLease = s.leases.get("session-contended");

@@ -186,6 +186,7 @@ export class IngressRouter {
       r.serveId,
       r.instanceUuid,
       r.ownerGeneration,
+      this.binaryEpoch,
       now,
       this.opts.leaseTtlMs,
     );
@@ -198,7 +199,7 @@ export class IngressRouter {
     const expired = this.repos.leases.listExpired(now);
     for (const l of expired) {
       this.repos.assignments.setState(l.sessionId, "dormant", now);
-      this.repos.leases.release(l.sessionId);
+      this.repos.leases.release(l.sessionId, l.serveId, l.instanceUuid, l.ownerGeneration, l.binaryEpoch);
     }
   }
 

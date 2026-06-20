@@ -190,6 +190,9 @@ describe("Routing Repositories", () => {
   it("SessionLeaseRepo CAS logic: acquireCAS, renewCAS, release, listExpired", () => {
     const s = openStorageDb(":memory:");
 
+    // We must bump binary epoch of routing_meta to 1, to match input1's epoch (1)
+    s.meta.bumpEpoch(10_000);
+
     const input1 = {
       sessionId: "session-1",
       serveId: "serve-1",
@@ -197,6 +200,17 @@ describe("Routing Repositories", () => {
       ownerGeneration: 1,
       binaryEpoch: 1,
     };
+
+    // Before acquire, we must seed the assignment to match!
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    });
 
     // 1. acquireCAS on empty row -> true.
     let acquired = s.leases.acquireCAS(input1, 10_000, 5_000); // lease expires at 15_000
@@ -221,6 +235,7 @@ describe("Routing Repositories", () => {
       ownerGeneration: 1,
       binaryEpoch: 1,
     };
+    // Desired assignment is serve-1, so acquiring with serve-2 should be rejected.
     acquired = s.leases.acquireCAS(inputDiff, 12_000, 5_000);
     expect(acquired).toBe(false);
 
@@ -230,12 +245,12 @@ describe("Routing Repositories", () => {
     expect(s.leases.get("session-1")?.leaseExpiresAt).toBe(18_000);
 
     // 4. renewCAS with matching owner -> true and pushes lease_expires_at out;
-    let renewed = s.leases.renewCAS("session-1", "serve-1", "uuid-1", 1, 14_000, 6_000); // expires 20_000
+    let renewed = s.leases.renewCAS("session-1", "serve-1", "uuid-1", 1, 1, 14_000, 6_000); // expires 20_000
     expect(renewed).toBe(true);
     expect(s.leases.get("session-1")?.leaseExpiresAt).toBe(20_000);
 
     // renewCAS with wrong instance_uuid -> false.
-    renewed = s.leases.renewCAS("session-1", "serve-1", "uuid-wrong", 1, 15_000, 5_000);
+    renewed = s.leases.renewCAS("session-1", "serve-1", "uuid-wrong", 1, 1, 15_000, 5_000);
     expect(renewed).toBe(false);
 
     // 5. acquireCAS by a HIGHER owner_generation -> true (crash-reassignment wins).
@@ -246,6 +261,16 @@ describe("Routing Repositories", () => {
       ownerGeneration: 2,
       binaryEpoch: 1,
     };
+    // Must update assignment first for the higher generation on serve-2 to succeed
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-2",
+      ownerGeneration: 2,
+      state: "assigned",
+      lastActiveAt: 16_000,
+      updatedAt: 16_000,
+    });
     acquired = s.leases.acquireCAS(inputHigher, 16_000, 5_000); // expires 21_000
     expect(acquired).toBe(true);
 
@@ -263,6 +288,16 @@ describe("Routing Repositories", () => {
       ownerGeneration: 2,
       binaryEpoch: 1,
     };
+    // Must update assignment to point to serve-3 at gen 2
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-3",
+      ownerGeneration: 2,
+      state: "assigned",
+      lastActiveAt: 22_000,
+      updatedAt: 22_000,
+    });
     acquired = s.leases.acquireCAS(inputDiffAfterExpiry, 22_000, 5_000); // now is 22_000, past 21_000
     expect(acquired).toBe(true);
     expect(s.leases.get("session-1")?.serveId).toBe("serve-3");
@@ -282,16 +317,221 @@ describe("Routing Repositories", () => {
       ownerGeneration: 1,
       binaryEpoch: 1,
     };
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-4",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: 28_000,
+      updatedAt: 28_000,
+    });
     const staleAcquired = s.leases.acquireCAS(inputStaleLower, 28_000, 5_000); // lease has expired (27_000), but generation is stale (1 < 2)
     expect(staleAcquired).toBe(false);
 
     // renewCAS on non-existent lease returns false safely
-    const renewNonExistent = s.leases.renewCAS("nonexistent", "serve-1", "uuid-1", 1, 10_000, 5_000);
+    const renewNonExistent = s.leases.renewCAS("nonexistent", "serve-1", "uuid-1", 1, 1, 10_000, 5_000);
     expect(renewNonExistent).toBe(false);
 
-    // 8. release
-    s.leases.release("session-1");
+    // 8. release with exact owning token
+    s.leases.release("session-1", "serve-3", "uuid-3", 2, 1);
     expect(s.leases.get("session-1")).toBeNull();
+
+    s.db.close();
+  });
+
+  it("Hole 2 / release fence", () => {
+    const s = openStorageDb(":memory:");
+    s.meta.bumpEpoch(10_000); // epoch = 1
+
+    // Seed assignment
+    s.assignments.upsert({
+      sessionId: "session-fence",
+      directoryKey: null,
+      desiredServeId: "serve-A",
+      ownerGeneration: 5,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    });
+
+    // Acquire lease
+    const acquired = s.leases.acquireCAS(
+      { sessionId: "session-fence", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 5, binaryEpoch: 1 },
+      10_000,
+      5_000,
+    );
+    expect(acquired).toBe(true);
+
+    // Try to release with stale tokens
+    // 1. Wrong instanceUuid
+    let released = s.leases.release("session-fence", "serve-A", "uuid-wrong", 5, 1);
+    expect(released).toBe(false);
+    expect(s.leases.get("session-fence")).not.toBeNull();
+
+    // 2. Lower generation
+    released = s.leases.release("session-fence", "serve-A", "uuid-A", 4, 1);
+    expect(released).toBe(false);
+    expect(s.leases.get("session-fence")).not.toBeNull();
+
+    // 3. Wrong epoch
+    released = s.leases.release("session-fence", "serve-A", "uuid-A", 5, 0);
+    expect(released).toBe(false);
+    expect(s.leases.get("session-fence")).not.toBeNull();
+
+    // 4. Different serveId
+    released = s.leases.release("session-fence", "serve-B", "uuid-A", 5, 1);
+    expect(released).toBe(false);
+    expect(s.leases.get("session-fence")).not.toBeNull();
+
+    // Correct token release
+    released = s.leases.release("session-fence", "serve-A", "uuid-A", 5, 1);
+    expect(released).toBe(true);
+    expect(s.leases.get("session-fence")).toBeNull();
+
+    s.db.close();
+  });
+
+  it("Hole 1 / acquire correctness", () => {
+    const s = openStorageDb(":memory:");
+    s.meta.bumpEpoch(10_000); // epoch = 1
+
+    // Seed assignment
+    s.assignments.upsert({
+      sessionId: "session-acq",
+      directoryKey: null,
+      desiredServeId: "serve-A",
+      ownerGeneration: 5,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    });
+
+    // (a) Caller generation (4) < assignment generation (5) with no existing lease
+    let acquired = s.leases.acquireCAS(
+      { sessionId: "session-acq", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 4, binaryEpoch: 1 },
+      10_000,
+      5_000,
+    );
+    expect(acquired).toBe(false);
+    expect(s.leases.get("session-acq")).toBeNull();
+
+    // (b) Higher-gen (or matching) acquire wins
+    acquired = s.leases.acquireCAS(
+      { sessionId: "session-acq", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 5, binaryEpoch: 1 },
+      10_000,
+      5_000,
+    );
+    expect(acquired).toBe(true);
+    expect(s.leases.get("session-acq")?.ownerGeneration).toBe(5);
+
+    // (c) Same-gen self-renew idempotent -> true
+    acquired = s.leases.acquireCAS(
+      { sessionId: "session-acq", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 5, binaryEpoch: 1 },
+      11_000,
+      5_000,
+    );
+    expect(acquired).toBe(true);
+    expect(s.leases.get("session-acq")?.leaseExpiresAt).toBe(16_000);
+
+    // (d) Same-gen, expired, different serve+instance -> steal succeeds
+    // Expire the lease by advancing time to 17_000 (expires at 16_000)
+    // Update assignment to point to serve-B at generation 5
+    s.assignments.upsert({
+      sessionId: "session-acq",
+      directoryKey: null,
+      desiredServeId: "serve-B",
+      ownerGeneration: 5,
+      state: "assigned",
+      lastActiveAt: 17_000,
+      updatedAt: 17_000,
+    });
+
+    acquired = s.leases.acquireCAS(
+      { sessionId: "session-acq", serveId: "serve-B", instanceUuid: "uuid-B", ownerGeneration: 5, binaryEpoch: 1 },
+      17_000,
+      5_000,
+    );
+    expect(acquired).toBe(true);
+    const l = s.leases.get("session-acq");
+    expect(l?.serveId).toBe("serve-B");
+    expect(l?.instanceUuid).toBe("uuid-B");
+
+    // (e) Epoch mismatch (routing_meta has 1, caller passes 2) -> rejected
+    acquired = s.leases.acquireCAS(
+      { sessionId: "session-acq", serveId: "serve-B", instanceUuid: "uuid-B", ownerGeneration: 5, binaryEpoch: 2 },
+      18_000,
+      5_000,
+    );
+    expect(acquired).toBe(false);
+
+    s.db.close();
+  });
+
+  it("Hole 3 / renew correctness", () => {
+    const s = openStorageDb(":memory:");
+    s.meta.bumpEpoch(10_000); // epoch = 1
+
+    s.assignments.upsert({
+      sessionId: "session-renew",
+      directoryKey: null,
+      desiredServeId: "serve-A",
+      ownerGeneration: 5,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    });
+
+    const acquired = s.leases.acquireCAS(
+      { sessionId: "session-renew", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 5, binaryEpoch: 1 },
+      10_000,
+      5_000,
+    );
+    expect(acquired).toBe(true);
+
+    // (a) Renew fails after assignments.bumpGeneration (assignment gen no longer matches caller's gen)
+    s.assignments.bumpGeneration("session-renew", 11_000); // generation is now 6
+    let renewed = s.leases.renewCAS("session-renew", "serve-A", "uuid-A", 5, 1, 11_000, 5_000);
+    expect(renewed).toBe(false);
+
+    // Restore assignment gen to 5 for next checks
+    s.assignments.upsert({
+      sessionId: "session-renew",
+      directoryKey: null,
+      desiredServeId: "serve-A",
+      ownerGeneration: 5,
+      state: "assigned",
+      lastActiveAt: 12_000,
+      updatedAt: 12_000,
+    });
+
+    // (b) Renew fails after meta.bumpEpoch (caller's epoch no longer matches)
+    s.meta.bumpEpoch(12_000); // meta binary_epoch is now 2
+    renewed = s.leases.renewCAS("session-renew", "serve-A", "uuid-A", 5, 1, 12_000, 5_000);
+    expect(renewed).toBe(false);
+
+    // (c) Renew succeeds for current owner at current epoch+gen
+    // Bump assignment gen to 6, meta epoch is 2. Let's align both!
+    s.assignments.upsert({
+      sessionId: "session-renew",
+      directoryKey: null,
+      desiredServeId: "serve-A",
+      ownerGeneration: 6,
+      state: "assigned",
+      lastActiveAt: 13_000,
+      updatedAt: 13_000,
+    });
+    // First let the current owner acquire at generation 6, epoch 2
+    const acq2 = s.leases.acquireCAS(
+      { sessionId: "session-renew", serveId: "serve-A", instanceUuid: "uuid-A", ownerGeneration: 6, binaryEpoch: 2 },
+      13_000,
+      5_000,
+    );
+    expect(acq2).toBe(true);
+
+    // Now renew with gen 6, epoch 2
+    renewed = s.leases.renewCAS("session-renew", "serve-A", "uuid-A", 6, 2, 14_000, 5_000);
+    expect(renewed).toBe(true);
 
     s.db.close();
   });
