@@ -239,12 +239,13 @@ describe("Hardened Lease CAS Concurrency Proof", () => {
 
           for (let j = i + 1; j < group.length; j++) {
             const b = group[j]!;
-            // Since the array is sorted by acquiredAt, b.acquiredAt >= a.acquiredAt.
-            // Therefore, they overlap if and only if b.acquiredAt < aEnd.
-            // We use a small grace margin (e.g. 8ms) to avoid false overlap assertions
-            // due to multi-process clock-sampling/scheduling skews in user space.
-            const overlapGraceMs = 8;
-            if (b.acquiredAt < aEnd - overlapGraceMs) {
+            // Sorted by acquiredAt, so b.acquiredAt >= a.acquiredAt; they overlap iff
+            // b.acquiredAt < aEnd. NO grace margin: acquiredAt/expiresAt are the exact
+            // `now`/`now+ttl` values written to the DB's lease_expires_at, and the CAS only
+            // lets a competing owner acquire once lease_expires_at <= its now (expiry) or
+            // after a fenced release — so a correct CAS yields ZERO cross-uuid overlap.
+            // Any overlap here is a genuine two-owner violation, not a clock artifact.
+            if (b.acquiredAt < aEnd) {
               // Overlap detected. Assert they are from the same instance_uuid (self-renew)
               if (a.instanceUuid !== b.instanceUuid) {
                 const sessionLogs = allActionLogs
