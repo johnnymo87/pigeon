@@ -57,7 +57,7 @@ export function startServer(
     }
   });
 
-  server.listen(config.port);
+  server.listen(config.port, config.bindHost);
 
   return {
     server,

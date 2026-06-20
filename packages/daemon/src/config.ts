@@ -14,6 +14,8 @@ export interface DaemonConfig {
   activeTurnCap: number;
   idleMigrateMs: number;
   dormantTtlMs: number;
+  bindHost: string;
+  authToken?: string;
 }
 
 const DEFAULT_PORT = 4731;
@@ -73,5 +75,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     activeTurnCap: numOr(env.PIGEON_ACTIVE_TURN_CAP, 25),
     idleMigrateMs: numOr(env.PIGEON_IDLE_MIGRATE_MS, 60_000),
     dormantTtlMs:  numOr(env.PIGEON_DORMANT_TTL_MS, 300_000),
+    bindHost: env.PIGEON_BIND_HOST?.trim() || "127.0.0.1",
+    authToken: env.PIGEON_DAEMON_AUTH_TOKEN?.trim() || undefined,
   };
 }

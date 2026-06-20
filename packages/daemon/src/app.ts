@@ -5,6 +5,7 @@ import { generateToken, formatTelegramNotification, formatQuestionNotification, 
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError } from "./routing/router";
+import { checkAuth } from "./auth";
 
 function makeMsgId(): string {
   // Sortable-ish by createdAt: timestamp prefix in base36 + short random suffix.
@@ -90,6 +91,7 @@ interface AppOptions {
   chatId?: string;
   machineId?: string;
   router?: IngressRouter;
+  authToken?: string;
 }
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
@@ -101,6 +103,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
   return async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    const authFailure = checkAuth(request, url, options.authToken);
+    if (authFailure) return authFailure;
 
     try {
       if (request.method === "GET" && url.pathname === "/health") {

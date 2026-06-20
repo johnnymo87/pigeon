@@ -311,6 +311,7 @@ const server = startServer(config, createApp(storage, {
   chatId: config.telegramChatId,
   machineId: config.machineId,
   router: ingressRouter,
+  authToken: config.authToken,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
       await poller.registerSession(sessionId, label ?? undefined);
