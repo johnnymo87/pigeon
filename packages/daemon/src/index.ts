@@ -24,9 +24,35 @@ import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
+import { IngressRouter } from "./routing/router";
+import { seedServes } from "./routing/serve-registry";
+import { ServeHealthPoller } from "./routing/serve-health-poller";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
+
+const ingressRouter = config.serveEndpoints.length > 0
+  ? new IngressRouter(storage, {
+      leaseTtlMs: config.leaseTtlMs,
+      staleServeMs: config.staleServeMs,
+      idleMigrateMs: config.idleMigrateMs,
+      dormantTtlMs: config.dormantTtlMs,
+      activeTurnCap: config.activeTurnCap,
+    })
+  : undefined;
+
+let healthPoller: ServeHealthPoller | undefined;
+if (ingressRouter) {
+  seedServes(storage.serves, config.serveEndpoints, Date.now());
+  ingressRouter.rebuildFromDb();
+  healthPoller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
+  healthPoller.start();
+  const sweepTimer = setInterval(() => ingressRouter.sweep(Date.now()), config.healthPollMs);
+  sweepTimer.unref?.();
+  console.log(`[pigeon-daemon] ingress router started (serves=${config.serveEndpoints.length})`);
+} else {
+  console.log("[pigeon-daemon] ingress router NOT started (no serveEndpoints)");
+}
 
 const opencodeClient = config.opencodeUrl
   ? new OpencodeClient({ baseUrl: config.opencodeUrl })
@@ -270,6 +296,7 @@ const server = startServer(config, createApp(storage, {
   notifier,
   chatId: config.telegramChatId,
   machineId: config.machineId,
+  router: ingressRouter,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
       await poller.registerSession(sessionId, label ?? undefined);

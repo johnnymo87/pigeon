@@ -4,6 +4,7 @@ import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
+import { IngressRouter, NoHealthyServeError } from "./routing/router";
 
 function makeMsgId(): string {
   // Sortable-ish by createdAt: timestamp prefix in base36 + short random suffix.
@@ -88,6 +89,7 @@ interface AppOptions {
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
   chatId?: string;
   machineId?: string;
+  router?: IngressRouter;
 }
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
@@ -518,6 +520,28 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             await onSessionDelete(sessionId);
           }
           return Response.json({ ok: true });
+        }
+      }
+
+      if (request.method === "GET" && url.pathname === "/route") {
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId)) {
+          return Response.json({ error: "invalid session_id" }, { status: 400 });
+        }
+        if (!options.router) {
+          return Response.json({ error: "routing not configured" }, { status: 503 });
+        }
+        try {
+          const route = options.router.ensureRouted(sessionId, nowFn());
+          return Response.json(route);
+        } catch (err) {
+          if (err instanceof NoHealthyServeError) {
+            return new Response(JSON.stringify({ error: "no healthy serve", retryAfter: 5 }), {
+              status: 503,
+              headers: { "content-type": "application/json", "Retry-After": "5" },
+            });
+          }
+          throw err;
         }
       }
 
