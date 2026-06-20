@@ -333,4 +333,208 @@ describe("IngressRouter Service Logic", () => {
     expect(res2?.serveId).toBe("serve-2");
     expect(res2?.ownerGeneration).toBe(2);
   });
+
+  // Test 8: Bounded-load skip
+  it("Bounded-load skip: avoids over-utilized serves unless all are at capacity", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 1,
+    });
+
+    const now = 10_000;
+    const s1: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    const s2: ServeInstanceRecord = {
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    s.serves.upsert(s1);
+    s.serves.upsert(s2);
+
+    let dormantPickSid = "";
+    for (let i = 0; i < 1000; i++) {
+      const candidate = `session-dormant-pick-${i}`;
+      if (pickServe(candidate, ["serve-1", "serve-2"]) === "serve-1") {
+        dormantPickSid = candidate;
+        break;
+      }
+    }
+    expect(dormantPickSid).not.toBe("");
+
+    // Force a dormant assignment on serve-1 (should NOT count toward capacity)
+    s.assignments.upsert({
+      sessionId: "session-dormant-temp",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 1,
+      state: "dormant",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+
+    // Place session. Since serve-1's only assignment is dormant, active count is 0 < activeTurnCap (1).
+    // So serve-1 is eligible and picked by HRW.
+    const resDormant = router.placeSession(dormantPickSid, now);
+    expect(resDormant.serveId).toBe("serve-1");
+
+    // Force one active assignment on serve-1
+    s.assignments.upsert({
+      sessionId: "session-forced-1",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+
+    // Place a new session. It should pick serve-2 since serve-1 is at capacity (1 >= activeTurnCap=1)
+    const res1 = router.placeSession("session-new", now);
+    expect(res1.serveId).toBe("serve-2");
+
+    // Force both serves to be at capacity by adding an active assignment on serve-2
+    s.assignments.upsert({
+      sessionId: "session-forced-2",
+      directoryKey: null,
+      desiredServeId: "serve-2",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+
+    // Now both serves are at cap. Next placeSession falls back to the full pool (and picks one of them)
+    const res2 = router.placeSession("session-fallback", now);
+    expect(["serve-1", "serve-2"]).toContain(res2.serveId);
+  });
+
+  // Test 9: Sweep marks dormant + prunes lease
+  it("Sweep marks dormant + prunes lease: transitions expired lease assignments to dormant and removes lease rows", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    const serve: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    s.serves.upsert(serve);
+
+    const res = router.ensureRouted("session-1", now);
+    expect(res.expiresAt).toBe(now + 5000);
+
+    // sweep before expiry keeps it assigned
+    router.sweep(now + 2000);
+    expect(s.assignments.get("session-1")?.state).toBe("assigned");
+    expect(s.leases.get("session-1")).not.toBeNull();
+
+    // sweep after expiry transitions to dormant and prunes lease
+    router.sweep(now + 6000); // 5000 is expiry, so 6000 is after expiry
+    expect(s.assignments.get("session-1")?.state).toBe("dormant");
+    expect(s.leases.get("session-1")).toBeNull();
+  });
+
+  // Test 10: LeaseContendedError
+  it("LeaseContendedError: throws LeaseContendedError if lease acquisition fails and resolveRoute is null", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    const s1: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    const s2: ServeInstanceRecord = {
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "unhealthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    s.serves.upsert(s1);
+    s.serves.upsert(s2);
+
+    // Force assignment.desiredServeId = "serve-1", generation = 2
+    s.assignments.upsert({
+      sessionId: "session-contended",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 2,
+      state: "assigned",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+
+    // Force lease row on serve-2 at generation 2 (unexpired)
+    s.leases.acquireCAS({
+      sessionId: "session-contended",
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      ownerGeneration: 2,
+      binaryEpoch: 0,
+    }, now, 5000);
+
+    // Verify lease row exists with serve-2 and gen 2
+    const forcedLease = s.leases.get("session-contended");
+    expect(forcedLease?.serveId).toBe("serve-2");
+    expect(forcedLease?.ownerGeneration).toBe(2);
+
+    // Call placeSession.
+    expect(() => router.placeSession("session-contended", now)).toThrow(LeaseContendedError);
+  });
+
+  // Test 11: touch on unrouted session -> null
+  it("touch on unrouted session: returns null", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const res = router.touch("session-unrouted", 10_000);
+    expect(res).toBeNull();
+  });
 });

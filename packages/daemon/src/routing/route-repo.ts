@@ -203,6 +203,13 @@ export class SessionAssignmentRepo {
       .all() as Row[];
     return rows.map(asAssignment);
   }
+
+  countActiveForServe(serveId: string): number {
+    const res = this.db
+      .prepare(`SELECT COUNT(*) as count FROM session_assignment WHERE desired_serve_id = ? AND state = 'assigned'`)
+      .get(serveId) as { count: number } | undefined;
+    return res?.count ?? 0;
+  }
 }
 
 export class SessionLeaseRepo {

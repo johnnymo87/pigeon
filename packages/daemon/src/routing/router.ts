@@ -41,7 +41,6 @@ export class IngressRouter {
       dormantTtlMs: number;
       activeTurnCap: number;
       binaryEpoch?: number;
-      nowFn?: () => number;
     },
   ) {
     this.sticky = new StickyRouter<string, string>(opts.idleMigrateMs);
@@ -107,7 +106,7 @@ export class IngressRouter {
 
     // Bounded-load skip
     let eligible = candidates.filter(
-      (id) => this.repos.assignments.listForServe(id).length < this.opts.activeTurnCap,
+      (id) => this.repos.assignments.countActiveForServe(id) < this.opts.activeTurnCap,
     );
     if (eligible.length === 0) {
       eligible = candidates;
@@ -199,6 +198,7 @@ export class IngressRouter {
     const expired = this.repos.leases.listExpired(now);
     for (const l of expired) {
       this.repos.assignments.setState(l.sessionId, "dormant", now);
+      this.repos.leases.release(l.sessionId);
     }
   }
 

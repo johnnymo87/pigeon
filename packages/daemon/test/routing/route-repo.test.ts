@@ -152,6 +152,30 @@ describe("Routing Repositories", () => {
     expect(allAssignments).toHaveLength(2);
     expect(allAssignments.find(x => x.sessionId === "session-1")?.state).toBe("migrating");
 
+    // 5c. countActiveForServe
+    // Right now, both assignments are non-assigned ('migrating' and 'dormant')
+    expect(s.assignments.countActiveForServe("serve-1")).toBe(0);
+
+    // Upsert an 'assigned' one
+    const a3: AssignmentRecord = {
+      sessionId: "session-3",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    };
+    s.assignments.upsert(a3);
+    expect(s.assignments.countActiveForServe("serve-1")).toBe(1);
+
+    // Upsert other states
+    s.assignments.setState("session-3", "draining", 11_000);
+    expect(s.assignments.countActiveForServe("serve-1")).toBe(0);
+
+    s.assignments.setState("session-3", "assigned", 11_000);
+    expect(s.assignments.countActiveForServe("serve-1")).toBe(1);
+
     // bumpGeneration on missing assignment throws
     expect(() => s.assignments.bumpGeneration("nonexistent", 12_000)).toThrow(
       "Assignment not found to bump generation: nonexistent"
