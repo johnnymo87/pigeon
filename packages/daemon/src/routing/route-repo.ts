@@ -196,6 +196,13 @@ export class SessionAssignmentRepo {
       .all(serveId) as Row[];
     return rows.map(asAssignment);
   }
+
+  all(): AssignmentRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM session_assignment")
+      .all() as Row[];
+    return rows.map(asAssignment);
+  }
 }
 
 export class SessionLeaseRepo {

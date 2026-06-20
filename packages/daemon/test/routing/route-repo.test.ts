@@ -147,6 +147,11 @@ describe("Routing Repositories", () => {
     expect(list.find(x => x.sessionId === "session-1")?.state).toBe("migrating");
     expect(list.find(x => x.sessionId === "session-2")?.state).toBe("dormant");
 
+    // 5b. all
+    const allAssignments = s.assignments.all();
+    expect(allAssignments).toHaveLength(2);
+    expect(allAssignments.find(x => x.sessionId === "session-1")?.state).toBe("migrating");
+
     // bumpGeneration on missing assignment throws
     expect(() => s.assignments.bumpGeneration("nonexistent", 12_000)).toThrow(
       "Assignment not found to bump generation: nonexistent"
