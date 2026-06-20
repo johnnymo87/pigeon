@@ -13,7 +13,7 @@ import { OutboxRepository } from "./outbox-repo";
 import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
 import { initRouteSchema } from "../routing/route-schema";
-import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo } from "../routing/route-repo";
+import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMetaRepo } from "../routing/route-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -27,6 +27,7 @@ export interface StorageDb {
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
+  meta: RoutingMetaRepo;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -52,5 +53,6 @@ export function openStorageDb(path: string): StorageDb {
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),
+    meta: new RoutingMetaRepo(db),
   };
 }

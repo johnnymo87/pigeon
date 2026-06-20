@@ -3,6 +3,7 @@ import type {
   ServeInstanceRecord,
   AssignmentRecord,
   LeaseRecord,
+  RoutingMetaRecord,
 } from "./types";
 
 type Row = Record<string, unknown>;
@@ -40,6 +41,15 @@ function asLease(row: Row): LeaseRecord {
     leaseExpiresAt: Number(row.lease_expires_at),
     heartbeatAt: Number(row.heartbeat_at),
     binaryEpoch: Number(row.binary_epoch),
+  };
+}
+
+function asRoutingMeta(row: Row): RoutingMetaRecord {
+  return {
+    schemaVersion: Number(row.schema_version),
+    ddlChecksum: String(row.ddl_checksum),
+    binaryEpoch: Number(row.binary_epoch),
+    updatedAt: Number(row.updated_at),
   };
 }
 
@@ -285,5 +295,26 @@ export class SessionLeaseRepo {
       .prepare("SELECT * FROM session_lease WHERE lease_expires_at <= ?")
       .all(now) as Row[];
     return rows.map(asLease);
+  }
+}
+
+export class RoutingMetaRepo {
+  constructor(private readonly db: BetterSqlite3.Database) {}
+
+  get(): RoutingMetaRecord {
+    const row = this.db
+      .prepare("SELECT * FROM routing_meta WHERE id = 1")
+      .get() as Row | undefined;
+    if (!row) {
+      throw new Error("Routing meta singleton row not found; has schema been initialized?");
+    }
+    return asRoutingMeta(row);
+  }
+
+  bumpEpoch(now: number): number {
+    this.db
+      .prepare("UPDATE routing_meta SET binary_epoch = binary_epoch + 1, updated_at = ? WHERE id = 1")
+      .run(now);
+    return this.get().binaryEpoch;
   }
 }

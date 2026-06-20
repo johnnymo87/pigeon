@@ -37,3 +37,10 @@ export interface RouteResult {
   eventUrl: string;
   expiresAt: number;
 }
+
+export interface RoutingMetaRecord {
+  schemaVersion: number;
+  ddlChecksum: string;
+  binaryEpoch: number;
+  updatedAt: number;
+}

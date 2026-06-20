@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { existsSync, unlinkSync } from "node:fs";
 import { openStorageDb } from "../../src/storage/database";
 import type {
   ServeInstanceRecord,
@@ -291,5 +294,61 @@ describe("Routing Repositories", () => {
     expect(s.leases.get("session-1")).toBeNull();
 
     s.db.close();
+  });
+
+  it("RoutingMetaRepo: get, bumpEpoch, idempotent seed", () => {
+    // 1. After openStorageDb(":memory:"), s.meta.get() returns initial row
+    const s = openStorageDb(":memory:");
+    const meta = s.meta.get();
+    expect(meta).toEqual({
+      schemaVersion: 1,
+      binaryEpoch: 0,
+      ddlChecksum: expect.any(String),
+      updatedAt: expect.any(Number),
+    });
+    expect(meta.ddlChecksum.length).toBeGreaterThan(0);
+
+    // 2. s.meta.bumpEpoch(now) returns 1, subsequent get reflects change
+    const now = 20_000;
+    const newEpoch = s.meta.bumpEpoch(now);
+    expect(newEpoch).toBe(1);
+
+    const meta2 = s.meta.get();
+    expect(meta2.binaryEpoch).toBe(1);
+    expect(meta2.updatedAt).toBe(now);
+
+    s.db.close();
+
+    // 3. Idempotent seed using a file-backed temp DB
+    const dbPath = join(tmpdir(), `pigeon-test-routing-meta-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    if (existsSync(dbPath)) {
+      unlinkSync(dbPath);
+    }
+
+    try {
+      // First open -> seeds meta with epoch=0
+      const sFile1 = openStorageDb(dbPath);
+      expect(sFile1.meta.get().binaryEpoch).toBe(0);
+
+      // Bump to 3
+      sFile1.meta.bumpEpoch(10_000);
+      sFile1.meta.bumpEpoch(11_000);
+      sFile1.meta.bumpEpoch(12_000);
+      expect(sFile1.meta.get().binaryEpoch).toBe(3);
+
+      sFile1.db.close();
+
+      // Re-open same path -> initRouteSchema runs again, should NOT reset epoch or updatedAt
+      const sFile2 = openStorageDb(dbPath);
+      const metaAfterReopen = sFile2.meta.get();
+      expect(metaAfterReopen.binaryEpoch).toBe(3);
+      expect(metaAfterReopen.updatedAt).toBe(12_000);
+
+      sFile2.db.close();
+    } finally {
+      if (existsSync(dbPath)) {
+        unlinkSync(dbPath);
+      }
+    }
   });
 });
