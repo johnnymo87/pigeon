@@ -534,4 +534,77 @@ describe("IngressRouter Service Logic", () => {
     const res = router.touch("session-unrouted", 10_000);
     expect(res).toBeNull();
   });
+
+  // Test 12: Epoch gates serve health
+  it("Epoch gates serve health: places successfully when serve binaryEpoch matches meta binaryEpoch", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    const serve: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 1,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    s.serves.upsert(serve);
+
+    // Separately: serve seeded with binaryEpoch: 1 while meta stays 0 -> placeSession throws NoHealthyServeError
+    expect(() => router.placeSession("session-1", now)).toThrow(NoHealthyServeError);
+
+    // Bump meta epoch to 1
+    s.meta.bumpEpoch(now);
+
+    // Now placeSession / ensureRouted should succeed
+    const res = router.ensureRouted("session-1", now);
+    expect(res).not.toBeNull();
+    expect(res.serveId).toBe("serve-1");
+  });
+
+  // Test 13: Epoch bump self-invalidates a route
+  it("Epoch bump self-invalidates a route: returns null from resolveRoute after an epoch bump", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    const serve: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    };
+    s.serves.upsert(serve);
+
+    const res = router.ensureRouted("session-1", now);
+    expect(res).not.toBeNull();
+
+    // Now resolveRoute succeeds
+    const resolved = router.resolveRoute("session-1", now);
+    expect(resolved).not.toBeNull();
+
+    // Bump meta epoch to 1
+    s.meta.bumpEpoch(now);
+
+    // Now resolveRoute returns null because the current epoch is 1, but the serve and assignment/lease are still at 0
+    const resolvedAfterBump = router.resolveRoute("session-1", now);
+    expect(resolvedAfterBump).toBeNull();
+  });
 });

@@ -4,6 +4,7 @@ import type {
   ServeInstanceRepo,
   SessionAssignmentRepo,
   SessionLeaseRepo,
+  RoutingMetaRepo,
 } from "./route-repo";
 import type {
   ServeInstanceRecord,
@@ -26,13 +27,13 @@ export class LeaseContendedError extends Error {
 
 export class IngressRouter {
   private sticky: StickyRouter<string, string>;
-  private binaryEpoch: number;
 
   constructor(
     private repos: {
       serves: ServeInstanceRepo;
       assignments: SessionAssignmentRepo;
       leases: SessionLeaseRepo;
+      meta: RoutingMetaRepo;
     },
     private opts: {
       leaseTtlMs: number;
@@ -40,31 +41,30 @@ export class IngressRouter {
       idleMigrateMs: number;
       dormantTtlMs: number;
       activeTurnCap: number;
-      binaryEpoch?: number;
     },
   ) {
     this.sticky = new StickyRouter<string, string>(opts.idleMigrateMs);
-    this.binaryEpoch = opts.binaryEpoch ?? 0;
   }
 
-  private isServeHealthy(s: ServeInstanceRecord | null, now: number): boolean {
+  private isServeHealthy(s: ServeInstanceRecord | null, now: number, epoch: number): boolean {
     return (
       !!s &&
       s.healthState === "healthy" &&
       s.heartbeatAt > now - this.opts.staleServeMs &&
       !s.draining &&
-      s.binaryEpoch === this.binaryEpoch
+      s.binaryEpoch === epoch
     );
   }
 
   resolveRoute(sessionId: string, now: number): RouteResult | null {
+    const epoch = this.repos.meta.get().binaryEpoch;
     const a = this.repos.assignments.get(sessionId);
     if (!a) {
       return null;
     }
 
     const serve = this.repos.serves.get(a.desiredServeId);
-    if (!serve || !this.isServeHealthy(serve, now)) {
+    if (!serve || !this.isServeHealthy(serve, now, epoch)) {
       return null;
     }
 
@@ -94,10 +94,11 @@ export class IngressRouter {
     now: number,
     directoryKey?: string | null,
   ): RouteResult {
+    const epoch = this.repos.meta.get().binaryEpoch;
     const healthy = this.repos.serves.listHealthy(
       now,
       this.opts.staleServeMs,
-      this.binaryEpoch,
+      epoch,
     );
     const candidates = healthy.map((s) => s.serveId);
     if (candidates.length === 0) {
@@ -145,7 +146,7 @@ export class IngressRouter {
         serveId: chosen,
         instanceUuid: serve.instanceUuid,
         ownerGeneration,
-        binaryEpoch: this.binaryEpoch,
+        binaryEpoch: epoch,
       },
       now,
       this.opts.leaseTtlMs,
@@ -175,6 +176,7 @@ export class IngressRouter {
   }
 
   touch(sessionId: string, now: number): RouteResult | null {
+    const epoch = this.repos.meta.get().binaryEpoch;
     const r = this.resolveRoute(sessionId, now);
     if (!r) {
       return null;
@@ -186,7 +188,7 @@ export class IngressRouter {
       r.serveId,
       r.instanceUuid,
       r.ownerGeneration,
-      this.binaryEpoch,
+      epoch,
       now,
       this.opts.leaseTtlMs,
     );

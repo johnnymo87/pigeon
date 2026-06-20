@@ -38,18 +38,13 @@ describe("serve-health-poller", () => {
     s.serves.setHealth("serve-1", "healthy", 1000);
 
     const router = new IngressRouter(
-      {
-        serves: s.serves,
-        assignments: s.assignments,
-        leases: s.leases,
-      },
+      s,
       {
         leaseTtlMs: 30000,
         staleServeMs: 15000,
         idleMigrateMs: 60000,
         dormantTtlMs: 300000,
         activeTurnCap: 25,
-        binaryEpoch: 0,
       }
     );
 
@@ -115,18 +110,13 @@ describe("serve-health-poller", () => {
     s.serves.setHealth("serve-0", "healthy", 1000);
 
     const router = new IngressRouter(
-      {
-        serves: s.serves,
-        assignments: s.assignments,
-        leases: s.leases,
-      },
+      s,
       {
         leaseTtlMs: 30000,
         staleServeMs: 15000,
         idleMigrateMs: 60000,
         dormantTtlMs: 300000,
         activeTurnCap: 25,
-        binaryEpoch: 0,
       }
     );
 
