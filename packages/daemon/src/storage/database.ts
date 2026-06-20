@@ -12,6 +12,8 @@ import {
 import { OutboxRepository } from "./outbox-repo";
 import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
+import { initRouteSchema } from "../routing/route-schema";
+import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo } from "../routing/route-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -22,6 +24,9 @@ export interface StorageDb {
   pendingQuestions: PendingQuestionRepository;
   outbox: OutboxRepository;
   swarm: SwarmRepository;
+  serves: ServeInstanceRepo;
+  assignments: SessionAssignmentRepo;
+  leases: SessionLeaseRepo;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -33,6 +38,7 @@ export function openStorageDb(path: string): StorageDb {
   db.exec("PRAGMA foreign_keys = ON;");
   initSchema(db);
   initSwarmSchema(db);
+  initRouteSchema(db);
 
   return {
     db,
@@ -43,5 +49,8 @@ export function openStorageDb(path: string): StorageDb {
     pendingQuestions: new PendingQuestionRepository(db),
     outbox: new OutboxRepository(db),
     swarm: new SwarmRepository(db),
+    serves: new ServeInstanceRepo(db),
+    assignments: new SessionAssignmentRepo(db),
+    leases: new SessionLeaseRepo(db),
   };
 }
