@@ -1,28 +1,12 @@
 import { openStorageDb } from "../../src/storage/database.js";
+import type {
+  OwnershipEvent,
+  WorkerSetupMessage,
+  WorkerResultMessage,
+  ActionLog,
+} from "./lease-cas-concurrency.test.js";
 
-interface OwnershipEvent {
-  sessionId: string;
-  instanceUuid: string;
-  generation: number;
-  epoch: number;
-  acquiredAt: number;
-  expiresAt: number;
-  releasedAt?: number;
-}
-
-interface ActionLog {
-  action: "acquire" | "renew" | "release";
-  sessionId: string;
-  instanceUuid: string;
-  gen: number;
-  epoch: number;
-  now: number;
-  ttlMs?: number;
-  success: boolean;
-  resultExpiresAt?: number;
-}
-
-process.on("message", async (msg: any) => {
+process.on("message", async (msg: WorkerSetupMessage) => {
   if (!msg || msg.type !== "setup") return;
 
   const { dbPath, instanceUuid, sessions, deadline } = msg;
@@ -248,6 +232,7 @@ process.on("message", async (msg: any) => {
   } catch {}
 
   // Post results back
-  process.send!({ events, actionLogs, counters });
+  const resultMsg: WorkerResultMessage = { events, actionLogs, counters };
+  process.send!(resultMsg);
   process.exit(0);
 });
