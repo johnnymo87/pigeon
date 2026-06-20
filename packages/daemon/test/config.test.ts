@@ -51,4 +51,52 @@ describe("loadConfig", () => {
     const config = loadConfig({});
     expect(config.opencodeUrl).toBeUndefined();
   });
+
+  it("loads routing fields with defaults when env is empty", () => {
+    const config = loadConfig({});
+    expect(config.serveEndpoints).toEqual([]);
+    expect(config.leaseTtlMs).toBe(30000);
+    expect(config.staleServeMs).toBe(15000);
+    expect(config.healthPollMs).toBe(5000);
+    expect(config.activeTurnCap).toBe(25);
+    expect(config.idleMigrateMs).toBe(60000);
+    expect(config.dormantTtlMs).toBe(300000);
+  });
+
+  it("loads routing fields from env", () => {
+    const config = loadConfig({
+      PIGEON_SERVE_ENDPOINTS: "http://endpoint1, http://endpoint2 ",
+      PIGEON_LEASE_TTL_MS: "10000",
+      PIGEON_SERVE_STALE_MS: "5000",
+      PIGEON_HEALTH_POLL_MS: "2000",
+      PIGEON_ACTIVE_TURN_CAP: "10",
+      PIGEON_IDLE_MIGRATE_MS: "12000",
+      PIGEON_DORMANT_TTL_MS: "15000",
+    });
+    expect(config.serveEndpoints).toEqual(["http://endpoint1", "http://endpoint2"]);
+    expect(config.leaseTtlMs).toBe(10000);
+    expect(config.staleServeMs).toBe(5000);
+    expect(config.healthPollMs).toBe(2000);
+    expect(config.activeTurnCap).toBe(10);
+    expect(config.idleMigrateMs).toBe(12000);
+    expect(config.dormantTtlMs).toBe(15000);
+  });
+
+  it("falls back to default if parsing numbers results in NaN or empty", () => {
+    const config = loadConfig({
+      PIGEON_LEASE_TTL_MS: "nope",
+      PIGEON_SERVE_STALE_MS: "",
+      PIGEON_HEALTH_POLL_MS: "  ",
+    });
+    expect(config.leaseTtlMs).toBe(30000);
+    expect(config.staleServeMs).toBe(15000);
+    expect(config.healthPollMs).toBe(5000);
+  });
+
+  it("falls back to opencodeUrl for serveEndpoints when PIGEON_SERVE_ENDPOINTS is empty and OPENCODE_URL is set", () => {
+    const config = loadConfig({
+      OPENCODE_URL: "http://localhost:4096"
+    });
+    expect(config.serveEndpoints).toEqual(["http://localhost:4096"]);
+  });
 });
