@@ -221,9 +221,11 @@ export class SessionLeaseRepo {
          ON CONFLICT(session_id) DO UPDATE SET
            serve_id=@serve, instance_uuid=@uuid, owner_generation=@gen,
            lease_expires_at=@exp, heartbeat_at=@now, binary_epoch=@epoch
-         WHERE session_lease.lease_expires_at <= @now
-            OR session_lease.owner_generation < @gen
-            OR (session_lease.serve_id=@serve AND session_lease.instance_uuid=@uuid)`,
+         WHERE session_lease.owner_generation < @gen
+            OR (session_lease.owner_generation = @gen AND (
+                 session_lease.lease_expires_at <= @now
+                 OR (session_lease.serve_id = @serve AND session_lease.instance_uuid = @uuid)
+               ))`,
       )
       .run({
         sid: i.sessionId,

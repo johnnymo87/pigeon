@@ -53,6 +53,11 @@ describe("Routing Repositories", () => {
     let healthy = s.serves.listHealthy(10_000, 2_000, 1);
     expect(healthy).toHaveLength(2);
 
+    // listHealthy exact boundary check: heartbeat_at is exactly now - staleMs (9_000) -> should be excluded
+    healthy = s.serves.listHealthy(11_000, 2_000, 1); // threshold is 9_000. s2 is exactly 9_000 -> excluded. s1 is 10_000 -> included.
+    expect(healthy).toHaveLength(1);
+    expect(healthy[0]!.serveId).toBe("serve-1");
+
     // Stale check: let's make s2 stale by setting now to 12_000, staleMs 2_000 (threshold 10_000). s1 is exactly at 10_000 (not > 10_000, or is it > or >=? Let's check instructions: "heartbeat_at > (now-staleMs)")
     // heartbeat_at > (now - staleMs) -> threshold = 12_000 - 2_000 = 10_000. s1 heartbeat is 10_000, so not > 10_000. s2 is 9_000, not > 10_000. So both excluded if now is 12_000.
     // If now is 11_500, threshold is 11_500 - 2_000 = 9_500. s1 (10_000) is included, s2 (9_000) is excluded.
@@ -141,6 +146,11 @@ describe("Routing Repositories", () => {
     expect(list).toHaveLength(2);
     expect(list.find(x => x.sessionId === "session-1")?.state).toBe("migrating");
     expect(list.find(x => x.sessionId === "session-2")?.state).toBe("dormant");
+
+    // bumpGeneration on missing assignment throws
+    expect(() => s.assignments.bumpGeneration("nonexistent", 12_000)).toThrow(
+      "Assignment not found to bump generation: nonexistent"
+    );
 
     s.db.close();
   });
@@ -231,6 +241,21 @@ describe("Routing Repositories", () => {
     const expired = s.leases.listExpired(27_000);
     expect(expired).toHaveLength(1);
     expect(expired[0]!.sessionId).toBe("session-1");
+
+    // Zombie check: lease at owner_generation=2 that has expired CANNOT be acquired by owner_generation=1
+    const inputStaleLower = {
+      sessionId: "session-1",
+      serveId: "serve-4",
+      instanceUuid: "uuid-4",
+      ownerGeneration: 1,
+      binaryEpoch: 1,
+    };
+    const staleAcquired = s.leases.acquireCAS(inputStaleLower, 28_000, 5_000); // lease has expired (27_000), but generation is stale (1 < 2)
+    expect(staleAcquired).toBe(false);
+
+    // renewCAS on non-existent lease returns false safely
+    const renewNonExistent = s.leases.renewCAS("nonexistent", "serve-1", "uuid-1", 1, 10_000, 5_000);
+    expect(renewNonExistent).toBe(false);
 
     // 8. release
     s.leases.release("session-1");
