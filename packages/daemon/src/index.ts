@@ -256,15 +256,30 @@ if (outboxSender) {
 
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.
-// Requires opencode-client (so config.opencodeUrl must be set).
-const swarmArbiter = opencodeClient && config.opencodeUrl
+// Requires opencode-client or ingress router.
+const dirRegistries = new Map<string, SessionDirectoryRegistry>();
+const dirRegistryForEndpoint = (baseUrl: string): SessionDirectoryRegistry => {
+  let r = dirRegistries.get(baseUrl);
+  if (!r) { r = new SessionDirectoryRegistry({ baseUrl, ttlMs: 5 * 60 * 1000 }); dirRegistries.set(baseUrl, r); }
+  return r;
+};
+const directoryForSession = async (sessionId: string): Promise<string | undefined> => {
+  let baseUrl: string | undefined;
+  if (ingressRouter) {
+    try { baseUrl = ingressRouter.ensureRouted(sessionId, Date.now()).apiBase; }
+    catch { baseUrl = undefined; }   // NoHealthyServeError -> fall through
+  }
+  baseUrl ??= config.opencodeUrl;
+  if (!baseUrl) return undefined;
+  try { return await dirRegistryForEndpoint(baseUrl).resolve(sessionId); }
+  catch { return undefined; }
+};
+
+const swarmArbiter = (config.opencodeUrl || ingressRouter)
   ? new SwarmArbiter({
       storage,
-      opencodeClient,
-      registry: new SessionDirectoryRegistry({
-        baseUrl: config.opencodeUrl,
-        ttlMs: 5 * 60 * 1000,
-      }),
+      clientForSession,
+      directoryForSession,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })

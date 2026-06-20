@@ -1,12 +1,11 @@
 import type { StorageDb } from "../storage/database";
 import type { OpencodeClient } from "../opencode-client";
-import type { SessionDirectoryRegistry } from "./registry";
 import { renderEnvelope } from "./envelope";
 
 export interface ArbiterOptions {
   storage: StorageDb;
-  opencodeClient: OpencodeClient;
-  registry: SessionDirectoryRegistry;
+  clientForSession: (sessionId: string) => OpencodeClient | undefined;   // replaces opencodeClient
+  directoryForSession: (sessionId: string) => Promise<string | undefined>; // replaces registry
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -22,8 +21,8 @@ function backoffFor(attempts: number): number {
 
 export class SwarmArbiter {
   private readonly storage: StorageDb;
-  private readonly opencodeClient: OpencodeClient;
-  private readonly registry: SessionDirectoryRegistry;
+  private readonly clientForSession: (sessionId: string) => OpencodeClient | undefined;
+  private readonly directoryForSession: (sessionId: string) => Promise<string | undefined>;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -38,8 +37,8 @@ export class SwarmArbiter {
 
   constructor(opts: ArbiterOptions) {
     this.storage = opts.storage;
-    this.opencodeClient = opts.opencodeClient;
-    this.registry = opts.registry;
+    this.clientForSession = opts.clientForSession;
+    this.directoryForSession = opts.directoryForSession;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
@@ -85,7 +84,11 @@ export class SwarmArbiter {
       if (!next) return;
 
       try {
-        const directory = await this.registry.resolve(target);
+        const client = this.clientForSession(target);
+        const directory = await this.directoryForSession(target);
+        if (!client || directory == null) {
+          throw new Error(`target ${target} not routable/resolvable`); // falls into existing retry/backoff
+        }
         const prompt = renderEnvelope(
           {
             v: "1",
@@ -99,7 +102,7 @@ export class SwarmArbiter {
           },
           next.payload,
         );
-        await this.opencodeClient.sendPrompt(target, directory, prompt);
+        await client.sendPrompt(target, directory, prompt);
         this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
         this.log("delivered", { msgId: next.msgId, target });
       } catch (err) {

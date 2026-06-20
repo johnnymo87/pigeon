@@ -46,10 +46,8 @@ describe("swarm routes e2e", () => {
 
     arbiter = new SwarmArbiter({
       storage,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      opencodeClient: opencodeClient as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      registry: registry as any,
+      clientForSession: () => opencodeClient as any,
+      directoryForSession: async (sessionId) => `/dir/${sessionId}`,
       log: () => {},
     });
 
@@ -117,10 +115,8 @@ describe("swarm routes e2e", () => {
 
     arbiter = new SwarmArbiter({
       storage,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      opencodeClient: opencodeClient as any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      registry: registry as any,
+      clientForSession: () => opencodeClient as any,
+      directoryForSession: async (sessionId) => `/dir/${sessionId}`,
       log: () => {},
     });
 

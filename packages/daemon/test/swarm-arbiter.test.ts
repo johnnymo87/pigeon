@@ -46,10 +46,8 @@ function makeFixture() {
 
   const arbiter = new SwarmArbiter({
     storage,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    opencodeClient: opencodeClient as any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    registry: registry as any,
+    clientForSession: (sessionId: string) => opencodeClient as any,
+    directoryForSession: async (sessionId: string) => `/dir/${sessionId}`,
     nowFn: () => now,
     log: () => {},
   });
