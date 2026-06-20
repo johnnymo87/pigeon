@@ -232,6 +232,19 @@ export class SessionLeaseRepo {
     return row ? asLease(row) : null;
   }
 
+  /**
+   * Atomic lease acquire. A lease may only be created/taken when it agrees with the
+   * source-of-truth tables: `session_assignment` (desired serve + owner_generation) AND
+   * `routing_meta.binary_epoch`. This is a single SQL statement so the check-and-set is
+   * race-safe across connections/processes (SQLite holds the write lock for the whole stmt).
+   *
+   * The INSERT path is `INSERT ... SELECT ... WHERE <assignment+epoch match>` (NOT
+   * `INSERT ... VALUES`): when no lease row exists, a stale caller whose generation/epoch
+   * does not match the assignment produces zero SELECT rows and inserts nothing (fixes the
+   * "stale lower-gen insert when row absent" hole). The ON CONFLICT path re-validates the
+   * same assignment+epoch invariant against `excluded.*`, then applies the take-over ladder.
+   * Returns true iff a row was written (changes > 0).
+   */
   acquireCAS(
     i: { sessionId: string; serveId: string; instanceUuid: string; ownerGeneration: number; binaryEpoch: number },
     now: number,
@@ -246,11 +259,18 @@ export class SessionLeaseRepo {
          ON CONFLICT(session_id) DO UPDATE SET
            serve_id=excluded.serve_id, instance_uuid=excluded.instance_uuid, owner_generation=excluded.owner_generation,
            lease_expires_at=excluded.lease_expires_at, heartbeat_at=excluded.heartbeat_at, binary_epoch=excluded.binary_epoch
+         -- Re-validate the assignment+epoch invariant on conflict: the proposed (excluded.*) row
+         -- must still match the source-of-truth assignment and the current binary_epoch.
          WHERE EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
                        WHERE sa.session_id=excluded.session_id AND sa.desired_serve_id=excluded.serve_id
                          AND sa.owner_generation=excluded.owner_generation AND rm.binary_epoch=excluded.binary_epoch)
+           -- Take-over ladder (only one branch need hold):
+           --   A: higher binary_epoch wins immediately (cutover; safe because M6 drains/stops old serves first).
            AND ( session_lease.binary_epoch < excluded.binary_epoch
+                 --   B: same epoch, higher generation wins (crash-reassignment).
                  OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation < excluded.owner_generation)
+                 --   C: same epoch+generation, allowed only if the held lease has expired OR it's
+                 --      the same owner (serve+instance) renewing its own lease (idempotent).
                  OR (session_lease.binary_epoch = excluded.binary_epoch AND session_lease.owner_generation = excluded.owner_generation
                      AND (session_lease.lease_expires_at <= @now
                           OR (session_lease.serve_id = excluded.serve_id AND session_lease.instance_uuid = excluded.instance_uuid))) )`,
@@ -278,6 +298,9 @@ export class SessionLeaseRepo {
   ): boolean {
     const res = this.db
       .prepare(
+        // Renew only the caller's own lease (full-token fence) AND only while it still agrees
+        // with the source-of-truth assignment + current binary_epoch — so an old serve cannot
+        // keep renewing after pigeon bumps the generation or the epoch.
         `UPDATE session_lease SET lease_expires_at=@now+@ttlMs, heartbeat_at=@now
          WHERE session_id=@sid AND serve_id=@serve AND instance_uuid=@uuid AND owner_generation=@gen AND binary_epoch=@epoch
            AND EXISTS (SELECT 1 FROM session_assignment sa JOIN routing_meta rm ON rm.id=1
