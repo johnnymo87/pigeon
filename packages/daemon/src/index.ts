@@ -96,12 +96,21 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
       },
       {
         onCommand: async (msg) => {
+          // Resolve the target session's owning-serve client so the plugin-free
+          // revive fallback (getSession + sendPrompt in revive-and-deliver) hits
+          // the serve that actually owns this session in a pool, not a fixed
+          // :4096. Mirrors the clientForSession resolution the other handlers use
+          // (zao4.10). The primary DirectChannelAdapter path is already pool-aware
+          // via the session's per-serve backendEndpoint. When unroutable, omit the
+          // client to preserve command-ingest's "no client -> delete dead session"
+          // fallback.
+          const client = clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
             apiKey: config.workerApiKey,
             editNotification: (nid, text, rm, entities) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }, entities as unknown[] | undefined),
             machineId: config.machineId,
-            ...(opencodeClient ? { opencodeClient } : {}),
+            ...(client ? { opencodeClient: client } : {}),
             sendTelegramReply: sendTelegramMessage,
           });
         },
