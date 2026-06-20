@@ -187,6 +187,38 @@ describe("Routing Repositories", () => {
     s.db.close();
   });
 
+  it("SessionAssignmentRepo.setDormantFenced: only dormant-marks when serve+generation match", () => {
+    const s = openStorageDb(":memory:");
+
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 2,
+      state: "assigned",
+      lastActiveAt: 10_000,
+      updatedAt: 10_000,
+    });
+
+    // Wrong generation -> no-op, state unchanged.
+    expect(s.assignments.setDormantFenced("session-1", "serve-1", 1, 11_000)).toBe(false);
+    expect(s.assignments.get("session-1")?.state).toBe("assigned");
+
+    // Wrong serve -> no-op.
+    expect(s.assignments.setDormantFenced("session-1", "serve-9", 2, 11_000)).toBe(false);
+    expect(s.assignments.get("session-1")?.state).toBe("assigned");
+
+    // Matching serve+generation -> dormant.
+    expect(s.assignments.setDormantFenced("session-1", "serve-1", 2, 12_000)).toBe(true);
+    expect(s.assignments.get("session-1")?.state).toBe("dormant");
+    expect(s.assignments.get("session-1")?.updatedAt).toBe(12_000);
+
+    // Already dormant -> no-op (changes=0).
+    expect(s.assignments.setDormantFenced("session-1", "serve-1", 2, 13_000)).toBe(false);
+
+    s.db.close();
+  });
+
   it("SessionLeaseRepo CAS logic: acquireCAS, renewCAS, release, listExpired", () => {
     const s = openStorageDb(":memory:");
 

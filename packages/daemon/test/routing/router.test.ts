@@ -607,4 +607,137 @@ describe("IngressRouter Service Logic", () => {
     const resolvedAfterBump = router.resolveRoute("session-1", now);
     expect(resolvedAfterBump).toBeNull();
   });
+
+  // Test 14: resolveRoute rejects a stale-epoch lease even if the serve re-registers at the new epoch
+  it("resolveRoute: rejects a stale-epoch lease even when the serve has re-registered at the new epoch", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    router.ensureRouted("session-1", now);
+    expect(router.resolveRoute("session-1", now)).not.toBeNull();
+
+    // Cutover: bump meta epoch to 1 AND have the serve re-register at epoch 1 (healthy).
+    s.meta.bumpEpoch(now);
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 1,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    // The serve is now healthy at epoch 1, but the lease is still epoch 0 -> must reject.
+    expect(router.resolveRoute("session-1", now)).toBeNull();
+  });
+
+  // Test 15: touch fails closed when the lease can no longer be renewed
+  it("touch: returns null (fail closed) when renew is rejected after a generation bump", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    router.ensureRouted("session-1", now);
+    // Happy path: touch renews and returns the route.
+    expect(router.touch("session-1", now + 1000)).not.toBeNull();
+
+    // Pigeon bumps the assignment generation -> the held lease (gen 1) can no longer be renewed.
+    s.assignments.bumpGeneration("session-1", now + 1500);
+
+    // touch must fail closed: renew is rejected, so do not report the session as still routed.
+    expect(router.touch("session-1", now + 2000)).toBeNull();
+  });
+
+  // Test 16: sweep does not clobber a newer assignment created by a concurrent re-route
+  it("sweep: fenced dormant — an expired old lease does not clobber a newer re-routed assignment", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    // Old state: an expired lease at generation 1.
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 1,
+      state: "assigned",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+    // Expired lease row (gen 1) via raw insert so it's listed by listExpired.
+    s.db
+      .prepare(
+        `INSERT INTO session_lease (session_id, serve_id, instance_uuid, owner_generation, lease_expires_at, heartbeat_at, binary_epoch)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("session-1", "serve-1", "uuid-1", 1, now - 1, now - 5000, 0);
+
+    // Concurrent re-route happened: assignment is now gen 2 'assigned' with a fresh unexpired lease.
+    s.assignments.upsert({
+      sessionId: "session-1",
+      directoryKey: null,
+      desiredServeId: "serve-1",
+      ownerGeneration: 2,
+      state: "assigned",
+      lastActiveAt: now,
+      updatedAt: now,
+    });
+
+    // sweep at `now`: the OLD (gen 1) lease is expired and listed. But release with the old token
+    // must no-op (the live row is gen 2), so the assignment must NOT be marked dormant.
+    router.sweep(now);
+
+    expect(s.assignments.get("session-1")?.state).toBe("assigned");
+    expect(s.assignments.get("session-1")?.ownerGeneration).toBe(2);
+  });
 });

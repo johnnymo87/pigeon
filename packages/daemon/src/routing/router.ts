@@ -73,7 +73,10 @@ export class IngressRouter {
       !lease ||
       lease.leaseExpiresAt <= now ||
       lease.ownerGeneration !== a.ownerGeneration ||
-      lease.serveId !== a.desiredServeId
+      lease.serveId !== a.desiredServeId ||
+      // Defense-in-depth: reject a stale-epoch lease even if the serve has already
+      // re-registered at the new epoch (the lease itself must be at the current epoch).
+      lease.binaryEpoch !== epoch
     ) {
       return null;
     }
@@ -182,8 +185,9 @@ export class IngressRouter {
       return null;
     }
 
-    this.repos.assignments.touchActive(sessionId, now);
-    this.repos.leases.renewCAS(
+    // Fail closed: if the lease can no longer be renewed (generation or epoch bumped
+    // underneath us), we have lost ownership — do NOT report the session as still routed.
+    const renewed = this.repos.leases.renewCAS(
       sessionId,
       r.serveId,
       r.instanceUuid,
@@ -192,6 +196,10 @@ export class IngressRouter {
       now,
       this.opts.leaseTtlMs,
     );
+    if (!renewed) {
+      return null;
+    }
+    this.repos.assignments.touchActive(sessionId, now);
     this.sticky.route(sessionId, now, r.serveId);
     return r;
   }
@@ -200,8 +208,19 @@ export class IngressRouter {
     this.sticky.sweep(now, this.opts.dormantTtlMs);
     const expired = this.repos.leases.listExpired(now);
     for (const l of expired) {
-      this.repos.assignments.setState(l.sessionId, "dormant", now);
-      this.repos.leases.release(l.sessionId, l.serveId, l.instanceUuid, l.ownerGeneration, l.binaryEpoch);
+      // Release FIRST with the full token: if a newer owner has already replaced this
+      // lease (concurrent re-route), release no-ops and we must NOT touch the assignment.
+      const released = this.repos.leases.release(
+        l.sessionId,
+        l.serveId,
+        l.instanceUuid,
+        l.ownerGeneration,
+        l.binaryEpoch,
+      );
+      if (released) {
+        // Fenced by serve + generation so we only dormant-mark the assignment we just expired.
+        this.repos.assignments.setDormantFenced(l.sessionId, l.serveId, l.ownerGeneration, now);
+      }
     }
   }
 

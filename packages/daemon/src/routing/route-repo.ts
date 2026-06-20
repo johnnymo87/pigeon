@@ -200,6 +200,22 @@ export class SessionAssignmentRepo {
       .run(state, now, sessionId);
   }
 
+  /**
+   * Mark an assignment dormant ONLY if it still matches the given serve + generation
+   * (and isn't already dormant). Fenced so a sweeper expiring an OLD lease cannot clobber
+   * a newer assignment created by a concurrent re-route. Returns true iff a row changed.
+   */
+  setDormantFenced(sessionId: string, serveId: string, ownerGeneration: number, now: number): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE session_assignment
+         SET state = 'dormant', updated_at = @now
+         WHERE session_id = @sid AND desired_serve_id = @serve AND owner_generation = @gen AND state != 'dormant'`,
+      )
+      .run({ now, sid: sessionId, serve: serveId, gen: ownerGeneration });
+    return res.changes > 0;
+  }
+
   listForServe(serveId: string): AssignmentRecord[] {
     const rows = this.db
       .prepare("SELECT * FROM session_assignment WHERE desired_serve_id = ?")
