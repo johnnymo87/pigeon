@@ -47,11 +47,20 @@ let healthPoller: ServeHealthPoller | undefined;
 if (ingressRouter) {
   seedServes(storage.serves, config.serveEndpoints, Date.now());
   ingressRouter.rebuildFromDb();
-  healthPoller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
-  healthPoller.start();
+  if (config.serveLiveness === "self") {
+    const poller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
+    const selfLivenessTimer = setInterval(() => {
+      poller.sweepStale(Date.now(), config.staleServeMs);
+    }, config.healthPollMs);
+    selfLivenessTimer.unref?.();
+    console.log(`[pigeon-daemon] ingress router started with self-heartbeat liveness sweep (serves=${config.serveEndpoints.length})`);
+  } else {
+    healthPoller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
+    healthPoller.start();
+    console.log(`[pigeon-daemon] ingress router started with HTTP polling liveness (serves=${config.serveEndpoints.length})`);
+  }
   const sweepTimer = setInterval(() => ingressRouter.sweep(Date.now()), config.healthPollMs);
   sweepTimer.unref?.();
-  console.log(`[pigeon-daemon] ingress router started (serves=${config.serveEndpoints.length})`);
 } else {
   console.log("[pigeon-daemon] ingress router NOT started (no serveEndpoints)");
 }

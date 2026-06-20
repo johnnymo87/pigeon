@@ -118,6 +118,35 @@ export class ServeInstanceRepo {
       .run(state, now, serveId);
   }
 
+  insertStubIfAbsent(rec: ServeInstanceRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO serve_instance
+           (serve_id, instance_uuid, endpoint, binary_epoch, health_state, heartbeat_at, draining)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(serve_id) DO NOTHING`,
+      )
+      .run(
+        rec.serveId,
+        rec.instanceUuid,
+        rec.endpoint,
+        rec.binaryEpoch,
+        rec.healthState,
+        rec.heartbeatAt,
+        rec.draining ? 1 : 0,
+      );
+  }
+
+  setHealthState(serveId: string, state: "healthy" | "unhealthy" | "unknown"): void {
+    this.db
+      .prepare(
+        `UPDATE serve_instance
+         SET health_state = ?
+         WHERE serve_id = ?`,
+      )
+      .run(state, serveId);
+  }
+
   setDraining(serveId: string, draining: boolean): void {
     this.db
       .prepare(

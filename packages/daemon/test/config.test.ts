@@ -61,6 +61,18 @@ describe("loadConfig", () => {
     expect(config.activeTurnCap).toBe(25);
     expect(config.idleMigrateMs).toBe(60000);
     expect(config.dormantTtlMs).toBe(300000);
+    expect(config.serveLiveness).toBe("http");
+  });
+
+  it("loads serveLiveness from env", () => {
+    const configSelf = loadConfig({ PIGEON_SERVE_LIVENESS: "self" });
+    expect(configSelf.serveLiveness).toBe("self");
+
+    const configHttp = loadConfig({ PIGEON_SERVE_LIVENESS: "http" });
+    expect(configHttp.serveLiveness).toBe("http");
+
+    const configInvalid = loadConfig({ PIGEON_SERVE_LIVENESS: "other" });
+    expect(configInvalid.serveLiveness).toBe("http");
   });
 
   it("loads routing fields from env", () => {

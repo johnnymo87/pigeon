@@ -7,34 +7,20 @@ export function seedServes(
   now: number,
   opts?: { uuidFn?: () => string; binaryEpoch?: number },
 ): void {
-  const binaryEpoch = opts?.binaryEpoch ?? 0;
   const uuidFn = opts?.uuidFn ?? randomUUID;
 
   for (let i = 0; i < endpoints.length; i++) {
     const endpoint = endpoints[i]!;
     const serveId = `serve-${i}`;
-    const existing = serves.get(serveId);
 
-    if (existing) {
-      serves.upsert({
-        serveId,
-        instanceUuid: existing.instanceUuid,
-        endpoint,
-        binaryEpoch,
-        healthState: existing.healthState,
-        heartbeatAt: existing.heartbeatAt,
-        draining: existing.draining,
-      });
-    } else {
-      serves.upsert({
-        serveId,
-        instanceUuid: uuidFn(),
-        endpoint,
-        binaryEpoch,
-        healthState: "unknown",
-        heartbeatAt: now,
-        draining: false,
-      });
-    }
+    serves.insertStubIfAbsent({
+      serveId,
+      instanceUuid: uuidFn(),
+      endpoint,
+      binaryEpoch: 0,
+      healthState: "unknown",
+      heartbeatAt: 0,
+      draining: false,
+    });
   }
 }

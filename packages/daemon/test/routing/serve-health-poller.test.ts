@@ -197,4 +197,89 @@ describe("serve-health-poller", () => {
     vi.useRealTimers();
     s.db.close();
   });
+
+  it("staleness sweep logic (sweepStale)", async () => {
+    const s = openStorageDb(":memory:");
+
+    const staleMs = 15000;
+    const now = 20000;
+
+    // 1. A healthy+stale serve (heartbeat_at <= now - staleMs)
+    // stale threshold: 20000 - 15000 = 5000
+    // heartbeat_at = 4000
+    s.serves.upsert({
+      serveId: "serve-stale",
+      instanceUuid: "uuid-stale",
+      endpoint: "http://localhost:4001",
+      binaryEpoch: 1,
+      healthState: "healthy",
+      heartbeatAt: 4000,
+      draining: false,
+    });
+
+    // 2. A fresh serve (heartbeat_at > now - staleMs)
+    // heartbeat_at = 6000
+    s.serves.upsert({
+      serveId: "serve-fresh",
+      instanceUuid: "uuid-fresh",
+      endpoint: "http://localhost:4002",
+      binaryEpoch: 1,
+      healthState: "healthy",
+      heartbeatAt: 6000,
+      draining: false,
+    });
+
+    // 3. A stub / never-registered serve (healthState = 'unknown', heartbeatAt = 0)
+    s.serves.upsert({
+      serveId: "serve-stub",
+      instanceUuid: "uuid-stub",
+      endpoint: "http://localhost:4003",
+      binaryEpoch: 0,
+      healthState: "unknown",
+      heartbeatAt: 0,
+      draining: false,
+    });
+
+    // 4. An already unhealthy serve (healthState = 'unhealthy', heartbeatAt = 1000)
+    s.serves.upsert({
+      serveId: "serve-unhealthy",
+      instanceUuid: "uuid-unhealthy",
+      endpoint: "http://localhost:4004",
+      binaryEpoch: 1,
+      healthState: "unhealthy",
+      heartbeatAt: 1000,
+      draining: false,
+    });
+
+    const reassignedServeIds: string[] = [];
+    const poller = new ServeHealthPoller(s.serves, {
+      reassignFromDeadServe: (serveId) => {
+        reassignedServeIds.push(serveId);
+      }
+    }, {
+      healthPollMs: 5000,
+    });
+
+    // Run sweepStale
+    poller.sweepStale(now, staleMs);
+
+    // Verify stale serve is marked unhealthy, without bumping heartbeatAt
+    const recordStale = s.serves.get("serve-stale")!;
+    expect(recordStale.healthState).toBe("unhealthy");
+    expect(recordStale.heartbeatAt).toBe(4000); // Unchanged!
+
+    // Verify fresh serve is untouched
+    const recordFresh = s.serves.get("serve-fresh")!;
+    expect(recordFresh.healthState).toBe("healthy");
+    expect(recordFresh.heartbeatAt).toBe(6000);
+
+    // Verify other serves are untouched
+    expect(s.serves.get("serve-stub")!.healthState).toBe("unknown");
+    expect(s.serves.get("serve-unhealthy")!.healthState).toBe("unhealthy");
+
+    // Only the healthy->stale transition triggers reassignment
+    expect(reassignedServeIds).toEqual(["serve-stale"]);
+
+    s.db.close();
+  });
 });

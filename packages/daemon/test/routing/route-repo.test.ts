@@ -95,6 +95,49 @@ describe("Routing Repositories", () => {
     s.db.close();
   });
 
+  it("ServeInstanceRepo: insertStubIfAbsent and setHealthState", () => {
+    const s = openStorageDb(":memory:");
+
+    const stub: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "placeholder-uuid",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "unknown",
+      heartbeatAt: 0,
+      draining: false,
+    };
+
+    // 1. insertStubIfAbsent when absent
+    s.serves.insertStubIfAbsent(stub);
+    expect(s.serves.get("serve-1")).toEqual(stub);
+
+    // 2. insertStubIfAbsent on conflict does nothing (idempotent/TOCTOU safe)
+    const activeServe: ServeInstanceRecord = {
+      serveId: "serve-1",
+      instanceUuid: "real-uuid",
+      endpoint: "http://localhost:8080",
+      binaryEpoch: 2,
+      healthState: "healthy",
+      heartbeatAt: 12345,
+      draining: false,
+    };
+    s.serves.upsert(activeServe);
+
+    // Call insertStubIfAbsent again with stub, should NOT clobber activeServe
+    s.serves.insertStubIfAbsent(stub);
+    expect(s.serves.get("serve-1")).toEqual(activeServe);
+
+    // 3. setHealthState updates healthState ONLY, without bumping heartbeatAt
+    s.serves.setHealthState("serve-1", "unhealthy");
+    const afterSetHealthState = s.serves.get("serve-1");
+    expect(afterSetHealthState?.healthState).toBe("unhealthy");
+    expect(afterSetHealthState?.heartbeatAt).toBe(12345); // Unchanged!
+    expect(afterSetHealthState?.instanceUuid).toBe("real-uuid"); // Unchanged!
+
+    s.db.close();
+  });
+
   it("SessionAssignmentRepo: upsert, get, bumpGeneration, touchActive, setState, listForServe", () => {
     const s = openStorageDb(":memory:");
 

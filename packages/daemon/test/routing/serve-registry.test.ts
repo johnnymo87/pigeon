@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { openStorageDb } from "../../src/storage/database";
 import { seedServes } from "../../src/routing/serve-registry";
+import type { ServeInstanceRecord } from "../../src/routing/types";
 
 describe("serve-registry", () => {
-  it("seeds serve-0/serve-1 for endpoints with unknown health and deterministic uuidFn", () => {
+  it("creates non-healthy stub for missing serves", () => {
     const s = openStorageDb(":memory:");
     const endpoints = ["http://127.0.0.1:4096", "http://127.0.0.1:4097"];
     let uuidCount = 0;
@@ -16,9 +17,9 @@ describe("serve-registry", () => {
       serveId: "serve-0",
       instanceUuid: "mock-uuid-0",
       endpoint: "http://127.0.0.1:4096",
-      binaryEpoch: 42,
+      binaryEpoch: 0,
       healthState: "unknown",
-      heartbeatAt: 1000,
+      heartbeatAt: 0,
       draining: false,
     });
 
@@ -27,38 +28,54 @@ describe("serve-registry", () => {
       serveId: "serve-1",
       instanceUuid: "mock-uuid-1",
       endpoint: "http://127.0.0.1:4097",
-      binaryEpoch: 42,
+      binaryEpoch: 0,
       healthState: "unknown",
-      heartbeatAt: 1000,
+      heartbeatAt: 0,
       draining: false,
     });
 
     s.db.close();
   });
 
-  it("is non-destructive on subsequent seeds: preserves instanceUuid and health state/heartbeat", () => {
+  it("leaves existing serve-written rows entirely untouched", () => {
+    const s = openStorageDb(":memory:");
+    
+    // Create an existing serve-written row
+    const existingRow: ServeInstanceRecord = {
+      serveId: "serve-0",
+      instanceUuid: "uuid-X",
+      endpoint: "http://127.0.0.1:1234",
+      binaryEpoch: 2,
+      healthState: "healthy",
+      heartbeatAt: 5000,
+      draining: false,
+    };
+    s.serves.upsert(existingRow);
+
+    // Call seedServes (which would normally map serve-0 to endpoints[0])
+    seedServes(s.serves, ["http://127.0.0.1:4096"], 6000, { uuidFn: () => "uuid-Y", binaryEpoch: 1 });
+
+    // Assert it survives byte-for-byte
+    const s0 = s.serves.get("serve-0");
+    expect(s0).toEqual(existingRow);
+
+    s.db.close();
+  });
+
+  it("is idempotent and never overwrites existing or stub rows", () => {
     const s = openStorageDb(":memory:");
     const endpoints = ["http://127.0.0.1:4096"];
-    
-    // First seed
-    seedServes(s.serves, endpoints, 1000, { uuidFn: () => "uuid-A", binaryEpoch: 1 });
-    
-    // Manually transition to healthy and change heartbeat
-    s.serves.setHealth("serve-0", "healthy", 2000);
 
-    // Second seed with different uuidFn and binaryEpoch, and even endpoint if changed
-    seedServes(s.serves, ["http://127.0.0.1:8080"], 3000, { uuidFn: () => "uuid-B", binaryEpoch: 2 });
+    // First seed creates a stub
+    seedServes(s.serves, endpoints, 1000, { uuidFn: () => "uuid-stub", binaryEpoch: 1 });
+    const stub = s.serves.get("serve-0");
+    expect(stub?.healthState).toBe("unknown");
+    expect(stub?.heartbeatAt).toBe(0);
 
-    const s0 = s.serves.get("serve-0");
-    expect(s0).toEqual({
-      serveId: "serve-0",
-      instanceUuid: "uuid-A", // Preserved!
-      endpoint: "http://127.0.0.1:8080", // Updated!
-      binaryEpoch: 2, // Updated!
-      healthState: "healthy", // Preserved!
-      heartbeatAt: 2000, // Preserved!
-      draining: false, // Preserved!
-    });
+    // Call seedServes again, should do nothing
+    seedServes(s.serves, endpoints, 2000, { uuidFn: () => "uuid-other", binaryEpoch: 2 });
+    const stubAfter = s.serves.get("serve-0");
+    expect(stubAfter).toEqual(stub);
 
     s.db.close();
   });

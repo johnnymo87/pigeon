@@ -71,4 +71,22 @@ export class ServeHealthPoller {
       this.timer = null;
     }
   }
+
+  sweepStale(now: number, staleMs: number): void {
+    const allServes = this.serves.all();
+    for (const s of allServes) {
+      if (s.healthState === "healthy" && s.heartbeatAt <= now - staleMs) {
+        try {
+          this.serves.setHealthState(s.serveId, "unhealthy");
+          try {
+            this.router.reassignFromDeadServe(s.serveId, now);
+          } catch (err) {
+            // Swallow NoHealthyServeError / reassignment error per serve
+          }
+        } catch (err) {
+          // Swallow DB / state errors per serve
+        }
+      }
+    }
+  }
 }
