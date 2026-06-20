@@ -12,7 +12,8 @@
     "parity:harness": "tsx scripts/parity-harness.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^11.9.1"
+    "better-sqlite3": "^11.9.1",
+    "sticky-router": "git+ssh://git@github.com/johnnymo87/sticky-router.git#v0.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
