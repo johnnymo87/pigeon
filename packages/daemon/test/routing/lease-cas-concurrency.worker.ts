@@ -45,8 +45,19 @@ process.on("message", async (msg: WorkerSetupMessage) => {
     }
   }
 
+  const timeQuery = storage.db.prepare("SELECT (julianday('now') - 2440587.5) * 86400000.0 as now");
+  const getNow = () => {
+    try {
+      const row = timeQuery.get() as { now: number };
+      return Math.round(row.now);
+    } catch {
+      return Date.now();
+    }
+  };
+
   try {
-    while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    while (getNow() < deadline) {
       const sessionId = sessions[Math.floor(Math.random() * sessions.length)]!;
 
       // Read current generation and epoch
@@ -70,7 +81,7 @@ process.on("message", async (msg: WorkerSetupMessage) => {
 
       let acquiredAt = 0;
       const success = await withRetry(() => {
-        const now = Date.now();
+        const now = getNow();
         const ok = storage.leases.acquireCAS(
           {
             sessionId,
@@ -129,7 +140,7 @@ process.on("message", async (msg: WorkerSetupMessage) => {
 
           let renewAt = 0;
           const renewSuccess = await withRetry(() => {
-            const now = Date.now();
+            const now = getNow();
             const ok = storage.leases.renewCAS(
               sessionId,
               "serve-A",
@@ -172,7 +183,7 @@ process.on("message", async (msg: WorkerSetupMessage) => {
 
           let releasedAt = 0;
           const released = await withRetry(() => {
-            const now = Date.now();
+            const now = getNow();
             const ok = storage.leases.release(
               sessionId,
               "serve-A",
@@ -209,13 +220,13 @@ process.on("message", async (msg: WorkerSetupMessage) => {
         // If we had an active lease in our local map, it means we lost it.
         const prevEvent = activeLeases.get(sessionId);
         if (prevEvent) {
-          prevEvent.releasedAt = Date.now();
+          prevEvent.releasedAt = getNow();
           activeLeases.delete(sessionId);
         }
       }
 
       // Small randomized delay to allow interleaving and yield execution
-      await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 5)));
+      await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 15) + 10));
     }
   } catch (err: any) {
     // If worker crashes, report error
