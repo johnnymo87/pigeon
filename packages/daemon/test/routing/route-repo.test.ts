@@ -313,9 +313,13 @@ describe("Routing Repositories", () => {
     const newEpoch = s.meta.bumpEpoch(now);
     expect(newEpoch).toBe(1);
 
+    // Sequential bump should return 2
+    const secondEpoch = s.meta.bumpEpoch(now + 1000);
+    expect(secondEpoch).toBe(2);
+
     const meta2 = s.meta.get();
-    expect(meta2.binaryEpoch).toBe(1);
-    expect(meta2.updatedAt).toBe(now);
+    expect(meta2.binaryEpoch).toBe(2);
+    expect(meta2.updatedAt).toBe(now + 1000);
 
     s.db.close();
 

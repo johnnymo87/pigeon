@@ -312,9 +312,16 @@ export class RoutingMetaRepo {
   }
 
   bumpEpoch(now: number): number {
-    this.db
-      .prepare("UPDATE routing_meta SET binary_epoch = binary_epoch + 1, updated_at = ? WHERE id = 1")
-      .run(now);
-    return this.get().binaryEpoch;
+    const res = this.db
+      .prepare(
+        `UPDATE routing_meta SET binary_epoch = binary_epoch + 1, updated_at = ?
+         WHERE id = 1
+         RETURNING binary_epoch`,
+      )
+      .get(now) as { binary_epoch: number } | undefined;
+    if (!res) {
+      throw new Error("Failed to bump epoch; routing_meta row not found.");
+    }
+    return Number(res.binary_epoch);
   }
 }
