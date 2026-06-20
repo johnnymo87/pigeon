@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { openStorageDb } from "../../src/storage/database";
 import { IngressRouter } from "../../src/routing/router";
 import { OpencodeClientFactory } from "../../src/routing/client-factory";
+import { makeDirectoryResolver } from "../../src/routing/directory-resolver";
 import { SessionDirectoryRegistry } from "../../src/swarm/registry";
 import { SwarmArbiter } from "../../src/swarm/arbiter";
 import type { ServeInstanceRecord } from "../../src/routing/types";
@@ -60,9 +61,11 @@ describe("cross-serve-delivery integration", () => {
     fakeB = await startFakeServe();
   });
 
-  afterAll(() => {
-    fakeA.server.close();
-    fakeB.server.close();
+  afterAll(async () => {
+    const close = (s?: { server: import("node:http").Server }) =>
+      s?.server ? new Promise<void>((res) => s.server.close(() => res())) : Promise.resolve();
+    await close(fakeA);
+    await close(fakeB);
   });
 
   it("proves end-to-end swarm routing across fake serves including failover", async () => {
@@ -103,32 +106,8 @@ describe("cross-serve-delivery integration", () => {
     const clientFactory = new OpencodeClientFactory(ingressRouter, () => now);
     const clientForSession = (sid: string) => clientFactory.forSession(sid);
 
-    // Build pool-aware directory resolver as in Part 2
-    const dirRegistries = new Map<string, SessionDirectoryRegistry>();
-    const dirRegistryForEndpoint = (baseUrl: string): SessionDirectoryRegistry => {
-      let r = dirRegistries.get(baseUrl);
-      if (!r) {
-        r = new SessionDirectoryRegistry({ baseUrl, ttlMs: 5 * 60 * 1000 });
-        dirRegistries.set(baseUrl, r);
-      }
-      return r;
-    };
-    const directoryForSession = async (sessionId: string): Promise<string | undefined> => {
-      let baseUrl: string | undefined;
-      if (ingressRouter) {
-        try {
-          baseUrl = ingressRouter.ensureRouted(sessionId, now).apiBase;
-        } catch {
-          baseUrl = undefined;
-        }
-      }
-      if (!baseUrl) return undefined;
-      try {
-        return await dirRegistryForEndpoint(baseUrl).resolve(sessionId);
-      } catch {
-        return undefined;
-      }
-    };
+    // Use the shared pool-aware read-only directory resolver
+    const directoryForSession = makeDirectoryResolver({ ingressRouter, fallbackBaseUrl: undefined, nowFn: () => now });
 
     // 3. Force placement: ses_A -> serve-0, ses_B -> serve-1
     storage.assignments.upsert({

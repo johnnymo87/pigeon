@@ -85,9 +85,12 @@ export class SwarmArbiter {
 
       try {
         const client = this.clientForSession(target);
+        if (!client) {
+          throw new Error(`target ${target} not routable: no healthy serve available`);
+        }
         const directory = await this.directoryForSession(target);
-        if (!client || directory == null) {
-          throw new Error(`target ${target} not routable/resolvable`); // falls into existing retry/backoff
+        if (!directory) {
+          throw new Error(`target ${target} not resolvable: directory lookup returned empty`);
         }
         const prompt = renderEnvelope(
           {

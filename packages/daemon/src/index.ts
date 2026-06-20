@@ -28,6 +28,7 @@ import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
+import { makeDirectoryResolver } from "./routing/directory-resolver";
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -257,23 +258,7 @@ if (outboxSender) {
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.
 // Requires opencode-client or ingress router.
-const dirRegistries = new Map<string, SessionDirectoryRegistry>();
-const dirRegistryForEndpoint = (baseUrl: string): SessionDirectoryRegistry => {
-  let r = dirRegistries.get(baseUrl);
-  if (!r) { r = new SessionDirectoryRegistry({ baseUrl, ttlMs: 5 * 60 * 1000 }); dirRegistries.set(baseUrl, r); }
-  return r;
-};
-const directoryForSession = async (sessionId: string): Promise<string | undefined> => {
-  let baseUrl: string | undefined;
-  if (ingressRouter) {
-    try { baseUrl = ingressRouter.ensureRouted(sessionId, Date.now()).apiBase; }
-    catch { baseUrl = undefined; }   // NoHealthyServeError -> fall through
-  }
-  baseUrl ??= config.opencodeUrl;
-  if (!baseUrl) return undefined;
-  try { return await dirRegistryForEndpoint(baseUrl).resolve(sessionId); }
-  catch { return undefined; }
-};
+const directoryForSession = makeDirectoryResolver({ ingressRouter, fallbackBaseUrl: config.opencodeUrl });
 
 const swarmArbiter = (config.opencodeUrl || ingressRouter)
   ? new SwarmArbiter({
