@@ -218,6 +218,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestModelListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             machineId: config.machineId, opencodeClient: client, sendTelegramReply: sendTelegramMessage,
+            allowedProviders: config.allowedProviders,
           });
         },
         onModelSet: async (msg) => {
@@ -227,6 +228,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             model: msg.model, machineId: config.machineId, opencodeClient: client,
             storage, sendTelegramReply: sendTelegramMessage,
+            allowedProviders: config.allowedProviders,
           });
         },
         onCurrentState: async (msg) => {
