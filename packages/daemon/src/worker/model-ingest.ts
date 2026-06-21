@@ -1,13 +1,14 @@
 import type { OpencodeClient } from "../opencode-client";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 
-const ALLOWED_PROVIDERS = new Set(["anthropic", "openai", "google", "vertex"]);
+const DEFAULT_ALLOWED_PROVIDERS = ["anthropic", "openai"];
 
 export interface ModelListCommandInput {
   commandId: string;
   sessionId: string;
   chatId: string;
   machineId?: string;
+  allowedProviders?: string[];
   opencodeClient: Pick<OpencodeClient, "listProviders">;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
@@ -18,6 +19,7 @@ export interface ModelSetCommandInput {
   chatId: string;
   model: string;
   machineId?: string;
+  allowedProviders?: string[];
   opencodeClient: Pick<OpencodeClient, "listProviders">;
   storage: {
     sessions: {
@@ -33,7 +35,8 @@ export async function ingestModelListCommand(input: ModelListCommandInput): Prom
   try {
     const result = await opencodeClient.listProviders();
 
-    const allowedProviders = result.all.filter((p) => ALLOWED_PROVIDERS.has(p.id));
+    const allowedSet = new Set(input.allowedProviders ?? DEFAULT_ALLOWED_PROVIDERS);
+    const allowedProviders = result.all.filter((p) => allowedSet.has(p.id));
 
     const b = new TgMessageBuilder()
       .append("🤖 ")

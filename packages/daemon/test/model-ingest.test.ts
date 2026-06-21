@@ -101,13 +101,15 @@ describe("ingestModelListCommand", () => {
     expect(text).not.toMatch(/\/model <code> sess-abc/);
   });
 
-  it("filters out non-allowed providers", async () => {
+  it("filters out non-allowed providers by default (anthropic/openai only)", async () => {
     const input = makeInput({
       opencodeClient: {
         listProviders: vi.fn().mockResolvedValue({
           all: [
             { id: "anthropic", models: { "claude-opus-4-6": {} } },
-            { id: "somecustom", models: { "custom-model": {} } },
+            { id: "openai", models: { "gpt-5.4": {} } },
+            { id: "google-vertex", models: { "gemini-3-pro": {} } },
+            { id: "google-vertex-anthropic", models: { "claude-sonnet-4-6": {} } },
             { id: "mistral", models: { "mistral-7b": {} } },
           ],
           default: { code: "anthropic/claude-opus-4-6" },
@@ -120,10 +122,35 @@ describe("ingestModelListCommand", () => {
 
     const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("anthropic");
-    expect(text).not.toContain("somecustom");
+    expect(text).toContain("openai");
+    expect(text).not.toContain("google-vertex");
     expect(text).not.toContain("mistral");
-    expect(text).not.toContain("custom-model");
-    expect(text).not.toContain("mistral-7b");
+  });
+
+  it("includes vertex providers when allowedProviders opts in", async () => {
+    const input = makeInput({
+      allowedProviders: ["anthropic", "openai", "google-vertex", "google-vertex-anthropic"],
+      opencodeClient: {
+        listProviders: vi.fn().mockResolvedValue({
+          all: [
+            { id: "anthropic", models: { "claude-opus-4-6": {} } },
+            { id: "google-vertex", models: { "gemini-3-pro": {} } },
+            { id: "google-vertex-anthropic", models: { "claude-sonnet-4-6": {} } },
+            { id: "mistral", models: { "mistral-7b": {} } },
+          ],
+          default: { code: "anthropic/claude-opus-4-6" },
+          connected: ["anthropic", "google-vertex", "google-vertex-anthropic"],
+        }),
+      },
+    });
+
+    await ingestModelListCommand(input);
+
+    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    expect(text).toContain("google-vertex");
+    expect(text).toContain("google-vertex/gemini-3-pro");
+    expect(text).toContain("google-vertex-anthropic/claude-sonnet-4-6");
+    expect(text).not.toContain("mistral");
   });
 
   it("sends error reply when listProviders throws (plain text, no entities)", async () => {
