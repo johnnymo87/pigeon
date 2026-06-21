@@ -132,7 +132,7 @@ All three variants check the session exists and the machine is online before que
 
 Lists or sets the model for a session.
 
-- `/model <session-id>`: lists available models from allowed providers (anthropic, openai, google, vertex) with the current default.
+- `/model <session-id>`: lists available models from the configured provider allowlist (default `anthropic`, `openai`; extendable per-device via the `PIGEON_ALLOWED_PROVIDERS` env var, e.g. to add `google-vertex` and `google-vertex-anthropic`) with the current default.
 - `/model <provider/model> <session-id>`: validates the model exists, then stores it as a `model_override` on the session in daemon SQLite.
 
 The override is applied on subsequent command deliveries -- `command-ingest.ts` reads it and passes it through the adapter as `metadata.model`. The plugin includes it in the `prompt_async` request body.
