@@ -17,6 +17,7 @@ export interface DaemonConfig {
   bindHost: string;
   authToken?: string;
   serveLiveness: "self" | "http";
+  allowedProviders?: string[];
 }
 
 const DEFAULT_PORT = 4731;
@@ -59,6 +60,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const defaultDbPath = `${process.cwd()}/data/pigeon-daemon.db`;
   const opencodeUrl = env.OPENCODE_URL?.trim() || undefined;
   const serveEndpoints = parseList(env.PIGEON_SERVE_ENDPOINTS);
+  const allowedProviders = parseList(env.PIGEON_ALLOWED_PROVIDERS);
 
   return {
     port: parsePort(env.PIGEON_DAEMON_PORT),
@@ -79,5 +81,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     bindHost: env.PIGEON_BIND_HOST?.trim() || "127.0.0.1",
     authToken: env.PIGEON_DAEMON_AUTH_TOKEN?.trim() || undefined,
     serveLiveness: env.PIGEON_SERVE_LIVENESS === "self" ? "self" : "http",
+    allowedProviders: allowedProviders.length > 0 ? allowedProviders : undefined,
   };
 }

@@ -111,4 +111,22 @@ describe("loadConfig", () => {
     });
     expect(config.serveEndpoints).toEqual(["http://localhost:4096"]);
   });
+
+  it("parses PIGEON_ALLOWED_PROVIDERS into a list", () => {
+    const config = loadConfig({
+      PIGEON_ALLOWED_PROVIDERS: "anthropic, openai ,google-vertex,google-vertex-anthropic",
+    });
+    expect(config.allowedProviders).toEqual([
+      "anthropic",
+      "openai",
+      "google-vertex",
+      "google-vertex-anthropic",
+    ]);
+  });
+
+  it("leaves allowedProviders undefined when PIGEON_ALLOWED_PROVIDERS is unset or empty", () => {
+    expect(loadConfig({}).allowedProviders).toBeUndefined();
+    expect(loadConfig({ PIGEON_ALLOWED_PROVIDERS: "" }).allowedProviders).toBeUndefined();
+    expect(loadConfig({ PIGEON_ALLOWED_PROVIDERS: "  " }).allowedProviders).toBeUndefined();
+  });
 });
