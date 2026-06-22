@@ -99,6 +99,44 @@ describe("ingestLaunchCommand", () => {
       );
     });
 
+    it("sends the prompt to the routed owner serve, not the create serve", async () => {
+      // In a K-serve pool the session is CREATED on serve-0 (a row in the
+      // shared opencode.db) but its agent loop must run on the serve pigeon
+      // HRW-assigns. resolveOwnerClient(sessionId) returns that owner's client.
+      const ownerClient = {
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OpencodeClient;
+      const resolveOwnerClient = vi.fn().mockReturnValue(ownerClient);
+      const input = makeInput({ resolveOwnerClient });
+
+      await ingestLaunchCommand(input);
+
+      // Session is created on serve-0 (the create client).
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith("/home/user/project");
+      // Owner resolved for the created session id (this is what HRW-places it).
+      expect(resolveOwnerClient).toHaveBeenCalledWith("sess-123");
+      // Prompt goes to the OWNER, not the create client.
+      expect(ownerClient.sendPrompt).toHaveBeenCalledWith(
+        "sess-123",
+        "/home/user/project",
+        "Write a hello world program",
+      );
+      expect(input.opencodeClient.sendPrompt).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the create serve when no owner can be resolved (no healthy pool serve)", async () => {
+      const resolveOwnerClient = vi.fn().mockReturnValue(undefined);
+      const input = makeInput({ resolveOwnerClient });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.opencodeClient.sendPrompt).toHaveBeenCalledWith(
+        "sess-123",
+        "/home/user/project",
+        "Write a hello world program",
+      );
+    });
+
     it("sends a confirmation Telegram reply containing the session id and directory with entities", async () => {
       const input = makeInput();
 

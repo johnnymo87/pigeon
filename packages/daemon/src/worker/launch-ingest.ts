@@ -28,6 +28,14 @@ export interface LaunchCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: OpencodeClient;
+  /**
+   * Resolve the client for the serve that OWNS a session (pigeon HRW placement).
+   * The session is created on `opencodeClient` (serve-0) but its agent loop must
+   * run on the serve pigeon assigns, so the prompt is sent via this owner. When
+   * absent, or when it returns undefined (no healthy pool serve), the launch
+   * degrades to sending on `opencodeClient` — the pre-pool single-serve behavior.
+   */
+  resolveOwnerClient?: (sessionId: string) => OpencodeClient | undefined;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
   /** Injected for tests; defaults to node child_process.spawn. */
   spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe" | Array<"ignore" | "inherit" | "pipe" | number>; detached?: boolean }) => ChildProcess;
@@ -46,7 +54,10 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
 
   try {
     const session = await opencodeClient.createSession(directory);
-    await opencodeClient.sendPrompt(session.id, directory, prompt);
+    // Route the prompt to the serve that owns the session (HRW placement);
+    // fall back to the create serve when routing is unavailable.
+    const owner = input.resolveOwnerClient?.(session.id) ?? opencodeClient;
+    await owner.sendPrompt(session.id, directory, prompt);
     console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
 
     // Auto-attach: best-effort, fire-and-forget. If oc-auto-attach is not

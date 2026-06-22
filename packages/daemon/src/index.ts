@@ -135,6 +135,11 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient,
+            // Create on serve-0 (opencodeClient) but run the agent loop on the
+            // serve pigeon HRW-assigns: clientForSession resolves (and places)
+            // the owner. Unconfigured pool => clientForSession returns the
+            // serve-0 client, i.e. today's behavior.
+            resolveOwnerClient: clientForSession,
             sendTelegramReply: sendTelegramMessage,
           });
         },
