@@ -234,6 +234,20 @@ export class IngressRouter {
   reassignFromDeadServe(serveId: string, now: number): void {
     const assignments = this.repos.assignments.listForServe(serveId);
     for (const a of assignments) {
+      // Do NOT evict a session whose lease on this serve is still valid. A
+      // stale heartbeat can falsely flag a live-but-busy single-threaded serve
+      // as dead (its event loop is blocked by a CPU-heavy turn for longer than
+      // staleServeMs), but only the owning serve can renew its own lease
+      // (renewCAS is full-token fenced), so an unexpired lease proves the serve
+      // is still alive and actively running the turn. Migrating it here bumps
+      // owner_generation and yanks the lease out from under the in-flight run,
+      // killing it with "session lease lost mid-run". A genuinely dead serve
+      // stops renewing, so its lease expires within leaseTtlMs and the session
+      // becomes eligible for reassignment on the next sweep/poll.
+      const lease = this.repos.leases.get(a.sessionId);
+      if (lease && lease.serveId === serveId && lease.leaseExpiresAt > now) {
+        continue;
+      }
       this.placeSession(a.sessionId, now);
     }
   }

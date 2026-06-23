@@ -317,21 +317,132 @@ describe("IngressRouter Service Logic", () => {
     expect(s.assignments.get("session-1")?.desiredServeId).toBe("serve-1");
     expect(s.assignments.get("session-2")?.desiredServeId).toBe("serve-1");
 
-    // Now, mark serve-1 unhealthy, and serve-2 healthy
+    // Now, mark serve-1 unhealthy. serve-1 is a TRULY dead serve here: it stops
+    // renewing, so once we advance past the lease TTL (5000) its leases expire
+    // and the sessions become eligible for reassignment.
     s.serves.setHealth("serve-1", "unhealthy", now);
-    s.serves.setHealth("serve-2", "healthy", now);
+    const later = now + 6000;
+    s.serves.setHealth("serve-2", "healthy", later);
 
-    // Trigger reassignFromDeadServe
-    router.reassignFromDeadServe("serve-1", now);
+    // Trigger reassignFromDeadServe after the dead serve's leases have expired.
+    router.reassignFromDeadServe("serve-1", later);
 
     // Both should now resolve on serve-2 with generation 2
-    const res1 = router.resolveRoute("session-1", now);
-    const res2 = router.resolveRoute("session-2", now);
+    const res1 = router.resolveRoute("session-1", later);
+    const res2 = router.resolveRoute("session-2", later);
 
     expect(res1?.serveId).toBe("serve-2");
     expect(res1?.ownerGeneration).toBe(2);
     expect(res2?.serveId).toBe("serve-2");
     expect(res2?.ownerGeneration).toBe(2);
+  });
+
+  // Test 7b: a serve flagged "dead" by stale heartbeat but still holding a VALID
+  // (unexpired) lease is NOT actually dead — it is provably still renewing. The
+  // single-threaded opencode serve can miss heartbeats for >staleServeMs while a
+  // CPU-heavy turn blocks its event loop, yet keep the run alive. Evicting it
+  // bumps the generation and kills the in-flight run ("session lease lost
+  // mid-run"). reassignFromDeadServe must therefore SKIP sessions whose lease on
+  // the dead serve is still valid, and only migrate them once the lease expires.
+  it("reassignFromDeadServe: does NOT evict a session whose lease on the dead serve is still valid", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+    s.serves.upsert({
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    // Place session-1 on serve-1 with a fresh lease (TTL 5000, gen 1).
+    s.serves.setHealth("serve-2", "unhealthy", now);
+    const placed = router.ensureRouted("session-1", now);
+    expect(placed.serveId).toBe("serve-1");
+    expect(placed.ownerGeneration).toBe(1);
+    s.serves.setHealth("serve-2", "healthy", now);
+
+    // serve-1's heartbeat went stale (event-loop blocked by a busy turn), so the
+    // poller flags it unhealthy — but the lease is STILL VALID (lease_expires_at
+    // is now+5000 > now): the serve is alive and still renewing.
+    s.serves.setHealth("serve-1", "unhealthy", now);
+
+    router.reassignFromDeadServe("serve-1", now);
+
+    // The session must NOT have been migrated: same serve, same generation, lease intact.
+    const a = s.assignments.get("session-1");
+    expect(a?.desiredServeId).toBe("serve-1");
+    expect(a?.ownerGeneration).toBe(1);
+    const lease = s.leases.get("session-1");
+    expect(lease?.serveId).toBe("serve-1");
+    expect(lease?.ownerGeneration).toBe(1);
+  });
+
+  // Test 7c: once the lease on the dead serve has actually expired (a truly dead
+  // serve stops renewing), reassignFromDeadServe migrates the session to a
+  // healthy serve, bumping the generation.
+  it("reassignFromDeadServe: migrates a session once its lease on the dead serve has expired", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+    s.serves.upsert({
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    s.serves.setHealth("serve-2", "unhealthy", now);
+    router.ensureRouted("session-1", now);
+    s.serves.setHealth("serve-1", "unhealthy", now);
+
+    // Advance past lease expiry (TTL 5000): the dead serve stopped renewing.
+    // Keep serve-2's heartbeat fresh at `later` so it's an eligible target.
+    const later = now + 6000;
+    s.serves.setHealth("serve-2", "healthy", later);
+    router.reassignFromDeadServe("serve-1", later);
+
+    const res1 = router.resolveRoute("session-1", later);
+    expect(res1?.serveId).toBe("serve-2");
+    expect(res1?.ownerGeneration).toBe(2);
   });
 
   // Test 8: Bounded-load skip

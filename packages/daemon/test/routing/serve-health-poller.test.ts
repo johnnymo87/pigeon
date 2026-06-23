@@ -29,18 +29,19 @@ describe("serve-health-poller", () => {
     s.db.close();
   });
 
-  it("performs dead serve reassignment off a failed serve", async () => {
+  it("does NOT reassign a session with a live lease on a probe-failed serve, but DOES once the lease expires", async () => {
     const s = openStorageDb(":memory:");
     seedServes(s.serves, ["http://serve-0.local", "http://serve-1.local"], 1000, { uuidFn: () => "uuid-0" });
-    
+
     // Seed them healthy first so router can place session
     s.serves.setHealth("serve-0", "healthy", 1000);
     s.serves.setHealth("serve-1", "healthy", 1000);
 
+    const leaseTtlMs = 30000;
     const router = new IngressRouter(
       s,
       {
-        leaseTtlMs: 30000,
+        leaseTtlMs,
         staleServeMs: 15000,
         idleMigrateMs: 60000,
         dormantTtlMs: 300000,
@@ -48,7 +49,7 @@ describe("serve-health-poller", () => {
       }
     );
 
-    // Place session
+    // Place session (lease at 1000 -> expires at 1000 + leaseTtlMs)
     const placement = router.placeSession("sess-1", 1000);
     const assignedServeId = placement.serveId;
     const otherServeId = assignedServeId === "serve-0" ? "serve-1" : "serve-0";
@@ -67,17 +68,31 @@ describe("serve-health-poller", () => {
       fetchFn,
     });
 
-    // Run pollOnce at 2000
+    // Phase 1: probe fails at 2000 while the lease is still valid. The serve is
+    // flagged unhealthy, but the session must NOT be migrated — a live lease
+    // proves the (single-threaded, momentarily-unresponsive) serve is still
+    // running the turn. Evicting it would kill the run with "lease lost mid-run".
     await poller.pollOnce(2000);
 
-    // Assigned serve should be unhealthy, other serve healthy
+    expect(s.serves.get(assignedServeId)!.healthState).toBe("unhealthy");
+    const stillAssigned = s.assignments.get("sess-1");
+    expect(stillAssigned!.desiredServeId).toBe(assignedServeId);
+    expect(stillAssigned!.ownerGeneration).toBe(1);
+    expect(s.leases.get("sess-1")!.serveId).toBe(assignedServeId);
+
+    // Phase 2: the lease has now expired (a truly dead serve stopped renewing).
+    // A subsequent poll migrates the session to the healthy serve.
+    const afterExpiry = 1000 + leaseTtlMs + 1000;
+    s.serves.setHealth(otherServeId, "healthy", afterExpiry); // keep target fresh
+    await poller.pollOnce(afterExpiry);
+
     expect(s.serves.get(assignedServeId)!.healthState).toBe("unhealthy");
     expect(s.serves.get(otherServeId)!.healthState).toBe("healthy");
 
-    // Session should have been reassigned to the other serve
-    const newRoute = router.resolveRoute("sess-1", 2000);
+    const newRoute = router.resolveRoute("sess-1", afterExpiry);
     expect(newRoute).not.toBeNull();
     expect(newRoute!.serveId).toBe(otherServeId);
+    expect(newRoute!.ownerGeneration).toBe(2);
 
     s.db.close();
   });
