@@ -4,7 +4,7 @@ import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
-import { IngressRouter, NoHealthyServeError } from "./routing/router";
+import { IngressRouter } from "./routing/router";
 import { checkAuth } from "./auth";
 
 function makeMsgId(): string {
@@ -536,18 +536,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!options.router) {
           return Response.json({ error: "routing not configured" }, { status: 503 });
         }
-        try {
-          const route = options.router.ensureRouted(sessionId, nowFn());
-          return Response.json(route);
-        } catch (err) {
-          if (err instanceof NoHealthyServeError) {
-            return new Response(JSON.stringify({ error: "no healthy serve", retryAfter: 5 }), {
-              status: 503,
-              headers: { "content-type": "application/json", "Retry-After": "5" },
-            });
-          }
-          throw err;
+        // Read-only discovery: report this session's CURRENT route if one exists.
+        // This endpoint MUST NOT manufacture an assignment/lease — calling the
+        // placing path (ensureRouted -> placeSession) here produced phantom routes
+        // for stale, mistyped, or never-existent session ids (a GET with a
+        // non-idempotent write side-effect that masked the real "session not found"
+        // condition; see pigeon-eup). Placement still happens on the in-process
+        // control/swarm paths via OpencodeClientFactory.forSession -> ensureRouted;
+        // this endpoint only reads.
+        const route = options.router.resolveRoute(sessionId, nowFn());
+        if (!route) {
+          return Response.json({ error: "session not routed" }, { status: 404 });
         }
+        return Response.json(route);
       }
 
       return Response.json({ error: "Not found" }, { status: 404 });

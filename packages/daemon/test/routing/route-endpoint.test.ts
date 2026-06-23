@@ -32,9 +32,9 @@ describe("GET /route endpoint", () => {
     return { app, router, storage };
   }
 
-  it("Valid: session_id=ses_abc123 returns 200 with route details", async () => {
+  it("Placed session: GET returns 200 with route details", async () => {
     const fixedNow = 1000;
-    const { app, storage: db } = setupRouterAndApp(fixedNow);
+    const { app, router, storage: db } = setupRouterAndApp(fixedNow);
 
     // seed ONE healthy serve
     db.serves.upsert({
@@ -46,6 +46,10 @@ describe("GET /route endpoint", () => {
       heartbeatAt: fixedNow,
       draining: false,
     });
+
+    // The session was legitimately placed by an in-process path (e.g. a
+    // control command or swarm message via forSession -> ensureRouted).
+    router!.placeSession("ses_abc123", fixedNow);
 
     const res = await app(new Request("http://localhost/route?session_id=ses_abc123", { method: "GET" }));
     expect(res.status).toBe(200);
@@ -85,32 +89,35 @@ describe("GET /route endpoint", () => {
     expect(body).toEqual({ error: "routing not configured" });
   });
 
-  it("No healthy serve: router over storage with NO healthy serve returns 503 with Retry-After", async () => {
+  it("Unhealthy serve: a placed session whose serve went unhealthy returns 404 (no stale route)", async () => {
     const fixedNow = 1000;
-    const { app, storage: db } = setupRouterAndApp(fixedNow);
+    const { app, router, storage: db } = setupRouterAndApp(fixedNow);
 
-    // seed ONE unhealthy/stale serve
+    // Serve starts healthy and the session is placed on it.
     db.serves.upsert({
       serveId: "serve-0",
       instanceUuid: "u0",
       endpoint: "http://127.0.0.1:4096",
       binaryEpoch: 0,
-      healthState: "unhealthy",
+      healthState: "healthy",
       heartbeatAt: fixedNow,
       draining: false,
     });
+    router!.placeSession("ses_abc", fixedNow);
+
+    // The serve then goes unhealthy. A read-only lookup must NOT report the
+    // session as still routed there.
+    db.serves.setHealthState("serve-0", "unhealthy");
 
     const res = await app(new Request("http://localhost/route?session_id=ses_abc", { method: "GET" }));
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(404);
     const body = await res.json();
-    expect(body).toEqual({ error: "no healthy serve", retryAfter: 5 });
-    expect(res.headers.get("Retry-After")).toBe("5");
-    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(body).toEqual({ error: "session not routed" });
   });
 
-  it("Idempotent: two GETs for the same session return the same serveId + ownerGeneration", async () => {
+  it("Idempotent: two GETs for the same placed session return the same serveId + ownerGeneration", async () => {
     const fixedNow = 1000;
-    const { app, storage: db } = setupRouterAndApp(fixedNow);
+    const { app, router, storage: db } = setupRouterAndApp(fixedNow);
 
     db.serves.upsert({
       serveId: "serve-0",
@@ -121,6 +128,7 @@ describe("GET /route endpoint", () => {
       heartbeatAt: fixedNow,
       draining: false,
     });
+    router!.placeSession("ses_abc", fixedNow);
 
     const res1 = await app(new Request("http://localhost/route?session_id=ses_abc", { method: "GET" }));
     expect(res1.status).toBe(200);
@@ -132,5 +140,33 @@ describe("GET /route endpoint", () => {
 
     expect(body1).toEqual(body2);
     expect(body1.ownerGeneration).toBe(1);
+  });
+
+  it("Phantom-write regression: GET /route for an unplaced session returns 404 and creates NO assignment/lease", async () => {
+    const fixedNow = 1000;
+    const { app, storage: db } = setupRouterAndApp(fixedNow);
+
+    // A healthy serve exists, but the session has NEVER been placed.
+    db.serves.upsert({
+      serveId: "serve-0",
+      instanceUuid: "u0",
+      endpoint: "http://127.0.0.1:4096",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: fixedNow,
+      draining: false,
+    });
+
+    const sid = "ses_phantom999";
+    const res = await app(new Request(`http://localhost/route?session_id=${sid}`, { method: "GET" }));
+
+    // A read endpoint must NOT manufacture a route for a session that doesn't exist.
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body).toEqual({ error: "session not routed" });
+
+    // And it must leave NO durable routing state behind.
+    expect(db.assignments.get(sid)).toBeNull();
+    expect(db.leases.get(sid)).toBeNull();
   });
 });

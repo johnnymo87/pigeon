@@ -38,9 +38,17 @@ milestone (see "Deferred to mn9r" below).
 
 ## `GET /route?session_id=ses_…`
 
-Discovery endpoint. Returns the owning serve so a client can connect **directly**
-to it for the session-scoped `/event` stream (requires the opencode `/event
-?session_ids=` patch, bead x8wi).
+**Read-only** discovery endpoint. Returns the owning serve so a client can connect
+**directly** to it for the session-scoped `/event` stream (requires the opencode
+`/event?session_ids=` patch, bead x8wi).
+
+It reports a session's *current* route via `resolveRoute` (read-only); it does
+**not** place/assign. A lookup for a session that has never been routed returns
+`404` and leaves no `session_assignment`/`session_lease` behind. Manufacturing a
+route here (the old `ensureRouted` behavior) produced phantom assignments+leases
+for stale/mistyped/never-existent sids and masked the real "session not found"
+condition (pigeon-eup). Placement happens on the in-process control/swarm paths
+(`OpencodeClientFactory.forSession` → `ensureRouted`), not via this endpoint.
 
 ```json
 { "sessionId", "serveId", "instanceUuid", "ownerGeneration",
@@ -48,7 +56,13 @@ to it for the session-scoped `/event` stream (requires the opencode `/event
   "eventUrl": "http://127.0.0.1:4096/event?session_ids=<sid>",
   "expiresAt": <lease epoch ms> }
 ```
-- `400` invalid/missing `session_id`; `503` + `Retry-After` when no healthy serve; `503` when routing unconfigured.
+- `200` with the route JSON when the session is currently routed (assignment +
+  valid lease on a healthy serve).
+- `404 { "error": "session not routed" }` when the session has no current valid
+  route (never placed, or its serve/lease is no longer valid). External callers
+  (`oc-auto-attach`, `opencode-launch`) treat this as "fall back to `OPENCODE_URL`"
+  and do their own conclusive `GET /session/<id>` existence check.
+- `400` invalid/missing `session_id`; `503` when routing unconfigured.
 
 ## Cross-serve session→session messaging
 
