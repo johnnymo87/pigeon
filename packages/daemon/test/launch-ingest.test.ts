@@ -48,16 +48,18 @@ describe("ingestLaunchCommand", () => {
       );
     });
 
-    it("expands a single word directory to ~/projects/<word>", async () => {
+    it("expands a single word directory to ~/projects/<word> on Linux, or ~/Code/<word> on macOS", async () => {
       const input = makeInput({ directory: "pigeon" });
 
       await ingestLaunchCommand(input);
 
       const homeDir = require("os").homedir();
-      expect(input.opencodeClient.createSession).toHaveBeenCalledWith(`${homeDir}/projects/pigeon`);
+      const isDarwin = require("os").platform() === "darwin";
+      const expectedPrefix = isDarwin ? "Code" : "projects";
+      expect(input.opencodeClient.createSession).toHaveBeenCalledWith(`${homeDir}/${expectedPrefix}/pigeon`);
       expect(input.opencodeClient.sendPrompt).toHaveBeenCalledWith(
         "sess-123",
-        `${homeDir}/projects/pigeon`,
+        `${homeDir}/${expectedPrefix}/pigeon`,
         "Write a hello world program",
       );
     });

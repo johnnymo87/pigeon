@@ -8,9 +8,12 @@ import type { LaunchMessage } from "./poller";
 /** Path of the log file shared with the home.base.nix shell wrapper. */
 const AUTO_ATTACH_LOG_PATH = "/tmp/oc-auto-attach.log";
 
-/** Treat a bare word (no slashes, no ~) as ~/projects/<word>. */
+/** Treat a bare word (no slashes, no ~) as ~/projects/<word> (or ~/Code/<word> on macOS). */
 function expandShorthand(dir: string): string {
-  if (!dir.includes("/") && !dir.startsWith("~")) return `~/projects/${dir}`;
+  if (!dir.includes("/") && !dir.startsWith("~")) {
+    const isDarwin = os.platform() === "darwin";
+    return isDarwin ? `~/Code/${dir}` : `~/projects/${dir}`;
+  }
   return dir;
 }
 
