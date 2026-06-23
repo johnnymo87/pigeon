@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
@@ -6,13 +5,8 @@ import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
 import { IngressRouter } from "./routing/router";
 import { checkAuth } from "./auth";
-
-function makeMsgId(): string {
-  // Sortable-ish by createdAt: timestamp prefix in base36 + short random suffix.
-  // The inbox `since` cursor relies on lexicographic msg_id order to approximate
-  // arrival order; the timestamp prefix gives us that for free.
-  return `msg_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
-}
+import { payloadHasCloseTag } from "./swarm/envelope";
+import { makeMsgId } from "./ids";
 
 interface LegacySession {
   session_id: string;
@@ -163,6 +157,22 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
         if (!payload) return Response.json({ error: "payload is required" }, { status: 400 });
+        // Reject a payload that contains the literal </swarm_message> close
+        // tag at enqueue time. renderEnvelope() guards this too, but that runs
+        // later in the arbiter at delivery time — accepting it here (202) makes
+        // the sender think it succeeded while the arbiter silently burns
+        // retries and drops it. Fail fast so the caller finds out immediately.
+        // (Same "fail fast, don't burn arbiter retries" rationale as the
+        // ses_ shape check above.)
+        if (payloadHasCloseTag(payload)) {
+          return Response.json(
+            {
+              error:
+                "payload must not contain the literal </swarm_message> close tag",
+            },
+            { status: 400 },
+          );
+        }
 
         const msgId = callerMsgId ?? makeMsgId();
         storage.swarm.insert(

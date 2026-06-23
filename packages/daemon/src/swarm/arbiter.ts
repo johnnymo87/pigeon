@@ -1,6 +1,13 @@
 import type { StorageDb } from "../storage/database";
+import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { OpencodeClient } from "../opencode-client";
-import { renderEnvelope } from "./envelope";
+import { renderEnvelope, PermanentDeliveryError } from "./envelope";
+import { makeMsgId } from "../ids";
+
+/** Kind used for system notifications sent back to a sender whose message
+ *  could not be delivered. Also used as the loop guard: a delivery.failed
+ *  message that itself fails must NOT spawn another notification. */
+export const DELIVERY_FAILED_KIND = "delivery.failed";
 
 export interface ArbiterOptions {
   storage: StorageDb;
@@ -109,6 +116,18 @@ export class SwarmArbiter {
         this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
         this.log("delivered", { msgId: next.msgId, target });
       } catch (err) {
+        // Permanent errors can never succeed on retry (e.g. the payload
+        // contains the literal close tag). Fail fast instead of burning
+        // MAX_ATTEMPTS retries over ~6 minutes.
+        if (err instanceof PermanentDeliveryError) {
+          this.storage.swarm.markFailed(next.msgId, this.nowFn());
+          this.log("failed (permanent)", {
+            msgId: next.msgId,
+            error: String(err),
+          });
+          this.notifySenderOfFailure(next, String(err));
+          return; // stop draining this target until next tick
+        }
         const after = this.storage.swarm.getByMsgId(next.msgId);
         const attempts = (after?.attempts ?? 0) + 1;
         if (attempts >= MAX_ATTEMPTS) {
@@ -117,6 +136,7 @@ export class SwarmArbiter {
             msgId: next.msgId,
             error: String(err),
           });
+          this.notifySenderOfFailure(next, String(err));
         } else {
           this.storage.swarm.markRetry(
             next.msgId,
@@ -132,5 +152,38 @@ export class SwarmArbiter {
         return; // stop draining this target until next tick
       }
     }
+  }
+
+  /**
+   * Enqueue a system notification back to the original sender when their
+   * message could not be delivered. The sender's only prior signal was the
+   * optimistic 202 "Queued" ack, so without this a permanent/terminal failure
+   * is invisible to them.
+   */
+  private notifySenderOfFailure(failed: SwarmMessageRecord, reason: string): void {
+    // Loop guard: a failed delivery.failed notification must not spawn another.
+    if (failed.kind === DELIVERY_FAILED_KIND) return;
+    // Only route notifications to a real session sender. `from` is not
+    // guaranteed to be a session id (channels, coordinators), and a
+    // non-ses_ target is unroutable anyway.
+    if (!/^ses_[A-Za-z0-9_-]+$/.test(failed.fromSession)) return;
+
+    const target = failed.toSession ?? failed.channel ?? "(unknown target)";
+    const payload =
+      `DELIVERY FAILED: your swarm message ${failed.msgId} to ${target} ` +
+      `could not be delivered and was NOT received. Reason: ${reason}.`;
+    this.storage.swarm.insert(
+      {
+        msgId: makeMsgId(),
+        fromSession: "pigeon",
+        toSession: failed.fromSession,
+        channel: null,
+        kind: DELIVERY_FAILED_KIND,
+        priority: "normal",
+        replyTo: failed.msgId,
+        payload,
+      },
+      this.nowFn(),
+    );
   }
 }

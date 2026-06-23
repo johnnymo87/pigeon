@@ -19,14 +19,39 @@ function escAttr(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
-const CLOSE_TAG = "</swarm_message>";
+export const CLOSE_TAG = "</swarm_message>";
+
+/**
+ * Thrown when a delivery can NEVER succeed no matter how many times it is
+ * retried (e.g. the payload contains the literal envelope close tag). The
+ * arbiter uses this to fail fast instead of burning ~6 minutes of retries on
+ * a deterministic error.
+ */
+export class PermanentDeliveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentDeliveryError";
+  }
+}
+
+/**
+ * True when the payload contains the literal `</swarm_message>` close tag,
+ * which would break envelope parsing on the receiving side. Shared by the
+ * enqueue-time validator (`POST /swarm/send`) and `renderEnvelope` so both
+ * reject the same inputs.
+ */
+export function payloadHasCloseTag(payload: string): boolean {
+  return payload.includes(CLOSE_TAG);
+}
 
 export function renderEnvelope(
   fields: EnvelopeFields,
   payload: string,
 ): string {
-  if (payload.includes(CLOSE_TAG)) {
-    throw new Error("payload must not contain the literal close tag");
+  if (payloadHasCloseTag(payload)) {
+    throw new PermanentDeliveryError(
+      "payload must not contain the literal close tag",
+    );
   }
 
   const attrs: string[] = [

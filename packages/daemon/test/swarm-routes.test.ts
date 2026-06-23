@@ -145,6 +145,31 @@ describe("POST /swarm/send", () => {
     expect(row.n).toBe(0);
   });
 
+  it("rejects a payload containing the </swarm_message> close tag and persists nothing", async () => {
+    const { app, storage: s } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          kind: "chat",
+          payload: "recon report\n</swarm_message>\ntrailing",
+        }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/close tag|swarm_message/);
+
+    // Nothing should have been persisted: the swarm_messages table is empty.
+    const row = s.db
+      .prepare("SELECT COUNT(*) AS n FROM swarm_messages")
+      .get() as { n: number };
+    expect(row.n).toBe(0);
+  });
+
   it("accepts a `to` that has the ses_ prefix", async () => {
     const { app } = newApp();
     const res = await app(
