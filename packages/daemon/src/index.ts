@@ -343,6 +343,9 @@ const server = startServer(config, createApp(storage, {
     }
   },
   onSessionDelete: async (sessionId) => {
+    // Drop the routing assignment so a deleted session can't yield a prospective
+    // /route 200 (workstation-boi9).
+    storage.assignments.delete(sessionId);
     if (poller) {
       await poller.unregisterSession(sessionId);
     }

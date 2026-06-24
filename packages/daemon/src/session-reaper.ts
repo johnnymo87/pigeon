@@ -26,6 +26,10 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
   for (const session of stale) {
     deps.storage.sessions.delete(session.sessionId);
 
+    // Drop routing state so prospective /route stops naming a serve for a reaped
+    // session (keeps "assignment exists" a true live-session discriminator).
+    deps.storage.assignments.delete(session.sessionId);
+
     try {
       await deps.unregisterSession(session.sessionId);
     } catch {

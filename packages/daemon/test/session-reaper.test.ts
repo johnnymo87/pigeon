@@ -123,6 +123,38 @@ describe("reapStaleSessions", () => {
 
     expect(storage.sessions.get("expired-ttl")).toBeNull();
   });
+
+  it("reaping a stale session deletes its routing assignment", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+
+    // Stale session (last_seen = 1000, well past TTL)
+    storage.sessions.upsert({ sessionId: "ses_stale", notify: true, label: "old" }, 1_000);
+
+    // Seed a routing assignment for it
+    storage.assignments.upsert({
+      sessionId: "ses_stale",
+      directoryKey: null,
+      desiredServeId: "serve-0",
+      ownerGeneration: 1,
+      state: "dormant",
+      lastActiveAt: 0,
+      updatedAt: 0,
+    });
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(storage.sessions.get("ses_stale")).toBeNull();
+    expect(storage.assignments.get("ses_stale")).toBeNull();
+  });
 });
 
 describe("startSessionReaper", () => {
