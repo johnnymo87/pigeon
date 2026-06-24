@@ -262,6 +262,20 @@ describe("Routing Repositories", () => {
     s.db.close();
   });
 
+  it("assignments.delete removes the row", () => {
+    const s = openStorageDb(":memory:");
+    const now = 1000;
+    s.assignments.upsert({
+      sessionId: "ses_del", directoryKey: null, desiredServeId: "serve-0",
+      ownerGeneration: 1, state: "dormant", lastActiveAt: now, updatedAt: now,
+    });
+    expect(s.assignments.get("ses_del")).not.toBeNull();
+    s.assignments.delete("ses_del");
+    expect(s.assignments.get("ses_del")).toBeNull();
+    // Idempotent: deleting a missing row does not throw.
+    expect(() => s.assignments.delete("ses_missing")).not.toThrow();
+  });
+
   it("SessionLeaseRepo CAS logic: acquireCAS, renewCAS, release, listExpired", () => {
     const s = openStorageDb(":memory:");
 

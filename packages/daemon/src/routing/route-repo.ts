@@ -168,6 +168,10 @@ export class SessionAssignmentRepo {
     return row ? asAssignment(row) : null;
   }
 
+  delete(sessionId: string): void {
+    this.db.prepare("DELETE FROM session_assignment WHERE session_id = ?").run(sessionId);
+  }
+
   upsert(rec: AssignmentRecord): void {
     this.db
       .prepare(
