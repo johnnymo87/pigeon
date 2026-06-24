@@ -36,6 +36,8 @@ export interface RouteResult {
   apiBase: string;
   eventUrl: string;
   expiresAt: number;
+  /** True only for a read-only prospective route (idle session, no lease held). */
+  prospective?: boolean;
 }
 
 export interface RoutingMetaRecord {
