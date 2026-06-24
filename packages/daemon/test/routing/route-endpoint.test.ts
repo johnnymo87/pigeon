@@ -89,30 +89,18 @@ describe("GET /route endpoint", () => {
     expect(body).toEqual({ error: "routing not configured" });
   });
 
-  it("Unhealthy serve: a placed session whose serve went unhealthy returns 404 (no stale route)", async () => {
-    const fixedNow = 1000;
-    const { app, router, storage: db } = setupRouterAndApp(fixedNow);
-
-    // Serve starts healthy and the session is placed on it.
-    db.serves.upsert({
-      serveId: "serve-0",
-      instanceUuid: "u0",
-      endpoint: "http://127.0.0.1:4096",
-      binaryEpoch: 0,
-      healthState: "healthy",
-      heartbeatAt: fixedNow,
-      draining: false,
-    });
-    router!.placeSession("ses_abc", fixedNow);
-
-    // The serve then goes unhealthy. A read-only lookup must NOT report the
-    // session as still routed there.
-    db.serves.setHealthState("serve-0", "unhealthy");
-
+  it("Idle session, single serve unhealthy, no live lease -> 404 (empty healthy pool)", async () => {
+    // With a SECOND healthy serve this same scenario returns a prospective re-pick
+    // (see the "200 prospective re-pick" test above). With only one, unhealthy serve
+    // the healthy pool is empty so prospective also yields null -> 404 -> consumer
+    // falls back to the default serve.
+    const t0 = 1000;
+    const { app, storage: db } = setupRouterAndApp(t0);
+    db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "unhealthy", heartbeatAt: t0, draining: false });
+    db.assignments.upsert({ sessionId: "ses_abc", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
     const res = await app(new Request("http://localhost/route?session_id=ses_abc", { method: "GET" }));
     expect(res.status).toBe(404);
-    const body = await res.json();
-    expect(body).toEqual({ error: "session not routed" });
+    expect(await res.json()).toEqual({ error: "session not routed" });
   });
 
   it("Idempotent: two GETs for the same placed session return the same serveId + ownerGeneration", async () => {
@@ -168,5 +156,39 @@ describe("GET /route endpoint", () => {
     // And it must leave NO durable routing state behind.
     expect(db.assignments.get(sid)).toBeNull();
     expect(db.leases.get(sid)).toBeNull();
+  });
+
+  it("Idle real session (dormant assignment, no lease) -> 200 prospective", async () => {
+    const t0 = 1000;
+    const { app, storage: db } = setupRouterAndApp(t0);
+    db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
+    db.assignments.upsert({ sessionId: "ses_idle1", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    const res = await app(new Request("http://localhost/route?session_id=ses_idle1", { method: "GET" }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.apiBase).toBe("http://127.0.0.1:4096");
+    expect(body.prospective).toBe(true);
+    expect(db.leases.get("ses_idle1")).toBeNull();
+  });
+
+  it("Idle, assigned serve dead + a second healthy serve -> 200 prospective re-pick", async () => {
+    const t0 = 1000;
+    const { app, storage: db } = setupRouterAndApp(t0);
+    db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "unhealthy", heartbeatAt: t0, draining: false });
+    db.serves.upsert({ serveId: "serve-1", instanceUuid: "u1", endpoint: "http://127.0.0.1:4097", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
+    db.assignments.upsert({ sessionId: "ses_idle2", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    const res = await app(new Request("http://localhost/route?session_id=ses_idle2", { method: "GET" }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).serveId).toBe("serve-1");
+  });
+
+  it("Deleted session (assignment removed) -> 404", async () => {
+    const t0 = 1000;
+    const { app, storage: db } = setupRouterAndApp(t0);
+    db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
+    db.assignments.upsert({ sessionId: "ses_del", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    db.assignments.delete("ses_del");
+    const res = await app(new Request("http://localhost/route?session_id=ses_del", { method: "GET" }));
+    expect(res.status).toBe(404);
   });
 });
