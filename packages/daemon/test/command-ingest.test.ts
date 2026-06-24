@@ -723,6 +723,7 @@ describe("ingestWorkerCommand", () => {
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-gone", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
 
       const tgCalls: Array<{ chatId: string; text: string }> = [];
 
@@ -747,6 +748,7 @@ describe("ingestWorkerCommand", () => {
 
       // Session deleted (matches old behavior for the truly-gone case)
       expect(storage.sessions.get("sess-gone")).toBeNull();
+      expect(storage.assignments.get("sess-gone")).toBeNull();
 
       // User notified
       expect(tgCalls).toHaveLength(1);
@@ -911,6 +913,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-no-client", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
 
       await ingestWorkerCommand(
         storage,
@@ -928,6 +931,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
 
       // Old behavior preserved: session deleted
       expect(storage.sessions.get("sess-no-client")).toBeNull();
+      expect(storage.assignments.get("sess-no-client")).toBeNull();
       storage.db.close();
     });
   });

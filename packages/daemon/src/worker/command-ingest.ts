@@ -506,6 +506,8 @@ async function deliverViaAdapter(
         case "sessionGone": {
           console.warn(`[command-ingest] session gone in opencode-serve sessionId=${msg.sessionId}`);
           storage.sessions.delete(msg.sessionId);
+          // Drop routing state too so prospective /route can't name a serve for a dead session (workstation-boi9).
+          storage.assignments.delete(msg.sessionId);
           await options.sendTelegramReply?.(
             msg.chatId,
             `Session no longer exists. The opencode session was deleted from this machine.`,
@@ -551,6 +553,7 @@ async function deliverViaAdapter(
     // No opencodeClient — preserve the original "delete dead session" behavior.
     console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId} (no opencodeClient for revival)`);
     storage.sessions.delete(msg.sessionId);
+    storage.assignments.delete(msg.sessionId);
     return;
   }
 
