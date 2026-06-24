@@ -92,6 +92,68 @@ export class IngressRouter {
     };
   }
 
+  /**
+   * Read-only PROSPECTIVE route for an IDLE session (resolveRoute returned null
+   * because no valid+healthy lease is held). Predicts the serve the session will
+   * (re)activate on so an idle TUI's stream is pre-positioned, instead of all
+   * idle TUIs piling onto the default serve. Performs NO writes.
+   *
+   * Order: (gate) assignment must exist — a never-placed/deleted/garbage sid
+   * returns null so GET /route still 404s (no phantom route; assignments are
+   * deleted on session delete/reap). (1) honor a still-valid, current-epoch lease
+   * on a non-draining serve — an unexpired lease proves the serve is alive even
+   * if its heartbeat is stale (CPU-stalled owner), mirroring reassignFromDeadServe.
+   * (2) else the assigned serve if currently healthy. (3) else a fresh HRW re-pick
+   * over the healthy pool; null if empty (-> caller falls back to the default serve).
+   */
+  resolveProspectiveRoute(sessionId: string, now: number): RouteResult | null {
+    const a = this.repos.assignments.get(sessionId);
+    if (!a) {
+      return null;
+    }
+
+    const epoch = this.repos.meta.get().binaryEpoch;
+
+    const lease = this.repos.leases.get(sessionId);
+    if (lease && lease.leaseExpiresAt > now && lease.binaryEpoch === epoch) {
+      const leaseServe = this.repos.serves.get(lease.serveId);
+      if (leaseServe && !leaseServe.draining) {
+        return this.prospectiveResult(sessionId, lease.serveId, leaseServe, lease.ownerGeneration);
+      }
+    }
+
+    const assigned = this.repos.serves.get(a.desiredServeId);
+    if (assigned && this.isServeHealthy(assigned, now, epoch)) {
+      return this.prospectiveResult(sessionId, a.desiredServeId, assigned, a.ownerGeneration);
+    }
+
+    const healthy = this.repos.serves.listHealthy(now, this.opts.staleServeMs, epoch);
+    const chosen = pickServe(sessionId, healthy.map((s) => s.serveId));
+    if (!chosen) {
+      return null;
+    }
+    const chosenServe = healthy.find((s) => s.serveId === chosen)!;
+    return this.prospectiveResult(sessionId, chosen, chosenServe, a.ownerGeneration);
+  }
+
+  private prospectiveResult(
+    sessionId: string,
+    serveId: string,
+    serve: ServeInstanceRecord,
+    ownerGeneration: number,
+  ): RouteResult {
+    return {
+      sessionId,
+      serveId,
+      instanceUuid: serve.instanceUuid,
+      ownerGeneration,
+      apiBase: serve.endpoint,
+      eventUrl: `${serve.endpoint}/event?session_ids=${sessionId}`,
+      expiresAt: 0,
+      prospective: true,
+    };
+  }
+
   placeSession(
     sessionId: string,
     now: number,

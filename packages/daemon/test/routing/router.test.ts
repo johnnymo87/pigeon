@@ -852,3 +852,112 @@ describe("IngressRouter Service Logic", () => {
     expect(s.assignments.get("session-1")?.ownerGeneration).toBe(2);
   });
 });
+
+describe("resolveProspectiveRoute (idle prospective routing)", () => {
+  const OPTS = { leaseTtlMs: 5000, staleServeMs: 2000, idleMigrateMs: 3000, dormantTtlMs: 10000, activeTurnCap: 10 };
+  const now = 100_000;
+
+  type S = ReturnType<typeof openStorageDb>;
+  const seedServe = (s: S, id: string, endpoint: string, opts: { healthy?: boolean; epoch?: number; draining?: boolean; heartbeatAt?: number } = {}) =>
+    s.serves.upsert({
+      serveId: id, instanceUuid: `uuid-${id}`, endpoint,
+      binaryEpoch: opts.epoch ?? 0,
+      healthState: opts.healthy === false ? "unhealthy" : "healthy",
+      heartbeatAt: opts.heartbeatAt ?? now, draining: opts.draining ?? false,
+    });
+  const seedAssignment = (s: S, sid: string, serveId: string, state: "assigned" | "dormant" = "dormant") =>
+    s.assignments.upsert({ sessionId: sid, directoryKey: null, desiredServeId: serveId, ownerGeneration: 1, state, lastActiveAt: now, updatedAt: now });
+
+  it("REAL dormant path: placeSession -> expire -> sweep -> prospective 200", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-1", "http://localhost:8001");
+    router.placeSession("session-x", now);
+    const later = now + OPTS.leaseTtlMs + 1;
+    s.serves.setHealth("serve-1", "healthy", later);
+    router.sweep(later);
+    expect(router.resolveRoute("session-x", later)).toBeNull();
+    expect(s.assignments.get("session-x")?.state).toBe("dormant");
+    const r = router.resolveProspectiveRoute("session-x", later)!;
+    expect(r.serveId).toBe("serve-1");
+    expect(r.prospective).toBe(true);
+    expect(r.expiresAt).toBe(0);
+  });
+
+  it("idle, assigned serve healthy -> assignment serve, no writes", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-1", "http://localhost:8001");
+    seedAssignment(s, "ses_a", "serve-1");
+    expect(router.resolveRoute("ses_a", now)).toBeNull();
+    const r = router.resolveProspectiveRoute("ses_a", now)!;
+    expect(r.serveId).toBe("serve-1");
+    expect(r.apiBase).toBe("http://localhost:8001");
+    expect(r.eventUrl).toBe("http://localhost:8001/event?session_ids=ses_a");
+    expect(r.prospective).toBe(true);
+    expect(s.leases.get("ses_a")).toBeNull();
+    expect(s.assignments.get("ses_a")?.desiredServeId).toBe("serve-1");
+  });
+
+  it("lease-honor: unexpired lease but stale-heartbeat serve -> returns lease serve (not a re-pick)", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-0", "http://localhost:8000", { heartbeatAt: now - OPTS.staleServeMs - 1 });
+    seedServe(s, "serve-1", "http://localhost:8001");
+    seedAssignment(s, "ses_b", "serve-0", "assigned");
+    s.leases.acquireCAS({ sessionId: "ses_b", serveId: "serve-0", instanceUuid: "uuid-serve-0", ownerGeneration: 1, binaryEpoch: 0 }, now, OPTS.leaseTtlMs);
+    expect(router.resolveRoute("ses_b", now)).toBeNull();
+    const r = router.resolveProspectiveRoute("ses_b", now)!;
+    expect(r.serveId).toBe("serve-0");
+  });
+
+  it("never-placed sid -> null; deleted sid (assignment removed) -> null", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-1", "http://localhost:8001");
+    expect(router.resolveProspectiveRoute("ses_ghost", now)).toBeNull();
+    seedAssignment(s, "ses_gone", "serve-1");
+    s.assignments.delete("ses_gone");
+    expect(router.resolveProspectiveRoute("ses_gone", now)).toBeNull();
+  });
+
+  it("assigned serve dead + multiple healthy -> true HRW re-pick over the healthy pool", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-0", "http://localhost:8000", { healthy: false });
+    seedServe(s, "serve-1", "http://localhost:8001");
+    seedServe(s, "serve-2", "http://localhost:8002");
+    seedServe(s, "serve-3", "http://localhost:8003");
+    seedAssignment(s, "ses_c", "serve-0");
+    const r = router.resolveProspectiveRoute("ses_c", now)!;
+    expect(r.serveId).toBe(pickServe("ses_c", ["serve-1", "serve-2", "serve-3"]));
+    expect(r.serveId).not.toBe("serve-0");
+  });
+
+  it("assigned serve dead + no other healthy serve -> null", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-0", "http://localhost:8000", { healthy: false });
+    seedAssignment(s, "ses_d", "serve-0");
+    expect(router.resolveProspectiveRoute("ses_d", now)).toBeNull();
+  });
+
+  it("wrong-epoch assigned serve -> never returns a stale-epoch serve", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-old", "http://localhost:8000", { epoch: 1 });
+    seedServe(s, "serve-new", "http://localhost:8001", { epoch: 0 });
+    seedAssignment(s, "ses_e", "serve-old");
+    const r = router.resolveProspectiveRoute("ses_e", now);
+    expect(r).not.toBeNull();
+    expect(r!.serveId).toBe("serve-new");
+  });
+
+  it("ignores assignment.state: 'assigned' + expired lease -> 200", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, OPTS);
+    seedServe(s, "serve-1", "http://localhost:8001");
+    seedAssignment(s, "ses_f", "serve-1", "assigned");
+    expect(router.resolveProspectiveRoute("ses_f", now)!.serveId).toBe("serve-1");
+  });
+});
