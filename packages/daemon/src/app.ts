@@ -3,7 +3,7 @@ import type { StopNotifier, QuestionNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
-import { IngressRouter } from "./routing/router";
+import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
 import { makeMsgId } from "./ids";
@@ -535,6 +535,40 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             await onSessionDelete(sessionId);
           }
           return Response.json({ ok: true });
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/place") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        if (!options.router) {
+          return Response.json({ error: "routing not configured" }, { status: 503 });
+        }
+
+        try {
+          const now = nowFn();
+          const r = options.router.ensureRouted(sessionId, now);
+          return Response.json({
+            ok: true,
+            session_id: sessionId,
+            serve_id: r.serveId,
+            api_base: r.apiBase,
+            event_url: r.eventUrl,
+            owner_generation: r.ownerGeneration,
+            instance_uuid: r.instanceUuid,
+            expires_at: r.expiresAt,
+          });
+        } catch (err) {
+          if (err instanceof NoHealthyServeError) {
+            return Response.json({ error: "no healthy serve" }, { status: 503 });
+          }
+          if (err instanceof LeaseContendedError) {
+            return Response.json({ error: "lease contended", session_id: sessionId }, { status: 409 });
+          }
+          throw err;
         }
       }
 

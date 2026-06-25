@@ -191,4 +191,144 @@ describe("GET /route endpoint", () => {
     const res = await app(new Request("http://localhost/route?session_id=ses_del", { method: "GET" }));
     expect(res.status).toBe(404);
   });
+
+  describe("POST /place endpoint", () => {
+    it("places an unplaced session -> returns a serve_id + api_base; an assignment row now exists", async () => {
+      const fixedNow = 1000;
+      const { app, storage: db } = setupRouterAndApp(fixedNow);
+
+      db.serves.upsert({
+        serveId: "serve-0",
+        instanceUuid: "u0",
+        endpoint: "http://127.0.0.1:4096",
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: fixedNow,
+        draining: false,
+      });
+
+      const res = await app(new Request("http://localhost/place", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "ses_unplaced1" }),
+      }));
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        ok: true,
+        session_id: "ses_unplaced1",
+        serve_id: "serve-0",
+        api_base: "http://127.0.0.1:4096",
+        event_url: "http://127.0.0.1:4096/event?session_ids=ses_unplaced1",
+        owner_generation: 1,
+        instance_uuid: "u0",
+        expires_at: fixedNow + 30000,
+      });
+
+      const assignment = db.assignments.get("ses_unplaced1");
+      expect(assignment).not.toBeNull();
+      expect(assignment!.desiredServeId).toBe("serve-0");
+    });
+
+    it("IDEMPOTENT: calling /place twice for the same session returns the SAME serve_id", async () => {
+      const fixedNow = 1000;
+      const { app, storage: db } = setupRouterAndApp(fixedNow);
+
+      db.serves.upsert({
+        serveId: "serve-0",
+        instanceUuid: "u0",
+        endpoint: "http://127.0.0.1:4096",
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: fixedNow,
+        draining: false,
+      });
+
+      const res1 = await app(new Request("http://localhost/place", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "ses_idempotent" }),
+      }));
+      expect(res1.status).toBe(200);
+      const body1 = await res1.json();
+
+      const res2 = await app(new Request("http://localhost/place", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "ses_idempotent" }),
+      }));
+      expect(res2.status).toBe(200);
+      const body2 = await res2.json();
+
+      expect(body1).toEqual(body2);
+      expect(body1.serve_id).toBe("serve-0");
+    });
+
+    it("400 when session_id missing", async () => {
+      const { app } = setupRouterAndApp(1000);
+      const res = await app(new Request("http://localhost/place", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }));
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body).toEqual({ error: "session_id is required" });
+    });
+
+    it("spreads across multiple healthy serves when placing many distinct session ids (HRW)", async () => {
+      const fixedNow = 1000;
+      const { app, storage: db } = setupRouterAndApp(fixedNow);
+
+      db.serves.upsert({
+        serveId: "serve-0",
+        instanceUuid: "u0",
+        endpoint: "http://127.0.0.1:4096",
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: fixedNow,
+        draining: false,
+      });
+      db.serves.upsert({
+        serveId: "serve-1",
+        instanceUuid: "u1",
+        endpoint: "http://127.0.0.1:4097",
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: fixedNow,
+        draining: false,
+      });
+
+      const serveIds = new Set<string>();
+      for (let i = 0; i < 20; i++) {
+        const res = await app(new Request("http://localhost/place", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: `ses_test_${i}` }),
+        }));
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        serveIds.add(body.serve_id);
+      }
+
+      // Assert that we used both serves (i.e. we spread them and didn't land all on one)
+      expect(serveIds.size).toBe(2);
+      expect(serveIds.has("serve-0")).toBe(true);
+      expect(serveIds.has("serve-1")).toBe(true);
+    });
+
+    it("503 when no healthy serve", async () => {
+      const { app } = setupRouterAndApp(1000);
+      // We do not seed any healthy serves!
+      const res = await app(new Request("http://localhost/place", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "ses_no_healthy" }),
+      }));
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({ error: "no healthy serve" });
+    });
+  });
 });
