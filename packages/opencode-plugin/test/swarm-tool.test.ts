@@ -75,7 +75,7 @@ const SAMPLE_MESSAGES: SwarmInboxMessage[] = [
 ]
 
 describe("swarmRead (pure helper)", () => {
-  test("hits /swarm/inbox with the calling session id and returns messages", async () => {
+  test("hits /swarm/inbox with the calling session id and returns a page", async () => {
     const seenUrls: string[] = []
     const fetchFn = (async (input: RequestInfo | URL) => {
       seenUrls.push(typeof input === "string" ? input : input.toString())
@@ -85,25 +85,28 @@ describe("swarmRead (pure helper)", () => {
       })
     }) as typeof fetch
 
-    const messages = await swarmRead({
+    const page = await swarmRead({
       daemonBaseUrl: "http://daemon.test",
       sessionId: "ses_target",
       fetchFn,
     })
 
-    expect(messages).toEqual(SAMPLE_MESSAGES)
+    expect(page.messages).toEqual(SAMPLE_MESSAGES)
+    expect(page.hasMore).toBe(false) // absent has_more defaults to false
     expect(seenUrls).toHaveLength(1)
     const url = new URL(seenUrls[0]!)
     expect(url.pathname).toBe("/swarm/inbox")
     expect(url.searchParams.get("session")).toBe("ses_target")
     expect(url.searchParams.get("since")).toBeNull()
+    expect(url.searchParams.get("before")).toBeNull()
+    expect(url.searchParams.get("limit")).toBeNull()
   })
 
-  test("forwards `since` cursor as a query param", async () => {
+  test("forwards `since`, `before`, and `limit` as query params", async () => {
     const seenUrls: string[] = []
     const fetchFn = (async (input: RequestInfo | URL) => {
       seenUrls.push(typeof input === "string" ? input : input.toString())
-      return new Response(JSON.stringify({ messages: [] }), {
+      return new Response(JSON.stringify({ messages: [], has_more: false }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -115,11 +118,28 @@ describe("swarmRead (pure helper)", () => {
         sessionId: "ses_target",
         fetchFn,
       },
-      "msg_aaa",
+      { since: "msg_aaa", before: "msg_zzz", limit: 5 },
     )
 
     const url = new URL(seenUrls[0]!)
     expect(url.searchParams.get("since")).toBe("msg_aaa")
+    expect(url.searchParams.get("before")).toBe("msg_zzz")
+    expect(url.searchParams.get("limit")).toBe("5")
+  })
+
+  test("parses `has_more` from the response body", async () => {
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ messages: SAMPLE_MESSAGES, has_more: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch
+
+    const page = await swarmRead({
+      daemonBaseUrl: "http://daemon.test",
+      sessionId: "ses_target",
+      fetchFn,
+    })
+    expect(page.hasMore).toBe(true)
   })
 
   test("throws with status + body when daemon returns non-2xx", async () => {
@@ -153,11 +173,11 @@ describe("swarmRead (pure helper)", () => {
     })
 
     try {
-      const messages = await swarmRead({
+      const page = await swarmRead({
         daemonBaseUrl: `http://127.0.0.1:${server.port}`,
         sessionId: "ses_real",
       })
-      expect(messages).toEqual(SAMPLE_MESSAGES)
+      expect(page.messages).toEqual(SAMPLE_MESSAGES)
       expect(requestLog).toEqual([
         { path: "/swarm/inbox", query: { session: "ses_real" } },
       ])
@@ -188,24 +208,58 @@ describe("formatInbox", () => {
     const blocks = out.split("\n\n")
     expect(blocks).toHaveLength(2)
   })
+
+  test("appends a scroll-back hint (before=<oldest>) in recent mode when hasMore", () => {
+    const out = formatInbox(SAMPLE_MESSAGES, { hasMore: true, mode: "recent" })
+    expect(out).toContain("before=")
+    expect(out).toContain("msg_aaa") // oldest returned id
+  })
+
+  test("appends a forward hint (since=<newest>) in forward mode when hasMore", () => {
+    const out = formatInbox(SAMPLE_MESSAGES, { hasMore: true, mode: "forward" })
+    expect(out).toContain("since=")
+    expect(out).toContain("msg_bbb") // newest returned id
+  })
+
+  test("no pagination hint when hasMore is false", () => {
+    const out = formatInbox(SAMPLE_MESSAGES, { hasMore: false, mode: "recent" })
+    expect(out).not.toContain("Older messages")
+    expect(out).not.toContain("before=")
+  })
 })
 
 describe("createSwarmReadTool", () => {
-  test("builds a ToolDefinition with description + args.since schema", () => {
+  test("builds a ToolDefinition with description + since/before/limit args", () => {
     const def = createSwarmReadTool("http://127.0.0.1:4731")
     expect(typeof def.description).toBe("string")
     expect(def.description.length).toBeGreaterThan(0)
     expect(def.args).toHaveProperty("since")
+    expect(def.args).toHaveProperty("before")
+    expect(def.args).toHaveProperty("limit")
     expect(typeof def.execute).toBe("function")
   })
 
-  test("execute() calls the daemon with the ToolContext sessionID and returns formatted inbox", async () => {
+  const makeCtx = (
+    metadataCalls: Array<{ title?: string; metadata?: unknown }>,
+  ) => ({
+    sessionID: "ses_caller",
+    messageID: "msg_x",
+    agent: "build",
+    directory: "/tmp",
+    worktree: "/tmp",
+    abort: new AbortController().signal,
+    metadata: (input: { title?: string; metadata?: unknown }) => {
+      metadataCalls.push(input)
+    },
+    ask: async () => {},
+  })
+
+  test("execute() defaults to limit=10, passes sessionID, returns formatted inbox", async () => {
     const seenUrls: string[] = []
-    // Patch global fetch for this test (the tool factory doesn't accept a fetchFn).
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       seenUrls.push(typeof input === "string" ? input : input.toString())
-      return new Response(JSON.stringify({ messages: SAMPLE_MESSAGES }), {
+      return new Response(JSON.stringify({ messages: SAMPLE_MESSAGES, has_more: false }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -215,32 +269,57 @@ describe("createSwarmReadTool", () => {
       const def = createSwarmReadTool("http://daemon.test")
       const metadataCalls: Array<{ title?: string; metadata?: unknown }> = []
       const result = await def.execute(
-        { since: undefined },
-        {
-          sessionID: "ses_caller",
-          messageID: "msg_x",
-          agent: "build",
-          directory: "/tmp",
-          worktree: "/tmp",
-          abort: new AbortController().signal,
-          metadata: (input) => {
-            metadataCalls.push(input)
-          },
-          ask: async () => {},
-        },
+        { since: undefined, before: undefined, limit: undefined },
+        makeCtx(metadataCalls) as never,
       )
 
       expect(seenUrls).toHaveLength(1)
       const url = new URL(seenUrls[0]!)
       expect(url.searchParams.get("session")).toBe("ses_caller")
+      expect(url.searchParams.get("limit")).toBe("10") // default
       expect(result).toContain("msg_id=msg_aaa")
       expect(result).toContain("from=ses_alice")
       expect(metadataCalls).toEqual([
         {
           title: "swarm inbox (2)",
-          metadata: { count: 2, since: null },
+          metadata: {
+            count: 2,
+            since: null,
+            before: null,
+            limit: 10,
+            has_more: false,
+          },
         },
       ])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test("execute() forwards an explicit limit and appends a scroll-back hint when has_more", async () => {
+    const seenUrls: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seenUrls.push(typeof input === "string" ? input : input.toString())
+      return new Response(JSON.stringify({ messages: SAMPLE_MESSAGES, has_more: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    }) as typeof fetch
+
+    try {
+      const def = createSwarmReadTool("http://daemon.test")
+      const metadataCalls: Array<{ title?: string; metadata?: unknown }> = []
+      const result = await def.execute(
+        { since: undefined, before: undefined, limit: 2 },
+        makeCtx(metadataCalls) as never,
+      )
+
+      const url = new URL(seenUrls[0]!)
+      expect(url.searchParams.get("limit")).toBe("2")
+      // recent mode (no since) + has_more => hint to page back with before=<oldest>
+      expect(result).toContain("before=")
+      expect(result).toContain("msg_aaa")
     } finally {
       globalThis.fetch = originalFetch
     }

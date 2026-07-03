@@ -294,16 +294,59 @@ describe("GET /swarm/inbox", () => {
       new Request("http://localhost/swarm/inbox?session=ses_b&limit=1"),
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { messages: Array<{ msg_id: string }> };
+    const body = (await res.json()) as {
+      messages: Array<{ msg_id: string }>;
+      has_more: boolean;
+    };
     expect(body.messages.map((m) => m.msg_id)).toEqual(["m3"]);
+    expect(body.has_more).toBe(true);
 
     const two = await app(
       new Request("http://localhost/swarm/inbox?session=ses_b&limit=2"),
     );
     const twoBody = (await two.json()) as {
       messages: Array<{ msg_id: string }>;
+      has_more: boolean;
     };
     expect(twoBody.messages.map((m) => m.msg_id)).toEqual(["m2", "m3"]);
+    expect(twoBody.has_more).toBe(true);
+  });
+
+  it("pages backward with `before` (newest older than cursor)", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 1_000 });
+
+    for (const [id, ts] of [
+      ["m1", 1_000],
+      ["m2", 2_000],
+      ["m3", 3_000],
+    ] as const) {
+      storage.swarm.insert(
+        {
+          msgId: id,
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: id,
+        },
+        ts,
+      );
+      storage.swarm.markHandedOff(id, ts + 500);
+    }
+
+    const res = await app(
+      new Request("http://localhost/swarm/inbox?session=ses_b&before=m3&limit=1"),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      messages: Array<{ msg_id: string }>;
+      has_more: boolean;
+    };
+    expect(body.messages.map((m) => m.msg_id)).toEqual(["m2"]);
+    expect(body.has_more).toBe(true); // m1 still older
   });
 
   it("rejects when session is missing", async () => {

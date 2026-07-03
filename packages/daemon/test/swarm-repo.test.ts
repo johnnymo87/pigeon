@@ -73,14 +73,16 @@ describe("SwarmRepository", () => {
     s.swarm.insert({ ...BASE, msgId: "m2" }, 2_000);
     s.swarm.markHandedOff("m1", 1_500);
     s.swarm.markHandedOff("m2", 2_500);
-    const inbox = s.swarm.getInbox("ses_b", null);
-    expect(inbox.map((m) => m.msgId)).toEqual(["m1", "m2"]);
-    const since = s.swarm.getInbox("ses_b", "m1");
-    expect(since.map((m) => m.msgId)).toEqual(["m2"]);
+    const inbox = s.swarm.getInbox("ses_b", {});
+    expect(inbox.messages.map((m) => m.msgId)).toEqual(["m1", "m2"]);
+    expect(inbox.hasMore).toBe(false);
+    const since = s.swarm.getInbox("ses_b", { since: "m1" });
+    expect(since.messages.map((m) => m.msgId)).toEqual(["m2"]);
+    expect(since.hasMore).toBe(false);
     s.db.close();
   });
 
-  it("getInbox with a limit returns the newest N messages, in ascending order", () => {
+  it("getInbox with a limit returns the NEWEST N messages (recent view), ascending", () => {
     const s = createStorage();
     s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
     s.swarm.insert({ ...BASE, msgId: "m2" }, 2_000);
@@ -90,24 +92,75 @@ describe("SwarmRepository", () => {
     s.swarm.markHandedOff("m3", 3_500);
 
     // limit=1 must return the NEWEST message, not the oldest.
-    expect(s.swarm.getInbox("ses_b", null, 1).map((m) => m.msgId)).toEqual([
-      "m3",
-    ]);
+    const one = s.swarm.getInbox("ses_b", { limit: 1 });
+    expect(one.messages.map((m) => m.msgId)).toEqual(["m3"]);
+    expect(one.hasMore).toBe(true); // older messages exist
+
     // limit=2 returns the newest 2, in chronological (ascending) order.
-    expect(s.swarm.getInbox("ses_b", null, 2).map((m) => m.msgId)).toEqual([
-      "m2",
-      "m3",
-    ]);
+    const two = s.swarm.getInbox("ses_b", { limit: 2 });
+    expect(two.messages.map((m) => m.msgId)).toEqual(["m2", "m3"]);
+    expect(two.hasMore).toBe(true);
+
+    // limit == count: everything, ascending, nothing more.
+    const three = s.swarm.getInbox("ses_b", { limit: 3 });
+    expect(three.messages.map((m) => m.msgId)).toEqual(["m1", "m2", "m3"]);
+    expect(three.hasMore).toBe(false);
+
     // limit larger than available returns everything, ascending.
-    expect(s.swarm.getInbox("ses_b", null, 50).map((m) => m.msgId)).toEqual([
-      "m1",
-      "m2",
-      "m3",
-    ]);
-    // since + limit: newest N of the messages after the cursor.
-    expect(s.swarm.getInbox("ses_b", "m1", 1).map((m) => m.msgId)).toEqual([
-      "m3",
-    ]);
+    const big = s.swarm.getInbox("ses_b", { limit: 50 });
+    expect(big.messages.map((m) => m.msgId)).toEqual(["m1", "m2", "m3"]);
+    expect(big.hasMore).toBe(false);
+  });
+
+  it("getInbox with `since` + limit drains forward: OLDEST N after the cursor", () => {
+    const s = createStorage();
+    for (const [id, ts] of [
+      ["m1", 1_000],
+      ["m2", 2_000],
+      ["m3", 3_000],
+    ] as const) {
+      s.swarm.insert({ ...BASE, msgId: id }, ts);
+      s.swarm.markHandedOff(id, ts + 500);
+    }
+    // Forward replay wants the oldest-after-cursor first so a caller can
+    // advance `since` without skipping the middle.
+    const page1 = s.swarm.getInbox("ses_b", { since: "m1", limit: 1 });
+    expect(page1.messages.map((m) => m.msgId)).toEqual(["m2"]);
+    expect(page1.hasMore).toBe(true); // m3 still ahead
+
+    const page2 = s.swarm.getInbox("ses_b", { since: "m2", limit: 1 });
+    expect(page2.messages.map((m) => m.msgId)).toEqual(["m3"]);
+    expect(page2.hasMore).toBe(false);
+
+    const both = s.swarm.getInbox("ses_b", { since: "m1", limit: 2 });
+    expect(both.messages.map((m) => m.msgId)).toEqual(["m2", "m3"]);
+    expect(both.hasMore).toBe(false);
+    s.db.close();
+  });
+
+  it("getInbox with `before` pages backward: NEWEST N older than the cursor", () => {
+    const s = createStorage();
+    for (const [id, ts] of [
+      ["m1", 1_000],
+      ["m2", 2_000],
+      ["m3", 3_000],
+    ] as const) {
+      s.swarm.insert({ ...BASE, msgId: id }, ts);
+      s.swarm.markHandedOff(id, ts + 500);
+    }
+    // Scrolling back from m3: the newest message older than m3 is m2.
+    const back1 = s.swarm.getInbox("ses_b", { before: "m3", limit: 1 });
+    expect(back1.messages.map((m) => m.msgId)).toEqual(["m2"]);
+    expect(back1.hasMore).toBe(true); // m1 still older
+
+    const back2 = s.swarm.getInbox("ses_b", { before: "m3", limit: 2 });
+    expect(back2.messages.map((m) => m.msgId)).toEqual(["m1", "m2"]);
+    expect(back2.hasMore).toBe(false);
+
+    // before without limit returns all older messages, ascending.
+    const allBefore = s.swarm.getInbox("ses_b", { before: "m3" });
+    expect(allBefore.messages.map((m) => m.msgId)).toEqual(["m1", "m2"]);
+    expect(allBefore.hasMore).toBe(false);
     s.db.close();
   });
 

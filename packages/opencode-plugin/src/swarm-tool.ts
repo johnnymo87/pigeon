@@ -43,35 +43,75 @@ export interface SwarmInboxMessage {
   created_at: number
 }
 
+/** Cursor-based query for the inbox. All fields are optional. */
+export interface SwarmReadQuery {
+  /** Only messages strictly newer than this msg_id (forward replay). */
+  since?: string
+  /** Only messages strictly older than this msg_id (scroll back). */
+  before?: string
+  /** Max messages to return. */
+  limit?: number
+}
+
+/** One page of inbox messages plus whether more exist beyond the window. */
+export interface SwarmReadPage {
+  messages: SwarmInboxMessage[]
+  hasMore: boolean
+}
+
 /**
- * Pure helper: hits GET /swarm/inbox?session=<id>[&since=<msg_id>] and
- * returns the parsed messages array. Exported separately so unit tests
- * can exercise it without going through the opencode tool runtime.
+ * Pure helper: hits GET
+ * /swarm/inbox?session=<id>[&since=][&before=][&limit=] and returns the
+ * parsed page (messages + has_more). Exported separately so unit tests can
+ * exercise it without going through the opencode tool runtime.
  */
 export async function swarmRead(
   opts: SwarmReadOptions,
-  since?: string,
-): Promise<SwarmInboxMessage[]> {
+  query: SwarmReadQuery = {},
+): Promise<SwarmReadPage> {
   const fetchFn = opts.fetchFn ?? fetch
   const url = new URL("/swarm/inbox", opts.daemonBaseUrl)
   url.searchParams.set("session", opts.sessionId)
-  if (since) url.searchParams.set("since", since)
+  if (query.since) url.searchParams.set("since", query.since)
+  if (query.before) url.searchParams.set("before", query.before)
+  if (typeof query.limit === "number") {
+    url.searchParams.set("limit", String(query.limit))
+  }
 
   const res = await fetchFn(url.toString())
   if (!res.ok) {
     const body = await res.text().catch(() => "")
     throw new Error(`swarm_read failed: ${res.status} ${body}`)
   }
-  const body = (await res.json()) as { messages: SwarmInboxMessage[] }
-  return body.messages
+  const body = (await res.json()) as {
+    messages: SwarmInboxMessage[]
+    has_more?: boolean
+  }
+  return { messages: body.messages, hasMore: body.has_more ?? false }
+}
+
+/** Rendering options for {@link formatInbox}. */
+export interface FormatInboxOptions {
+  /** Whether more messages exist beyond the returned window. */
+  hasMore?: boolean
+  /**
+   * Paging direction, used to choose the right "get more" hint:
+   * - "forward": more RECENT messages remain → page with `since=<newest>`.
+   * - "recent" (default): OLDER messages remain → page with `before=<oldest>`.
+   */
+  mode?: "forward" | "recent"
 }
 
 /**
  * Format inbox messages as a single string the LLM can reason about.
  * Each message is rendered as a compact block with routing metadata
- * followed by its payload.
+ * followed by its payload. When `hasMore` is set, a trailing hint tells
+ * the model how to fetch the next page.
  */
-export function formatInbox(messages: SwarmInboxMessage[]): string {
+export function formatInbox(
+  messages: SwarmInboxMessage[],
+  opts: FormatInboxOptions = {},
+): string {
   if (messages.length === 0) {
     return "Inbox is empty."
   }
@@ -83,38 +123,77 @@ export function formatInbox(messages: SwarmInboxMessage[]): string {
       m.payload,
     ].join("\n")
   })
-  return blocks.join("\n\n")
+  let out = blocks.join("\n\n")
+
+  if (opts.hasMore) {
+    if (opts.mode === "forward") {
+      const newest = messages[messages.length - 1]!.msg_id
+      out += `\n\nMore recent messages arrived after these. Call swarm_read again with since="${newest}" to continue.`
+    } else {
+      const oldest = messages[0]!.msg_id
+      out += `\n\nOlder messages exist beyond this page. Call swarm_read again with before="${oldest}" to see them.`
+    }
+  }
+  return out
 }
+
+/** Default page size for swarm_read when the caller doesn't specify `limit`. */
+export const SWARM_READ_DEFAULT_LIMIT = 10 as const
 
 /**
  * Build a `ToolDefinition` registered as `swarm_read` in the plugin's
- * `tool` map. The factory captures `daemonBaseUrl` so the runtime call
- * only needs `since` from the LLM and `sessionID` from ToolContext.
+ * `tool` map. The factory captures `daemonBaseUrl`; at runtime the tool
+ * takes optional `since`/`before`/`limit` from the LLM and `sessionID`
+ * from ToolContext.
  */
 export function createSwarmReadTool(daemonBaseUrl: string): ToolDefinition {
   return tool({
     description:
       "Read swarm messages addressed to the current session from the pigeon daemon. " +
       "Use this to check for backlog or messages that weren't pushed via prompt_async (e.g. low-priority chatter). " +
-      "Optionally pass a `since` msg_id cursor to fetch only messages newer than a known msg_id.",
+      `Returns the newest ${SWARM_READ_DEFAULT_LIMIT} messages by default (most recent last). ` +
+      "Pagination is cursor-based: pass `before` (an older-than cursor) to scroll back through history, " +
+      "or `since` (a newer-than cursor) to drain forward from a known point. When more messages exist beyond " +
+      "the returned page, the output ends with a hint telling you which cursor to pass next.",
     args: {
       since: tool.schema
         .string()
         .optional()
         .describe(
-          "Optional msg_id cursor. When provided, only messages with msg_id > this value are returned.",
+          "Forward cursor: only messages with msg_id > this value, oldest-first (drain forward / catch up).",
+        ),
+      before: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Backward cursor: only messages with msg_id < this value, newest-first within the window (scroll back through history).",
+        ),
+      limit: tool.schema
+        .number()
+        .optional()
+        .describe(
+          `Max messages to return (default ${SWARM_READ_DEFAULT_LIMIT}). The response is always chronological (oldest-first).`,
         ),
     },
     async execute(args, ctx) {
-      const messages = await swarmRead(
+      const limit = typeof args.limit === "number" ? args.limit : SWARM_READ_DEFAULT_LIMIT
+      // `since` implies forward drain; otherwise it's a recent/scroll-back view.
+      const mode: "forward" | "recent" = args.since ? "forward" : "recent"
+      const { messages, hasMore } = await swarmRead(
         { daemonBaseUrl, sessionId: ctx.sessionID },
-        args.since,
+        { since: args.since, before: args.before, limit },
       )
       ctx.metadata({
-        title: `swarm inbox (${messages.length})`,
-        metadata: { count: messages.length, since: args.since ?? null },
+        title: `swarm inbox (${messages.length}${hasMore ? "+" : ""})`,
+        metadata: {
+          count: messages.length,
+          since: args.since ?? null,
+          before: args.before ?? null,
+          limit,
+          has_more: hasMore,
+        },
       })
-      return formatInbox(messages)
+      return formatInbox(messages, { hasMore, mode })
     },
   })
 }

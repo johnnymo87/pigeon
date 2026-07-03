@@ -187,6 +187,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const sessionId = url.searchParams.get("session");
         if (!sessionId) return Response.json({ error: "session is required" }, { status: 400 });
         const since = url.searchParams.get("since");
+        const before = url.searchParams.get("before");
         const limitParam = url.searchParams.get("limit");
         let limit: number | undefined;
         if (limitParam !== null) {
@@ -196,9 +197,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           }
           limit = parsed;
         }
-        const messages = storage.swarm.getInbox(sessionId, since, limit);
+        const page = storage.swarm.getInbox(sessionId, { since, before, limit });
         return Response.json({
-          messages: messages.map((m) => ({
+          messages: page.messages.map((m) => ({
             msg_id: m.msgId,
             from: m.fromSession,
             to: m.toSession,
@@ -210,6 +211,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             created_at: m.createdAt,
             handed_off_at: m.handedOffAt,
           })),
+          has_more: page.hasMore,
         });
       }
 
