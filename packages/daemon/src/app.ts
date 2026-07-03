@@ -187,7 +187,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const sessionId = url.searchParams.get("session");
         if (!sessionId) return Response.json({ error: "session is required" }, { status: 400 });
         const since = url.searchParams.get("since");
-        const messages = storage.swarm.getInbox(sessionId, since);
+        const limitParam = url.searchParams.get("limit");
+        let limit: number | undefined;
+        if (limitParam !== null) {
+          const parsed = Number.parseInt(limitParam, 10);
+          if (!Number.isFinite(parsed) || parsed <= 0) {
+            return Response.json({ error: "limit must be a positive integer" }, { status: 400 });
+          }
+          limit = parsed;
+        }
+        const messages = storage.swarm.getInbox(sessionId, since, limit);
         return Response.json({
           messages: messages.map((m) => ({
             msg_id: m.msgId,

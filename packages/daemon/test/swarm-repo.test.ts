@@ -80,6 +80,37 @@ describe("SwarmRepository", () => {
     s.db.close();
   });
 
+  it("getInbox with a limit returns the newest N messages, in ascending order", () => {
+    const s = createStorage();
+    s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
+    s.swarm.insert({ ...BASE, msgId: "m2" }, 2_000);
+    s.swarm.insert({ ...BASE, msgId: "m3" }, 3_000);
+    s.swarm.markHandedOff("m1", 1_500);
+    s.swarm.markHandedOff("m2", 2_500);
+    s.swarm.markHandedOff("m3", 3_500);
+
+    // limit=1 must return the NEWEST message, not the oldest.
+    expect(s.swarm.getInbox("ses_b", null, 1).map((m) => m.msgId)).toEqual([
+      "m3",
+    ]);
+    // limit=2 returns the newest 2, in chronological (ascending) order.
+    expect(s.swarm.getInbox("ses_b", null, 2).map((m) => m.msgId)).toEqual([
+      "m2",
+      "m3",
+    ]);
+    // limit larger than available returns everything, ascending.
+    expect(s.swarm.getInbox("ses_b", null, 50).map((m) => m.msgId)).toEqual([
+      "m1",
+      "m2",
+      "m3",
+    ]);
+    // since + limit: newest N of the messages after the cursor.
+    expect(s.swarm.getInbox("ses_b", "m1", 1).map((m) => m.msgId)).toEqual([
+      "m3",
+    ]);
+    s.db.close();
+  });
+
   it("listTargetsWithReady returns distinct targets with ready work", () => {
     const s = createStorage();
     s.swarm.insert({ ...BASE, msgId: "m1", toSession: "ses_b" }, 1_000);

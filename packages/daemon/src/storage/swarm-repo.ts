@@ -145,27 +145,45 @@ export class SwarmRepository {
       .run(now, msgId);
   }
 
+  /**
+   * Fetch delivered (handed-off) messages for a session.
+   *
+   * Messages are always returned in ascending msg_id order (chronological,
+   * oldest-first) because consumers — `swarm_read`, the `since` cursor, and
+   * the delivery-check jq snippet — expect chronological order.
+   *
+   * When `limit` is provided, the **newest** N messages are selected (not the
+   * oldest N). We do this by ordering DESC + LIMIT in a subquery and then
+   * re-sorting ASC, so a caller asking for `limit=1` gets the most recent
+   * message rather than the stalest one. Omitting `limit` returns all rows.
+   */
   getInbox(
     toSession: string,
     sinceMsgId: string | null,
+    limit?: number,
   ): SwarmMessageRecord[] {
-    if (sinceMsgId === null) {
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM swarm_messages
-           WHERE to_session = ? AND state = 'handed_off'
-           ORDER BY msg_id ASC`,
-        )
-        .all(toSession) as Row[];
-      return rows.map(asRecord);
+    const hasLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0;
+    const sinceClause = sinceMsgId === null ? "" : "AND msg_id > ?";
+    const params: Array<string | number> = [toSession];
+    if (sinceMsgId !== null) params.push(sinceMsgId);
+
+    let sql: string;
+    if (hasLimit) {
+      // Select the newest N, then re-sort ascending for a chronological response.
+      sql = `SELECT * FROM (
+               SELECT * FROM swarm_messages
+               WHERE to_session = ? AND state = 'handed_off' ${sinceClause}
+               ORDER BY msg_id DESC
+               LIMIT ?
+             ) ORDER BY msg_id ASC`;
+      params.push(Math.floor(limit as number));
+    } else {
+      sql = `SELECT * FROM swarm_messages
+             WHERE to_session = ? AND state = 'handed_off' ${sinceClause}
+             ORDER BY msg_id ASC`;
     }
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM swarm_messages
-         WHERE to_session = ? AND state = 'handed_off' AND msg_id > ?
-         ORDER BY msg_id ASC`,
-      )
-      .all(toSession, sinceMsgId) as Row[];
+
+    const rows = this.db.prepare(sql).all(...params) as Row[];
     return rows.map(asRecord);
   }
 

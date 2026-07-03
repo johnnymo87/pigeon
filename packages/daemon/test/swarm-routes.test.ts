@@ -265,6 +265,47 @@ describe("GET /swarm/inbox", () => {
     expect(sinceBody.messages.map((m) => m.msg_id)).toEqual(["m2"]);
   });
 
+  it("honors `limit` by returning the newest N messages, ascending", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 1_000 });
+
+    for (const [id, ts] of [
+      ["m1", 1_000],
+      ["m2", 2_000],
+      ["m3", 3_000],
+    ] as const) {
+      storage.swarm.insert(
+        {
+          msgId: id,
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: id,
+        },
+        ts,
+      );
+      storage.swarm.markHandedOff(id, ts + 500);
+    }
+
+    const res = await app(
+      new Request("http://localhost/swarm/inbox?session=ses_b&limit=1"),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { messages: Array<{ msg_id: string }> };
+    expect(body.messages.map((m) => m.msg_id)).toEqual(["m3"]);
+
+    const two = await app(
+      new Request("http://localhost/swarm/inbox?session=ses_b&limit=2"),
+    );
+    const twoBody = (await two.json()) as {
+      messages: Array<{ msg_id: string }>;
+    };
+    expect(twoBody.messages.map((m) => m.msg_id)).toEqual(["m2", "m3"]);
+  });
+
   it("rejects when session is missing", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 1_000 });
