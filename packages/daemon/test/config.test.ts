@@ -129,4 +129,39 @@ describe("loadConfig", () => {
     expect(loadConfig({ PIGEON_ALLOWED_PROVIDERS: "" }).allowedProviders).toBeUndefined();
     expect(loadConfig({ PIGEON_ALLOWED_PROVIDERS: "  " }).allowedProviders).toBeUndefined();
   });
+
+  it("loads delivery watchdog fields with defaults when env is empty", () => {
+    const config = loadConfig({});
+    expect(config.watchdogIntervalMs).toBe(60_000);
+    expect(config.verifyAfterMs).toBe(300_000);
+    expect(config.stuckAlertMs).toBe(900_000);
+    expect(config.stuckAbortSilenceMs).toBe(3_600_000);
+    expect(config.maxRequeues).toBe(3);
+  });
+
+  it("loads delivery watchdog fields from env", () => {
+    const config = loadConfig({
+      WATCHDOG_INTERVAL_MS: "30000",
+      VERIFY_AFTER_MS: "60000",
+      STUCK_ALERT_MS: "120000",
+      STUCK_ABORT_SILENCE_MS: "180000",
+      MAX_REQUEUES: "5",
+    });
+    expect(config.watchdogIntervalMs).toBe(30000);
+    expect(config.verifyAfterMs).toBe(60000);
+    expect(config.stuckAlertMs).toBe(120000);
+    expect(config.stuckAbortSilenceMs).toBe(180000);
+    expect(config.maxRequeues).toBe(5);
+  });
+
+  it("falls back to delivery watchdog defaults if parsing numbers results in NaN or empty", () => {
+    const config = loadConfig({
+      WATCHDOG_INTERVAL_MS: "nope",
+      VERIFY_AFTER_MS: "",
+      STUCK_ALERT_MS: "  ",
+    });
+    expect(config.watchdogIntervalMs).toBe(60_000);
+    expect(config.verifyAfterMs).toBe(300_000);
+    expect(config.stuckAlertMs).toBe(900_000);
+  });
 });

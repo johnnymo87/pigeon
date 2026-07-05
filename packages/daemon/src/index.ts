@@ -4,6 +4,7 @@ import {
   FallbackStopNotifier,
   TelegramNotificationService,
   WorkerNotificationService,
+  type StopNotifier,
 } from "./notification-service";
 import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
@@ -12,6 +13,8 @@ import { OUTBOX_RETENTION_MS } from "./storage/schema";
 import { Poller } from "./worker/poller";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
+import { DeliveryWatchdog } from "./swarm/delivery-watchdog";
+import { makeWatchdogResolveClients } from "./swarm/watchdog-client-resolver";
 import { SessionDirectoryRegistry } from "./swarm/registry";
 import { ingestWorkerCommand } from "./worker/command-ingest";
 import { ingestLaunchCommand } from "./worker/launch-ingest";
@@ -327,9 +330,51 @@ const telegramNotifier = config.telegramBotToken && config.telegramChatId
   ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
   : undefined;
 
-const notifier = workerNotifier && telegramNotifier
+const notifier: StopNotifier | undefined = workerNotifier && telegramNotifier
   ? new FallbackStopNotifier(workerNotifier, telegramNotifier)
   : (workerNotifier ?? telegramNotifier);
+
+// Delivery watchdog: periodically re-checks handed-off swarm messages that
+// haven't verified an assistant run actually started, escalating alert ->
+// abort+redeliver -> terminal. Gated the same way as the swarm arbiter
+// (opencode-client or ingress router required) — no swarm delivery, nothing
+// to watch.
+const watchdogResolveClients = makeWatchdogResolveClients({
+  ingressRouter,
+  serveRegistry: storage.serves,
+  routingMeta: storage.meta,
+  clientFactory,
+  staleServeMs: config.staleServeMs,
+  singleClient: opencodeClient,
+});
+
+const deliveryWatchdog = (config.opencodeUrl || ingressRouter)
+  ? new DeliveryWatchdog({
+      storage,
+      resolveClients: watchdogResolveClients,
+      notifier,
+      intervalMs: config.watchdogIntervalMs,
+      verifyAfterMs: config.verifyAfterMs,
+      stuckAlertMs: config.stuckAlertMs,
+      stuckAbortSilenceMs: config.stuckAbortSilenceMs,
+      maxRequeues: config.maxRequeues,
+      log: (msg, fields) =>
+        console.log(`[delivery-watchdog] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (deliveryWatchdog) {
+  deliveryWatchdog.start(config.watchdogIntervalMs);
+  console.log("[pigeon-daemon] delivery watchdog started", JSON.stringify({
+    intervalMs: config.watchdogIntervalMs,
+    verifyAfterMs: config.verifyAfterMs,
+    stuckAlertMs: config.stuckAlertMs,
+    stuckAbortSilenceMs: config.stuckAbortSilenceMs,
+    maxRequeues: config.maxRequeues,
+  }));
+} else {
+  console.log("[pigeon-daemon] delivery watchdog NOT started (no opencodeUrl in config)");
+}
 
 const server = startServer(config, createApp(storage, {
   notifier,

@@ -1,3 +1,11 @@
+import {
+  DEFAULT_WATCHDOG_INTERVAL_MS,
+  DEFAULT_VERIFY_AFTER_MS,
+  DEFAULT_STUCK_ALERT_MS,
+  DEFAULT_STUCK_ABORT_SILENCE_MS,
+  DEFAULT_MAX_REQUEUES,
+} from "./swarm/delivery-watchdog";
+
 export interface DaemonConfig {
   port: number;
   dbPath: string;
@@ -18,6 +26,11 @@ export interface DaemonConfig {
   authToken?: string;
   serveLiveness: "self" | "http";
   allowedProviders?: string[];
+  watchdogIntervalMs: number;
+  verifyAfterMs: number;
+  stuckAlertMs: number;
+  stuckAbortSilenceMs: number;
+  maxRequeues: number;
 }
 
 const DEFAULT_PORT = 4731;
@@ -82,5 +95,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     authToken: env.PIGEON_DAEMON_AUTH_TOKEN?.trim() || undefined,
     serveLiveness: env.PIGEON_SERVE_LIVENESS === "self" ? "self" : "http",
     allowedProviders: allowedProviders.length > 0 ? allowedProviders : undefined,
+    watchdogIntervalMs: numOr(env.WATCHDOG_INTERVAL_MS, DEFAULT_WATCHDOG_INTERVAL_MS),
+    verifyAfterMs: numOr(env.VERIFY_AFTER_MS, DEFAULT_VERIFY_AFTER_MS),
+    stuckAlertMs: numOr(env.STUCK_ALERT_MS, DEFAULT_STUCK_ALERT_MS),
+    stuckAbortSilenceMs: numOr(env.STUCK_ABORT_SILENCE_MS, DEFAULT_STUCK_ABORT_SILENCE_MS),
+    maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
   };
 }
