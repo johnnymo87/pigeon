@@ -1,0 +1,794 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { openStorageDb, type StorageDb } from "../src/storage/database";
+import {
+  DeliveryWatchdog,
+  type ClientSet,
+  type WatchdogClient,
+} from "../src/swarm/delivery-watchdog";
+
+// ---------------------------------------------------------------------------
+// Transcript builders — mirror opencode's GET /session/:id/message shape.
+// ---------------------------------------------------------------------------
+
+function userMessage(created: number, text: string): unknown {
+  return {
+    info: { role: "user", time: { created } },
+    parts: [{ type: "text", text }],
+  };
+}
+
+function assistantMessage(opts: {
+  created: number;
+  completed?: number | null;
+  error?: unknown;
+  parts?: unknown[];
+}): unknown {
+  const time: Record<string, number> = { created: opts.created };
+  if (typeof opts.completed === "number") time.completed = opts.completed;
+  return {
+    info: { role: "assistant", time, error: opts.error },
+    parts: opts.parts ?? [],
+  };
+}
+
+function toolPart(start: number, end?: number): unknown {
+  return {
+    type: "tool",
+    state:
+      end !== undefined
+        ? { status: "completed", time: { start, end } }
+        : { status: "running", time: { start } },
+  };
+}
+
+function textPart(start: number, end?: number): unknown {
+  return {
+    type: "text",
+    text: "...",
+    time: end !== undefined ? { start, end } : { start },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fixture
+// ---------------------------------------------------------------------------
+
+function makeClient(): WatchdogClient & {
+  getSessionMessages: ReturnType<typeof vi.fn>;
+  abortSession: ReturnType<typeof vi.fn>;
+} {
+  return {
+    getSessionMessages: vi.fn(async () => [] as unknown[]),
+    abortSession: vi.fn(async () => {}),
+  };
+}
+
+function makeFixture() {
+  const storage: StorageDb = openStorageDb(":memory:");
+  let now = 1_000_000;
+  const clientMap = new Map<string, ClientSet>();
+  const sendPlainAlert = vi.fn(async (_text: string, _severity: string) => {});
+
+  const resolveClients = vi.fn((sessionId: string): ClientSet => {
+    return clientMap.get(sessionId) ?? { preferred: undefined, all: [] };
+  });
+
+  const watchdog = new DeliveryWatchdog({
+    storage,
+    resolveClients,
+    notifier: { sendPlainAlert },
+    nowFn: () => now,
+    log: () => {},
+  });
+
+  function insertHandedOff(opts: {
+    msgId: string;
+    fromSession: string;
+    toSession: string;
+    handedOffAt: number;
+  }): void {
+    storage.swarm.insert(
+      {
+        msgId: opts.msgId,
+        fromSession: opts.fromSession,
+        toSession: opts.toSession,
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "payload",
+      },
+      opts.handedOffAt,
+    );
+    storage.swarm.markHandedOff(opts.msgId, opts.handedOffAt);
+  }
+
+  return {
+    storage,
+    watchdog,
+    resolveClients,
+    sendPlainAlert,
+    clientMap,
+    insertHandedOff,
+    setNow(v: number) {
+      now = v;
+    },
+    getNow() {
+      return now;
+    },
+  };
+}
+
+type Fixture = ReturnType<typeof makeFixture>;
+
+describe("DeliveryWatchdog", () => {
+  let fixture: Fixture | null = null;
+
+  afterEach(() => {
+    fixture?.watchdog.stop();
+    fixture?.storage.db.close();
+    fixture = null;
+  });
+
+  it("1. verifies: user row + later completed clean assistant sets verified_at", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(100, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 200, completed: 300 }),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBe(400_000);
+    expect(row.state).toBe("handed_off");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("2. reply_to=\"<id>\" in another row does NOT count as our user row", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    // A decoy row mentions m1 only as reply_to, and a clean assistant run
+    // follows it. If the matcher incorrectly treated reply_to as an anchor,
+    // this assistant message would satisfy verification.
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" reply_to="m1">`),
+      assistantMessage({ created: 100, completed: 200 }),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBeNull();
+    expect(row.state).toBe("queued"); // requeued: no true anchor found
+    expect(row.requeueCount).toBe(1);
+  });
+
+  it("3. redelivered duplicate: LATEST msg_id match anchors verification", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    // First (stale) delivery attempt at t=50, an in-flight leftover from that
+    // attempt at t=70 (completed: null), then the TRUE redelivery anchor at
+    // t=200. Using the correct (latest) anchor, the in-flight message at 70
+    // is BEFORE the anchor -> blocking, not verifying. If the wrong (first)
+    // anchor were used, that same in-flight message would count as serving
+    // evidence and incorrectly verify.
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 70, completed: null }),
+      userMessage(200, `<swarm_message v="1" msg_id="m1">`),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 650_000 });
+    fixture.setNow(1_000_000); // age=350_000 (<900_000 stuckAlertMs); silence small
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBeNull();
+    expect(row.state).toBe("handed_off"); // stuck-but-waiting, not requeued/aborted
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("4. later assistant row completed WITH ERROR is not verification; falls through to stuck rules", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 100, completed: 150, error: { name: "UnknownError" } }),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBeNull();
+    // No in-flight turn at all (the errored assistant already completed) ->
+    // idle-never-ran -> requeue.
+    expect(row.state).toBe("queued");
+    expect(row.requeueCount).toBe(1);
+  });
+
+  it("5. serving in-flight turn (created > anchor) verifies, no alert/abort", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 100, completed: null }),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBe(400_000);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("6. blocking in-flight turn (created < anchor) triggers stuck rules, not verification", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      assistantMessage({ created: 10, completed: null }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 650_000 });
+    fixture.setNow(1_000_000); // age below stuckAlertMs, silence below stuckAbortSilenceMs
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.verifiedAt).toBeNull();
+    expect(row.state).toBe("handed_off");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("7. user row missing: requeue (no abort); terminal + alert on maxRequeues exhaustion", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([]); // no user row for m1 at all
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+    // Detection 1: requeueCount 0 -> 1
+    fixture.setNow(400_000);
+    await watchdog.processOnce();
+    let row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("queued");
+    expect(row.requeueCount).toBe(1);
+    expect(client.abortSession).not.toHaveBeenCalled();
+
+    // Simulate the arbiter redelivering.
+    storage.swarm.markHandedOff("m1", 500_000);
+    fixture.setNow(900_000);
+    await watchdog.processOnce();
+    row = storage.swarm.getByMsgId("m1")!;
+    expect(row.requeueCount).toBe(2);
+
+    storage.swarm.markHandedOff("m1", 1_000_000);
+    fixture.setNow(1_400_000);
+    await watchdog.processOnce();
+    row = storage.swarm.getByMsgId("m1")!;
+    expect(row.requeueCount).toBe(3);
+    expect(row.state).toBe("queued");
+
+    // Detection 4: requeueCount(3) >= maxRequeues(3) -> terminal.
+    storage.swarm.markHandedOff("m1", 1_500_000);
+    fixture.setNow(1_900_000);
+    await watchdog.processOnce();
+    row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("failed");
+    expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+    expect(client.abortSession).not.toHaveBeenCalled();
+
+    const notices = storage.db
+      .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+      .all() as Array<Record<string, unknown>>;
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.to_session).toBe("ses_a");
+  });
+
+  it("8. idle-never-ran: requeue (no abort); bounded terminal on exhaustion", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    const anchorText = `<swarm_message v="1" msg_id="m1">`;
+    client.getSessionMessages.mockImplementation(async () => [
+      userMessage(50, anchorText),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+    fixture.setNow(400_000);
+    await watchdog.processOnce();
+    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(1);
+    expect(client.abortSession).not.toHaveBeenCalled();
+
+    storage.swarm.markHandedOff("m1", 500_000);
+    fixture.setNow(900_000);
+    await watchdog.processOnce();
+    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(2);
+
+    storage.swarm.markHandedOff("m1", 1_000_000);
+    fixture.setNow(1_400_000);
+    await watchdog.processOnce();
+    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(3);
+
+    storage.swarm.markHandedOff("m1", 1_500_000);
+    fixture.setNow(1_900_000);
+    await watchdog.processOnce();
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("failed");
+    expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("9. blocking in-flight with FRESH part activity: labeled ACTIVE warn once past stuckAlertMs, no abort", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(999_000)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    // age = 1_000_000 > stuckAlertMs(900_000); lastActivity=999_000, silence=1_000 (fresh)
+    fixture.setNow(1_000_000);
+
+    await watchdog.processOnce();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const [text, severity] = sendPlainAlert.mock.calls[0]!;
+    expect(text).toContain("ACTIVE");
+    expect(text).toContain("m1");
+    expect(text).toContain("ses_b");
+    expect(severity).toBe("warning");
+    expect(client.abortSession).not.toHaveBeenCalled();
+    expect(storage.swarm.getByMsgId("m1")!.verifiedAt).toBeNull();
+  });
+
+  it("10. blocking in-flight, age > stuckAlertMs: alert exactly once (dedupe), pruned on verify", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(999_000)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(1_000_000);
+
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect((watchdog as any).stuckAlerted.has("m1")).toBe(true);
+
+    // Repeat cycles: alert must not fire again.
+    fixture.setNow(1_050_000);
+    await watchdog.processOnce();
+    fixture.setNow(1_100_000);
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    // Now let it verify — the dedupe entry should be pruned.
+    client.getSessionMessages.mockImplementation(async () => [
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 60, completed: 70 }),
+    ]);
+    fixture.setNow(1_150_000);
+    await watchdog.processOnce();
+
+    expect(storage.swarm.getByMsgId("m1")!.verifiedAt).toBe(1_150_000);
+    expect((watchdog as any).stuckAlerted.has("m1")).toBe(false);
+  });
+
+  it("11. blocking in-flight past stuckAbortSilenceMs, no aborted_at: TOCTOU refetch then abort+requeue", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const clientA = makeClient();
+    const clientB = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }), // silent since t=20
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    // silence = now - 20, must exceed stuckAbortSilenceMs (3_600_000)
+    fixture.setNow(4_000_000);
+
+    await watchdog.processOnce();
+
+    // Initial fetch + TOCTOU refetch, both via the preferred (readClient).
+    expect(clientA.getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(clientA.abortSession).toHaveBeenCalledWith("ses_b");
+    expect(clientB.abortSession).toHaveBeenCalledWith("ses_b");
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.abortedAt).toBe(4_000_000);
+    expect(row.state).toBe("queued");
+    expect(row.requeueCount).toBe(1);
+  });
+
+  it("12. TOCTOU: refetch shows fresh activity -> no abort", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    const staleTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    const freshTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 3_999_000)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    client.getSessionMessages
+      .mockResolvedValueOnce(staleTranscript)
+      .mockResolvedValueOnce(freshTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(4_000_000);
+
+    await watchdog.processOnce();
+
+    expect(client.getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(client.abortSession).not.toHaveBeenCalled();
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.abortedAt).toBeNull();
+    expect(row.state).toBe("handed_off");
+  });
+
+  it("13. aborted_at already set + stuck again post-redelivery: markFailed + error alert + sender delivery.failed", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      assistantMessage({ created: 10, completed: null }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    // Simulate: a prior cycle already aborted once and requeued.
+    storage.swarm.markAborted("m1", 100_000);
+    storage.swarm.requeueForRecovery("m1", 100_000, 5_000);
+    storage.swarm.markHandedOff("m1", 200_000); // arbiter redelivered
+
+    fixture.setNow(600_000); // eligible again (> verifyAfterMs past 200_000)
+
+    await watchdog.processOnce();
+
+    expect(client.getSessionMessages).toHaveBeenCalledTimes(1); // no TOCTOU refetch
+    expect(client.abortSession).not.toHaveBeenCalled();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("failed");
+    expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+
+    const notices = storage.db
+      .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+      .all() as Array<Record<string, unknown>>;
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.to_session).toBe("ses_a");
+  });
+
+  it("14. 404 handling: confirmed (terminal), contradicted (proceed), 5xx (skip no counter bump)", async () => {
+    // Scenario A: confirmed 404 across both clients -> markFailed + alert.
+    {
+      const f = makeFixture();
+      const clientA = makeClient();
+      const clientB = makeClient();
+      clientA.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (404): not found"),
+      );
+      clientB.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (404): not found"),
+      );
+      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+      f.setNow(400_000);
+
+      await f.watchdog.processOnce();
+
+      expect(clientB.getSessionMessages).toHaveBeenCalledTimes(1);
+      const row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.state).toBe("failed");
+      expect(f.sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+      f.watchdog.stop();
+      f.storage.db.close();
+    }
+
+    // Scenario B: contradicted — other serve returns 200 -> proceed with it.
+    {
+      const f = makeFixture();
+      const clientA = makeClient();
+      const clientB = makeClient();
+      clientA.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (404): not found"),
+      );
+      clientB.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+        assistantMessage({ created: 100, completed: 200 }),
+      ]);
+      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+      f.setNow(400_000);
+
+      await f.watchdog.processOnce();
+
+      const row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.verifiedAt).toBe(400_000);
+      expect(row.state).toBe("handed_off");
+      f.watchdog.stop();
+      f.storage.db.close();
+    }
+
+    // Scenario C: 5xx -> skip, no counter bump.
+    {
+      const f = makeFixture();
+      const client = makeClient();
+      client.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (500): internal error"),
+      );
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+      f.setNow(400_000);
+
+      await f.watchdog.processOnce();
+
+      const row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.requeueCount).toBe(0);
+      expect(f.sendPlainAlert).not.toHaveBeenCalled();
+      f.watchdog.stop();
+      f.storage.db.close();
+    }
+  });
+
+  it("15. broadcast partial failure sets aborted_at (no repeat abort); all-hard-fail leaves aborted_at unset + alert", async () => {
+    // Scenario A: one 2xx + one 4xx -> aborted_at set; a later stuck-again
+    // cycle goes straight to terminal (no second abort attempt).
+    {
+      const f = makeFixture();
+      const clientA = makeClient();
+      const clientB = makeClient();
+      const stuckTranscript = [
+        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ];
+      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
+      clientA.abortSession.mockResolvedValue(undefined);
+      clientB.abortSession.mockRejectedValue(new Error("abortSession failed: 403 Forbidden"));
+      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+      f.setNow(4_000_000);
+
+      await f.watchdog.processOnce();
+
+      let row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.abortedAt).toBe(4_000_000);
+      expect(row.state).toBe("queued");
+      expect(clientA.abortSession).toHaveBeenCalledTimes(1);
+      expect(clientB.abortSession).toHaveBeenCalledTimes(1);
+
+      // Redeliver and get stuck again — must go straight to terminal, no
+      // second abort broadcast.
+      f.storage.swarm.markHandedOff("m1", 4_100_000);
+      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
+      f.setNow(4_500_000);
+      await f.watchdog.processOnce();
+
+      row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.state).toBe("failed");
+      expect(clientA.abortSession).toHaveBeenCalledTimes(1); // unchanged
+      expect(clientB.abortSession).toHaveBeenCalledTimes(1); // unchanged
+
+      f.watchdog.stop();
+      f.storage.db.close();
+    }
+
+    // Scenario B: all serves hard-fail -> aborted_at unset, skip + alert.
+    {
+      const f = makeFixture();
+      const clientA = makeClient();
+      const clientB = makeClient();
+      const stuckTranscript = [
+        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ];
+      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
+      clientA.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
+      clientB.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
+      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+      f.setNow(4_000_000);
+
+      await f.watchdog.processOnce();
+
+      const row = f.storage.swarm.getByMsgId("m1")!;
+      expect(row.abortedAt).toBeNull();
+      expect(row.state).toBe("handed_off");
+      expect(f.sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+
+      f.watchdog.stop();
+      f.storage.db.close();
+    }
+  });
+
+  it("16. abortSession all-fail: no requeue count burn", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const clientA = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientA.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
+    clientMap.set("ses_b", { preferred: clientA, all: [clientA] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(4_000_000);
+
+    const before = storage.swarm.getByMsgId("m1")!.requeueCount;
+    await watchdog.processOnce();
+    const after = storage.swarm.getByMsgId("m1")!.requeueCount;
+
+    expect(before).toBe(0);
+    expect(after).toBe(0);
+    expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
+  });
+
+  it("17. two stuck rows to one session in one cycle: ONE transcript fetch, ONE intervention", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(10, `<swarm_message v="1" msg_id="m1">`),
+      userMessage(20, `<swarm_message v="1" msg_id="m2">`),
+      // No assistant messages at all -> both rows are "idle-never-ran".
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    insertHandedOff({ msgId: "m2", fromSession: "ses_c", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    expect(client.getSessionMessages).toHaveBeenCalledTimes(1);
+
+    const m1 = storage.swarm.getByMsgId("m1")!;
+    const m2 = storage.swarm.getByMsgId("m2")!;
+    const requeuedCount = [m1, m2].filter((r) => r.state === "queued").length;
+    const untouchedCount = [m1, m2].filter((r) => r.state === "handed_off").length;
+    expect(requeuedCount).toBe(1);
+    expect(untouchedCount).toBe(1);
+  });
+
+  it("18. no healthy serve: skipped; unverified > 1h -> age alarm once, pruned on verify", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, resolveClients, insertHandedOff, sendPlainAlert } = fixture;
+
+    clientMap.set("ses_b", { preferred: undefined, all: [] });
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+    // Eligible (past verifyAfterMs) but age < 1h -> skip, no alarm.
+    fixture.setNow(400_000);
+    await watchdog.processOnce();
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
+
+    // age > 1h -> alarm fires once.
+    fixture.setNow(3_700_000);
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect((watchdog as any).ageAlarmed.has("m1")).toBe(true);
+
+    // Still no healthy serve, still old -> dedupe holds.
+    fixture.setNow(3_800_000);
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    // Now a healthy serve appears and verifies the message -> dedupe entry pruned.
+    const client = makeClient();
+    client.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 100, completed: 200 }),
+    ]);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+    fixture.setNow(3_900_000);
+    await watchdog.processOnce();
+
+    expect(storage.swarm.getByMsgId("m1")!.verifiedAt).toBe(3_900_000);
+    expect((watchdog as any).ageAlarmed.has("m1")).toBe(false);
+    void resolveClients;
+  });
+
+  it("19. re-entrancy: overlapping processOnce calls coalesce (second returns immediately)", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    let resolveFetch!: (v: unknown[]) => void;
+    client.getSessionMessages.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    const listSpy = vi.spyOn(storage.swarm, "listUnverifiedHandedOff");
+
+    const first = watchdog.processOnce();
+    const second = watchdog.processOnce();
+
+    const secondResult = await second;
+    expect(secondResult.coalesced).toBe(true);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
+    resolveFetch([
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      assistantMessage({ created: 100, completed: 200 }),
+    ]);
+    const firstResult = await first;
+    expect(firstResult.coalesced).toBe(false);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+});
