@@ -65,6 +65,14 @@ export function makeWatchdogResolveClients(
         return { preferred: undefined, all: [] };
       }
 
+      // TUNING ASSUMPTION: resolveProspectiveRoute's lease-holding path can
+      // return a serve that is NOT in the healthy `all` set (an unexpired
+      // lease outlives a stale heartbeat). That ghost-preferred case is
+      // unreachable while VERIFY_AFTER_MS (default 300s) far exceeds
+      // leaseTtlMs (default 30s) — any lease from handoff time is long
+      // expired before the watchdog first looks at a row. If VERIFY_AFTER_MS
+      // is ever tuned below ~leaseTtlMs, a dead-but-leased serve becomes the
+      // preferred read client and non-404 fetch failures would skip silently.
       const prospective = opts.ingressRouter!.resolveProspectiveRoute(sessionId, now);
       const preferred = prospective
         ? opts.clientFactory!.forEndpoint(prospective.apiBase)

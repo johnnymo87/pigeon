@@ -320,6 +320,7 @@ export class DeliveryWatchdog {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
+  private readonly intervalMs: number;
 
   constructor(opts: DeliveryWatchdogOptions) {
     this.storage = opts.storage;
@@ -328,6 +329,7 @@ export class DeliveryWatchdog {
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[delivery-watchdog] ${m}`, f ?? ""));
+    this.intervalMs = opts.intervalMs ?? DEFAULT_WATCHDOG_INTERVAL_MS;
     this.verifyAfterMs = opts.verifyAfterMs ?? DEFAULT_VERIFY_AFTER_MS;
     this.stuckAlertMs = opts.stuckAlertMs ?? DEFAULT_STUCK_ALERT_MS;
     this.stuckAbortSilenceMs =
@@ -335,7 +337,7 @@ export class DeliveryWatchdog {
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
   }
 
-  start(intervalMs = DEFAULT_WATCHDOG_INTERVAL_MS): void {
+  start(intervalMs = this.intervalMs): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
       void this.processOnce();
