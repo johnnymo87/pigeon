@@ -909,44 +909,119 @@ describe("DeliveryWatchdog", () => {
     expect((watchdog as any).stuckAlerted.has("m1")).toBe(false);
   });
 
-  it("24. processOnce catches a thrown resolveClients: resolves (no reject), logs, never crashes", async () => {
+  it("24. per-session error isolation: one session's resolveClients throw is caught+logged+skipped; another session's rows still get processed in the same cycle", async () => {
     const storage: StorageDb = openStorageDb(":memory:");
     const logSpy = vi.fn();
     const boom = new Error("boom: resolveClients exploded");
-    const resolveClients = vi.fn((_sessionId: string): ClientSet => {
-      throw boom;
+
+    const clientB = makeClient();
+    clientB.getSessionMessages.mockResolvedValue([
+      userMessage(50, `<swarm_message v="1" msg_id="m2">`),
+      assistantMessage({ created: 100, completed: 200 }),
+    ]);
+
+    const resolveClients = vi.fn((sessionId: string): ClientSet => {
+      if (sessionId === "ses_bad") throw boom;
+      if (sessionId === "ses_b") return { preferred: clientB, all: [clientB] };
+      return { preferred: undefined, all: [] };
     });
+
     const watchdog = new DeliveryWatchdog({
       storage,
       resolveClients,
-      nowFn: () => 1_000_000,
+      nowFn: () => 400_000,
       log: logSpy,
     });
 
-    storage.swarm.insert(
-      {
-        msgId: "m1",
-        fromSession: "ses_a",
-        toSession: "ses_b",
-        channel: null,
-        kind: "chat",
-        priority: "normal",
-        replyTo: null,
-        payload: "payload",
-      },
-      0,
-    );
-    storage.swarm.markHandedOff("m1", 0);
+    function insert(msgId: string, fromSession: string, toSession: string): void {
+      storage.swarm.insert(
+        {
+          msgId,
+          fromSession,
+          toSession,
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload",
+        },
+        0,
+      );
+      storage.swarm.markHandedOff(msgId, 0);
+    }
+    insert("m1", "ses_x", "ses_bad");
+    insert("m2", "ses_y", "ses_b");
 
-    await expect(watchdog.processOnce()).resolves.toMatchObject({
-      error: expect.any(String),
-    });
+    const result = await watchdog.processOnce();
+
+    // The whole cycle still resolves cleanly — no top-level `error`.
+    expect(result.error).toBeUndefined();
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    // The failing session's row is untouched (not verified, not requeued).
+    const badRow = storage.swarm.getByMsgId("m1")!;
+    expect(badRow.verifiedAt).toBeNull();
+    expect(badRow.state).toBe("handed_off");
+
+    // The healthy session's row still got processed in the SAME cycle.
+    expect(storage.swarm.getByMsgId("m2")!.verifiedAt).toBe(400_000);
+
     expect(logSpy).toHaveBeenCalledWith(
       expect.any(String),
-      expect.objectContaining({ error: expect.stringContaining("boom") }),
+      expect.objectContaining({ sessionId: "ses_bad", error: expect.stringContaining("boom") }),
     );
 
     watchdog.stop();
     storage.db.close();
+  });
+
+  it("25. lifecycle alert budget: warn -> abort+redeliver -> stuck again -> terminal fires sendPlainAlert exactly twice (one warn, one error)", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }), // silent since t=20
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+    // Episode step 1: past stuckAlertMs but silence still within
+    // stuckAbortSilenceMs -> warn alert fires, no abort.
+    fixture.setNow(1_000_000); // age=1_000_000>900_000; silence=999_980<=3_600_000
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect(sendPlainAlert.mock.calls[0]![1]).toBe("warning");
+    expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
+
+    // Episode step 2: silence now exceeds stuckAbortSilenceMs -> TOCTOU
+    // refetch confirms still-stuck -> abort broadcast + requeue. No new
+    // alert (the stuck-alert dedupe already fired, and abort success
+    // itself doesn't alert).
+    fixture.setNow(3_700_000); // silence=3_699_980>3_600_000
+    await watchdog.processOnce();
+    let row = storage.swarm.getByMsgId("m1")!;
+    expect(row.abortedAt).toBe(3_700_000);
+    expect(row.state).toBe("queued");
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1); // still just the warn
+
+    // Simulate the arbiter redelivering the recovered message.
+    storage.swarm.markHandedOff("m1", 3_700_000);
+
+    // Episode step 3: eligible again (past verifyAfterMs) and still stuck on
+    // the SAME blocking turn. Because aborted_at is already (permanently)
+    // set, this must go straight to terminal — no second abort attempt —
+    // firing exactly one more (error) alert.
+    fixture.setNow(4_100_000); // age since redelivery = 400_000 > verifyAfterMs(300_000)
+    await watchdog.processOnce();
+    row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("failed");
+    expect(client.abortSession).toHaveBeenCalledTimes(1); // unchanged since step 2 — no second abort attempt
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(2);
+    expect(sendPlainAlert.mock.calls[1]![1]).toBe("error");
   });
 });

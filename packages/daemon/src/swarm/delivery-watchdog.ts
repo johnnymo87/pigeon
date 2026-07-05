@@ -340,6 +340,10 @@ export class DeliveryWatchdog {
     this.timer = setInterval(() => {
       void this.processOnce();
     }, intervalMs);
+    // Matches the other background loops in index.ts (sweepTimer,
+    // selfLivenessTimer): don't let this interval alone keep the process
+    // alive on shutdown.
+    this.timer.unref?.();
   }
 
   stop(): void {
@@ -439,7 +443,17 @@ export class DeliveryWatchdog {
     }
 
     for (const [sessionId, sessionRows] of bySession) {
-      await this.processSession(sessionId, sessionRows, now, counts);
+      try {
+        await this.processSession(sessionId, sessionRows, now, counts);
+      } catch (err) {
+        // A single session's resolveClients/fetch/etc. blowing up must not
+        // abort the whole cycle — every other session's rows still deserve
+        // a chance to verify/requeue/abort this cycle. Isolate the failure
+        // to this session's rows (counted as skipped) and keep going.
+        const message = err instanceof Error ? err.message : String(err);
+        this.log("session error", { sessionId, error: message });
+        counts.skipped += sessionRows.length;
+      }
     }
 
     this.log("cycle complete", { ...counts });
