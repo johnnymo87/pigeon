@@ -18,7 +18,10 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       next_retry_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      handed_off_at INTEGER
+      handed_off_at INTEGER,
+      verified_at INTEGER,
+      requeue_count INTEGER NOT NULL DEFAULT 0,
+      aborted_at INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -28,4 +31,36 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_swarm_channel
       ON swarm_messages(channel, state, created_at);
   `);
+
+  // Additive migration for existing databases created before delivery
+  // verification. Detect whether verified_at is about to be freshly added
+  // *before* altering, so we know whether to run the one-time backfill below.
+  const hadVerifiedAtBeforeMigration = (
+    db.pragma("table_info(swarm_messages)") as Array<{ name: string }>
+  ).some((c) => c.name === "verified_at");
+
+  const additiveColumns = [
+    "ALTER TABLE swarm_messages ADD COLUMN verified_at INTEGER",
+    "ALTER TABLE swarm_messages ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE swarm_messages ADD COLUMN aborted_at INTEGER",
+  ];
+
+  for (const statement of additiveColumns) {
+    try {
+      db.exec(statement);
+    } catch {
+      // Column already exists.
+    }
+  }
+
+  if (!hadVerifiedAtBeforeMigration) {
+    // The watchdog governs only post-deploy messages. Without this backfill
+    // its first cycle would mass-fetch and mass-redeliver up to
+    // SWARM_RETENTION_MS worth of stale, already-delivered prompts.
+    db.exec(`
+      UPDATE swarm_messages
+      SET verified_at = COALESCE(handed_off_at, updated_at)
+      WHERE state = 'handed_off'
+    `);
+  }
 }

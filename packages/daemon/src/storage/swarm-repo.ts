@@ -19,6 +19,9 @@ export interface SwarmMessageRecord {
   createdAt: number;
   updatedAt: number;
   handedOffAt: number | null;
+  verifiedAt: number | null;
+  requeueCount: number;
+  abortedAt: number | null;
 }
 
 /** Cursor-based paging options for {@link SwarmRepository.getInbox}. */
@@ -64,6 +67,9 @@ function asRecord(row: Row): SwarmMessageRecord {
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     handedOffAt: (row.handed_off_at as number | null) ?? null,
+    verifiedAt: (row.verified_at as number | null) ?? null,
+    requeueCount: Number(row.requeue_count ?? 0),
+    abortedAt: (row.aborted_at as number | null) ?? null,
   };
 }
 
@@ -139,6 +145,58 @@ export class SwarmRepository {
          WHERE msg_id = ?`,
       )
       .run(now, now, msgId);
+  }
+
+  /** Confirms an assistant run actually started for a handed-off message. Verified rows are never re-checked. */
+  markVerified(msgId: string, now = Date.now()): void {
+    this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET verified_at = ?
+         WHERE msg_id = ?`,
+      )
+      .run(now, msgId);
+  }
+
+  /** Watchdog-initiated redelivery of a message whose handoff was never verified. */
+  requeueForRecovery(msgId: string, now: number, delayMs: number): void {
+    this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET state = 'queued', next_retry_at = ?, updated_at = ?, requeue_count = requeue_count + 1
+         WHERE msg_id = ?`,
+      )
+      .run(now + delayMs, now, msgId);
+  }
+
+  /** Records that the watchdog has fired its one allowed abort for this message. */
+  markAborted(msgId: string, now = Date.now()): void {
+    this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET aborted_at = ?
+         WHERE msg_id = ?`,
+      )
+      .run(now, msgId);
+  }
+
+  /**
+   * Handed-off, session-targeted messages whose assistant run has not yet
+   * been verified, and whose handoff is old enough to be worth checking.
+   * Excludes channel messages (no single target session to verify against)
+   * and messages handed off more recently than `verifyAfterMs`.
+   */
+  listUnverifiedHandedOff(now: number, verifyAfterMs: number): SwarmMessageRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM swarm_messages
+         WHERE state = 'handed_off'
+           AND verified_at IS NULL
+           AND to_session IS NOT NULL
+           AND handed_off_at < ?`,
+      )
+      .all(now - verifyAfterMs) as Row[];
+    return rows.map(asRecord);
   }
 
   markRetry(msgId: string, now: number, backoffMs: number): void {
