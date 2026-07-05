@@ -147,7 +147,15 @@ export class SwarmRepository {
       .run(now, now, msgId);
   }
 
-  /** Confirms an assistant run actually started for a handed-off message. Verified rows are never re-checked. */
+  /**
+   * Confirms an assistant run actually started for a handed-off message.
+   * Verified rows are never re-checked.
+   *
+   * Deliberately does NOT bump `updated_at`: {@link cleanupOlderThan} anchors
+   * retention on `updated_at`, and bumping it here would reset the retention
+   * clock for messages that have already been sitting in `handed_off` for a
+   * while, extending how long they linger before cleanup.
+   */
   markVerified(msgId: string, now = Date.now()): void {
     this.db
       .prepare(
@@ -169,13 +177,20 @@ export class SwarmRepository {
       .run(now + delayMs, now, msgId);
   }
 
-  /** Records that the watchdog has fired its one allowed abort for this message. */
+  /**
+   * Records that the watchdog has fired its one allowed abort for this
+   * message. First-write-wins: a message can only be aborted once, so a
+   * second call is a no-op that leaves the original timestamp untouched.
+   *
+   * Deliberately does NOT bump `updated_at`, for the same reason as
+   * {@link markVerified}: {@link cleanupOlderThan} anchors retention on it.
+   */
   markAborted(msgId: string, now = Date.now()): void {
     this.db
       .prepare(
         `UPDATE swarm_messages
          SET aborted_at = ?
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND aborted_at IS NULL`,
       )
       .run(now, msgId);
   }

@@ -39,28 +39,47 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
     db.pragma("table_info(swarm_messages)") as Array<{ name: string }>
   ).some((c) => c.name === "verified_at");
 
-  const additiveColumns = [
-    "ALTER TABLE swarm_messages ADD COLUMN verified_at INTEGER",
-    "ALTER TABLE swarm_messages ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE swarm_messages ADD COLUMN aborted_at INTEGER",
-  ];
+  // The ALTERs, the supporting index, and the backfill must all commit or
+  // all roll back together. If a crash landed only the ALTERs (verified_at
+  // present) without the backfill, every later init would see verified_at
+  // already there and skip the backfill forever -- silently defeating the
+  // migration. Wrapping them in one transaction makes "verified_at exists"
+  // reliably imply "backfill ran".
+  const migrate = db.transaction(() => {
+    const additiveColumns = [
+      "ALTER TABLE swarm_messages ADD COLUMN verified_at INTEGER",
+      "ALTER TABLE swarm_messages ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE swarm_messages ADD COLUMN aborted_at INTEGER",
+    ];
 
-  for (const statement of additiveColumns) {
-    try {
-      db.exec(statement);
-    } catch {
-      // Column already exists.
+    for (const statement of additiveColumns) {
+      try {
+        db.exec(statement);
+      } catch {
+        // Column already exists.
+      }
     }
-  }
 
-  if (!hadVerifiedAtBeforeMigration) {
-    // The watchdog governs only post-deploy messages. Without this backfill
-    // its first cycle would mass-fetch and mass-redeliver up to
-    // SWARM_RETENTION_MS worth of stale, already-delivered prompts.
+    // Supports the watchdog's listUnverifiedHandedOff poll (every ~60s over
+    // up to 7 days of rows). Created here rather than in the CREATE TABLE
+    // block above because on upgrade paths verified_at doesn't exist until
+    // the ALTERs above run.
     db.exec(`
-      UPDATE swarm_messages
-      SET verified_at = COALESCE(handed_off_at, updated_at)
-      WHERE state = 'handed_off'
+      CREATE INDEX IF NOT EXISTS idx_swarm_unverified
+        ON swarm_messages(state, verified_at, handed_off_at);
     `);
-  }
+
+    if (!hadVerifiedAtBeforeMigration) {
+      // The watchdog governs only post-deploy messages. Without this backfill
+      // its first cycle would mass-fetch and mass-redeliver up to
+      // SWARM_RETENTION_MS worth of stale, already-delivered prompts.
+      db.exec(`
+        UPDATE swarm_messages
+        SET verified_at = COALESCE(handed_off_at, updated_at)
+        WHERE state = 'handed_off'
+      `);
+    }
+  });
+
+  migrate();
 }

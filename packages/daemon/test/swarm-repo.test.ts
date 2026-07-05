@@ -1,5 +1,5 @@
 import BetterSqlite3 from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { initSwarmSchema } from "../src/storage/swarm-schema";
 
@@ -205,6 +205,17 @@ describe("SwarmRepository", () => {
       s.db.close();
     });
 
+    it("markVerified deliberately does not bump updated_at (cleanupOlderThan anchors retention on it)", () => {
+      const s = createStorage();
+      s.swarm.insert(BASE, 1_000);
+      s.swarm.markHandedOff("msg_01h1", 2_000);
+      const before = s.swarm.getByMsgId("msg_01h1")!.updatedAt;
+      s.swarm.markVerified("msg_01h1", 99_000);
+      const after = s.swarm.getByMsgId("msg_01h1")!.updatedAt;
+      expect(after).toBe(before);
+      s.db.close();
+    });
+
     it("requeueForRecovery resets state to queued, sets next_retry_at, increments requeue_count", () => {
       const s = createStorage();
       s.swarm.insert(BASE, 1_000);
@@ -227,6 +238,28 @@ describe("SwarmRepository", () => {
       s.swarm.insert(BASE, 1_000);
       s.swarm.markHandedOff("msg_01h1", 2_000);
       s.swarm.markAborted("msg_01h1", 9_000);
+      const m = s.swarm.getByMsgId("msg_01h1");
+      expect(m!.abortedAt).toBe(9_000);
+      s.db.close();
+    });
+
+    it("markAborted deliberately does not bump updated_at (cleanupOlderThan anchors retention on it)", () => {
+      const s = createStorage();
+      s.swarm.insert(BASE, 1_000);
+      s.swarm.markHandedOff("msg_01h1", 2_000);
+      const before = s.swarm.getByMsgId("msg_01h1")!.updatedAt;
+      s.swarm.markAborted("msg_01h1", 99_000);
+      const after = s.swarm.getByMsgId("msg_01h1")!.updatedAt;
+      expect(after).toBe(before);
+      s.db.close();
+    });
+
+    it("markAborted is first-write-wins: a second call does not overwrite the original abort timestamp", () => {
+      const s = createStorage();
+      s.swarm.insert(BASE, 1_000);
+      s.swarm.markHandedOff("msg_01h1", 2_000);
+      s.swarm.markAborted("msg_01h1", 9_000);
+      s.swarm.markAborted("msg_01h1", 12_000);
       const m = s.swarm.getByMsgId("msg_01h1");
       expect(m!.abortedAt).toBe(9_000);
       s.db.close();
@@ -260,6 +293,31 @@ describe("SwarmRepository", () => {
       const rows = s.swarm.listUnverifiedHandedOff(now, verifyAfterMs);
       const ids = rows.map((r) => r.msgId).sort();
       expect(ids).toEqual(["eligible"]);
+      s.db.close();
+    });
+
+    it("has an index supporting listUnverifiedHandedOff's (state, verified_at, handed_off_at) lookup", () => {
+      const s = createStorage();
+      const indexes = s.db.prepare("PRAGMA index_list(swarm_messages)").all() as Array<{ name: string }>;
+      expect(indexes.map((i) => i.name)).toContain("idx_swarm_unverified");
+      s.db.close();
+    });
+
+    it("listUnverifiedHandedOff's query plan uses the index rather than a full table scan", () => {
+      const s = createStorage();
+      const plan = s.db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT * FROM swarm_messages
+           WHERE state = 'handed_off'
+             AND verified_at IS NULL
+             AND to_session IS NOT NULL
+             AND handed_off_at < ?`,
+        )
+        .all(100) as Array<{ detail: string }>;
+      const detail = plan.map((p) => p.detail).join(" ");
+      expect(detail).toContain("idx_swarm_unverified");
+      expect(detail).not.toMatch(/SCAN swarm_messages\b/);
       s.db.close();
     });
   });
@@ -367,6 +425,50 @@ describe("swarm_messages verification column migration", () => {
     expect(names).toContain("verified_at");
     expect(names).toContain("requeue_count");
     expect(names).toContain("aborted_at");
+    db.close();
+  });
+
+  it("still adds any still-missing columns if a prior (non-atomic) migration was interrupted after adding verified_at", () => {
+    const db = oldSchemaDb();
+    insertRaw(db, { msgId: "with_handoff", state: "handed_off", updatedAt: 6_000, handedOffAt: 5_000 });
+
+    // Simulate a previously-interrupted migration: verified_at was added but
+    // requeue_count/aborted_at (and the backfill) never ran.
+    db.exec("ALTER TABLE swarm_messages ADD COLUMN verified_at INTEGER");
+
+    initSwarmSchema(db);
+
+    const cols = db.pragma("table_info(swarm_messages)") as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("requeue_count");
+    expect(names).toContain("aborted_at");
+    db.close();
+  });
+
+  it("rolls back the whole migration (ALTERs + backfill) if interrupted mid-transaction", () => {
+    const db = oldSchemaDb();
+    insertRaw(db, { msgId: "with_handoff", state: "handed_off", updatedAt: 6_000, handedOffAt: 5_000 });
+
+    const originalExec = db.exec.bind(db);
+    const execSpy = vi.spyOn(db, "exec").mockImplementation((sql: string) => {
+      if (sql.includes("UPDATE swarm_messages")) {
+        throw new Error("simulated crash during backfill");
+      }
+      return originalExec(sql);
+    });
+
+    expect(() => initSwarmSchema(db)).toThrow("simulated crash during backfill");
+    execSpy.mockRestore();
+
+    // Because the ALTERs + backfill run inside a single transaction, a
+    // failure partway through must roll back the columns added earlier in
+    // the same transaction too -- otherwise a later init call would see
+    // verified_at already present and would skip the backfill forever.
+    const cols = (db.pragma("table_info(swarm_messages)") as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).not.toContain("verified_at");
+    expect(cols).not.toContain("requeue_count");
+    expect(cols).not.toContain("aborted_at");
+
     db.close();
   });
 });
