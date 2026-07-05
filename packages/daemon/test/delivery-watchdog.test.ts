@@ -384,6 +384,9 @@ describe("DeliveryWatchdog", () => {
     expect(text).toContain("ACTIVE");
     expect(text).toContain("m1");
     expect(text).toContain("ses_b");
+    // Human-readable durations render alongside the raw ms values.
+    expect(text).toContain("1000000ms (17min)");
+    expect(text).toContain("1000ms (1s)");
     expect(severity).toBe("warning");
     expect(client.abortSession).not.toHaveBeenCalled();
     expect(storage.swarm.getByMsgId("m1")!.verifiedAt).toBeNull();
@@ -736,6 +739,8 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(3_700_000);
     await watchdog.processOnce();
     expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    // Human-readable duration renders alongside the raw ms value.
+    expect(sendPlainAlert.mock.calls[0]![0]).toContain("3700000ms (62min)");
     expect((watchdog as any).ageAlarmed.has("m1")).toBe(true);
 
     // Still no healthy serve, still old -> dedupe holds.
@@ -790,5 +795,158 @@ describe("DeliveryWatchdog", () => {
     const firstResult = await first;
     expect(firstResult.coalesced).toBe(false);
     expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("20. contradicted 404 second opinion: TOCTOU refetch and abort broadcast use the winning (alt) client", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const clientA = makeClient(); // preferred — 404s every time
+    const clientB = makeClient(); // alt — the contradicting second opinion
+    clientA.getSessionMessages.mockRejectedValue(
+      new Error("getSessionMessages failed (404): not found"),
+    );
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }), // silent since t=20
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    clientB.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    // silence = now - 20, must exceed stuckAbortSilenceMs (3_600_000)
+    fixture.setNow(4_000_000);
+
+    await watchdog.processOnce();
+
+    // Preferred (404-ing) client is read exactly once — the initial fetch.
+    expect(clientA.getSessionMessages).toHaveBeenCalledTimes(1);
+    // The alt client wins the second opinion AND serves the TOCTOU refetch
+    // that gates the abort — it must NOT go back to the 404-ing preferred.
+    expect(clientB.getSessionMessages).toHaveBeenCalledTimes(2);
+
+    expect(clientA.abortSession).toHaveBeenCalledWith("ses_b");
+    expect(clientB.abortSession).toHaveBeenCalledWith("ses_b");
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.abortedAt).toBe(4_000_000);
+    expect(row.state).toBe("queued");
+    expect(row.requeueCount).toBe(1);
+  });
+
+  it("21. 404 with no second-opinion client available: skip, no counter bump", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    client.getSessionMessages.mockRejectedValue(
+      new Error("getSessionMessages failed (404): not found"),
+    );
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("handed_off");
+    expect(row.verifiedAt).toBeNull();
+    expect(row.requeueCount).toBe(0);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+  });
+
+  it("22. 404 second-opinion fetch itself errors (non-404): skip, no counter bump", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const clientA = makeClient();
+    const clientB = makeClient();
+    clientA.getSessionMessages.mockRejectedValue(
+      new Error("getSessionMessages failed (404): not found"),
+    );
+    clientB.getSessionMessages.mockRejectedValue(
+      new Error("network error: ECONNRESET"),
+    );
+    clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(400_000);
+
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.state).toBe("handed_off");
+    expect(row.verifiedAt).toBeNull();
+    expect(row.requeueCount).toBe(0);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+  });
+
+  it("23. dedupe reconciliation: row deleted out-of-band (retention sweep) prunes stale stuckAlerted entry", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(999_000)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+    fixture.setNow(1_000_000);
+
+    await watchdog.processOnce();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect((watchdog as any).stuckAlerted.has("m1")).toBe(true);
+
+    // Simulate the 7-day retention sweep (cleanupOlderThan) deleting the row
+    // out-of-band, without ever routing it through markVerified/markFailed.
+    storage.db.prepare("DELETE FROM swarm_messages WHERE msg_id = ?").run("m1");
+
+    fixture.setNow(1_050_000);
+    await watchdog.processOnce();
+
+    expect((watchdog as any).stuckAlerted.has("m1")).toBe(false);
+  });
+
+  it("24. processOnce catches a thrown resolveClients: resolves (no reject), logs, never crashes", async () => {
+    const storage: StorageDb = openStorageDb(":memory:");
+    const logSpy = vi.fn();
+    const boom = new Error("boom: resolveClients exploded");
+    const resolveClients = vi.fn((_sessionId: string): ClientSet => {
+      throw boom;
+    });
+    const watchdog = new DeliveryWatchdog({
+      storage,
+      resolveClients,
+      nowFn: () => 1_000_000,
+      log: logSpy,
+    });
+
+    storage.swarm.insert(
+      {
+        msgId: "m1",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "payload",
+      },
+      0,
+    );
+    storage.swarm.markHandedOff("m1", 0);
+
+    await expect(watchdog.processOnce()).resolves.toMatchObject({
+      error: expect.any(String),
+    });
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ error: expect.stringContaining("boom") }),
+    );
+
+    watchdog.stop();
+    storage.db.close();
   });
 });

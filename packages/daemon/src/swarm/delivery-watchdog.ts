@@ -86,6 +86,9 @@ export interface CycleSummary {
   skipped: number;
   /** True when this call coalesced into an already-running cycle and did no work. */
   coalesced: boolean;
+  /** Set when the cycle threw and was caught at the top level; counts above
+   *  reflect only whatever partial progress happened before the throw. */
+  error?: string;
 }
 
 function emptySummary(coalesced = false): CycleSummary {
@@ -98,6 +101,17 @@ function emptySummary(coalesced = false): CycleSummary {
     skipped: 0,
     coalesced,
   };
+}
+
+/** Render a millisecond duration as a short human-readable string
+ *  ("45s", "62min") for alert bodies. Raw ms is still logged alongside it. */
+function humanDuration(ms: number): string {
+  const abs = Math.abs(ms);
+  if (abs < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (Math.abs(seconds) < 60) return `${Math.round(seconds)}s`;
+  const minutes = ms / 60_000;
+  return `${Math.round(minutes)}min`;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +356,10 @@ export class DeliveryWatchdog {
     this.processing = true;
     try {
       return await this.runCycle();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log("cycle error", { error: message });
+      return { ...emptySummary(), error: message };
     } finally {
       this.processing = false;
     }
@@ -361,6 +379,46 @@ export class DeliveryWatchdog {
     this.ageAlarmed.delete(msgId);
   }
 
+  /**
+   * Reconcile the in-memory dedupe Sets against this cycle's eligible-row
+   * snapshot, dropping any entry whose msgId is no longer present.
+   *
+   * Why this is safe: `stuckAlerted`/`ageAlarmed` are only ever populated for
+   * a msgId that appeared in `listUnverifiedHandedOff` at alert time. Given
+   * fixed `state`/`verified_at`/`handed_off_at`, that query's eligibility
+   * (`handed_off_at < now - verifyAfterMs`) only becomes MORE true as `now`
+   * advances — so a row that was once eligible stays eligible on every
+   * subsequent cycle until one of three things happens: (a) it verifies,
+   * (b) it goes terminal, or (c) its `state` moves away from `handed_off`
+   * (redelivery via `requeueForRecovery`, which resets `handed_off_at` on
+   * the next `markHandedOff`). Paths (a) and (b) already call
+   * `pruneDedupe` explicitly. Path (c) currently does NOT prune explicitly
+   * on a successful abort+requeue — but that's fine (arguably correct):
+   * the row is temporarily absent from the eligible set only for the brief
+   * window between the abort's requeue and the arbiter's redelivery, and
+   * per the class-level doc comment a fresh redelivery is meant to get its
+   * own alert budget anyway, so reconciling it away here just makes that
+   * intent actually happen.
+   *
+   * The remaining case — and the bug this exists to fix — is the row being
+   * deleted out from under us by the 7-day `cleanupOlderThan` retention
+   * sweep without ever resolving through (a) or (b). That leaves a
+   * dedupe entry with no corresponding row at all, and reconciling against
+   * "not in this cycle's eligible set" catches it the same way.
+   *
+   * Rows that are alive but simply too young (handed_off more recently than
+   * `verifyAfterMs`) were never alerted in the first place — they can't be
+   * in these Sets — so they can't be spuriously pruned here.
+   */
+  private reconcileDedupe(eligibleIds: ReadonlySet<string>): void {
+    for (const msgId of this.stuckAlerted) {
+      if (!eligibleIds.has(msgId)) this.stuckAlerted.delete(msgId);
+    }
+    for (const msgId of this.ageAlarmed) {
+      if (!eligibleIds.has(msgId)) this.ageAlarmed.delete(msgId);
+    }
+  }
+
   private async runCycle(): Promise<CycleSummary> {
     const now = this.nowFn();
     const counts = emptySummary();
@@ -368,6 +426,8 @@ export class DeliveryWatchdog {
       now,
       this.verifyAfterMs,
     );
+
+    this.reconcileDedupe(new Set(rows.map((r) => r.msgId)));
 
     const bySession = new Map<string, SwarmMessageRecord[]>();
     for (const row of rows) {
@@ -393,7 +453,7 @@ export class DeliveryWatchdog {
     counts: CycleSummary,
   ): Promise<void> {
     const clients = this.resolveClients(sessionId);
-    const readClient = clients.preferred ?? clients.all[0];
+    let readClient = clients.preferred ?? clients.all[0];
 
     if (!readClient) {
       for (const row of rows) {
@@ -409,7 +469,7 @@ export class DeliveryWatchdog {
           counts.alerted++;
           await this.alert(
             "warning",
-            `delivery watchdog: msg ${row.msgId} to ${sessionId} unverified for ${age}ms — no healthy serve available to check it`,
+            `delivery watchdog: msg ${row.msgId} to ${sessionId} unverified for ${age}ms (${humanDuration(age)}) — no healthy serve available to check it`,
           );
           this.log("alerted", {
             msgId: row.msgId,
@@ -442,8 +502,13 @@ export class DeliveryWatchdog {
         const second = await fetchTranscript(alt, sessionId);
         if (second.ok) {
           // Contradicted — the "gone" serve was wrong. Proceed with the
-          // second opinion's transcript.
+          // second opinion's transcript, and adopt `alt` as the read client
+          // for the rest of this session's processing (the TOCTOU refetch
+          // in attemptAbort included) — otherwise every subsequent refetch
+          // keeps hitting the 404-ing client and abort escalation stalls
+          // forever via "toctou-refetch-failed".
           messages = second.messages;
+          readClient = alt;
         } else if (second.status === 404) {
           // Confirmed — the session is truly gone.
           for (const row of rows) {
@@ -512,6 +577,23 @@ export class DeliveryWatchdog {
     }
   }
 
+  /** Shared skip block for every "we already used this cycle's one
+   *  intervention (requeue/abort/terminal) on another row for this
+   *  session" fallthrough. Always returns `false` (no intervention used). */
+  private skipInterventionBudgetUsed(
+    row: SwarmMessageRecord,
+    sessionId: string,
+    counts: CycleSummary,
+  ): boolean {
+    counts.skipped++;
+    this.log("skipped", {
+      msgId: row.msgId,
+      sessionId,
+      reason: "intervention-budget-used",
+    });
+    return false;
+  }
+
   private async evaluateRow(
     row: SwarmMessageRecord,
     messages: ParsedMessage[],
@@ -528,13 +610,7 @@ export class DeliveryWatchdog {
       // The 2xx lied (or the write was lost) — our prompt never made it
       // into the transcript at all.
       if (interventionAlreadyUsed) {
-        counts.skipped++;
-        this.log("skipped", {
-          msgId: row.msgId,
-          sessionId,
-          reason: "intervention-budget-used",
-        });
-        return false;
+        return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
       return this.requeueOrTerminal(
         row,
@@ -558,13 +634,7 @@ export class DeliveryWatchdog {
       // Session is idle — our prompt is sitting there but nothing ever ran
       // it. Nothing to abort.
       if (interventionAlreadyUsed) {
-        counts.skipped++;
-        this.log("skipped", {
-          msgId: row.msgId,
-          sessionId,
-          reason: "intervention-budget-used",
-        });
-        return false;
+        return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
       return this.requeueOrTerminal(
         row,
@@ -579,13 +649,7 @@ export class DeliveryWatchdog {
       // We already used our one recovery attempt (abort+redeliver) for this
       // message, and after redelivery it's stuck again. Give up.
       if (interventionAlreadyUsed) {
-        counts.skipped++;
-        this.log("skipped", {
-          msgId: row.msgId,
-          sessionId,
-          reason: "intervention-budget-used",
-        });
-        return false;
+        return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
       this.storage.swarm.markFailed(row.msgId, now);
       counts.terminal++;
@@ -619,7 +683,7 @@ export class DeliveryWatchdog {
       const label = fresh ? "ACTIVE" : "SILENT";
       await this.alert(
         "warning",
-        `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms, turn silent ${silence}ms`,
+        `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})`,
       );
       this.log("alerted", {
         msgId: row.msgId,
@@ -635,13 +699,7 @@ export class DeliveryWatchdog {
     }
 
     if (interventionAlreadyUsed) {
-      counts.skipped++;
-      this.log("skipped", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "intervention-budget-used",
-      });
-      return false;
+      return this.skipInterventionBudgetUsed(row, sessionId, counts);
     }
 
     return this.attemptAbort(row, sessionId, anchor, readClient, clients, now, counts);
