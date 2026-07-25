@@ -223,6 +223,10 @@ export async function handleSendNotification(
     replyMarkup,
   });
 
+  if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
+    return json({ error: "rate_limited", retryAfter: telegramResult.retryAfter }, 429);
+  }
+
   if (!telegramResult.ok) {
     return json(
       { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },

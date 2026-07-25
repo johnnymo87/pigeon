@@ -572,6 +572,35 @@ describe("POST /notifications/send", () => {
     expect(body.error).toBe("Telegram API error");
   });
 
+  it("returns 429 when Telegram rate limits with retryAfter", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        429,
+        JSON.stringify({
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry after 17",
+          parameters: { retry_after: 17 },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const res = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "hello",
+    });
+
+    expect(res.status).toBe(429);
+    const body = (await res.json()) as { error: string; retryAfter: number };
+    expect(body).toEqual({
+      error: "rate_limited",
+      retryAfter: 17,
+    });
+  });
+
 // ─── Telegram Client Module Classifier ─────────────────────────────────────
 
 describe("telegram client module classifier", () => {
