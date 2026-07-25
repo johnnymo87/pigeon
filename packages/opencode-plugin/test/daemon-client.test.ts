@@ -271,6 +271,43 @@ describe("daemon-client", () => {
         message: "Session completed successfully",
         label: "Test Session",
       })
+      expect("title" in requestLog[0].body).toBe(false)
+    })
+
+    test("should include title in POST body when provided and omit when absent", async () => {
+      // given with title
+      const optsWithTitle = {
+        sessionId: "test-session-title",
+        message: "Done",
+        label: "Test Session",
+        title: "Fix flaky auth test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      await notifyStop(optsWithTitle)
+
+      // then
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].body.title).toBe("Fix flaky auth test")
+
+      // given without title
+      requestLog = []
+      const optsWithoutTitle = {
+        sessionId: "test-session-no-title",
+        message: "Done",
+        label: "Test Session",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      await notifyStop(optsWithoutTitle)
+
+      // then
+      expect(requestLog).toHaveLength(1)
+      expect("title" in requestLog[0].body).toBe(false)
     })
 
     test("should handle failure gracefully", async () => {
@@ -639,6 +676,40 @@ describe("daemon-client", () => {
     })
   })
 
+  describe("notifyQuestionAsked", () => {
+    test("should include title in POST body when provided and omit when absent", async () => {
+      const optsWithTitle = {
+        sessionId: "sess-q-title",
+        requestId: "req-1",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        title: "Question Session Title",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      await notifyQuestionAsked(optsWithTitle)
+
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0]?.body.title).toBe("Question Session Title")
+
+      requestLog = []
+      const optsWithoutTitle = {
+        sessionId: "sess-q-no-title",
+        requestId: "req-2",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      await notifyQuestionAsked(optsWithoutTitle)
+
+      expect(requestLog).toHaveLength(1)
+      expect("title" in (requestLog[0]?.body ?? {})).toBe(false)
+    })
+  })
+
   describe("sendQuestionAsked (no circuit breaker)", () => {
     test("sends question even when breaker is open", async () => {
       // given - trip the breaker by failing against an unreachable port
@@ -738,6 +809,38 @@ describe("daemon-client", () => {
       })
       expect(result).toEqual({ ok: true, notified: true })
       expect(requestLog).toHaveLength(1) // request went through - breaker is still closed
+    })
+
+    test("should include title in POST body when provided and omit when absent", async () => {
+      const optsWithTitle = {
+        sessionId: "sess-sq-title",
+        requestId: "req-1",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        title: "Send Question Title",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      await sendQuestionAsked(optsWithTitle)
+
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0]?.body.title).toBe("Send Question Title")
+
+      requestLog = []
+      const optsWithoutTitle = {
+        sessionId: "sess-sq-no-title",
+        requestId: "req-2",
+        questions: [{ question: "OK?", header: "Check", options: [], custom: true }],
+        label: "test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      await sendQuestionAsked(optsWithoutTitle)
+
+      expect(requestLog).toHaveLength(1)
+      expect("title" in (requestLog[0]?.body ?? {})).toBe(false)
     })
   })
 })

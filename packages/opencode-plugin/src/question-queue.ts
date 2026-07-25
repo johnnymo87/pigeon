@@ -11,6 +11,7 @@ export type QuestionEntry = {
     custom?: boolean
   }>
   label: string
+  title?: string
 }
 
 export type QuestionQueueOptions = {

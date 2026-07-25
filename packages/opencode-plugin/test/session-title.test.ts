@@ -422,5 +422,85 @@ describe("Session Title Management", () => {
         expect(registerSessionSpy.mock.calls[0][0].title).toBeUndefined()
       })
     })
+
+    describe("Notification title wiring tests", () => {
+      let notifyStopSpy: any
+      let sendQuestionAskedSpy: any
+
+      beforeEach(() => {
+        notifyStopSpy = vi.spyOn(daemonClient, "notifyStop").mockResolvedValue({ ok: true, deliveryState: "accepted" })
+        sendQuestionAskedSpy = vi.spyOn(daemonClient, "sendQuestionAsked").mockResolvedValue({ ok: true, deliveryState: "accepted" })
+      })
+
+      test("session.idle passes live title to notifyStop", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        // Create session with title
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_idle_title", title: "Live Idle Title" } },
+          } as any,
+        })
+
+        // Simulate assistant message updated
+        await hooks.event!({
+          event: {
+            type: "message.updated",
+            properties: { info: { id: "msg_idle_1", sessionID: "ses_idle_title", role: "assistant" } },
+          } as any,
+        })
+
+        // Dispatch session.idle
+        await hooks.event!({
+          event: {
+            type: "session.idle",
+            properties: { sessionID: "ses_idle_title" },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_idle_title",
+              title: "Live Idle Title",
+            })
+          )
+        })
+      })
+
+      test("question.asked passes live title to sendQuestionAsked", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_q_title", title: "Live Question Title" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "question.asked",
+            properties: {
+              id: "q_1",
+              sessionID: "ses_q_title",
+              questions: [{ question: "Continue?", header: "Check", options: [] }],
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(sendQuestionAskedSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_q_title",
+              title: "Live Question Title",
+            })
+          )
+        })
+      })
+    })
   })
 })

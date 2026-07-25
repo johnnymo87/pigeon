@@ -27,6 +27,7 @@ type NotifyStopOpts = {
   event?: string
   message: string
   label: string
+  title?: string
   media?: FileMedia[]
   daemonUrl?: string
   log: LogFn
@@ -50,6 +51,7 @@ type NotifyQuestionAskedOpts = {
   requestId: string
   questions: QuestionInfo[]
   label: string
+  title?: string
   daemonUrl?: string
   log: LogFn
 }
@@ -160,13 +162,14 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
      const res = await fetch(`${url}/stop`, {
        method: "POST",
        headers: daemonHeaders(),
-        body: JSON.stringify({
-          session_id: opts.sessionId,
-          event: opts.event ?? "Stop",
-          message: opts.message,
-          label: opts.label,
-          ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
-        }),
+         body: JSON.stringify({
+           session_id: opts.sessionId,
+           event: opts.event ?? "Stop",
+           message: opts.message,
+           label: opts.label,
+           ...(opts.title ? { title: opts.title } : {}),
+           ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
+         }),
        signal: AbortSignal.timeout(3000),
      })
 
@@ -202,6 +205,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
         request_id: opts.requestId,
         questions: opts.questions,
         label: opts.label,
+        ...(opts.title ? { title: opts.title } : {}),
       }),
       signal: AbortSignal.timeout(1000),
     })
@@ -264,6 +268,7 @@ export async function sendQuestionAsked(opts: NotifyQuestionAskedOpts): Promise<
       request_id: opts.requestId,
       questions: opts.questions,
       label: opts.label,
+      ...(opts.title ? { title: opts.title } : {}),
     }),
     signal: AbortSignal.timeout(3000),
   })

@@ -350,6 +350,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const summary = typeof body.summary === "string" ? body.summary : null;
         const event = typeof body.event === "string" ? body.event : "Stop";
         const label = typeof body.label === "string" ? body.label : null;
+        const requestTitle = typeof body.title === "string" && body.title !== "" ? body.title : undefined;
+
+        if (requestTitle !== undefined) {
+          storage.sessions.setTitle(sessionId, requestTitle, nowFn());
+        }
+        const effectiveTitle = requestTitle ?? session.title;
 
         const now = nowFn();
         const notificationId = `s:${sessionId}:${now}`;
@@ -376,7 +382,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Format notification for the outbox
         const notification = formatTelegramNotification({
           event,
-          label: displayName({ title: session.title, label: label || session.label, sessionId }),
+          label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
           summary: message || summary || "Task completed",
           cwd: session.cwd,
           token,
@@ -401,7 +407,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           token,
         }, now);
 
-        console.log(`[stop] queued sessionId=${sessionId} notificationId=${notificationId} label=${label || session.label}`);
+        console.log(`[stop] queued sessionId=${sessionId} notificationId=${notificationId} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
         return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
       }
 
@@ -434,6 +440,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const label = typeof body.label === "string" ? body.label : null;
+        const requestTitle = typeof body.title === "string" && body.title !== "" ? body.title : undefined;
+
+        if (requestTitle !== undefined) {
+          storage.sessions.setTitle(sessionId, requestTitle, nowFn());
+        }
+        const effectiveTitle = requestTitle ?? session.title;
+
         const now = nowFn();
 
         // Generate stable notification ID for idempotency
@@ -473,7 +486,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (questions.length > 1) {
           // Multi-question: wizard mode — show step 1
           const notification = formatQuestionWizardStep({
-            label: displayName({ title: session.title, label: label || session.label, sessionId }),
+            label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
             questions,
             currentStep: 0,
             cwd: session.cwd,
@@ -490,7 +503,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         } else {
           // Single-question: existing behavior
           const notification = formatQuestionNotification({
-            label: displayName({ title: session.title, label: label || session.label, sessionId }),
+            label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
             questions,
             cwd: session.cwd,
             token,

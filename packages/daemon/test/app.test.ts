@@ -420,6 +420,60 @@ describe("createApp", () => {
     expect(Array.isArray(payload.messages[0].entities)).toBe(true);
   });
 
+  it("POST /stop with title updates session title and displays in header, and omits preserve title", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 65_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-stop-title", notify: true, label: "Initial Label" }),
+    }));
+
+    // Call /stop with title
+    const stop1 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-title",
+        event: "Stop",
+        message: "First stop",
+        title: "Live Title From Stop",
+      }),
+    }));
+
+    expect(stop1.status).toBe(202);
+    expect(storage.sessions.get("sess-stop-title")?.title).toBe("Live Title From Stop");
+
+    const json1 = await stop1.json();
+    const outboxEntry1 = storage.outbox.getByNotificationId(json1.notificationId);
+    const payload1 = JSON.parse(outboxEntry1!.payload);
+    expect(payload1.messages[0].text).toContain("Live Title From Stop");
+
+    // Call /stop omitting title - title must be preserved in DB and used in header
+    const stop2 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-title",
+        event: "Stop",
+        message: "Second stop without title",
+      }),
+    }));
+
+    expect(stop2.status).toBe(202);
+    expect(storage.sessions.get("sess-stop-title")?.title).toBe("Live Title From Stop");
+
+    const json2 = await stop2.json();
+    const outboxEntry2 = storage.outbox.getByNotificationId(json2.notificationId);
+    const payload2 = JSON.parse(outboxEntry2!.payload);
+    expect(payload2.messages[0].text).toContain("Live Title From Stop");
+  });
+
   it("returns existing outbox entry on duplicate stop request", async () => {
     storage = openStorageDb(":memory:");
     const fixedNow = 70_000;
@@ -639,6 +693,59 @@ describe("createApp", () => {
 
     const sessionAfter = storage.sessions.get("sess-q-touch");
     expect(sessionAfter!.lastSeen).toBe(200_000);
+  });
+
+  it("POST /question-asked with title updates session title and displays in header, and omits preserve title", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 100_000,
+      chatId: "42",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-q-title", notify: true }),
+    }));
+
+    const res1 = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q-title",
+        request_id: "req-t1",
+        questions: [{ type: "text", question: "Continue?", options: [] }],
+        title: "Question Title Test",
+      }),
+    }));
+
+    expect(res1.status).toBe(202);
+    expect(storage.sessions.get("sess-q-title")?.title).toBe("Question Title Test");
+
+    const json1 = await res1.json();
+    const outbox1 = storage.outbox.getByNotificationId(json1.notificationId);
+    const payload1 = JSON.parse(outbox1!.payload);
+    expect(payload1.message.text).toContain("Question Title Test");
+
+    // Omitting title preserves stored title
+    const res2 = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q-title",
+        request_id: "req-t2",
+        questions: [{ type: "text", question: "Continue2?", options: [] }],
+      }),
+    }));
+
+    expect(res2.status).toBe(202);
+    expect(storage.sessions.get("sess-q-title")?.title).toBe("Question Title Test");
+
+    const json2 = await res2.json();
+    const outbox2 = storage.outbox.getByNotificationId(json2.notificationId);
+    const payload2 = JSON.parse(outbox2!.payload);
+    expect(payload2.message.text).toContain("Question Title Test");
   });
 
   it("POST /question-asked with multiple questions formats wizard step 1", async () => {

@@ -66,6 +66,7 @@ const plugin: Plugin = async (ctx) => {
         requestId: entry.requestId,
         questions: entry.questions,
         label: entry.label,
+        title: entry.title,
         daemonUrl,
         log,
       })
@@ -455,6 +456,7 @@ const plugin: Plugin = async (ctx) => {
                 sessionId: sessionID,
                 message: messageWithFooter,
                 label,
+                title: sessionManager.getTitle(sessionID),
                 media: files.length > 0 ? files : undefined,
                 daemonUrl,
                 log,
@@ -549,6 +551,7 @@ const plugin: Plugin = async (ctx) => {
                 sessionId: sessionID,
                 message: errorMsg,
                 label,
+                title: sessionManager.getTitle(sessionID),
                 daemonUrl,
                 log,
               }).catch((err) => {
@@ -601,6 +604,7 @@ const plugin: Plugin = async (ctx) => {
              requestId,
              questions,
              label,
+             title: sessionManager.getTitle(sessionID),
            })
 
            // Flush any unnotified assistant text as a stop notification.
@@ -620,6 +624,7 @@ const plugin: Plugin = async (ctx) => {
                      sessionId: sessionID,
                      message: messageWithFooter,
                      label,
+                     title: sessionManager.getTitle(sessionID),
                      media: files.length > 0 ? files : undefined,
                      daemonUrl,
                      log,
@@ -657,6 +662,7 @@ const plugin: Plugin = async (ctx) => {
             event: "Retry",
             message: `${retryMsg}\nNext attempt at ${nextAt}`,
             label,
+            title: sessionManager.getTitle(sessionID),
             daemonUrl,
             log,
           }).catch((err) => {

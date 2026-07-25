@@ -174,6 +174,13 @@ export class SessionRepository {
     return result.changes > 0;
   }
 
+  setTitle(sessionId: string, title: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?")
+      .run(title, now, sessionId);
+    return result.changes > 0;
+  }
+
   delete(sessionId: string): boolean {
     const result = this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
     return result.changes > 0;
