@@ -76,8 +76,8 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions — `f5f68ed`, `c52ece9`
 - [x] T0.4 Plugin: capture title from `session.get()` at registration — `3eeba51`
 - [x] T0.5 Plugin: `session.updated` handler keeps the title fresh — `43ac380`, `2fd9a56`
-- [ ] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title`
-- [ ] **Checkpoint 0** — full test + typecheck, deploy, observe titles in Telegram headers
+- [x] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title` — `83936bd`, `2f58b9e`
+- [ ] **Checkpoint 0** — full test + typecheck ✅ green (daemon 609+1, plugin 271, worker 163; typecheck clean modulo the 2 known `lease-cas-concurrency` files). **Deploy + observe in Telegram still pending.**
 
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
