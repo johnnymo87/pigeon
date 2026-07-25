@@ -50,13 +50,23 @@ npm run test         # all workspaces
 npm run typecheck    # all workspaces
 ```
 
-**Baseline as of 2026-07-25, commit `3c32389`** — measure regressions against this, not against zero:
+**Baseline for Phase 1 — commit `b8f6b7d` (post-Phase-0)** — measure regressions against this:
+
+| Package | Test files | Tests |
+|---|---|---|
+| `@pigeon/daemon` | 48 | 610 passed, 1 skipped |
+| `@pigeon/opencode-plugin` | 13 | 275 passed |
+| `@pigeon/worker` | 1 | 163 passed |
+
+<details><summary>Original pre-Phase-0 baseline, commit <code>3c32389</code> (historical)</summary>
 
 | Package | Test files | Tests |
 |---|---|---|
 | `@pigeon/daemon` | 48 | 588 passed, 1 skipped |
 | `@pigeon/opencode-plugin` | 12 | 246 passed |
 | `@pigeon/worker` | 1 | 163 passed |
+
+</details>
 
 `npm run test` is **fully green**. `npm run typecheck` is **not**: `@pigeon/daemon` has
 pre-existing errors confined to `test/routing/lease-cas-concurrency.test.ts` and
@@ -495,6 +505,18 @@ on the old daemon+plugin — safe skew, just basename-style names from there mea
 ## Phase 1 — Outbox correctness + Telegram client
 
 **Why before topics:** T1.1 fixes a bug that a 20 msg/min supergroup ceiling would promote from rare to routine, and T1.3/T1.6 are the refactors that make threading expressible. All ship dark.
+
+> **Phase 1 workspace (prepared 2026-07-25).** Worktree
+> `/home/dev/projects/pigeon/.worktrees/forum-topics-phase1`, branch `feat/forum-topics-phase1`,
+> branched from `b8f6b7d`, `npm install` done, baseline verified green (610+1 / 275 / 163).
+> **Do all Phase 1 work there, never in `/home/dev/projects/pigeon`** — that checkout runs the
+> LIVE daemon via `tsx` on source in place (`WorkingDirectory=…/packages/daemon`), and the live
+> plugin loads from it too. See the Checkpoint 0 deploy log for how a restart rolls out.
+>
+> **Suggested order:** start with **T1.0b** and **T1.0c** — they are pre-existing production bugs
+> already affecting users today, unlike the rest of the phase which is refactor/enabling work.
+> `npm run --workspace @pigeon/daemon typecheck` still has 4 **pre-existing** errors confined to
+> `test/routing/lease-cas-concurrency.test.ts` and `.bun-worker.ts`; not a regression, do not fix.
 
 > **[rev2-plan] Ordering changed.** The Telegram client extraction (T1.3) now comes **before** the 429 handling (T1.4). The reverse order has you hand-roll 429 classification inline in `notifications.ts`, then immediately subsume it into the extracted client's classifier — guaranteed churn.
 
