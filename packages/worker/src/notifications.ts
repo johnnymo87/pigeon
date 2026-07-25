@@ -230,12 +230,7 @@ export async function handleSendNotification(
       error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
     };
     return json(
-      {
-        error: "Telegram API error",
-        details,
-        tgKind: telegramResult.kind,
-        tgRetryAfter: telegramResult.kind === "rate_limited" ? telegramResult.retryAfter : undefined,
-      },
+      { error: "Telegram API error", details },
       502,
     );
   }
@@ -332,15 +327,7 @@ export async function handleEditNotification(
       description: telegramResult.kind === "error" ? telegramResult.description : telegramResult.kind,
       error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
     };
-    return json(
-      {
-        error: "Telegram API error",
-        details,
-        tgKind: telegramResult.kind,
-        tgRetryAfter: telegramResult.kind === "rate_limited" ? telegramResult.retryAfter : undefined,
-      },
-      502,
-    );
+    return json({ error: "Telegram API error", details }, 502);
   }
 
   return json({ ok: true });

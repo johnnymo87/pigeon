@@ -571,7 +571,34 @@ describe("POST /notifications/send", () => {
     expect(body.error).toBe("Telegram API error");
   });
 
-  it("classifies 429 rate_limited with retry_after in Telegram client", async () => {
+// ─── Telegram Client Module Classifier ─────────────────────────────────────
+
+describe("telegram client module classifier", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("sendMessage succeeds", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: 42 } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
+    expect(res).toEqual({
+      ok: true,
+      result: { message_id: 42 },
+    });
+  });
+
+  it("sendMessage classifies 429 rate_limited with retry_after", async () => {
     fetchMock
       .get("https://api.telegram.org")
       .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
@@ -586,26 +613,21 @@ describe("POST /notifications/send", () => {
         { headers: { "Content-Type": "application/json" } },
       );
 
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "hello",
-    });
-
-    expect(res.status).toBe(502);
-    const body = (await res.json()) as { error: string; details: unknown; tgKind: string; tgRetryAfter: number };
-    expect(body.error).toBe("Telegram API error");
-    expect(body.tgKind).toBe("rate_limited");
-    expect(body.tgRetryAfter).toBe(30);
-    expect(body.details).toEqual({
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
+    expect(res).toEqual({
       ok: false,
-      error_code: 429,
-      description: "Too Many Requests: retry after 30",
-      parameters: { retry_after: 30 },
+      kind: "rate_limited",
+      retryAfter: 30,
+      response: {
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry after 30",
+        parameters: { retry_after: 30 },
+      },
     });
   });
 
-  it("classifies thread_not_found in Telegram client", async () => {
+  it("sendMessage classifies thread_not_found", async () => {
     fetchMock
       .get("https://api.telegram.org")
       .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
@@ -619,22 +641,46 @@ describe("POST /notifications/send", () => {
         { headers: { "Content-Type": "application/json" } },
       );
 
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "hello",
-    });
-
-    expect(res.status).toBe(502);
-    const body = (await res.json()) as { error: string; details: unknown; tgKind: string };
-    expect(body.error).toBe("Telegram API error");
-    expect(body.tgKind).toBe("thread_not_found");
-    expect(body.details).toEqual({
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
+    expect(res).toEqual({
       ok: false,
-      error_code: 400,
-      description: "Bad Request: message thread not found",
+      kind: "thread_not_found",
+      response: {
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: message thread not found",
+      },
     });
   });
+
+  it("sendMessage classifies plain 400 as kind error", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        400,
+        JSON.stringify({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: chat not found",
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
+    expect(res).toEqual({
+      ok: false,
+      kind: "error",
+      errorCode: 400,
+      description: "Bad Request: chat not found",
+      response: {
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: chat not found",
+      },
+    });
+  });
+});
 
   it("stores unique tokens per notification", async () => {
     mockTelegramSuccess(100);

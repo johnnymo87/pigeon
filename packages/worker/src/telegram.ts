@@ -52,8 +52,8 @@ async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
     retry_after?: number;
   } | null;
 
-  if (data && data.ok === true && data.result !== undefined) {
-    return { ok: true, result: data.result };
+  if (data !== null && data.ok === true && data.result !== undefined) {
+    return { ok: true, result: data.result as T };
   }
 
   const errorCode = data?.error_code ?? (res.status !== 200 ? res.status : undefined);
@@ -69,10 +69,7 @@ async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
     };
   }
 
-  if (
-    description &&
-    (description.includes("message thread not found") || description.includes("thread not found"))
-  ) {
+  if (description && description.includes("thread not found")) {
     return {
       ok: false,
       kind: "thread_not_found",
