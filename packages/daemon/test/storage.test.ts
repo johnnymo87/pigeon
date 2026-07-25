@@ -305,6 +305,35 @@ describe("storage schema and repositories", () => {
     });
   });
 
+  describe("SessionRepository setTitle", () => {
+    it("updates session title and updated_at and returns true", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-title",
+        cwd: "/tmp",
+        label: "demo",
+        notify: true,
+      }, 1_000);
+
+      const updated = storage.sessions.setTitle("sess-title", "New Title", 2_000);
+      expect(updated).toBe(true);
+
+      const session = storage.sessions.get("sess-title");
+      expect(session).not.toBeNull();
+      expect(session!.title).toBe("New Title");
+      expect(session!.updatedAt).toBe(2_000);
+
+      storage.db.close();
+    });
+
+    it("returns false when no row matched", () => {
+      const storage = createStorage();
+      const updated = storage.sessions.setTitle("nope", "Title", 2_000);
+      expect(updated).toBe(false);
+      storage.db.close();
+    });
+  });
+
   describe("PendingQuestionRepository wizard state", () => {
     const q1 = { question: "Which DB?", header: "DB", options: [{ label: "PostgreSQL", description: "Relational" }] };
     const q2 = { question: "Which ORM?", header: "ORM", options: [{ label: "Prisma", description: "TypeScript ORM" }] };

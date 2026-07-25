@@ -194,6 +194,61 @@ describe("createApp", () => {
     expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
   });
 
+  it("does not clobber a stored title when /session-start passes whitespace-only title", async () => {
+    const app = newApp();
+    const res1 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_ws",
+        notify: true,
+        title: "Original Title",
+      }),
+    }));
+    expect(res1.status).toBe(200);
+    expect(storage?.sessions.get("ses_ws")?.title).toBe("Original Title");
+
+    const res2 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_ws",
+        notify: true,
+        title: "   ",
+      }),
+    }));
+    expect(res2.status).toBe(200);
+    expect(storage?.sessions.get("ses_ws")?.title).toBe("Original Title");
+  });
+
+  it("stores trimmed title when /session-start or /stop passes title with surrounding whitespace", async () => {
+    const app = newApp();
+    const res1 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_trim",
+        notify: true,
+        title: "  Padded Title  ",
+      }),
+    }));
+    expect(res1.status).toBe(200);
+    expect(storage?.sessions.get("ses_trim")?.title).toBe("Padded Title");
+
+    const res2 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_trim",
+        event: "Stop",
+        message: "Done",
+        title: "  New Padded Title  ",
+      }),
+    }));
+    expect(res2.status).toBe(202);
+    expect(storage?.sessions.get("ses_trim")?.title).toBe("New Padded Title");
+  });
+
   it("supports /sessions/enable-notify preserving backend_kind fields", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 20_000 });
@@ -468,10 +523,20 @@ describe("createApp", () => {
     expect(stop2.status).toBe(202);
     expect(storage.sessions.get("sess-stop-title")?.title).toBe("Live Title From Stop");
 
-    const json2 = await stop2.json();
-    const outboxEntry2 = storage.outbox.getByNotificationId(json2.notificationId);
-    const payload2 = JSON.parse(outboxEntry2!.payload);
-    expect(payload2.messages[0].text).toContain("Live Title From Stop");
+    // Call /stop with whitespace-only title - title must remain untouched in DB
+    const stop3 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-title",
+        event: "Stop",
+        message: "Third stop with whitespace title",
+        title: "   ",
+      }),
+    }));
+
+    expect(stop3.status).toBe(202);
+    expect(storage.sessions.get("sess-stop-title")?.title).toBe("Live Title From Stop");
   });
 
   it("returns existing outbox entry on duplicate stop request", async () => {

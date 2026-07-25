@@ -77,6 +77,10 @@ function maybeNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function parseTitle(val: unknown): string | undefined {
+  return typeof val === "string" && val.trim() !== "" ? val.trim() : undefined;
+}
+
 interface AppOptions {
   nowFn?: () => number;
   notifier?: StopNotifier & Partial<QuestionNotifier>;
@@ -234,7 +238,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             startTime: maybeNumber(body.start_time) ?? existing?.startTime,
             cwd: (typeof body.cwd === "string" ? body.cwd : undefined) ?? existing?.cwd,
             label: (typeof body.label === "string" && body.label !== "" ? body.label : undefined) ?? existing?.label,
-            title: (typeof body.title === "string" && body.title !== "" ? body.title : undefined) ?? existing?.title,
+            title: parseTitle(body.title) ?? existing?.title,
             notify: (body.notify as boolean | undefined) ?? existing?.notify ?? false,
             state: existing?.state ?? "running",
             ptyPath: typeof body.tty === "string" ? body.tty : existing?.ptyPath,
@@ -350,7 +354,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const summary = typeof body.summary === "string" ? body.summary : null;
         const event = typeof body.event === "string" ? body.event : "Stop";
         const label = typeof body.label === "string" ? body.label : null;
-        const requestTitle = typeof body.title === "string" && body.title !== "" ? body.title : undefined;
+        const requestTitle = parseTitle(body.title);
 
         if (requestTitle !== undefined) {
           storage.sessions.setTitle(sessionId, requestTitle, nowFn());
@@ -440,7 +444,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const label = typeof body.label === "string" ? body.label : null;
-        const requestTitle = typeof body.title === "string" && body.title !== "" ? body.title : undefined;
+        const requestTitle = parseTitle(body.title);
 
         if (requestTitle !== undefined) {
           storage.sessions.setTitle(sessionId, requestTitle, nowFn());
