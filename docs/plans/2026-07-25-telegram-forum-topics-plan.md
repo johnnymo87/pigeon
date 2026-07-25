@@ -77,7 +77,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T0.4 Plugin: capture title from `session.get()` at registration — `3eeba51`
 - [x] T0.5 Plugin: `session.updated` handler keeps the title fresh — `43ac380`, `2fd9a56`
 - [x] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title` — `83936bd`, `2f58b9e`
-- [ ] **Checkpoint 0** — full test + typecheck ✅ green (daemon 609+1, plugin 271, worker 163; typecheck clean modulo the 2 known `lease-cas-concurrency` files). **Deploy + observe in Telegram still pending.**
+- [~] **Checkpoint 0** — test gate ✅ (daemon 610+1, plugin 275, worker 163; typecheck clean modulo the 2 known `lease-cas-concurrency` files). Merged to `main` + pushed ✅. **cloudbox daemon deployed + verified ✅** (see below). **Remaining: plugin side needs a serve-pool restart, then observe a real title in Telegram. devbox not yet deployed.**
 
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
@@ -453,6 +453,26 @@ sqlite3 <daemon-db-path> "PRAGMA table_info(sessions);" | grep title
   sessions in the same chat until then.
 
 **Do not proceed to Phase 1 until you have seen a real title in a real notification** — Phase 2's topic names depend entirely on this.
+
+#### Deploy log — cloudbox daemon, 2026-07-25 11:51 EDT ✅
+
+`sudo systemctl restart pigeon-daemon.service` on `main` @ `cd8c93b`. Verified:
+
+- Clean start: ingress router (serves=4), swarm arbiter, delivery watchdog, listening on 4731.
+  No migration errors, no `no such column`. (`status=143` on stop is just SIGTERM.)
+- **Migration applied:** `title` present as cid 19, `TEXT`, nullable, default `NULL`.
+  331 pre-existing session rows, all `title` NULL — correct, since no new plugin has run yet.
+- `/sessions` and `/swarm/send` both respond normally, exercising `asSession()` over all
+  331 real rows.
+- **The old-plugin → new-daemon skew case is confirmed live:** running sessions have no stored
+  title, so `displayName` falls through to the directory basename and notifications are
+  byte-identical to before. Phase 0 is genuinely dark on the daemon alone.
+- Incidentally confirmed **T1.0d**: `title` is absent from the legacy `/sessions` JSON.
+
+**Still outstanding for Checkpoint 0:** every opencode process still holds the *old* plugin, so
+nothing writes a title yet. Needs a serve-pool restart (or the nightly workspace reset), then a
+fresh session, then confirm a real title on its **second or later** notification. devbox is still
+on the old daemon+plugin — safe skew, just basename-style names from there meanwhile.
 
 ---
 
