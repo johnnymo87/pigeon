@@ -71,7 +71,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 ### Phase 0 — Session titles (ships dark)
 
-- [ ] T0.1 Daemon: `title` column + storage plumbing
+- [x] T0.1 Daemon: `title` column + storage plumbing — `3a595e1`, `f1938da`
 - [ ] T0.2 Daemon: `/session-start` accepts `title` (incl. don't-clobber semantics)
 - [ ] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions
 - [ ] T0.4 Plugin: capture title from `session.get()` at registration
