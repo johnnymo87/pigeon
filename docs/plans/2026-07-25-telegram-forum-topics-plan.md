@@ -113,7 +113,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T1.0e Daemon + plugin: event-distinct emoji, drop the redundant event word, fix `session.error` mislabelling *(raised after Checkpoint 0)*
 - [x] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender` — `49bb724`. Exported `chunkNotificationId(id, index, isLast)`: last chunk keeps the **bare** id (the wizard edit lookup at `notifications.ts:321` matches on it exactly), earlier chunks get `#c{index}`. Ids depend only on `(id, index, isLast)` — stability across attempts *is* the dedup mechanism. Reviewer traced the fix as **fully** closing the duplicate-message hole, not merely narrowing it.
 - [x] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix — `1743d4a`. One line: `.replace(/#c\d+$/, "")`, anchored so a non-terminal `#` is preserved. Verified `q:ses_x:a:b#c3` → `a:b` (`:`-containing ids still rejoin) and `q:ses_x:req#c` → `req#c` (needs a digit). Review independently enumerated **all four** worker `notification_id` consumers (dedup `:199`, 2 inserts, wizard lookup `:321`, this parser) and confirmed the other three correctly want the raw suffixed id.
-- [ ] T1.3 Worker: extract a central Telegram client module
+- [x] T1.3 Worker: extract a central Telegram client module — `e154eb4`, `0529f22`, `51e1bb2`. `telegram.ts` with `sendMessage`/`editMessageText`/`sendPhoto`/`sendDocument`/`answerCallbackQuery`/`getFile` returning `TgResult<T>`. **Pure refactor held: 0 deleted lines in the existing test file**, 167 pre-existing tests unedited, 173 total. Spec review caught scope creep — the first cut leaked `tgKind`/`tgRetryAfter` into the 502 body, which is T1.4's job; removed in `0529f22` and the classifier tests re-pointed at `sendMessage`'s `TgResult` instead of asserting through the HTTP response. Classifier verified out-of-band through a stubbed `fetch`: 429-with-`parameters.retry_after` → `rate_limited` w/ that value; bare-429-by-HTTP-status → `rate_limited` w/ the 1s default; plain 400 → `error` (**conservative fallthrough intact**); `message thread not found` → `thread_not_found`; non-JSON body → `error` + `errorCode` from HTTP status; **network errors propagate rather than being swallowed**.
 - [ ] T1.4 Worker: map `rate_limited` to a 429 response
 - [ ] T1.5 Daemon: global outbox pause on `retry_after` + `FallbackNotifier` skip
 - [ ] T1.6 Daemon: convert `poller.sendNotification` to an options object
@@ -769,7 +769,7 @@ git commit -am "fix(worker): strip chunk suffix when parsing question notificati
 - Modify: `packages/worker/src/webhook.ts` (`sendTelegramMessage` `:282-292`, `answerCallbackQuery` `:297-307`, `getFile` `:240-247`, file download `:258-259`)
 - Test: `packages/worker/test/worker.test.ts`
 
-**Why:** six inline `fetch` calls against a template-literal URL, with three duplicate `sendMessage` implementations. Phase 2 adds five forum methods and a `message_thread_id` parameter to most sends. That is not expressible until this is one module.
+**Why:** eight inline `fetch` calls against template-literal URLs, with **two** independent `sendMessage` implementations (*corrected during execution — the plan said "six" and "three"; actual: 8 fetch sites = 4 in `notifications.ts` + 4 in `webhook.ts`, of which one is the raw file download, and 2 `sendMessage` impls*). Phase 2 adds five forum methods and a `message_thread_id` parameter to most sends. That is not expressible until this is one module.
 
 **Design of the module.** Every method returns a discriminated result so callers can distinguish rate limits from permanent failures — Phase 2's fallback rule (T2.8) depends on this:
 
@@ -798,6 +798,24 @@ export type TgResult<T> =
 ```bash
 git commit -am "refactor(worker): extract a central Telegram client module"
 ```
+
+#### T1.3 execution notes — constraints a future edit must not break
+
+- **`webhook.ts`'s `sendTelegramMessage` has 19 call sites** and deliberately discards the `TgResult`, returning `void`.
+  These are best-effort user-facing chat messages that never checked errors. Both wrappers now carry a comment saying
+  the discard is intentional — "fixing" it into error handling silently changes behaviour at 19 sites.
+- **Do not catch network errors in the client.** `await fetch(...)` must keep rejecting so callers behave as before;
+  only *Telegram-level* failures (an HTTP response with `ok: false`) get classified. Verified by probe.
+- **`sendPhoto`/`sendDocument` must not set `Content-Type`** — the runtime supplies the multipart boundary.
+- **The raw file download stays out of the client.** It returns a byte stream passed *unconsumed* to
+  `env.MEDIA.put(key, fileRes.body)`; routing it through a JSON-parsing method would consume the stream and break media relay.
+- **`details` in the 502 body is load-bearing** and now built by the exported `getTelegramErrorDetails()`. The synthetic
+  `{ok:false, description, error_code}` branch is **live**, not defensive: a non-JSON body makes `res.json()` yield `null`,
+  so `response` is `undefined` and the fallback fires.
+- `thread_not_found` matches only `"thread not found"` (the longer `"message thread not found"` check was dead — it is a
+  superstring). Still unpinned against the real API; **T2.7 must confirm empirically** before Phase 2 relies on it.
+- The reviewer's suggested `createTelegramClient(botToken)` factory was **deliberately deferred to T2.4**, when the five
+  forum methods and `message_thread_id` give it real requirements. Don't add it speculatively.
 
 ### Task T1.4: Map `rate_limited` to a 429 response
 
