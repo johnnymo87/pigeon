@@ -209,6 +209,20 @@ const plugin: Plugin = async (ctx) => {
 
     const label = ctx.directory.split("/").filter(Boolean).pop() ?? "unknown"
 
+    /**
+     * Initiates background session registration with the daemon.
+     *
+     * CRITICAL: MUST remain synchronous and return `void`. Do NOT make this
+     * function `async` or `await regPromise` inside it. It immediately records
+     * `regPromise` on `sessionManager` so downstream handlers calling
+     * `awaitRegistration(sessionID)` wait on the HTTP request without blocking
+     * the plugin's event dispatcher.
+     *
+     * `envInfo` is passed as an already-resolved value (leaving `await envInfoP`
+     * at call sites) so `regPromise` recorded in `sessionManager` is the actual
+     * `registerSession` promise. `title` is optional by design because the fallback
+     * path in `lateDiscoverSession` (where `session.get()` fails) has no title.
+     */
     const doRegisterSession = (
       sessionID: string,
       envInfo: EnvironmentInfo,
