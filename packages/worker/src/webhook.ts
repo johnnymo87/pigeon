@@ -1,6 +1,7 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
+import { sendMessage, answerCallbackQuery as answerCallbackQueryClient, getFile } from "./telegram";
 
 type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "current_state";
 
@@ -237,19 +238,7 @@ async function relayMediaToR2(
     return { error: `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)` };
   }
 
-  const getFileRes = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file_id: media.fileId }),
-    },
-  );
-
-  const getFileResult = (await getFileRes.json()) as {
-    ok: boolean;
-    result?: { file_path: string };
-  };
+  const getFileResult = await getFile(env.TELEGRAM_BOT_TOKEN, { fileId: media.fileId });
 
   if (!getFileResult.ok || !getFileResult.result?.file_path) {
     return { error: "Could not download file from Telegram" };
@@ -284,11 +273,7 @@ async function sendTelegramMessage(
   chatId: number | string,
   text: string,
 ): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
+  await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId, text });
 }
 
 /**
@@ -299,11 +284,7 @@ async function answerCallbackQuery(
   callbackQueryId: string,
   text: string,
 ): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
-  });
+  await answerCallbackQueryClient(env.TELEGRAM_BOT_TOKEN, { callbackQueryId, text });
 }
 
 /**

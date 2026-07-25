@@ -27,6 +27,14 @@ import {
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
+import {
+  sendMessage,
+  editMessageText,
+  sendPhoto,
+  sendDocument,
+  answerCallbackQuery,
+  getFile,
+} from "../src/telegram";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
 
@@ -561,6 +569,71 @@ describe("POST /notifications/send", () => {
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: string; details: unknown };
     expect(body.error).toBe("Telegram API error");
+  });
+
+  it("classifies 429 rate_limited with retry_after in Telegram client", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        429,
+        JSON.stringify({
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry after 30",
+          parameters: { retry_after: 30 },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const res = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "hello",
+    });
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string; details: unknown; tgKind: string; tgRetryAfter: number };
+    expect(body.error).toBe("Telegram API error");
+    expect(body.tgKind).toBe("rate_limited");
+    expect(body.tgRetryAfter).toBe(30);
+    expect(body.details).toEqual({
+      ok: false,
+      error_code: 429,
+      description: "Too Many Requests: retry after 30",
+      parameters: { retry_after: 30 },
+    });
+  });
+
+  it("classifies thread_not_found in Telegram client", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        400,
+        JSON.stringify({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: message thread not found",
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const res = await sendNotification({
+      sessionId: SESSION_ID,
+      chatId: CHAT_ID,
+      text: "hello",
+    });
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string; details: unknown; tgKind: string };
+    expect(body.error).toBe("Telegram API error");
+    expect(body.tgKind).toBe("thread_not_found");
+    expect(body.details).toEqual({
+      ok: false,
+      error_code: 400,
+      description: "Bad Request: message thread not found",
+    });
   });
 
   it("stores unique tokens per notification", async () => {

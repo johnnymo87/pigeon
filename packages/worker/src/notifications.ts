@@ -1,4 +1,5 @@
 import { verifyApiKey, unauthorized } from "./auth";
+import { sendMessage, editMessageText, sendPhoto, sendDocument } from "./telegram";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -126,16 +127,16 @@ async function sendTelegramPhoto(
   filename: string,
   replyToMessageId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  form.append("photo", photoBlob, filename);
-  if (replyToMessageId) form.append("reply_to_message_id", String(replyToMessageId));
-
-  const res = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
-    { method: "POST", body: form },
-  );
-  return res.json() as Promise<{ ok: boolean; result?: { message_id: number } }>;
+  const res = await sendPhoto(env.TELEGRAM_BOT_TOKEN, {
+    chatId,
+    photo: photoBlob,
+    filename,
+    replyToMessageId,
+  });
+  if (res.ok) {
+    return { ok: true, result: res.result };
+  }
+  return { ok: false };
 }
 
 async function sendTelegramDocument(
@@ -145,16 +146,16 @@ async function sendTelegramDocument(
   filename: string,
   replyToMessageId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  form.append("document", documentBlob, filename);
-  if (replyToMessageId) form.append("reply_to_message_id", String(replyToMessageId));
-
-  const res = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`,
-    { method: "POST", body: form },
-  );
-  return res.json() as Promise<{ ok: boolean; result?: { message_id: number } }>;
+  const res = await sendDocument(env.TELEGRAM_BOT_TOKEN, {
+    chatId,
+    document: documentBlob,
+    filename,
+    replyToMessageId,
+  });
+  if (res.ok) {
+    return { ok: true, result: res.result };
+  }
+  return { ok: false };
 }
 
 /**
@@ -215,35 +216,26 @@ export async function handleSendNotification(
   const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
   // Call Telegram API
-  const telegramPayload: Record<string, unknown> = {
-    chat_id: chatId,
+  const telegramResult = await sendMessage(env.TELEGRAM_BOT_TOKEN, {
+    chatId,
     text,
-  };
-  if (entities && entities.length > 0) {
-    telegramPayload.entities = entities;
-  }
-  if (replyMarkup) {
-    telegramPayload.reply_markup = replyMarkup;
-  }
+    entities: entities as unknown[] | undefined,
+    replyMarkup,
+  });
 
-  const telegramResponse = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(telegramPayload),
-    },
-  );
-
-  const telegramResult = (await telegramResponse.json()) as {
-    ok: boolean;
-    result?: { message_id: number };
-    description?: string;
-  };
-
-  if (!telegramResult.ok || !telegramResult.result) {
+  if (!telegramResult.ok) {
+    const details = telegramResult.response ?? {
+      ok: false,
+      description: telegramResult.kind === "error" ? telegramResult.description : telegramResult.kind,
+      error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
+    };
     return json(
-      { error: "Telegram API error", details: telegramResult },
+      {
+        error: "Telegram API error",
+        details,
+        tgKind: telegramResult.kind,
+        tgRetryAfter: telegramResult.kind === "rate_limited" ? telegramResult.retryAfter : undefined,
+      },
       502,
     );
   }
@@ -326,34 +318,29 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
-  const telegramPayload: Record<string, unknown> = {
-    chat_id: row.chat_id,
-    message_id: row.message_id,
+  const telegramResult = await editMessageText(env.TELEGRAM_BOT_TOKEN, {
+    chatId: row.chat_id,
+    messageId: row.message_id,
     text,
-  };
-  if (entities && entities.length > 0) {
-    telegramPayload.entities = entities;
-  }
-  if (replyMarkup) {
-    telegramPayload.reply_markup = replyMarkup;
-  }
-
-  const telegramResponse = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(telegramPayload),
-    },
-  );
-
-  const telegramResult = (await telegramResponse.json()) as {
-    ok: boolean;
-    description?: string;
-  };
+    entities,
+    replyMarkup,
+  });
 
   if (!telegramResult.ok) {
-    return json({ error: "Telegram API error", details: telegramResult }, 502);
+    const details = telegramResult.response ?? {
+      ok: false,
+      description: telegramResult.kind === "error" ? telegramResult.description : telegramResult.kind,
+      error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
+    };
+    return json(
+      {
+        error: "Telegram API error",
+        details,
+        tgKind: telegramResult.kind,
+        tgRetryAfter: telegramResult.kind === "rate_limited" ? telegramResult.retryAfter : undefined,
+      },
+      502,
+    );
   }
 
   return json({ ok: true });
