@@ -19,12 +19,21 @@ describe("displayName", () => {
     expect(displayName({ title: "Fix auth", label: "pigeon", sessionId: "ses_abcdef123" }))
       .toBe("Fix auth");
   });
+  it("handles title present with label null", () => {
+    expect(displayName({ title: "Fix auth", label: null, sessionId: "ses_abcdef123" })).toBe("Fix auth");
+  });
   it("falls back to label when title is absent or blank", () => {
     expect(displayName({ title: null, label: "pigeon", sessionId: "ses_abcdef123" })).toBe("pigeon");
     expect(displayName({ title: "  ", label: "pigeon", sessionId: "ses_abcdef123" })).toBe("pigeon");
   });
   it("falls back to a session-id prefix when both are absent", () => {
     expect(displayName({ title: null, label: null, sessionId: "ses_abcdef123" })).toBe("ses_abcd");
+  });
+  it("falls back to a session-id prefix when title and label are both blank", () => {
+    expect(displayName({ title: "  ", label: "   ", sessionId: "ses_abcdef123" })).toBe("ses_abcd");
+  });
+  it("handles session ids shorter than 8 characters", () => {
+    expect(displayName({ title: null, label: null, sessionId: "ses_123" })).toBe("ses_123");
   });
 });
 
