@@ -82,6 +82,9 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
 - [ ] T1.0 Plugin: extract the 4× duplicated `registerSession` block *(added during Phase 0; see the trap note — the helper must NOT await)*
+- [ ] T1.0b Daemon: fix `splitTelegramMessage`'s `maxBody <= 0` hole *(found by Phase 0 adversarial review)* — when header+footer overhead alone exceeds 4096, `split-message.ts:29-31` falls into the single-message branch and sends the oversized text anyway → Telegram 400 → worker 502 → outbox retries then `markFailed` → **notification permanently lost**. Phase 0 clamped titles to 200 chars, which removes the new trigger, but the underlying hole predates this work and belongs to this outbox-correctness phase.
+- [ ] T1.0c Daemon: narrow the additive-migration `catch` *(found by Phase 0 adversarial review)* — `schema.ts:117-123` swallows **every** error from every additive statement, not just duplicate-column. A real `ALTER TABLE` failure (disk full, a `sqlite3` shell holding a write txn past the 5s busy timeout, corruption) starts the daemon cleanly and then fails every `/session-start` and most `/stop`s with the root cause already discarded. Rethrow unless the message matches `/duplicate column/i`. Touches nine pre-existing statements, so it needs its own test pass.
+- [ ] T1.0d Daemon: expose `title` in the legacy `/sessions` JSON — absent from `toLegacySession` (`app.ts:30-67`); Phase 2 will want it.
 - [ ] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender`
 - [ ] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix
 - [ ] T1.3 Worker: extract a central Telegram client module
@@ -402,7 +405,40 @@ git commit -am "feat: carry session title on stop and question notifications"
 npm run test && npm run typecheck
 ```
 
-Green (modulo the two pre-existing daemon typecheck files). Deploy per the `cross-device-deployment` skill and confirm in Telegram that stop notifications show real session titles, **including on the second and later notifications of a long session** (that is what proves T0.5+T0.6 work, not just T0.4).
+Green (modulo the two pre-existing daemon typecheck files). Deploy per the `cross-device-deployment` skill.
+
+> **⚠️ VERIFY WITH A NEWLY LAUNCHED SESSION, NOT AN EXISTING ONE.** An adversarial review caught
+> this: **the plugin is loaded into each opencode process at startup**, so restarting the *daemon*
+> does not reload it. Every already-running session keeps the old in-memory plugin — no
+> `session.updated` handler, no `title` in its `/stop` bodies — and its `sessions` row stays
+> `title = NULL` forever. Checking an existing session therefore shows the directory basename
+> indefinitely, **which looks exactly like the feature being broken**. Verify with a session
+> started *after* the restart (`/launch cloudbox pigeon "..."` or a fresh TUI session).
+> Existing sessions pick the feature up only as their opencode processes restart (the nightly
+> workspace reset finishes the job).
+
+Then confirm in Telegram that stop notifications show real session titles, **on the second or
+later notification of that fresh session** (that is what proves T0.5+T0.6, not just T0.4).
+
+**Also check the migration actually applied** — `schema.ts`'s additive loop swallows *every*
+error, not just "duplicate column", so a genuinely failed `ALTER TABLE` would start cleanly and
+then fail every `/session-start` with `no such column: title`:
+
+```bash
+sqlite3 <daemon-db-path> "PRAGMA table_info(sessions);" | grep title
+```
+
+**Deploy-sequence cautions:**
+
+- **`git status` the live checkout before merging.** Other sessions share that worktree; merging
+  over a dirty tree is how the previous data-loss incident started.
+- **Restart while your own session is idle.** A failed `notifyStop` during the restart opens the
+  plugin's circuit breaker for 30s (`daemon-client.ts:66-101`) and `notifyStop` has no retry
+  queue, so stop notifications in the restart window +30s are silently dropped. Question
+  notifications are safe (2-minute retry queue).
+- **devbox stays on the old daemon/plugin** until deployed separately. That skew is safe — an old
+  daemon simply never reads the `title` field — but expect basename-style names from devbox
+  sessions in the same chat until then.
 
 **Do not proceed to Phase 1 until you have seen a real title in a real notification** — Phase 2's topic names depend entirely on this.
 
