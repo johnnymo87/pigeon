@@ -931,19 +931,63 @@ Otherwise a pure refactor: the rest of the suite must pass unchanged.
 
 **Commit:** `refactor(daemon): sendNotification takes an options object (fixes dropped entities)`
 
-### Checkpoint 1
+### Checkpoint 1 — gate passed, deploy pending
 
-```bash
-npm run test && npm run typecheck
-```
+**Run order was changed deliberately: adversarial review BEFORE deploy**, not after as originally
+written. Phase 0's review found a false-red *in the deploy plan itself*, so reviewing first is
+what catches that class of defect while it's still cheap. It did again — see B1 below.
 
-Deploy per `cross-device-deployment`. Then **dispatch an adversarial review of the cumulative Phase 0 + Phase 1 diff** before starting Phase 2:
+**Test/typecheck gate: PASS.** daemon **645 passed + 1 skipped / 48 files**, plugin **276 / 13**,
+worker **174 / 1** — **1095 total**. Typecheck clean except the 4 known pre-existing errors in
+`test/routing/lease-cas-concurrency.test.ts` / `.bun-worker.ts`.
 
-```bash
-git diff <sha-before-T0.1>..HEAD
-```
+> **One flaky failure, characterised not hand-waved.** During one full-workspace run, the
+> lease-CAS concurrency proof failed. Established as a load flake, not a regression: the Phase 0+1
+> diff touches **zero** files under `src/routing/` or `test/routing/`, and it passes 3/3 isolated
+> and 2/2 on subsequent full runs (load average was ~3.5 — four opencode-serve instances plus the
+> suite). Filed as a bead; expect it to recur at future checkpoints.
 
-Phase 2 is the largest and riskiest phase; a clean base matters.
+**Adversarial review (fable) of `git diff 87cfe5e..HEAD`** — 58 commits, 30 files, +3495/−362.
+Verdict: *"the code is sound to deploy; the deploy procedure is not."* **No code blockers.**
+
+Of three hypotheses raised going in, **one was confirmed, one refuted, one confirmed-safe**:
+
+- **Refuted (good news):** the newly-live `entities` path (T1.6) is *not* an offset hazard.
+  Entities are **rebased per chunk** — `sliceBodyMessage` re-bases to `clippedStart - start`
+  (`split-message.ts:197-203`) and `concatMessages` re-adds the running offset
+  (`telegram-message.ts:61-72`) — and `TgMessageBuilder` uses `.length`, which *is* UTF-16 code
+  units, exactly Telegram's spec. The stop body carries no entities at all. Skew-safe too: the
+  worker already accepted `entities` at `87cfe5e`; only the daemon closure dropped them.
+- **Confirmed → fixed in `521e41f`:** T1.5's pause trusted `retryAfter` **unclamped**. Since the
+  age clock keeps running while paused, one anomalous value (Telegram has returned thousands of
+  seconds) would sleep past `MAX_AGE_MS` and age-fail the **entire backlog** — strictly *worse*
+  than the pre-T1.5 behaviour of probing every ≤120s and usually recovering. Now clamped to
+  `MAX_PAUSE_MS` (300s) and the wire value is validated (`NaN`/`Infinity`/negative/zero/non-numeric
+  ⇒ no pause), because an `NaN` reaching `pausedUntil` is the failure mode where the outbox looks
+  healthy and never delivers again.
+- **Confirmed safe:** worker↔daemon skew in **both** deploy orders; **no required deploy order.**
+  The feared case — an old worker failing to strip `#c{index}` from a `q:` id — is *unreachable*,
+  because question notifications are never chunked (`/question-asked` enqueues a single message),
+  so `q:` ids never carry a suffix. Suffixes only appear on `s:` ids, which nothing parses.
+
+**B1 (blocker, fixed in `5eb2eff`): the deploy runbook was wrong on *both* NixOS hosts.**
+`opencode-serve.service` no longer exists on devbox **or** cloudbox; both run
+`opencode-serve@4096..4099` under `opencode-serve-pool.target`, and the hosts differ in scope —
+cloudbox's target is a *system* unit, devbox's is a *user* unit (**no sudo**). Also recorded there:
+restarting opencode-serve is usually **unnecessary** for a pigeon deploy and isn't free (kills
+in-flight headless runs, drops attachments, and doesn't touch tmux TUIs, which hold their own
+plugin copy), and the `:4096` health curl only proves one of four instances is up.
+
+**No irreversible steps.** The daemon `title` column is additive and old code ignores it; there is
+**no worker D1 DDL** in this diff, so worker rollback is a plain redeploy. T1.0c's migration
+rethrow cannot realistically brick startup (tables are created before the ALTERs, statements are
+static and CI-exercised, and the duplicate-column matcher fails safe).
+
+Remaining findings filed as beads, not blocking: surrogate-blind title truncation (**must be fixed
+before T2.3 clones the pattern**), no entity-stripping fallback on a deterministic 400, the flaky
+concurrency proof, and the dead stop/question send paths (see T2.5's warning).
+
+**Deploy is NOT done — it needs a human**: `sudo` is unavailable from the agent shell.
 
 ---
 
@@ -999,6 +1043,14 @@ Add the flag and a single exported predicate — `topicsEnabled(env): boolean` �
 **Commit:** `feat(worker): add TELEGRAM_TOPICS_ENABLED flag (default off)`
 
 ### Task T2.3: `topics.ts` repo module + `topicName`
+
+> **⚠️ Do NOT copy `parseTitle`'s truncation.** `app.ts:94` and `session-state.ts:12` both use a
+> bare `.slice(0, 200)`, which is **surrogate-blind** — and `topicName()` truncates *far* more
+> often, since Telegram caps topic names at **128** chars vs the 200-char title clamp. A lone
+> surrogate in a topic name is the same bug class that T1.0b already fixed once in
+> `splitTelegramMessage`. Reuse the guard at `split-message.ts:176-180` (the design's `[...str]`
+> spread is the same idea). Also **decide explicitly what to do with internal newlines** — the
+> title clamps don't strip them, which is harmless in a message header but not in a topic name.
 
 **Files:**
 - Create: `packages/worker/src/topics.ts`
@@ -1061,6 +1113,16 @@ Algorithm:
 **Commit:** `feat(worker): topic manager with create-reservation protocol`
 
 ### Task T2.5: `title`/`dir`/`threaded` end-to-end through the outbox
+
+> **⚠️ Two dead lookalike send paths will tempt you into the wrong file.**
+> `WorkerNotificationService.sendStopNotification`/`sendQuestionNotification`,
+> `TelegramNotificationService`'s equivalents, and `FallbackNotifier`'s stop/question arms have
+> **zero production callers** — the wired notifier is used *only* for `sendPlainAlert`
+> (`app.ts:142`, `swarm/delivery-watchdog.ts:377`). Real stop/question traffic goes through the
+> **outbox enqueue in `app.ts`** (~`:400-425`, ~`:500-545`), which is what this task must change.
+> Those dead classes duplicate the same formatting+chunking logic and *have passing unit tests*, so
+> editing them yields a fully green suite and **zero production effect** — the worst kind of green.
+> Verify with a grep that the code you're editing has a live caller before you start.
 
 **Files:**
 - Modify: `packages/daemon/src/app.ts` — the outbox enqueue payloads at **`:385-390`** (stop) and **`:498-502`** (question)
