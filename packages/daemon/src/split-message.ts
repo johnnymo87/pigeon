@@ -16,6 +16,7 @@ import type { TgMessage, TgEntity } from "./telegram-message";
 import { concatMessages } from "./telegram-message";
 
 const SEP: TgMessage = { text: "\n\n", entities: [] };
+const MIN_BODY_BUDGET = 200;
 
 export function splitTelegramMessage(
   header: TgMessage,
@@ -23,21 +24,43 @@ export function splitTelegramMessage(
   footer: TgMessage,
   maxLen = 4096,
 ): TgMessage[] {
-  const overhead = header.text.length + footer.text.length + SEP.text.length * 2;
-  const maxBody = maxLen - overhead;
+  const minBodyBudget = Math.min(MIN_BODY_BUDGET, Math.floor(maxLen / 4));
+  let currentHeader = header;
+  let overhead = currentHeader.text.length + footer.text.length + SEP.text.length * 2;
+  let maxBody = maxLen - overhead;
 
-  if (maxBody <= 0 || body.text.length <= maxBody) {
-    // Single message: concatenate header + "\n\n" + body + "\n\n" + footer
-    return [concatMessages([header, SEP, body, SEP, footer])];
+  if (maxBody < minBodyBudget && currentHeader.text.length > 0) {
+    const allowedHeaderLen = Math.max(
+      0,
+      maxLen - minBodyBudget - footer.text.length - SEP.text.length * 2,
+    );
+    if (currentHeader.text.length > allowedHeaderLen) {
+      currentHeader = sliceBodyMessage(currentHeader, 0, allowedHeaderLen);
+      overhead = currentHeader.text.length + footer.text.length + SEP.text.length * 2;
+      maxBody = maxLen - overhead;
+    }
   }
 
-  // Split the body text into chunks at natural boundaries
-  const bodyChunks = splitBodyText(body.text, maxBody);
+  const chunkMaxBody = Math.max(1, maxBody);
 
-  return bodyChunks.map((chunk) => {
-    const chunkMsg = sliceBodyMessage(body, chunk.start, chunk.end);
-    return concatMessages([header, SEP, chunkMsg, SEP, footer]);
-  });
+  let result: TgMessage[];
+
+  if (maxBody > 0 && body.text.length <= maxBody) {
+    result = [concatMessages([currentHeader, SEP, body, SEP, footer])];
+  } else {
+    let bodyChunks = splitBodyText(body.text, chunkMaxBody);
+    if (bodyChunks.length === 0) {
+      bodyChunks = [{ start: 0, end: 0 }];
+    }
+    result = bodyChunks.map((chunk) => {
+      const chunkMsg = sliceBodyMessage(body, chunk.start, chunk.end);
+      return concatMessages([currentHeader, SEP, chunkMsg, SEP, footer]);
+    });
+  }
+
+  return result.map((msg) =>
+    msg.text.length > maxLen ? sliceBodyMessage(msg, 0, maxLen) : msg,
+  );
 }
 
 /**
