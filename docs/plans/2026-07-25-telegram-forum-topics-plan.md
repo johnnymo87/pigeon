@@ -28,6 +28,21 @@ This plan is a **spine**. It is expected to outlive several compactions, subagen
 - Phase 2 task detail was written before Phase 0/1 landed. **Re-read the affected source files before executing any Phase 2 task** — line numbers will have drifted.
 - If a task turns out to be wrong, amend this file in the same commit as the fix and note why.
 
+> **⚠️ Plugin tests can write to the LIVE daemon. This already happened once.**
+> `packages/opencode-plugin/src/index.ts:53-55` and `daemon-client.ts:77` both fall back to
+> `http://127.0.0.1:4731` — the production daemon — when `PIGEON_DAEMON_URL` is unset. During
+> T0.5 a red-phase run whose `registerSession` spy didn't yet cover the `lateDiscoverSession`
+> paths made **real POSTs**, creating two fake sessions (`ses_late_try`, `ses_late_catch`,
+> `cwd=/path/to/my-project`) in the production SQLite DB. They were removed via
+> `DELETE /sessions/:id`.
+>
+> `packages/opencode-plugin/test/setup.ts` now pins `PIGEON_DAEMON_URL` to `http://127.0.0.1:1`
+> for the whole plugin suite and throws if anything targets 4731. **Do not remove that guard**,
+> and if you add a new plugin test file, make sure `setupFiles` still covers it.
+>
+> This matters more in Phase 2 than it did here: the same class of missing mock would create
+> **real Telegram forum topics** in the production chat, not just DB rows.
+
 **Verification commands** (run from repo root):
 
 ```bash
