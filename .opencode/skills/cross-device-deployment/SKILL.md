@@ -42,27 +42,60 @@ npm install
 | **macbook** | `launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon` |
 | **chromebook** | `systemctl --user restart pigeon-daemon.service` |
 
-### 3. Restart opencode-serve
+### 3. Restart opencode-serve (only when you actually need it — see below)
 
-All four machines run opencode-serve. Restart using the same service-manager pattern as the daemon on each machine.
+> **⚠️ `opencode-serve.service` no longer exists on devbox or cloudbox.** Both now run a
+> **pool** of instances (`opencode-serve@4096..4099.service`) governed by
+> `opencode-serve-pool.target`, and the instances are `PartOf=` that target, so restarting the
+> target propagates. The old single-unit command fails outright
+> (`Unit opencode-serve.service could not be found`). Note the two hosts differ in **scope**:
+> cloudbox's pool is a *system* target, devbox's is a *user* target — so devbox takes **no sudo**.
 
 | Machine | Command |
 |---------|---------|
-| **devbox** | `sudo systemctl restart opencode-serve.service` |
-| **cloudbox** | `sudo systemctl restart opencode-serve.service` |
-| **macbook** | `launchctl stop org.nix-community.home.opencode-serve && launchctl start org.nix-community.home.opencode-serve` |
-| **chromebook** | `systemctl --user restart opencode-serve.service` |
+| **devbox** | `systemctl --user restart opencode-serve-pool.target` — **user unit, no sudo** |
+| **cloudbox** | `sudo systemctl restart opencode-serve-pool.target` |
+| **macbook** | Verify the label first: `launchctl list \| grep opencode` |
+| **chromebook** | Verify the label first: `systemctl --user list-units '*opencode*'` |
 
-If a command fails because a service name doesn't match, confirm the exact label with `systemctl list-units '*opencode*'` (Linux) or `launchctl list | grep opencode` (macOS) and adjust.
+**Restarting opencode-serve is usually NOT required to deploy pigeon.** The daemon and worker
+carry the routing/notification logic; opencode-serve only needs cycling when the **plugin**
+changed and you want that change live immediately. It is not free:
+
+- It **kills in-flight headless runs and drops attached sessions** on the pool.
+- It only covers **pool-hosted** sessions. A tmux TUI is a *separate* opencode process holding
+  its own copy of the plugin, and keeps the old plugin until that TUI is restarted. On devbox the
+  nightly workspace reset cycles those, so expect full plugin coverage only after the next cycle.
+
+So prefer: deploy worker + daemons, and schedule the pool restart deliberately rather than
+reflexively as a deploy step.
+
+Verify the pool afterwards by instance, not just the one port:
+`systemctl --user list-units 'opencode-serve@*'` (devbox) /
+`systemctl list-units 'opencode-serve@*'` (cloudbox).
+
+If any command fails because a name doesn't match, discover the real one with
+`systemctl list-units '*opencode*'` / `systemctl --user list-units '*opencode*'` (Linux) or
+`launchctl list | grep opencode` (macOS) before improvising.
 
 ### 4. Verify
 
 ```bash
 curl -s http://127.0.0.1:4731/health          # pigeon-daemon
-curl -s http://127.0.0.1:4096/global/health   # opencode-serve
+curl -s http://127.0.0.1:4096/global/health   # opencode-serve (ONE pool instance only)
 ```
 
 Both should return JSON with `"ok":true` / `"healthy":true`.
+
+On the pool hosts (devbox, cloudbox) the `:4096` curl proves only that **one of four** instances
+is up. Check them all — a single wedged instance silently degrades a quarter of sessions:
+
+```bash
+for p in 4096 4097 4098 4099; do
+  printf '%s: ' "$p"; curl -s --max-time 3 "http://127.0.0.1:$p/global/health" || echo DOWN
+  echo
+done
+```
 
 ## Nix Service Changes
 
