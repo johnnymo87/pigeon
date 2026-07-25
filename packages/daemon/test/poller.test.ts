@@ -490,7 +490,7 @@ describe("Poller.sendNotification()", () => {
     ) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
-    const result = await poller.sendNotification("sess-1", "chat-123", "Hello!", { inline_keyboard: [] });
+    const result = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-123", text: "Hello!", replyMarkup: { inline_keyboard: [] } });
 
     expect(result.ok).toBe(true);
     const [url, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
@@ -509,7 +509,7 @@ describe("Poller.sendNotification()", () => {
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
     const media = [{ key: "outbound/123/photo.png", mime: "image/png", filename: "photo.png" }];
-    await poller.sendNotification("sess-2", "chat-456", "With media!", { inline_keyboard: [] }, media);
+    await poller.sendNotification({ sessionId: "sess-2", chatId: "chat-456", text: "With media!", replyMarkup: { inline_keyboard: [] }, media });
 
     const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -522,7 +522,7 @@ describe("Poller.sendNotification()", () => {
     ) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
-    await poller.sendNotification("sess-3", "chat-789", "No media!", { inline_keyboard: [] }, []);
+    await poller.sendNotification({ sessionId: "sess-3", chatId: "chat-789", text: "No media!", replyMarkup: { inline_keyboard: [] }, media: [] });
 
     const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -810,7 +810,7 @@ describe("Poller dispatch — current_state", () => {
     });
     (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
 
-    const res = await poller.sendNotification("sess-1", "chat-1", "hello", { inline_keyboard: [] });
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
     expect(res).toEqual({ ok: false, retryAfter: 17 });
   });
 });

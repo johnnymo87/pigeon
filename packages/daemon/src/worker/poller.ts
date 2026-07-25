@@ -5,6 +5,16 @@
  * callbacks, and acks via POST /commands/:id/ack after successful dispatch.
  */
 
+export interface SendNotificationInput {
+  sessionId: string;
+  chatId: string;
+  text: string;
+  replyMarkup: unknown;
+  media?: Array<{ key: string; mime: string; filename: string }>;
+  notificationId?: string;
+  entities?: unknown[];
+}
+
 export interface PollerConfig {
   workerUrl: string;
   apiKey: string;
@@ -295,14 +305,9 @@ export class Poller {
   }
 
   async sendNotification(
-    sessionId: string,
-    chatId: string,
-    text: string,
-    replyMarkup: { inline_keyboard?: unknown[] },
-    media?: Array<{ key: string; mime: string; filename: string }>,
-    notificationId?: string,
-    entities?: unknown[],
+    input: SendNotificationInput,
   ): Promise<{ ok: boolean; retryAfter?: number }> {
+    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities } = input;
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",

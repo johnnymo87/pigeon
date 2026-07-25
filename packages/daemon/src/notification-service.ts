@@ -4,6 +4,7 @@ import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
 import type { Activity } from "./current-state-enrich";
+import type { SendNotificationInput } from "./worker/poller";
 
 interface NotificationInput {
   event: string;
@@ -90,13 +91,7 @@ export interface QuestionNotifier {
 
 export interface WorkerNotificationSender {
   sendNotification(
-    sessionId: string,
-    chatId: string,
-    text: string,
-    replyMarkup: { inline_keyboard?: unknown[] },
-    media?: Array<{ key: string; mime: string; filename: string }>,
-    notificationId?: string,
-    entities?: TgEntity[],
+    input: SendNotificationInput,
   ): Promise<{ ok: boolean; retryAfter?: number }>;
 
   uploadMedia?(
@@ -557,15 +552,14 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     media?: Array<{ key: string; mime: string; filename: string }>,
     entities?: TgEntity[],
   ): Promise<void> {
-    const result = await this.workerSender.sendNotification(
+    const result = await this.workerSender.sendNotification({
       sessionId,
-      this.chatId,
+      chatId: this.chatId,
       text,
       replyMarkup,
       media,
-      undefined,
       entities,
-    );
+    });
 
     if (!result.ok) {
       if (result.retryAfter !== undefined) {

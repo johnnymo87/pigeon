@@ -3,6 +3,7 @@ import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
 import { chunkNotificationId, OutboxSender } from "../src/worker/outbox-sender";
 import type { SendNotificationFn } from "../src/worker/outbox-sender";
+import type { SendNotificationInput } from "../src/worker/poller";
 
 const BASE_OUTBOX_INPUT = {
   notificationId: "notif-1",
@@ -42,18 +43,58 @@ describe("OutboxSender.processOnce()", () => {
     await sender.processOnce();
 
     expect(sendNotification).toHaveBeenCalledTimes(1);
-    expect(sendNotification).toHaveBeenCalledWith(
-      "sess-1",
-      "chat-123",
-      "Which option?",
-      { inline_keyboard: [] },
-      undefined,
-      "notif-1",
-      [{ offset: 0, length: 5, type: "bold" }],
-    );
+    expect(sendNotification).toHaveBeenCalledWith({
+      sessionId: "sess-1",
+      chatId: "chat-123",
+      text: "Which option?",
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-1",
+      entities: [{ offset: 0, length: 5, type: "bold" }],
+    });
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("sent");
+  });
+
+  it("forwards entities through index poller closure when processing outbox entry", async () => {
+    const entities = [{ offset: 0, length: 5, type: "bold" }];
+    storage.outbox.upsert({
+      notificationId: "notif-entities-1",
+      sessionId: "sess-1",
+      requestId: "req-1",
+      kind: "question",
+      payload: JSON.stringify({
+        message: { text: "Hello formatted", entities },
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-entities-1",
+      }),
+      token: "tok-abc",
+    }, 1_000);
+
+    const pollerSendNotification = vi.fn().mockResolvedValue({ ok: true });
+    const fakePoller = { sendNotification: pollerSendNotification };
+
+    // This closure matches src/index.ts:275-276 after refactoring
+    const sendNotificationClosure: SendNotificationFn = (input) =>
+      fakePoller.sendNotification(input);
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: sendNotificationClosure,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(pollerSendNotification).toHaveBeenCalledWith({
+      sessionId: "sess-1",
+      chatId: "chat-123",
+      text: "Hello formatted",
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-entities-1",
+      entities,
+    });
   });
 
   it("retries on transient failure with backoff (ok: false)", async () => {
@@ -216,14 +257,14 @@ describe("OutboxSender.processOnce()", () => {
     expect(sendFn).toHaveBeenCalledTimes(3);
     const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
     // First two calls have empty replyMarkup
-    expect((calls[0] as any)[3]).toEqual({ inline_keyboard: [] });
-    expect((calls[1] as any)[3]).toEqual({ inline_keyboard: [] });
+    expect((calls[0] as any)[0].replyMarkup).toEqual({ inline_keyboard: [] });
+    expect((calls[1] as any)[0].replyMarkup).toEqual({ inline_keyboard: [] });
     // Last call has the real replyMarkup
-    expect((calls[2] as any)[3]).toEqual({ inline_keyboard: [[{ text: "OK", callback_data: "cmd:tok:q0" }]] });
+    expect((calls[2] as any)[0].replyMarkup).toEqual({ inline_keyboard: [[{ text: "OK", callback_data: "cmd:tok:q0" }]] });
     // Text content
-    expect((calls[0] as any)[2]).toBe("Message 1");
-    expect((calls[1] as any)[2]).toBe("Message 2");
-    expect((calls[2] as any)[2]).toBe("Message 3");
+    expect((calls[0] as any)[0].text).toBe("Message 1");
+    expect((calls[1] as any)[0].text).toBe("Message 2");
+    expect((calls[2] as any)[0].text).toBe("Message 3");
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record?.state).toBe("sent");
@@ -282,9 +323,9 @@ describe("OutboxSender.processOnce()", () => {
   it("gives every chunk a stable idempotency key so the worker can dedup retries", async () => {
     const ids: Array<string | undefined> = [];
     let failChunk2 = true;
-    const sendNotification = vi.fn(async (...args: Parameters<SendNotificationFn>) => {
-      const text = args[2];
-      const notificationId = args[5];
+    const sendNotification = vi.fn(async (input: SendNotificationInput) => {
+      const text = input.text;
+      const notificationId = input.notificationId;
       ids.push(notificationId);
       if (failChunk2 && text === "chunk-2") {
         failChunk2 = false;
@@ -362,7 +403,7 @@ describe("OutboxSender.processOnce()", () => {
     await sender.processOnce();
 
     expect(sendFn).toHaveBeenCalledTimes(1);
-    expect((sendFn as ReturnType<typeof vi.fn>).mock.calls[0]![5]).toBe("single-notif-1");
+    expect((sendFn as ReturnType<typeof vi.fn>).mock.calls[0]![0].notificationId).toBe("single-notif-1");
   });
 
   it("preserves bare notificationId for the last chunk in a multi-chunk entry", async () => {
@@ -391,8 +432,8 @@ describe("OutboxSender.processOnce()", () => {
 
     expect(sendFn).toHaveBeenCalledTimes(2);
     const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
-    expect(calls[0]![5]).toBe("multi-notif-1#c0");
-    expect(calls[1]![5]).toBe("multi-notif-1");
+    expect(calls[0]![0].notificationId).toBe("multi-notif-1#c0");
+    expect(calls[1]![0].notificationId).toBe("multi-notif-1");
   });
 
   it("passes undefined notificationId for all chunks when notificationId is missing", async () => {
@@ -418,8 +459,8 @@ describe("OutboxSender.processOnce()", () => {
 
     expect(sendFn).toHaveBeenCalledTimes(2);
     const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
-    expect(calls[0]![5]).toBeUndefined();
-    expect(calls[1]![5]).toBeUndefined();
+    expect(calls[0]![0].notificationId).toBeUndefined();
+    expect(calls[1]![0].notificationId).toBeUndefined();
   });
 });
 
@@ -499,8 +540,8 @@ describe("OutboxSender start/stop", () => {
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-3" }, 1_000);
 
-    const sendNotification = vi.fn().mockImplementation(async (_s, _c, _t, _r, _m, notifId) => {
-      if (notifId === "notif-1") {
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      if (input.notificationId === "notif-1") {
         return { ok: false, retryAfter: 30 };
       }
       return { ok: true };
@@ -531,8 +572,8 @@ describe("OutboxSender start/stop", () => {
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-3" }, 1_000);
 
-    const sendNotification = vi.fn().mockImplementation(async (_s, _c, _t, _r, _m, notifId) => {
-      if (notifId === "notif-1") {
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      if (input.notificationId === "notif-1") {
         return { ok: false };
       }
       return { ok: true };

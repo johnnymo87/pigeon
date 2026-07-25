@@ -7,15 +7,10 @@
  */
 
 import type { StorageDb } from "../storage/database";
+import type { SendNotificationInput } from "./poller";
 
 export type SendNotificationFn = (
-  sessionId: string,
-  chatId: string,
-  text: string,
-  replyMarkup: unknown,
-  media?: unknown,
-  notificationId?: string,
-  entities?: unknown[],
+  input: SendNotificationInput,
 ) => Promise<{ ok: boolean; retryAfter?: number }>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
@@ -173,15 +168,14 @@ export class OutboxSender {
           for (let i = 0; i < messages.length; i++) {
             const isLast = i === messages.length - 1;
             const msg = messages[i]!;
-            const result = await this.sendNotification(
-              entry.sessionId,
-              this.chatId,
-              msg.text,
-              isLast ? replyMarkup : { inline_keyboard: [] },
-              undefined,
-              chunkNotificationId(notificationId, i, isLast),
-              msg.entities,
-            );
+            const result = await this.sendNotification({
+              sessionId: entry.sessionId,
+              chatId: this.chatId,
+              text: msg.text,
+              replyMarkup: isLast ? replyMarkup : { inline_keyboard: [] },
+              notificationId: chunkNotificationId(notificationId, i, isLast),
+              entities: msg.entities,
+            });
 
             if (!result.ok) {
               allOk = false;

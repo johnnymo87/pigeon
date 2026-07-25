@@ -252,7 +252,13 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
             sendCard: (sid, text, entities) =>
-              poller!.sendNotification(sid, msg.chatId, text, { inline_keyboard: [] }, undefined, undefined, entities)
+              poller!.sendNotification({
+                sessionId: sid,
+                chatId: msg.chatId,
+                text,
+                replyMarkup: { inline_keyboard: [] },
+                entities,
+              })
                 .then((res) => {
                   if (!res.ok) {
                     throw new Error("sendNotification returned ok=false");
@@ -272,8 +278,7 @@ if (poller) {
 const outboxSender = poller && config.telegramChatId
   ? new OutboxSender({
       storage,
-      sendNotification: (sessionId, chatId, text, replyMarkup, media, notificationId) =>
-        poller.sendNotification(sessionId, chatId, text, replyMarkup as { inline_keyboard?: unknown[] }, media as Array<{ key: string; mime: string; filename: string }> | undefined, notificationId),
+      sendNotification: (input) => poller.sendNotification(input),
       chatId: config.telegramChatId,
       log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
     })

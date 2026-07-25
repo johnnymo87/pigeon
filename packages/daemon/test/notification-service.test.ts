@@ -14,6 +14,7 @@ import {
   displayName,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";
+import type { SendNotificationInput } from "../src/worker/poller";
 import { openStorageDb } from "../src/storage/database";
 
 describe("displayName", () => {
@@ -730,12 +731,12 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
 
     // sendNotification should have been called with the media keys
     expect(sendNotificationMock).toHaveBeenCalledTimes(1);
-    const notifCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, Array<{ key: string; mime: string; filename: string }>];
-    const mediaKeys = notifCall[4];
+    const notifCall = sendNotificationMock.mock.calls[0] as unknown as [SendNotificationInput];
+    const mediaKeys = notifCall[0].media;
     expect(mediaKeys).toHaveLength(1);
-    expect(mediaKeys[0]!.mime).toBe("image/png");
-    expect(mediaKeys[0]!.filename).toBe("screenshot.png");
-    expect(mediaKeys[0]!.key).toMatch(/^outbound\//);
+    expect(mediaKeys![0]!.mime).toBe("image/png");
+    expect(mediaKeys![0]!.filename).toBe("screenshot.png");
+    expect(mediaKeys![0]!.key).toMatch(/^outbound\//);
 
     storage.db.close();
   });
@@ -788,8 +789,8 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
     expect(sendNotificationMock).toHaveBeenCalledTimes(1);
 
     // media keys should be undefined (upload failed, resulting array is empty)
-    const failNotifCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, unknown];
-    const failMediaKeys = failNotifCall[4];
+    const failNotifCall = sendNotificationMock.mock.calls[0] as unknown as [SendNotificationInput];
+    const failMediaKeys = failNotifCall[0].media;
     expect(failMediaKeys).toBeUndefined();
 
     storage.db.close();
@@ -835,8 +836,8 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
 
     // sendNotification should have been called without media
     expect(sendNotificationMock).toHaveBeenCalledTimes(1);
-    const noMediaCall = sendNotificationMock.mock.calls[0] as unknown as [string, string, string, unknown, unknown];
-    const noMediaKeys = noMediaCall[4];
+    const noMediaCall = sendNotificationMock.mock.calls[0] as unknown as [SendNotificationInput];
+    const noMediaKeys = noMediaCall[0].media;
     expect(noMediaKeys).toBeUndefined();
 
     storage.db.close();
@@ -893,8 +894,8 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
 
     // Only the last call should have media
     for (let i = 0; i < callCount; i++) {
-      const call = (sendNotificationMock as ReturnType<typeof vi.fn>).mock.calls[i] as unknown as [string, string, string, unknown, unknown];
-      const media = call[4];
+      const call = (sendNotificationMock as ReturnType<typeof vi.fn>).mock.calls[i] as unknown as [SendNotificationInput];
+      const media = call[0].media;
       if (i < callCount - 1) {
         expect(media).toBeUndefined();
       } else {
