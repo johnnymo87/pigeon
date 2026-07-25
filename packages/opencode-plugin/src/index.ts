@@ -209,94 +209,79 @@ const plugin: Plugin = async (ctx) => {
 
     const label = ctx.directory.split("/").filter(Boolean).pop() ?? "unknown"
 
+    const doRegisterSession = (
+      sessionID: string,
+      envInfo: EnvironmentInfo,
+      title?: string,
+    ): void => {
+      const regPromise = registerSession({
+        sessionId: sessionID,
+        cwd: ctx.directory,
+        label,
+        title,
+        pid: envInfo.pid,
+        ppid: envInfo.ppid,
+        tty: envInfo.tty,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+        backendEndpoint: directChannel.endpoint,
+        backendAuthToken: directChannel.authToken,
+        daemonUrl,
+        log,
+      })
+        .then((result) => {
+          log("registerSession result", { sessionID, result })
+          if (result?.ok) {
+            sessionManager.onRegistered(sessionID)
+          }
+        })
+        .catch((err) => {
+          log("registerSession error:", serializeError(err))
+        })
+      sessionManager.setRegistrationPromise(sessionID, regPromise)
+    }
+
     // Late session discovery: if we miss session.created (plugin loaded after session exists),
     // register the session when we first see its ID in any event.
-     const lateDiscoverSession = async (sessionID: string) => {
-       if (sessionManager.isKnown(sessionID)) return
+    const lateDiscoverSession = async (sessionID: string) => {
+      if (sessionManager.isKnown(sessionID)) return
 
-       let promise = sessionManager.getDiscoveryPromise(sessionID)
-       if (promise) {
-         await promise
-         return
-       }
+      let promise = sessionManager.getDiscoveryPromise(sessionID)
+      if (promise) {
+        await promise
+        return
+      }
 
-       promise = (async () => {
-         log("late session discovery", { sessionID })
+      promise = (async () => {
+        log("late session discovery", { sessionID })
 
-         const envInfo = await envInfoP
+        const envInfo = await envInfoP
 
-          try {
-            const session = await ctx.client.session.get({ path: { id: sessionID } })
-            const parentID = session.data?.parentID
-            const title = session.data?.title
+        try {
+          const session = await ctx.client.session.get({ path: { id: sessionID } })
+          const parentID = session.data?.parentID
+          const title = session.data?.title
 
-            sessionManager.onSessionCreated(sessionID, parentID, title)
+          sessionManager.onSessionCreated(sessionID, parentID, title)
 
-            if (!parentID) {
-              const regPromise = registerSession({
-                sessionId: sessionID,
-                cwd: ctx.directory,
-                label,
-                title,
-                pid: envInfo.pid,
-                ppid: envInfo.ppid,
-                tty: envInfo.tty,
-                backendKind: "opencode-plugin-direct",
-                backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
-                backendEndpoint: directChannel.endpoint,
-                backendAuthToken: directChannel.authToken,
-                daemonUrl,
-                log,
-              })
-               .then((result) => {
-                 log("registerSession result", { sessionID, result })
-                 if (result?.ok) {
-                   sessionManager.onRegistered(sessionID)
-                 }
-               })
-               .catch((err) => {
-                 log("registerSession error:", serializeError(err))
-               })
-             sessionManager.setRegistrationPromise(sessionID, regPromise)
-           }
-         } catch (err) {
-           // Fallback: register without parentID
-           log("session.get failed, registering without parentID", serializeError(err))
-           sessionManager.onSessionCreated(sessionID, undefined)
-            const regPromise = registerSession({
-              sessionId: sessionID,
-              cwd: ctx.directory,
-              label,
-              pid: envInfo.pid,
-              ppid: envInfo.ppid,
-              tty: envInfo.tty,
-              backendKind: "opencode-plugin-direct",
-              backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
-              backendEndpoint: directChannel.endpoint,
-              backendAuthToken: directChannel.authToken,
-              daemonUrl,
-              log,
-            })
-              .then((result) => {
-                log("registerSession result", { sessionID, result })
-                if (result?.ok) {
-                  sessionManager.onRegistered(sessionID)
-                }
-              })
-              .catch((err) => {
-                log("registerSession error:", serializeError(err))
-              })
-            sessionManager.setRegistrationPromise(sessionID, regPromise)
-         }
-       })()
+          if (!parentID) {
+            doRegisterSession(sessionID, envInfo, title)
+          }
+        } catch (err) {
+          // Fallback: register without parentID
+          log("session.get failed, registering without parentID", serializeError(err))
+          sessionManager.onSessionCreated(sessionID, undefined)
+          doRegisterSession(sessionID, envInfo)
+        }
+      })()
 
-       sessionManager.setDiscoveryPromise(sessionID, promise)
-       try {
-         await promise
-       } finally {
-         sessionManager.clearDiscoveryPromise(sessionID)
-       }
-     }
+      sessionManager.setDiscoveryPromise(sessionID, promise)
+      try {
+        await promise
+      } finally {
+        sessionManager.clearDiscoveryPromise(sessionID)
+      }
+    }
 
     return {
       tool: {
@@ -333,32 +318,8 @@ const plugin: Plugin = async (ctx) => {
             // Note: session.created fires before opencode generates the title,
             // so sessionInfo.title here is usually a placeholder.
             // Session titles are subsequently updated when session.updated events arrive.
-            const regPromise = registerSession({
-              sessionId: sessionID,
-              cwd: ctx.directory,
-              label,
-              title,
-              pid: envInfo.pid,
-                ppid: envInfo.ppid,
-                tty: envInfo.tty,
-                backendKind: "opencode-plugin-direct",
-                backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
-                backendEndpoint: directChannel.endpoint,
-                backendAuthToken: directChannel.authToken,
-                daemonUrl,
-                log,
-              })
-               .then((result) => {
-                 log("registerSession result", { sessionID, result })
-                 if (result?.ok) {
-                   sessionManager.onRegistered(sessionID)
-                 }
-               })
-                .catch((err) => {
-                  log("registerSession error:", serializeError(err))
-                })
-             sessionManager.setRegistrationPromise(sessionID, regPromise)
-           }
+            doRegisterSession(sessionID, envInfo, title)
+          }
 
           return
         }
@@ -385,31 +346,7 @@ const plugin: Plugin = async (ctx) => {
           sessionManager.setTitle(sessionID, title)
 
           const envInfo = await envInfoP
-          const regPromise = registerSession({
-            sessionId: sessionID,
-            cwd: ctx.directory,
-            label,
-            title,
-            pid: envInfo.pid,
-            ppid: envInfo.ppid,
-            tty: envInfo.tty,
-            backendKind: "opencode-plugin-direct",
-            backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
-            backendEndpoint: directChannel.endpoint,
-            backendAuthToken: directChannel.authToken,
-            daemonUrl,
-            log,
-          })
-            .then((result) => {
-              log("registerSession result", { sessionID, result })
-              if (result?.ok) {
-                sessionManager.onRegistered(sessionID)
-              }
-            })
-            .catch((err) => {
-              log("registerSession error:", serializeError(err))
-            })
-          sessionManager.setRegistrationPromise(sessionID, regPromise)
+          doRegisterSession(sessionID, envInfo, title)
 
           return
         }
