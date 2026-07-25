@@ -110,7 +110,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T1.0b Daemon: fix `splitTelegramMessage`'s degenerate-budget holes — `f12cb3f`, `07da3bc`, `8188d17`, `7f8a872`. **Four defects fixed, only the first was in the original plan** — see the T1.0b post-mortem in the Phase 1 body. *(found by Phase 0 adversarial review + T1.0b verification)* — (1) `maxBody <= 0` hole: when header+footer overhead alone exceeds 4096, `split-message.ts:29-31` falls into the single-message branch and sends the oversized text anyway → Telegram 400 → worker 502 → outbox retries then `markFailed` → **notification permanently lost**. (2) Chunk-explosion hole (found during T1.0b verification): when `maxBody` is small but positive (`maxBody = 12`), chunk count explodes (`maxBody = 12` → ~800 chunks) which would flood the supergroup past Phase 2's ~20 msgs/min rate ceiling. Clamps headers so body gets at least `minBodyBudget` (scaling with `maxLen`), bounding chunk count and strictly enforcing `maxLen` per chunk.
 - [x] T1.0c Daemon: narrow the additive-migration `catch` — `ff2567e`, `8f01980`. Adds exported `isDuplicateColumnError(err: unknown)` + `runAdditiveMigrations(db, statements = additiveColumns)`; non-duplicate errors rethrow wrapped with the failing SQL and `{ cause }`. **Discrimination must be on the message, not `err.code`** — verified that better-sqlite3 reports `SQLITE_ERROR` for duplicate-column, `no such table`, syntax errors *and* NOT NULL-without-default alike, so `err.code` cannot discriminate; a JSDoc block records this so nobody "tightens" it into a startup crash. Verified a **copy** of the real production DB (332 session rows) still initializes cleanly twice. *(found by Phase 0 adversarial review)* — `schema.ts:117-123` swallowed **every** error from every additive statement, not just duplicate-column. A real `ALTER TABLE` failure (disk full, a `sqlite3` shell holding a write txn past the 5s busy timeout, corruption) starts the daemon cleanly and then fails every `/session-start` and most `/stop`s with the root cause already discarded. Rethrow unless the message matches `/duplicate column/i`. Touches nine pre-existing statements, so it needs its own test pass.
 - [x] T1.0d Daemon: expose `title` in the legacy `/sessions` JSON — `15a3988`, `bca941d`. 3-line projection change. Incidentally added the **first** test pinning `backend_auth_token` redaction in `toLegacySession` (there was none), guarding *both* spellings — verified by injecting a `...session` spread, which the snake_case assertion alone did **not** catch. Note the inline input type is load-bearing for that redaction: the explicit field-by-field return is what keeps the token internal, so don't refactor it to `Pick<SessionRecord, …>` plus a spread.
-- [ ] T1.0e Daemon + plugin: event-distinct emoji, drop the redundant event word, fix `session.error` mislabelling *(raised after Checkpoint 0)*
+- [x] T1.0e Daemon + plugin: event-distinct emoji, drop the redundant event word, fix `session.error` mislabelling *(raised after Checkpoint 0)*
 - [ ] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender`
 - [ ] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix
 - [ ] T1.3 Worker: extract a central Telegram client module
@@ -551,9 +551,9 @@ net for this refactor.
 
 ### Task T1.0e *(added after Checkpoint 0)*: Event-distinct emoji, drop the redundant event word
 
-**Files:** `packages/daemon/src/notification-service.ts` (`eventEmoji` `:93-97`, header builder
+**Files:** `packages/daemon/src/notification-service.ts` (`eventEmoji` `:93-98`, header builder
 `:108-111`), `packages/opencode-plugin/src/index.ts` (the `session.error` `notifyStop` call
-`~:550`), tests in `packages/daemon/test/model-ingest.test.ts` and `telegram-message.test.ts`.
+`~:550`), tests in `packages/daemon/test/notification-service.test.ts`, `packages/daemon/test/app.test.ts`, and `packages/opencode-plugin/test/session-title.test.ts`.
 
 **Origin:** after Checkpoint 0 landed, the header read `🤖 **Stop**: Organize pigeon messages by
 session` and the obvious question was whether `Stop:` earns its place. Investigation says: not
@@ -564,17 +564,16 @@ as written, and it hides a bug.
 - **Nothing parses the header.** No code matches on `Stop:` or the emoji; reply routing uses
   `notificationId` plus the `🆔 <sessionId>` footer. Changing the header is routing-safe.
 - **`eventEmoji` is not 1:1 with the event.** `SubagentStop`→🔧, `Question`/`Notification`→❓,
-  and **everything else — `Stop`, `Error`, `Retry` — falls through to 🤖**. So the word is
-  currently the *only* thing separating a clean finish from a retry.
+  and **everything else — `Stop`, `Error`, `Retry` — falls through to 🤖**. So the word was
+  previously the *only* thing separating a clean finish from an error or retry.
 - **`session.error` mislabels itself as a stop.** The plugin's error path
-  (`index.ts:550-556`) passes no `event`, so the daemon defaults to `"Stop"` (`app.ts:365`).
-  An errored session renders a header **identical** to a successful one; the error appears only
-  in the body. That is the actual defect here, independent of the cosmetics.
-- Scope is genuinely small: one formatter function plus **6 test lines in 2 files**.
+  (`index.ts:550-556`) passed no `event`, so the daemon defaulted to `"Stop"` (`app.ts:368`).
+  An errored session rendered a header **identical** to a successful one; the error appeared only
+  in the body. Added `event: "Error"` to `notifyStop` at line 550.
+- **Scope correction:** The plan originally claimed `model-ingest.test.ts` and `telegram-message.test.ts` were affected. Neither was: `/model` constructs its own header without `eventEmoji` or `formatTelegramNotification`, and `telegram-message.test.ts` tests builder primitives with hardcoded test strings. Affected tests were `packages/daemon/test/notification-service.test.ts` and `packages/daemon/test/app.test.ts` (daemon) and `packages/opencode-plugin/test/session-title.test.ts` (plugin).
+- **Vestigial branches:** `Question`, `Notification`, and `SubagentStop` are vestigial branches in `formatTelegramNotification` (`Question` uses `formatQuestionNotification`; callers supply events; in practice only `Stop`, `Retry`, and `Error` reach it). Kept for future compatibility.
 
-**Do:** give each event a distinct emoji (e.g. Stop ✅ or 🤖, Error ❌, Retry 🔁), then drop the
-now-redundant bold event word from the header. Make the plugin's error path pass an explicit
-`event: "Error"` so the emoji is correct.
+**Do:** give each event a distinct emoji (`Stop` ✅, `Error` ❌, `Retry` 🔁, `SubagentStop` 🔧, `Question` ❓, `Notification` 🔔, fallback 🤖), then drop the now-redundant bold event word from the header. Make the plugin's error path pass an explicit `event: "Error"` so the emoji is correct.
 
 > **Do not over-invest in the header's title portion.** Phase 2 puts each session in its own
 > topic **named from the title**, at which point `<emoji> <title>` inside a topic already called

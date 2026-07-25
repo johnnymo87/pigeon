@@ -90,11 +90,17 @@ export interface WorkerNotificationSender {
   ): Promise<{ ok: boolean; key: string }>;
 }
 
+const EVENT_EMOJIS: Record<string, string> = {
+  Stop: "✅",
+  Error: "❌",
+  Retry: "🔁",
+  SubagentStop: "🔧",
+  Question: "❓",
+  Notification: "🔔",
+};
+
 function eventEmoji(event: string): string {
-  if (event === "SubagentStop") return "🔧";
-  if (event === "Question") return "❓";
-  if (event === "Notification") return "❓";
-  return "🤖";
+  return EVENT_EMOJIS[event] ?? "🤖";
 }
 
 export function formatTelegramNotification(input: NotificationInput): {
@@ -107,8 +113,7 @@ export function formatTelegramNotification(input: NotificationInput): {
 
   const headerBuilder = new TgMessageBuilder()
     .append(`${eventEmoji(input.event)} `)
-    .appendBold(input.event)
-    .append(`: ${input.label}`);
+    .append(input.label);
 
   const bodyBuilder = new TgMessageBuilder().append(input.summary);
 

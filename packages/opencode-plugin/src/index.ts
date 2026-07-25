@@ -549,6 +549,7 @@ const plugin: Plugin = async (ctx) => {
 
               notifyStop({
                 sessionId: sessionID,
+                event: "Error",
                 message: errorMsg,
                 label,
                 title: sessionManager.getTitle(sessionID),

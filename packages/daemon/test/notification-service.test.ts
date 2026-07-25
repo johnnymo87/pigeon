@@ -53,12 +53,14 @@ describe("formatTelegramNotification", () => {
     expect(result.body).toBeDefined();
     expect(result.footer).toBeDefined();
 
-    // Header contains event (bold) and label (plain - no escaping needed)
-    expect(result.header.text).toContain("Stop");
-    expect(result.header.text).toContain("my_[label]*");
-    // Header should have a bold entity for "Stop"
-    const boldEntity = result.header.entities.find(e => e.type === "bold");
-    expect(boldEntity).toBeDefined();
+    // Header contains emoji and label (no event word or bold entity)
+    expect(result.header.text).toBe("✅ my_[label]*");
+    expect(result.header.text).not.toContain("Stop");
+    // Entities should be valid utf-16 offsets
+    for (const entity of result.header.entities) {
+      expect(entity.offset).toBeGreaterThanOrEqual(0);
+      expect(entity.offset + entity.length).toBeLessThanOrEqual(result.header.text.length);
+    }
 
     // Body is the summary
     expect(result.body.text).toBe("Done");
@@ -71,6 +73,62 @@ describe("formatTelegramNotification", () => {
     expect(codeEntities.length).toBeGreaterThanOrEqual(2);
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
+  });
+
+  it("maps each event to its distinct emoji and omits event word from header", () => {
+    const cases = [
+      { event: "Stop", expectedEmoji: "✅" },
+      { event: "Error", expectedEmoji: "❌" },
+      { event: "Retry", expectedEmoji: "🔁" },
+      { event: "SubagentStop", expectedEmoji: "🔧" },
+      { event: "Question", expectedEmoji: "❓" },
+      { event: "Notification", expectedEmoji: "🔔" },
+      { event: "UnknownEvent", expectedEmoji: "🤖" },
+    ];
+
+    for (const { event, expectedEmoji } of cases) {
+      const result = formatTelegramNotification({
+        event,
+        label: "test-label",
+        summary: "Done",
+        cwd: "/home/dev/projects/pigeon",
+        token: "tok123",
+        sessionId: "sess-123",
+      });
+
+      expect(result.header.text).toBe(`${expectedEmoji} test-label`);
+      expect(result.header.text).not.toContain(event);
+
+      // Verify entity integrity
+      for (const entity of result.header.entities) {
+        expect(entity.offset).toBeGreaterThanOrEqual(0);
+        expect(entity.offset + entity.length).toBeLessThanOrEqual(result.header.text.length);
+      }
+    }
+  });
+
+  it("produces visibly different headers for Stop and Error events", () => {
+    const stopResult = formatTelegramNotification({
+      event: "Stop",
+      label: "my-label",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      sessionId: "sess-123",
+    });
+
+    const errorResult = formatTelegramNotification({
+      event: "Error",
+      label: "my-label",
+      summary: "Failed",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      sessionId: "sess-123",
+    });
+
+    expect(stopResult.header.text).not.toEqual(errorResult.header.text);
+    expect(stopResult.header.text).toContain("✅");
+    expect(errorResult.header.text).toContain("❌");
   });
 
   it("includes machine ID in footer when provided", () => {

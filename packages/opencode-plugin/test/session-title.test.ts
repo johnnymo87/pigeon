@@ -626,6 +626,38 @@ describe("Session Title Management", () => {
           )
         })
       })
+
+      test("session.error passes event: 'Error' to notifyStop", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_err_1", title: "Errored Session" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "session.error",
+            properties: {
+              sessionID: "ses_err_1",
+              error: new Error("Something broke"),
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_err_1",
+              event: "Error",
+              message: "Error: Something broke",
+            })
+          )
+        })
+      })
     })
   })
 })

@@ -566,7 +566,7 @@ describe("createApp", () => {
     const payload = JSON.parse(outboxEntry!.payload);
     expect(payload.messages).toBeDefined();
     expect(payload.messages.length).toBeGreaterThan(0);
-    expect(payload.messages[0].text).toContain("Stop");
+    expect(payload.messages[0].text).toContain("✅ My Session");
     expect(Array.isArray(payload.messages[0].entities)).toBe(true);
   });
 
