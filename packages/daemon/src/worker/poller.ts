@@ -302,7 +302,7 @@ export class Poller {
     media?: Array<{ key: string; mime: string; filename: string }>,
     notificationId?: string,
     entities?: unknown[],
-  ): Promise<{ ok: boolean }> {
+  ): Promise<{ ok: boolean; retryAfter?: number }> {
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -320,7 +320,11 @@ export class Poller {
           ...(entities && entities.length > 0 ? { entities } : {}),
         }),
       });
-      return await response.json() as { ok: boolean };
+      const payload = (await response.json()) as { ok?: boolean; retryAfter?: number };
+      return {
+        ok: Boolean(payload.ok),
+        ...(payload.retryAfter !== undefined ? { retryAfter: payload.retryAfter } : {}),
+      };
     } catch {
       return { ok: false };
     }

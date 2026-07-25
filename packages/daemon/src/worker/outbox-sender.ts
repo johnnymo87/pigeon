@@ -16,7 +16,7 @@ export type SendNotificationFn = (
   media?: unknown,
   notificationId?: string,
   entities?: unknown[],
-) => Promise<{ ok: boolean }>;
+) => Promise<{ ok: boolean; retryAfter?: number }>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
 
@@ -61,6 +61,7 @@ export class OutboxSender {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
+  private pausedUntil = 0;
 
   constructor(opts: OutboxSenderOptions) {
     this.storage = opts.storage;
@@ -104,9 +105,13 @@ export class OutboxSender {
       }
 
       const now = this.nowFn();
+      if (now < this.pausedUntil) {
+        return;
+      }
+
       const entries = this.storage.outbox.getReady(now, 5);
 
-      for (const entry of entries) {
+      batchLoop: for (const entry of entries) {
         const age = now - entry.createdAt;
 
         // Check terminal conditions
@@ -175,6 +180,15 @@ export class OutboxSender {
                 attempts: entry.attempts + 1,
                 nextRetryIn: backoff,
               });
+              if (result.retryAfter !== undefined) {
+                this.pausedUntil = now + result.retryAfter * 1000;
+                this.log("outbox paused due to rate limit", {
+                  notificationId: entry.notificationId,
+                  retryAfterSec: result.retryAfter,
+                  pausedUntil: this.pausedUntil,
+                });
+                break batchLoop;
+              }
               break;
             }
           }

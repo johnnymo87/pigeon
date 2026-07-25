@@ -800,4 +800,17 @@ describe("Poller dispatch — current_state", () => {
     
     poller.stop();
   });
+
+  it("sendNotification returns ok: false and retryAfter on rate limit (429)", async () => {
+    const poller = new Poller(BASE_CONFIG, makeCallbacks());
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      json: async () => ({ error: "rate_limited", retryAfter: 17 }),
+    });
+    (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
+
+    const res = await poller.sendNotification("sess-1", "chat-1", "hello", { inline_keyboard: [] });
+    expect(res).toEqual({ ok: false, retryAfter: 17 });
+  });
 });

@@ -493,4 +493,60 @@ describe("OutboxSender start/stop", () => {
 
     expect(processOnceSpy).toHaveBeenCalledTimes(callsBeforeStop);
   });
+
+  it("pauses the whole outbox when a send reports retryAfter", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-3" }, 1_000);
+
+    const sendNotification = vi.fn().mockImplementation(async (_s, _c, _t, _r, _m, notifId) => {
+      if (notifId === "notif-1") {
+        return { ok: false, retryAfter: 30 };
+      }
+      return { ok: true };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1); // not 3
+
+    now += 29_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1); // still paused
+
+    now += 2_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(2); // resumed
+  });
+
+  it("does not pause the outbox on ordinary (non-rate-limit) failure", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-3" }, 1_000);
+
+    const sendNotification = vi.fn().mockImplementation(async (_s, _c, _t, _r, _m, notifId) => {
+      if (notifId === "notif-1") {
+        return { ok: false };
+      }
+      return { ok: true };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+  });
 });

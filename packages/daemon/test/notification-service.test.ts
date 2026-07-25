@@ -5,6 +5,8 @@ import {
   formatQuestionWizardStep,
   TelegramNotificationService,
   WorkerNotificationService,
+  FallbackNotifier,
+  RateLimitError,
   type WorkerNotificationSender,
   relativeTime,
   formatStateCard,
@@ -1094,6 +1096,77 @@ describe("current-state formatting helpers", () => {
 
       expect(index2.text).toContain("1 main session(s) · 0 🟢 active · 1 ⚪ idle");
       expect(index2.text).not.toContain("on home screen");
+    });
+  });
+
+  describe("FallbackNotifier with RateLimitError", () => {
+    it("does not fall back to direct Telegram on a rate limit", async () => {
+      const primary = {
+        sendStopNotification: vi.fn().mockRejectedValue(new RateLimitError("rate limited", 30)),
+        sendQuestionNotification: vi.fn().mockRejectedValue(new RateLimitError("rate limited", 30)),
+        sendPlainAlert: vi.fn().mockRejectedValue(new RateLimitError("rate limited", 30)),
+      };
+      const fallback = {
+        sendStopNotification: vi.fn().mockResolvedValue({ token: "fallback-tok" }),
+        sendQuestionNotification: vi.fn().mockResolvedValue({ token: "fallback-tok" }),
+        sendPlainAlert: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const notifier = new FallbackNotifier(primary, fallback);
+
+      await expect(notifier.sendStopNotification({
+        session: { sessionId: "sess-1", label: "test", cwd: "/tmp" },
+        event: "Stop",
+        summary: "done",
+      })).rejects.toThrow(RateLimitError);
+
+      expect(fallback.sendStopNotification).not.toHaveBeenCalled();
+
+      await expect(notifier.sendQuestionNotification({
+        session: { sessionId: "sess-1", label: "test", cwd: "/tmp" },
+        questionRequestId: "q1",
+        questions: [],
+      })).rejects.toThrow(RateLimitError);
+
+      expect(fallback.sendQuestionNotification).not.toHaveBeenCalled();
+
+      await expect(notifier.sendPlainAlert("test alert", "info")).rejects.toThrow(RateLimitError);
+
+      expect(fallback.sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("falls back to secondary notifier on ordinary error", async () => {
+      const primary = {
+        sendStopNotification: vi.fn().mockRejectedValue(new Error("network error")),
+        sendQuestionNotification: vi.fn().mockRejectedValue(new Error("network error")),
+        sendPlainAlert: vi.fn().mockRejectedValue(new Error("network error")),
+      };
+      const fallback = {
+        sendStopNotification: vi.fn().mockResolvedValue({ token: "fallback-tok" }),
+        sendQuestionNotification: vi.fn().mockResolvedValue({ token: "fallback-tok" }),
+        sendPlainAlert: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const notifier = new FallbackNotifier(primary, fallback);
+
+      const stopRes = await notifier.sendStopNotification({
+        session: { sessionId: "sess-1", label: "test", cwd: "/tmp" },
+        event: "Stop",
+        summary: "done",
+      });
+      expect(stopRes).toEqual({ token: "fallback-tok" });
+      expect(fallback.sendStopNotification).toHaveBeenCalledTimes(1);
+
+      const questionRes = await notifier.sendQuestionNotification({
+        session: { sessionId: "sess-1", label: "test", cwd: "/tmp" },
+        questionRequestId: "q1",
+        questions: [],
+      });
+      expect(questionRes).toEqual({ token: "fallback-tok" });
+      expect(fallback.sendQuestionNotification).toHaveBeenCalledTimes(1);
+
+      await notifier.sendPlainAlert("test alert", "info");
+      expect(fallback.sendPlainAlert).toHaveBeenCalledTimes(1);
     });
   });
 });

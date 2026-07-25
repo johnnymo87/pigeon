@@ -67,6 +67,16 @@ export interface StopNotifier {
   sendPlainAlert?(text: string, severity: AlertSeverity): Promise<void>;
 }
 
+export class RateLimitError extends Error {
+  constructor(
+    message: string,
+    public readonly retryAfter: number,
+  ) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
 export interface QuestionNotifier {
   sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult>;
 }
@@ -80,7 +90,7 @@ export interface WorkerNotificationSender {
     media?: Array<{ key: string; mime: string; filename: string }>,
     notificationId?: string,
     entities?: TgEntity[],
-  ): Promise<{ ok: boolean }>;
+  ): Promise<{ ok: boolean; retryAfter?: number }>;
 
   uploadMedia?(
     key: string,
@@ -551,6 +561,9 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     );
 
     if (!result.ok) {
+      if (result.retryAfter !== undefined) {
+        throw new RateLimitError("Worker notification send rate limited", result.retryAfter);
+      }
       throw new Error("Worker notification send failed");
     }
   }
@@ -669,7 +682,10 @@ export class FallbackNotifier implements StopNotifier, QuestionNotifier {
   async sendStopNotification(input: StopNotificationInput): Promise<NotificationResult> {
     try {
       return await this.primary.sendStopNotification(input);
-    } catch {
+    } catch (err) {
+      if (err instanceof RateLimitError) {
+        throw err;
+      }
       return this.fallback.sendStopNotification(input);
     }
   }
@@ -677,7 +693,10 @@ export class FallbackNotifier implements StopNotifier, QuestionNotifier {
   async sendQuestionNotification(input: QuestionNotificationInput): Promise<NotificationResult> {
     try {
       return await this.primary.sendQuestionNotification(input);
-    } catch {
+    } catch (err) {
+      if (err instanceof RateLimitError) {
+        throw err;
+      }
       return this.fallback.sendQuestionNotification(input);
     }
   }
@@ -687,7 +706,10 @@ export class FallbackNotifier implements StopNotifier, QuestionNotifier {
       try {
         await this.primary.sendPlainAlert(text, severity);
         return;
-      } catch {
+      } catch (err) {
+        if (err instanceof RateLimitError) {
+          throw err;
+        }
         // fall through to fallback
       }
     }
