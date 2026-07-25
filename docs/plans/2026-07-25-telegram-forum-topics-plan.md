@@ -416,6 +416,18 @@ Green (modulo the two pre-existing daemon typecheck files). Deploy per the `cros
 > started *after* the restart (`/launch cloudbox pigeon "..."` or a fresh TUI session).
 > Existing sessions pick the feature up only as their opencode processes restart (the nightly
 > workspace reset finishes the job).
+>
+> **And "fresh session" is not sufficient on its own — the serve process must be new too.**
+> The plugin is a Node module, loaded once per *process*. On cloudbox `opencode-serve` is a
+> **pool** (`opencode-serve@4096..4099.service`) behind `opencode-frontdoor` on port 4700, and
+> those are long-lived. A brand-new session that lands on an unrestarted pool instance still
+> executes the **old** plugin module and still sends no title. So end-to-end verification needs
+> the pool instance hosting the new session to have been restarted after the merge — not just
+> the daemon.
+>
+> Restarting the whole pool disrupts every live session on the machine (including whichever one
+> is driving the deploy), so the zero-risk alternative is to let the **nightly workspace reset**
+> restart everything and verify the next morning.
 
 Then confirm in Telegram that stop notifications show real session titles, **on the second or
 later notification of that fresh session** (that is what proves T0.5+T0.6, not just T0.4).
