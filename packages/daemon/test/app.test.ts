@@ -229,6 +229,34 @@ describe("createApp", () => {
     expect(body.session.backend_endpoint).toBe("http://127.0.0.1:8888/pigeon/direct/execute");
   });
 
+  it("supports /sessions/enable-notify preserving title", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 20_000 });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "title-sess-1",
+        notify: false,
+        title: "Fix flaky auth test",
+      }),
+    }));
+
+    const response = await app(new Request("http://localhost/sessions/enable-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "title-sess-1", label: "Notified Title Session" }),
+    }));
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; session: Record<string, unknown> };
+    expect(body.ok).toBe(true);
+    expect(body.session.notify).toBe(true);
+    expect(body.session.label).toBe("Notified Title Session");
+    expect(storage?.sessions.get("title-sess-1")?.title).toBe("Fix flaky auth test");
+  });
+
   it("supports /sessions/enable-notify parity behavior", async () => {
     const started: Array<{ sessionId: string; notify: boolean; label: string | null | undefined }> = [];
     storage = openStorageDb(":memory:");
