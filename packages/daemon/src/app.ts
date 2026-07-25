@@ -1,6 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import type { StopNotifier, QuestionNotifier } from "./notification-service";
-import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep } from "./notification-service";
+import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
@@ -376,7 +376,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Format notification for the outbox
         const notification = formatTelegramNotification({
           event,
-          label: label || session.label || sessionId.slice(0, 8),
+          label: displayName({ title: session.title, label: label || session.label, sessionId }),
           summary: message || summary || "Task completed",
           cwd: session.cwd,
           token,
@@ -473,7 +473,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (questions.length > 1) {
           // Multi-question: wizard mode — show step 1
           const notification = formatQuestionWizardStep({
-            label: label || session.label || sessionId.slice(0, 8),
+            label: displayName({ title: session.title, label: label || session.label, sessionId }),
             questions,
             currentStep: 0,
             cwd: session.cwd,
@@ -490,7 +490,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         } else {
           // Single-question: existing behavior
           const notification = formatQuestionNotification({
-            label: label || session.label || sessionId.slice(0, 8),
+            label: displayName({ title: session.title, label: label || session.label, sessionId }),
             questions,
             cwd: session.cwd,
             token,

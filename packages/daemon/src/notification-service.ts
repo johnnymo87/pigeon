@@ -15,10 +15,23 @@ interface NotificationInput {
   sessionId: string;
 }
 
-interface SessionLike {
+export interface SessionLike {
+  title?: string | null;
   sessionId: string;
   label: string | null;
   cwd: string | null;
+}
+
+export function displayName(input: {
+  title?: string | null;
+  label?: string | null;
+  sessionId: string;
+}): string {
+  const title = input.title?.trim();
+  if (title) return title;
+  const label = input.label?.trim();
+  if (label) return label;
+  return input.sessionId.slice(0, 8);
 }
 
 interface StopNotificationInput {
@@ -424,7 +437,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
 
     const notification = formatTelegramNotification({
       event: input.event,
-      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      label: displayName({ title: input.session.title, label: input.label || input.session.label, sessionId: input.session.sessionId }),
       summary: input.summary,
       cwd: input.session.cwd,
       token,
@@ -470,7 +483,7 @@ export class TelegramNotificationService implements StopNotifier, QuestionNotifi
     }, now);
 
     const notification = formatQuestionNotification({
-      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      label: displayName({ title: input.session.title, label: input.label || input.session.label, sessionId: input.session.sessionId }),
       questions: input.questions,
       cwd: input.session.cwd,
       token,
@@ -553,7 +566,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
 
     const notification = formatTelegramNotification({
       event: input.event,
-      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      label: displayName({ title: input.session.title, label: input.label || input.session.label, sessionId: input.session.sessionId }),
       summary: input.summary,
       cwd: input.session.cwd,
       token,
@@ -622,7 +635,7 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
     }, now);
 
     const notification = formatQuestionNotification({
-      label: input.label || input.session.label || input.session.sessionId.slice(0, 8),
+      label: displayName({ title: input.session.title, label: input.label || input.session.label, sessionId: input.session.sessionId }),
       questions: input.questions,
       cwd: input.session.cwd,
       token,

@@ -11,7 +11,7 @@ import {
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "../opencode-direct/contracts";
 import type { ExecuteMessage } from "./poller";
-import { formatQuestionWizardStep } from "../notification-service";
+import { formatQuestionWizardStep, displayName } from "../notification-service";
 import { reviveAndDeliver, type ReviveAndDeliverDeps } from "./revive-and-deliver";
 
 export interface WorkerCommandIngestOptions {
@@ -181,7 +181,7 @@ export async function ingestWorkerCommand(
 
         // Format next step
         const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
-        const label = session.label || session.sessionId.slice(0, 8);
+        const label = displayName(session);
         const { message, replyMarkup } = formatQuestionWizardStep({
           label,
           questions: pendingQuestion.questions,

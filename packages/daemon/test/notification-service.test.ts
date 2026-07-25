@@ -9,9 +9,24 @@ import {
   relativeTime,
   formatStateCard,
   formatCurrentStateIndex,
+  displayName,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";
 import { openStorageDb } from "../src/storage/database";
+
+describe("displayName", () => {
+  it("prefers title", () => {
+    expect(displayName({ title: "Fix auth", label: "pigeon", sessionId: "ses_abcdef123" }))
+      .toBe("Fix auth");
+  });
+  it("falls back to label when title is absent or blank", () => {
+    expect(displayName({ title: null, label: "pigeon", sessionId: "ses_abcdef123" })).toBe("pigeon");
+    expect(displayName({ title: "  ", label: "pigeon", sessionId: "ses_abcdef123" })).toBe("pigeon");
+  });
+  it("falls back to a session-id prefix when both are absent", () => {
+    expect(displayName({ title: null, label: null, sessionId: "ses_abcdef123" })).toBe("ses_abcd");
+  });
+});
 
 describe("formatTelegramNotification", () => {
   it("formats body as TgMessage with no inline buttons", () => {
@@ -151,6 +166,49 @@ describe("TelegramNotificationService", () => {
     expect(payload.parse_mode).toBeUndefined();
     expect(Array.isArray(payload.entities)).toBe(true);
     expect((payload.entities as unknown[]).length).toBeGreaterThan(0);
+
+    storage.db.close();
+  });
+
+  it("prefers session.title over session.label in notification header when title is present", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-title",
+      notify: true,
+      title: "Fix flakiness in auth test",
+      label: "pigeon",
+      cwd: "/tmp/demo",
+    }, 1_000);
+
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1234 } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const service = new TelegramNotificationService(
+      storage,
+      "bot-token",
+      "8248645256",
+      () => 2_000,
+      fetchMock,
+    );
+
+    await service.sendStopNotification({
+      session: {
+        sessionId: "sess-title",
+        title: "Fix flakiness in auth test",
+        label: "pigeon",
+        cwd: "/tmp/demo",
+      },
+      event: "Stop",
+      summary: "All done",
+    });
+
+    const [, options] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
+    expect(payload.text as string).toContain("Fix flakiness in auth test");
 
     storage.db.close();
   });
@@ -503,6 +561,44 @@ describe("TelegramNotificationService.sendQuestionNotification", () => {
     // Entities instead of parse_mode
     expect(payload.parse_mode).toBeUndefined();
     expect(Array.isArray(payload.entities)).toBe(true);
+
+    storage.db.close();
+  });
+
+  it("prefers session.title over session.label in question notification when title is present", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-q-title",
+      notify: true,
+      title: "Add OAuth2 PKCE flow",
+      label: "pigeon",
+      cwd: "/tmp",
+    }, 1_000);
+
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const service = new TelegramNotificationService(
+      storage, "bot-token", "8248645256", () => 2_000, fetchMock,
+    );
+
+    await service.sendQuestionNotification({
+      session: { sessionId: "sess-q-title", title: "Add OAuth2 PKCE flow", label: "pigeon", cwd: "/tmp" },
+      questionRequestId: "question_xyz",
+      questions: [{
+        question: "Which DB?",
+        header: "DB",
+        options: [{ label: "PG", description: "PostgreSQL" }],
+      }],
+    });
+
+    const [, options] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
+    expect(payload.text as string).toContain("Add OAuth2 PKCE flow");
 
     storage.db.close();
   });
