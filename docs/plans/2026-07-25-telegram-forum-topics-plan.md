@@ -107,7 +107,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
 - [ ] T1.0 Plugin: extract the 4× duplicated `registerSession` block *(added during Phase 0; see the trap note — the helper must NOT await)*
-- [ ] T1.0b Daemon: fix `splitTelegramMessage`'s degenerate-budget holes *(found by Phase 0 adversarial review + T1.0b verification)* — (1) `maxBody <= 0` hole: when header+footer overhead alone exceeds 4096, `split-message.ts:29-31` falls into the single-message branch and sends the oversized text anyway → Telegram 400 → worker 502 → outbox retries then `markFailed` → **notification permanently lost**. (2) Chunk-explosion hole (found during T1.0b verification): when `maxBody` is small but positive (`maxBody = 12`), chunk count explodes (`maxBody = 12` → ~800 chunks) which would flood the supergroup past Phase 2's ~20 msgs/min rate ceiling. Clamps headers so body gets at least `minBodyBudget` (scaling with `maxLen`), bounding chunk count and strictly enforcing `maxLen` per chunk.
+- [x] T1.0b Daemon: fix `splitTelegramMessage`'s degenerate-budget holes — `f12cb3f`, `07da3bc`, `8188d17`, `7f8a872`. **Four defects fixed, only the first was in the original plan** — see the T1.0b post-mortem in the Phase 1 body. *(found by Phase 0 adversarial review + T1.0b verification)* — (1) `maxBody <= 0` hole: when header+footer overhead alone exceeds 4096, `split-message.ts:29-31` falls into the single-message branch and sends the oversized text anyway → Telegram 400 → worker 502 → outbox retries then `markFailed` → **notification permanently lost**. (2) Chunk-explosion hole (found during T1.0b verification): when `maxBody` is small but positive (`maxBody = 12`), chunk count explodes (`maxBody = 12` → ~800 chunks) which would flood the supergroup past Phase 2's ~20 msgs/min rate ceiling. Clamps headers so body gets at least `minBodyBudget` (scaling with `maxLen`), bounding chunk count and strictly enforcing `maxLen` per chunk.
 - [ ] T1.0c Daemon: narrow the additive-migration `catch` *(found by Phase 0 adversarial review)* — `schema.ts:117-123` swallows **every** error from every additive statement, not just duplicate-column. A real `ALTER TABLE` failure (disk full, a `sqlite3` shell holding a write txn past the 5s busy timeout, corruption) starts the daemon cleanly and then fails every `/session-start` and most `/stop`s with the root cause already discarded. Rethrow unless the message matches `/duplicate column/i`. Touches nine pre-existing statements, so it needs its own test pass.
 - [ ] T1.0d Daemon: expose `title` in the legacy `/sessions` JSON — absent from `toLegacySession` (`app.ts:30-67`); Phase 2 will want it.
 - [ ] T1.0e Daemon + plugin: event-distinct emoji, drop the redundant event word, fix `session.error` mislabelling *(raised after Checkpoint 0)*
@@ -581,6 +581,61 @@ now-redundant bold event word from the header. Make the plugin's error path pass
 > `<title>` is pure duplication. The likely end state is emoji + summary with no title at all.
 > Fix the verb and the emoji here; let Phase 2 decide the title's fate, since only there does the
 > header know whether it sits in a per-session topic or the General fallback.
+
+### T1.0b post-mortem — four defects, one planned
+
+Recorded because the *process* findings generalise to the rest of Phase 1, and because
+`split-message.ts` is now load-bearing for Phase 2 (topic-name truncation faces the same
+UTF-16 problem).
+
+**What was actually wrong.** The plan named one defect; verification found four:
+
+| # | Defect | Reachable in prod? | Found by |
+|---|---|---|---|
+| 1 | `maxBody <= 0` → oversized chunk (4714 chars) → Telegram 400 → outbox `markFailed` → **notification lost** | No (title clamp removed the trigger) | Phase 0 adversarial review |
+| 2 | Small-positive `maxBody` → **800 chunks** from one notification | No | probing before dispatch |
+| 3 | Body hard-cut **splits UTF-16 surrogate pairs** → lone surrogate → Telegram 400 → **notification lost** | **YES — live today** | probing the fix |
+| 4 | `splitBodyText` **infinite-loops** (heap exhaustion) on tiny `maxBody` | No | code review |
+
+Defect 3 is the important one: **pre-existing, live, and nobody had noticed.** Any notification
+body whose emoji straddles the ~4096 boundary corrupts. Verified at body offset 4085 with
+`😀`. Emoji-bearing bodies are routine in opencode output, so this was silently losing
+notifications before this task existed.
+
+**Two regressions were introduced and caught mid-task**, both by the same mechanism — a fix
+whose guard assumed the happy-path shape:
+
+- The chunk-count fix used `Math.max(1, maxBody)`, which fell to `1` when the *footer* alone
+  busted the budget → **8000 chunks**, 10× worse than the defect being fixed.
+- The surrogate fix decremented `chunkEnd` to `pos`, so `pos` stopped advancing → **hang**.
+  The reviewer's proposed patch (`if (chunkEnd === pos && pos + 2 <= text.length)`) was *also*
+  incomplete: a trailing unpaired surrogate leaves `pos + 2 > text.length` and it still hangs.
+  Fixed by guaranteeing `pos` strictly increases *structurally*, not per-case.
+
+**Process lessons that apply to T1.0–T1.6:**
+
+1. **A property test is only as good as the inputs' ability to break it.** Twice a sweep here
+   asserted a property over inputs that could not violate it — first the count bound, then
+   `hasLoneSurrogate` over a pure-ASCII body. Both passed trivially; both hid a live defect.
+   When adding a sweep, confirm it *fails* against the unfixed code.
+2. **Enforce invariants structurally; don't patch symptoms.** Every case-by-case guard here
+   left a pathological input broken. The fixes that held were the ones that made the invariant
+   unconditional.
+3. **A clamp that hides a broken precondition converts a loud failure into a silent one.**
+   `Math.max(1, maxBody)` satisfied the size invariant while destroying the count bound.
+4. **Verify reviewer repros before implementing against them.** One "verified" repro in this
+   task did not reproduce (the cut landed before the emoji), and implementing against it would
+   have pinned nothing. A later Critical from the same reviewer *was* real. Check each.
+
+**Final state:** invariants are (a) every chunk `<= maxLen`, (b) chunk count bounded by
+`~ceil(bodyLen / minBodyBudget)`, (c) no chunk contains a lone surrogate, (d) `splitBodyText`
+always terminates. Verified out-of-band over 3521 cases (`maxLen` 0–40 × 9 body classes
+including malformed UTF-16 × header/footer combos, plus emoji at body offsets 4050–4149).
+Known accepted wart: `maxLen < 0` violates (a); no caller can pass a negative.
+
+**Carry into Phase 2:** `topicName` clamps to Telegram's 128-char topic-name cap and the design
+already specifies `[...str]` spread to avoid splitting surrogate pairs — same hazard class as
+defect 3. Reuse this reasoning there rather than rediscovering it.
 
 ### Task T1.1: Per-chunk idempotency keys
 
