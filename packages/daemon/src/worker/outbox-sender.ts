@@ -61,6 +61,12 @@ export class OutboxSender {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
+
+  /**
+   * Timestamp (ms) until which outbox delivery is paused due to rate limiting.
+   * Kept in-memory: if daemon restarts mid-pause, state is self-healing as the
+   * next delivery attempt will receive another 429 and re-establish pausedUntil.
+   */
   private pausedUntil = 0;
 
   constructor(opts: OutboxSenderOptions) {
@@ -105,8 +111,15 @@ export class OutboxSender {
       }
 
       const now = this.nowFn();
-      if (now < this.pausedUntil) {
-        return;
+      if (this.pausedUntil > 0) {
+        if (now < this.pausedUntil) {
+          return;
+        }
+        this.log("outbox rate-limit pause ended, resuming delivery", {
+          now,
+          wasPausedUntil: this.pausedUntil,
+        });
+        this.pausedUntil = 0;
       }
 
       const entries = this.storage.outbox.getReady(now, 5);

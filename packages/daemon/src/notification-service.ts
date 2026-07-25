@@ -55,6 +55,23 @@ interface NotificationResult {
 
 export type AlertSeverity = "info" | "warning" | "error";
 
+/**
+ * Error thrown when a notification attempt is rate-limited by the worker / Telegram API.
+ */
+export class RateLimitError extends Error {
+  /**
+   * @param message Human-readable error description.
+   * @param retryAfter Duration to wait before retrying, in **seconds** (direct from Telegram API `parameters.retry_after`).
+   */
+  constructor(
+    message: string,
+    public readonly retryAfter: number,
+  ) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
 export interface StopNotifier {
   sendStopNotification(input: StopNotificationInput): Promise<NotificationResult>;
   /**
@@ -65,16 +82,6 @@ export interface StopNotifier {
    * its presence and degrade gracefully.
    */
   sendPlainAlert?(text: string, severity: AlertSeverity): Promise<void>;
-}
-
-export class RateLimitError extends Error {
-  constructor(
-    message: string,
-    public readonly retryAfter: number,
-  ) {
-    super(message);
-    this.name = "RateLimitError";
-  }
 }
 
 export interface QuestionNotifier {
