@@ -223,6 +223,9 @@ export async function handleSendNotification(
     replyMarkup,
   });
 
+  // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
+  // The daemon converts to ms when it pauses the outbox; don't change the unit here
+  // without changing that multiplication too.
   if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
     return json({ error: "rate_limited", retryAfter: telegramResult.retryAfter }, 429);
   }
