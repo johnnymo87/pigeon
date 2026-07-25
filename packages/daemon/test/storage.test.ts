@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
+import BetterSqlite3 from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
 import { openStorageDb } from "../src/storage/database";
+import { isDuplicateColumnError, runAdditiveMigrations } from "../src/storage/schema";
 
 function createStorage() {
   return openStorageDb(":memory:");
@@ -370,6 +375,88 @@ describe("storage schema and repositories", () => {
       storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" }, 1000, 100);
       expect(storage.pendingQuestions.advanceStep("s1", ["x"], 2000)).toBeNull();
       storage.db.close();
+    });
+  });
+
+  describe("additive migrations error handling", () => {
+    it("isDuplicateColumnError returns true for a real duplicate-column error", () => {
+      const db = new BetterSqlite3(":memory:");
+      db.exec("CREATE TABLE t (a TEXT);");
+      let dupErr: unknown;
+      try {
+        db.exec("ALTER TABLE t ADD COLUMN a TEXT;");
+      } catch (err) {
+        dupErr = err;
+      }
+      expect(isDuplicateColumnError(dupErr)).toBe(true);
+      db.close();
+    });
+
+    it("isDuplicateColumnError returns false for real non-duplicate SQLite errors", () => {
+      const db = new BetterSqlite3(":memory:");
+
+      let noTableErr: unknown;
+      try {
+        db.exec("ALTER TABLE missing ADD COLUMN a TEXT;");
+      } catch (err) {
+        noTableErr = err;
+      }
+      expect(isDuplicateColumnError(noTableErr)).toBe(false);
+
+      let syntaxErr: unknown;
+      try {
+        db.exec("ALTER TABLE");
+      } catch (err) {
+        syntaxErr = err;
+      }
+      expect(isDuplicateColumnError(syntaxErr)).toBe(false);
+
+      db.exec("CREATE TABLE t_notnull (id INT);");
+      db.exec("INSERT INTO t_notnull VALUES (1);");
+      let notNullErr: unknown;
+      try {
+        db.exec("ALTER TABLE t_notnull ADD COLUMN b TEXT NOT NULL;");
+      } catch (err) {
+        notNullErr = err;
+      }
+      expect(isDuplicateColumnError(notNullErr)).toBe(false);
+
+      db.close();
+    });
+
+    it("isDuplicateColumnError returns false for non-Error throws without throwing", () => {
+      expect(isDuplicateColumnError(undefined)).toBe(false);
+      expect(isDuplicateColumnError(null)).toBe(false);
+      expect(isDuplicateColumnError("duplicate column name: a")).toBe(false);
+      expect(isDuplicateColumnError({ message: "duplicate column name: a" })).toBe(false);
+      expect(isDuplicateColumnError(123)).toBe(false);
+    });
+
+    it("propagates real migration failure and names offending statement", () => {
+      const db = new BetterSqlite3(":memory:");
+      const badStatement = "ALTER TABLE non_existent_table ADD COLUMN foo TEXT";
+
+      expect(() => runAdditiveMigrations(db, [badStatement])).toThrowError(
+        badStatement,
+      );
+
+      db.close();
+    });
+
+    it("preserves idempotency when opened twice against the same file-backed database", () => {
+      const dbDir = mkdtempSync(join(tmpdir(), "pigeon-test-db-"));
+      const dbPath = join(dbDir, "storage.db");
+      try {
+        const storage1 = openStorageDb(dbPath);
+        storage1.db.close();
+
+        expect(() => {
+          const storage2 = openStorageDb(dbPath);
+          storage2.db.close();
+        }).not.toThrow();
+      } finally {
+        rmSync(dbDir, { recursive: true, force: true });
+      }
     });
   });
 });

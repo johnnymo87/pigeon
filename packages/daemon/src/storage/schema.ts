@@ -7,6 +7,45 @@ export const INBOX_DONE_RETENTION_MS = 60 * 60 * 1000;
 export const PENDING_QUESTION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 export const OUTBOX_RETENTION_MS = 60 * 60 * 1000; // 1 hour
 
+export function isDuplicateColumnError(err: unknown): boolean {
+  if (err instanceof Error) {
+    return /duplicate column/i.test(err.message);
+  }
+  return false;
+}
+
+export const additiveColumns = [
+  "ALTER TABLE sessions ADD COLUMN backend_kind TEXT",
+  "ALTER TABLE sessions ADD COLUMN backend_protocol_version INTEGER",
+  "ALTER TABLE sessions ADD COLUMN backend_endpoint TEXT",
+  "ALTER TABLE sessions ADD COLUMN backend_auth_token TEXT",
+  "ALTER TABLE sessions ADD COLUMN nvim_socket TEXT DEFAULT NULL",
+  "ALTER TABLE pending_questions ADD COLUMN current_step INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE pending_questions ADD COLUMN answers_json_v2 TEXT NOT NULL DEFAULT '[]'",
+  "ALTER TABLE pending_questions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE sessions ADD COLUMN model_override TEXT DEFAULT NULL",
+  "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
+];
+
+export function runAdditiveMigrations(
+  db: BetterSqlite3.Database,
+  statements: string[] = additiveColumns,
+): void {
+  for (const statement of statements) {
+    try {
+      db.exec(statement);
+    } catch (err: unknown) {
+      if (isDuplicateColumnError(err)) {
+        continue;
+      }
+      const origMessage = err instanceof Error ? err.message : String(err);
+      throw new Error(`Additive migration failed for statement "${statement}": ${origMessage}`, {
+        cause: err,
+      });
+    }
+  }
+}
+
 export function initSchema(db: BetterSqlite3.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -100,25 +139,5 @@ export function initSchema(db: BetterSqlite3.Database): void {
       ON outbox(state, next_retry_at);
   `);
 
-  // Additive migrations for existing databases created before backend fields.
-  const additiveColumns = [
-    "ALTER TABLE sessions ADD COLUMN backend_kind TEXT",
-    "ALTER TABLE sessions ADD COLUMN backend_protocol_version INTEGER",
-    "ALTER TABLE sessions ADD COLUMN backend_endpoint TEXT",
-    "ALTER TABLE sessions ADD COLUMN backend_auth_token TEXT",
-    "ALTER TABLE sessions ADD COLUMN nvim_socket TEXT DEFAULT NULL",
-    "ALTER TABLE pending_questions ADD COLUMN current_step INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE pending_questions ADD COLUMN answers_json_v2 TEXT NOT NULL DEFAULT '[]'",
-    "ALTER TABLE pending_questions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE sessions ADD COLUMN model_override TEXT DEFAULT NULL",
-    "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
-  ];
-
-  for (const statement of additiveColumns) {
-    try {
-      db.exec(statement);
-    } catch {
-      // Column already exists.
-    }
-  }
+  runAdditiveMigrations(db);
 }
