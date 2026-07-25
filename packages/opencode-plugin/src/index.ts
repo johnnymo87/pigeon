@@ -229,7 +229,7 @@ const plugin: Plugin = async (ctx) => {
             const parentID = session.data?.parentID
             const title = session.data?.title
 
-            sessionManager.onSessionCreated(sessionID, parentID)
+            sessionManager.onSessionCreated(sessionID, parentID, title)
 
             if (!parentID) {
               const regPromise = registerSession({
@@ -325,13 +325,13 @@ const plugin: Plugin = async (ctx) => {
 
           if (!sessionID) return
 
-          sessionManager.onSessionCreated(sessionID, parentID)
+          sessionManager.onSessionCreated(sessionID, parentID, title)
 
           if (!parentID) {
             const envInfo = await envInfoP
             // Note: session.created fires before opencode generates the title,
             // so sessionInfo.title here is usually a placeholder.
-            // Task T0.5 handles updating/refreshing titles on session.updated.
+            // Session titles are subsequently updated when session.updated events arrive.
             const regPromise = registerSession({
               sessionId: sessionID,
               cwd: ctx.directory,
@@ -358,6 +358,57 @@ const plugin: Plugin = async (ctx) => {
                 })
              sessionManager.setRegistrationPromise(sessionID, regPromise)
            }
+
+          return
+        }
+
+        if (eventType === "session.updated") {
+          const sessionInfo = props?.info as
+            | { id?: string; title?: string; parentID?: string }
+            | undefined
+
+          const sessionID = sessionInfo?.id
+          const parentID = sessionInfo?.parentID
+          const rawTitle = sessionInfo?.title
+
+          log("session.updated", { sessionID, parentID, rawTitle })
+
+          if (!sessionID) return
+          if (parentID) return
+          if (!sessionManager.isKnown(sessionID) || !sessionManager.isMainSession(sessionID)) return
+
+          const title = rawTitle?.trim() || undefined
+          if (!title) return
+          if (sessionManager.getTitle(sessionID) === title) return
+
+          sessionManager.setTitle(sessionID, title)
+
+          const envInfo = await envInfoP
+          const regPromise = registerSession({
+            sessionId: sessionID,
+            cwd: ctx.directory,
+            label,
+            title,
+            pid: envInfo.pid,
+            ppid: envInfo.ppid,
+            tty: envInfo.tty,
+            backendKind: "opencode-plugin-direct",
+            backendProtocolVersion: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            backendEndpoint: directChannel.endpoint,
+            backendAuthToken: directChannel.authToken,
+            daemonUrl,
+            log,
+          })
+            .then((result) => {
+              log("registerSession result", { sessionID, result })
+              if (result?.ok) {
+                sessionManager.onRegistered(sessionID)
+              }
+            })
+            .catch((err) => {
+              log("registerSession error:", serializeError(err))
+            })
+          sessionManager.setRegistrationPromise(sessionID, regPromise)
 
           return
         }

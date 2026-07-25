@@ -7,6 +7,7 @@ type SessionEntry = {
   lastNotifiedMessageId: string | undefined
   registrationPromise: Promise<void> | undefined
   lastSeenAt: number
+  title: string | undefined
 }
 
 export class SessionManager {
@@ -27,7 +28,7 @@ export class SessionManager {
     this.discoveryPromises.delete(sessionID)
   }
 
-  onSessionCreated(sessionID: string, parentID?: string): void {
+  onSessionCreated(sessionID: string, parentID?: string, title?: string): void {
     this.cleanupSession(sessionID)
 
     this.sessions.set(sessionID, {
@@ -36,11 +37,23 @@ export class SessionManager {
       lastNotifiedMessageId: undefined,
       registrationPromise: undefined,
       lastSeenAt: Date.now(),
+      title: title?.trim() || undefined,
     })
 
     if (!parentID) {
       this.mainSessionIds.add(sessionID)
     }
+  }
+
+  setTitle(sessionID: string, title: string | undefined): void {
+    const entry = this.sessions.get(sessionID)
+    if (!entry) return
+    entry.title = title?.trim() || undefined
+    entry.lastSeenAt = Date.now()
+  }
+
+  getTitle(sessionID: string): string | undefined {
+    return this.sessions.get(sessionID)?.title
   }
 
   setRegistrationPromise(sessionID: string, promise: Promise<void>): void {
