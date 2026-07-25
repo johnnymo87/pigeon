@@ -36,6 +36,22 @@ function getBackoff(attempts: number): number {
   return BACKOFF_SCHEDULE[Math.min(attempts, BACKOFF_SCHEDULE.length - 1)] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 120_000;
 }
 
+/**
+ * Per-chunk idempotency key. The LAST chunk keeps the bare notificationId
+ * because handleEditNotification (the multi-question wizard) looks messages up
+ * by exactly that id, and it is the chunk that carries reply_markup.
+ * Earlier chunks get a "#c{i}" suffix so worker-side dedup can suppress them
+ * on retry. See webhook.ts question-id parsing, which strips this suffix.
+ */
+export function chunkNotificationId(
+  notificationId: string | undefined,
+  index: number,
+  isLast: boolean,
+): string | undefined {
+  if (!notificationId) return undefined;
+  return isLast ? notificationId : `${notificationId}#c${index}`;
+}
+
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
@@ -145,7 +161,7 @@ export class OutboxSender {
               msg.text,
               isLast ? replyMarkup : { inline_keyboard: [] },
               undefined,
-              isLast ? notificationId : undefined,
+              chunkNotificationId(notificationId, i, isLast),
               msg.entities,
             );
 

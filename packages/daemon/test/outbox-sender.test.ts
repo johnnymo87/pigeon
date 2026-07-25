@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
-import { OutboxSender } from "../src/worker/outbox-sender";
+import { chunkNotificationId, OutboxSender } from "../src/worker/outbox-sender";
 import type { SendNotificationFn } from "../src/worker/outbox-sender";
 
 const BASE_OUTBOX_INPUT = {
@@ -277,6 +277,166 @@ describe("OutboxSender.processOnce()", () => {
 
     // Second run should have been skipped (guard flag)
     expect(callCount).toBe(1);
+  });
+
+  it("gives every chunk a stable idempotency key so the worker can dedup retries", async () => {
+    const ids: Array<string | undefined> = [];
+    let failChunk2 = true;
+    const sendNotification = vi.fn(async (...args: Parameters<SendNotificationFn>) => {
+      const text = args[2];
+      const notificationId = args[5];
+      ids.push(notificationId);
+      if (failChunk2 && text === "chunk-2") {
+        failChunk2 = false;
+        return { ok: false };
+      }
+      return { ok: true };
+    });
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      payload: JSON.stringify({
+        messages: [
+          { text: "chunk-1", entities: [] },
+          { text: "chunk-2", entities: [] },
+          { text: "chunk-3", entities: [] },
+        ],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-123",
+      }),
+    }, 1_000);
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Attempt 1: chunk-1 succeeds, chunk-2 fails -> entry marked retry
+    await sender.processOnce();
+    expect(ids).toEqual(["notif-123#c0", "notif-123#c1"]);
+
+    // Advance time past 5s backoff
+    now += 6_000;
+
+    // Attempt 2: chunk-1 succeeds, chunk-2 succeeds, chunk-3 succeeds -> entry sent
+    await sender.processOnce();
+    expect(ids).toEqual([
+      "notif-123#c0",
+      "notif-123#c1",
+      "notif-123#c0",
+      "notif-123#c1",
+      "notif-123",
+    ]);
+
+    // Every chunk got a defined notificationId
+    expect(ids.every((id) => id !== undefined)).toBe(true);
+
+    // Chunk 0's id is identical on both attempts
+    expect(ids[0]).toBe(ids[2]);
+    // Chunk 1's id is identical on both attempts
+    expect(ids[1]).toBe(ids[3]);
+  });
+
+  it("preserves bare notificationId for single-chunk entries", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "single-notif-1",
+      payload: JSON.stringify({
+        messages: [{ text: "Only chunk", entities: [] }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "single-notif-1",
+      }),
+    }, 1_000);
+
+    const sendFn = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: sendFn,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect((sendFn as ReturnType<typeof vi.fn>).mock.calls[0]![5]).toBe("single-notif-1");
+  });
+
+  it("preserves bare notificationId for the last chunk in a multi-chunk entry", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "multi-notif-1",
+      payload: JSON.stringify({
+        messages: [
+          { text: "chunk 1" },
+          { text: "chunk 2" },
+        ],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "multi-notif-1",
+      }),
+    }, 1_000);
+
+    const sendFn = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: sendFn,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0]![5]).toBe("multi-notif-1#c0");
+    expect(calls[1]![5]).toBe("multi-notif-1");
+  });
+
+  it("passes undefined notificationId for all chunks when notificationId is missing", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "no-id-notif",
+      payload: JSON.stringify({
+        messages: [{ text: "chunk 1" }, { text: "chunk 2" }],
+        replyMarkup: { inline_keyboard: [] },
+        // notificationId omitted
+      }),
+    }, 1_000);
+
+    const sendFn = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: sendFn,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    const calls = (sendFn as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0]![5]).toBeUndefined();
+    expect(calls[1]![5]).toBeUndefined();
+  });
+});
+
+describe("chunkNotificationId unit tests", () => {
+  it("returns undefined when notificationId is undefined", () => {
+    expect(chunkNotificationId(undefined, 0, false)).toBeUndefined();
+    expect(chunkNotificationId(undefined, 0, true)).toBeUndefined();
+  });
+
+  it("returns bare notificationId when isLast is true", () => {
+    expect(chunkNotificationId("notif-1", 0, true)).toBe("notif-1");
+    expect(chunkNotificationId("notif-1", 2, true)).toBe("notif-1");
+  });
+
+  it("returns #c{index} suffix when isLast is false", () => {
+    expect(chunkNotificationId("notif-1", 0, false)).toBe("notif-1#c0");
+    expect(chunkNotificationId("notif-1", 1, false)).toBe("notif-1#c1");
   });
 });
 
