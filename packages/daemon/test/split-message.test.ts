@@ -15,6 +15,21 @@ describe("splitTelegramMessage", () => {
   const plainFooter: TgMessage = { text: "FOOTER", entities: [] };
   const plainBody = (text: string): TgMessage => ({ text, entities: [] });
 
+  function hasLoneSurrogate(str: string): boolean {
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        if (i + 1 >= str.length) return true;
+        const next = str.charCodeAt(i + 1);
+        if (next < 0xdc00 || next > 0xdfff) return true;
+        i++;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   it("returns single message when body fits", () => {
     const result = splitTelegramMessage(plainHeader, plainBody("Short body"), plainFooter, 100);
     expect(result).toHaveLength(1);
@@ -167,7 +182,43 @@ describe("splitTelegramMessage", () => {
       }
     });
 
-    it("property sweep: satisfies maxLen, chunk count bounds, and entity bounds for all size combinations", () => {
+    it("never splits surrogate pairs on body hard-cut and reconstructs original body", () => {
+      const originalBodyText = "x".repeat(4085) + "😀" + "y".repeat(200);
+      const header = plainBody("Hdr");
+      const footer = plainBody("Ftr");
+      const result = splitTelegramMessage(header, plainBody(originalBodyText), footer, 4096);
+
+      expect(result.length).toBeGreaterThan(1);
+      for (const chunk of result) {
+        expect(chunk.text.length).toBeLessThanOrEqual(4096);
+        expect(hasLoneSurrogate(chunk.text)).toBe(false);
+      }
+
+      // Reconstruct body text from chunks and verify byte-for-byte equivalence
+      const reconstructedBody = result
+        .map((chunk) => {
+          const prefix = "Hdr\n\n";
+          const suffix = "\n\nFtr";
+          return chunk.text.slice(prefix.length, chunk.text.length - suffix.length);
+        })
+        .join("");
+
+      expect(reconstructedBody).toBe(originalBodyText);
+    });
+
+    it("returns without infinite loop on tiny maxLen", () => {
+      const header = plainBody("Header");
+      const body = plainBody("hello");
+      const footer = plainBody("Footer");
+      const result = splitTelegramMessage(header, body, footer, 3);
+      expect(result.length).toBeGreaterThan(0);
+      for (const chunk of result) {
+        expect(chunk.text.length).toBeLessThanOrEqual(3);
+        expect(hasLoneSurrogate(chunk.text)).toBe(false);
+      }
+    });
+
+    it("property sweep: satisfies maxLen, chunk count bounds, entity bounds, and surrogate integrity for all size combinations", () => {
       const maxLen = 4096;
       const minBodyBudget = Math.min(200, Math.floor(maxLen / 4));
       for (const headerLen of [0, 50, 4000, 4092, 4200]) {
@@ -191,6 +242,7 @@ describe("splitTelegramMessage", () => {
             expect(result.length).toBeLessThanOrEqual(expectedMaxChunks);
             for (const chunk of result) {
               expect(chunk.text.length).toBeLessThanOrEqual(maxLen);
+              expect(hasLoneSurrogate(chunk.text)).toBe(false);
               for (const entity of chunk.entities) {
                 expect(entity.offset).toBeGreaterThanOrEqual(0);
                 expect(entity.offset + entity.length).toBeLessThanOrEqual(chunk.text.length);

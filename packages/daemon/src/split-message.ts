@@ -3,6 +3,14 @@
  *
  * Each chunk is formatted as: header + "\n\n" + bodyChunk + "\n\n" + footer
  *
+ * Header and footer are truncated as needed if overhead crowds out the body budget below minBodyBudget.
+ * Header is truncated first (least load-bearing); footer is truncated second (routing metadata at top preserved).
+ *
+ * Guarantees two hard invariants:
+ * 1. Every returned chunk satisfies text.length <= maxLen.
+ * 2. Chunk count is bounded by ~ceil(bodyLength / minBodyBudget) for all inputs.
+ * 3. UTF-16 surrogate pairs (e.g. emoji) are never split across chunks or truncation boundaries.
+ *
  * Body is split at natural boundaries in priority order:
  * 1. Paragraph break (\n\n)
  * 2. Line break (\n)
@@ -66,10 +74,7 @@ export function splitTelegramMessage(
   if (maxBody > 0 && body.text.length <= maxBody) {
     result = [concatMessages([currentHeader, SEP, body, SEP, currentFooter])];
   } else {
-    let bodyChunks = splitBodyText(body.text, maxBody);
-    if (bodyChunks.length === 0) {
-      bodyChunks = [{ start: 0, end: 0 }];
-    }
+    const bodyChunks = splitBodyText(body.text, maxBody);
     result = bodyChunks.map((chunk) => {
       const chunkMsg = sliceBodyMessage(body, chunk.start, chunk.end);
       return concatMessages([currentHeader, SEP, chunkMsg, SEP, currentFooter]);
@@ -94,6 +99,8 @@ interface TextRange {
  * Split body text into ranges at natural boundaries.
  */
 function splitBodyText(text: string, maxBody: number): TextRange[] {
+  if (maxBody <= 0) return [{ start: 0, end: text.length }];
+
   const ranges: TextRange[] = [];
   let pos = 0;
 
@@ -106,6 +113,16 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
     const remaining = text.slice(pos);
     const cutPoint = findSplitPoint(remaining, maxBody);
     let chunkEnd = pos + cutPoint;
+    let nextPos = pos + cutPoint;
+
+    // Adjust chunkEnd if it cuts between a high and low surrogate
+    if (chunkEnd > pos && chunkEnd < text.length) {
+      const c = text.charCodeAt(chunkEnd - 1);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        chunkEnd--;
+        nextPos = chunkEnd;
+      }
+    }
 
     // Trim trailing separator from chunk
     let chunk = text.slice(pos, chunkEnd);
@@ -119,8 +136,8 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
 
     ranges.push({ start: pos, end: chunkEnd });
 
-    // Advance past the cut point (including separators)
-    pos = pos + cutPoint;
+    // Advance past cut point or adjusted position
+    pos = nextPos;
     // Trim leading separator or space from next chunk
     if (text.slice(pos).startsWith("\n\n")) {
       pos += 2;
@@ -138,8 +155,21 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
  * Slice a TgMessage to the character range [start, end), adjusting entity offsets.
  * Entities that start before end and finish after end are clipped to end.
  * Entities that start at or after end are dropped.
+ *
+ * Guarantees that neither start nor end splits a UTF-16 surrogate pair.
  */
 function sliceBodyMessage(body: TgMessage, start: number, end: number): TgMessage {
+  // Prevent splitting surrogate pairs at end
+  if (end > start && end < body.text.length) {
+    const c = body.text.charCodeAt(end - 1);
+    if (c >= 0xd800 && c <= 0xdbff) end--;
+  }
+  // Prevent splitting surrogate pairs at start
+  if (start > 0 && start < end) {
+    const c = body.text.charCodeAt(start);
+    if (c >= 0xdc00 && c <= 0xdfff) start++;
+  }
+
   const text = body.text.slice(start, end);
   const entities: TgEntity[] = [];
 
