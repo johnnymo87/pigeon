@@ -218,9 +218,28 @@ describe("splitTelegramMessage", () => {
       }
     });
 
+    it("returns without infinite loop when maxBody === 1 and body starts with surrogate pair", () => {
+      const result = splitTelegramMessage(plainBody(""), plainBody("😀hello"), plainBody(""), 5);
+      expect(result.length).toBeGreaterThan(0);
+      for (const chunk of result) {
+        expect(chunk.text.length).toBeLessThanOrEqual(5);
+        expect(hasLoneSurrogate(chunk.text)).toBe(false);
+      }
+    });
+
+    it("returns without infinite loop when body ends in unpaired high surrogate at tiny maxLen", () => {
+      const result = splitTelegramMessage(plainBody(""), plainBody("abc\uD83D"), plainBody(""), 5);
+      expect(result.length).toBeGreaterThan(0);
+      for (const chunk of result) {
+        expect(chunk.text.length).toBeLessThanOrEqual(5);
+        expect(hasLoneSurrogate(chunk.text)).toBe(false);
+      }
+    });
+
     it("property sweep: satisfies maxLen, chunk count bounds, entity bounds, and surrogate integrity for all size combinations", () => {
       const maxLen = 4096;
       const minBodyBudget = Math.min(200, Math.floor(maxLen / 4));
+      const EMOJI_PATTERN = "B😀code👩‍💻flag🏴󠁧󠁢";
       for (const headerLen of [0, 50, 4000, 4092, 4200]) {
         for (const footerLen of [0, 10, 100, 5000]) {
           for (const bodyLen of [0, 2, 500, 10000]) {
@@ -232,8 +251,12 @@ describe("splitTelegramMessage", () => {
               text: "F".repeat(footerLen),
               entities: footerLen > 0 ? [{ offset: 0, length: footerLen, type: "italic" }] : [],
             };
+            let bodyText = EMOJI_PATTERN.repeat(Math.ceil(bodyLen / EMOJI_PATTERN.length) + 1).slice(0, bodyLen);
+            if (bodyText.length > 0 && bodyText.charCodeAt(bodyText.length - 1) >= 0xd800 && bodyText.charCodeAt(bodyText.length - 1) <= 0xdbff) {
+              bodyText = bodyText.slice(0, -1);
+            }
             const b: TgMessage = {
-              text: "B".repeat(bodyLen),
+              text: bodyText,
               entities: bodyLen > 10 ? [{ offset: 2, length: Math.min(8, bodyLen - 2), type: "code" }] : [],
             };
             const result = splitTelegramMessage(h, b, f, maxLen);

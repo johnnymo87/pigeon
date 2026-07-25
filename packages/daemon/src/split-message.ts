@@ -6,7 +6,7 @@
  * Header and footer are truncated as needed if overhead crowds out the body budget below minBodyBudget.
  * Header is truncated first (least load-bearing); footer is truncated second (routing metadata at top preserved).
  *
- * Guarantees two hard invariants:
+ * Guarantees three hard invariants:
  * 1. Every returned chunk satisfies text.length <= maxLen.
  * 2. Chunk count is bounded by ~ceil(bodyLength / minBodyBudget) for all inputs.
  * 3. UTF-16 surrogate pairs (e.g. emoji) are never split across chunks or truncation boundaries.
@@ -115,13 +115,27 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
     let chunkEnd = pos + cutPoint;
     let nextPos = pos + cutPoint;
 
-    // Adjust chunkEnd if it cuts between a high and low surrogate
-    if (chunkEnd > pos && chunkEnd < text.length) {
+    // Adjust chunkEnd if it cuts between a high and low surrogate, or ends on an unpaired high surrogate
+    if (chunkEnd > pos) {
       const c = text.charCodeAt(chunkEnd - 1);
       if (c >= 0xd800 && c <= 0xdbff) {
         chunkEnd--;
         nextPos = chunkEnd;
       }
+    }
+
+    // Structural invariant: pos MUST strictly advance on every iteration (nextPos > pos).
+    // If maxBody === 1 and text[pos] is a high surrogate, chunkEnd was decremented to pos (empty chunk).
+    // A surrogate pair is 2 code units and indivisible; a 1-unit budget must still emit both code units
+    // to advance pos, or clamp to text.length if a trailing high surrogate is unpaired (malformed input).
+    if (chunkEnd === pos) {
+      chunkEnd = Math.min(pos + 2, text.length);
+      nextPos = chunkEnd;
+    }
+
+    // Defensive guard: guarantee pos advances under all conditions to prevent infinite loops.
+    if (nextPos <= pos) {
+      nextPos = Math.min(pos + 1, text.length);
     }
 
     // Trim trailing separator from chunk
@@ -159,12 +173,14 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
  * Guarantees that neither start nor end splits a UTF-16 surrogate pair.
  */
 function sliceBodyMessage(body: TgMessage, start: number, end: number): TgMessage {
-  // Prevent splitting surrogate pairs at end
-  if (end > start && end < body.text.length) {
+  // Prevent splitting surrogate pairs at end or leaving a trailing unpaired high surrogate
+  if (end > start) {
     const c = body.text.charCodeAt(end - 1);
     if (c >= 0xd800 && c <= 0xdbff) end--;
   }
-  // Prevent splitting surrogate pairs at start
+  // Prevent splitting surrogate pairs at start. Note: unreachable when called from splitBodyText
+  // (which only hands start = 0 or a valid high-surrogate boundary), but retained as defensive programming
+  // for general TgMessage slicing.
   if (start > 0 && start < end) {
     const c = body.text.charCodeAt(start);
     if (c >= 0xdc00 && c <= 0xdfff) start++;
