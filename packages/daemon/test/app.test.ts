@@ -249,6 +249,40 @@ describe("createApp", () => {
     expect(storage?.sessions.get("ses_trim")?.title).toBe("New Padded Title");
   });
 
+  it("clamps titles longer than 200 characters to 200 characters after trimming", async () => {
+    const app = newApp();
+    const longTitle = "a".repeat(250);
+    const expectedTitle = "a".repeat(200);
+
+    const res1 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_long",
+        notify: true,
+        title: "  " + longTitle + "  ",
+      }),
+    }));
+    expect(res1.status).toBe(200);
+    expect(storage?.sessions.get("ses_long")?.title).toBe(expectedTitle);
+    expect(storage?.sessions.get("ses_long")?.title?.length).toBe(200);
+
+    const exact200Title = "b".repeat(200);
+    const res2 = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_long",
+        event: "Stop",
+        message: "Done",
+        title: exact200Title,
+      }),
+    }));
+    expect(res2.status).toBe(202);
+    expect(storage?.sessions.get("ses_long")?.title).toBe(exact200Title);
+    expect(storage?.sessions.get("ses_long")?.title?.length).toBe(200);
+  });
+
   it("supports /sessions/enable-notify preserving backend_kind fields", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 20_000 });

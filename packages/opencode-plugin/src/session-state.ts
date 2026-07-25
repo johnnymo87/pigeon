@@ -1,3 +1,17 @@
+/**
+ * Maximum session title length (200 characters).
+ * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
+ * and to accommodate Phase 2 forum topic names (capped at 128 chars).
+ */
+export const MAX_TITLE_LENGTH = 200
+
+export function normalizeTitle(title: string | undefined): string | undefined {
+  if (!title) return undefined
+  const trimmed = title.trim()
+  if (!trimmed) return undefined
+  return trimmed.slice(0, MAX_TITLE_LENGTH)
+}
+
 const State = { Created: 0, Registering: 1, Registered: 2, Notified: 3 } as const
 type State = (typeof State)[keyof typeof State]
 
@@ -37,7 +51,7 @@ export class SessionManager {
       lastNotifiedMessageId: undefined,
       registrationPromise: undefined,
       lastSeenAt: Date.now(),
-      title: title?.trim() || undefined,
+      title: normalizeTitle(title),
     })
 
     if (!parentID) {
@@ -48,7 +62,7 @@ export class SessionManager {
   setTitle(sessionID: string, title: string | undefined): void {
     const entry = this.sessions.get(sessionID)
     if (!entry) return
-    entry.title = title?.trim() || undefined
+    entry.title = normalizeTitle(title)
     entry.lastSeenAt = Date.now()
   }
 

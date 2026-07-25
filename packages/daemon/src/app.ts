@@ -77,8 +77,18 @@ function maybeNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Maximum session title length (200 characters).
+ * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
+ * and to accommodate Phase 2 forum topic names (capped at 128 chars).
+ */
+const MAX_TITLE_LENGTH = 200;
+
 function parseTitle(val: unknown): string | undefined {
-  return typeof val === "string" && val.trim() !== "" ? val.trim() : undefined;
+  if (typeof val !== "string") return undefined;
+  const trimmed = val.trim();
+  if (trimmed === "") return undefined;
+  return trimmed.slice(0, MAX_TITLE_LENGTH);
 }
 
 interface AppOptions {

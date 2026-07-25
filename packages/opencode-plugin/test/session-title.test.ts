@@ -32,6 +32,21 @@ describe("Session Title Management", () => {
       expect(manager.getTitle("session-1")).toBe("New Refreshed Title")
     })
 
+    test("setTitle clamps title longer than 200 characters after trimming", () => {
+      manager.onSessionCreated("session-1")
+      const longTitle = "  " + "x".repeat(300) + "  "
+      manager.setTitle("session-1", longTitle)
+      expect(manager.getTitle("session-1")).toBe("x".repeat(200))
+      expect(manager.getTitle("session-1")?.length).toBe(200)
+    })
+
+    test("onSessionCreated clamps initial title longer than 200 characters after trimming", () => {
+      const longTitle = "  " + "y".repeat(250) + "  "
+      manager.onSessionCreated("session-1", undefined, longTitle)
+      expect(manager.getTitle("session-1")).toBe("y".repeat(200))
+      expect(manager.getTitle("session-1")?.length).toBe(200)
+    })
+
     test("setTitle with empty/whitespace string sets title to undefined", () => {
       manager.onSessionCreated("session-1", undefined, "Initial Title")
       manager.setTitle("session-1", "   ")
@@ -177,6 +192,116 @@ describe("Session Title Management", () => {
       })
 
       expect(registerSessionSpy).toHaveBeenCalledTimes(0)
+    })
+
+    test("session.updated clamps title longer than 200 characters and debounces subsequent updates", async () => {
+      const mockCtx = createMockCtx()
+      const hooks = await plugin(mockCtx)
+
+      await hooks.event!({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "ses_1", title: "Title A" },
+          },
+        } as any,
+      })
+
+      registerSessionSpy.mockClear()
+
+      const longTitle = "  " + "z".repeat(250) + "  "
+      const expectedClampedTitle = "z".repeat(200)
+
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", title: longTitle },
+          },
+        } as any,
+      })
+
+      expect(registerSessionSpy).toHaveBeenCalledTimes(1)
+      expect(registerSessionSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          sessionId: "ses_1",
+          title: expectedClampedTitle,
+        })
+      )
+
+      registerSessionSpy.mockClear()
+
+      // Second session.updated with same long title should debounce because normalized title is identical
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", title: longTitle },
+          },
+        } as any,
+      })
+
+      expect(registerSessionSpy).not.toHaveBeenCalled()
+    })
+
+    test("session.updated log call only fires when title actually changes", async () => {
+      const logSpy = vi.fn()
+      const mockCtx = createMockCtx()
+      mockCtx.client.app.log = logSpy
+
+      const hooks = await plugin(mockCtx)
+
+      // Create session
+      await hooks.event!({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "ses_1", title: "Title A" },
+          },
+        } as any,
+      })
+
+      logSpy.mockClear()
+
+      // 1. session.updated with same title Title A (guard fails: title unchanged) -> should NOT log session.updated
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", title: "Title A" },
+          },
+        } as any,
+      })
+
+      const sessionUpdatedLogs1 = logSpy.mock.calls.filter(call => call[0]?.body?.message === "session.updated")
+      expect(sessionUpdatedLogs1.length).toBe(0)
+
+      // 2. session.updated with child session parentID set (guard fails: parentID) -> should NOT log session.updated
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", parentID: "parent_123", title: "Title B" },
+          },
+        } as any,
+      })
+
+      const sessionUpdatedLogs2 = logSpy.mock.calls.filter(call => call[0]?.body?.message === "session.updated")
+      expect(sessionUpdatedLogs2.length).toBe(0)
+
+      // 3. session.updated with new title Title B -> guard passes -> SHOULD log session.updated
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", title: "Title B" },
+          },
+        } as any,
+      })
+
+      const sessionUpdatedLogs3 = logSpy.mock.calls.filter(call => call[0]?.body?.message === "session.updated")
+      expect(sessionUpdatedLogs3.length).toBe(1)
+      expect(sessionUpdatedLogs3[0]![0].body.extra.data).toEqual({ sessionID: "ses_1", parentID: undefined, rawTitle: "Title B" })
     })
 
     test("session.updated ignores unknown session", async () => {

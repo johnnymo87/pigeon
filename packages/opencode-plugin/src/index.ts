@@ -10,7 +10,7 @@ import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
 import { TokenTracker, ProviderCache, type MessageTokenInfo } from "./token-tracker"
-import { SessionManager } from "./session-state"
+import { SessionManager, normalizeTitle } from "./session-state"
 import { createSwarmReadTool, SWARM_READ_TOOL_NAME } from "./swarm-tool"
 import { createSwarmSendTool, SWARM_SEND_TOOL_NAME } from "./swarm-send-tool"
 import { createSwarmListTool, SWARM_LIST_TOOL_NAME } from "./swarm-list-tool"
@@ -372,15 +372,15 @@ const plugin: Plugin = async (ctx) => {
           const parentID = sessionInfo?.parentID
           const rawTitle = sessionInfo?.title
 
-          log("session.updated", { sessionID, parentID, rawTitle })
-
           if (!sessionID) return
           if (parentID) return
           if (!sessionManager.isKnown(sessionID) || !sessionManager.isMainSession(sessionID)) return
 
-          const title = typeof rawTitle === "string" ? rawTitle.trim() || undefined : undefined
+          const title = typeof rawTitle === "string" ? normalizeTitle(rawTitle) : undefined
           if (!title) return
           if (sessionManager.getTitle(sessionID) === title) return
+
+          log("session.updated", { sessionID, parentID, rawTitle })
 
           sessionManager.setTitle(sessionID, title)
 
