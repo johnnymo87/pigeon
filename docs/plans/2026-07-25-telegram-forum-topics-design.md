@@ -5,8 +5,11 @@ Scope: `packages/worker` (topic manager, inbound routing), `packages/daemon`
 (session title storage, payload fields, outbox fixes),
 `packages/opencode-plugin` (title capture)
 
-Revision 2, after adversarial review. Findings that changed the design are noted
-inline as **[rev2]**.
+Revision 3. Findings from the first adversarial review (of this design) are noted
+inline as **[rev2]**; findings from the second (of the derived implementation
+plan, which surfaced contradictions in this document) as **[rev3]**.
+
+Companion: `docs/plans/2026-07-25-telegram-forum-topics-plan.md`.
 
 ## Problem
 
@@ -89,9 +92,20 @@ be re-muted each time it gets a fresh session. Inherent to session-granularity.
 — `deleteForumTopic` removes the topic *and all its messages* — so 30 days buys
 a comfortable scrollback window while capping the visible list at ~400 topics.
 
-Session end is already well covered: `DELETE /sessions/:id` fires on graceful
-exit, and the hourly session reaper (`SESSION_TTL_MS` = 1 week,
+Session end is *mostly* covered: `DELETE /sessions/:id` fires on graceful exit,
+and the hourly session reaper (`SESSION_TTL_MS` = 1 week,
 `daemon/src/session-reaper.ts:18-49`) catches ungraceful deaths.
+
+**[rev3] One hole: dead-session cleanup leaks topics permanently.** When command
+delivery finds the session gone in opencode-serve, the daemon calls
+`storage.sessions.delete()` *without* unregistering from the worker
+(`command-ingest.ts:508`, `:555`; the only `unregisterSession` callers are
+`session-reaper.ts:34` and `index.ts:395`). Once the local row is gone the reaper
+can never see that session, so its topic is never closed and never reaped — the
+30-day lifecycle and the ~400-topic cap silently fail for exactly the crash-prone
+sessions that generate the most topics. The fix belongs in the **worker**, not the
+daemon: the hourly cron closes topics whose `sessions` row is absent or stale.
+That also covers a daemon crash, which no daemon-side fix can.
 
 **[rev2] Reopen on resurrection.** Sessions come back from the dead by at least
 three routes: `/current-state` re-registers every surveyed session
@@ -153,10 +167,13 @@ fixes, all small, all addressing verified bugs rather than speculative load:
    (`outbox-sender.ts:139-163`). Only the last chunk carries `notificationId`
    (`:148`), and worker dedup keys on it (`notifications.ts:197-205`). So a
    failure on chunk 2 of 3 re-sends chunk 1, which has no idempotency key →
-   duplicate message → more traffic into an already-throttled chat. Give every
-   chunk an id, `{notificationId}:c{i}`. Note the inbound parser at
-   `webhook.ts:334-340` splits `q:{sessionId}:{requestId}` and must tolerate the
-   `:c{i}` suffix. This is a pre-existing bug that a 20/min ceiling promotes from
+   duplicate message → more traffic into an already-throttled chat.    Give every
+   chunk an id. The last chunk keeps the bare `notificationId` (the wizard's
+   `handleEditNotification` looks messages up by exactly that id); earlier chunks
+   get a **`#c{i}`** suffix. `#` and not `:`, because notification ids are
+   `:`-delimited and both `webhook.ts:336-339` and `resolveCallbackSession`
+   (`:374`) parse by splitting on `:`. The inbound `q:` parser must strip
+   `/#c\d+$/`. This is a pre-existing bug that a 20/min ceiling promotes from
    rare to routine.
 2. **429 never falls back to General.** Posting the message somewhere else burns
    another call against the same exhausted budget and misplaces it. A 429 on any
@@ -165,6 +182,13 @@ fixes, all small, all addressing verified bugs rather than speculative load:
    `retry_after` across the *whole outbox*, not just the failing entry.
    Today a `retry_after` reschedules one entry while the other four in the batch
    keep firing.
+4. **`FallbackNotifier` must not fall back on a 429.** `FallbackNotifier`
+   (`daemon/src/index.ts:334`, `notification-service.ts:651-657`) catches *any*
+   worker-send failure and re-sends directly to Telegram. Once the worker starts
+   returning 429, that is exactly the forbidden behavior — burning another call
+   on an already-exhausted chat budget. `retryAfter` must propagate through
+   `WorkerNotificationSender` so the fallback is skipped for rate limits.
+   Volume on this path is low (watchdog, `/alert`), but it is the same rule.
 
 **Deliberately deferred: a chat-level `next_send_at` gate in D1.** The reviewer
 argued for it on the grounds that two daemons at 5 entries per 5s tick have a
@@ -201,16 +225,25 @@ retry.
   `title ?? label ?? sessionId.slice(0,8)`, replacing three duplicated
   precedence expressions in `app.ts` (`:377`, `:474`, `:491`) and four in
   `notification-service.ts` (`:427`, `:473`, `:556`, `:625`).
-- **Worker.** No schema change. The title rides in the `label` field newly added
-  to the `POST /notifications/send` body.
+- **Worker.** No schema change. The title arrives per-notification on the
+  `POST /notifications/send` body — see the `dir` + `title` fields below.
 
 **[rev2] Dropped claim.** Revision 1 asserted Phase 0 incidentally fixes the bug
 where `/current-state` writes the real title into the worker's `sessions.label`
 and the next `/session-start` clobbers it back to the basename. It does not:
 plugin registration happens before a title exists, and nothing re-registers on
-title change. The bug persists and is now harmless — topic names come from the
-per-notification `label`, so the worker's `sessions.label` column is not
-load-bearing for anything in this design.
+title change. The bug persists and is now harmless — everything topic-related
+comes from per-notification fields, so the worker's `sessions.label` column is
+not load-bearing for anything in this design.
+
+**[rev3] Corollary: the worker needs `dir` *and* `title` as separate fields.**
+An earlier revision said the title "rides in the `label` field", which
+contradicted the topic-name format below — `{dirBasename} · {title}` has no
+basename source once `label` means "title", and the worker's `sessions.label` is
+the very column just disclaimed as corrupted (`/current-state` overwrites it with
+titles at `current-state-ingest.ts:96` → `sessions.ts:76-79`). Fifteen `mono`
+worktrees would render `Fix auth test · Fix auth test`. The daemon holds both
+values after Phase 0, so it sends both.
 
 ### New D1 table
 
@@ -274,8 +307,18 @@ reservation is cheap insurance.
 
 ### Outbound
 
-`POST /notifications/send` gains two fields: `label` (the session title) and
-**[rev2]** `threaded: boolean`.
+`POST /notifications/send` gains three fields: **[rev3]** `title` (the opencode
+session title) and `dir` (the directory basename, from the daemon's
+`sessions.label`), plus **[rev2]** `threaded: boolean`.
+
+**[rev3]** These must be threaded through the *outbox* payload, not just the
+`poller.sendNotification` signature. Stop and question notifications — the
+notifications that actually create topics — are enqueued as
+`{messages, replyMarkup, notificationId}` (`app.ts:385-390`, `:498-502`) and
+`OutboxSender` parses exactly those keys (`outbox-sender.ts:113-121`). Without
+adding `title`/`dir`/`threaded` at both enqueue sites and in the sender's parse,
+the worker receives a payload whose new fields are never populated on the primary
+path.
 
 **[rev2] `/current-state` must not mint topics.** Revision 1 claimed
 `/current-state` "stays global." It does not: its cards go through
@@ -370,13 +413,23 @@ The bot cannot create a supergroup or enable forum mode, so there is a one-time
 manual step:
 
 1. Create a supergroup → Settings → enable **Topics**.
-2. Add the bot, promote to admin with `can_manage_topics`,
-   `can_delete_messages`, `can_pin_messages`. Admin status also bypasses privacy
-   mode, so no BotFather `/setprivacy` change is required.
+2. Add the bot, promote to admin with `can_manage_topics` and
+   `can_delete_messages`. Admin status also bypasses privacy mode, so no
+   BotFather `/setprivacy` change is required. (**[rev3]** `can_pin_messages` is
+   *not* needed — nothing in this design pins, and `unpinAllForumTopicMessages`
+   is unused.)
 3. Note the new chat id (negative, `-100…`).
 
 Rollout is decoupled from that setup by a worker flag `TELEGRAM_TOPICS_ENABLED`:
 
+0. **[rev3] Apply the additive D1 DDL first, before deploying any code.** The new
+   `commands.message_thread_id` column is referenced *unconditionally* by
+   `queueCommand`'s INSERT and `pollNextCommand`'s SELECT (`d1-ops.ts:73-81`,
+   `:119-131`) — the feature flag gates behavior, not SQL text. Deploying before
+   the `ALTER TABLE` means the first webhook command from any machine fails with
+   `no such column` and command ingestion is dead until someone notices.
+   Additive DDL is backwards-compatible with the currently-deployed code, so
+   DDL-first is safe in both directions.
 1. Deploy worker + daemon with the flag **off**. Behavior identical to today,
    except Phase 0 titles now appear in headers and the outbox chunk-duplication
    bug is fixed.

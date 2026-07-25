@@ -8,7 +8,9 @@
 
 **Tech Stack:** TypeScript, vitest everywhere. Worker: Cloudflare Workers + D1, tested via `cloudflare:test` (miniflare) with real D1 and `fetchMock` for Telegram. Daemon: Node + `better-sqlite3`. Plugin: `@opencode-ai/plugin`.
 
-**Design doc:** `docs/plans/2026-07-25-telegram-forum-topics-design.md` (revision 2). Read it before starting any phase — it carries the rationale, the verified-bug evidence, and the deferred decisions.
+**Design doc:** `docs/plans/2026-07-25-telegram-forum-topics-design.md` (**revision 3**). Read it before starting any phase — it carries the rationale, the verified-bug evidence, and the deferred decisions.
+
+**Review history:** this plan is post-second-adversarial-review. Findings from that review are marked **[rev2-plan]** where they changed a task, so a future reviewer can see what was already litigated.
 
 ---
 
@@ -57,6 +59,12 @@ npm run --workspace @pigeon/opencode-plugin test
 
 Single test file: `npx vitest run test/<file>.test.ts` from inside the package dir.
 
+**Test-helper idioms** (the sketches below are illustrative; these are the real ones):
+
+- Daemon storage tests: `createStorage()`, not `createTestStorage()` — see `packages/daemon/test/storage.test.ts:4`.
+- Daemon app tests: `await app(new Request(url, {...}))`, **not** supertest — see `packages/daemon/test/app.test.ts:45`.
+- `OutboxSender` takes an injected `nowFn` (`outbox-sender.ts:27,53`), so time-dependent tests need **no fake timers**; drive a mutable `now` variable as `outbox-sender.test.ts:39` already does.
+
 ---
 
 ## Progress Tracker
@@ -64,8 +72,8 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 ### Phase 0 — Session titles (ships dark)
 
 - [ ] T0.1 Daemon: `title` column + storage plumbing
-- [ ] T0.2 Daemon: `/session-start` accepts `title`
-- [ ] T0.3 Daemon: `displayName()` helper replaces 7 duplicated precedence expressions
+- [ ] T0.2 Daemon: `/session-start` accepts `title` (incl. don't-clobber semantics)
+- [ ] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions
 - [ ] T0.4 Plugin: capture title from `session.get()` at registration
 - [ ] T0.5 Plugin: `session.updated` handler keeps the title fresh
 - [ ] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title`
@@ -74,33 +82,43 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
 - [ ] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender`
-- [ ] T1.2 Worker: `q:` notification-id parsing tolerates the chunk suffix
-- [ ] T1.3 Worker: surface Telegram's `retry_after` as a 429 response
-- [ ] T1.4 Daemon: global outbox pause on `retry_after`
-- [ ] T1.5 Worker: extract a central Telegram client module
+- [ ] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix
+- [ ] T1.3 Worker: extract a central Telegram client module
+- [ ] T1.4 Worker: map `rate_limited` to a 429 response
+- [ ] T1.5 Daemon: global outbox pause on `retry_after` + `FallbackNotifier` skip
 - [ ] T1.6 Daemon: convert `poller.sendNotification` to an options object
 - [ ] **Checkpoint 1** — full test + typecheck, deploy, adversarial review of the Phase 0+1 diff
 
 ### Phase 2 — Topics
 
+*Outbound:*
+
 - [ ] T2.1 Worker: `topics` table (schema file + test schema array)
-- [ ] T2.2 Worker: `topics.ts` repo module
-- [ ] T2.3 Worker: reservation protocol + `createForumTopic`
-- [ ] T2.4 Worker: `label` + `threaded` on the send payload; wire topic resolution
-- [ ] T2.5 Worker: reopen-on-closed
-- [ ] T2.6 Worker: stale-thread recovery
-- [ ] T2.7 Worker: non-429 fallback to General, 429 propagates
-- [ ] T2.8 Worker: media sends pass `message_thread_id`
-- [ ] T2.9 Worker: close topic on session unregister
-- [ ] T2.10 Worker: reap closed topics in the hourly cron
-- [ ] T2.11 Daemon: `/current-state` cards send `threaded: false`
-- [ ] T2.12 Worker: inbound topic-membership resolution + service-message guard
-- [ ] T2.13 Worker + daemon: `message_thread_id` round-trip on commands
-- [ ] T2.14 Worker: webhook confirmations echo `message_thread_id`
-- [ ] T2.15 Worker: bare slash commands resolve via topic
-- [ ] T2.16 Worker: `TELEGRAM_TOPICS_ENABLED` flag
-- [ ] T2.17 Docs: migration runbook + `worker-deployment` skill update
-- [ ] **Checkpoint 2** — adversarial review, then execute the migration runbook
+- [ ] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)**
+- [ ] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)`
+- [ ] T2.4 Worker: forum methods + topic manager with reservation protocol
+- [ ] T2.5 Daemon + worker: `title`/`dir`/`threaded` end-to-end **through the outbox**
+- [ ] T2.6 Worker: reopen-on-closed
+- [ ] T2.7 Worker: stale-thread recovery
+- [ ] T2.8 Worker: non-429 fallback to General, 429 propagates
+- [ ] T2.9 Worker: media sends pass `message_thread_id`
+- [ ] **Checkpoint 2a** — outbound complete; flag-off byte-equivalence; deploy dark
+
+*Lifecycle + inbound:*
+
+- [ ] T2.10 Worker: close topic on session unregister
+- [ ] T2.11 Worker: cron reaps closed topics **and closes orphaned ones**
+- [ ] T2.12 Daemon: `/current-state` cards send `threaded: false`
+- [ ] T2.13 Worker: inbound topic-membership resolution + service-message guard
+- [ ] T2.14 Worker + daemon: `message_thread_id` round-trip on commands
+- [ ] **Checkpoint 2b** — inbound + round-trip verified across all command types
+
+*Polish + migration:*
+
+- [ ] T2.15 Worker: webhook confirmations echo `message_thread_id`
+- [ ] T2.16 Worker: bare slash commands resolve via topic
+- [ ] T2.17 Docs: migration runbook + skill updates
+- [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
 
 ---
 
@@ -117,16 +135,14 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 **Files:**
 - Modify: `packages/daemon/src/storage/schema.ts:103-113` (additive migration list)
 - Modify: `packages/daemon/src/storage/types.ts` (`SessionRecord`, `UpsertSessionInput`)
-- Modify: `packages/daemon/src/storage/repos.ts` (`asSession`, upsert SQL)
+- Modify: `packages/daemon/src/storage/repos.ts` (`asSession` `:23-44`, upsert SQL `:83-125`)
 - Test: `packages/daemon/test/storage.test.ts`
 
 **Step 1: Write the failing test**
 
-Add to `packages/daemon/test/storage.test.ts`, following the existing session-upsert test style in that file:
-
 ```typescript
 it("persists and returns session title", () => {
-  const storage = createTestStorage();
+  const storage = createStorage(":memory:");   // match the helper used at storage.test.ts:4
   storage.sessions.upsert({
     sessionId: "ses_title",
     cwd: "/home/dev/projects/pigeon",
@@ -138,7 +154,7 @@ it("persists and returns session title", () => {
 });
 
 it("leaves title null when not supplied", () => {
-  const storage = createTestStorage();
+  const storage = createStorage(":memory:");
   storage.sessions.upsert({ sessionId: "ses_notitle", cwd: "/tmp", notify: true });
   expect(storage.sessions.get("ses_notitle")?.title).toBeNull();
 });
@@ -147,11 +163,11 @@ it("leaves title null when not supplied", () => {
 **Step 2: Run test to verify it fails**
 
 Run: `npm run --workspace @pigeon/daemon test -- storage`
-Expected: FAIL — `title` is not a known property / returns `undefined`.
+Expected: FAIL — `title` is not a known property on `UpsertSessionInput`.
 
 **Step 3: Implement**
 
-`schema.ts` — append to the `additiveColumns` array (order matters only in that it must be last, matching the existing convention of appending):
+`schema.ts` — append to the `additiveColumns` array:
 
 ```typescript
 "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
@@ -159,12 +175,13 @@ Expected: FAIL — `title` is not a known property / returns `undefined`.
 
 `storage/types.ts` — add `title: string | null;` to `SessionRecord` and `title?: string | null;` to `UpsertSessionInput`.
 
-`storage/repos.ts` — add `title: row.title ?? null` to `asSession()`, and add the column to the upsert statement. **Follow the existing existing-value-fallback idiom** used for `label` (`COALESCE`-style: an absent `title` must not clobber a stored one).
+`storage/repos.ts` — add `title: row.title ?? null` to `asSession()`, add the column to the INSERT list, and add `title = excluded.title` to the ON CONFLICT clause.
+
+> **[rev2-plan] Correction.** An earlier draft of this task said to "follow the existing COALESCE-style existing-value-fallback idiom for `label`" in `repos.ts`. **No such idiom exists there** — `repos.ts:94` is a bare `label = excluded.label`, and the don't-clobber logic lives caller-side at `app.ts:236`. Do the same for `title`: the repo overwrites unconditionally, and **T0.2 owns the don't-clobber semantics and its test.** Do not invent a COALESCE here; it would diverge this column from every other one.
 
 **Step 4: Run test to verify it passes**
 
-Run: `npm run --workspace @pigeon/daemon test -- storage`
-Expected: PASS. Also run the full daemon suite — the upsert SQL is shared by many tests.
+Run: `npm run --workspace @pigeon/daemon test -- storage`, then the full daemon suite — the upsert SQL is shared by many tests.
 
 **Step 5: Commit**
 
@@ -176,53 +193,65 @@ git commit -m "feat(daemon): store opencode session title alongside label"
 ### Task T0.2: Daemon `/session-start` accepts `title`
 
 **Files:**
-- Modify: `packages/daemon/src/app.ts:218-262` (the `/session-start` handler)
+- Modify: `packages/daemon/src/app.ts:218-262` (the `/session-start` handler; the upsert at `:229-255`)
 - Test: `packages/daemon/test/app.test.ts`
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing test** (note the real request idiom — `app(new Request(...))`, not supertest):
 
 ```typescript
 it("stores title from /session-start", async () => {
-  const res = await request(app).post("/session-start").send({
-    session_id: "ses_t2",
-    notify: true,
-    cwd: "/home/dev/projects/pigeon",
-    label: "pigeon",
-    title: "Fix flaky auth test",
-  });
+  const res = await app(new Request("http://d/session-start", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      session_id: "ses_t2", notify: true,
+      cwd: "/home/dev/projects/pigeon", label: "pigeon",
+      title: "Fix flaky auth test",
+    }),
+  }));
   expect(res.status).toBe(200);
   expect(storage.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
 });
 
 it("does not clobber a stored title when /session-start omits it", async () => {
-  // seed with a title, then re-register without one
-  ...
-  expect(storage.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+  // register with a title, then re-register without one (the real sequence:
+  // session.updated sets a title, then a late re-registration omits it)
+  // assert the title survives
 });
 ```
 
-Match the existing supertest/fetch idiom already used in `app.test.ts`.
+The second test is the one that matters — it is the behavior T0.1 deliberately did not implement.
 
-**Step 2: Run to verify it fails.** Expected: `title` is `null`.
+**Step 2: Run to verify it fails.** Expected: first test gives `null`; second gives `null` after re-registration.
 
-**Step 3: Implement.** In the upsert at `app.ts:229-255`, add `title` using the *same* precedence idiom as `label` at `:236` — `body.title` if a non-empty string, else `existing.title`.
+**Step 3: Implement.** In the upsert, add `title` using the *same* expression shape as `label` at `app.ts:236`:
 
-**Step 4: Run tests.** `npm run --workspace @pigeon/daemon test -- app`
+```typescript
+title: (typeof body.title === "string" && body.title !== "" ? body.title : undefined) ?? existing?.title,
+```
+
+**Step 4: Run.** `npm run --workspace @pigeon/daemon test -- app`
 
 **Step 5: Commit**
 
 ```bash
-git commit -am "feat(daemon): accept title on /session-start"
+git commit -am "feat(daemon): accept title on /session-start without clobbering"
 ```
 
-### Task T0.3: `displayName()` helper replaces duplicated precedence
+### Task T0.3: `displayName()` replaces 8 duplicated precedence expressions
 
 **Files:**
-- Modify: `packages/daemon/src/notification-service.ts` (add helper; use at `:427`, `:473`, `:556`, `:625`)
-- Modify: `packages/daemon/src/app.ts` (use at `:377`, `:474`, `:491`)
+- Modify: `packages/daemon/src/notification-service.ts` — add helper; widen `SessionLike` (`:18-22`); use at `:427`, `:473`, `:556`, `:625`
+- Modify: `packages/daemon/src/app.ts` — use at `:377`, `:474`, `:491`
+- Modify: `packages/daemon/src/worker/command-ingest.ts:184` — **the 8th site**
 - Test: `packages/daemon/test/notification-service.test.ts`
 
-**Why a helper:** the expression `label || session.label || sessionId.slice(0,8)` is currently duplicated **seven** times across two files. Adding a third input to seven copies is how bugs are born. DRY it first.
+**Why a helper:** the expression is currently duplicated **eight** times across three files. Adding a third input to eight copies is how bugs are born. DRY it first.
+
+> **[rev2-plan] Two additions a prior draft missed.**
+>
+> 1. **`command-ingest.ts:184`** is `session.label || session.sessionId.slice(0, 8)` and it names the **wizard's subsequent steps**. Miss it and a multi-question wizard shows the title on step 1 and the directory basename on steps 2+.
+> 2. **`SessionLike` (`notification-service.ts:18-22`) has no `title` field** — it is `{ sessionId, label, cwd }`. The four `notification-service.ts` replacements cannot receive a title until this type is widened, and every construction site of a `SessionLike` must then supply it. Because `title` will be optional, **the compiler will not catch a missed site** — it will silently keep showing basenames. Grep for every `SessionLike` construction and fix each.
 
 **Step 1: Write the failing test**
 
@@ -260,9 +289,9 @@ export function displayName(input: {
 }
 ```
 
-Then replace all seven call sites. **Do this mechanically and verify each** — `app.ts:377` currently reads `label || session.label || sessionId.slice(0,8)`; it becomes `displayName({ title: session.title, label: label || session.label, sessionId })`. Note the request-supplied `label` still wins over the stored one.
+Then replace all eight call sites. `app.ts:377` currently reads `label || session.label || sessionId.slice(0,8)`; it becomes `displayName({ title: session.title, label: label || session.label, sessionId })` — the request-supplied `label` still wins over the stored one.
 
-**Step 4: Run the full daemon suite.** Formatter snapshots may need updating — inspect each diff and confirm it is the intended title change, not an accident.
+**Step 4: Run the full daemon suite.** Formatter assertions will change — inspect each diff and confirm it is the intended title change, not an accident.
 
 **Step 5: Commit**
 
@@ -277,16 +306,16 @@ git commit -am "refactor(daemon): extract displayName(), prefer session title in
 - Modify: `packages/opencode-plugin/src/daemon-client.ts:113-130` (`registerSession` body)
 - Test: `packages/opencode-plugin/test/daemon-client.test.ts`
 
-**Step 1: Write the failing test** in `daemon-client.test.ts`, asserting `registerSession({ ..., title: "Fix auth" })` puts `title` in the POST body and omits the key entirely when undefined (match how `label` is handled).
+**Step 1: Write the failing test** asserting `registerSession({ ..., title: "Fix auth" })` puts `title` in the POST body and omits the key entirely when undefined (mirror how `label` is handled).
 
 **Step 2: Run to verify it fails.**
 
 **Step 3: Implement.**
 - `daemon-client.ts`: add `title?: string` to the options type and `...(title ? { title } : {})` to the body.
-- `index.ts:228-231`: `const session = await ctx.client.session.get(...)` already runs — capture `session.data?.title` and pass it to the `registerSession` call at `:234`.
+- `index.ts:228-231`: `session.get()` already runs — capture `session.data?.title` and pass it to the `registerSession` call at `:234`. The `catch` fallback at `:259-286` has no session object, so it passes no title.
 - `index.ts:314-318` (`session.created`): `sessionInfo.title` is already declared in the local narrowing type but unused — pass it at `:329`.
 
-**Caveat to encode in a comment:** `session.created` fires *before* opencode generates the title, so this value is usually a placeholder. T0.5 is what makes it correct. Do not delete T0.5 as redundant.
+**Caveat to encode as a code comment:** `session.created` fires *before* opencode generates the title, so this value is usually a placeholder. T0.5 is what makes it correct. Do not delete T0.5 as redundant.
 
 **Step 4: Run.** `npm run --workspace @pigeon/opencode-plugin test`
 
@@ -300,23 +329,24 @@ git commit -am "feat(plugin): send opencode session title on registration"
 
 **Files:**
 - Modify: `packages/opencode-plugin/src/index.ts` (event dispatcher, `:307-627`)
-- Test: `packages/opencode-plugin/test/` — new `session-title.test.ts`
+- Modify: `packages/opencode-plugin/src/session-state.ts` (hold the title — see below)
+- Test: new `packages/opencode-plugin/test/session-title.test.ts`
 
 **Verified prerequisite:** `EventSessionUpdated` is a member of the SDK `Event` union (`node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts:499-504`, union at `:602`) and the plugin `event` hook receives the full union (`node_modules/@opencode-ai/plugin/dist/index.d.ts:109-110`). These events do reach plugins.
 
-**Step 1: Write the failing test.** Assert that dispatching a `session.updated` event whose `info.title` differs from the last-seen title triggers exactly one `registerSession` call, and that dispatching the *same* title again triggers none (debounce — opencode emits `session.updated` frequently for reasons unrelated to the title).
+> **[rev2-plan] Where the title lives matters.** T0.6 needs to read the *current* title at notify time, from a different handler. Do **not** keep it in a `Map` private to this handler's closure — store it on `sessionManager` (`session-state.ts`) with `setTitle(sessionID, title)` / `getTitle(sessionID)`. T0.6 depends on this.
+
+**Step 1: Write the failing test.** Assert that dispatching `session.updated` with a title different from the last-seen one triggers exactly one `registerSession` call, and dispatching the *same* title again triggers none. The debounce is required: opencode emits `session.updated` frequently for reasons unrelated to the title.
 
 **Step 2: Run to verify it fails.**
 
-**Step 3: Implement.** Add a handler that:
+**Step 3: Implement.** A handler that:
 - reads `props.info` as `{ id?: string; title?: string; parentID?: string }`
-- ignores child sessions (`parentID` set) and unknown sessions
-- keeps a `Map<sessionID, string>` of last-sent titles; returns early if unchanged
-- calls the existing `registerSession` (the daemon-side upsert is idempotent, so no new endpoint is needed)
+- ignores child sessions (`parentID` set) and sessions `sessionManager` does not know
+- returns early if `sessionManager.getTitle(id) === title`
+- otherwise `setTitle` and call the existing `registerSession` (the daemon upsert is idempotent, so no new endpoint is needed)
 
-Reuse `sessionManager` for known-session checks rather than adding parallel state.
-
-**Step 4: Run.** Both the new test and the full plugin suite.
+**Step 4: Run.** New test plus the full plugin suite.
 
 **Step 5: Commit**
 
@@ -327,13 +357,16 @@ git commit -m "feat(plugin): refresh session title on session.updated"
 ### Task T0.6: `/stop` and `/question-asked` carry `title`
 
 **Files:**
-- Modify: `packages/opencode-plugin/src/daemon-client.ts:158-169` (`notifyStop`), `:195-205` + `:257-267` (question payloads)
+- Modify: `packages/opencode-plugin/src/daemon-client.ts:158-169` (`notifyStop`), `:195-205` (`notifyQuestionAsked`), `:257-267` (`sendQuestionAsked`)
+- Modify: `packages/opencode-plugin/src/index.ts` — **every** notify call site: `:396-405` (session.idle), `:490-498` (session.error), `:561-568` (stop-flush before a question), `:597-606` (retry), plus the question paths around `:541-546`
 - Modify: `packages/daemon/src/app.ts:326-404` (`/stop`), `:406-519` (`/question-asked`)
 - Test: `packages/opencode-plugin/test/daemon-client.test.ts`, `packages/daemon/test/app.test.ts`
 
-**Why:** registration-time title can be stale (a session is registered once but notifies many times). Carrying `title` on each notification is what makes the header — and later the topic name — track the live title.
+**Why:** registration-time title is stale — a session registers once but notifies many times. Carrying `title` per notification is what makes the header, and later the topic name, track the live title.
 
-**Steps:** same TDD shape. Plugin sends `title` alongside the existing `label`; the daemon handlers pass it into `displayName()` with request-supplied values winning over stored ones, and persist it back to the `sessions` row so `/current-state` and topic naming see it too.
+> **[rev2-plan] The mechanism must be named, not implied.** Those call sites currently pass the module-scope `label` closure from `index.ts:209`. They must additionally pass `sessionManager.getTitle(sessionID)` (from T0.5). A prior draft listed only `daemon-client.ts` and `app.ts` and would have shipped a `title` field that was always `undefined` on the notification path.
+
+**Steps:** standard TDD shape. Plugin sends `title` alongside the existing `label`. The daemon handlers feed it to `displayName()` with request-supplied values winning over stored ones, **and persist it back to the `sessions` row** so `/current-state` and Phase 2 topic naming see it too.
 
 **Commit:**
 
@@ -347,13 +380,17 @@ git commit -am "feat: carry session title on stop and question notifications"
 npm run test && npm run typecheck
 ```
 
-Both must be green. Then deploy per the `cross-device-deployment` skill and confirm in Telegram that stop notifications now show real session titles. **Do not proceed to Phase 1 until you have seen a real title in a real notification** — Phase 2's topic names depend entirely on this working.
+Green (modulo the two pre-existing daemon typecheck files). Deploy per the `cross-device-deployment` skill and confirm in Telegram that stop notifications show real session titles, **including on the second and later notifications of a long session** (that is what proves T0.5+T0.6 work, not just T0.4).
+
+**Do not proceed to Phase 1 until you have seen a real title in a real notification** — Phase 2's topic names depend entirely on this.
 
 ---
 
 ## Phase 1 — Outbox correctness + Telegram client
 
-**Why before topics:** T1.1 fixes a bug that a 20 msg/min supergroup ceiling would promote from rare to routine, and T1.5/T1.6 are the refactors that make threading expressible. All ship dark.
+**Why before topics:** T1.1 fixes a bug that a 20 msg/min supergroup ceiling would promote from rare to routine, and T1.3/T1.6 are the refactors that make threading expressible. All ship dark.
+
+> **[rev2-plan] Ordering changed.** The Telegram client extraction (T1.3) now comes **before** the 429 handling (T1.4). The reverse order has you hand-roll 429 classification inline in `notifications.ts`, then immediately subsume it into the extracted client's classifier — guaranteed churn.
 
 ### Task T1.1: Per-chunk idempotency keys
 
@@ -363,25 +400,23 @@ Both must be green. Then deploy per the `cross-device-deployment` skill and conf
 
 **The verified bug:** `OutboxSender` sends chunks in a loop; on any chunk failing it `break`s and marks the *whole entry* for retry (`:152-163`). On retry the loop restarts at `i=0`. Only the last chunk carries `notificationId` (`:148`), and worker dedup keys on it (`packages/worker/src/notifications.ts:197-205`). So chunks before the failure are re-sent with no idempotency key → duplicate Telegram messages → more traffic into an already-throttled chat.
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing test** — name it `"gives every chunk a stable idempotency key so the worker can dedup retries"`. (The daemon *does* re-send on retry; the fix is that the worker can now suppress it. Do not name the test as though the daemon stops re-sending.)
 
 ```typescript
-it("does not re-send delivered chunks after a mid-chunk failure", async () => {
-  const sent: Array<string | undefined> = [];
-  let failNext = true;
-  const sendNotification = vi.fn(async (_s, _c, text, _rm, _m, notificationId) => {
-    sent.push(text);
-    if (failNext && text === "chunk-2") { failNext = false; return { ok: false }; }
+it("gives every chunk a stable idempotency key so the worker can dedup retries", async () => {
+  const ids: Array<string | undefined> = [];
+  let failChunk2 = true;
+  const sendNotification = vi.fn(async (input) => {
+    ids.push(input.notificationId);
+    if (failChunk2 && input.text === "chunk-2") { failChunk2 = false; return { ok: false }; }
     return { ok: true };
   });
-  // enqueue a 3-chunk entry, processOnce() twice (advancing time past the backoff)
-  // assert: every distinct notificationId passed to sendNotification is unique,
-  // and chunk-1's id on the retry equals its id on the first attempt
-  //   (so worker-side dedup suppresses it)
+  // enqueue a 3-chunk entry; processOnce(); advance `now` past the backoff; processOnce()
+  expect(ids.every(id => id !== undefined)).toBe(true);
+  // chunk 0's id is identical on both attempts
+  expect(ids[0]).toBe(ids[2]);
 });
 ```
-
-The assertion that matters: **every chunk send carries a defined `notificationId`**, and the id for chunk *i* is stable across attempts.
 
 **Step 2: Run to verify it fails.** Expected: chunk 0 is sent with `notificationId === undefined` on both attempts.
 
@@ -407,23 +442,25 @@ export function chunkNotificationId(
 
 Use it at `:148` in place of `isLast ? notificationId : undefined`.
 
-**Why `#` and not `:`:** notification ids are `:`-delimited (`q:{sessionId}:{requestId}`) and the worker parses them by splitting on `:` (`webhook.ts:336-339`). A `#` suffix cannot be confused with a delimiter.
+**Why `#` and not `:`:** notification ids are `:`-delimited (`q:{sessionId}:{requestId}`) and *both* worker parsers split on `:` — `webhook.ts:336-339` and `resolveCallbackSession` at `:374`. A `#` suffix cannot be mistaken for a delimiter.
 
 **Step 4: Run.** `npm run --workspace @pigeon/daemon test -- outbox`
 
 **Step 5: Commit**
 
 ```bash
-git commit -am "fix(daemon): per-chunk idempotency keys so outbox retries do not duplicate chunks"
+git commit -am "fix(daemon): per-chunk idempotency keys so outbox retries can be deduped"
 ```
 
-### Task T1.2: Worker `q:` parsing tolerates the chunk suffix
+### Task T1.2: Worker `q:` parsing strips the chunk suffix
 
 **Files:**
 - Modify: `packages/worker/src/webhook.ts:334-340`
-- Test: `packages/worker/test/worker.test.ts` (`resolveMessageSession` describe block)
+- Test: `packages/worker/test/worker.test.ts`
 
-**The bug this prevents:** line 338 is `result.questionRequestId = parts.slice(2).join(":")`. For a chunk id `q:ses_x:req123#c0` that yields `req123#c0` — a request id that matches nothing, so the swipe-reply silently fails to answer the question.
+**The bug this prevents:** line 338 is `parts.slice(2).join(":")`. For a chunk id `q:ses_x:req123#c0` that yields `req123#c0` — a request id matching nothing, so the swipe-reply silently fails to answer the question.
+
+> **[rev2-plan] This is prophylaxis, not a live bug.** Question notifications are currently enqueued as a single message (`app.ts:498` does not split), so no `q:…#c0` id exists in production today. Ship it anyway — T2.x makes question bodies longer, and a latent silent-failure in the question path is not worth leaving armed.
 
 **Step 1: Write the failing test**
 
@@ -440,7 +477,7 @@ it("strips the chunk suffix from a question notification id", async () => {
 
 **Step 2: Run to verify it fails.** Expected: `"req123#c0"`.
 
-**Step 3: Implement.** After the existing `parts.slice(2).join(":")`, strip the suffix:
+**Step 3: Implement**
 
 ```typescript
 result.questionRequestId = parts.slice(2).join(":").replace(/#c\d+$/, "");
@@ -454,74 +491,7 @@ result.questionRequestId = parts.slice(2).join(":").replace(/#c\d+$/, "");
 git commit -am "fix(worker): strip chunk suffix when parsing question notification ids"
 ```
 
-### Task T1.3: Worker surfaces Telegram `retry_after` as 429
-
-**Files:**
-- Modify: `packages/worker/src/notifications.ts:244-249`
-- Test: `packages/worker/test/worker.test.ts`
-
-**Step 1: Write the failing test.** Using `fetchMock`, stub `sendMessage` to return `{ ok: false, error_code: 429, parameters: { retry_after: 17 } }`. Assert `handleSendNotification` responds **429** with body `{ error: "rate_limited", retryAfter: 17 }`, not the current 502.
-
-**Step 2: Run to verify it fails.** Expected: 502.
-
-**Step 3: Implement.** Widen the Telegram result type to include `error_code?: number` and `parameters?: { retry_after?: number }`. Before the generic 502 at `:244-249`:
-
-```typescript
-if (!telegramResult.ok && telegramResult.error_code === 429) {
-  const retryAfter = telegramResult.parameters?.retry_after ?? 60;
-  return json({ error: "rate_limited", retryAfter }, 429);
-}
-```
-
-**Step 4: Run.** Worker suite.
-
-**Step 5: Commit**
-
-```bash
-git commit -am "feat(worker): surface Telegram retry_after as a 429 response"
-```
-
-### Task T1.4: Global outbox pause on `retry_after`
-
-**Files:**
-- Modify: `packages/daemon/src/worker/poller.ts:297-327` (`sendNotification` returns `retryAfter`)
-- Modify: `packages/daemon/src/worker/outbox-sender.ts` (`SendNotificationFn` type, `processOnce`)
-- Test: `packages/daemon/test/outbox-sender.test.ts`, `packages/daemon/test/poller.test.ts`
-
-**The gap:** today a `retry_after` reschedules one entry while the other four in the batch keep firing at the same throttled chat.
-
-**Step 1: Write the failing test**
-
-```typescript
-it("pauses the whole outbox when a send reports retryAfter", async () => {
-  // 3 queued entries; first send returns { ok: false, retryAfter: 30 }
-  await sender.processOnce();
-  expect(sendNotification).toHaveBeenCalledTimes(1); // not 3
-  now += 29_000;
-  await sender.processOnce();
-  expect(sendNotification).toHaveBeenCalledTimes(1); // still paused
-  now += 2_000;
-  await sender.processOnce();
-  expect(sendNotification).toHaveBeenCalledTimes(2); // resumed
-});
-```
-
-**Step 2: Run to verify it fails.** Expected: 3 calls on the first `processOnce`.
-
-**Step 3: Implement.**
-- `poller.sendNotification`: on a 429, read `retryAfter` from the JSON body and return `{ ok: false, retryAfter }`.
-- `SendNotificationFn` return type becomes `Promise<{ ok: boolean; retryAfter?: number }>`.
-- `OutboxSender` gains `private pausedUntil = 0`. `processOnce` returns early if `this.nowFn() < this.pausedUntil`. On a `retryAfter` result, set `this.pausedUntil = now + retryAfter * 1000`, mark the entry for retry, and `break` out of the entry loop.
-
-**Step 4: Run.** Daemon suite.
-
-**Step 5: Commit**
-
-```bash
-git commit -am "feat(daemon): pause the whole outbox on Telegram retry_after"
-```
-
-### Task T1.5: Extract a central Telegram client in the worker
+### Task T1.3: Extract a central Telegram client in the worker
 
 **Files:**
 - Create: `packages/worker/src/telegram.ts`
@@ -531,7 +501,7 @@ git commit -am "feat(daemon): pause the whole outbox on Telegram retry_after"
 
 **Why:** six inline `fetch` calls against a template-literal URL, with three duplicate `sendMessage` implementations. Phase 2 adds five forum methods and a `message_thread_id` parameter to most sends. That is not expressible until this is one module.
 
-**Design of the module.** Every method returns a discriminated result so callers can distinguish rate limits from permanent failures — Phase 2's fallback rule depends on this:
+**Design of the module.** Every method returns a discriminated result so callers can distinguish rate limits from permanent failures — Phase 2's fallback rule (T2.8) depends on this:
 
 ```typescript
 export type TgResult<T> =
@@ -541,15 +511,15 @@ export type TgResult<T> =
   | { ok: false; kind: "error"; errorCode?: number; description?: string };
 ```
 
-`thread_not_found` is classified by matching Telegram's description for a missing `message_thread_id`. **Verify the exact string empirically during Phase 2** and, until then, treat an unmatched 400 as `kind: "error"`.
+`thread_not_found` is classified by matching Telegram's description for a missing `message_thread_id`. **The exact string is unverified** — leave the branch in place but treat an unmatched 400 as `kind: "error"`, and pin the real string empirically in T2.7.
 
 **Step 1: Write the failing tests** for the classifier — a 429 with `parameters.retry_after`, a plain 400, and a success — driving `sendMessage` through `fetchMock`.
 
 **Step 2: Run to verify they fail.** Expected: module does not exist.
 
-**Step 3: Implement** `telegram.ts` with `sendMessage`, `editMessageText`, `sendPhoto`, `sendDocument`, `answerCallbackQuery`, `getFile`. Leave the forum methods for T2.3. Then refactor every call site to use it.
+**Step 3: Implement** `telegram.ts` with `sendMessage`, `editMessageText`, `sendPhoto`, `sendDocument`, `answerCallbackQuery`, `getFile`. Forum methods come in T2.4. Then refactor every call site.
 
-**This is a pure refactor.** The existing worker suite must pass **unchanged**. If a test needs editing, stop — you have changed behavior.
+**This is a pure refactor.** The existing worker suite must pass **unchanged**. If an existing test needs editing, stop — you have changed behavior.
 
 **Step 4: Run.** `npm run --workspace @pigeon/worker test && npm run --workspace @pigeon/worker typecheck`
 
@@ -559,17 +529,84 @@ export type TgResult<T> =
 git commit -am "refactor(worker): extract a central Telegram client module"
 ```
 
+### Task T1.4: Map `rate_limited` to a 429 response
+
+**Files:**
+- Modify: `packages/worker/src/notifications.ts:244-249`
+- Test: `packages/worker/test/worker.test.ts`
+
+Now trivial, because T1.3 already classifies. Where the generic 502 is returned:
+
+```typescript
+if (!res.ok && res.kind === "rate_limited") {
+  return json({ error: "rate_limited", retryAfter: res.retryAfter }, 429);
+}
+```
+
+**Test:** stub `sendMessage` via `fetchMock` to return `{ ok: false, error_code: 429, parameters: { retry_after: 17 } }`; assert **429** with `{ error: "rate_limited", retryAfter: 17 }`, not the current 502.
+
+**Commit:** `feat(worker): surface Telegram rate limits as a 429 response`
+
+### Task T1.5: Global outbox pause + `FallbackNotifier` skip
+
+**Files:**
+- Modify: `packages/daemon/src/worker/poller.ts:297-327` (`sendNotification` returns `retryAfter`)
+- Modify: `packages/daemon/src/worker/outbox-sender.ts` (`SendNotificationFn` type, `processOnce`)
+- Modify: `packages/daemon/src/notification-service.ts:645-680` (`FallbackNotifier`), `:61-70` (`WorkerNotificationSender`)
+- Test: `packages/daemon/test/outbox-sender.test.ts`, `packages/daemon/test/poller.test.ts`, `packages/daemon/test/notification-service.test.ts`
+
+**Two gaps, one task** (they share the `retryAfter` plumbing):
+
+1. Today a `retry_after` reschedules one entry while the other four in the batch keep firing at the same throttled chat.
+2. **[rev2-plan]** `FallbackNotifier` (`index.ts:334`, `notification-service.ts:651-657`) catches *any* worker-send failure and re-sends **directly to Telegram**. Once the worker starts returning 429, that is precisely the behavior the design forbids — burning another call on an exhausted budget, on the same chat. Volume here is low (watchdog, `/alert`), but it is the same rule.
+
+**Step 1: Write the failing tests**
+
+```typescript
+it("pauses the whole outbox when a send reports retryAfter", async () => {
+  // 3 queued entries; first send returns { ok: false, retryAfter: 30 }
+  await sender.processOnce();
+  expect(sendNotification).toHaveBeenCalledTimes(1); // not 3
+  now += 29_000; await sender.processOnce();
+  expect(sendNotification).toHaveBeenCalledTimes(1); // still paused
+  now += 2_000;  await sender.processOnce();
+  expect(sendNotification).toHaveBeenCalledTimes(2); // resumed
+});
+
+it("does not fall back to direct Telegram on a rate limit", async () => {
+  // worker sender returns { ok: false, retryAfter: 30 }
+  // assert the direct Telegram notifier was NOT called
+});
+```
+
+No fake timers needed — `OutboxSender` takes an injected `nowFn` (`outbox-sender.ts:27,53`).
+
+**Step 2: Run to verify they fail.** Expected: 3 calls on the first `processOnce`; fallback fires on the 429.
+
+**Step 3: Implement.**
+- `poller.sendNotification`: on 429, read `retryAfter` from the JSON body; return `{ ok: false, retryAfter }`.
+- `SendNotificationFn` return type → `Promise<{ ok: boolean; retryAfter?: number }>`.
+- `OutboxSender` gains `private pausedUntil = 0`; `processOnce` returns early if `now < pausedUntil`; on a `retryAfter` result set `pausedUntil = now + retryAfter * 1000`, mark the entry for retry, and `break`.
+- `FallbackNotifier`: skip the direct-Telegram path when the worker result carries `retryAfter`.
+
+**Step 4: Run.** Daemon suite.
+
+**Step 5: Commit**
+
+```bash
+git commit -am "feat(daemon): pause the outbox on retry_after and never fall back on a rate limit"
+```
+
 ### Task T1.6: `poller.sendNotification` takes an options object
 
 **Files:**
 - Modify: `packages/daemon/src/worker/poller.ts:297-327`
 - Modify: `packages/daemon/src/worker/outbox-sender.ts` (`SendNotificationFn`, call at `:142-150`)
-- Modify: `packages/daemon/src/notification-service.ts:61-70`, `packages/daemon/src/index.ts:254-260`
+- Modify: `packages/daemon/src/notification-service.ts:61-70`
+- Modify: `packages/daemon/src/index.ts:272-280` (the `sendNotification` closure) and `:254-260`
 - Test: `packages/daemon/test/poller.test.ts` and any test constructing a `SendNotificationFn`
 
-**Why:** the signature is already seven positional parameters, three of them optional. Phase 2 adds `label` and `threaded`. Nine positional parameters with a `undefined, undefined` gap in the middle is how the wrong argument ends up in the wrong slot.
-
-**Step 1–4:** mechanical refactor to
+**Why:** the signature is already seven positional parameters, three optional. T2.5 adds `title`, `dir`, and `threaded`. Ten positional parameters with an `undefined, undefined` gap in the middle is how the wrong argument lands in the wrong slot.
 
 ```typescript
 export interface SendNotificationInput {
@@ -583,13 +620,11 @@ export interface SendNotificationInput {
 }
 ```
 
-Pure refactor: the existing suite must pass unchanged.
+> **[rev2-plan] Fix a pre-existing bug while you are here.** The closure at `index.ts:275-276` passes only **six** of the seven positional arguments, so `entities` is **silently dropped** on that path today. Do not faithfully preserve that. Converting to an options object fixes it structurally — add a test asserting `entities` survives, so the fix is pinned rather than incidental.
 
-**Step 5: Commit**
+Otherwise a pure refactor: the rest of the suite must pass unchanged.
 
-```bash
-git commit -am "refactor(daemon): sendNotification takes an options object"
-```
+**Commit:** `refactor(daemon): sendNotification takes an options object (fixes dropped entities)`
 
 ### Checkpoint 1
 
@@ -599,7 +634,7 @@ npm run test && npm run typecheck
 
 Deploy per `cross-device-deployment`. Then **dispatch an adversarial review of the cumulative Phase 0 + Phase 1 diff** before starting Phase 2:
 
-```
+```bash
 git diff <sha-before-T0.1>..HEAD
 ```
 
@@ -611,7 +646,12 @@ Phase 2 is the largest and riskiest phase; a clean base matters.
 
 > **Before executing any Phase 2 task:** re-read `docs/plans/2026-07-25-telegram-forum-topics-design.md` and the source files named below. Line numbers in this section predate Phases 0 and 1 and will have drifted.
 
-**Prerequisite that is not code:** the supergroup must exist before T2.16 can be flipped on, but *all* of Phase 2 can be built and tested against `fetchMock` without it. Do the manual setup during Checkpoint 2, not now.
+**The supergroup does not need to exist yet.** All of Phase 2 is buildable and testable against `fetchMock`. Do the manual Telegram setup during Checkpoint 2, not now.
+
+> **[rev2-plan] Two structural changes from the reviewed draft.**
+>
+> 1. **The feature flag moved from last to second (T2.2).** In the reviewed draft, live topic resolution landed at T2.4 with `threaded` defaulting true, three tasks before the General fallback existed and twelve before the kill switch. Commits land on shared history one task at a time over a multi-week phase; any out-of-band worker deploy in that window would point the production DM at `createForumTopic` — which fails on a non-forum chat — with *undefined* failure handling. Checkpoint discipline does not protect against deploys it did not schedule. The flag now exists before anything reads it, and flag-off equivalence tests accrue through the whole phase instead of being retrofitted.
+> 2. **Two extra checkpoints (2a, 2b).** 17 tasks behind a single checkpoint concentrates too much unverified work, and T2.14 is the task most likely to blow up scope.
 
 ### Task T2.1: `topics` table
 
@@ -619,7 +659,7 @@ Phase 2 is the largest and riskiest phase; a clean base matters.
 - Modify: `packages/worker/src/d1-schema.sql`
 - Modify: `packages/worker/test/worker.test.ts:35-79` (the `d1SchemaStatements` array)
 
-**Trap:** the worker test file **duplicates the schema** rather than reading the `.sql` file. Both must be updated or tests pass locally against a table production does not have.
+**Trap:** the worker test file **duplicates the schema** rather than reading the `.sql` file. Update both, or tests pass locally against a table production does not have.
 
 ```sql
 CREATE TABLE IF NOT EXISTS topics (
@@ -638,38 +678,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
 CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at);
 ```
 
-`chat_id` is `TEXT` to match the existing `messages` table convention. The unique index is **partial** because the reservation protocol inserts rows with a NULL `message_thread_id`.
+`chat_id` is `TEXT` to match the existing `messages` table convention. The unique index is **partial** because the reservation protocol (T2.4) inserts rows with a NULL `message_thread_id`.
 
 **Commit:** `feat(worker): add topics table`
 
-### Task T2.2: `topics.ts` repo module
+### Task T2.2: `TELEGRAM_TOPICS_ENABLED` flag
+
+**Files:**
+- Modify: `packages/worker/src/types.ts` (`Env`)
+- Modify: `packages/worker/wrangler.toml` (set to `"false"`)
+- Test: `packages/worker/test/worker.test.ts`
+
+Add the flag and a single exported predicate — `topicsEnabled(env): boolean` — with tests for `"true"`, `"false"`, and absent (absent ⇒ **false**). Nothing reads it yet; T2.5 onward gate on it. Building it now means every later task can add its flag-off equivalence test as it goes.
+
+**Commit:** `feat(worker): add TELEGRAM_TOPICS_ENABLED flag (default off)`
+
+### Task T2.3: `topics.ts` repo module + `topicName`
 
 **Files:**
 - Create: `packages/worker/src/topics.ts`
 - Test: `packages/worker/test/worker.test.ts` (new describe block)
 
-Pure D1 access, no Telegram calls — those come in T2.3. Functions: `getBySession`, `getByThread`, `reserve` (returns whether this caller won), `finalize`, `rename`, `markClosed`, `markOpen`, `deleteBySession`, `listReapable`.
+Pure D1 access, no Telegram calls (those are T2.4). Functions: `getBySession`, `getByThread`, `reserve` (returns whether this caller won), `finalize`, `rename`, `markClosed`, `markOpen`, `deleteBySession`, `listReapable`, `listOrphaned`.
 
-Also here: the topic-name builder, tested independently.
+Also here, tested independently:
 
 ```typescript
 const MACHINE_ICON_COLORS: Record<string, number> = {
-  devbox: 7322096,    // blue
-  cloudbox: 9367192,  // green
+  devbox: 7322096,    // 0x6FB9F0 blue
+  cloudbox: 9367192,  // 0x8EEE98 green
 };
-const DEFAULT_ICON_COLOR = 16766590; // yellow
+const DEFAULT_ICON_COLOR = 16766590; // 0xFFD67E yellow
 
-export function topicName(dirBasename: string, title: string): string {
-  const full = `${dirBasename} · ${title}`;
-  return full.length <= 128 ? full : full.slice(0, 127) + "…";
+/** `{dir} · {title}`, clamped to Telegram's 128-char topic-name limit. */
+export function topicName(dir: string, title: string): string {
+  const full = `${dir} · ${title}`;
+  if (full.length <= 128) return full;
+  return [...full].slice(0, 127).join("") + "…";
 }
 ```
 
-A **fixed map, not a hash** — with six allowed `icon_color` values a hash collides trivially between two machines.
+A **fixed map, not a hash** — with six allowed `icon_color` values a hash collides trivially between two machines. The `[...full]` spread is deliberate: `slice` on a raw string can split a surrogate pair in an emoji-bearing title.
 
-**Commit:** `feat(worker): topics repo module`
+> **[rev2-plan] `dir` and `title` are two separate inputs and both arrive per-notification.** Do not try to derive `dir` from the worker's `sessions.label` — that column is corrupted by `/current-state`, which overwrites it with titles (`current-state-ingest.ts:96` → `sessions.ts:76-79`). T2.5 supplies both fields explicitly. Without this, fifteen `mono` worktrees all render `Fix auth test · Fix auth test`.
 
-### Task T2.3: Reservation protocol + `createForumTopic`
+**Commit:** `feat(worker): topics repo module and topic-name builder`
+
+### Task T2.4: Forum methods + topic manager with reservation protocol
 
 **Files:**
 - Modify: `packages/worker/src/telegram.ts` (add `createForumTopic`, `editForumTopic`, `closeForumTopic`, `reopenForumTopic`, `deleteForumTopic`)
@@ -678,45 +733,67 @@ A **fixed map, not a hash** — with six allowed `icon_color` values a hash coll
 
 **The race being defended against:** the Poller dispatch loop and the OutboxSender run on independent timers in the same daemon process, so two concurrent worker invocations for the same session can both miss the lookup and both call `createForumTopic`. `session_id` is the primary key, so the loser's write is dropped while its Telegram topic survives as an orphan with a notification stranded inside it.
 
-**Test first:** two concurrent `resolveTopic()` calls for the same session produce exactly **one** `createForumTopic` call and both return the same `message_thread_id`.
+**Test first** — and this test is *not* vacuous under miniflare: `Promise.all` of two `resolveTopic()` calls interleaves at `await` points, so both SELECTs miss before either INSERT commits and `INSERT OR IGNORE` picks the winner. That is the same mechanism production relies on across isolates.
+
+```typescript
+it("creates exactly one topic under concurrent resolution", async () => {
+  const [a, b] = await Promise.all([
+    resolveTopic(env.DB, env, { sessionId: "ses_race", dir: "pigeon", title: "T", machineId: "devbox" }),
+    resolveTopic(env.DB, env, { sessionId: "ses_race", dir: "pigeon", title: "T", machineId: "devbox" }),
+  ]);
+  expect(createForumTopicCalls).toBe(1);
+  expect(a.messageThreadId).toBe(b.messageThreadId);
+});
+```
 
 Algorithm:
 
-1. `INSERT OR IGNORE INTO topics (session_id, ..., message_thread_id) VALUES (..., NULL)`.
+1. `INSERT OR IGNORE INTO topics (session_id, …, message_thread_id) VALUES (…, NULL)`.
 2. Winner (insert changed a row) calls `createForumTopic`, then `finalize`s the row.
-3. Loser re-reads; if `message_thread_id` is still NULL, poll briefly (bounded — 5 tries, 100ms) then give up and fall back to General rather than hanging the request.
-4. If the winner's `createForumTopic` fails, it must **delete its reservation row** so the next notification retries rather than being permanently stuck on a NULL thread.
+3. Loser re-reads; if `message_thread_id` is still NULL, poll briefly (**bounded** — 5 tries × 100ms) then give up and fall back to General rather than hanging the request.
+4. If the winner's `createForumTopic` fails, it **must delete its reservation row** so the next notification retries instead of being permanently stuck on a NULL thread.
 
 **Commit:** `feat(worker): topic manager with create-reservation protocol`
 
-### Task T2.4: `label` + `threaded` on the send payload
+### Task T2.5: `title`/`dir`/`threaded` end-to-end through the outbox
 
 **Files:**
-- Modify: `packages/worker/src/notifications.ts` (`SendNotificationBody`, `handleSendNotification`)
+- Modify: `packages/daemon/src/app.ts` — the outbox enqueue payloads at **`:385-390`** (stop) and **`:498-502`** (question)
+- Modify: `packages/daemon/src/worker/outbox-sender.ts:113-121` (payload parse) and the send call at `:142-150`
+- Modify: `packages/daemon/src/index.ts:272-280` (the closure) and `:254-260`
 - Modify: `packages/daemon/src/worker/poller.ts` (`SendNotificationInput` from T1.6)
-- Test: both suites
+- Modify: `packages/worker/src/notifications.ts` (`SendNotificationBody`, `handleSendNotification`)
+- Test: `packages/daemon/test/outbox-sender.test.ts`, `packages/daemon/test/app.test.ts`, `packages/worker/test/worker.test.ts`
 
-`threaded` defaults to **`true`** when absent so the outbox path needs no change; `/current-state` opts out explicitly in T2.11.
+> **[rev2-plan] This task exists because the reviewed draft could not deliver the feature.** That draft scoped the payload change to `notifications.ts` + `poller.ts` only. But stop and question notifications — *the* notifications that create topics — are enqueued as `{messages, replyMarkup, notificationId}` (`app.ts:385-390`, `:498-502`) and `OutboxSender` parses exactly those three keys (`outbox-sender.ts:113-121`). The worker would have received a `title`/`dir` that nothing ever populated on the primary path, and the phase exit criterion would have failed silently. **The outbox payload is the load-bearing hop. Do not skip it.**
+
+`threaded` defaults to **`true`** when absent, so the outbox path needs no per-call-site change once the payload carries it; `/current-state` opts out explicitly in T2.12.
+
+Wire topic resolution into `handleSendNotification` **behind `topicsEnabled(env)`** from its first commit. Add a flag-off test asserting the Telegram payload contains no `message_thread_id`.
+
+**End-to-end test to include:** enqueue a stop notification with a title, run `processOnce`, and assert the worker received both `title` and `dir`. That is the assertion the reviewed draft lacked.
 
 **Commit:** `feat: thread notifications into per-session topics`
 
-### Task T2.5: Reopen-on-closed
+### Task T2.6: Reopen-on-closed
 
 Sessions resurrect via `/current-state` re-registration (`current-state-ingest.ts:96`), revive-on-reply (`docs/plans/2026-05-03-revive-on-reply-design.md`), and `opencode attach`. Without reopen, a revived session's notifications land in the collapsed "closed" section — invisible — or fail outright.
 
-**Test:** resolving a topic with `state='closed'` calls `reopenForumTopic` and flips `state` to `open` before sending.
+**Test:** resolving a `state='closed'` topic calls `reopenForumTopic` and flips `state` to `open` before sending.
 
 **Also settle empirically here:** whether an admin bot can post into a closed topic at all. Record the answer in the design doc.
 
 **Commit:** `feat(worker): reopen closed topics on send`
 
-### Task T2.6: Stale-thread recovery
+### Task T2.7: Stale-thread recovery
 
-If a topic is deleted by hand in Telegram, the next send fails. Detect `kind: "thread_not_found"`, delete the `topics` row, and recreate once. Guard against infinite recursion with a single retry.
+If a topic is deleted by hand in Telegram, the next send fails. Detect `kind: "thread_not_found"`, delete the `topics` row, recreate **once** (guard against recursion).
+
+**Pin the classifier here:** T1.3 left `thread_not_found` matched against an unverified description string. Confirm the real string against live Telegram during Checkpoint 2 and tighten the match.
 
 **Commit:** `fix(worker): recreate topics deleted out of band`
 
-### Task T2.7: Fallback rules
+### Task T2.8: Fallback rules
 
 - Non-429 topic failure (revoked rights, forum mode off) → send to General with today's format. **Never drop a notification.**
 - 429 anywhere → return 429 with `retryAfter`. **Never** fall back to General: that burns another call against the same exhausted budget and misplaces the message.
@@ -725,29 +802,40 @@ Two tests, one per branch.
 
 **Commit:** `feat(worker): topic failure falls back to General, except rate limits`
 
-### Task T2.8: Media passes `message_thread_id`
+### Task T2.9: Media passes `message_thread_id`
 
 Media already lands in the right topic via `reply_to_message_id` (`notifications.ts:272-273`), so this is belt-and-braces. Add the parameter to `sendPhoto`/`sendDocument`.
 
 **Commit:** `feat(worker): pass message_thread_id on media sends`
 
-### Task T2.9: Close topic on unregister
+### Checkpoint 2a — outbound complete
+
+```bash
+npm run test && npm run typecheck
+```
+
+Then, critically: **flag-off byte-equivalence.** With `TELEGRAM_TOPICS_ENABLED=false`, the Telegram payloads must be identical to Phase 1. Deploy dark and confirm no behavior change in the production DM before continuing.
+
+### Task T2.10: Close topic on unregister
 
 **Files:** `packages/worker/src/sessions.ts:87-100`
 
-Note `:98-99` already deletes the `sessions` row and its `messages`. **Do not delete the `topics` row** — the reaper needs it for 30 days. Mark `state='closed'`, set `closed_at`, best-effort `closeForumTopic`. Mark closed in D1 **even if the Telegram call fails**, so the reaper still collects it.
+`:98-99` already deletes the `sessions` row and its `messages`. **Do not delete the `topics` row** — the reaper needs it for 30 days. Mark `state='closed'`, set `closed_at`, best-effort `closeForumTopic`. Mark closed in D1 **even if the Telegram call fails**, so the reaper still collects it.
 
 **Commit:** `feat(worker): close a session's topic on unregister`
 
-### Task T2.10: Reap closed topics
+### Task T2.11: Cron reaps closed topics and closes orphaned ones
 
 **Files:** `packages/worker/src/index.ts:67-71` (existing hourly cron, `wrangler.toml:15-16`)
 
-Delete topics with `state='closed' AND closed_at < now - 30d`. On a `deleteForumTopic` "not found" error, drop the row anyway. Cap deletions per run (e.g. 20) so one cron tick cannot blow the rate budget.
+Two jobs:
 
-**Commit:** `feat(worker): reap topics closed over 30 days ago`
+1. **Reap:** delete topics with `state='closed' AND closed_at < now - 30d`. On a `deleteForumTopic` "not found", drop the row anyway. Cap at **5 deletions per run** — the whole chat budget is 20/min, and a cron burst races live notifications.
+2. **Close orphans.** **[rev2-plan]** Dead-session cleanup calls `storage.sessions.delete()` *without* unregistering from the worker (`command-ingest.ts:508`, `:555`; the only `unregisterSession` callers are `session-reaper.ts:34` and `index.ts:395`). Once the local row is gone the daemon reaper can never see that session, so its topic would never be closed and never reaped — the 30-day lifecycle and the ~400-topic cap silently fail for exactly the crash-prone sessions that generate the most topics. So: close `state='open'` topics whose `sessions` row is **absent**, or whose `sessions.updated_at` is older than the session TTL. Fixing this worker-side rather than daemon-side also covers a daemon crash, which no daemon-side fix can.
 
-### Task T2.11: `/current-state` cards are unthreaded
+**Commit:** `feat(worker): reap old topics and close orphaned ones`
+
+### Task T2.12: `/current-state` cards are unthreaded
 
 **Files:** `packages/daemon/src/worker/current-state-ingest.ts:94-113`, `packages/daemon/src/index.ts:254-260`
 
@@ -761,7 +849,7 @@ Send `threaded: false`.
 
 **Commit:** `fix(daemon): /current-state cards do not create topics`
 
-### Task T2.12: Inbound topic-membership resolution
+### Task T2.13: Inbound topic-membership resolution
 
 **Files:** `packages/worker/src/webhook.ts` — `TelegramMessage` (`:122-134`), `resolveMessageSession` (`:319-357`)
 
@@ -781,67 +869,80 @@ if (message.reply_to_message && !isTopicServiceReply) {
 }
 ```
 
-**Tests:** (a) bare text in a topic resolves via `topics`; (b) a message whose `reply_to_message.message_id === message_thread_id` does **not** resolve via swipe-reply; (c) a genuine swipe-reply inside a topic still outranks topic membership.
+**Tests:** (a) bare text in a topic resolves via `topics`; (b) a message whose `reply_to_message.message_id === message_thread_id` does **not** resolve via swipe-reply; (c) a genuine swipe-reply inside a topic still outranks topic membership; (d) flag-off: topic membership is not consulted.
 
 **Known and accepted limitation to document in code:** topic membership carries no `notification_id`, so the metadata fallback at `packages/daemon/src/worker/command-ingest.ts:274-305` — which rescues question replies after the `pending_questions` row expires at 4h (`schema.ts:7`) — is unreachable for topic-routed messages. The common case still works because `command-ingest.ts:129` checks `pendingQuestions.getBySessionId` *before* consulting metadata. **For questions older than 4 hours, swipe-reply remains the only reliable answer path.**
 
 **Commit:** `feat(worker): resolve inbound messages by forum topic membership`
 
-### Task T2.13: `message_thread_id` round-trip on commands
+### Task T2.14: `message_thread_id` round-trip on commands
 
-**Files:** `packages/worker/src/d1-schema.sql` + test schema array, `packages/worker/src/d1-ops.ts:60-80` (`queueCommand`), `packages/worker/src/poll.ts`, `packages/daemon/src/worker/poller.ts` (command type), `packages/daemon/src/index.ts:80-99` (`sendTelegramMessage`) and its eleven call sites (`:126, 146, 161, 176, 191, 200, 210, 220, 228, 238, 261`)
-
-**The problem:** `sendTelegramMessage` in the daemon is the **primary** reply path for `/kill`, `/interrupt`, `/compact`, `/mcp list`, `/model`, launch errors, and revive errors — not a break-glass fallback. Without this task, `/mcp list` typed in a topic sends the command from the topic and the result to General.
+**The problem:** `sendTelegramMessage` in the daemon (`index.ts:80-99`) is the **primary** reply path for `/kill`, `/interrupt`, `/compact`, `/mcp list`, `/model`, launch errors, and revive errors — not a break-glass fallback. Without this task, `/mcp list` typed in a topic sends the command from the topic and the result to General.
 
 **The fix keeps the daemon ignorant of topics.** `ALTER TABLE commands ADD COLUMN message_thread_id INTEGER`; the worker populates it from the inbound message; it is returned on `GET /machines/:id/next`; the daemon's `sendTelegramReply` echoes it back. The daemon never reads the `topics` table.
 
+> **[rev2-plan] This task's blast radius is ~3× what the reviewed draft listed.** Enumerate all of it, because `messageThreadId` will be optional everywhere and **typecheck will happily pass with the daemon half unimplemented** — leaving the advertised fix undelivered.
+
+**Files:**
+- Worker: `src/d1-schema.sql` + `test/worker.test.ts` schema array; `src/d1-ops.ts:60-80` (`queueCommand` INSERT) and `:119-131` (`pollNextCommand` SELECT); `src/poll.ts:30-73` (the per-command-type response branches); `src/webhook.ts` (populate from the inbound message)
+- Daemon: `src/worker/poller.ts` (every command message type); `src/index.ts` (every `on*` handler, `:126-261`); and the input types + `sendTelegramReply(chatId, …)` calls of **seven ingest modules** — `kill-ingest`, `interrupt-ingest`, `compact-ingest`, `mcp-ingest` (3 functions), `model-ingest` (2 functions), `launch-ingest`, and `command-ingest` (`:511`, `:520`, `:529`)
+- Tests: the eight corresponding daemon ingest test files
+
+**Acceptance test per command type:** assert the reply function received the thread id. Do not rely on typecheck.
+
 **Commit:** `feat: carry message_thread_id through commands so daemon replies stay in-topic`
 
-### Task T2.14: Webhook confirmations echo the thread
+### Checkpoint 2b — inbound + round-trip
+
+```bash
+npm run test && npm run typecheck
+```
+
+Manually exercise each command type (`/kill`, `/interrupt`, `/compact`, `/mcp list`, `/model`) and confirm both the command *and its reply* stay in one place. This is the checkpoint that catches a half-implemented T2.14.
+
+### Task T2.15: Webhook confirmations echo the thread
 
 **Files:** `packages/worker/src/webhook.ts` — ~22 `sendTelegramMessage` call sites (`:401, 413, 459, 480, 486, 496, 502, 555, 562, 574, 581, 595, 609, 623, 637, 653, 669, 699, 701, 715, 724, 739`)
 
-Thread the inbound `message_thread_id` through so "Killing session…" and "Could not find session for this message" land in the topic the user typed in. Mechanical, but **count the call sites** and verify none were missed.
+Thread the inbound `message_thread_id` so "Killing session…" and "Could not find session for this message" land in the topic the user typed in. Mechanical, but **count the call sites** and verify none were missed.
 
 **Commit:** `feat(worker): webhook confirmations reply in the originating topic`
 
-### Task T2.15: Bare slash commands in a topic
+### Task T2.16: Bare slash commands in a topic
 
 **Files:** `packages/worker/src/webhook.ts:472-507` (`resolveReplySession`)
 
 `/kill`, `/interrupt`, `/compact`, `/mcp *`, `/model *` currently hard-require a swipe-reply. In a topic, resolve from `message_thread_id` instead. Keep the `isMachineRecent` gate.
 
+> **[rev2-plan] `resolveReplySession` needs the service-message guard too.** A bare `/kill` in a topic arrives with `reply_to_message` set to the `ForumTopicCreated` service message; without the guard, `lookupMessage` misses and the handler errors out **before** any topic fallback is reached. The guard is specified in T2.13 for `resolveMessageSession` — apply it here as well, ideally by extracting it as a shared helper.
+
 `/launch` and `/current-state` stay global and answer in General.
 
 **Commit:** `feat(worker): slash commands resolve via topic without a reply`
-
-### Task T2.16: `TELEGRAM_TOPICS_ENABLED` flag
-
-**Files:** `packages/worker/src/types.ts` (`Env`), `packages/worker/wrangler.toml`, `packages/worker/src/notifications.ts`, `packages/worker/src/webhook.ts`
-
-When off: skip all topic resolution and all topic-membership inbound routing — behavior byte-identical to Phase 1. **Test both branches**; this flag is the rollback mechanism.
-
-**Commit:** `feat(worker): TELEGRAM_TOPICS_ENABLED flag`
 
 ### Task T2.17: Migration runbook
 
 **Files:** Create `docs/runbooks/telegram-forum-migration.md`; update `.opencode/skills/worker-deployment/SKILL.md` and `AGENTS.md`
 
-Document the manual setup (create supergroup → enable Topics → add bot → promote with `can_manage_topics`, `can_delete_messages`, `can_pin_messages`; admin status also bypasses privacy mode, so no BotFather change is needed), the D1 `ALTER`/`CREATE` statements to run against production, the staged rollout, and the rollback.
+Document the manual setup: create supergroup → enable Topics → add bot → promote to admin with `can_manage_topics` and `can_delete_messages`. Admin status also bypasses privacy mode, so no BotFather `/setprivacy` change is needed. **[rev2-plan]** `can_pin_messages` is *not* required — nothing in this design pins, and `unpinAllForumTopicMessages` is unused.
+
+**The runbook's central invariant, stated first and in bold: additive D1 DDL is applied BEFORE any code deploy.** See Checkpoint 2 for why.
 
 **Commit:** `docs: Telegram forum migration runbook`
 
-### Checkpoint 2
+### Checkpoint 2 — migration
 
 1. `npm run test && npm run typecheck`
 2. Adversarial review of the full Phase 2 diff.
-3. Execute the runbook:
-   - deploy with `TELEGRAM_TOPICS_ENABLED` **off**; confirm no behavior change
-   - apply the D1 schema changes to production
-   - create the supergroup and add its id to `ALLOWED_CHAT_IDS` **alongside** `8248645256`, so in-flight notifications to the old DM do not start 403ing mid-flight
-   - flip the flag; update the `TELEGRAM_CHAT_ID` sops secret per machine; restart daemons
-   - burn in per `daemon-cutover-burnin`, **watching worker logs for 429 frequency**
-   - after burn-in, drop the old chat id
+3. Execute the runbook **in this order**:
+
+   1. **Apply the additive D1 DDL to production first** (`topics` table, `commands.message_thread_id`).
+      **[rev2-plan]** The reviewed draft had deploy-then-DDL. That bricks command ingestion: T2.14 makes `queueCommand`'s INSERT and `pollNextCommand`'s SELECT reference `commands.message_thread_id` **unconditionally** (`d1-ops.ts:73-81`, `:119-131`) — the feature flag gates *behavior*, not SQL text. Deploying first means the next webhook command from any machine dies with `no such column`. Additive DDL is backwards-compatible with the currently-deployed code, so DDL-first is safe in both directions.
+   2. Deploy with `TELEGRAM_TOPICS_ENABLED` **off**; confirm no behavior change.
+   3. Create the supergroup; add its id to `ALLOWED_CHAT_IDS` **alongside** `8248645256`, so in-flight notifications to the old DM do not start 403ing mid-flight.
+   4. Flip the flag; update the `TELEGRAM_CHAT_ID` sops secret per machine; restart daemons.
+   5. Burn in per `daemon-cutover-burnin`, **watching worker logs for 429 frequency**.
+   6. After burn-in, drop the old chat id.
 
 **Deferred item with an explicit trigger:** the design defers a chat-level `next_send_at` gate in D1. If 429s appear on more than a handful of days during burn-in, build it. Record the observed 429 rate in the design doc either way.
 
