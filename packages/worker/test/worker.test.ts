@@ -34,6 +34,7 @@ import {
   sendDocument,
   answerCallbackQuery,
   getFile,
+  getTelegramErrorDetails,
 } from "../src/telegram";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
@@ -679,6 +680,41 @@ describe("telegram client module classifier", () => {
         description: "Bad Request: chat not found",
       },
     });
+  });
+
+  it("classifies non-JSON 502 response and generates synthetic details", async () => {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(502, "Bad Gateway", { headers: { "Content-Type": "text/html" } });
+
+    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
+    expect(res).toEqual({
+      ok: false,
+      kind: "error",
+      errorCode: 502,
+      description: undefined,
+      response: undefined,
+    });
+
+    const details = getTelegramErrorDetails(res);
+    expect(details).toEqual({
+      ok: false,
+      description: undefined,
+      error_code: 502,
+    });
+  });
+
+  it("getTelegramErrorDetails extracts raw response body when present", () => {
+    const rawBody = { ok: false, error_code: 400, description: "Bad Request: chat not found" };
+    const details = getTelegramErrorDetails({
+      ok: false,
+      kind: "error",
+      errorCode: 400,
+      description: "Bad Request: chat not found",
+      response: rawBody,
+    });
+    expect(details).toBe(rawBody);
   });
 });
 

@@ -1,5 +1,5 @@
 import { verifyApiKey, unauthorized } from "./auth";
-import { sendMessage, editMessageText, sendPhoto, sendDocument } from "./telegram";
+import { sendMessage, editMessageText, sendPhoto, sendDocument, getTelegramErrorDetails } from "./telegram";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -224,13 +224,8 @@ export async function handleSendNotification(
   });
 
   if (!telegramResult.ok) {
-    const details = telegramResult.response ?? {
-      ok: false,
-      description: telegramResult.kind === "error" ? telegramResult.description : telegramResult.kind,
-      error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
-    };
     return json(
-      { error: "Telegram API error", details },
+      { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
       502,
     );
   }
@@ -322,12 +317,10 @@ export async function handleEditNotification(
   });
 
   if (!telegramResult.ok) {
-    const details = telegramResult.response ?? {
-      ok: false,
-      description: telegramResult.kind === "error" ? telegramResult.description : telegramResult.kind,
-      error_code: telegramResult.kind === "rate_limited" ? 429 : (telegramResult.kind === "error" ? telegramResult.errorCode : 400),
-    };
-    return json({ error: "Telegram API error", details }, 502);
+    return json(
+      { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
+      502,
+    );
   }
 
   return json({ ok: true });

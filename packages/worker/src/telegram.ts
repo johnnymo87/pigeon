@@ -42,6 +42,28 @@ export interface GetFileOptions {
   fileId: string;
 }
 
+const DEFAULT_RETRY_AFTER_SECONDS = 1;
+
+/**
+ * Extract or synthesize the `details` field for a 502 response from a failed TgResult.
+ * If raw response body is present on the result, returns it directly; otherwise synthesizes an object.
+ */
+export function getTelegramErrorDetails(result: TgResult<unknown>): unknown {
+  if (result.ok) return undefined;
+  return (
+    result.response ?? {
+      ok: false,
+      description: result.kind === "error" ? result.description : result.kind,
+      error_code:
+        result.kind === "rate_limited"
+          ? 429
+          : result.kind === "error"
+            ? result.errorCode
+            : 400,
+    }
+  );
+}
+
 async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
   const data = (await res.json().catch(() => null)) as {
     ok?: boolean;
@@ -64,7 +86,7 @@ async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
     return {
       ok: false,
       kind: "rate_limited",
-      retryAfter: typeof retryAfter === "number" ? retryAfter : 1,
+      retryAfter: typeof retryAfter === "number" ? retryAfter : DEFAULT_RETRY_AFTER_SECONDS,
       response: data ?? undefined,
     };
   }
@@ -113,7 +135,7 @@ export async function sendMessage(
 export async function editMessageText(
   botToken: string,
   options: EditMessageTextOptions,
-): Promise<TgResult<unknown>> {
+): Promise<TgResult<{ message_id?: number } | boolean>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     message_id: options.messageId,
@@ -132,7 +154,7 @@ export async function editMessageText(
     body: JSON.stringify(payload),
   });
 
-  return parseTgResponse<unknown>(res);
+  return parseTgResponse<{ message_id?: number } | boolean>(res);
 }
 
 export async function sendPhoto(

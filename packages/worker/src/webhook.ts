@@ -267,6 +267,10 @@ async function relayMediaToR2(
 
 /**
  * Send a message via the Telegram Bot API.
+ *
+ * Discarding the TgResult is deliberate: these are best-effort user-facing
+ * chat messages across 19 call sites, and adding error handling here would
+ * change behavior across all of them.
  */
 async function sendTelegramMessage(
   env: Env,
@@ -278,6 +282,9 @@ async function sendTelegramMessage(
 
 /**
  * Answer a callback query.
+ *
+ * Discarding the TgResult is deliberate: callback query acknowledgements are
+ * best-effort and adding error handling would change existing behavior.
  */
 async function answerCallbackQuery(
   env: Env,
