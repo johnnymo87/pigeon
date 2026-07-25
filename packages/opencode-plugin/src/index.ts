@@ -377,7 +377,7 @@ const plugin: Plugin = async (ctx) => {
           if (parentID) return
           if (!sessionManager.isKnown(sessionID) || !sessionManager.isMainSession(sessionID)) return
 
-          const title = rawTitle?.trim() || undefined
+          const title = typeof rawTitle === "string" ? rawTitle.trim() || undefined : undefined
           if (!title) return
           if (sessionManager.getTitle(sessionID) === title) return
 

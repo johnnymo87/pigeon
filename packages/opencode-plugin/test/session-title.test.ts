@@ -233,6 +233,44 @@ describe("Session Title Management", () => {
       expect(registerSessionSpy).toHaveBeenCalledTimes(0)
     })
 
+    test("session.updated ignores child session even if parentID is omitted in update event", async () => {
+      const mockCtx = createMockCtx()
+      const hooks = await plugin(mockCtx)
+
+      // Create main session and subagent session
+      await hooks.event!({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "ses_main" },
+          },
+        } as any,
+      })
+
+      await hooks.event!({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "ses_child", parentID: "ses_main" },
+          },
+        } as any,
+      })
+
+      registerSessionSpy.mockClear()
+
+      // Dispatch session.updated for child session WITHOUT parentID in event payload
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_child", title: "Child Title Without ParentID" },
+          },
+        } as any,
+      })
+
+      expect(registerSessionSpy).toHaveBeenCalledTimes(0)
+    })
+
     test("session.updated ignores blank or whitespace-only title", async () => {
       const mockCtx = createMockCtx()
       const hooks = await plugin(mockCtx)
@@ -254,6 +292,34 @@ describe("Session Title Management", () => {
           type: "session.updated",
           properties: {
             info: { id: "ses_1", title: "   " },
+          },
+        } as any,
+      })
+
+      expect(registerSessionSpy).toHaveBeenCalledTimes(0)
+    })
+
+    test("session.updated handles non-string title gracefully", async () => {
+      const mockCtx = createMockCtx()
+      const hooks = await plugin(mockCtx)
+
+      await hooks.event!({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "ses_1", title: "Initial Title" },
+          },
+        } as any,
+      })
+
+      registerSessionSpy.mockClear()
+
+      // Dispatch session.updated with non-string title
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: {
+            info: { id: "ses_1", title: 12345 },
           },
         } as any,
       })
@@ -309,10 +375,12 @@ describe("Session Title Management", () => {
             },
           } as any,
         })
-        await new Promise((resolve) => setTimeout(resolve, 10))
 
-        expect(sessionGetMock).toHaveBeenCalledWith({ path: { id: "ses_late_try" } })
-        expect(registerSessionSpy).toHaveBeenCalledTimes(1)
+        await vi.waitFor(() => {
+          expect(sessionGetMock).toHaveBeenCalledWith({ path: { id: "ses_late_try" } })
+          expect(registerSessionSpy).toHaveBeenCalledTimes(1)
+        })
+
         expect(registerSessionSpy).toHaveBeenLastCalledWith(
           expect.objectContaining({
             sessionId: "ses_late_try",
@@ -340,10 +408,12 @@ describe("Session Title Management", () => {
             },
           } as any,
         })
-        await new Promise((resolve) => setTimeout(resolve, 10))
 
-        expect(sessionGetMock).toHaveBeenCalledWith({ path: { id: "ses_late_catch" } })
-        expect(registerSessionSpy).toHaveBeenCalledTimes(1)
+        await vi.waitFor(() => {
+          expect(sessionGetMock).toHaveBeenCalledWith({ path: { id: "ses_late_catch" } })
+          expect(registerSessionSpy).toHaveBeenCalledTimes(1)
+        })
+
         expect(registerSessionSpy).toHaveBeenLastCalledWith(
           expect.objectContaining({
             sessionId: "ses_late_catch",
