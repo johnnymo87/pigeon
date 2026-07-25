@@ -278,6 +278,9 @@ if (poller) {
 const outboxSender = poller && config.telegramChatId
   ? new OutboxSender({
       storage,
+      // The arrow wrapper is required: passing `poller.sendNotification` directly
+      // detaches `this`, and the method dereferences `this.fetchFn`/`this.config`,
+      // so it would throw at runtime. Do not "simplify" this to a bare reference.
       sendNotification: (input) => poller.sendNotification(input),
       chatId: config.telegramChatId,
       log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
