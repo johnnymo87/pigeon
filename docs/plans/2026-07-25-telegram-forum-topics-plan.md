@@ -74,7 +74,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T0.1 Daemon: `title` column + storage plumbing — `3a595e1`, `f1938da`
 - [x] T0.2 Daemon: `/session-start` accepts `title` (incl. don't-clobber semantics) — `7453e41`, `b7add26`
 - [x] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions — `f5f68ed`, `c52ece9`
-- [ ] T0.4 Plugin: capture title from `session.get()` at registration
+- [x] T0.4 Plugin: capture title from `session.get()` at registration — `3eeba51`
 - [ ] T0.5 Plugin: `session.updated` handler keeps the title fresh
 - [ ] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title`
 - [ ] **Checkpoint 0** — full test + typecheck, deploy, observe titles in Telegram headers
@@ -337,6 +337,20 @@ git commit -am "feat(plugin): send opencode session title on registration"
 > **[rev2-plan] Where the title lives matters.** T0.6 needs to read the *current* title at notify time, from a different handler. Do **not** keep it in a `Map` private to this handler's closure — store it on `sessionManager` (`session-state.ts`) with `setTitle(sessionID, title)` / `getTitle(sessionID)`. T0.6 depends on this.
 
 **Step 1: Write the failing test.** Assert that dispatching `session.updated` with a title different from the last-seen one triggers exactly one `registerSession` call, and dispatching the *same* title again triggers none. The debounce is required: opencode emits `session.updated` frequently for reasons unrelated to the title.
+
+> **[T0.4 carry-over] Two items this task should absorb.**
+>
+> 1. **The `index.ts` registration wiring is untested.** T0.4's tests cover
+>    `daemon-client.registerSession` in isolation, and the plugin has **no `index.ts`-level
+>    test harness at all** — so nothing verifies that the three `registerSession` call sites
+>    actually pass a title. Wiring that read the wrong property would still be green. Both
+>    reviewers judged `session-title.test.ts` (this task's new file) the right home: it needs
+>    an event-dispatch harness anyway, so extend it to also cover `session.created` and the
+>    `lateDiscoverSession` try/catch paths.
+> 2. **Rephrase the T0.4 caveat comment** at `packages/opencode-plugin/src/index.ts:331`.
+>    It currently says "Task T0.5 handles updating/refreshing titles" — a plan-task ID that
+>    means nothing to a future reader once this plan is history. Describe the lifecycle
+>    instead: the title is refreshed on subsequent `session.updated` events.
 
 **Step 2: Run to verify it fails.**
 
