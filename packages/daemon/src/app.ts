@@ -15,6 +15,7 @@ interface LegacySession {
   start_time: number | null;
   cwd: string | null;
   label: string | null;
+  title: string | null;
   notify: boolean;
   state: string;
   nvim_socket: string | null;
@@ -34,6 +35,7 @@ function toLegacySession(session: {
   startTime: number | null;
   cwd: string | null;
   label: string | null;
+  title: string | null;
   notify: boolean;
   state: string;
   nvimSocket: string | null;
@@ -53,6 +55,7 @@ function toLegacySession(session: {
     start_time: session.startTime,
     cwd: session.cwd,
     label: session.label,
+    title: session.title,
     notify: session.notify,
     state: session.state,
     nvim_socket: session.nvimSocket,

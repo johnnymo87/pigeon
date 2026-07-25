@@ -221,6 +221,62 @@ describe("createApp", () => {
     expect(storage?.sessions.get("ses_ws")?.title).toBe("Original Title");
   });
 
+  it("projects title in legacy /sessions JSON responses and redacts backend_auth_token", async () => {
+    const app = newApp();
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_with_title",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "Feature Forum Topics",
+        backend_auth_token: "secret-token-123",
+      }),
+    }));
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_no_title",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+      }),
+    }));
+
+    const listRes = await app(new Request("http://localhost/sessions"));
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as { ok: boolean; sessions: Array<Record<string, unknown>> };
+    expect(listBody.ok).toBe(true);
+
+    const sesWithTitle = listBody.sessions.find(s => s.session_id === "ses_with_title")!;
+    const sesNoTitle = listBody.sessions.find(s => s.session_id === "ses_no_title")!;
+
+    expect(sesWithTitle).toBeDefined();
+    expect(sesWithTitle.title).toBe("Feature Forum Topics");
+    expect(sesWithTitle).not.toHaveProperty("backend_auth_token");
+
+    expect(sesNoTitle).toBeDefined();
+    expect("title" in sesNoTitle).toBe(true);
+    expect(sesNoTitle.title).toBeNull();
+
+    const singleWithTitleRes = await app(new Request("http://localhost/sessions/ses_with_title"));
+    expect(singleWithTitleRes.status).toBe(200);
+    const singleWithTitleBody = (await singleWithTitleRes.json()) as { ok: boolean; session: Record<string, unknown> };
+    expect(singleWithTitleBody.session.title).toBe("Feature Forum Topics");
+    expect(singleWithTitleBody.session).not.toHaveProperty("backend_auth_token");
+
+    const singleNoTitleRes = await app(new Request("http://localhost/sessions/ses_no_title"));
+    expect(singleNoTitleRes.status).toBe(200);
+    const singleNoTitleBody = (await singleNoTitleRes.json()) as { ok: boolean; session: Record<string, unknown> };
+    expect("title" in singleNoTitleBody.session).toBe(true);
+    expect(singleNoTitleBody.session.title).toBeNull();
+  });
+
   it("stores trimmed title when /session-start or /stop passes title with surrounding whitespace", async () => {
     const app = newApp();
     const res1 = await app(new Request("http://localhost/session-start", {
