@@ -100,6 +100,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [ ] T1.0b Daemon: fix `splitTelegramMessage`'s `maxBody <= 0` hole *(found by Phase 0 adversarial review)* — when header+footer overhead alone exceeds 4096, `split-message.ts:29-31` falls into the single-message branch and sends the oversized text anyway → Telegram 400 → worker 502 → outbox retries then `markFailed` → **notification permanently lost**. Phase 0 clamped titles to 200 chars, which removes the new trigger, but the underlying hole predates this work and belongs to this outbox-correctness phase.
 - [ ] T1.0c Daemon: narrow the additive-migration `catch` *(found by Phase 0 adversarial review)* — `schema.ts:117-123` swallows **every** error from every additive statement, not just duplicate-column. A real `ALTER TABLE` failure (disk full, a `sqlite3` shell holding a write txn past the 5s busy timeout, corruption) starts the daemon cleanly and then fails every `/session-start` and most `/stop`s with the root cause already discarded. Rethrow unless the message matches `/duplicate column/i`. Touches nine pre-existing statements, so it needs its own test pass.
 - [ ] T1.0d Daemon: expose `title` in the legacy `/sessions` JSON — absent from `toLegacySession` (`app.ts:30-67`); Phase 2 will want it.
+- [ ] T1.0e Daemon + plugin: event-distinct emoji, drop the redundant event word, fix `session.error` mislabelling *(raised after Checkpoint 0)*
 - [ ] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender`
 - [ ] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix
 - [ ] T1.3 Worker: extract a central Telegram client module
@@ -525,6 +526,39 @@ passes no `title` (it has no session object), so the helper needs an optional `t
 parameter. The four integration tests added by T0.5 in
 `packages/opencode-plugin/test/session-title.test.ts` drive all four paths and are the safety
 net for this refactor.
+
+### Task T1.0e *(added after Checkpoint 0)*: Event-distinct emoji, drop the redundant event word
+
+**Files:** `packages/daemon/src/notification-service.ts` (`eventEmoji` `:93-97`, header builder
+`:108-111`), `packages/opencode-plugin/src/index.ts` (the `session.error` `notifyStop` call
+`~:550`), tests in `packages/daemon/test/model-ingest.test.ts` and `telegram-message.test.ts`.
+
+**Origin:** after Checkpoint 0 landed, the header read `🤖 **Stop**: Organize pigeon messages by
+session` and the obvious question was whether `Stop:` earns its place. Investigation says: not
+as written, and it hides a bug.
+
+**Findings (verified):**
+
+- **Nothing parses the header.** No code matches on `Stop:` or the emoji; reply routing uses
+  `notificationId` plus the `🆔 <sessionId>` footer. Changing the header is routing-safe.
+- **`eventEmoji` is not 1:1 with the event.** `SubagentStop`→🔧, `Question`/`Notification`→❓,
+  and **everything else — `Stop`, `Error`, `Retry` — falls through to 🤖**. So the word is
+  currently the *only* thing separating a clean finish from a retry.
+- **`session.error` mislabels itself as a stop.** The plugin's error path
+  (`index.ts:550-556`) passes no `event`, so the daemon defaults to `"Stop"` (`app.ts:365`).
+  An errored session renders a header **identical** to a successful one; the error appears only
+  in the body. That is the actual defect here, independent of the cosmetics.
+- Scope is genuinely small: one formatter function plus **6 test lines in 2 files**.
+
+**Do:** give each event a distinct emoji (e.g. Stop ✅ or 🤖, Error ❌, Retry 🔁), then drop the
+now-redundant bold event word from the header. Make the plugin's error path pass an explicit
+`event: "Error"` so the emoji is correct.
+
+> **Do not over-invest in the header's title portion.** Phase 2 puts each session in its own
+> topic **named from the title**, at which point `<emoji> <title>` inside a topic already called
+> `<title>` is pure duplication. The likely end state is emoji + summary with no title at all.
+> Fix the verb and the emoji here; let Phase 2 decide the title's fate, since only there does the
+> header know whether it sits in a per-session topic or the General fallback.
 
 ### Task T1.1: Per-chunk idempotency keys
 
