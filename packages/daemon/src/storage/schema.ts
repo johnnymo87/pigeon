@@ -7,6 +7,19 @@ export const INBOX_DONE_RETENTION_MS = 60 * 60 * 1000;
 export const PENDING_QUESTION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 export const OUTBOX_RETENTION_MS = 60 * 60 * 1000; // 1 hour
 
+/**
+ * True only for SQLite's benign "column already exists" error.
+ *
+ * Must match on the message, NOT on err.code: better-sqlite3 reports
+ * SQLITE_ERROR for duplicate-column, "no such table", syntax errors, and
+ * NOT NULL-without-default alike, so the code cannot discriminate. Verified
+ * messages: "duplicate column name: a" / "no such table: nope" /
+ * "incomplete input" / "Cannot add a NOT NULL column with default value NULL".
+ *
+ * Fails safe: an unrecognised message is treated as a REAL failure and
+ * rethrown. Loosening this restores the silent-schema-drift bug; tightening it
+ * to err.code turns a benign duplicate column into a daemon startup crash.
+ */
 export function isDuplicateColumnError(err: unknown): boolean {
   if (err instanceof Error) {
     return /duplicate column/i.test(err.message);

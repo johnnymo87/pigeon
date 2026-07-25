@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import BetterSqlite3 from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { openStorageDb } from "../src/storage/database";
 import { isDuplicateColumnError, runAdditiveMigrations } from "../src/storage/schema";
 
@@ -436,9 +436,16 @@ describe("storage schema and repositories", () => {
       const db = new BetterSqlite3(":memory:");
       const badStatement = "ALTER TABLE non_existent_table ADD COLUMN foo TEXT";
 
-      expect(() => runAdditiveMigrations(db, [badStatement])).toThrowError(
-        badStatement,
-      );
+      let caughtErr: unknown;
+      try {
+        runAdditiveMigrations(db, [badStatement]);
+      } catch (err) {
+        caughtErr = err;
+      }
+
+      expect(caughtErr).toBeInstanceOf(Error);
+      expect((caughtErr as Error).message).toContain(badStatement);
+      expect((caughtErr as Error).cause).toBeInstanceOf(BetterSqlite3.SqliteError);
 
       db.close();
     });
