@@ -24,40 +24,59 @@ export function splitTelegramMessage(
   footer: TgMessage,
   maxLen = 4096,
 ): TgMessage[] {
+  // Scale minBodyBudget with maxLen so small maxLen test cases (e.g. maxLen = 26 where overhead = 16 leaves maxBody = 10)
+  // are not broken by a floor of 13 (maxLen / 2). Using maxLen / 4 gives minBodyBudget = 6 for maxLen = 26, leaving 10 >= 6
+  // without triggering unwanted header truncation. For standard maxLen = 4096, minBodyBudget evaluates to 200.
   const minBodyBudget = Math.min(MIN_BODY_BUDGET, Math.floor(maxLen / 4));
   let currentHeader = header;
-  let overhead = currentHeader.text.length + footer.text.length + SEP.text.length * 2;
+  let currentFooter = footer;
+  let overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
   let maxBody = maxLen - overhead;
 
+  // 1. Truncate header if overhead crowds out body budget below minBodyBudget
   if (maxBody < minBodyBudget && currentHeader.text.length > 0) {
     const allowedHeaderLen = Math.max(
       0,
-      maxLen - minBodyBudget - footer.text.length - SEP.text.length * 2,
+      maxLen - minBodyBudget - currentFooter.text.length - SEP.text.length * 2,
     );
     if (currentHeader.text.length > allowedHeaderLen) {
       currentHeader = sliceBodyMessage(currentHeader, 0, allowedHeaderLen);
-      overhead = currentHeader.text.length + footer.text.length + SEP.text.length * 2;
+      overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
       maxBody = maxLen - overhead;
     }
   }
 
-  const chunkMaxBody = Math.max(1, maxBody);
+  // 2. Truncate footer if overhead still crowds out body budget (pathological footer)
+  if (maxBody < minBodyBudget && currentFooter.text.length > 0) {
+    const allowedFooterLen = Math.max(
+      0,
+      maxLen - currentHeader.text.length - minBodyBudget - SEP.text.length * 2,
+    );
+    if (currentFooter.text.length > allowedFooterLen) {
+      // Note: session ID sits near the top of the footer (after cwd), so truncating from 0 to allowedFooterLen
+      // preserves routing metadata at the start of the footer while dropping any pathological tail.
+      currentFooter = sliceBodyMessage(currentFooter, 0, allowedFooterLen);
+      overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
+      maxBody = maxLen - overhead;
+    }
+  }
 
   let result: TgMessage[];
 
   if (maxBody > 0 && body.text.length <= maxBody) {
-    result = [concatMessages([currentHeader, SEP, body, SEP, footer])];
+    result = [concatMessages([currentHeader, SEP, body, SEP, currentFooter])];
   } else {
-    let bodyChunks = splitBodyText(body.text, chunkMaxBody);
+    let bodyChunks = splitBodyText(body.text, maxBody);
     if (bodyChunks.length === 0) {
       bodyChunks = [{ start: 0, end: 0 }];
     }
     result = bodyChunks.map((chunk) => {
       const chunkMsg = sliceBodyMessage(body, chunk.start, chunk.end);
-      return concatMessages([currentHeader, SEP, chunkMsg, SEP, footer]);
+      return concatMessages([currentHeader, SEP, chunkMsg, SEP, currentFooter]);
     });
   }
 
+  // Final safety clamp: ensure no chunk exceeds maxLen (belt and braces)
   return result.map((msg) =>
     msg.text.length > maxLen ? sliceBodyMessage(msg, 0, maxLen) : msg,
   );

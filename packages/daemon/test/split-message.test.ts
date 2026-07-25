@@ -131,12 +131,13 @@ describe("splitTelegramMessage", () => {
       }
     });
 
-    it("enforces maxLen invariant when footer alone exceeds maxLen", () => {
+    it("enforces maxLen invariant and bounds chunk count when footer alone exceeds maxLen", () => {
       const header = plainBody("HEADER");
-      const body = plainBody("BODY");
+      const body = plainBody("B".repeat(10000));
       const footer = plainBody("F".repeat(5000));
       const result = splitTelegramMessage(header, body, footer, 4096);
       expect(result.length).toBeGreaterThan(0);
+      expect(result.length).toBeLessThan(60);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(4096);
       }
@@ -166,8 +167,9 @@ describe("splitTelegramMessage", () => {
       }
     });
 
-    it("property sweep: satisfies maxLen and entity bounds for all size combinations", () => {
+    it("property sweep: satisfies maxLen, chunk count bounds, and entity bounds for all size combinations", () => {
       const maxLen = 4096;
+      const minBodyBudget = Math.min(200, Math.floor(maxLen / 4));
       for (const headerLen of [0, 50, 4000, 4092, 4200]) {
         for (const footerLen of [0, 10, 100, 5000]) {
           for (const bodyLen of [0, 2, 500, 10000]) {
@@ -185,6 +187,8 @@ describe("splitTelegramMessage", () => {
             };
             const result = splitTelegramMessage(h, b, f, maxLen);
             expect(result.length).toBeGreaterThan(0);
+            const expectedMaxChunks = bodyLen === 0 ? 1 : Math.ceil(bodyLen / minBodyBudget) + 5;
+            expect(result.length).toBeLessThanOrEqual(expectedMaxChunks);
             for (const chunk of result) {
               expect(chunk.text.length).toBeLessThanOrEqual(maxLen);
               for (const entity of chunk.entities) {
