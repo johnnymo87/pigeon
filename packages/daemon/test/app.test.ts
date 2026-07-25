@@ -116,6 +116,84 @@ describe("createApp", () => {
     expect(singleBody.session.backend_endpoint).toBe("http://127.0.0.1:9999/pigeon/direct/execute");
   });
 
+  it("stores title from /session-start", async () => {
+    const app = newApp();
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_t2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "Fix flaky auth test",
+      }),
+    }));
+    expect(res.status).toBe(200);
+    expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+  });
+
+  it("does not clobber a stored title when /session-start omits it", async () => {
+    const app = newApp();
+    const res1 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_t2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "Fix flaky auth test",
+      }),
+    }));
+    expect(res1.status).toBe(200);
+    expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+
+    const res2 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_t2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+      }),
+    }));
+    expect(res2.status).toBe(200);
+    expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+  });
+
+  it("does not clobber a stored title when /session-start passes empty string title", async () => {
+    const app = newApp();
+    const res1 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_t2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "Fix flaky auth test",
+      }),
+    }));
+    expect(res1.status).toBe(200);
+    expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+
+    const res2 = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_t2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "",
+      }),
+    }));
+    expect(res2.status).toBe(200);
+    expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
+  });
+
   it("supports /sessions/enable-notify preserving backend_kind fields", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 20_000 });
