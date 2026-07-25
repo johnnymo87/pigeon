@@ -335,7 +335,7 @@ async function resolveMessageSession(
       if (mapping.notification_id && mapping.notification_id.startsWith("q:")) {
         const parts = mapping.notification_id.split(":");
         if (parts.length >= 3) {
-          result.questionRequestId = parts.slice(2).join(":");
+          result.questionRequestId = parts.slice(2).join(":").replace(/#c\d+$/, "");
         }
       }
       return result;

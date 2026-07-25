@@ -3715,3 +3715,76 @@ describe("swipe-reply to question notification", () => {
     expect(pollBody.metadata).toBeUndefined();
   });
 });
+
+// ─── Question Notification ID Chunk Suffix Parsing ────────────────────────
+
+describe("resolveMessageSession question notification parsing", () => {
+  const chatId = "123456789";
+
+  async function seedMessage(opts: {
+    chatId: string;
+    messageId: number;
+    sessionId: string;
+    notificationId?: string;
+    token?: string;
+  }): Promise<void> {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO messages (chat_id, message_id, session_id, token, notification_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        opts.chatId,
+        opts.messageId,
+        opts.sessionId,
+        opts.token ?? "test-token",
+        opts.notificationId ?? null,
+        Date.now(),
+      )
+      .run();
+  }
+
+  it("strips the chunk suffix from a question notification id", async () => {
+    await seedMessage({ chatId, messageId: 42, sessionId: "ses_x", notificationId: "q:ses_x:req123#c0" });
+    const r = await resolveMessageSession(env.DB, {
+      message_id: 99,
+      chat: { id: Number(chatId) },
+      text: "my answer",
+      reply_to_message: { message_id: 42 },
+    });
+    expect(r?.questionRequestId).toBe("req123");
+  });
+
+  it("leaves a bare question notification id intact without suffix", async () => {
+    await seedMessage({ chatId, messageId: 43, sessionId: "ses_x", notificationId: "q:ses_x:req123" });
+    const r = await resolveMessageSession(env.DB, {
+      message_id: 100,
+      chat: { id: Number(chatId) },
+      text: "my answer",
+      reply_to_message: { message_id: 43 },
+    });
+    expect(r?.questionRequestId).toBe("req123");
+  });
+
+  it("strips multi-digit chunk index suffixes", async () => {
+    await seedMessage({ chatId, messageId: 44, sessionId: "ses_x", notificationId: "q:ses_x:req123#c12" });
+    const r = await resolveMessageSession(env.DB, {
+      message_id: 101,
+      chat: { id: Number(chatId) },
+      text: "my answer",
+      reply_to_message: { message_id: 44 },
+    });
+    expect(r?.questionRequestId).toBe("req123");
+  });
+
+  it("preserves request id containing hash that is not a chunk suffix at end of string", async () => {
+    await seedMessage({ chatId, messageId: 45, sessionId: "ses_x", notificationId: "q:ses_x:req#c12_suffix" });
+    const r = await resolveMessageSession(env.DB, {
+      message_id: 102,
+      chat: { id: Number(chatId) },
+      text: "my answer",
+      reply_to_message: { message_id: 45 },
+    });
+    expect(r?.questionRequestId).toBe("req#c12_suffix");
+  });
+});
+
