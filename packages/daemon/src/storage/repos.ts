@@ -28,6 +28,7 @@ function asSession(row: SqlRow): SessionRecord {
     startTime: (row.start_time as number | null) ?? null,
     cwd: (row.cwd as string | null) ?? null,
     label: (row.label as string | null) ?? null,
+    title: (row.title as string | null) ?? null,
     notify: Number(row.notify) === 1,
     state: String(row.state),
     ptyPath: (row.pty_path as string | null) ?? null,
@@ -82,16 +83,17 @@ export class SessionRepository {
 
     this.db.prepare(
       `INSERT INTO sessions (
-         session_id, ppid, pid, start_time, cwd, label, notify, state,
+         session_id, ppid, pid, start_time, cwd, label, title, notify, state,
          pty_path, nvim_socket, backend_kind, backend_protocol_version,
          backend_endpoint, backend_auth_token, created_at, updated_at, last_seen, expires_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          ppid = excluded.ppid,
          pid = excluded.pid,
          start_time = excluded.start_time,
          cwd = excluded.cwd,
          label = excluded.label,
+         title = excluded.title,
          notify = excluded.notify,
          state = excluded.state,
          pty_path = excluded.pty_path,
@@ -110,6 +112,7 @@ export class SessionRepository {
       input.startTime ?? null,
       input.cwd ?? null,
       input.label ?? null,
+      input.title ?? null,
       input.notify ? 1 : 0,
       input.state ?? "running",
       input.ptyPath ?? null,

@@ -5,6 +5,7 @@ export interface SessionRecord {
   startTime: number | null;
   cwd: string | null;
   label: string | null;
+  title: string | null;
   notify: boolean;
   state: string;
   ptyPath: string | null;
@@ -83,6 +84,7 @@ export interface UpsertSessionInput {
   startTime?: number | null;
   cwd?: string | null;
   label?: string | null;
+  title?: string | null;
   notify?: boolean;
   state?: string;
   ptyPath?: string | null;

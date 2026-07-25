@@ -16,6 +16,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
       start_time INTEGER,
       cwd TEXT,
       label TEXT,
+      title TEXT DEFAULT NULL,
       notify INTEGER NOT NULL DEFAULT 0,
       state TEXT NOT NULL DEFAULT 'running',
       pty_path TEXT,
@@ -110,6 +111,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
     "ALTER TABLE pending_questions ADD COLUMN answers_json_v2 TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE pending_questions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN model_override TEXT DEFAULT NULL",
+    "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
   ];
 
   for (const statement of additiveColumns) {

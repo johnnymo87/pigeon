@@ -15,6 +15,7 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     startTime: Date.now(),
     cwd: "/tmp",
     label: null,
+    title: null,
     notify: true,
     state: "active",
     ptyPath: "/dev/pts/42",

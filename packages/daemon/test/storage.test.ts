@@ -41,6 +41,26 @@ describe("storage schema and repositories", () => {
     storage.db.close();
   });
 
+  it("persists and returns session title", () => {
+    const storage = createStorage();
+    storage.sessions.upsert({
+      sessionId: "ses_title",
+      cwd: "/home/dev/projects/pigeon",
+      label: "pigeon",
+      title: "Fix flaky auth test",
+      notify: true,
+    });
+    expect(storage.sessions.get("ses_title")?.title).toBe("Fix flaky auth test");
+    storage.db.close();
+  });
+
+  it("leaves title null when not supplied", () => {
+    const storage = createStorage();
+    storage.sessions.upsert({ sessionId: "ses_notitle", cwd: "/tmp", notify: true });
+    expect(storage.sessions.get("ses_notitle")?.title).toBeNull();
+    storage.db.close();
+  });
+
   it("mints, validates, and expires session tokens", () => {
     const storage = createStorage();
     storage.sessions.upsert({ sessionId: "sess-token", notify: true }, 10_000);
