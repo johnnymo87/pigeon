@@ -99,6 +99,58 @@ describe("daemon-client", () => {
       })
     })
 
+    test("should include title in request body when title is provided", async () => {
+      // given
+      const opts = {
+        sessionId: "test-session-123",
+        cwd: "/home/user/project",
+        label: "Test Session",
+        title: "Fix auth",
+        pid: 12345,
+        ppid: 12344,
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      const result = await registerSession(opts)
+
+      // then
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].body).toEqual({
+        session_id: "test-session-123",
+        notify: true,
+        cwd: "/home/user/project",
+        label: "Test Session",
+        title: "Fix auth",
+        pid: 12345,
+        ppid: 12344,
+      })
+    })
+
+    test("should omit title from request body when title is undefined", async () => {
+      // given
+      const opts = {
+        sessionId: "test-session-123",
+        cwd: "/home/user/project",
+        label: "Test Session",
+        title: undefined,
+        pid: 12345,
+        ppid: 12344,
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      const result = await registerSession(opts)
+
+      // then
+      expect(result).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect("title" in (requestLog[0].body as object)).toBe(false)
+    })
+
     test("should handle network failure gracefully", async () => {
       // given - invalid URL that will fail
       const opts = {

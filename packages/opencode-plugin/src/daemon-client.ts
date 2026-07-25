@@ -4,6 +4,7 @@ type RegisterSessionOpts = {
   sessionId: string
   cwd: string
   label: string
+  title?: string
   pid: number
   ppid: number
   tty?: string
@@ -113,11 +114,12 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
        const res = await fetch(`${url}/session-start`, {
          method: "POST",
          headers: daemonHeaders(),
-        body: JSON.stringify({
+         body: JSON.stringify({
           session_id: opts.sessionId,
           notify: true,
           cwd: opts.cwd,
           label: opts.label,
+          ...(opts.title ? { title: opts.title } : {}),
           pid: opts.pid,
           ppid: opts.ppid,
           tty: opts.tty,

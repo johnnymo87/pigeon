@@ -224,17 +224,19 @@ const plugin: Plugin = async (ctx) => {
 
          const envInfo = await envInfoP
 
-         try {
-           const session = await ctx.client.session.get({ path: { id: sessionID } })
-           const parentID = session.data?.parentID
+          try {
+            const session = await ctx.client.session.get({ path: { id: sessionID } })
+            const parentID = session.data?.parentID
+            const title = session.data?.title
 
-           sessionManager.onSessionCreated(sessionID, parentID)
+            sessionManager.onSessionCreated(sessionID, parentID)
 
             if (!parentID) {
               const regPromise = registerSession({
                 sessionId: sessionID,
                 cwd: ctx.directory,
                 label,
+                title,
                 pid: envInfo.pid,
                 ppid: envInfo.ppid,
                 tty: envInfo.tty,
@@ -317,20 +319,25 @@ const plugin: Plugin = async (ctx) => {
 
           const sessionID = sessionInfo?.id
           const parentID = sessionInfo?.parentID
+          const title = sessionInfo?.title
 
-          log("session.created", { sessionID, parentID })
+          log("session.created", { sessionID, parentID, title })
 
           if (!sessionID) return
 
-           sessionManager.onSessionCreated(sessionID, parentID)
+          sessionManager.onSessionCreated(sessionID, parentID)
 
-            if (!parentID) {
-              const envInfo = await envInfoP
-              const regPromise = registerSession({
-                sessionId: sessionID,
-                cwd: ctx.directory,
-                label,
-                pid: envInfo.pid,
+          if (!parentID) {
+            const envInfo = await envInfoP
+            // Note: session.created fires before opencode generates the title,
+            // so sessionInfo.title here is usually a placeholder.
+            // Task T0.5 handles updating/refreshing titles on session.updated.
+            const regPromise = registerSession({
+              sessionId: sessionID,
+              cwd: ctx.directory,
+              label,
+              title,
+              pid: envInfo.pid,
                 ppid: envInfo.ppid,
                 tty: envInfo.tty,
                 backendKind: "opencode-plugin-direct",
