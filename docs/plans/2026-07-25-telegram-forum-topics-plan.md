@@ -73,7 +73,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 - [x] T0.1 Daemon: `title` column + storage plumbing — `3a595e1`, `f1938da`
 - [x] T0.2 Daemon: `/session-start` accepts `title` (incl. don't-clobber semantics) — `7453e41`, `b7add26`
-- [ ] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions
+- [x] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions — `f5f68ed`, `c52ece9`
 - [ ] T0.4 Plugin: capture title from `session.get()` at registration
 - [ ] T0.5 Plugin: `session.updated` handler keeps the title fresh
 - [ ] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title`
@@ -365,6 +365,13 @@ git commit -m "feat(plugin): refresh session title on session.updated"
 **Why:** registration-time title is stale — a session registers once but notifies many times. Carrying `title` per notification is what makes the header, and later the topic name, track the live title.
 
 > **[rev2-plan] The mechanism must be named, not implied.** Those call sites currently pass the module-scope `label` closure from `index.ts:209`. They must additionally pass `sessionManager.getTitle(sessionID)` (from T0.5). A prior draft listed only `daemon-client.ts` and `app.ts` and would have shipped a `title` field that was always `undefined` on the notification path.
+
+> **[T0.3 carry-over] Fix the `/stop` log line while you are in this handler.** `app.ts:403` logs
+> `` label=${label || session.label} `` — a 2-tier expression with no session-id fallback, so T0.3
+> correctly left it out of the eight display sites. But it now *disagrees* with what the user sees:
+> the log records the directory basename while Telegram renders the title. That makes
+> "why did this notification say X" harder to debug, and Phase 2 will make it worse (topic
+> names derive from the same title). Switch it to `displayName(...)` so logs match display.
 
 **Steps:** standard TDD shape. Plugin sends `title` alongside the existing `label`. The daemon handlers feed it to `displayName()` with request-supplied values winning over stored ones, **and persist it back to the `sessions` row** so `/current-state` and Phase 2 topic naming see it too.
 
