@@ -258,7 +258,11 @@ describe("createApp", () => {
 
     expect(sesWithTitle).toBeDefined();
     expect(sesWithTitle.title).toBe("Feature Forum Topics");
+    // Redaction guard, both spellings: the snake_case key catches an explicit
+    // mapping being added, the camelCase key catches a `...session` spread
+    // leaking the raw storage record.
     expect(sesWithTitle).not.toHaveProperty("backend_auth_token");
+    expect(sesWithTitle).not.toHaveProperty("backendAuthToken");
 
     expect(sesNoTitle).toBeDefined();
     expect("title" in sesNoTitle).toBe(true);
@@ -269,6 +273,7 @@ describe("createApp", () => {
     const singleWithTitleBody = (await singleWithTitleRes.json()) as { ok: boolean; session: Record<string, unknown> };
     expect(singleWithTitleBody.session.title).toBe("Feature Forum Topics");
     expect(singleWithTitleBody.session).not.toHaveProperty("backend_auth_token");
+    expect(singleWithTitleBody.session).not.toHaveProperty("backendAuthToken");
 
     const singleNoTitleRes = await app(new Request("http://localhost/sessions/ses_no_title"));
     expect(singleNoTitleRes.status).toBe(200);
