@@ -115,7 +115,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix — `1743d4a`. One line: `.replace(/#c\d+$/, "")`, anchored so a non-terminal `#` is preserved. Verified `q:ses_x:a:b#c3` → `a:b` (`:`-containing ids still rejoin) and `q:ses_x:req#c` → `req#c` (needs a digit). Review independently enumerated **all four** worker `notification_id` consumers (dedup `:199`, 2 inserts, wizard lookup `:321`, this parser) and confirmed the other three correctly want the raw suffixed id.
 - [x] T1.3 Worker: extract a central Telegram client module — `e154eb4`, `0529f22`, `51e1bb2`. `telegram.ts` with `sendMessage`/`editMessageText`/`sendPhoto`/`sendDocument`/`answerCallbackQuery`/`getFile` returning `TgResult<T>`. **Pure refactor held: 0 deleted lines in the existing test file**, 167 pre-existing tests unedited, 173 total. Spec review caught scope creep — the first cut leaked `tgKind`/`tgRetryAfter` into the 502 body, which is T1.4's job; removed in `0529f22` and the classifier tests re-pointed at `sendMessage`'s `TgResult` instead of asserting through the HTTP response. Classifier verified out-of-band through a stubbed `fetch`: 429-with-`parameters.retry_after` → `rate_limited` w/ that value; bare-429-by-HTTP-status → `rate_limited` w/ the 1s default; plain 400 → `error` (**conservative fallthrough intact**); `message thread not found` → `thread_not_found`; non-JSON body → `error` + `errorCode` from HTTP status; **network errors propagate rather than being swallowed**.
 - [x] T1.4 Worker: map `rate_limited` to a 429 response — `d4ba3c9`, `b0ad593`. Four-line branch before the generic 502, returning exactly `{ error: "rate_limited", retryAfter }`. **Send path only** — `handleEditNotification` keeps its 502 on purpose (T1.5 consumes only the send path, so a 429 there would have no consumer; revisit if the wizard's edit path ever needs backoff). `retryAfter` is in **seconds** and now says so in a comment, because T1.5 multiplies by 1000 and a silent unit slip there is a 1000× error. Test asserts `17` propagated from `parameters.retry_after` — not the client's `DEFAULT_RETRY_AFTER_SECONDS = 1` fallback, so it proves real plumbing. The plain-400→502 guard was shown non-vacuous by injecting an over-broad `if (!ok) → 429` and watching the pre-existing 502 test fail.
-- [ ] T1.5 Daemon: global outbox pause on `retry_after` + `FallbackNotifier` skip
+- [x] T1.5 Daemon: global outbox pause on `retry_after` + `FallbackNotifier` skip — `18f8959`, `b7aaafb`. `OutboxSender.pausedUntil` + a **labeled `break batchLoop`**: the pre-existing `break` only left the *chunk* loop, so the other four entries in the `getReady(now, 5)` batch kept firing at the same throttled chat — that was the actual bug, and the "called once, not 3" test is what pins it. Ordinary failures still take per-entry backoff and must **not** pause (asserted, since an over-eager pause would stall the whole outbox on one broken message — worse than the bug). New exported `RateLimitError` carries `retryAfter` across the throw boundary; `FallbackNotifier` rethrows it in all three methods instead of re-sending direct to Telegram. `retryAfter` is **seconds**, converted to ms exactly once, and now JSDoc'd on the error because it's public API. Resume is logged and `pausedUntil` reset, so a stalled outbox no longer goes silent unexplained; the field stays in-memory deliberately (a restart mid-window just gets another 429 and re-establishes it).
 - [ ] T1.6 Daemon: convert `poller.sendNotification` to an options object
 - [ ] **Checkpoint 1** — full test + typecheck, deploy, adversarial review of the Phase 0+1 diff
 
@@ -884,6 +884,23 @@ No fake timers needed — `OutboxSender` takes an injected `nowFn` (`outbox-send
 ```bash
 git commit -am "feat(daemon): pause the outbox on retry_after and never fall back on a rate limit"
 ```
+
+#### T1.5 execution notes — two plan references were stale
+
+- **`FallbackNotifier` is constructed via the deprecated alias.** `index.ts:334` reads
+  `new FallbackStopNotifier(workerNotifier, telegramNotifier)`, and
+  `FallbackStopNotifier = FallbackNotifier` (`notification-service.ts:723`). Grepping for
+  `new FallbackNotifier` finds **nothing** and will make you conclude it's dead code. It isn't.
+- **Its only live consumers are the `sendPlainAlert` paths** — `app.ts:142` (try/catch → 502) and
+  `swarm/delivery-watchdog.ts:377` (try/catch → logs). **No src caller invokes
+  `sendStopNotification`/`sendQuestionNotification`** on it; those go through the durable outbox.
+  That's why making `FallbackNotifier` *throw* (it previously never did) is safe — both live callers
+  already catch. Re-verify this if a future task adds a caller.
+- `poller.sendNotification` **never checks HTTP status**; it parses the body and reads `ok` from it.
+  A 429 body therefore yields a falsy `ok` on its own, which is why `retryAfter` is read from the
+  same parsed body rather than from `response.status`.
+- It now returns a *narrowed* `{ ok, retryAfter? }` instead of the raw parsed body. Verified safe:
+  nothing reads `messageId`/`token` off that result.
 
 ### Task T1.6: `poller.sendNotification` takes an options object
 
