@@ -636,6 +636,32 @@ Known accepted wart: `maxLen < 0` violates (a); no caller can pass a negative.
 already specifies `[...str]` spread to avoid splitting surrogate pairs — same hazard class as
 defect 3. Reuse this reasoning there rather than rediscovering it.
 
+### Phase 1 running note — verify every reviewer patch before applying it
+
+Recorded mid-phase because it has now happened **three times** and each instance
+would have shipped a defect or wasted a cycle. Applies to T1.0, T1.3–T1.6.
+
+1. **T1.0b** — a reviewer's "Verification" block for a surrogate-pair bug did **not
+   reproduce** (their cut landed before the emoji they placed). Implementing against it
+   would have pinned nothing. The *concern* was real; the repro was fabricated, and the
+   genuinely reachable path was elsewhere (the pre-existing body hard-cut).
+2. **T1.0b** — the same reviewer's proposed fix for the loop hang
+   (`if (chunkEnd === pos && pos + 2 <= text.length)`) was **incomplete**: a trailing
+   unpaired surrogate leaves `pos + 2 > text.length` and it still hangs. Fixed by making
+   `pos` advance *structurally* instead.
+3. **T1.0e** — a reviewer suggested `objectContaining({ event: undefined })` to assert a
+   key is absent. **Vitest requires the key to be PRESENT**, so it fails against the
+   correct implementation. The working form is
+   `expect(spy.mock.calls.at(-1)![0]).not.toHaveProperty("event")`.
+
+Reviewers have nonetheless been high-value — one caught a genuine Critical hang that tests
+missed. The rule is not "distrust reviewers", it is **"reproduce the claim, then apply the
+fix you verified, not the one you were handed."**
+
+Corollary, learned the same way: after adding an assertion meant to pin behaviour, **inject
+the regression and watch it fail.** Done for the auth-token redaction guard (T1.0d) and the
+`session.idle` event guard (T1.0e); both would otherwise have been silently vacuous.
+
 ### Task T1.1: Per-chunk idempotency keys
 
 **Files:**
