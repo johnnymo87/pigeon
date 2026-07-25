@@ -27,6 +27,14 @@ const MAX_ATTEMPTS = 10;
 const MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 const BACKOFF_SCHEDULE = [5_000, 10_000, 30_000, 60_000, 120_000];
 
+/**
+ * Maximum duration (ms) to pause the outbox on a rate limit response (300s = 5m).
+ * Trusting an arbitrarily large upstream retry_after (e.g. 3600s) could cause entries
+ * to exceed MAX_AGE_MS (15m) while paused and be permanently marked failed.
+ * Probing again after at most 300s is strictly safer than sleeping indefinitely.
+ */
+export const MAX_PAUSE_MS = 5 * 60 * 1000;
+
 function getBackoff(attempts: number): number {
   return BACKOFF_SCHEDULE[Math.min(attempts, BACKOFF_SCHEDULE.length - 1)] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 120_000;
 }
@@ -187,11 +195,17 @@ export class OutboxSender {
                 attempts: entry.attempts + 1,
                 nextRetryIn: backoff,
               });
-              if (result.retryAfter !== undefined) {
-                this.pausedUntil = now + result.retryAfter * 1000;
+              if (
+                typeof result.retryAfter === "number" &&
+                Number.isFinite(result.retryAfter) &&
+                result.retryAfter > 0
+              ) {
+                const pauseMs = Math.min(result.retryAfter * 1000, MAX_PAUSE_MS);
+                this.pausedUntil = now + pauseMs;
                 this.log("outbox paused due to rate limit", {
                   notificationId: entry.notificationId,
                   retryAfterSec: result.retryAfter,
+                  pauseMs,
                   pausedUntil: this.pausedUntil,
                 });
                 break batchLoop;

@@ -325,10 +325,16 @@ export class Poller {
           ...(entities && entities.length > 0 ? { entities } : {}),
         }),
       });
-      const payload = (await response.json()) as { ok?: boolean; retryAfter?: number };
+      const payload = (await response.json()) as { ok?: boolean; retryAfter?: unknown };
+      const retryAfter =
+        typeof payload.retryAfter === "number" &&
+        Number.isFinite(payload.retryAfter) &&
+        payload.retryAfter > 0
+          ? payload.retryAfter
+          : undefined;
       return {
         ok: Boolean(payload.ok),
-        ...(payload.retryAfter !== undefined ? { retryAfter: payload.retryAfter } : {}),
+        ...(retryAfter !== undefined ? { retryAfter } : {}),
       };
     } catch {
       return { ok: false };

@@ -813,4 +813,28 @@ describe("Poller dispatch — current_state", () => {
     const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
     expect(res).toEqual({ ok: false, retryAfter: 17 });
   });
+
+  it("strips garbage retryAfter from 429 response body", async () => {
+    const poller = new Poller(BASE_CONFIG, makeCallbacks());
+    
+    const garbagePayloads = [
+      { error: "rate_limited", retryAfter: "30" },
+      { error: "rate_limited", retryAfter: -5 },
+      { error: "rate_limited", retryAfter: 0 },
+      { error: "rate_limited", retryAfter: NaN },
+      { error: "rate_limited" },
+    ];
+
+    for (const payload of garbagePayloads) {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        json: async () => payload,
+      });
+      (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
+
+      const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
+      expect(res).toEqual({ ok: false });
+    }
+  });
 });

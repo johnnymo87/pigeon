@@ -590,4 +590,95 @@ describe("OutboxSender start/stop", () => {
     await sender.processOnce();
     expect(sendNotification).toHaveBeenCalledTimes(3);
   });
+
+  it("clamps pause duration to MAX_PAUSE_MS (300s) when retryAfter is far above ceiling", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
+
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      if (input.notificationId === "notif-1") {
+        return { ok: false, retryAfter: 3600 };
+      }
+      return { ok: true };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    now += 299_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1); // still paused at +299s
+
+    now += 2_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(2); // resumed at +301s (300s max pause)
+  });
+
+  it("pauses for exact duration when retryAfter is below MAX_PAUSE_MS ceiling", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2" }, 1_000);
+
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      if (input.notificationId === "notif-1") {
+        return { ok: false, retryAfter: 30 };
+      }
+      return { ok: true };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    now += 29_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    now += 2_000;
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not pause or corrupt state on garbage retryAfter values", async () => {
+    const garbageValues = [NaN, -5, 0, "30" as any, undefined, null as any, Infinity];
+
+    for (const garbage of garbageValues) {
+      const id1 = `notif-g1-${String(garbage)}`;
+      const id2 = `notif-g2-${String(garbage)}`;
+      storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: id1 }, 1_000);
+      storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: id2 }, 1_000);
+
+      const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+        if (input.notificationId === id1) {
+          return { ok: false, retryAfter: garbage };
+        }
+        return { ok: true };
+      }) as SendNotificationFn;
+
+      let now = 5_000;
+      const sender = new OutboxSender({
+        storage,
+        sendNotification,
+        chatId: "chat-123",
+        nowFn: () => now,
+      });
+
+      await sender.processOnce();
+      expect(sendNotification).toHaveBeenCalledTimes(2);
+    }
+  });
 });
