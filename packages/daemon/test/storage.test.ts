@@ -61,6 +61,22 @@ describe("storage schema and repositories", () => {
     storage.db.close();
   });
 
+  it("overwrites title on session re-upsert at the storage layer", () => {
+    // Note: The storage layer intentionally overwrites `title` unconditionally.
+    // Preserve-on-omit/don't-clobber behavior is the caller's responsibility (e.g., T0.2 in app.ts).
+    const storage = createStorage();
+    storage.sessions.upsert({ sessionId: "ses_reupsert", cwd: "/tmp", title: "Original Title", notify: true });
+    expect(storage.sessions.get("ses_reupsert")?.title).toBe("Original Title");
+
+    storage.sessions.upsert({ sessionId: "ses_reupsert", cwd: "/tmp", title: "Updated Title", notify: true });
+    expect(storage.sessions.get("ses_reupsert")?.title).toBe("Updated Title");
+
+    storage.sessions.upsert({ sessionId: "ses_reupsert", cwd: "/tmp", notify: true });
+    expect(storage.sessions.get("ses_reupsert")?.title).toBeNull();
+
+    storage.db.close();
+  });
+
   it("mints, validates, and expires session tokens", () => {
     const storage = createStorage();
     storage.sessions.upsert({ sessionId: "sess-token", notify: true }, 10_000);
