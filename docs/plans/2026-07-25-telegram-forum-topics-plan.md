@@ -75,12 +75,13 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T0.2 Daemon: `/session-start` accepts `title` (incl. don't-clobber semantics) — `7453e41`, `b7add26`
 - [x] T0.3 Daemon: `displayName()` replaces **8** duplicated precedence expressions — `f5f68ed`, `c52ece9`
 - [x] T0.4 Plugin: capture title from `session.get()` at registration — `3eeba51`
-- [ ] T0.5 Plugin: `session.updated` handler keeps the title fresh
+- [x] T0.5 Plugin: `session.updated` handler keeps the title fresh — `43ac380`, `2fd9a56`
 - [ ] T0.6 Plugin + daemon: `/stop` and `/question-asked` carry `title`
 - [ ] **Checkpoint 0** — full test + typecheck, deploy, observe titles in Telegram headers
 
 ### Phase 1 — Outbox correctness + Telegram client (ships dark)
 
+- [ ] T1.0 Plugin: extract the 4× duplicated `registerSession` block *(added during Phase 0; see the trap note — the helper must NOT await)*
 - [ ] T1.1 Daemon: per-chunk idempotency keys in `OutboxSender`
 - [ ] T1.2 Worker: `q:` notification-id parsing strips the chunk suffix
 - [ ] T1.3 Worker: extract a central Telegram client module
@@ -412,6 +413,35 @@ Green (modulo the two pre-existing daemon typecheck files). Deploy per the `cros
 **Why before topics:** T1.1 fixes a bug that a 20 msg/min supergroup ceiling would promote from rare to routine, and T1.3/T1.6 are the refactors that make threading expressible. All ship dark.
 
 > **[rev2-plan] Ordering changed.** The Telegram client extraction (T1.3) now comes **before** the 429 handling (T1.4). The reverse order has you hand-roll 429 classification inline in `notifications.ts`, then immediately subsume it into the extracted client's classifier — guaranteed churn.
+
+### Task T1.0 *(added during Phase 0)*: Extract the plugin's `registerSession` block
+
+**Files:** `packages/opencode-plugin/src/index.ts`
+
+By the end of Phase 0 there are **four** near-identical ~25-line `registerSession(...)`
+invocations in `index.ts`: `lateDiscoverSession` try (`~:235`), `lateDiscoverSession` catch
+(`~:265`), `session.created` (`~:335`), and `session.updated` (`~:387`, added by T0.5). Each
+builds the same 12-field option set, chains the same `.then(onRegistered)`/`.catch(log)`, and
+calls `setRegistrationPromise`. Three copies predate Phase 0; T0.5 added the fourth. This is
+the same argument that justified extracting `displayName()` in T0.3.
+
+**Deferred out of Phase 0 deliberately.** Checkpoint 0 has to validate the registration path
+in production, and churning that path immediately beforehand defeats the checkpoint. Phase 1
+is the refactor phase.
+
+> **Trap — the obvious extraction is wrong.** A code reviewer proposed a helper ending in
+> `await regPromise`, called as `await doRegisterSession(...)`. **Do not do that.** None of the
+> four sites currently awaits `regPromise`; they fire-and-forget and hand the promise to
+> `sessionManager.setRegistrationPromise` so that *later* handlers can
+> `await sessionManager.awaitRegistration(sessionID)` (`index.ts:427`, `:528`, `:588`, `:645`).
+> Awaiting inside the helper would block the event dispatcher on a daemon round-trip at every
+> registration. The helper must stay fire-and-forget and return `void`.
+
+Also note the four blocks are *not* byte-identical: the `lateDiscoverSession` catch path
+passes no `title` (it has no session object), so the helper needs an optional `title`
+parameter. The four integration tests added by T0.5 in
+`packages/opencode-plugin/test/session-title.test.ts` drive all four paths and are the safety
+net for this refactor.
 
 ### Task T1.1: Per-chunk idempotency keys
 
