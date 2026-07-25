@@ -593,6 +593,13 @@ describe("Session Title Management", () => {
             })
           )
         })
+
+        // session.idle must NOT set an event: it relies on the daemon defaulting
+        // to "Stop" (app.ts:368). Pinned so a future edit can't relabel a clean
+        // finish as an error. Asserted on the call argument rather than via
+        // objectContaining({ event: undefined }), which requires the key to be
+        // PRESENT and so fails on the correct (key-absent) implementation.
+        expect(notifyStopSpy.mock.calls.at(-1)![0]).not.toHaveProperty("event")
       })
 
       test("question.asked passes live title to sendQuestionAsked", async () => {
