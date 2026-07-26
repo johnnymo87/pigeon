@@ -326,6 +326,63 @@ describe("ServeEndpointReconciler", () => {
     s.db.close();
   });
 
+  it("says the slot may still 500 — endpoint repair is NOT a full all-clear", async () => {
+    // A real hijack ALWAYS clobbers instance_uuid too, because registerSelf writes
+    // endpoint and instance_uuid in one upsert. We deliberately do not repair uuid
+    // (pigeon must never write it), so after this repair pigeon still stamps leases
+    // from the rogue uuid, the real serve's lease CAS matches zero rows and fails
+    // closed, and every prompt on that slot 500s until the serve self-heals or is
+    // restarted. An alert that just says "repaired" tells the operator to stand
+    // down while the slot is still hard-down.
+    const { s, reconciler, sendPlainAlert } = make();
+    s.serves.upsert(hijackedRow());
+
+    await reconciler.tick();
+
+    const [text] = sendPlainAlert.mock.calls[0] as unknown as [string];
+    expect(text).toMatch(/instance_uuid|500|restart/i);
+    expect(text).not.toMatch(/fully repaired|all clear/i);
+
+    s.db.close();
+  });
+
+  it("flags an ALL-SLOTS drift as config skew, not a hijack", async () => {
+    // A hijacker takes one slot. Every configured slot drifting in the same tick is
+    // the signature of PIGEON_SERVE_ENDPOINTS disagreeing with reality — e.g. the
+    // port list was renumbered and the pool was not restarted (the serve units set
+    // restartIfChanged = false, so a rebuild alone does NOT move them). Reasserting
+    // config there points every slot at a port nothing has bound, and once the
+    // serve-side self-heal ships it becomes a permanent flap war. Different cause,
+    // different alert.
+    const { s, reconciler, sendPlainAlert } = make();
+    s.serves.upsert(hijackedRow({ serveId: "serve-0", endpoint: "http://127.0.0.1:5096" }));
+    s.serves.upsert(hijackedRow({ serveId: "serve-1", endpoint: "http://127.0.0.1:5097" }));
+
+    await reconciler.tick();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const [text] = sendPlainAlert.mock.calls[0] as unknown as [string];
+    expect(text).toMatch(/config/i);
+    expect(text).toMatch(/serve-0/);
+    expect(text).toMatch(/serve-1/);
+    expect(text).not.toMatch(/hijack/i);
+
+    s.db.close();
+  });
+
+  it("a single drift in a multi-slot pool is still reported as a hijack", async () => {
+    const { s, reconciler, sendPlainAlert } = make();
+    s.serves.upsert(hijackedRow());
+
+    await reconciler.tick();
+
+    const [text] = sendPlainAlert.mock.calls[0] as unknown as [string];
+    expect(text).toMatch(/hijack/i);
+    expect(text).not.toMatch(/config/i);
+
+    s.db.close();
+  });
+
   it("still repairs when the alert throws — detection must never block the repair", async () => {
     const s = openStorageDb(":memory:");
     seedServes(s.serves, POOL, 1000);

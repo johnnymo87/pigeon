@@ -145,12 +145,26 @@ export class ServeEndpointReconciler {
     }
 
     const now = this.nowFn();
+
+    // A hijacker takes ONE slot. Every configured slot drifting at once is the
+    // signature of PIGEON_SERVE_ENDPOINTS disagreeing with reality — normally a
+    // renumbered port list where the pool has not been restarted (the serve units
+    // set restartIfChanged = false, so a rebuild alone does NOT move the running
+    // serves). In that state "reasserting config" points every slot at a port
+    // nothing has bound, and once the serve-side self-heal ships the two writers
+    // flap against each other indefinitely. We still repair — config is the
+    // authority by design — but the operator needs to be told it is a config/
+    // reality skew, not an intruder, because the fix is a pool restart.
+    const configSkew = drifts.length > 1 && drifts.length === this.endpoints.length;
+    const pending: EndpointDrift[] = [];
+
     for (const drift of drifts) {
       // Logged unconditionally — the cooldown throttles Telegram, never the record.
       this.log("serve endpoint drift repaired", {
         serveId: drift.serveId,
         found: drift.found,
         reassertedTo: drift.configured,
+        cause: configSkew ? "config-skew" : "hijack",
       });
 
       const last = this.lastAlertAt.get(drift.serveId);
@@ -158,27 +172,49 @@ export class ServeEndpointReconciler {
         continue;
       }
       this.lastAlertAt.set(drift.serveId, now);
-      await this.alert(drift);
+      pending.push(drift);
+    }
+
+    if (pending.length > 0) {
+      await this.alert(pending, configSkew);
     }
 
     return drifts;
   }
 
-  private async alert(drift: EndpointDrift): Promise<void> {
+  private async alert(drifts: EndpointDrift[], configSkew: boolean): Promise<void> {
     if (!this.notifier?.sendPlainAlert) {
       return;
     }
     const where = this.machineId ? ` on ${this.machineId}` : "";
-    const text =
-      `routing registry hijack repaired${where}: ${drift.serveId} endpoint had drifted ` +
-      `to ${drift.found}, reasserted ${drift.configured}. ` +
-      `Some process claimed this pool slot — check for a stray "opencode serve" ` +
-      `that inherited OPENCODE_SERVE_ID + OPENCODE_ROUTING_DB.`;
+    const detail = drifts
+      .map((d) => `${d.serveId} was ${d.found} -> ${d.configured}`)
+      .join("; ");
+
+    // Two genuinely different incidents, two different remedies. Never emit the
+    // word "hijack" for a config skew: it sends the operator hunting a process
+    // that does not exist.
+    const text = configSkew
+      ? `serve endpoint config skew${where}: EVERY configured slot disagreed with ` +
+        `PIGEON_SERVE_ENDPOINTS and was reasserted (${detail}). This is normally a ` +
+        `renumbered port list with the pool not restarted, NOT an intruder — the ` +
+        `serves keep their old ports because the units set restartIfChanged=false. ` +
+        `Until the pool is restarted these endpoints point at ports nothing has ` +
+        `bound. Fix: systemctl restart opencode-serve-pool.target.`
+      // NOT an all-clear. registerSelf writes endpoint AND instance_uuid in one
+      // upsert, so a real hijack always leaves a foreign uuid behind — and pigeon
+      // must never rewrite uuid (doing so is what makes every prompt 500).
+      : `routing registry hijack: endpoint reasserted${where} (${detail}). ` +
+        `PARTIAL REPAIR ONLY — instance_uuid is probably still the intruder's, so ` +
+        `this slot may return HTTP 500 on every prompt until the serve self-heals ` +
+        `(~30s, needs the registry-port-fence build) or is restarted. ` +
+        `Check for a stray "opencode serve" that inherited OPENCODE_SERVE_ID + ` +
+        `OPENCODE_ROUTING_DB.`;
     try {
       await this.notifier.sendPlainAlert(text, "error");
     } catch (err) {
       this.log("drift alert send failed", {
-        serveId: drift.serveId,
+        serveIds: drifts.map((d) => d.serveId).join(","),
         error: err instanceof Error ? err.message : String(err),
       });
     }
