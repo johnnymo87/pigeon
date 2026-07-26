@@ -16,7 +16,23 @@ import {
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import { isAllowedChatId, generateToken } from "../src/notifications";
-import { topicsEnabled } from "../src/topics";
+import {
+  topicsEnabled,
+  topicName,
+  clampPreservingSurrogates,
+  getBySession,
+  getByThread,
+  reserve,
+  finalize,
+  rename,
+  markClosed,
+  markOpen,
+  deleteBySession,
+  listReapable,
+  listOrphaned,
+  MACHINE_ICON_COLORS,
+  DEFAULT_ICON_COLOR,
+} from "../src/topics";
 import {
   verifyWebhookSecret,
   deduplicateUpdate,
@@ -4103,6 +4119,276 @@ describe("resolveMessageSession question notification parsing", () => {
       reply_to_message: { message_id: 45 },
     });
     expect(r?.questionRequestId).toBe("req#c12_suffix");
+  });
+});
+
+// ─── Topics Module & Topic Name Tests ────────────────────────────────────
+
+function hasUnpairedSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (i + 1 >= s.length) return true;
+      const next = s.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+describe("topics module and topicName", () => {
+  describe("topicsEnabled", () => {
+    it("returns true only for exact string 'true'", () => {
+      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true" })).toBe(true);
+      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "false" })).toBe(false);
+      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "TRUE" })).toBe(false);
+      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "1" })).toBe(false);
+      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "" })).toBe(false);
+      expect(topicsEnabled({})).toBe(false);
+    });
+  });
+
+  describe("constants", () => {
+    it("exports machine icon colors and default color", () => {
+      expect(MACHINE_ICON_COLORS.devbox).toBe(7322096);
+      expect(MACHINE_ICON_COLORS.cloudbox).toBe(9367192);
+      expect(DEFAULT_ICON_COLOR).toBe(16766590);
+    });
+  });
+
+  describe("topicName formatting and surrogate clamping", () => {
+    it("passes short dir and title through unchanged", () => {
+      expect(topicName("pigeon", "Fix flaky auth test")).toBe("pigeon · Fix flaky auth test");
+    });
+
+    it("handles missing/empty dir or title gracefully", () => {
+      expect(topicName("", "Fix test")).toBe("Fix test");
+      expect(topicName("pigeon", "")).toBe("pigeon");
+      expect(topicName("   ", "   ")).toBe("session");
+    });
+
+    it("replaces internal newlines with single spaces", () => {
+      expect(topicName("pigeon", "Fix\nflaky\r\nauth\r test")).toBe("pigeon · Fix flaky auth test");
+    });
+
+    it("clamps 128-emoji title to <= 128 UTF-16 code units", () => {
+      const emojiTitle = "😀".repeat(128);
+      const name = topicName("pigeon", emojiTitle);
+      expect(name.length).toBeLessThanOrEqual(128);
+      expect(hasUnpairedSurrogate(name)).toBe(false);
+    });
+
+    it("preserves an astral character landing exactly on boundary or drops it safely", () => {
+      // 123 'a's + " · a😀" => 123 + 3 + 1 + 2 = 129 UTF-16 units.
+      // Index 127 falls on high surrogate of 😀.
+      const name1 = topicName("a".repeat(123), "a😀");
+      expect(name1.length).toBeLessThanOrEqual(128);
+      expect(hasUnpairedSurrogate(name1)).toBe(false);
+      expect(name1.endsWith("…")).toBe(true);
+
+      // 122 'a's + " · a😀" => 122 + 3 + 1 + 2 = 128 UTF-16 units (fits exactly).
+      // 122 'a's + " · a😀b" => 128 + 1 = 129 UTF-16 units.
+      // Index 127 falls right between high surrogate (126) and low surrogate (127) of 😀.
+      const name2 = topicName("a".repeat(122), "a😀b");
+      expect(name2.length).toBeLessThanOrEqual(128);
+      expect(hasUnpairedSurrogate(name2)).toBe(false);
+      expect(name2.endsWith("…")).toBe(true);
+    });
+
+    it("handles clampPreservingSurrogates edge cases", () => {
+      const s = "abc😀def"; // 😀 is at index 3,4
+      expect(clampPreservingSurrogates(s, 10)).toBe("abc😀def");
+      expect(clampPreservingSurrogates(s, 4)).toBe("abc"); // cuts off high surrogate at index 3
+      expect(clampPreservingSurrogates(s, 5)).toBe("abc😀"); // keeps full pair at index 3,4
+    });
+  });
+
+  describe("D1 repo functions", () => {
+    const chatId = "-100123456789";
+
+    it("reserve & getBySession & getByThread - tests winner and loser outcomes", async () => {
+      const sessionId = "ses_topics_t1";
+      const now = 1000000;
+
+      // Winner outcome: first reservation succeeds
+      const won1 = await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId,
+        name: "pigeon · test",
+        now,
+      });
+      expect(won1).toBe(true);
+
+      // Verify row exists and has state='open' with message_thread_id=null
+      const row1 = await getBySession(env.DB, sessionId);
+      expect(row1).not.toBeNull();
+      expect(row1?.session_id).toBe(sessionId);
+      expect(row1?.machine_id).toBe("devbox");
+      expect(row1?.chat_id).toBe(chatId);
+      expect(row1?.name).toBe("pigeon · test");
+      expect(row1?.state).toBe("open");
+      expect(row1?.message_thread_id).toBeNull();
+      expect(row1?.created_at).toBe(now);
+
+      // Loser outcome: concurrent/subsequent reserve call for same sessionId returns false
+      const won2 = await reserve(env.DB, {
+        sessionId,
+        machineId: "cloudbox",
+        chatId,
+        name: "pigeon · competing",
+        now: now + 50,
+      });
+      expect(won2).toBe(false);
+
+      // Verify row was NOT mutated by loser
+      const rowAfterLoser = await getBySession(env.DB, sessionId);
+      expect(rowAfterLoser?.machine_id).toBe("devbox");
+      expect(rowAfterLoser?.name).toBe("pigeon · test");
+    });
+
+    it("finalize, rename, markClosed, markOpen, getByThread", async () => {
+      const sessionId = "ses_topics_t2";
+      const now = 2000000;
+
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId,
+        name: "pigeon · t2",
+        now,
+      });
+
+      // finalize thread id
+      const finRes = await finalize(env.DB, {
+        sessionId,
+        messageThreadId: 4242,
+        name: "pigeon · t2 finalized",
+        now: now + 100,
+      });
+      expect(finRes).toBe(true);
+
+      const byThread = await getByThread(env.DB, chatId, 4242);
+      expect(byThread).not.toBeNull();
+      expect(byThread?.session_id).toBe(sessionId);
+      expect(byThread?.name).toBe("pigeon · t2 finalized");
+
+      // rename
+      const renRes = await rename(env.DB, {
+        sessionId,
+        name: "pigeon · renamed",
+        now: now + 200,
+      });
+      expect(renRes).toBe(true);
+      const afterRename = await getBySession(env.DB, sessionId);
+      expect(afterRename?.name).toBe("pigeon · renamed");
+
+      // markClosed
+      const closeRes = await markClosed(env.DB, {
+        sessionId,
+        now: now + 300,
+      });
+      expect(closeRes).toBe(true);
+      const closedRow = await getBySession(env.DB, sessionId);
+      expect(closedRow?.state).toBe("closed");
+      expect(closedRow?.closed_at).toBe(now + 300);
+
+      // markOpen
+      const openRes = await markOpen(env.DB, {
+        sessionId,
+        now: now + 400,
+      });
+      expect(openRes).toBe(true);
+      const openRow = await getBySession(env.DB, sessionId);
+      expect(openRow?.state).toBe("open");
+      expect(openRow?.closed_at).toBeNull();
+    });
+
+    it("deleteBySession", async () => {
+      const sessionId = "ses_topics_t3";
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId,
+        name: "pigeon · t3",
+      });
+
+      expect(await getBySession(env.DB, sessionId)).not.toBeNull();
+      const delRes = await deleteBySession(env.DB, sessionId);
+      expect(delRes).toBe(true);
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
+
+      // delete non-existent
+      expect(await deleteBySession(env.DB, "non_existent")).toBe(false);
+    });
+
+    it("listReapable", async () => {
+      const now = 3000000;
+
+      // Seed 3 topics: open, closed old, closed recent
+      const s1 = "ses_reap_1";
+      const s2 = "ses_reap_2";
+      const s3 = "ses_reap_3";
+
+      await reserve(env.DB, { sessionId: s1, machineId: "devbox", chatId, name: "s1", now });
+      await reserve(env.DB, { sessionId: s2, machineId: "devbox", chatId, name: "s2", now });
+      await reserve(env.DB, { sessionId: s3, machineId: "devbox", chatId, name: "s3", now });
+
+      // s1 stays open
+      // s2 closed at now - 1000
+      await markClosed(env.DB, { sessionId: s2, now: now - 1000 });
+      // s3 closed at now - 500
+      await markClosed(env.DB, { sessionId: s3, now: now - 500 });
+
+      // Query reapable with closedBefore = now - 200
+      const reapable = await listReapable(env.DB, { closedBefore: now - 200, limit: 10 });
+      expect(reapable.map((r: { session_id: string }) => r.session_id)).toEqual([s2, s3]);
+
+      // Test limit
+      const reapableLimit = await listReapable(env.DB, { closedBefore: now - 200, limit: 1 });
+      expect(reapableLimit.map((r: { session_id: string }) => r.session_id)).toEqual([s2]);
+    });
+
+    it("listOrphaned", async () => {
+      const now = 4000000;
+
+      const sActive = "ses_orph_active";
+      const sStale = "ses_orph_stale";
+      const sNoSession = "ses_orph_nosession";
+      const sClosedNoSession = "ses_orph_closed_nosession";
+
+      // Insert topics
+      await reserve(env.DB, { sessionId: sActive, machineId: "devbox", chatId, name: "active", now });
+      await reserve(env.DB, { sessionId: sStale, machineId: "devbox", chatId, name: "stale", now });
+      await reserve(env.DB, { sessionId: sNoSession, machineId: "devbox", chatId, name: "nosession", now });
+      await reserve(env.DB, { sessionId: sClosedNoSession, machineId: "devbox", chatId, name: "closed_nosession", now });
+      await markClosed(env.DB, { sessionId: sClosedNoSession, now });
+
+      // Insert matching sessions into sessions table
+      await env.DB.prepare(
+        `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(sActive, "devbox", "pigeon", now, now - 100).run();
+
+      await env.DB.prepare(
+        `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(sStale, "devbox", "pigeon", now, now - 10000).run();
+
+      // sNoSession has no row in sessions table
+
+      // Query orphaned with updatedBefore = now - 5000
+      const orphaned = await listOrphaned(env.DB, { updatedBefore: now - 5000 });
+      const orphanedIds = orphaned.map((r: { session_id: string }) => r.session_id);
+
+      // Should include sStale (updated_at < now - 5000) and sNoSession (sessions row absent)
+      // Should NOT include sActive (updated_at >= now - 5000) or sClosedNoSession (state='closed')
+      expect(orphanedIds).toContain(sNoSession);
+      expect(orphanedIds).toContain(sStale);
+      expect(orphanedIds).not.toContain(sActive);
+      expect(orphanedIds).not.toContain(sClosedNoSession);
+    });
   });
 });
 
