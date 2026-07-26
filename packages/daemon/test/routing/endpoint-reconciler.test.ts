@@ -363,6 +363,58 @@ describe("ServeEndpointReconciler", () => {
     s.db.close();
   });
 
+  it("safeTick NEVER rejects when the registry read throws — an unhandled rejection would kill the live daemon", async () => {
+    // better-sqlite3 throws synchronously on SQLITE_BUSY ("database is locked"),
+    // which really happens on this box when serves restart simultaneously. Inside
+    // an async method that surfaces as a rejected promise, and Node terminates the
+    // process on unhandled rejections by default. This runs in the LIVE daemon.
+    const log = vi.fn();
+    const exploding = {
+      get: () => {
+        throw new Error("SQLITE_BUSY: database is locked");
+      },
+      reassertEndpoint: () => false,
+    };
+    const reconciler = new ServeEndpointReconciler({
+      serves: exploding,
+      endpoints: POOL,
+      log,
+    });
+
+    await expect(reconciler.tick()).rejects.toThrow("database is locked");
+    await expect(reconciler.safeTick()).resolves.toEqual([]);
+    expect(log.mock.calls.some(([m]) => String(m).includes("tick failed"))).toBe(true);
+  });
+
+  it("start() drives safeTick, so a throwing tick cannot escape the timer", async () => {
+    const log = vi.fn();
+    const reconciler = new ServeEndpointReconciler({
+      serves: {
+        get: () => {
+          throw new Error("SQLITE_BUSY: database is locked");
+        },
+        reassertEndpoint: () => false,
+      },
+      endpoints: POOL,
+      log,
+    });
+
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => rejections.push(err);
+    process.on("unhandledRejection", onRejection);
+    try {
+      reconciler.start(1);
+      await new Promise((r) => setTimeout(r, 30));
+      reconciler.stop();
+      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+
+    expect(rejections).toEqual([]);
+    expect(log.mock.calls.some(([m]) => String(m).includes("tick failed"))).toBe(true);
+  });
+
   it("logs every drift it repairs even when the alert is cooled down", async () => {
     const { s, reconciler, log, advance } = make(POOL, { alertCooldownMs: 600_000 });
 

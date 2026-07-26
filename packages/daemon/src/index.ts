@@ -379,7 +379,7 @@ const endpointReconciler = ingressRouter
 
 if (endpointReconciler) {
   // Repair once at boot (so a restart is still a cure) and then continuously.
-  void endpointReconciler.tick();
+  void endpointReconciler.safeTick();
   endpointReconciler.start(config.healthPollMs);
   console.log("[pigeon-daemon] serve endpoint reconciler started", JSON.stringify({
     intervalMs: config.healthPollMs,

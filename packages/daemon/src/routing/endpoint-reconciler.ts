@@ -184,15 +184,33 @@ export class ServeEndpointReconciler {
     }
   }
 
+  /**
+   * `tick()` that is guaranteed never to reject.
+   *
+   * The repair reads and writes SQLite synchronously, so a transient
+   * SQLITE_BUSY ("database is locked" — which demonstrably happens on this box
+   * when serves restart simultaneously) surfaces as a rejected promise. Any
+   * fire-and-forget `void this.tick()` would turn that into an unhandled
+   * rejection, and Node terminates the process on those by default. This runs
+   * inside the LIVE pigeon daemon, so a locked DB must degrade to "retry on the
+   * next tick", never to "kill the daemon".
+   */
+  async safeTick(): Promise<EndpointDrift[]> {
+    try {
+      return await this.tick();
+    } catch (err) {
+      this.log("tick failed", { error: err instanceof Error ? err.message : String(err) });
+      return [];
+    }
+  }
+
   /** Start the periodic reconcile loop. */
   start(intervalMs: number): void {
     if (this.timer !== null) {
       return;
     }
     this.timer = setInterval(() => {
-      void this.tick().catch((err) => {
-        this.log("tick failed", { error: err instanceof Error ? err.message : String(err) });
-      });
+      void this.safeTick();
     }, intervalMs);
     this.timer.unref?.();
   }
