@@ -1,7 +1,7 @@
 import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
 import { resolveTopic } from "./topic-manager";
-import { topicsEnabled } from "./topics";
+import { deleteTopicBySession, topicsEnabled } from "./topics";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -244,13 +244,53 @@ export async function handleSendNotification(
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
 
   // Call Telegram API
-  const telegramResult = await tg.sendMessage({
+  let telegramResult = await tg.sendMessage({
     chatId,
     messageThreadId,
     text,
     entities: entities as unknown[] | undefined,
     replyMarkup,
   });
+
+  // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band in Telegram)
+  if (
+    !telegramResult.ok &&
+    telegramResult.kind === "thread_not_found" &&
+    messageThreadId !== undefined &&
+    topicsEnabled(env) &&
+    threaded !== false
+  ) {
+    // Delete stale finalized topic row from D1
+    await deleteTopicBySession(db, sessionId);
+
+    // Recreate topic (resolve topic again)
+    const retryTopicRes = await resolveTopic(db, {
+      sessionId,
+      machineId: session.machine_id,
+      chatId: String(chatId),
+      dir: dir ?? "",
+      title: title ?? "",
+      botToken: env.TELEGRAM_BOT_TOKEN,
+    });
+
+    if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
+      return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
+    }
+
+    const newMessageThreadId =
+      retryTopicRes.ok && retryTopicRes.messageThreadId !== null
+        ? retryTopicRes.messageThreadId
+        : undefined;
+
+    // Retry sendMessage exactly once
+    telegramResult = await tg.sendMessage({
+      chatId,
+      messageThreadId: newMessageThreadId,
+      text,
+      entities: entities as unknown[] | undefined,
+      replyMarkup,
+    });
+  }
 
   // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
   // The daemon converts to ms when it pauses the outbox; don't change the unit here

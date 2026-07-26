@@ -5114,6 +5114,184 @@ describe("topics module and topicName", () => {
         expect(res).toEqual({ ok: true, messageThreadId: 890 });
       });
     });
+
+    describe("Task T2.7: Stale-thread recovery in resolveTopic", () => {
+      const sessionId = "ses_reopen_stale";
+      const botToken = "fake-bot-token";
+
+      it("reopenForumTopic returns thread_not_found -> deletes stale D1 row and recreates topic", async () => {
+        const now = Date.now();
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · stale closed", now });
+        await finalize(env.DB, { sessionId, messageThreadId: 700, now });
+        await markClosed(env.DB, { sessionId, now });
+
+        // reopen returns thread_not_found
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+          .reply(400, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
+
+        // createForumTopic succeeds for new thread 701
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+          .reply(200, { ok: true, result: { message_thread_id: 701, name: "pigeon · stale closed" } });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "stale closed",
+          botToken,
+          now: now + 1000,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 701 });
+
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.message_thread_id).toBe(701);
+        expect(row?.state).toBe("open");
+      });
+    });
+  });
+
+  describe("Task T2.7: Stale-thread recovery on sendNotification", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("sendMessage returns thread_not_found -> deletes stale D1 row, recreates topic, and retries sendMessage once", async () => {
+      const sessionId = "ses_stale_send";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · stale send", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 700, now });
+
+      let sendThreadIds: Array<number | undefined> = [];
+
+      // Intercept 1st sendMessage (thread 700 -> thread_not_found)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sendThreadIds.push(body.message_thread_id);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      // Intercept 2nd sendMessage (thread 701 -> success)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sendThreadIds.push(body.message_thread_id);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 9999 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      let createTopicCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 701, name: "pigeon · stale send" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification on deleted topic",
+          title: "stale send",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      expect(createTopicCalled || sendThreadIds.length === 2).toBe(true);
+      expect(sendThreadIds).toEqual([700, 701]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.message_thread_id).toBe(701);
+    });
+
+    it("recursion guard: second sendMessage also returns thread_not_found -> does NOT retry again (at most once)", async () => {
+      const sessionId = "ses_stale_recursion_guard";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recursion", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 705, now });
+
+      let sendMessageCalls = 0;
+
+      // Intercept 1st sendMessage
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      // Intercept 2nd sendMessage
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      let createTopicCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => {
+          createTopicCalls++;
+          return { ok: true, result: { message_thread_id: 702, name: "pigeon · recursion" } };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification on double deleted topic",
+          title: "recursion",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(502); // Telegram API error on second failure
+      expect(createTopicCalls).toBe(1); // Exactly 1 recreate attempt
+    });
   });
 
   describe("Task T2.5: Threaded notification delivery", () => {
