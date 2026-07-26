@@ -281,7 +281,11 @@ export async function handleSendNotification(
       return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
     }
 
-    const newMessageThreadId =
+    // Adopt the recreated thread for EVERYTHING downstream, not just this retry.
+    // The media loop below reads messageThreadId; leaving it pointing at the deleted
+    // thread silently dropped every attachment (sendPhoto fails, the item is skipped
+    // with no retry and no log).
+    messageThreadId =
       retryTopicRes.ok && retryTopicRes.messageThreadId !== null
         ? retryTopicRes.messageThreadId
         : undefined;
@@ -289,7 +293,7 @@ export async function handleSendNotification(
     // Retry sendMessage exactly once
     telegramResult = await tg.sendMessage({
       chatId,
-      messageThreadId: newMessageThreadId,
+      messageThreadId,
       text,
       entities: entities as unknown[] | undefined,
       replyMarkup,
@@ -300,18 +304,17 @@ export async function handleSendNotification(
   // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
   // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
   // Never drop a notification. 429 errors must NOT fall back here.
-  // Non-429 topic failure fallback to General.
-  // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
-  // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
-  // Never drop a notification. 429 errors must NOT fall back here.
   if (
     !telegramResult.ok &&
     telegramResult.kind !== "rate_limited" &&
     messageThreadId !== undefined
   ) {
+    // Clear the thread for everything downstream: if the topic would not take the text
+    // it will not take the attachments either, so the media loop must follow to General.
+    messageThreadId = undefined;
     telegramResult = await tg.sendMessage({
       chatId,
-      messageThreadId: undefined,
+      messageThreadId,
       text,
       entities: entities as unknown[] | undefined,
       replyMarkup,

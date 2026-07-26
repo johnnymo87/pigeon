@@ -5803,6 +5803,111 @@ describe("topics module and topicName", () => {
       expect(docThreadId).toBe("9888");
     });
 
+    it("media follows the recreated thread after T2.7 stale-thread recovery", async () => {
+      // Regression: messageThreadId was assigned once and never updated by the T2.7
+      // retry, so the media loop kept sending to the DELETED thread. sendPhoto then
+      // failed and the item was silently skipped -- attachments dropped with no log.
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t29_media_after_recovery";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const imageKey = `media_test/img_recov_${Date.now()}.png`;
+      const uploadForm = new FormData();
+      uploadForm.append("key", imageKey);
+      uploadForm.append("mime", "image/png");
+      uploadForm.append("filename", "shot.png");
+      uploadForm.append("file", new Blob(["png_data"], { type: "image/png" }), "shot.png");
+      await SELF.fetch("https://worker/media/upload", {
+        method: "POST",
+        body: uploadForm,
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      });
+
+      // Seed a finalized topic pointing at thread 500, which Telegram no longer has.
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · Recovered",
+        now: Date.now(),
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: 51500, now: Date.now() });
+
+      // The recreate produces thread 777.
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 51777, name: "pigeon · Recovered" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      // First send hits the dead thread; the retry after recovery succeeds.
+      const sentThreadIds: (number | undefined)[] = [];
+      let sendCount = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sentThreadIds.push(JSON.parse(raw).message_thread_id);
+          sendCount++;
+          if (sendCount === 1) {
+            return {
+              statusCode: 400,
+              data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
+              responseOptions: { headers: { "Content-Type": "application/json" } },
+            };
+          }
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 520001 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .times(2);
+
+      let photoThreadId: string | null = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+        .reply((opts: any) => {
+          if (opts.body instanceof FormData) {
+            photoThreadId = opts.body.get("message_thread_id") as string | null;
+          } else {
+            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
+            photoThreadId = match ? match[1] : null;
+          }
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 520002 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification with photo",
+          title: "Recovered",
+          dir: "pigeon",
+          threaded: true,
+          media: [{ key: imageKey, mime: "image/png", filename: "shot.png" }],
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      // Text recovered onto the new thread.
+      expect(sentThreadIds).toEqual([51500, 51777]);
+      // The photo must follow the text onto 777, not chase the deleted 500.
+      expect(photoThreadId).toBe("51777");
+    });
+
     it("flag off -> sendPhoto and sendDocument do NOT carry message_thread_id", async () => {
       const sessionId = "ses_t29_flag_off_media";
       await registerSession(sessionId, "devbox", "pigeon");
