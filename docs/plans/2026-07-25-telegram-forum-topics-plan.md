@@ -124,7 +124,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 *Outbound:*
 
 - [x] T2.1 Worker: `topics` table (schema file + test schema arrays) — `d4c2dee`. Worker 174 → **178** tests, typecheck clean. Both assertions proven non-vacuous (dropping the index failed the duplicate test; dropping the `WHERE` failed the partial-index test). **The plan's trap was understated — see the corrected note at T2.1.**
-- [ ] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)**
+- [x] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)** — `40cb367`. Worker 178 → **182**, typecheck clean. `topicsEnabled(env)` lives in the new `src/topics.ts` (T2.3 expands it), not `types.ts`, which is ambient types only. Semantics are **strict `=== "true"`**: `"TRUE"`, `"1"`, `""`, `"true "` all ⇒ `false`. Non-vacuity proven by swapping in `Boolean(env.…)` and watching the `"false"` test fail — that permissive form is the one bug this predicate exists to prevent.
 - [ ] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)`
 - [ ] T2.4 Worker: forum methods + topic manager with reservation protocol
 - [ ] T2.5 Daemon + worker: `title`/`dir`/`threaded` end-to-end **through the outbox**
@@ -1109,16 +1109,33 @@ const MACHINE_ICON_COLORS: Record<string, number> = {
   cloudbox: 9367192,  // 0x8EEE98 green
 };
 const DEFAULT_ICON_COLOR = 16766590; // 0xFFD67E yellow
-
-/** `{dir} · {title}`, clamped to Telegram's 128-char topic-name limit. */
-export function topicName(dir: string, title: string): string {
-  const full = `${dir} · ${title}`;
-  if (full.length <= 128) return full;
-  return [...full].slice(0, 127).join("") + "…";
-}
 ```
 
-A **fixed map, not a hash** — with six allowed `icon_color` values a hash collides trivially between two machines. The `[...full]` spread is deliberate: `slice` on a raw string can split a surrogate pair in an emoji-bearing title.
+A **fixed map, not a hash** — with six allowed `icon_color` values a hash collides trivially between two machines.
+
+> **⚠️ The `topicName` sketch previously printed here was WRONG — do not resurrect it from git history.**
+> It read:
+>
+> ```typescript
+> if (full.length <= 128) return full;
+> return [...full].slice(0, 127).join("") + "…";
+> ```
+>
+> That **mixes units**: it *tests* with `.length` (UTF-16 code units) but *slices* with the `[...]` spread
+> (code points). Measured: a 128-emoji title is 256 code units, so the guard trips, and the spread then
+> returns 127 code points = 254 units + `…` = **255 UTF-16 units — roughly 2× over Telegram's 128 cap.**
+> The spread fixes surrogate splitting and silently introduces an overflow.
+>
+> **Clamp by UTF-16 code units, surrogate-safely, reserving one unit for the ellipsis.** Code points ≤ code
+> units always, so clamping to 128 units satisfies the limit under *either* reading of Telegram's "128
+> characters" — the conservative choice, since the Bot API does not say which it means.
+>
+> Reuse `clampPreservingSurrogates` — added in `8d97f29` at `packages/daemon/src/text.ts`, with an in-file
+> copy in `packages/opencode-plugin/src/session-state.ts`. The worker needs its **third** copy; the three
+> packages share no library, so duplicate it deliberately and cross-reference all three in comments.
+>
+> Still to **decide explicitly** (the title clamps punt on it): internal newlines. Harmless in a message
+> header, not in a topic name. Pick a behaviour, comment the reason, and test it.
 
 > **[rev2-plan] `dir` and `title` are two separate inputs and both arrive per-notification.** Do not try to derive `dir` from the worker's `sessions.label` — that column is corrupted by `/current-state`, which overwrites it with titles (`current-state-ingest.ts:96` → `sessions.ts:76-79`). T2.5 supplies both fields explicitly. Without this, fifteen `mono` worktrees all render `Fix auth test · Fix auth test`.
 
@@ -1357,7 +1374,7 @@ Document the manual setup: create supergroup → enable Topics → add bot → p
       **[rev2-plan]** The reviewed draft had deploy-then-DDL. That bricks command ingestion: T2.14 makes `queueCommand`'s INSERT and `pollNextCommand`'s SELECT reference `commands.message_thread_id` **unconditionally** (`d1-ops.ts:73-81`, `:119-131`) — the feature flag gates *behavior*, not SQL text. Deploying first means the next webhook command from any machine dies with `no such column`. Additive DDL is backwards-compatible with the currently-deployed code, so DDL-first is safe in both directions.
    2. Deploy with `TELEGRAM_TOPICS_ENABLED` **off**; confirm no behavior change.
    3. Create the supergroup; add its id to `ALLOWED_CHAT_IDS` **alongside** `8248645256`, so in-flight notifications to the old DM do not start 403ing mid-flight.
-   4. Flip the flag; update the `TELEGRAM_CHAT_ID` sops secret per machine; restart daemons.
+   4. Flip the flag — it is **strict `=== "true"`** (T2.2), so `"True"`/`"TRUE"`/`"1"` all silently leave topics **off**. Fail-safe by design, but confirm the deployed value is exactly `true` rather than assuming the flip took. Then update the `TELEGRAM_CHAT_ID` sops secret per machine and restart daemons.
    5. Burn in per `daemon-cutover-burnin`, **watching worker logs for 429 frequency**.
    6. After burn-in, drop the old chat id.
 
