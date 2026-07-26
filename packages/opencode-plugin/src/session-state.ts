@@ -5,11 +5,28 @@
  */
 export const MAX_TITLE_LENGTH = 200
 
+/**
+ * Clamp to at most `max` UTF-16 code units without splitting a surrogate pair.
+ *
+ * An unpaired surrogate survives JSON.stringify (escaped as a well-formed \udXXX) and so
+ * reaches Telegram, but cannot be encoded as UTF-8 — Telegram rejects it or mojibakes it to
+ * U+FFFD. Mirrors `clampPreservingSurrogates` in @pigeon/daemon's `text.ts`; the packages
+ * share no library, so this is duplicated deliberately. Keep them in sync.
+ */
+function clampPreservingSurrogates(s: string, max: number): string {
+  if (s.length <= max) return s
+  let end = max
+  const c = s.charCodeAt(end - 1)
+  // Trailing high surrogate means its low half was cut off — drop it too.
+  if (c >= 0xd800 && c <= 0xdbff) end--
+  return s.slice(0, end)
+}
+
 export function normalizeTitle(title: string | undefined): string | undefined {
   if (!title) return undefined
   const trimmed = title.trim()
   if (!trimmed) return undefined
-  return trimmed.slice(0, MAX_TITLE_LENGTH)
+  return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH)
 }
 
 const State = { Created: 0, Registering: 1, Registered: 2, Notified: 3 } as const

@@ -3,6 +3,26 @@ import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { StopNotifier, QuestionNotifier } from "../src/notification-service";
 
+/**
+ * True when `s` contains no unpaired UTF-16 surrogate. An unpaired surrogate survives
+ * JSON.stringify (which escapes it as a well-formed \\udXXX) but cannot be encoded as
+ * UTF-8, so Telegram either rejects the request or mojibakes it to U+FFFD.
+ */
+function isWellFormedTitle(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = s.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+
 describe("createApp", () => {
   let storage: StorageDb | null = null;
 
@@ -342,6 +362,46 @@ describe("createApp", () => {
     expect(res2.status).toBe(202);
     expect(storage?.sessions.get("ses_long")?.title).toBe(exact200Title);
     expect(storage?.sessions.get("ses_long")?.title?.length).toBe(200);
+  });
+
+  it("does not leave a lone surrogate when clamping splits an astral character", async () => {
+    const app = newApp();
+    // 199 ASCII + one astral char (2 UTF-16 units) straddling the 199/200 boundary.
+    // A bare .slice(0, 200) keeps the high surrogate and drops the low one.
+    const straddling = "a".repeat(199) + "\u{1F600}";
+    expect(straddling.length).toBe(201);
+
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: "ses_surrogate", notify: true, title: straddling }),
+    }));
+    expect(res.status).toBe(200);
+
+    const stored = storage?.sessions.get("ses_surrogate")?.title;
+    // The whole astral char is dropped rather than half of it kept.
+    expect(stored).toBe("a".repeat(199));
+    expect(stored?.length).toBe(199);
+    expect(isWellFormedTitle(stored!)).toBe(true);
+  });
+
+  it("keeps a whole astral character that ends exactly on the clamp boundary", async () => {
+    const app = newApp();
+    // 198 ASCII + astral char => length exactly 200, the pair is intact and must survive.
+    const exact = "a".repeat(198) + "\u{1F600}";
+    expect(exact.length).toBe(200);
+
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: "ses_surrogate_fit", notify: true, title: exact }),
+    }));
+    expect(res.status).toBe(200);
+
+    const stored = storage?.sessions.get("ses_surrogate_fit")?.title;
+    expect(stored).toBe(exact);
+    expect(stored?.length).toBe(200);
+    expect(isWellFormedTitle(stored!)).toBe(true);
   });
 
   it("supports /sessions/enable-notify preserving backend_kind fields", async () => {

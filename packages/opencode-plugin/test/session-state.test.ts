@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from "vitest"
-import { SessionManager } from "../src/session-state"
+import { SessionManager, normalizeTitle } from "../src/session-state"
 
 describe("SessionManager", () => {
   let manager: SessionManager
@@ -297,4 +297,45 @@ describe("SessionManager", () => {
        expect(manager.isRegistered("session-1")).toBe(true)
      })
    })
+})
+
+describe("normalizeTitle surrogate safety", () => {
+  const isWellFormed = (str: string): boolean => {
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i)
+      if (c >= 0xd800 && c <= 0xdbff) {
+        const next = str.charCodeAt(i + 1)
+        if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+        i++
+      } else if (c >= 0xdc00 && c <= 0xdfff) {
+        return false
+      }
+    }
+    return true
+  }
+
+  test("drops a whole astral char rather than leaving a lone surrogate", () => {
+    // 199 ASCII + astral char (2 units) => the clamp at 200 would split the pair.
+    const straddling = "a".repeat(199) + "\u{1F600}"
+    expect(straddling.length).toBe(201)
+
+    const out = normalizeTitle(straddling)
+    expect(out).toBe("a".repeat(199))
+    expect(out!.length).toBe(199)
+    expect(isWellFormed(out!)).toBe(true)
+  })
+
+  test("keeps an astral char that ends exactly on the boundary", () => {
+    const exact = "a".repeat(198) + "\u{1F600}"
+    expect(exact.length).toBe(200)
+
+    const out = normalizeTitle(exact)
+    expect(out).toBe(exact)
+    expect(out!.length).toBe(200)
+    expect(isWellFormed(out!)).toBe(true)
+  })
+
+  test("leaves short titles untouched", () => {
+    expect(normalizeTitle("Fix flaky auth test 😀")).toBe("Fix flaky auth test 😀")
+  })
 })

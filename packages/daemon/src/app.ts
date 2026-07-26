@@ -7,6 +7,7 @@ import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routi
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
 import { makeMsgId } from "./ids";
+import { clampPreservingSurrogates } from "./text";
 
 interface LegacySession {
   session_id: string;
@@ -91,7 +92,9 @@ function parseTitle(val: unknown): string | undefined {
   if (typeof val !== "string") return undefined;
   const trimmed = val.trim();
   if (trimmed === "") return undefined;
-  return trimmed.slice(0, MAX_TITLE_LENGTH);
+  // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that Telegram
+  // cannot encode, silently killing every notification for the session. See text.ts.
+  return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);
 }
 
 interface AppOptions {
