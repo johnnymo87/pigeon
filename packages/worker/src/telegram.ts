@@ -9,6 +9,7 @@ export interface SendMessageOptions {
   text: string;
   entities?: unknown[];
   replyMarkup?: unknown;
+  messageThreadId?: number;
 }
 
 export interface EditMessageTextOptions {
@@ -158,6 +159,9 @@ export async function sendMessage(
   }
   if (options.replyMarkup) {
     payload.reply_markup = options.replyMarkup;
+  }
+  if (options.messageThreadId !== undefined) {
+    payload.message_thread_id = options.messageThreadId;
   }
 
   const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {

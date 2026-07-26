@@ -1,5 +1,7 @@
 import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
+import { resolveTopic } from "./topic-manager";
+import { topicsEnabled } from "./topics";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -9,6 +11,9 @@ interface SendNotificationBody {
   media?: Array<{ key: string; mime: string; filename: string }>;
   notificationId?: string;
   entities?: unknown[];
+  title?: string;
+  dir?: string;
+  threaded?: boolean;
 }
 
 interface SessionRow {
@@ -171,7 +176,7 @@ export async function handleSendNotification(
   }
 
   const body = (await request.json()) as SendNotificationBody;
-  const { sessionId, chatId, text, replyMarkup, media, entities } = body;
+  const { sessionId, chatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
   const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
 
   // Validate required fields
@@ -215,11 +220,33 @@ export async function handleSendNotification(
   // otherwise generate a fresh token for reply-to-message routing.
   const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
+  let messageThreadId: number | undefined;
+
+  if (topicsEnabled(env) && threaded !== false) {
+    const topicRes = await resolveTopic(db, {
+      sessionId,
+      machineId: session.machine_id,
+      chatId: String(chatId),
+      dir: dir ?? "",
+      title: title ?? "",
+      botToken: env.TELEGRAM_BOT_TOKEN,
+    });
+
+    if (!topicRes.ok && topicRes.kind === "rate_limited") {
+      return json({ error: "rate_limited", retryAfter: topicRes.retryAfter }, 429);
+    }
+
+    if (topicRes.ok && topicRes.messageThreadId !== null) {
+      messageThreadId = topicRes.messageThreadId;
+    }
+  }
+
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
 
   // Call Telegram API
   const telegramResult = await tg.sendMessage({
     chatId,
+    messageThreadId,
     text,
     entities: entities as unknown[] | undefined,
     replyMarkup,

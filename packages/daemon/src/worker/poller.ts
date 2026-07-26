@@ -13,6 +13,9 @@ export interface SendNotificationInput {
   media?: Array<{ key: string; mime: string; filename: string }>;
   notificationId?: string;
   entities?: unknown[];
+  title?: string;
+  dir?: string;
+  threaded?: boolean;
 }
 
 export interface PollerConfig {
@@ -307,7 +310,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<{ ok: boolean; retryAfter?: number }> {
-    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities } = input;
+    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded } = input;
     try {
       const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -323,6 +326,9 @@ export class Poller {
           ...(media && media.length > 0 ? { media } : {}),
           ...(notificationId ? { notificationId } : {}),
           ...(entities && entities.length > 0 ? { entities } : {}),
+          ...(title ? { title } : {}),
+          ...(dir ? { dir } : {}),
+          ...(threaded !== undefined ? { threaded } : {}),
         }),
       });
       const payload = (await response.json()) as { ok?: boolean; retryAfter?: unknown };

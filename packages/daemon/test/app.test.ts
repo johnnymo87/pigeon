@@ -694,6 +694,43 @@ describe("createApp", () => {
     expect(storage.sessions.get("sess-stop-title")?.title).toBe("Live Title From Stop");
   });
 
+  it("includes title, dir, and threaded in outbox payload on /stop", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 68_000,
+      chatId: "chat-123",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-topic-payload",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        title: "Fix flaky test",
+      }),
+    }));
+
+    const stop = await app(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-stop-topic-payload",
+        message: "Done",
+      }),
+    }));
+
+    expect(stop.status).toBe(202);
+    const json = await stop.json();
+    const outboxEntry = storage.outbox.getByNotificationId(json.notificationId);
+    expect(outboxEntry).not.toBeNull();
+    const payload = JSON.parse(outboxEntry!.payload);
+    expect(payload.title).toBe("Fix flaky test");
+    expect(payload.dir).toBe("/home/dev/projects/pigeon");
+    expect(payload.threaded).toBe(true);
+  });
+
   it("returns existing outbox entry on duplicate stop request", async () => {
     storage = openStorageDb(":memory:");
     const fixedNow = 70_000;
@@ -855,6 +892,44 @@ describe("createApp", () => {
     expect(json.ok).toBe(true);
     expect(json.notified).toBe(false);
     expect(json.reason).toBe("notify=false");
+  });
+
+  it("includes title, dir, and threaded in outbox payload on /question-asked", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 85_000,
+      chatId: "chat-123",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q-topic-payload",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        title: "Question session",
+      }),
+    }));
+
+    const qRes = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-q-topic-payload",
+        request_id: "req-q1",
+        questions: [{ type: "text", question: "Confirm?", options: [] }],
+      }),
+    }));
+
+    expect(qRes.status).toBe(202);
+    const json = await qRes.json();
+    const outboxEntry = storage.outbox.getByNotificationId(json.notificationId);
+    expect(outboxEntry).not.toBeNull();
+    const payload = JSON.parse(outboxEntry!.payload);
+    expect(payload.title).toBe("Question session");
+    expect(payload.dir).toBe("/home/dev/projects/pigeon");
+    expect(payload.threaded).toBe(true);
   });
 
   it("POST /question-asked returns 400 for missing fields", async () => {

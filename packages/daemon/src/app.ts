@@ -415,6 +415,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
           replyMarkup: notification.replyMarkup,
           notificationId,
+          title: effectiveTitle ?? undefined,
+          dir: session.cwd ?? undefined,
+          threaded: true,
         };
 
         // Queue in outbox — OutboxSender will deliver with retry
@@ -501,7 +504,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }, now);
 
         // Format the notification payload for the outbox
-        let notificationPayload: { message: { text: string; entities: unknown[] }; replyMarkup: unknown; notificationId: string };
+        let notificationPayload: {
+          message: { text: string; entities: unknown[] };
+          replyMarkup: unknown;
+          notificationId: string;
+          title?: string;
+          dir?: string;
+          threaded?: boolean;
+        };
 
         if (questions.length > 1) {
           // Multi-question: wizard mode — show step 1
@@ -519,6 +529,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             message: { text: notification.message.text, entities: notification.message.entities },
             replyMarkup: notification.replyMarkup,
             notificationId,
+            title: effectiveTitle ?? undefined,
+            dir: session.cwd ?? undefined,
+            threaded: true,
           };
         } else {
           // Single-question: existing behavior
@@ -534,6 +547,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             message: { text: notification.message.text, entities: notification.message.entities },
             replyMarkup: notification.replyMarkup,
             notificationId,
+            title: effectiveTitle ?? undefined,
+            dir: session.cwd ?? undefined,
+            threaded: true,
           };
         }
 

@@ -15,7 +15,7 @@ import {
   cleanupSeenUpdates,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
-import { isAllowedChatId, generateToken } from "../src/notifications";
+import { isAllowedChatId, generateToken, handleSendNotification } from "../src/notifications";
 import {
   topicsEnabled,
   topicName,
@@ -5020,6 +5020,182 @@ describe("topics module and topicName", () => {
       expect(deleteCalls).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
       // Winner 1 re-read D1 and returned Winner 2's thread id 999
       expect(res).toEqual({ ok: true, messageThreadId: 999 });
+    });
+  });
+
+  describe("Task T2.5: Threaded notification delivery", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    let msgCounter = 850000;
+    const nextMsgId = () => ++msgCounter;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    it("flag off: TELEGRAM_TOPICS_ENABLED unset -> sendMessage payload has no message_thread_id", async () => {
+      const sessionId = "ses_t25_flag_off";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sentPayload = JSON.parse(raw);
+          return { ok: true, result: { message_id: nextMsgId() } };
+        });
+
+      const res = await sendNotification({
+        sessionId,
+        chatId: topicChatId,
+        text: "Task completed",
+        title: "Feature complete",
+        dir: "pigeon",
+        threaded: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.message_thread_id).toBeUndefined();
+
+      // Verify no topic created in D1
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("flag on + threaded: false -> sendMessage payload has no message_thread_id", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t25_threaded_false";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sentPayload = JSON.parse(raw);
+          return { ok: true, result: { message_id: nextMsgId() } };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Current state overview",
+          title: "Overview",
+          dir: "pigeon",
+          threaded: false,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.message_thread_id).toBeUndefined();
+
+      // Verify no topic created in D1
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("flag on + topic resolution succeeds -> sendMessage payload carries message_thread_id", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t25_flag_on_success";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      let createTopicPayload: any = null;
+      let sendMessagePayload: any = null;
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          createTopicPayload = JSON.parse(raw);
+          return { ok: true, result: { message_thread_id: 888, name: "pigeon · My Topic" } };
+        });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sendMessagePayload = JSON.parse(raw);
+          return { ok: true, result: { message_id: nextMsgId() } };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Task completed",
+          title: "My Topic",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      expect(createTopicPayload).toEqual({
+        chat_id: topicChatId,
+        name: "pigeon · My Topic",
+        icon_color: 7322096,
+      });
+      expect(sendMessagePayload).toEqual({
+        chat_id: topicChatId,
+        message_thread_id: 888,
+        text: "Task completed",
+      });
+
+      // Verify topic row in D1
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.message_thread_id).toBe(888);
+    });
+
+    it("flag on + topic resolution rate limited -> returns 429 with retryAfter", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t25_rate_limited";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 25 } });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Task completed",
+          title: "My Topic",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(429);
+      const json = await res.json();
+      expect(json).toEqual({ error: "rate_limited", retryAfter: 25 });
     });
   });
 });

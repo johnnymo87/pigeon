@@ -146,16 +146,25 @@ export class OutboxSender {
         let messages: Array<{ text: string; entities?: unknown[] }>;
         let replyMarkup: unknown;
         let notificationId: string | undefined;
+        let title: string | undefined;
+        let dir: string | undefined;
+        let threaded: boolean | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
             messages?: Array<{ text: string; entities?: unknown[] }>;
             message?: { text: string; entities?: unknown[] };
             replyMarkup: unknown;
             notificationId?: string;
+            title?: string;
+            dir?: string;
+            threaded?: boolean;
           };
           messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
           notificationId = parsed.notificationId;
+          title = parsed.title;
+          dir = parsed.dir;
+          threaded = parsed.threaded;
         } catch (err) {
           this.log("outbox entry payload parse failed", {
             notificationId: entry.notificationId,
@@ -183,6 +192,9 @@ export class OutboxSender {
               replyMarkup: isLast ? replyMarkup : { inline_keyboard: [] },
               notificationId: chunkNotificationId(notificationId, i, isLast),
               entities: msg.entities,
+              title,
+              dir,
+              threaded,
             });
 
             if (!result.ok) {

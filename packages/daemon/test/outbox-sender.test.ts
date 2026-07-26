@@ -97,6 +97,46 @@ describe("OutboxSender.processOnce()", () => {
     });
   });
 
+  it("passes title, dir, and threaded from outbox payload to sendNotification", async () => {
+    storage.outbox.upsert({
+      notificationId: "notif-topic-1",
+      sessionId: "sess-topic-1",
+      requestId: "req-1",
+      kind: "stop",
+      payload: JSON.stringify({
+        messages: [{ text: "Done" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-topic-1",
+        title: "Fix bug",
+        dir: "/home/dev/pigeon",
+        threaded: true,
+      }),
+      token: "tok-abc",
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledWith({
+      sessionId: "sess-topic-1",
+      chatId: "chat-123",
+      text: "Done",
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-topic-1",
+      entities: undefined,
+      title: "Fix bug",
+      dir: "/home/dev/pigeon",
+      threaded: true,
+    });
+  });
+
   it("retries on transient failure with backoff (ok: false)", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
