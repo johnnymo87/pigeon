@@ -9,6 +9,7 @@ declare global {
     CCR_API_KEY: string;
     ALLOWED_CHAT_IDS: string;
     ALLOWED_USER_IDS?: string;
+    TELEGRAM_TOPICS_ENABLED?: string;
     MEDIA: R2Bucket;
   }
 }

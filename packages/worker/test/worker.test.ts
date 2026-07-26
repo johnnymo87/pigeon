@@ -16,6 +16,7 @@ import {
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import { isAllowedChatId, generateToken } from "../src/notifications";
+import { topicsEnabled } from "../src/topics";
 import {
   verifyWebhookSecret,
   deduplicateUpdate,
@@ -482,6 +483,30 @@ describe("generateToken", () => {
   it("generates unique tokens", () => {
     const tokens = new Set(Array.from({ length: 50 }, () => generateToken()));
     expect(tokens.size).toBe(50);
+  });
+});
+
+describe("topicsEnabled", () => {
+  it("returns true when TELEGRAM_TOPICS_ENABLED is 'true'", () => {
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true" } as Env)).toBe(true);
+  });
+
+  it("returns false when TELEGRAM_TOPICS_ENABLED is 'false'", () => {
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "false" } as Env)).toBe(false);
+  });
+
+  it("returns false when TELEGRAM_TOPICS_ENABLED is absent / undefined", () => {
+    expect(topicsEnabled({} as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: undefined } as Env)).toBe(false);
+  });
+
+  it("returns false for messy, truthy, or non-matching inputs", () => {
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "TRUE" } as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "1" } as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "" } as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "   " } as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true " } as Env)).toBe(false);
+    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "yes" } as Env)).toBe(false);
   });
 });
 
