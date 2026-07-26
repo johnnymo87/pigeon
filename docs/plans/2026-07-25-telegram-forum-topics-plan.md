@@ -987,7 +987,35 @@ Remaining findings filed as beads, not blocking: surrogate-blind title truncatio
 before T2.3 clones the pattern**), no entity-stripping fallback on a deterministic 400, the flaky
 concurrency proof, and the dead stop/question send paths (see T2.5's warning).
 
-**Deploy is NOT done — it needs a human**: `sudo` is unavailable from the agent shell.
+**Phase 1 is DEPLOYED (2026-07-25).** Worker deployed to Cloudflare (version `a0c54991`, `/health` → `ok`);
+`origin/main` fast-forwarded to `328ecca` (no PR, by request); `pigeon-daemon` restarted 19:07:28 EDT on cloudbox
+with the new code confirmed live. The opencode-serve pool was deliberately **not** restarted — the two plugin
+changes are non-urgent, skew is safe, and a pool restart drops attached TUIs. Other machines (devbox, macbook,
+chromebook) still need `git pull && npm install` + a daemon restart when convenient; skew is safe indefinitely.
+
+---
+
+## ⚠️ Before Phase 2 starts — read this block
+
+**1. Do the surrogate-truncation fix first (bead `pigeon-5wn`, P2).** T2.3's `topicName()` truncates at Telegram's
+**128-char** topic-name cap, i.e. far more often than the 200-char title clamp — and the nearest code to copy
+(`app.ts:94`, `session-state.ts:12`) is surrogate-blind. Fix the pattern *before* T2.3 clones it. Reuse the guard at
+`split-message.ts:176-180`. This is the single highest-value pre-Phase-2 action.
+
+**2. Use a NEW worktree, and check for collisions.** A sibling session is working in
+`~/projects/pigeon/.worktrees/registry-fencing` (branch `registry-fencing` off `main@328ecca`) on the serve-registry
+fencing work (beads `pigeon-13p`, `pigeon-886`). It touches `packages/daemon/src/routing/` and `worker/`. Phase 2
+touches the worker + daemon notification paths, so overlap is possible but not guaranteed — **`git fetch` and check
+before assuming a clean base.** Never work in `/home/dev/projects/pigeon` itself: it runs the LIVE production daemon
+from its source.
+
+**3. Two traps are already documented at their tasks** — see the ⚠️ blocks at **T2.3** (surrogate truncation +
+newline handling) and **T2.5** (dead lookalike send paths with passing tests and zero production callers, bead
+`pigeon-m76`). Both produce *green tests and wrong behaviour*. Re-read them when you reach those tasks.
+
+**4. Open beads worth knowing about, none blocking Phase 2:** `pigeon-3m5` (swarm delivery reports false failure and
+double-injects to idle sessions — will bite you if you coordinate over swarm), `pigeon-4v0` (the lease-CAS
+concurrency proof is flaky under full-suite load; passes isolated — do not chase it), `pigeon-76k`, `pigeon-288`.
 
 ---
 
