@@ -29,6 +29,7 @@ import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
+import { ServeEndpointReconciler } from "./routing/endpoint-reconciler";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
@@ -341,6 +342,51 @@ const telegramNotifier = config.telegramBotToken && config.telegramChatId
 const notifier: StopNotifier | undefined = workerNotifier && telegramNotifier
   ? new FallbackStopNotifier(workerNotifier, telegramNotifier)
   : (workerNotifier ?? telegramNotifier);
+
+// Registry endpoint fencing (bead pigeon-13p). PIGEON_SERVE_ENDPOINTS is the
+// authority for a pool slot's endpoint; the registry row is not. Any process that
+// inherits OPENCODE_SERVE_ID + OPENCODE_ROUTING_DB can rewrite
+// serve_instance.endpoint via registerSelf, and nothing else in the system can
+// ever correct it: the real serve keeps the row's heartbeat fresh and healthy, and
+// seedServes uses ON CONFLICT DO NOTHING so even a daemon restart won't repair it.
+// On 2026-07-25 that routed 76 sessions at a closed port until it was fixed by
+// hand. This reasserts the configured endpoint (that column ONLY) every tick, and
+// the reassert firing is the alert.
+//
+// Deliberately NOT inside the `serveLiveness === "self"` branch above: that branch
+// is host-dependent, and a repair that silently doesn't exist on `http` hosts is
+// the failure mode this whole bead is about.
+//
+// NOTE on alert delivery: `StopNotifier.sendPlainAlert` is OPTIONAL
+// (notification-service.ts) and `WorkerNotificationService` does not implement it,
+// so on a host with no TELEGRAM_BOT_TOKEN the notifier resolves to worker-only and
+// drift alerts are silently dropped. The repair still happens. The startup line
+// below states which of the two it is, so an undeliverable alert is visible once
+// rather than invisible forever. Cannot use the durable outbox here: the worker's
+// POST /notifications/send 404s unless `sessionId` exists in its sessions table,
+// and an operational alert has no session — it would retry 10x and be marked
+// failed with no user-visible signal.
+const endpointReconciler = ingressRouter
+  ? new ServeEndpointReconciler({
+      serves: storage.serves,
+      endpoints: config.serveEndpoints,
+      notifier,
+      machineId: config.machineId,
+      log: (msg, fields) =>
+        console.warn(`[endpoint-reconciler] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (endpointReconciler) {
+  // Repair once at boot (so a restart is still a cure) and then continuously.
+  void endpointReconciler.tick();
+  endpointReconciler.start(config.healthPollMs);
+  console.log("[pigeon-daemon] serve endpoint reconciler started", JSON.stringify({
+    intervalMs: config.healthPollMs,
+    serves: config.serveEndpoints.length,
+    alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
+  }));
+}
 
 // Delivery watchdog: periodically re-checks handed-off swarm messages that
 // haven't verified an assistant run actually started, escalating alert ->
