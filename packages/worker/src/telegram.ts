@@ -25,6 +25,7 @@ export interface SendPhotoOptions {
   photo: Blob;
   filename: string;
   replyToMessageId?: number;
+  messageThreadId?: number;
 }
 
 export interface SendDocumentOptions {
@@ -32,6 +33,7 @@ export interface SendDocumentOptions {
   document: Blob;
   filename: string;
   replyToMessageId?: number;
+  messageThreadId?: number;
 }
 
 export interface AnswerCallbackQueryOptions {
@@ -205,6 +207,9 @@ export async function sendPhoto(
   const form = new FormData();
   form.append("chat_id", String(options.chatId));
   form.append("photo", options.photo, options.filename);
+  if (options.messageThreadId) {
+    form.append("message_thread_id", String(options.messageThreadId));
+  }
   if (options.replyToMessageId) {
     form.append("reply_to_message_id", String(options.replyToMessageId));
   }
@@ -224,6 +229,9 @@ export async function sendDocument(
   const form = new FormData();
   form.append("chat_id", String(options.chatId));
   form.append("document", options.document, options.filename);
+  if (options.messageThreadId) {
+    form.append("message_thread_id", String(options.messageThreadId));
+  }
   if (options.replyToMessageId) {
     form.append("reply_to_message_id", String(options.replyToMessageId));
   }

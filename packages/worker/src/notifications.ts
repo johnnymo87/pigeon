@@ -131,12 +131,14 @@ async function sendTelegramPhoto(
   photoBlob: Blob,
   filename: string,
   replyToMessageId?: number,
+  messageThreadId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
   const res = await tg.sendPhoto({
     chatId,
     photo: photoBlob,
     filename,
     replyToMessageId,
+    messageThreadId,
   });
   if (res.ok) {
     return { ok: true, result: res.result };
@@ -150,12 +152,14 @@ async function sendTelegramDocument(
   documentBlob: Blob,
   filename: string,
   replyToMessageId?: number,
+  messageThreadId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
   const res = await tg.sendDocument({
     chatId,
     document: documentBlob,
     filename,
     replyToMessageId,
+    messageThreadId,
   });
   if (res.ok) {
     return { ok: true, result: res.result };
@@ -349,8 +353,8 @@ export async function handleSendNotification(
         const isImage = item.mime.startsWith("image/");
 
         const mediaResult = isImage
-          ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId)
-          : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId);
+          ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId)
+          : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId);
 
         if (mediaResult.ok && mediaResult.result) {
           await db

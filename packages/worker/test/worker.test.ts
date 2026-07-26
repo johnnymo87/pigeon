@@ -5681,5 +5681,193 @@ describe("topics module and topicName", () => {
       expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
     });
   });
+
+  describe("Task T2.9: Media passes message_thread_id", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    it("flag on + topic resolved -> sendPhoto and sendDocument carry message_thread_id in FormData", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t29_flag_on_media";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      // Upload image and document to R2
+      const imageKey = `media_test/img_${Date.now()}.png`;
+      const docKey = `media_test/doc_${Date.now()}.pdf`;
+
+      const uploadForm1 = new FormData();
+      uploadForm1.append("key", imageKey);
+      uploadForm1.append("mime", "image/png");
+      uploadForm1.append("filename", "screenshot.png");
+      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
+      await SELF.fetch("https://worker/media/upload", {
+        method: "POST",
+        body: uploadForm1,
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      });
+
+      const uploadForm2 = new FormData();
+      uploadForm2.append("key", docKey);
+      uploadForm2.append("mime", "application/pdf");
+      uploadForm2.append("filename", "report.pdf");
+      uploadForm2.append("file", new Blob(["pdf_data"], { type: "application/pdf" }), "report.pdf");
+      await SELF.fetch("https://worker/media/upload", {
+        method: "POST",
+        body: uploadForm2,
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 9888, name: "pigeon · Media Topic" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_id: 1000 } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      let photoThreadId: string | null = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+        .reply((opts: any) => {
+          if (opts.body instanceof FormData) {
+            photoThreadId = opts.body.get("message_thread_id") as string | null;
+          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
+            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
+            photoThreadId = match ? match[1] : null;
+          }
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 1001 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      let docThreadId: string | null = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendDocument/ })
+        .reply((opts: any) => {
+          if (opts.body instanceof FormData) {
+            docThreadId = opts.body.get("message_thread_id") as string | null;
+          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
+            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
+            docThreadId = match ? match[1] : null;
+          }
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 1002 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification with photo and document",
+          title: "Media Topic",
+          dir: "pigeon",
+          threaded: true,
+          media: [
+            { key: imageKey, mime: "image/png", filename: "screenshot.png" },
+            { key: docKey, mime: "application/pdf", filename: "report.pdf" },
+          ],
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      expect(photoThreadId).toBe("9888");
+      expect(docThreadId).toBe("9888");
+    });
+
+    it("flag off -> sendPhoto and sendDocument do NOT carry message_thread_id", async () => {
+      const sessionId = "ses_t29_flag_off_media";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const imageKey = `media_test/img_off_${Date.now()}.png`;
+
+      const uploadForm1 = new FormData();
+      uploadForm1.append("key", imageKey);
+      uploadForm1.append("mime", "image/png");
+      uploadForm1.append("filename", "screenshot.png");
+      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
+      await SELF.fetch("https://worker/media/upload", {
+        method: "POST",
+        body: uploadForm1,
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_id: 2000 } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      let photoThreadId: string | null = null;
+      let photoCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+        .reply((opts: any) => {
+          photoCalled = true;
+          if (opts.body instanceof FormData) {
+            photoThreadId = opts.body.get("message_thread_id") as string | null;
+          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
+            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
+            photoThreadId = match ? match[1] : null;
+          }
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 2001 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification with photo with flag off",
+          title: "Media Topic",
+          dir: "pigeon",
+          threaded: true,
+          media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, env, request);
+
+      expect(res.status).toBe(200);
+      expect(photoCalled).toBe(true);
+      expect(photoThreadId).toBeNull();
+    });
+  });
 });
 
