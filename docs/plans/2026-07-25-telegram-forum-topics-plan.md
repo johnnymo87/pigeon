@@ -127,7 +127,8 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)** — `40cb367`. Worker 178 → **182**, typecheck clean. `topicsEnabled(env)` lives in the new `src/topics.ts` (T2.3 expands it), not `types.ts`, which is ambient types only. Semantics are **strict `=== "true"`**: `"TRUE"`, `"1"`, `""`, `"true "` all ⇒ `false`. Non-vacuity proven by swapping in `Boolean(env.…)` and watching the `"false"` test fail — that permissive form is the one bug this predicate exists to prevent.
 - [x] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)` — `0a42d05`. Worker 182 → **195**, typecheck clean. All ten repo functions, timestamps caller-injected. `topicName` clamps to **128 UTF-16 code units** via a third deliberate copy of `clampPreservingSurrogates`; a 128-emoji title measures exactly 128 units with no unpaired surrogate. **Newlines: `[\r\n]+` → single space, runs of spaces collapsed, trimmed** — topic names are single-line UI labels. Empty `dir` *and* `title` falls back to `"session"` (Telegram requires name length ≥ 1). Both assertions proven non-vacuous: the old broken sketch produced **246 units** (caught by the length assertion) and a bare `.slice(0,127)` left an unpaired high surrogate (caught by the well-formedness assertion).
   - **`reserve` wins/loses on `(res.meta.rows_written ?? 0) > 0`**, matching the established convention at `d1-ops.ts:189,261,283`. Robust to D1 counting index writes (a win reports ≥1 either way), but **`rows_written` is a billing-style metric, not SQLite's `changes()`** — miniflare reports `0` for an ignored insert and production D1 is *assumed* to agree. T2.4's entire single-winner race rides on this. **Verify against real D1 at Checkpoint 2a; do not let the dark deploy pass without it.**
-- [ ] T2.4 Worker: forum methods + topic manager with reservation protocol
+- [ ] T2.4a Worker: Telegram forum methods + `createTelegramClient` factory
+- [ ] T2.4b Worker: topic manager — reservation protocol with TTL, steal, and CAS finalize
 - [ ] T2.5 Daemon + worker: `title`/`dir`/`threaded` end-to-end **through the outbox**
 - [ ] T2.6 Worker: reopen-on-closed
 - [ ] T2.7 Worker: stale-thread recovery
@@ -1142,34 +1143,84 @@ A **fixed map, not a hash** — with six allowed `icon_color` values a hash coll
 
 **Commit:** `feat(worker): topics repo module and topic-name builder`
 
-### Task T2.4: Forum methods + topic manager with reservation protocol
+### Task T2.4a: Telegram forum methods + client factory
 
-**Files:**
-- Modify: `packages/worker/src/telegram.ts` (add `createForumTopic`, `editForumTopic`, `closeForumTopic`, `reopenForumTopic`, `deleteForumTopic`)
-- Create: `packages/worker/src/topic-manager.ts`
-- Test: `packages/worker/test/worker.test.ts`
+**Files:** modify `packages/worker/src/telegram.ts`; test in `packages/worker/test/worker.test.ts`.
 
-**The race being defended against:** the Poller dispatch loop and the OutboxSender run on independent timers in the same daemon process, so two concurrent worker invocations for the same session can both miss the lookup and both call `createForumTopic`. `session_id` is the primary key, so the loser's write is dropped while its Telegram topic survives as an orphan with a notification stranded inside it.
+Add `createForumTopic`, `editForumTopic`, `closeForumTopic`, `reopenForumTopic`, `deleteForumTopic`, each returning
+`TgResult<T>` exactly as the existing methods do. `createForumTopic` resolves to the created topic object (it carries
+`message_thread_id`); the other four resolve to Telegram's `true`.
 
-**Test first** — and this test is *not* vacuous under miniflare: `Promise.all` of two `resolveTopic()` calls interleaves at `await` points, so both SELECTs miss before either INSERT commits and `INSERT OR IGNORE` picks the winner. That is the same mechanism production relies on across isolates.
+**Also land the deferred `createTelegramClient(botToken)` factory.** T1.3 explicitly deferred it *to this task* on the
+grounds that five more methods would make the per-call token threading pay for itself. That was the deal; honour it.
 
-```typescript
-it("creates exactly one topic under concurrent resolution", async () => {
-  const [a, b] = await Promise.all([
-    resolveTopic(env.DB, env, { sessionId: "ses_race", dir: "pigeon", title: "T", machineId: "devbox" }),
-    resolveTopic(env.DB, env, { sessionId: "ses_race", dir: "pigeon", title: "T", machineId: "devbox" }),
-  ]);
-  expect(createForumTopicCalls).toBe(1);
-  expect(a.messageThreadId).toBe(b.messageThreadId);
-});
-```
+Pure mechanical work — no D1, no topic logic. Keep `parseTgResponse`'s conservative fallthrough intact.
 
-Algorithm:
+**Commit:** `feat(worker): telegram forum topic methods`
 
-1. `INSERT OR IGNORE INTO topics (session_id, …, message_thread_id) VALUES (…, NULL)`.
-2. Winner (insert changed a row) calls `createForumTopic`, then `finalize`s the row.
-3. Loser re-reads; if `message_thread_id` is still NULL, poll briefly (**bounded** — 5 tries × 100ms) then give up and fall back to General rather than hanging the request.
-4. If the winner's `createForumTopic` fails, it **must delete its reservation row** so the next notification retries instead of being permanently stuck on a NULL thread.
+### Task T2.4b: Topic manager — reservation with TTL, steal, and CAS finalize
+
+**Files:** create `packages/worker/src/topic-manager.ts`; modify `packages/worker/src/topics.ts`; test in
+`packages/worker/test/worker.test.ts`.
+
+**The race being defended:** the Poller dispatch loop and the OutboxSender run on independent timers in one daemon
+process, so two concurrent worker invocations for the same session can both miss the lookup and both call
+`createForumTopic`. `session_id` is the PK, so the loser's write is dropped while its Telegram topic survives as an
+orphan with a notification stranded inside it.
+
+> **The plain reservation protocol is NOT sufficient. Three findings from the Checkpoint-2a-preview adversarial
+> review (fable, 2026-07-25) change it. All three were verified against source before being written down.**
+
+**(1) A crashed winner degrades its session permanently, and the reaper provably cannot rescue it.**
+`INSERT` → `createForumTopic` (network) → `finalize` is three operations with no transaction and no TTL. If the
+isolate dies in between, the row is stuck at NULL forever. Every later notification then reserves, loses, burns the
+full poll, and falls back to General — silently, with a per-notification latency tax. And `listOrphaned` cannot see
+it while the session lives, because **`handleSendNotification` touches `sessions.updated_at` on every send**
+(`notifications.ts:209-212`) — the very fallback notifications keep the session looking healthy. Self-concealing.
+
+So the reservation needs a **TTL (120s — comfortably above any plausible `createForumTopic`) and a steal path**:
+
+- Loser, still NULL *and* `updated_at < now − TTL`, attempts
+  `UPDATE topics SET updated_at = ?, machine_id = ? WHERE session_id = ? AND message_thread_id IS NULL AND updated_at < ?`.
+  Winner of that CAS (`changes > 0`) proceeds as creator; everyone else falls back to General.
+
+**(2) `finalize` and `deleteBySession` must become CAS.** Both are currently unconditional `WHERE session_id = ?`
+(`topics.ts`). Harmless today; the moment a failure-path delete exists, a slow winner's late delete can remove a row
+another caller has since reserved *and* finalized — live Telegram topic, no D1 row, next notification mints a second
+one, first orphaned forever with no reaper visibility. Add `AND message_thread_id IS NULL` to both. `finalize`
+returning `false` means "you lost the race" ⇒ best-effort `deleteForumTopic` on the topic you just created.
+Verified safe: `finalize`'s only callers are reservation completion (`rename` handles name changes) and T2.7's
+recreate flow deletes-then-reserves.
+
+**(3) The 429 branch must be defined HERE, not deferred to T2.8.** Every default is wrong: leaving the reservation
+means the outbox retry loses, polls, and lands in General — the forbidden behaviour, laundered through the loser
+path; deleting and falling back to General is forbidden directly *and* swallows `retryAfter`, so T1.5's global outbox
+pause never engages and the rate budget burns invisibly. Correct behaviour: **delete the reservation AND propagate
+`rate_limited` out of `resolveTopic`** so `handleSendNotification` returns 429 and the existing branch
+(`notifications.ts:229-231`) does the rest. T2.8 then covers only the *non*-429 fallback.
+
+**Algorithm:**
+
+1. `getBySession`. Finalized ⇒ use it.
+2. `reserve` (`INSERT OR IGNORE`, winner detected via `meta.changes` — see `d63daf5`).
+3. Winner ⇒ `createForumTopic` ⇒ `finalize` (CAS). Create fails non-429 ⇒ conditional-delete the reservation, return
+   a General fallback. Create returns 429 ⇒ conditional-delete, propagate `rate_limited`. `finalize` returns false ⇒
+   best-effort `deleteForumTopic`, then re-read and use the winner's row.
+4. Loser ⇒ re-read; NULL ⇒ bounded poll (**5 × 100ms, via an injected delay fn**); still NULL and past TTL ⇒ attempt
+   the steal; otherwise fall back to General.
+
+**Testing — the sketched `Promise.all` test is necessary but not sufficient.** It is a *faithful* proof of the
+protocol (verified: no `withSession()` anywhere in the worker, so all queries hit one primary; miniflare interleaves
+at await points and `createForumTopicCalls === 1` is non-vacuous against a no-reservation implementation). But with
+an instant `fetchMock` it reaches the loser's poll only probabilistically, and never reaches the failure paths at
+all. **Inject the delay function** and add deterministic tests for: slow winner ⇒ loser polls to success and shares
+the thread id; winner never finalizes ⇒ loser exhausts the bound ⇒ General, notification still sent; create rejects
+⇒ reservation gone ⇒ *next* call wins and creates; create 429 ⇒ reservation gone AND `rate_limited` propagated;
+stale NULL ⇒ steal ⇒ create ⇒ finalize; slow original winner's finalize-CAS loses ⇒ compensating delete fires.
+
+**Known residual, accept and note in code:** winner creates the Telegram topic then dies before finalize ⇒ an orphan
+*Telegram* topic with no D1 row, invisible to the reaper. Unavoidable without an idempotent create, which Telegram
+does not offer. Cleanup is manual.
 
 **Commit:** `feat(worker): topic manager with create-reservation protocol`
 
@@ -1264,7 +1315,12 @@ Then, critically: **flag-off byte-equivalence.** With `TELEGRAM_TOPICS_ENABLED=f
 Two jobs:
 
 1. **Reap:** delete topics with `state='closed' AND closed_at < now - 30d`. On a `deleteForumTopic` "not found", drop the row anyway. Cap at **5 deletions per run** — the whole chat budget is 20/min, and a cron burst races live notifications.
-2. **Close orphans.** **[rev2-plan]** Dead-session cleanup calls `storage.sessions.delete()` *without* unregistering from the worker (`command-ingest.ts:508`, `:555`; the only `unregisterSession` callers are `session-reaper.ts:34` and `index.ts:395`). Once the local row is gone the daemon reaper can never see that session, so its topic would never be closed and never reaped — the 30-day lifecycle and the ~400-topic cap silently fail for exactly the crash-prone sessions that generate the most topics. So: close `state='open'` topics whose `sessions` row is **absent**, or whose `sessions.updated_at` is older than the session TTL. Fixing this worker-side rather than daemon-side also covers a daemon crash, which no daemon-side fix can.
+2. **NULL-thread rows skip Telegram entirely.** A stuck reservation row is `state='open'` with a null
+   `message_thread_id`; calling `closeForumTopic` on it is a guaranteed Telegram 400 (classified `error`, not
+   `thread_not_found`). Just close/delete the row. Also: job 2 needs the same per-run cap as job 1 —
+   `closeForumTopic` burns the same 20/min chat budget, and the first cron after a daemon outage could find dozens.
+   `listOrphaned` already takes a `limit`; use it.
+3. **Close orphans.** **[rev2-plan]** Dead-session cleanup calls `storage.sessions.delete()` *without* unregistering from the worker (`command-ingest.ts:508`, `:555`; the only `unregisterSession` callers are `session-reaper.ts:34` and `index.ts:395`). Once the local row is gone the daemon reaper can never see that session, so its topic would never be closed and never reaped — the 30-day lifecycle and the ~400-topic cap silently fail for exactly the crash-prone sessions that generate the most topics. So: close `state='open'` topics whose `sessions` row is **absent**, or whose `sessions.updated_at` is older than the session TTL. Fixing this worker-side rather than daemon-side also covers a daemon crash, which no daemon-side fix can.
 
 **Commit:** `feat(worker): reap old topics and close orphaned ones`
 
