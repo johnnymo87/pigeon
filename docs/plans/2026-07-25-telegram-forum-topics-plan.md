@@ -125,7 +125,8 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 - [x] T2.1 Worker: `topics` table (schema file + test schema arrays) — `d4c2dee`. Worker 174 → **178** tests, typecheck clean. Both assertions proven non-vacuous (dropping the index failed the duplicate test; dropping the `WHERE` failed the partial-index test). **The plan's trap was understated — see the corrected note at T2.1.**
 - [x] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)** — `40cb367`. Worker 178 → **182**, typecheck clean. `topicsEnabled(env)` lives in the new `src/topics.ts` (T2.3 expands it), not `types.ts`, which is ambient types only. Semantics are **strict `=== "true"`**: `"TRUE"`, `"1"`, `""`, `"true "` all ⇒ `false`. Non-vacuity proven by swapping in `Boolean(env.…)` and watching the `"false"` test fail — that permissive form is the one bug this predicate exists to prevent.
-- [ ] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)`
+- [x] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)` — `0a42d05`. Worker 182 → **195**, typecheck clean. All ten repo functions, timestamps caller-injected. `topicName` clamps to **128 UTF-16 code units** via a third deliberate copy of `clampPreservingSurrogates`; a 128-emoji title measures exactly 128 units with no unpaired surrogate. **Newlines: `[\r\n]+` → single space, runs of spaces collapsed, trimmed** — topic names are single-line UI labels. Empty `dir` *and* `title` falls back to `"session"` (Telegram requires name length ≥ 1). Both assertions proven non-vacuous: the old broken sketch produced **246 units** (caught by the length assertion) and a bare `.slice(0,127)` left an unpaired high surrogate (caught by the well-formedness assertion).
+  - **`reserve` wins/loses on `(res.meta.rows_written ?? 0) > 0`**, matching the established convention at `d1-ops.ts:189,261,283`. Robust to D1 counting index writes (a win reports ≥1 either way), but **`rows_written` is a billing-style metric, not SQLite's `changes()`** — miniflare reports `0` for an ignored insert and production D1 is *assumed* to agree. T2.4's entire single-winner race rides on this. **Verify against real D1 at Checkpoint 2a; do not let the dark deploy pass without it.**
 - [ ] T2.4 Worker: forum methods + topic manager with reservation protocol
 - [ ] T2.5 Daemon + worker: `title`/`dir`/`threaded` end-to-end **through the outbox**
 - [ ] T2.6 Worker: reopen-on-closed
@@ -1240,6 +1241,11 @@ Media already lands in the right topic via `reply_to_message_id` (`notifications
 ```bash
 npm run test && npm run typecheck
 ```
+
+**Verify `rows_written` against real D1 (carried over from T2.3).** Reserve twice for one `session_id` against the
+deployed database and confirm the second call reports `0`. Miniflare says so; production D1 has not been asked.
+If it disagrees, T2.4's reservation protocol elects two winners and every raced session gets an orphan topic —
+switch to `meta.changes` (also present on `D1Meta`) and re-test.
 
 Then, critically: **flag-off byte-equivalence.** With `TELEGRAM_TOPICS_ENABLED=false`, the Telegram payloads must be identical to Phase 1. Deploy dark and confirm no behavior change in the production DM before continuing.
 
