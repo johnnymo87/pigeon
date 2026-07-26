@@ -292,6 +292,28 @@ export async function handleSendNotification(
     });
   }
 
+  // Non-429 topic failure fallback to General.
+  // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
+  // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
+  // Never drop a notification. 429 errors must NOT fall back here.
+  // Non-429 topic failure fallback to General.
+  // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
+  // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
+  // Never drop a notification. 429 errors must NOT fall back here.
+  if (
+    !telegramResult.ok &&
+    telegramResult.kind !== "rate_limited" &&
+    messageThreadId !== undefined
+  ) {
+    telegramResult = await tg.sendMessage({
+      chatId,
+      messageThreadId: undefined,
+      text,
+      entities: entities as unknown[] | undefined,
+      replyMarkup,
+    });
+  }
+
   // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
   // The daemon converts to ms when it pauses the outbox; don't change the unit here
   // without changing that multiplication too.

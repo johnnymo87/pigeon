@@ -5257,11 +5257,19 @@ describe("topics module and topicName", () => {
           headers: { "Content-Type": "application/json" },
         });
 
-      // Intercept 2nd sendMessage
+      // Intercept 2nd sendMessage (retry on recreated topic fails again)
       fetchMock
         .get("https://api.telegram.org")
         .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
         .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      // Intercept 3rd sendMessage (fallback to General)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_id: 99981 } }), {
           headers: { "Content-Type": "application/json" },
         });
 
@@ -5289,7 +5297,7 @@ describe("topics module and topicName", () => {
 
       const res = await handleSendNotification(env.DB, testEnv, request);
 
-      expect(res.status).toBe(502); // Telegram API error on second failure
+      expect(res.status).toBe(200); // Falls back to General and delivers
       expect(createTopicCalls).toBe(1); // Exactly 1 recreate attempt
     });
   });
@@ -5467,6 +5475,210 @@ describe("topics module and topicName", () => {
       expect(res.status).toBe(429);
       const json = await res.json();
       expect(json).toEqual({ error: "rate_limited", retryAfter: 25 });
+    });
+  });
+
+  describe("Task T2.8: Fallback rules", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("non-429 topic sendMessage failure (e.g. CHAT_NOT_A_FORUM) -> falls back to General and succeeds", async () => {
+      const sessionId = "ses_t28_non429_send_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fallback", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 500, now });
+
+      const sentThreadIds: Array<number | undefined> = [];
+
+      // Intercept 1st sendMessage (with topic thread_id 500 -> non-429 error)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadIds.push(body.message_thread_id);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      // Intercept 2nd sendMessage (General fallback without message_thread_id -> success)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadIds.push(body.message_thread_id);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 8888 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification falling back to General",
+          title: "fallback",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json).toEqual({ ok: true, messageId: 8888, token: expect.any(String) });
+      expect(sentThreadIds).toEqual([500, undefined]);
+    });
+
+    it("429 topic sendMessage failure -> returns 429 with retryAfter and does NOT fall back to General", async () => {
+      const sessionId = "ses_t28_429_send_no_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · rate limit", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 501, now });
+
+      let sendCalls = 0;
+
+      // Intercept 1st sendMessage (with topic thread_id 501 -> 429 rate limit)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          sendCalls++;
+          return {
+            statusCode: 429,
+            data: JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 12 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification hit rate limit on topic send",
+          title: "rate limit",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(429);
+      const json = await res.json();
+      expect(json).toEqual({ error: "rate_limited", retryAfter: 12 });
+      expect(sendCalls).toBe(1); // Crucial assertion: exactly 1 call, no General fallback call made
+    });
+
+    it("non-429 createForumTopic failure -> falls back to General and succeeds", async () => {
+      const sessionId = "ses_t28_non429_create_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      let createTopicCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => {
+          createTopicCalls++;
+          return { ok: false, error_code: 400, description: "Bad Request: FORUM_CLOSED" };
+        });
+
+      let sentThreadId: number | undefined = 99;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 7777 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Fallback from create failure",
+          title: "create fallback",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(200);
+      expect(createTopicCalls).toBe(1);
+      expect(sentThreadId).toBeUndefined(); // Sent to General
+    });
+
+    it("429 createForumTopic failure -> returns 429 with retryAfter and does NOT call sendMessage", async () => {
+      const sessionId = "ses_t28_429_create_no_send";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 20 } });
+
+      let sendMessageCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, () => {
+          sendMessageCalled = true;
+          return { ok: true, result: { message_id: 1111 } };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Rate limit on create topic",
+          title: "rate limit create",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(429);
+      const json = await res.json();
+      expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
+      expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
     });
   });
 });
