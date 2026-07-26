@@ -117,13 +117,13 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T1.4 Worker: map `rate_limited` to a 429 response — `d4ba3c9`, `b0ad593`. Four-line branch before the generic 502, returning exactly `{ error: "rate_limited", retryAfter }`. **Send path only** — `handleEditNotification` keeps its 502 on purpose (T1.5 consumes only the send path, so a 429 there would have no consumer; revisit if the wizard's edit path ever needs backoff). `retryAfter` is in **seconds** and now says so in a comment, because T1.5 multiplies by 1000 and a silent unit slip there is a 1000× error. Test asserts `17` propagated from `parameters.retry_after` — not the client's `DEFAULT_RETRY_AFTER_SECONDS = 1` fallback, so it proves real plumbing. The plain-400→502 guard was shown non-vacuous by injecting an over-broad `if (!ok) → 429` and watching the pre-existing 502 test fail.
 - [x] T1.5 Daemon: global outbox pause on `retry_after` + `FallbackNotifier` skip — `18f8959`, `b7aaafb`. `OutboxSender.pausedUntil` + a **labeled `break batchLoop`**: the pre-existing `break` only left the *chunk* loop, so the other four entries in the `getReady(now, 5)` batch kept firing at the same throttled chat — that was the actual bug, and the "called once, not 3" test is what pins it. Ordinary failures still take per-entry backoff and must **not** pause (asserted, since an over-eager pause would stall the whole outbox on one broken message — worse than the bug). New exported `RateLimitError` carries `retryAfter` across the throw boundary; `FallbackNotifier` rethrows it in all three methods instead of re-sending direct to Telegram. `retryAfter` is **seconds**, converted to ms exactly once, and now JSDoc'd on the error because it's public API. Resume is logged and `pausedUntil` reset, so a stalled outbox no longer goes silent unexplained; the field stays in-memory deliberately (a restart mid-window just gets another 429 and re-establishes it).
 - [x] T1.6 Daemon: convert `poller.sendNotification` to an options object — `2e71f1f`, `992e35f`. **The dropped-`entities` bug was live and worse than the plan implied**: `OutboxSender` passed `msg.entities` as the 7th argument while the `index.ts:275` closure declared only six parameters, so *every* outbox-delivered notification — i.e. all stop and question notifications, the primary path — silently lost its Telegram formatting entities. Reproduced red (the spy call was missing the `[{offset:0,length:5,type:"bold"}]` array) before the fix. The closure is now a pass-through `(input) => poller.sendNotification(input)`, which cannot drop fields; it carries a comment warning that collapsing it to a bare `poller.sendNotification` reference detaches `this` and throws at runtime. `SendNotificationInput` lives in `worker/poller.ts`; review noted `notification-service.ts` importing a type from the concrete transport is a mild inversion — acceptable, but if T2.5 grows the interface further consider a shared `worker/types.ts`.
-- [ ] **Checkpoint 1** — full test + typecheck, deploy, adversarial review of the Phase 0+1 diff
+- [x] **Checkpoint 1** — full test + typecheck ✅, adversarial (fable) review ✅ (found the deploy-runbook defect and the unclamped outbox pause), **deployed to production** ✅ — worker `a0c54991`, `main` @ `328ecca`, cloudbox daemon restarted
 
 ### Phase 2 — Topics
 
 *Outbound:*
 
-- [ ] T2.1 Worker: `topics` table (schema file + test schema array)
+- [x] T2.1 Worker: `topics` table (schema file + test schema arrays) — `d4c2dee`. Worker 174 → **178** tests, typecheck clean. Both assertions proven non-vacuous (dropping the index failed the duplicate test; dropping the `WHERE` failed the partial-index test). **The plan's trap was understated — see the corrected note at T2.1.**
 - [ ] T2.2 Worker: `TELEGRAM_TOPICS_ENABLED` flag **(built before anything reads it)**
 - [ ] T2.3 Worker: `topics.ts` repo module + `topicName(dir, title)`
 - [ ] T2.4 Worker: forum methods + topic manager with reservation protocol
@@ -1036,7 +1036,22 @@ concurrency proof is flaky under full-suite load; passes isolated — do not cha
 - Modify: `packages/worker/src/d1-schema.sql`
 - Modify: `packages/worker/test/worker.test.ts:35-79` (the `d1SchemaStatements` array)
 
-**Trap:** the worker test file **duplicates the schema** rather than reading the `.sql` file. Update both, or tests pass locally against a table production does not have.
+**Trap (corrected during execution — it is worse than first written):** the worker test file does not duplicate the
+schema, it **triplicates** it. There are three independent hardcoded DDL arrays, none of which read
+`packages/worker/src/d1-schema.sql`:
+
+| Array | Location | Got `topics` in T2.1? |
+|---|---|---|
+| `d1SchemaStatements` | `worker.test.ts:44` | ✅ yes |
+| `schemaStatements` (inside `describe("d1-ops")`) | `worker.test.ts:2526` | ✅ yes |
+| `pollSchemaStatements` (inside `describe("poll and ack endpoints")`) | `worker.test.ts:3155` | ❌ **no — deliberately, see below** |
+
+`topics` was left out of `pollSchemaStatements` because no poll/ack test touches it, and adding it there would
+have been speculative scope. **That is safe for T2.1 and NOT safe for T2.14**, which adds a column to `commands` —
+a table the poll tests very much do use. See the warning added at T2.14.
+
+The general hazard: update one array and miss another, and the suite passes locally against a schema production
+does not have. Any future D1 change must check all three.
 
 ```sql
 CREATE TABLE IF NOT EXISTS topics (
@@ -1279,7 +1294,14 @@ if (message.reply_to_message && !isTopicServiceReply) {
 > **[rev2-plan] This task's blast radius is ~3× what the reviewed draft listed.** Enumerate all of it, because `messageThreadId` will be optional everywhere and **typecheck will happily pass with the daemon half unimplemented** — leaving the advertised fix undelivered.
 
 **Files:**
-- Worker: `src/d1-schema.sql` + `test/worker.test.ts` schema array; `src/d1-ops.ts:60-80` (`queueCommand` INSERT) and `:119-131` (`pollNextCommand` SELECT); `src/poll.ts:30-73` (the per-command-type response branches); `src/webhook.ts` (populate from the inbound message)
+> **⚠️ Three schema arrays, and this task needs at least two of them.** `worker.test.ts` hardcodes the DDL in
+> `d1SchemaStatements` (`:44`), `schemaStatements` (`:2526`), and `pollSchemaStatements` (`:3155`) — see the
+> corrected trap note at T2.1. T2.14 adds `commands.message_thread_id`, and `pollSchemaStatements` is the array
+> backing the **poll and ack** tests, i.e. exactly the code path this task changes. Miss it and
+> `pollNextCommand`'s SELECT references a column the test DB lacks. Grep all three before you finish.
+
+**Files:**
+- Worker: `src/d1-schema.sql` + **all three** `test/worker.test.ts` schema arrays as applicable; `src/d1-ops.ts:60-80` (`queueCommand` INSERT) and `:119-131` (`pollNextCommand` SELECT); `src/poll.ts:30-73` (the per-command-type response branches); `src/webhook.ts` (populate from the inbound message)
 - Daemon: `src/worker/poller.ts` (every command message type); `src/index.ts` (every `on*` handler, `:126-261`); and the input types + `sendTelegramReply(chatId, …)` calls of **seven ingest modules** — `kill-ingest`, `interrupt-ingest`, `compact-ingest`, `mcp-ingest` (3 functions), `model-ingest` (2 functions), `launch-ingest`, and `command-ingest` (`:511`, `:520`, `:529`)
 - Tests: the eight corresponding daemon ingest test files
 
