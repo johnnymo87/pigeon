@@ -5021,6 +5021,99 @@ describe("topics module and topicName", () => {
       // Winner 1 re-read D1 and returned Winner 2's thread id 999
       expect(res).toEqual({ ok: true, messageThreadId: 999 });
     });
+
+    describe("Task T2.6: Reopen-on-closed", () => {
+      const sessionId = "ses_closed_topic";
+      const botToken = "fake-bot-token";
+
+      it("resolving a state='closed' topic calls reopenForumTopic and flips state to open", async () => {
+        const now = Date.now();
+        // Seed a closed topic in D1
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · closed", now });
+        await finalize(env.DB, { sessionId, messageThreadId: 888, now });
+        await markClosed(env.DB, { sessionId, now });
+
+        let reopenCalled = false;
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+          .reply(200, (opts: any) => {
+            reopenCalled = true;
+            const body = JSON.parse(opts.body as string);
+            expect(body.chat_id).toBe(topicChatId);
+            expect(body.message_thread_id).toBe(888);
+            return { ok: true, result: true };
+          });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "closed",
+          botToken,
+          now: now + 1000,
+        });
+
+        expect(reopenCalled).toBe(true);
+        expect(res).toEqual({ ok: true, messageThreadId: 888 });
+
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.state).toBe("open");
+        expect(row?.closed_at).toBeNull();
+      });
+
+      it("reopenForumTopic returns 429 rate_limited -> propagates rate_limited error", async () => {
+        const now = Date.now();
+        await reserve(env.DB, { sessionId: "ses_closed_429", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed 429", now });
+        await finalize(env.DB, { sessionId: "ses_closed_429", messageThreadId: 889, now });
+        await markClosed(env.DB, { sessionId: "ses_closed_429", now });
+
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+          .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 10 } });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId: "ses_closed_429",
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "closed 429",
+          botToken,
+          now: now + 1000,
+        });
+
+        expect(res).toEqual({ ok: false, kind: "rate_limited", retryAfter: 10 });
+
+        const row = await getBySession(env.DB, "ses_closed_429");
+        expect(row?.state).toBe("closed");
+      });
+
+      it("reopenForumTopic returns non-429 error -> returns messageThreadId anyway so notification is not dropped", async () => {
+        const now = Date.now();
+        await reserve(env.DB, { sessionId: "ses_closed_err", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed err", now });
+        await finalize(env.DB, { sessionId: "ses_closed_err", messageThreadId: 890, now });
+        await markClosed(env.DB, { sessionId: "ses_closed_err", now });
+
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+          .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId: "ses_closed_err",
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "closed err",
+          botToken,
+          now: now + 1000,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 890 });
+      });
+    });
   });
 
   describe("Task T2.5: Threaded notification delivery", () => {

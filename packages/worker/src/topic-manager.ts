@@ -2,8 +2,10 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { createTelegramClient, type TelegramClient } from "./telegram";
 import {
   deleteBySession,
+  deleteTopicBySession,
   finalize,
   getBySession,
+  markOpen,
   reserve,
   stealReservation,
   topicName,
@@ -51,7 +53,38 @@ export async function resolveTopic(
   // 1. Existing topic lookup
   let existing = await getBySession(db, opts.sessionId);
   if (existing && existing.message_thread_id !== null) {
-    return { ok: true, messageThreadId: existing.message_thread_id };
+    if (existing.state === "closed") {
+      const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
+      // Checkpoint 2a question: Can an admin bot post into a closed Telegram forum topic without reopening?
+      // Unverified against live Telegram API. Reopening here ensures the topic is uncollapsed/visible.
+      const reopenRes = await tgClient.reopenForumTopic({
+        chatId: opts.chatId,
+        messageThreadId: existing.message_thread_id,
+      });
+
+      if (!reopenRes.ok) {
+        if (reopenRes.kind === "rate_limited") {
+          return {
+            ok: false,
+            kind: "rate_limited",
+            retryAfter: reopenRes.retryAfter,
+          };
+        }
+        if (reopenRes.kind === "thread_not_found") {
+          // Closed topic was deleted out-of-band in Telegram -> delete stale D1 row and fall through to recreate
+          await deleteTopicBySession(db, opts.sessionId);
+        } else {
+          // Non-429, non-thread_not_found error (e.g. TOPIC_NOT_MODIFIED)
+          // Do not drop notification -> proceed with existing message_thread_id
+          return { ok: true, messageThreadId: existing.message_thread_id };
+        }
+      } else {
+        await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+        return { ok: true, messageThreadId: existing.message_thread_id };
+      }
+    } else {
+      return { ok: true, messageThreadId: existing.message_thread_id };
+    }
   }
 
   const name = topicName(opts.dir, opts.title);

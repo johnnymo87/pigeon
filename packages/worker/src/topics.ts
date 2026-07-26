@@ -263,6 +263,23 @@ export async function deleteBySession(
 }
 
 /**
+ * Delete a topic record by session_id regardless of message_thread_id.
+ * Used for stale-thread recovery when a finalized topic was deleted out-of-band in Telegram.
+ * Note: `deleteBySession` remains CAS-guarded on `message_thread_id IS NULL` to protect
+ * topic creation reservation races from deleting finalized rows.
+ */
+export async function deleteTopicBySession(
+  db: D1Database,
+  sessionId: string,
+): Promise<boolean> {
+  const res = await db
+    .prepare("DELETE FROM topics WHERE session_id = ?")
+    .bind(sessionId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
  * Attempt to steal a stale reservation row (message_thread_id IS NULL and updated_at < expiredBefore).
  * Returns true if this caller won the CAS update and stole the reservation.
  */
