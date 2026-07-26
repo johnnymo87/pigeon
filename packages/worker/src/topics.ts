@@ -144,6 +144,7 @@ export async function reserve(
 
 /**
  * Finalize a reserved topic row with its assigned message_thread_id.
+ * CAS operation: only succeeds if message_thread_id IS NULL (prevents late winner overwriting).
  * Optionally updates name if provided.
  */
 export async function finalize(
@@ -161,21 +162,21 @@ export async function finalize(
       .prepare(
         `UPDATE topics
          SET message_thread_id = ?, name = ?, updated_at = ?
-         WHERE session_id = ?`,
+         WHERE session_id = ? AND message_thread_id IS NULL`,
       )
       .bind(opts.messageThreadId, opts.name, now, opts.sessionId)
       .run();
-    return (res.meta.rows_written ?? 0) > 0;
+    return (res.meta.changes ?? 0) > 0;
   } else {
     const res = await db
       .prepare(
         `UPDATE topics
          SET message_thread_id = ?, updated_at = ?
-         WHERE session_id = ?`,
+         WHERE session_id = ? AND message_thread_id IS NULL`,
       )
       .bind(opts.messageThreadId, now, opts.sessionId)
       .run();
-    return (res.meta.rows_written ?? 0) > 0;
+    return (res.meta.changes ?? 0) > 0;
   }
 }
 
@@ -247,17 +248,43 @@ export async function markOpen(
 }
 
 /**
- * Delete a topic record by session_id.
+ * Delete a topic reservation record by session_id.
+ * CAS operation: only deletes if message_thread_id IS NULL (preserves finalized topics).
  */
 export async function deleteBySession(
   db: D1Database,
   sessionId: string,
 ): Promise<boolean> {
   const res = await db
-    .prepare("DELETE FROM topics WHERE session_id = ?")
+    .prepare("DELETE FROM topics WHERE session_id = ? AND message_thread_id IS NULL")
     .bind(sessionId)
     .run();
-  return (res.meta.rows_written ?? 0) > 0;
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Attempt to steal a stale reservation row (message_thread_id IS NULL and updated_at < expiredBefore).
+ * Returns true if this caller won the CAS update and stole the reservation.
+ */
+export async function stealReservation(
+  db: D1Database,
+  opts: {
+    sessionId: string;
+    machineId: string | null;
+    expiredBefore: number;
+    now?: number;
+  },
+): Promise<boolean> {
+  const now = opts.now ?? Date.now();
+  const res = await db
+    .prepare(
+      `UPDATE topics
+       SET updated_at = ?, machine_id = ?
+       WHERE session_id = ? AND message_thread_id IS NULL AND updated_at < ?`,
+    )
+    .bind(now, opts.machineId, opts.sessionId, opts.expiredBefore)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 /**

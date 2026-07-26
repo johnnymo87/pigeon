@@ -28,11 +28,13 @@ import {
   markClosed,
   markOpen,
   deleteBySession,
+  stealReservation,
   listReapable,
   listOrphaned,
   MACHINE_ICON_COLORS,
   DEFAULT_ICON_COLOR,
 } from "../src/topics";
+import { resolveTopic, RESERVATION_TTL_MS } from "../src/topic-manager";
 import {
   verifyWebhookSecret,
   deduplicateUpdate,
@@ -4634,6 +4636,42 @@ describe("topics module and topicName", () => {
 
       // delete non-existent
       expect(await deleteBySession(env.DB, "non_existent")).toBe(false);
+
+      // CAS check: deleteBySession fails once topic is finalized
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "pigeon · t3" });
+      await finalize(env.DB, { sessionId, messageThreadId: 777 });
+      expect(await deleteBySession(env.DB, sessionId)).toBe(false);
+      expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(777);
+    });
+
+    it("stealReservation", async () => {
+      const sessionId = "ses_steal_unit";
+      const now = 5000000;
+      const staleTime = now - 150000;
+
+      await reserve(env.DB, { sessionId, machineId: "oldbox", chatId, name: "old", now: staleTime });
+
+      // Steal with expiredBefore = now - 120000 (staleTime < now - 120000)
+      const won = await stealReservation(env.DB, {
+        sessionId,
+        machineId: "newbox",
+        expiredBefore: now - 120000,
+        now,
+      });
+      expect(won).toBe(true);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.machine_id).toBe("newbox");
+      expect(row?.updated_at).toBe(now);
+
+      // Attempt steal on non-stale reservation
+      const won2 = await stealReservation(env.DB, {
+        sessionId,
+        machineId: "anotherbox",
+        expiredBefore: now - 120000,
+        now: now + 1000,
+      });
+      expect(won2).toBe(false);
     });
 
     it("listReapable", async () => {
@@ -4699,6 +4737,289 @@ describe("topics module and topicName", () => {
       expect(orphanedIds).toContain(sStale);
       expect(orphanedIds).not.toContain(sActive);
       expect(orphanedIds).not.toContain(sClosedNoSession);
+    });
+  });
+
+  describe("topic manager resolveTopic", () => {
+    const topicChatId = "-1001234567890";
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("two concurrent resolveTopic calls -> exactly one createForumTopic, both get same thread id", async () => {
+      const sessionId = "ses_topic_concurrent";
+      const botToken = "fake-bot-token";
+
+      let createCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(200, () => {
+          createCalls++;
+          return { ok: true, result: { message_thread_id: 101, name: "pigeon · test", icon_color: 7322096 } };
+        });
+
+      const noopDelay = async () => {};
+
+      const [res1, res2] = await Promise.all([
+        resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "test",
+          botToken,
+          delayFn: noopDelay,
+        }),
+        resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "test",
+          botToken,
+          delayFn: noopDelay,
+        }),
+      ]);
+
+      expect(createCalls).toBe(1);
+      expect(res1).toEqual({ ok: true, messageThreadId: 101 });
+      expect(res2).toEqual({ ok: true, messageThreadId: 101 });
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.message_thread_id).toBe(101);
+    });
+
+    it("slow winner -> loser polls to success and shares thread id", async () => {
+      const sessionId = "ses_topic_slow_winner";
+      const botToken = "fake-bot-token";
+
+      let pollCount = 0;
+
+      // Winner reserves first
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · slow",
+      });
+
+      // Loser calls resolveTopic while reservation is still NULL.
+      // On second poll iteration, winner finalizes D1.
+      const loserPromise = resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "slow",
+        botToken,
+        delayFn: async () => {
+          pollCount++;
+          if (pollCount === 2) {
+            await finalize(env.DB, { sessionId, messageThreadId: 202 });
+          }
+        },
+      });
+
+      const res = await loserPromise;
+      expect(res).toEqual({ ok: true, messageThreadId: 202 });
+      expect(pollCount).toBe(2);
+    });
+
+    it("winner never finalizes -> loser exhausts bound -> General fallback", async () => {
+      const sessionId = "ses_topic_never_finalizes";
+      const botToken = "fake-bot-token";
+
+      // Winner reserves but never finalizes
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · stuck",
+        now: Date.now(), // fresh reservation (< TTL)
+      });
+
+      let pollCount = 0;
+      const customDelay = async () => {
+        pollCount++;
+      };
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "stuck",
+        botToken,
+        delayFn: customDelay,
+        pollAttempts: 5,
+      });
+
+      expect(pollCount).toBe(5);
+      expect(res).toEqual({ ok: true, messageThreadId: null });
+    });
+
+    it("create rejects (non-429) -> reservation row gone -> next resolveTopic wins and creates", async () => {
+      const sessionId = "ses_topic_create_rejects";
+      const botToken = "fake-bot-token";
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: chat not found" });
+
+      const res1 = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "err",
+        botToken,
+      });
+
+      expect(res1).toEqual({ ok: true, messageThreadId: null });
+      // Reservation row was conditional-deleted
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
+
+      // Next resolveTopic call succeeds
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(200, { ok: true, result: { message_thread_id: 303, name: "pigeon · err" } });
+
+      const res2 = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "err",
+        botToken,
+      });
+
+      expect(res2).toEqual({ ok: true, messageThreadId: 303 });
+      expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
+    });
+
+    it("create returns 429 -> reservation gone and rate_limited propagated with retryAfter", async () => {
+      const sessionId = "ses_topic_429";
+      const botToken = "fake-bot-token";
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(429, {
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests",
+          parameters: { retry_after: 15 },
+        });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "rate",
+        botToken,
+      });
+
+      expect(res).toEqual({ ok: false, kind: "rate_limited", retryAfter: 15 });
+      // Reservation row was conditional-deleted
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
+    });
+
+    it("stale NULL reservation (past TTL) -> steal -> create -> finalize", async () => {
+      const sessionId = "ses_topic_stale_steal";
+      const botToken = "fake-bot-token";
+      const now = Date.now();
+      const staleTime = now - RESERVATION_TTL_MS - 5000; // 125s ago (> 120s TTL)
+
+      // Seed a stale NULL reservation
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "oldbox",
+        chatId: topicChatId,
+        name: "pigeon · stale",
+        now: staleTime,
+      });
+
+      let createCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(200, () => {
+          createCalled = true;
+          return { ok: true, result: { message_thread_id: 404, name: "pigeon · fresh" } };
+        });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "fresh",
+        botToken,
+        now,
+        delayFn: async () => {},
+      });
+
+      expect(createCalled).toBe(true);
+      expect(res).toEqual({ ok: true, messageThreadId: 404 });
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.message_thread_id).toBe(404);
+      expect(row?.machine_id).toBe("devbox");
+    });
+
+    it("slow original winner's finalize CAS loses -> compensating deleteForumTopic fires", async () => {
+      const sessionId = "ses_topic_finalize_cas_loses";
+      const botToken = "fake-bot-token";
+
+      let deleteCalls: Array<{ chatId: string; messageThreadId: number }> = [];
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/deleteForumTopic`, method: "POST" })
+        .reply(200, (opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          deleteCalls.push({ chatId: body.chat_id, messageThreadId: body.message_thread_id });
+          return { ok: true, result: true };
+        });
+
+      // Winner 1 calls resolveTopic, but right before returning from createForumTopic, Winner 2 finalizes with threadId 999
+      const mockTgClient = {
+        ...createTelegramClient(botToken),
+        createForumTopic: async () => {
+          // Right before returning from createForumTopic, Winner 2 finalizes
+          await finalize(env.DB, { sessionId, messageThreadId: 999, name: "winner 2" });
+          return {
+            ok: true as const,
+            result: { message_thread_id: 505, name: "pigeon · cas", icon_color: 7322096 },
+          };
+        },
+      };
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "cas",
+        botToken,
+        tgClient: mockTgClient,
+      });
+
+      // Winner 1's finalize CAS failed (message_thread_id was already 999)
+      // Winner 1 executed compensating deleteForumTopic for 505
+      expect(deleteCalls).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
+      // Winner 1 re-read D1 and returned Winner 2's thread id 999
+      expect(res).toEqual({ ok: true, messageThreadId: 999 });
     });
   });
 });
