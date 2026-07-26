@@ -85,6 +85,20 @@ const d1SchemaStatements = [
     machine_id    TEXT PRIMARY KEY,
     last_poll_at  INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS topics (
+    session_id        TEXT PRIMARY KEY,
+    machine_id        TEXT,
+    chat_id           TEXT NOT NULL,
+    message_thread_id INTEGER,
+    name              TEXT,
+    state             TEXT NOT NULL DEFAULT 'open',
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    closed_at         INTEGER
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
+    ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at)`,
 ];
 
 beforeAll(async () => {
@@ -2553,6 +2567,20 @@ describe("d1-ops", () => {
       machine_id    TEXT PRIMARY KEY,
       last_poll_at  INTEGER NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS topics (
+      session_id        TEXT PRIMARY KEY,
+      machine_id        TEXT,
+      chat_id           TEXT NOT NULL,
+      message_thread_id INTEGER,
+      name              TEXT,
+      state             TEXT NOT NULL DEFAULT 'open',
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL,
+      closed_at         INTEGER
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
+      ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at)`,
   ];
 
   beforeAll(async () => {
@@ -2565,6 +2593,7 @@ describe("d1-ops", () => {
     await env.DB.exec("DELETE FROM commands");
     await env.DB.exec("DELETE FROM machines");
     await env.DB.exec("DELETE FROM seen_updates");
+    await env.DB.exec("DELETE FROM topics");
   });
 
   // ─── generateCommandId ───────────────────────────────────────────────
@@ -2878,6 +2907,86 @@ describe("d1-ops", () => {
       "SELECT update_id FROM seen_updates WHERE update_id = ?",
     ).bind(1002).first();
     expect(recent).not.toBeNull();
+  });
+
+  // ─── topics table schema ──────────────────────────────────────────────
+
+  it("can insert and read back a topic row", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind("ses-1", "devbox", "-100123456789", 42, "pigeon · test topic", "open", now, now).run();
+
+    const row = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?")
+      .bind("ses-1")
+      .first<{
+        session_id: string;
+        machine_id: string;
+        chat_id: string;
+        message_thread_id: number;
+        name: string;
+        state: string;
+        created_at: number;
+        updated_at: number;
+        closed_at: number | null;
+      }>();
+
+    expect(row).not.toBeNull();
+    expect(row?.session_id).toBe("ses-1");
+    expect(row?.machine_id).toBe("devbox");
+    expect(row?.chat_id).toBe("-100123456789");
+    expect(row?.message_thread_id).toBe(42);
+    expect(row?.name).toBe("pigeon · test topic");
+    expect(row?.state).toBe("open");
+    expect(row?.created_at).toBe(now);
+    expect(row?.updated_at).toBe(now);
+    expect(row?.closed_at).toBeNull();
+  });
+
+  it("rejects duplicate (chat_id, message_thread_id) when message_thread_id is NOT NULL", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind("ses-1", "devbox", "-100123456789", 42, "topic 1", "open", now, now).run();
+
+    await expect(
+      env.DB.prepare(
+        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("ses-2", "devbox", "-100123456789", 42, "topic 2", "open", now, now).run()
+    ).rejects.toThrow();
+  });
+
+  it("allows multiple rows with NULL message_thread_id and the same chat_id", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`
+    ).bind("ses-1", "devbox", "-100123456789", "pending topic 1", "open", now, now).run();
+
+    await env.DB.prepare(
+      `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`
+    ).bind("ses-2", "devbox", "-100123456789", "pending topic 2", "open", now, now).run();
+
+    const rows = await env.DB.prepare("SELECT session_id FROM topics WHERE chat_id = ? ORDER BY session_id ASC")
+      .bind("-100123456789")
+      .all<{ session_id: string }>();
+
+    expect(rows.results.length).toBe(2);
+    expect(rows.results[0].session_id).toBe("ses-1");
+    expect(rows.results[1].session_id).toBe("ses-2");
+  });
+
+  it("verifies idx_topics_thread is defined as a partial unique index", async () => {
+    const row = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_topics_thread'"
+    ).first<{ sql: string }>();
+
+    expect(row).not.toBeNull();
+    expect(row?.sql).toContain("WHERE message_thread_id IS NOT NULL");
   });
 });
 

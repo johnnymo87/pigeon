@@ -50,3 +50,20 @@ CREATE TABLE IF NOT EXISTS machines (
   machine_id    TEXT PRIMARY KEY,
   last_poll_at  INTEGER NOT NULL
 );
+
+-- Topics: Telegram forum topics registry
+CREATE TABLE IF NOT EXISTS topics (
+  session_id        TEXT PRIMARY KEY,
+  machine_id        TEXT,
+  chat_id           TEXT NOT NULL,
+  message_thread_id INTEGER,
+  name              TEXT,
+  state             TEXT NOT NULL DEFAULT 'open',
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  closed_at         INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
+  ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at);
+
