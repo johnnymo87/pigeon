@@ -130,7 +130,16 @@ export async function reserve(
     )
     .bind(opts.sessionId, opts.machineId, opts.chatId, opts.name, now, now)
     .run();
-  return (res.meta.rows_written ?? 0) > 0;
+  // `changes`, not `rows_written`. The rest of this codebase reads `rows_written`
+  // (d1-ops.ts:189,261,283) but every one of those is an UPDATE or DELETE, where the
+  // distinction is invisible. Here it is load-bearing: this boolean elects the single
+  // winner of the topic-creation race, so a false positive mints duplicate Telegram
+  // topics. `changes` is contractually SQLite's changes() — 0 for an ignored insert.
+  // `rows_written` is a billing counter that says nothing about OR IGNORE; measured
+  // against production D1 it reports 2 for a plain insert and 3 for a CREATE TABLE,
+  // i.e. it counts page/bookkeeping writes. It happens to report 0 for an ignored
+  // insert today, but that is an observation, not a contract.
+  return (res.meta.changes ?? 0) > 0;
 }
 
 /**
