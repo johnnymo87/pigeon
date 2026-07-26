@@ -1,5 +1,5 @@
 import { verifyApiKey, unauthorized } from "./auth";
-import { sendMessage, editMessageText, sendPhoto, sendDocument, getTelegramErrorDetails } from "./telegram";
+import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -121,13 +121,13 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
 }
 
 async function sendTelegramPhoto(
-  env: Env,
+  tg: TelegramClient,
   chatId: string | number,
   photoBlob: Blob,
   filename: string,
   replyToMessageId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
-  const res = await sendPhoto(env.TELEGRAM_BOT_TOKEN, {
+  const res = await tg.sendPhoto({
     chatId,
     photo: photoBlob,
     filename,
@@ -140,13 +140,13 @@ async function sendTelegramPhoto(
 }
 
 async function sendTelegramDocument(
-  env: Env,
+  tg: TelegramClient,
   chatId: string | number,
   documentBlob: Blob,
   filename: string,
   replyToMessageId?: number,
 ): Promise<{ ok: boolean; result?: { message_id: number } }> {
-  const res = await sendDocument(env.TELEGRAM_BOT_TOKEN, {
+  const res = await tg.sendDocument({
     chatId,
     document: documentBlob,
     filename,
@@ -215,8 +215,10 @@ export async function handleSendNotification(
   // otherwise generate a fresh token for reply-to-message routing.
   const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
+  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+
   // Call Telegram API
-  const telegramResult = await sendMessage(env.TELEGRAM_BOT_TOKEN, {
+  const telegramResult = await tg.sendMessage({
     chatId,
     text,
     entities: entities as unknown[] | undefined,
@@ -258,8 +260,8 @@ export async function handleSendNotification(
         const isImage = item.mime.startsWith("image/");
 
         const mediaResult = isImage
-          ? await sendTelegramPhoto(env, chatId, blob, item.filename, messageId)
-          : await sendTelegramDocument(env, chatId, blob, item.filename, messageId);
+          ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId)
+          : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId);
 
         if (mediaResult.ok && mediaResult.result) {
           await db
@@ -315,7 +317,9 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
-  const telegramResult = await editMessageText(env.TELEGRAM_BOT_TOKEN, {
+  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+
+  const telegramResult = await tg.editMessageText({
     chatId: row.chat_id,
     messageId: row.message_id,
     text,

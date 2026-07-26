@@ -42,6 +42,43 @@ export interface GetFileOptions {
   fileId: string;
 }
 
+export interface ForumTopic {
+  message_thread_id: number;
+  name: string;
+  icon_color: number;
+  icon_custom_emoji_id?: string;
+  is_name_implicit?: boolean;
+}
+
+export interface CreateForumTopicOptions {
+  chatId: string | number;
+  name: string;
+  iconColor?: number;
+  iconCustomEmojiId?: string;
+}
+
+export interface EditForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+  name?: string;
+  iconCustomEmojiId?: string;
+}
+
+export interface CloseForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
+export interface ReopenForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
+export interface DeleteForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
 
 /**
@@ -227,3 +264,117 @@ export async function getFile(
 
   return parseTgResponse<{ file_path: string }>(res);
 }
+
+export async function createForumTopic(
+  botToken: string,
+  options: CreateForumTopicOptions,
+): Promise<TgResult<ForumTopic>> {
+  const payload: Record<string, unknown> = {
+    chat_id: options.chatId,
+    name: options.name,
+  };
+  if (options.iconColor !== undefined) {
+    payload.icon_color = options.iconColor;
+  }
+  if (options.iconCustomEmojiId !== undefined) {
+    payload.icon_custom_emoji_id = options.iconCustomEmojiId;
+  }
+
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/createForumTopic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return parseTgResponse<ForumTopic>(res);
+}
+
+export async function editForumTopic(
+  botToken: string,
+  options: EditForumTopicOptions,
+): Promise<TgResult<boolean>> {
+  const payload: Record<string, unknown> = {
+    chat_id: options.chatId,
+    message_thread_id: options.messageThreadId,
+  };
+  if (options.name !== undefined) {
+    payload.name = options.name;
+  }
+  if (options.iconCustomEmojiId !== undefined) {
+    payload.icon_custom_emoji_id = options.iconCustomEmojiId;
+  }
+
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/editForumTopic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return parseTgResponse<boolean>(res);
+}
+
+export async function closeForumTopic(
+  botToken: string,
+  options: CloseForumTopicOptions,
+): Promise<TgResult<boolean>> {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/closeForumTopic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: options.chatId,
+      message_thread_id: options.messageThreadId,
+    }),
+  });
+
+  return parseTgResponse<boolean>(res);
+}
+
+export async function reopenForumTopic(
+  botToken: string,
+  options: ReopenForumTopicOptions,
+): Promise<TgResult<boolean>> {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/reopenForumTopic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: options.chatId,
+      message_thread_id: options.messageThreadId,
+    }),
+  });
+
+  return parseTgResponse<boolean>(res);
+}
+
+export async function deleteForumTopic(
+  botToken: string,
+  options: DeleteForumTopicOptions,
+): Promise<TgResult<boolean>> {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteForumTopic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: options.chatId,
+      message_thread_id: options.messageThreadId,
+    }),
+  });
+
+  return parseTgResponse<boolean>(res);
+}
+
+export function createTelegramClient(botToken: string) {
+  return {
+    sendMessage: (options: SendMessageOptions) => sendMessage(botToken, options),
+    editMessageText: (options: EditMessageTextOptions) => editMessageText(botToken, options),
+    sendPhoto: (options: SendPhotoOptions) => sendPhoto(botToken, options),
+    sendDocument: (options: SendDocumentOptions) => sendDocument(botToken, options),
+    answerCallbackQuery: (options: AnswerCallbackQueryOptions) => answerCallbackQuery(botToken, options),
+    getFile: (options: GetFileOptions) => getFile(botToken, options),
+    createForumTopic: (options: CreateForumTopicOptions) => createForumTopic(botToken, options),
+    editForumTopic: (options: EditForumTopicOptions) => editForumTopic(botToken, options),
+    closeForumTopic: (options: CloseForumTopicOptions) => closeForumTopic(botToken, options),
+    reopenForumTopic: (options: ReopenForumTopicOptions) => reopenForumTopic(botToken, options),
+    deleteForumTopic: (options: DeleteForumTopicOptions) => deleteForumTopic(botToken, options),
+  };
+}
+
+export type TelegramClient = ReturnType<typeof createTelegramClient>;

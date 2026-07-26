@@ -52,6 +52,12 @@ import {
   answerCallbackQuery,
   getFile,
   getTelegramErrorDetails,
+  createTelegramClient,
+  createForumTopic,
+  editForumTopic,
+  closeForumTopic,
+  reopenForumTopic,
+  deleteForumTopic,
 } from "../src/telegram";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
@@ -799,6 +805,311 @@ describe("telegram client module classifier", () => {
       response: rawBody,
     });
     expect(details).toBe(rawBody);
+  });
+
+  describe("createTelegramClient factory and forum topic methods", () => {
+    it("createTelegramClient binds botToken and provides all methods", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(
+          200,
+          JSON.stringify({
+            ok: true,
+            result: {
+              message_thread_id: 101,
+              name: "Bound Topic",
+              icon_color: 7322096,
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+      expect(typeof client.sendMessage).toBe("function");
+      expect(typeof client.editMessageText).toBe("function");
+      expect(typeof client.sendPhoto).toBe("function");
+      expect(typeof client.sendDocument).toBe("function");
+      expect(typeof client.answerCallbackQuery).toBe("function");
+      expect(typeof client.getFile).toBe("function");
+      expect(typeof client.createForumTopic).toBe("function");
+      expect(typeof client.editForumTopic).toBe("function");
+      expect(typeof client.closeForumTopic).toBe("function");
+      expect(typeof client.reopenForumTopic).toBe("function");
+      expect(typeof client.deleteForumTopic).toBe("function");
+
+      const res = await client.createForumTopic({ chatId: "-10012345", name: "Bound Topic" });
+      expect(res).toEqual({
+        ok: true,
+        result: {
+          message_thread_id: 101,
+          name: "Bound Topic",
+          icon_color: 7322096,
+        },
+      });
+    });
+
+    it("createForumTopic success shape with optional parameters", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(
+          200,
+          JSON.stringify({
+            ok: true,
+            result: {
+              message_thread_id: 42,
+              name: "Feature Topic",
+              icon_color: 16766590,
+              icon_custom_emoji_id: "emoji_123",
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await createForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        name: "Feature Topic",
+        iconColor: 16766590,
+        iconCustomEmojiId: "emoji_123",
+      });
+
+      expect(res).toEqual({
+        ok: true,
+        result: {
+          message_thread_id: 42,
+          name: "Feature Topic",
+          icon_color: 16766590,
+          icon_custom_emoji_id: "emoji_123",
+        },
+      });
+    });
+
+    it("createForumTopic error classification path", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: TOPIC_NAME_INVALID",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await createForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        name: "",
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "error",
+        errorCode: 400,
+        description: "Bad Request: TOPIC_NAME_INVALID",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: TOPIC_NAME_INVALID",
+        },
+      });
+    });
+
+    it("editForumTopic success shape", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const res = await editForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+        name: "Renamed Topic",
+        iconCustomEmojiId: "emoji_456",
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+    });
+
+    it("editForumTopic error classification path (rate limited)", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+        .reply(
+          429,
+          JSON.stringify({
+            ok: false,
+            error_code: 429,
+            description: "Too Many Requests: retry after 15",
+            parameters: { retry_after: 15 },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await editForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+        name: "Renamed Topic",
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "rate_limited",
+        retryAfter: 15,
+        response: {
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry after 15",
+          parameters: { retry_after: 15 },
+        },
+      });
+    });
+
+    it("closeForumTopic success shape", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const res = await closeForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+    });
+
+    it("closeForumTopic error classification path (thread_not_found)", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: message thread not found",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await closeForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 999,
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "thread_not_found",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: message thread not found",
+        },
+      });
+    });
+
+    it("reopenForumTopic success shape", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const res = await reopenForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+    });
+
+    it("reopenForumTopic error classification path", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: TOPIC_NOT_MODIFIED",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await reopenForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "error",
+        errorCode: 400,
+        description: "Bad Request: TOPIC_NOT_MODIFIED",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: TOPIC_NOT_MODIFIED",
+        },
+      });
+    });
+
+    it("deleteForumTopic success shape", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, JSON.stringify({ ok: true, result: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const res = await deleteForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+    });
+
+    it("deleteForumTopic error classification path", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: TOPIC_NOT_FOUND",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await deleteForumTopic(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "error",
+        errorCode: 400,
+        description: "Bad Request: TOPIC_NOT_FOUND",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: TOPIC_NOT_FOUND",
+        },
+      });
+    });
   });
 });
 

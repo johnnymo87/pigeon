@@ -1,7 +1,7 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
-import { sendMessage, answerCallbackQuery as answerCallbackQueryClient, getFile } from "./telegram";
+import { createTelegramClient } from "./telegram";
 
 type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "current_state";
 
@@ -238,7 +238,8 @@ async function relayMediaToR2(
     return { error: `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)` };
   }
 
-  const getFileResult = await getFile(env.TELEGRAM_BOT_TOKEN, { fileId: media.fileId });
+  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const getFileResult = await tg.getFile({ fileId: media.fileId });
 
   if (!getFileResult.ok || !getFileResult.result?.file_path) {
     return { error: "Could not download file from Telegram" };
@@ -277,7 +278,8 @@ async function sendTelegramMessage(
   chatId: number | string,
   text: string,
 ): Promise<void> {
-  await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId, text });
+  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  await tg.sendMessage({ chatId, text });
 }
 
 /**
@@ -291,7 +293,8 @@ async function answerCallbackQuery(
   callbackQueryId: string,
   text: string,
 ): Promise<void> {
-  await answerCallbackQueryClient(env.TELEGRAM_BOT_TOKEN, { callbackQueryId, text });
+  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  await tg.answerCallbackQuery({ callbackQueryId, text });
 }
 
 /**
