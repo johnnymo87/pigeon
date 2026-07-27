@@ -18,6 +18,7 @@
  */
 
 import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+import { resolveDaemonToken, invalidateDaemonToken } from "./auth-token"
 
 /**
  * Registration name for the swarm-inbox replay tool. Must satisfy
@@ -78,7 +79,23 @@ export async function swarmRead(
     url.searchParams.set("limit", String(query.limit))
   }
 
-  const res = await fetchFn(url.toString())
+  const token = resolveDaemonToken()
+  const headers: Record<string, string> = {}
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`
+  }
+
+  let res = await fetchFn(url.toString(), { headers })
+  if (res.status === 401) {
+    invalidateDaemonToken()
+    const retryToken = resolveDaemonToken()
+    const retryHeaders: Record<string, string> = {}
+    if (retryToken) {
+      retryHeaders["Authorization"] = `Bearer ${retryToken}`
+    }
+    res = await fetchFn(url.toString(), { headers: retryHeaders })
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "")
     throw new Error(`swarm_read failed: ${res.status} ${body}`)

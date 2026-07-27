@@ -139,7 +139,7 @@ This variant:
 To register a plugin-direct session manually via curl:
 
 ```bash
-curl -s -X POST -H "Content-Type: application/json" \
+curl -s -X POST -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" -H "Content-Type: application/json" \
   "http://127.0.0.1:4731/session-start" \
   --data '{
     "session_id": "direct-parity-test",

@@ -13,9 +13,9 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Daemon package path: `packages/daemon`
 - OpenCode plugin package path: `packages/opencode-plugin`
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
-- Daemon health (local): `curl http://127.0.0.1:4731/health`
+- Daemon health (local): `curl http://127.0.0.1:4731/health` (anonymous by design)
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
-- Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
+- Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
 - Deploy daemon/plugin: `git pull && npm install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
 
@@ -42,6 +42,10 @@ The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon sh
 ### Model Override
 
 The `/model` command sets a per-session model override stored in the daemon's SQLite `sessions` table. When a command is delivered, the override is read and passed through the adapter to the plugin, which includes it in the `prompt_async` request body. The override persists until the session ends or a new `/model` command changes it.
+
+### Telegram Forum Topics
+
+Pigeon supports operating in a Telegram forum supergroup (`TELEGRAM_TOPICS_ENABLED = "true"` in worker `wrangler.toml`). Each opencode session maps to a dedicated forum topic thread named after the session's TUI title. Inbound commands, outbound notifications, and media pass through thread-aware worker endpoints referencing `commands.message_thread_id` and the D1 `topics` table. For migration details, see [`docs/runbooks/telegram-forum-migration.md`](docs/runbooks/telegram-forum-migration.md).
 
 ### Swarm IPC
 
@@ -120,6 +124,8 @@ Health check URLs are listed in the Quickstart section above.
   - Use when you need endpoint, table, and flow-level system understanding.
 - [worker-deployment](.opencode/skills/worker-deployment/SKILL.md)
   - Use when deploying to Cloudflare and validating production health/auth.
+- [telegram-forum-migration](docs/runbooks/telegram-forum-migration.md)
+  - Runbook for Telegram Forum Topics supergroup migration and rollback steps.
 - [worker-operations](.opencode/skills/worker-operations/SKILL.md)
   - Use for incident triage, log tailing, quick diagnostics, and rollback steps.
 - [worker-troubleshooting](.opencode/skills/worker-troubleshooting/SKILL.md)

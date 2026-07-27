@@ -1,3 +1,5 @@
+import { resolveDaemonToken, invalidateDaemonToken } from "./auth-token"
+
 type LogFn = (message: string, data?: unknown) => void
 
 type RegisterSessionOpts = {
@@ -102,9 +104,23 @@ function onFailure(): void {
 
 function daemonHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
-  const token = process.env.PIGEON_DAEMON_AUTH_TOKEN?.trim();
+  const token = resolveDaemonToken();
   if (token) h["Authorization"] = `Bearer ${token}`;
   return h;
+}
+
+async function fetchDaemon(
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  const headers = { ...daemonHeaders(), ...(init.headers as Record<string, string> | undefined) }
+  let res = await fetch(url, { ...init, headers })
+  if (res.status === 401) {
+    invalidateDaemonToken()
+    const retryHeaders = { ...daemonHeaders(), ...(init.headers as Record<string, string> | undefined) }
+    res = await fetch(url, { ...init, headers: retryHeaders })
+  }
+  return res
 }
 
 export async function registerSession(opts: RegisterSessionOpts): Promise<DaemonResult> {
@@ -113,9 +129,8 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
   const url = getDaemonUrl(opts.daemonUrl)
 
    try {
-       const res = await fetch(`${url}/session-start`, {
+       const res = await fetchDaemon(`${url}/session-start`, {
          method: "POST",
-         headers: daemonHeaders(),
          body: JSON.stringify({
           session_id: opts.sessionId,
           notify: true,
@@ -159,9 +174,8 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
   const url = getDaemonUrl(opts.daemonUrl)
 
    try {
-     const res = await fetch(`${url}/stop`, {
+     const res = await fetchDaemon(`${url}/stop`, {
        method: "POST",
-       headers: daemonHeaders(),
          body: JSON.stringify({
            session_id: opts.sessionId,
            event: opts.event ?? "Stop",
@@ -197,9 +211,8 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
   const url = getDaemonUrl(opts.daemonUrl)
 
   try {
-    const res = await fetch(`${url}/question-asked`, {
+    const res = await fetchDaemon(`${url}/question-asked`, {
       method: "POST",
-      headers: daemonHeaders(),
       body: JSON.stringify({
         session_id: opts.sessionId,
         request_id: opts.requestId,
@@ -233,9 +246,8 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
   const url = getDaemonUrl(opts.daemonUrl)
 
   try {
-    const res = await fetch(`${url}/question-answered`, {
+    const res = await fetchDaemon(`${url}/question-answered`, {
       method: "POST",
-      headers: daemonHeaders(),
       body: JSON.stringify({
         session_id: opts.sessionId,
       }),
@@ -260,9 +272,8 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
 export async function sendQuestionAsked(opts: NotifyQuestionAskedOpts): Promise<DaemonResult> {
   const url = getDaemonUrl(opts.daemonUrl)
 
-  const res = await fetch(`${url}/question-asked`, {
+  const res = await fetchDaemon(`${url}/question-asked`, {
     method: "POST",
-    headers: daemonHeaders(),
     body: JSON.stringify({
       session_id: opts.sessionId,
       request_id: opts.requestId,

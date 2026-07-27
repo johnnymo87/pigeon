@@ -1,4 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
+import { getByThread, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
@@ -122,6 +123,8 @@ interface TelegramVoice {
 
 interface TelegramMessage {
   message_id: number;
+  message_thread_id?: number;
+  is_topic_message?: boolean;
   chat: { id: number };
   from?: { id: number };
   text?: string;
@@ -137,7 +140,7 @@ interface TelegramMessage {
 interface TelegramCallbackQuery {
   id: string;
   from: { id: number };
-  message?: { chat: { id: number } };
+  message?: { chat: { id: number }; message_thread_id?: number };
   data?: string;
 }
 
@@ -270,16 +273,21 @@ async function relayMediaToR2(
  * Send a message via the Telegram Bot API.
  *
  * Discarding the TgResult is deliberate: these are best-effort user-facing
- * chat messages across 19 call sites, and adding error handling here would
+ * chat messages across 21 call sites, and adding error handling here would
  * change behavior across all of them.
  */
 async function sendTelegramMessage(
   env: Env,
   chatId: number | string,
   text: string,
+  opts: { messageThreadId: number | undefined },
 ): Promise<void> {
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-  await tg.sendMessage({ chatId, text });
+  await tg.sendMessage({
+    chatId,
+    text,
+    messageThreadId: topicsEnabled(env) ? opts.messageThreadId : undefined,
+  });
 }
 
 /**
@@ -298,24 +306,59 @@ async function answerCallbackQuery(
 }
 
 /**
- * Resolve a session from an incoming Telegram message.
- * Tries: (1) reply-to-message lookup, (2) /cmd TOKEN format.
+ * Note: in a non-forum supergroup that uses reply threads, message_thread_id is the
+ * thread-root message id, so a genuine reply to that root would be suppressed by the
+ * guard. This is accepted because the target chat is a forum supergroup; and even when
+ * it misfires the message falls through to topic membership, which resolves to the same session.
+ */
+function isTopicServiceReply(
+  message: TelegramMessage,
+  env: { TELEGRAM_TOPICS_ENABLED?: string },
+): boolean {
+  return (
+    // Gated on the flag so that flag-off routing is UNCONDITIONALLY identical to
+    // pre-topics behaviour. Without this, an update that carries message_thread_id
+    // while the flag is off diverges: the guard suppresses Try 1 and the command
+    // either fails or reports a different error than it used to. That is only
+    // unreachable if the Bot API never sets message_thread_id on private chats --
+    // an assumption still unverified (pigeon-cev). The flag is the rollback kill
+    // switch, so it must not depend on an unverified external fact.
+    topicsEnabled(env) &&
+    message.message_thread_id !== undefined &&
+    message.reply_to_message?.message_id === message.message_thread_id
+  );
+}
+
+/**
+ * Resolve a session from an inbound Telegram message.
  * Returns { sessionId, command, questionRequestId? } or null if no session found.
+ *
+ * Precedence, highest fidelity first:
+ * 1. Swipe-reply — a reply to a message tracked in the `messages` table, unless it is a
+ *    topic service reply (see the guard below).
+ * 2. Topic membership — when TELEGRAM_TOPICS_ENABLED is "true" and `message_thread_id` is set.
+ * 3. `/cmd TOKEN` format.
  *
  * When the looked-up message has a notification_id starting with `q:`, the
  * requestId is extracted (format: `q:{sessionId}:{requestId}`) and returned as
  * questionRequestId so that swipe-replies to question notifications can be
  * identified by the daemon.
+ *
+ * `env` is REQUIRED, deliberately. Making it optional would let a future call site omit it
+ * and silently disable topic routing on that path while still typechecking — the same class
+ * of half-wired-but-green failure this plan flags for T2.14. There is no caller that
+ * legitimately has no env.
  */
 async function resolveMessageSession(
   db: D1Database,
   message: TelegramMessage,
+  env: { TELEGRAM_TOPICS_ENABLED?: string },
 ): Promise<{ sessionId: string; command: string; questionRequestId?: string } | null> {
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
 
   // Try 1: reply-to-message lookup
-  if (message.reply_to_message) {
+  if (message.reply_to_message && !isTopicServiceReply(message, env)) {
     const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
       const result: { sessionId: string; command: string; questionRequestId?: string } = {
@@ -333,7 +376,20 @@ async function resolveMessageSession(
     }
   }
 
-  // Try 2: /cmd TOKEN command format
+  // Try 2: topic membership lookup
+  // Note: Topic membership carries no notification_id, so the metadata fallback in the daemon
+  // (command-ingest.ts:274-305) — which rescues question replies after the pending_questions row
+  // expires at 4h — is unreachable for topic-routed messages. The common case still works
+  // because command-ingest.ts:129 checks pendingQuestions.getBySessionId before consulting
+  // metadata. For questions older than 4 hours, swipe-reply remains the only reliable answer path.
+  if (topicsEnabled(env) && message.message_thread_id !== undefined) {
+    const topic = await getByThread(db, chatId, message.message_thread_id);
+    if (topic) {
+      return { sessionId: topic.session_id, command: text };
+    }
+  }
+
+  // Try 3: /cmd TOKEN command format
   const cmdMatch = text.match(/^\/cmd\s+(\S+)\s+(.+)$/s);
   if (cmdMatch) {
     const token = cmdMatch[1]!;
@@ -386,11 +442,13 @@ async function resolveSessionMachine(
   sessionId: string,
   command: string,
   chatId: number | string,
+  messageThreadId: number | undefined,
 ): Promise<{ machineId: string; label: string | null } | null> {
   // Validate command length
   if (command.length > MAX_COMMAND_LENGTH) {
     await sendTelegramMessage(env, chatId,
-      `Command too long (${command.length} chars, max ${MAX_COMMAND_LENGTH})`);
+      `Command too long (${command.length} chars, max ${MAX_COMMAND_LENGTH})`,
+      { messageThreadId });
     return null;
   }
 
@@ -401,7 +459,7 @@ async function resolveSessionMachine(
     .first<{ machine_id: string; label: string | null }>();
 
   if (!session) {
-    await sendTelegramMessage(env, chatId, "Session not found");
+    await sendTelegramMessage(env, chatId, "Session not found", { messageThreadId });
     return null;
   }
 
@@ -416,6 +474,19 @@ async function resolveSessionMachine(
 
 const MAX_QUEUE_PER_MACHINE = 100;
 
+interface QueueCommandOpts {
+  machineId: string;
+  sessionId: string | null;
+  command: string;
+  chatId: string;
+  label: string | null;
+  messageThreadId: number | undefined;
+  commandType?: CommandType;
+  directory?: string | null;
+  mediaRef?: MediaRef | null;
+  metadataJson?: string | null;
+}
+
 /**
  * Queue a command for delivery to a machine.
  * Returns the command_id, or null if the queue is full.
@@ -423,16 +494,21 @@ const MAX_QUEUE_PER_MACHINE = 100;
 async function queueCommand(
   db: D1Database,
   env: Env,
-  machineId: string,
-  sessionId: string | null,
-  command: string,
-  chatId: string,
-  label: string | null,
-  commandType: CommandType = "execute",
-  directory: string | null = null,
-  mediaRef: MediaRef | null = null,
-  metadataJson: string | null = null,
+  opts: QueueCommandOpts,
 ): Promise<string | null> {
+  const {
+    machineId,
+    sessionId,
+    command,
+    chatId,
+    label,
+    messageThreadId,
+    commandType = "execute",
+    directory = null,
+    mediaRef = null,
+    metadataJson = null,
+  } = opts;
+
   const mediaJson = mediaRef ? JSON.stringify(mediaRef) : null;
 
   const commandId = await d1QueueCommand(db, {
@@ -444,11 +520,13 @@ async function queueCommand(
     directory,
     mediaJson,
     metadataJson,
+    messageThreadId: messageThreadId ?? null,
   });
 
   if (commandId === null) {
     await sendTelegramMessage(env, chatId,
-      `Queue full for ${label || machineId} (${MAX_QUEUE_PER_MACHINE} commands pending).`);
+      `Queue full for ${label || machineId} (${MAX_QUEUE_PER_MACHINE} commands pending).`,
+      { messageThreadId });
     return null;
   }
 
@@ -456,8 +534,8 @@ async function queueCommand(
 }
 
 /**
- * Resolve a session from a reply-to-message.
- * Used by /kill, /compact, /mcp, /model commands.
+ * Resolve a session from a reply-to-message or topic membership.
+ * Used by /kill, /interrupt, /compact, /mcp, /model commands.
  * Returns session info or sends an error to Telegram and returns null.
  */
 async function resolveReplySession(
@@ -466,35 +544,53 @@ async function resolveReplySession(
   message: TelegramMessage,
 ): Promise<{ sessionId: string; machineId: string; label: string | null } | null> {
   const chatId = message.chat.id;
+  const messageThreadId = message.message_thread_id;
 
-  if (!message.reply_to_message) {
-    await sendTelegramMessage(env, chatId, "Reply to a session notification to use this command.");
-    return null;
+  let sessionId: string | null = null;
+  let triedReply = false;
+
+  // Try 1: swipe-reply, unless it is the topic's ForumTopicCreated service message
+  if (message.reply_to_message && !isTopicServiceReply(message, env)) {
+    triedReply = true;
+    const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
+    if (mapping) sessionId = mapping.session_id;
   }
 
-  const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
-  if (!mapping) {
-    await sendTelegramMessage(env, chatId, "Could not find a session for that message.");
+  // Try 2: topic membership — MUST be gated on the flag
+  if (!sessionId && topicsEnabled(env) && messageThreadId !== undefined) {
+    const topic = await getByThread(db, String(chatId), messageThreadId);
+    if (topic) sessionId = topic.session_id;
+  }
+
+  if (!sessionId) {
+    // topic-aware message only when the flag is on AND we are in a topic
+    const text =
+      topicsEnabled(env) && messageThreadId !== undefined
+        ? "Could not find a session for this topic."
+        : triedReply
+          ? "Could not find a session for that message."
+          : "Reply to a session notification to use this command.";
+    await sendTelegramMessage(env, chatId, text, { messageThreadId });
     return null;
   }
 
   const session = await db
     .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-    .bind(mapping.session_id)
+    .bind(sessionId)
     .first<{ machine_id: string; label: string | null }>();
 
   if (!session) {
-    await sendTelegramMessage(env, chatId, `Session \`${mapping.session_id}\` not found.`);
+    await sendTelegramMessage(env, chatId, `Session \`${sessionId}\` not found.`, { messageThreadId });
     return null;
   }
 
   const isRecent = await isMachineRecent(db, session.machine_id);
   if (!isRecent) {
-    await sendTelegramMessage(env, chatId, `${session.machine_id} is not recently seen.`);
+    await sendTelegramMessage(env, chatId, `${session.machine_id} is not recently seen.`, { messageThreadId });
     return null;
   }
 
-  return { sessionId: mapping.session_id, machineId: session.machine_id, label: session.label };
+  return { sessionId, machineId: session.machine_id, label: session.label };
 }
 
 /**
@@ -543,14 +639,23 @@ export async function handleTelegramWebhook(
       const isRecent = await isMachineRecent(db, machineId);
 
       if (!isRecent) {
-        await sendTelegramMessage(env, launchChatId, `${machineId} is not recently seen.`);
+        await sendTelegramMessage(env, launchChatId, `${machineId} is not recently seen.`, { messageThreadId: update.message.message_thread_id });
         return OK();
       }
 
-      const commandId = await queueCommand(db, env, machineId, null, prompt, String(launchChatId), null, "launch", directory);
+      const commandId = await queueCommand(db, env, {
+        machineId,
+        sessionId: null,
+        command: prompt,
+        chatId: String(launchChatId),
+        label: null,
+        commandType: "launch",
+        directory,
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`);
+      await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -562,14 +667,22 @@ export async function handleTelegramWebhook(
 
       const isRecent = await isMachineRecent(db, machineId);
       if (!isRecent) {
-        await sendTelegramMessage(env, csChatId, `${machineId} is not recently seen.`);
+        await sendTelegramMessage(env, csChatId, `${machineId} is not recently seen.`, { messageThreadId: update.message.message_thread_id });
         return OK();
       }
 
-      const commandId = await queueCommand(db, env, machineId, null, "", String(csChatId), null, "current_state");
+      const commandId = await queueCommand(db, env, {
+        machineId,
+        sessionId: null,
+        command: "",
+        chatId: String(csChatId),
+        label: null,
+        commandType: "current_state",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, csChatId, `Fetching current state on ${machineId}...`);
+      await sendTelegramMessage(env, csChatId, `Fetching current state on ${machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -580,10 +693,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(killChatId), resolved.label, "kill");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(killChatId),
+        label: resolved.label,
+        commandType: "kill",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -594,10 +715,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(interruptChatId), resolved.label, "interrupt");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(interruptChatId),
+        label: resolved.label,
+        commandType: "interrupt",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, interruptChatId, `Interrupting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, interruptChatId, `Interrupting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -608,10 +737,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(compactChatId), resolved.label, "compact");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(compactChatId),
+        label: resolved.label,
+        commandType: "compact",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -622,10 +759,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(mcpChatId), resolved.label, "mcp_list");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_list",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -638,10 +783,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_enable");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: serverName,
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_enable",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -654,10 +807,18 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_disable");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: serverName,
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_disable",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 
@@ -683,13 +844,21 @@ export async function handleTelegramWebhook(
       }
 
       const command = modelCode ?? "";
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, command, String(modelChatId), resolved.label, commandType);
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command,
+        chatId: String(modelChatId),
+        label: resolved.label,
+        commandType,
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       if (commandType === "model_set") {
-        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       } else {
-        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
+        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       }
       return OK();
     }
@@ -704,21 +873,21 @@ export async function handleTelegramWebhook(
     if (media && media.size > MAX_FILE_SIZE) {
       if (chatId) {
         await sendTelegramMessage(env, chatId,
-          `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)`);
+          `File too large (${(media.size / 1024 / 1024).toFixed(1)}MB, max 20MB)`, { messageThreadId: update.message.message_thread_id });
       }
       return OK();
     }
 
-    const resolved = await resolveMessageSession(db, update.message);
+    const resolved = await resolveMessageSession(db, update.message, env);
     if (!resolved) {
       if (chatId) {
         await sendTelegramMessage(env, chatId,
-          "Could not find session for this message. Please reply to a recent notification or use /cmd TOKEN command format.");
+          "Could not find session for this message. Please reply to a recent notification or use /cmd TOKEN command format.", { messageThreadId: update.message.message_thread_id });
       }
       return OK();
     }
 
-    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, chatId!);
+    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, chatId!, update.message.message_thread_id);
     if (!machine) return OK();
 
     // Relay media to R2 if present
@@ -727,7 +896,7 @@ export async function handleTelegramWebhook(
       const relayResult = await relayMediaToR2(env, media);
       if ("error" in relayResult) {
         if (chatId) {
-          await sendTelegramMessage(env, chatId, relayResult.error);
+          await sendTelegramMessage(env, chatId, relayResult.error, { messageThreadId: update.message.message_thread_id });
         }
         return OK();
       }
@@ -737,7 +906,17 @@ export async function handleTelegramWebhook(
     const metadataJson = resolved.questionRequestId
       ? JSON.stringify({ questionRequestId: resolved.questionRequestId })
       : null;
-    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef, metadataJson);
+    const commandId = await queueCommand(db, env, {
+      machineId: machine.machineId,
+      sessionId: resolved.sessionId,
+      command: resolved.command,
+      chatId: String(chatId!),
+      label: machine.label,
+      commandType: "execute",
+      mediaRef,
+      metadataJson,
+      messageThreadId: update.message.message_thread_id,
+    });
     if (!commandId) return OK();
 
     return OK();
@@ -760,10 +939,17 @@ export async function handleTelegramWebhook(
     const cbChatId = update.callback_query.message?.chat?.id;
     if (!cbChatId) return OK();
 
-    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, cbChatId);
+    const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, cbChatId, update.callback_query.message?.message_thread_id);
     if (!machine) return OK();
 
-    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(cbChatId), machine.label);
+    const commandId = await queueCommand(db, env, {
+      machineId: machine.machineId,
+      sessionId: resolved.sessionId,
+      command: resolved.command,
+      chatId: String(cbChatId),
+      label: machine.label,
+      messageThreadId: update.callback_query.message?.message_thread_id,
+    });
     if (!commandId) return OK();
 
     await answerCallbackQuery(env, update.callback_query.id, "Command sent");

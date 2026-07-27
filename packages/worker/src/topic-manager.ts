@@ -75,7 +75,10 @@ export async function resolveTopic(
           await deleteTopicBySession(db, opts.sessionId);
         } else {
           // Non-429, non-thread_not_found error (e.g. TOPIC_NOT_MODIFIED)
-          // Do not drop notification -> proceed with existing message_thread_id
+          // Do not drop notification -> proceed with existing message_thread_id.
+          // Proceeding-with-the-thread and leaving-it-closed are contradictory states.
+          // The sticky-closed row is what arms the reaper, so mark it open now.
+          await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
       } else {

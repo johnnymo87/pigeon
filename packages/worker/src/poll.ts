@@ -31,6 +31,7 @@ export async function handlePollNext(
     commandId: result.commandId,
     commandType: result.commandType,
     chatId: result.chatId,
+    messageThreadId: result.messageThreadId,
   };
 
   if (result.commandType === "launch") {

@@ -23,10 +23,22 @@ export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
 
 ## Deploy
 
+> **⚠️ WARNING: The `[vars]` Deploy-Revert Trap**
+>
+> `ALLOWED_CHAT_IDS` and `TELEGRAM_TOPICS_ENABLED` live in `[vars]` in `packages/worker/wrangler.toml`.
+> **Running `wrangler deploy` re-asserts `[vars]` from `wrangler.toml`**, silently overwriting any variables modified directly in the Cloudflare Dashboard UI.
+>
+> To update worker environment variables, edit `wrangler.toml` directly, preview with `npm run --workspace @pigeon/worker deploy -- --dry-run`, and then deploy.
+
 ```bash
 cd ~/projects/pigeon
 npm run --workspace @pigeon/worker deploy
 ```
+
+## Forum Topics Migration Runbook
+
+For the full, step-by-step procedure to migrate Pigeon from direct messages to Telegram Forum Topics, see:
+- `docs/runbooks/telegram-forum-migration.md`
 
 ## R2 Bucket
 

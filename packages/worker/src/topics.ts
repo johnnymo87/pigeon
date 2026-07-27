@@ -305,24 +305,27 @@ export async function stealReservation(
 }
 
 /**
- * List closed topics older than closedBefore, capped by limit.
+ * List closed topics older than closedBefore where the session is no longer live, capped by limit.
+ * Skips topics whose session is live (sessions row exists AND updated_at >= updatedBefore).
  * Used by cron reaper (T2.11).
  */
 export async function listReapable(
   db: D1Database,
   opts: {
     closedBefore: number;
+    updatedBefore: number;
     limit: number;
   },
 ): Promise<TopicRow[]> {
   const { results } = await db
     .prepare(
-      `SELECT * FROM topics
-       WHERE state = 'closed' AND closed_at < ?
-       ORDER BY closed_at ASC
+      `SELECT t.* FROM topics t
+       LEFT JOIN sessions s ON t.session_id = s.session_id
+       WHERE t.state = 'closed' AND t.closed_at < ? AND (s.session_id IS NULL OR s.updated_at < ?)
+       ORDER BY t.closed_at ASC
        LIMIT ?`,
     )
-    .bind(opts.closedBefore, opts.limit)
+    .bind(opts.closedBefore, opts.updatedBefore, opts.limit)
     .all<TopicRow>();
   return results ?? [];
 }

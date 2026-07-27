@@ -75,17 +75,24 @@ npm run test         # all workspaces
 npm run typecheck    # all workspaces
 ```
 
-**CURRENT baseline — commit `084db4b`, post-Checkpoint-2a** — measure regressions against this:
+**CURRENT baseline — post-Checkpoint-2b, 2026-07-27** — measure regressions against this:
 
 | Package | Test files | Tests |
 |---|---|---|
-| `@pigeon/daemon` | 49 | **674** passed, 1 skipped |
-| `@pigeon/opencode-plugin` | 13 | **279** passed |
-| `@pigeon/worker` | 1 | **231** passed |
+| `@pigeon/daemon` | 50 | **682** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | 14 | **290** passed |
+| `@pigeon/worker` | 1 | **267** passed |
 
-The daemon jumped 650 → 674 across a 48 → 49 file change because the **registry-fencing work landed on
-`main` mid-phase** and was merged in at Checkpoint 2a (`endpoint-reconciler.ts` and its 489-line test file).
-That work is unrelated to this plan; don't attribute those tests to it.
+Total **1239**. Two unrelated workstreams landed on `main` mid-phase and inflate these counts — do not
+attribute their tests to this plan: the **registry-fencing** work (`endpoint-reconciler.ts`, merged at
+Checkpoint 2a) and the **dx8p daemon-auth** work (deny-by-default `checkAuth`, plugin `auth-token.ts`,
+merged as PR #7 at Checkpoint 2b). Both are fully integrated and green alongside this phase.
+
+<details><summary>Earlier Phase-2 baselines (historical)</summary>
+
+Post-Checkpoint-2a `084db4b`: daemon 49/674+1, plugin 13/279, worker 1/231.
+
+</details>
 
 <details><summary>Earlier baselines (historical)</summary>
 
@@ -190,19 +197,150 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 *Lifecycle + inbound:*
 
-- [ ] T2.10 Worker: close topic on session unregister
-- [ ] T2.11 Worker: cron reaps closed topics **and closes orphaned ones**
-- [ ] T2.12 Daemon: `/current-state` cards send `threaded: false`
-- [ ] T2.13 Worker: inbound topic-membership resolution + service-message guard
-- [ ] T2.14 Worker + daemon: `message_thread_id` round-trip on commands
-- [ ] **Checkpoint 2b** — inbound + round-trip verified across all command types
+- [x] T2.10 Worker: close topic on session unregister — `9df1a96`, `fce16ec`. Worker 231 → **236**. `markClosed` in D1 first, then best-effort `closeForumTopic`; row is **never deleted** (the reaper needs it). A NULL-thread reservation row is closed in D1 with **zero** Telegram calls — `closeForumTopic` on it would be a guaranteed 400. Non-vacuity proven on all three guards (drop the flag gate ⇒ the flag-off test fails; drop the NULL guard ⇒ zero-calls test fails; move `markClosed` after Telegram ⇒ the "closed even when Telegram fails" test fails).
+  - **Reordered in `fce16ec`: the topic block runs AFTER the session/message deletes, and the order is load-bearing.** Deleting the session is the endpoint's primary job; closing the topic is auxiliary. The realistic failure is flipping the flag on before the DDL is applied, so `getBySession` hits a missing table — running the block first turns that into a 500 that leaves the session row in place and fails identically on every daemon-reaper retry. Running it last leaves the session deleted and the topic open with no `sessions` row, which is **exactly** the state T2.11's orphan-closer selects for (its `s.session_id IS NULL` arm fires without waiting for the 7-day TTL), so it self-heals on the next cron — **corrected at Checkpoint 2b:** in the missing-table scenario used to motivate this, the orphan-closer throws on that same missing table, so healing actually begins on the first cron *after the DDL is applied*. Moot in production, where it is. All 236 tests passed unedited across the move.
+- [x] T2.11 Worker: cron reaps closed topics **and closes orphaned ones** — `42237cc`. Worker 236 → **248**. New `src/topic-reaper.ts`: `reapTopics` (30d, cap 5), `closeOrphanedTopics` (7d session TTL, cap 5), and a `runTopicReaper` entry point gated on `topicsEnabled`. Wired **last** in `scheduled` and wrapped in try/catch so the three pre-existing cleanups are unaffected. `thread_not_found` still drops the D1 row; NULL-thread rows skip Telegram in **both** jobs; a 429 exits the run early (both jobs are capped and idempotent, so the next hourly cron resumes). Non-vacuity proven on all four: flag gate, NULL guard, cap, and the 429 early-exit.
+  - **I chased a suspected design flaw here and it was a false alarm — recording it so nobody re-chases it.** Job 2 keys on `sessions.updated_at` meaning *liveness*, and `touchSession` (`sessions.ts:143`) has **zero callers**, which looks like the field only moves on registration. It isn't: the touch is **inlined** at `notifications.ts:219` (inside `handleSendNotification`, before the topic gate, so it is flag-independent) and again at `webhook.ts:410`. Liveness tracking is real and the heuristic is sound. `touchSession` is dead code duplicating the inlined statement — pre-existing, out of scope here.
+  - **Do not "simplify" job 2 by dropping the `updated_at` clause and keeping only the row-absent case.** It is the *staleness* clause that does the real work: the daemon's dead-session cleanup deletes its **local** row without unregistering, so the **worker's** `sessions` row survives indefinitely. Row-absent alone would miss precisely the leak job 2 exists to plug.
+  - **Residual, accepted:** a topic whose Telegram delete/close fails with a *generic* error is retried forever and, because both list queries order oldest-first, permanently occupies one of the 5 slots per run. Progress continues at a degraded rate (4/5 slots), and a total failure — e.g. the bot losing admin rights — correctly stalls until rights return.
+- [x] T2.12 Daemon: `/current-state` cards send `threaded: false` — `390c6f5`. Daemon 674 → **676**. `SendNotificationInput` already carried `threaded?: boolean` from T2.5, so no type change was needed.
+  - **Deliberately not a one-line change.** Adding `threaded: false` inline to the `sendCard` closure would have put a load-bearing policy decision in `index.ts`, the composition root — which **no daemon test imports**, so it would have shipped with zero coverage. Extracted a pure exported `buildCardNotification()` in `current-state-ingest.ts` instead, carrying a comment explaining why the flag is load-bearing; `index.ts` now calls it and keeps its `res.ok === false` throw unchanged. Worker-side coverage already existed (`worker.test.ts:5363`) and was not duplicated.
+  - Non-vacuity proven **twice**, which matters here: the test fails with `threaded: true` *and* with the field deleted entirely — absent is exactly the pre-change behaviour, so a test that tolerated absence would have been worthless.
+- [x] T2.13 Worker: inbound topic-membership resolution + service-message guard — `80d98db`, `0fc8567`. Worker 248 → **255**. `TelegramMessage` gained `message_thread_id` and `is_topic_message`; precedence is now swipe-reply → topic membership → `/cmd TOKEN`, with the service-message guard exactly as specced. Topic membership resolves regardless of the row's `state` (typing in a closed topic still means that session). Both documented limitations are recorded in code: the 4h metadata-fallback gap for topic-routed question replies, and the non-forum-supergroup reply-thread residual. Non-vacuity proven on all three: delete the guard ⇒ (b) fails; hoist topic membership above swipe-reply ⇒ (c) fails; drop the flag gate ⇒ (d) fails.
+  - **Follow-up in `0fc8567`, and the reason matters: `env` was optional.** That is the *exact* half-wired-but-green failure mode this plan warns about at T2.14 — a future call site omits `env`, topic routing silently dies on that path, and typecheck stays clean. There is no caller that legitimately has no env, so optional bought nothing. Making it required is genuinely enforced: omitting it at `webhook.ts:747` is now `TS2554` (verified by injection).
+  - **Four pre-existing test call sites were passing only two arguments** and surviving purely because they return early at the swipe-reply branch — they would have thrown a `TypeError` the moment one fell through to the flag check. **`tsc` does not cover `packages/worker/test/`**, so typecheck could never have caught this; only reading the call sites did. Fixed to pass `env` explicitly. Worth remembering for T2.14: *a clean worker typecheck says nothing about the test file.*
+- [x] T2.14 Worker + daemon: `message_thread_id` round-trip on commands — **split into two commits**, `55cace6` (worker) + `120228f` (daemon). Worker 255 → **259**, daemon 676 → **680**.
+  - > ### ⚠️ T2.14 IS THE FIRST PHASE-2 CHANGE THAT IS **NOT** DARK. READ BEFORE ANY DEPLOY.
+    > `pollNextCommand`'s SELECT and `queueCommand`'s INSERT reference `message_thread_id`
+    > **unconditionally** — `topicsEnabled` appears **zero** times in `d1-ops.ts` and `poll.ts`, by design,
+    > since the daemon must never need the flag to receive its own commands. Everything before T2.14 was
+    > gated; this is not.
+    >
+    > **Consequence: deploying the worker without the column first fails every poll and every queue with
+    > `no such column` — a total command-delivery outage, flag off or on.** The `topics` DDL was additive
+    > and unused while dark, so Checkpoint 2a's ordering was forgiving. This one is load-bearing immediately.
+    >
+    > **Already applied to production D1 (`pigeon-router`) on 2026-07-26**, ahead of any deploy:
+    > `ALTER TABLE commands ADD COLUMN message_thread_id INTEGER;`
+    > Verified not by inspecting the schema but by running `pollNextCommand`'s **exact** nine-column SELECT
+    > against production and confirming `success: true`.
+  - **The plan's file list for the daemon half was wrong, and following it would have been ~10× the diff.** It called for the input types and `sendTelegramReply` calls of **seven ingest modules** plus eight test files (~54 call sites). But `sendTelegramReply` is an **injected dependency**, wired in `index.ts` at 10 sites as the bare `sendTelegramReply: sendTelegramMessage` — so the thread id binds in a **closure at the wiring layer** and **no ingest module changes at all**. Final daemon diff: 160 insertions / 14 deletions, **zero** files under `src/worker/*-ingest.ts`, zero ingest tests. This is also strictly better encapsulation — the plan's own goal is "keeps the daemon ignorant of topics", and the ingest modules now never learn topics exist either.
+  - **The central hazard was defeated structurally rather than by discipline.** The plan warns `messageThreadId` is optional-shaped everywhere so a half-wired implementation typechecks clean. Both halves converted their choke point to a **required options-object key** (`QueueCommandOpts.messageThreadId` in the worker; `sendTelegramMessage`'s third parameter in the daemon), following T1.6's precedent. Omission is now a compile error, verified by injection at both: `TS2345` in `webhook.ts`, `TS2345` in `index.ts`. **Honest footnote (Checkpoint 2b):** the fence is one wrapper deep, not structural — `d1-ops.queueCommand`'s own `messageThreadId` is still optional (`d1-ops.ts:44`), so a second caller of the repo function would bypass the enforcement entirely. Fine today; one caller. The worker's local `queueCommand` was 11 positional params with 4 defaults — a 12th positional would have been silently omittable at all 11 sites, and converting to options touched the same 11 sites anyway, so enforcement cost nothing.
+  - `poll.ts` needed **one** line, not nine: the response body has a **common** object assembled before the per-command-type branches, so `messageThreadId` applies to every type at once. The plan's "per-command-type response branches" predates that code.
+  - Reply routing lives in a new tested `src/worker/reply-factory.ts` (`createTelegramReplySender`) rather than ten repeated closures in the untested composition root — same reasoning as T2.12.
+  - **Deliberate: `/current-state`'s index goes to General** (`messageThreadId: undefined`, explicit). With T2.12 already sending cards unthreaded, routing the index to the invoking topic would split one response across two places. Consistency beat reply-where-asked. **Confirm this feels right during Checkpoint 2b's manual pass** — it is a UX judgement, not a correctness one.
+- [x] **Checkpoint 2b** — COMPLETE 2026-07-26. Test gate ✅ daemon **680**+1 skipped / plugin **279** / worker **265** = **1224**; typecheck clean modulo the 4 known `lease-cas` errors. `origin/main` merged in (`86bbe6c`, docs-only from the serve-pool session, no conflicts).
+  - Fable adversarial review ✅ — verdict **"safe to deploy"** with topics flag off. It tried to break flag-off equivalence of the non-dark T2.14 path and could not, verifying the three unconditional changes individually and confirming deploy ordering is safe **in both directions** (an old daemon ignores the extra JSON field; a new daemon against an old worker gets `undefined`, which `reply-factory.ts`'s `?? undefined` handles).
+  - **It found one real silent defect — F1, a 30-day time bomb that deletes a live topic and all its messages.** Fixed in `601c8d4`, worker 259 → **265**. Chain: T2.10 deliberately creates D1-closed/Telegram-open divergence (and the user manually reopening a topic does too) → `resolveTopic`'s generic reopen-error branch returned `ok` **without `markOpen`**, so the row stayed `closed` forever and every notification burned a futile `reopenForumTopic` → `listReapable` never consulted `sessions`, so 30 days later `deleteForumTopic` destroys a topic that a live session is actively posting to. Every test was green; the defect lived entirely in the composition, which no single task's tests covered. **This is the fourth checkpoint in a row where the silent-failure bug was the one that mattered.**
+  - Two independent fixes, both required: `markOpen` when we decide the thread is usable (which also heals a second route — a late `finalize` CAS can attach a live thread id to a closed row, since it guards only on `message_thread_id IS NULL`, not `state`); and `listReapable` skipping topics whose session is still **live**. Liveness is `sessions` row exists **AND** `updated_at` newer than the 7d TTL — **existence alone would have leaked**, because the daemon's dead-session cleanup orphans worker `sessions` rows permanently, and those topics would then never be reaped. Injection (iii) proved that refinement was load-bearing, not decorative.
+  - **The F1 fix was itself re-reviewed by fable (`a36847d`), because it had been written in response to the finding and so was the one piece of the phase no adversary had seen.** Verdict: `601c8d4` correctly and completely kills F1, and both fixes are required (neither is an over-fix — Fix B alone covers a window Fix A cannot: a session that resumes 30+ days later re-registers and gets a fresh `sessions` row while its topic row still carries a month-old `closed_at`). Worker 265 → **267**.
+  - > **CORRECTION TO MY OWN ENTRY ABOVE — Fix A is not pure healing, it is a trade.** I presented `markOpen` as strictly corrective. It is not. Pre-fix, a genuinely-still-closed topic got a reopen attempt on *every* notification and would self-heal the moment the cause cleared (e.g. the bot's admin rights restored). Post-fix, one generic failure marks the row open in D1 and **no reopen is ever attempted again** — the divergence becomes permanent. The trade is defensible (notification delivery is preserved either way by T2.8's General fallback, and the alternative means exact-string-matching `TOPIC_NOT_MODIFIED`, an API behaviour already flagged as unverified in `pigeon-cev`), but it is a trade and the next reviewer deserves to see it stated.
+  - Fix A's trade also opened a machine-generated route into the **inverse** divergence (D1-open / Telegram-closed), which the orphan-closer could not digest: a generic `closeForumTopic` failure left the row unmarked, `listOrphaned` re-selected it every run forever, and its `created_at ASC` ordering pinned one of the 5 caps permanently. Fixed in `a36847d` by marking closed on any non-429 outcome. Also fixed there: `runTopicReaper` was not forwarding `orphanTtlMs` to `reapTopics`, leaving dead the exact seam `601c8d4` had just created. Both proven non-vacuous by injection.
+  - Accepted residual, now recorded in two places: a **generic** Telegram failure in the *reap* loop still leaves the row and re-selects it oldest-first, so a permanently-undeletable topic degrades the reaper to 4 of 5 slots. Less reachable than the orphan variant and unchanged by this delta.
+  - **Manual in-topic verification is NOT possible at this checkpoint** — the forum supergroup does not exist until Checkpoint 2. What the plan asks for here ("exercise each command type in a topic") is deferred; what *is* verifiable now is the flag-off DM path, and the review's recommended post-deploy check is **one swipe-reply command in the production DM**, which is the only thing that would catch a private chat unexpectedly carrying `message_thread_id`.
+  - **DEPLOYED 2026-07-27**, worker version **`c790398a-e84d-4e21-8017-cbe36f5a539e`**. Bindings confirm `TELEGRAM_TOPICS_ENABLED ("false")` — verified via `--dry-run` *before* deploying, because a deploy re-asserts `[vars]` (`pigeon-cev` item 1).
+    - Post-deploy verification, all green: `/health` `ok`; `topics` row count **0**; authed `GET /sessions` **200**; daemon journal shows **zero** errors across many 5s poll cycles since deploy.
+    - **The decisive check on the non-dark T2.14 path:** `GET /machines/:id/next` returned **204**, proving `pollNextCommand`'s new nine-column SELECT executes against production D1. Deliberately polled a **non-existent probe machine id**, not a real one — a real poll *leases* the command it returns, which would have stolen a pending command from the live daemon. Exercises the identical SELECT with zero risk.
+    - Auth is `Authorization: Bearer <CCR_API_KEY>` (`auth.ts:20-26`), **not** `x-api-key`. Cost a round trip; noting it so the next person does not repeat it.
+    - **STILL OUTSTANDING — the one manual check both reviews asked for:** send a swipe-reply command in the production Telegram DM. It is the only thing that would catch a private chat unexpectedly carrying `message_thread_id`, which would make T2.13's service-message guard suppress a legitimate swipe-reply *silently*. Requires a human with the phone; I cannot do it.
+  - Other findings recorded rather than fixed: `pigeon-1xt` (T2.15/T2.16 are flag-flip **blockers**, not polish — bare reply-commands in a topic fail until T2.16, and their error messages are invisible until T2.15); `pigeon-cev` item 4 (what Telegram actually returns when reopening an already-open topic); F3 settled in the design doc (`/launch` answers where it was typed — the code is right, the design sentence was stale).
 
 *Polish + migration:*
 
-- [ ] T2.15 Worker: webhook confirmations echo `message_thread_id`
-- [ ] T2.16 Worker: bare slash commands resolve via topic
-- [ ] T2.17 Docs: migration runbook + skill updates
-- [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
+- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — `a7ccb24` (+ `00d9159` docs). Worker 267 → **271**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
+  - Required 4th parameter `opts: { messageThreadId: number | undefined }` added to `sendTelegramMessage` (no default, structural enforcement) with centralized `topicsEnabled(env)` gate inside `sendTelegramMessage` so dark-ship flag-off equivalence is guaranteed in one place.
+  - Exactly 22 call sites of `sendTelegramMessage` updated across `webhook.ts`, plus `resolveSessionMachine` parameter extended to thread `messageThreadId` to its 2 callers (message path and callback-query path).
+  - All 4 test cases added to `worker.test.ts` and verified via regression injections (removing `topicsEnabled` gate failed flag-off test; removing thread id in `resolveReplySession` failed error path test; removing thread id in callback query path failed callback query test).
+  - **UX note for Checkpoint 2:** `/current-state`'s confirmation ("Fetching current state...") and errors go to the topic where typed, while its index and session cards go to General (decided at T2.12/T2.14). The error case is what forces it: "cloudbox is not recently seen" is useless in General when the user is looking at a topic. It is a UX judgement, not a correctness one.
+  - **Verified independently rather than taken on report:** all 22 call sites were read to confirm none satisfies the new required parameter with a hardcoded `undefined` — the obvious way to make a required-param fence compile while leaving the feature half-wired. The seven shorthand `{ messageThreadId }` sites bind to real sources (`resolveSessionMachine`'s new required 6th param; `queueCommand`'s destructured `opts.messageThreadId`; `resolveReplySession`'s `message.message_thread_id`). `answerCallbackQuery` is correctly untouched — callback answers are ephemeral popups with no thread. I also re-ran the gate injection myself: removing `topicsEnabled(env)` fails **exactly one** test.
+  - **That "exactly one" is worth stating plainly, because T2.5 set a different precedent.** There, breaking the gate failed 19 pre-existing tests, and that breadth was the real evidence of flag-off equivalence. Here no pre-existing test sets an inbound `message_thread_id`, so none of them can detect this change either way. **T2.15's entire flag-off guarantee rests on one assertion.** That is adequate only because `sendTelegramMessage` is the sole path to the wire; a future call site that reaches for `tg.sendMessage` directly would escape the gate with nothing failing.
+  - > **⚠️ COMPOSITION-LEVEL GAP FOUND AT THIS TASK — bead `pigeon-cal` (P1), deliberately NOT fixed here.**
+    > Chain across three tasks, which is why no single task's tests cover it: T2.10 closes a topic when the
+    > session unregisters → T2.13 routes a message typed in a closed topic to that session *regardless of
+    > row state, by design* → T2.15 now sends the confirmation to that closed thread → `webhook.ts`'s
+    > `sendTelegramMessage` **discards the `TgResult`** (deliberate and pre-existing), and `telegram.ts`'s
+    > `sendMessage` **returns** a result rather than throwing. So a rejected send vanishes with no
+    > exception, no log, and no fallback.
+    >
+    > The notification path is fully defended here — T2.6 reopen, T2.7 `thread_not_found` recovery, T2.8
+    > General fallback. **Webhook confirmations have none of it.** And the messages that vanish are the
+    > *error* messages, so this is `pigeon-1xt`'s "invisible at the point of failure" reintroduced by a
+    > different mechanism, inside the very task meant to cure it.
+    >
+    > **Whether it bites at all depends on `pigeon-cev` item 3** — can a bot admin post into a *closed*
+    > topic? If yes, this is a non-issue. Not fixed now because fixing means guessing a Telegram behaviour
+    > (which this plan has twice refused to do, at T2.6 and T2.7) *and* making the wrapper stop discarding
+    > `TgResult` across all 22 sites — a riskier change than T2.15 itself. Resolve item 3, then either
+    > close `pigeon-cal` or mirror T2.8: on a non-429 failure with a thread id, retry once without it.
+- [x] T2.16 Worker: bare slash commands resolve via topic — `c68edae` (+ `ad1ec95` follow-up test). Worker 271 → **278**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
+  - Extracted shared module-level `isTopicServiceReply(message: TelegramMessage): boolean` helper (with non-forum supergroup thread-root comment carried) used by both `resolveMessageSession` and `resolveReplySession`.
+  - Rewrote `resolveReplySession` to 2 ordered attempts: Try 1 (swipe-reply, unless service reply) → Try 2 (topic membership, gated on `topicsEnabled(env)`). Falling through lets evicted swipe-replies still resolve via topic.
+  - Failure message selection uses `triedReply` boolean flag so flag-off behavior is byte-identical: reply present & lookup misses ⇒ `"Could not find a session for that message."`; no reply ⇒ `"Reply to a session notification to use this command."`. Flag-on in topic ⇒ `"Could not find a session for this topic."`.
+  - Non-vacuity proven via injections: removing `isTopicServiceReply` broke T2.13(b); removing `topicsEnabled` gate on Try 2 broke scenario 2a (resolved topic with flag OFF); hoisting Try 2 above Try 1 broke scenario 3 (topic membership outranked genuine swipe reply).
+  - Note on spec line numbers: spec listed `webhook.ts:472-507`, actual pre-edit range was `:525-566`.
+  - > **⚠️ THE `isTopicServiceReply` GUARD IS NOT LOAD-BEARING FOR THE HEADLINE CASE, AND THE ORIGINAL EVIDENCE DID NOT SHOW THAT.**
+    > The implementer's non-vacuity injection for scenario 1 removed the guard from *both* call sites and
+    > reported a failure — but the test that failed was **T2.13's**, not T2.16's. I re-ran the injection
+    > scoped to `resolveReplySession` alone: **all 277 tests still passed.**
+    >
+    > The reason is structural. The `pigeon-1xt` fix is carried entirely by the Try 1 → Try 2
+    > **fall-through**: `lookupMessage` simply misses on a `ForumTopicCreated` service message, because
+    > service messages are never stored in `messages`. The guard only earns its keep when a `messages` row
+    > *exists at the thread id itself*, in which case Try 1 would resolve to the **wrong session**.
+    >
+    > That is a dangerous shape to leave untested — a future reader would observe (as I did) that the guard
+    > is removable with a fully green suite, and delete it. Added **scenario 6**, which seeds a `messages`
+    > row at the thread id mapping to a different session and asserts topic membership still wins.
+    > Proven non-vacuous: with the guard disabled *only* in `resolveReplySession`, it fails with
+    > `expected 'Killing session ses_t216_coll_stale_…' to contain 'ses_t216_coll_topic_…'`. Worker 277 → **278**.
+    >
+    > Generalisable lesson, and the second time this phase it has bitten: **an injection that removes a
+    > shared helper proves the helper matters somewhere, not that it matters at the call site under test.**
+    > Scope the injection to the site you are claiming coverage for.
+  - Pre-existing T2.15 assertion changed: the "an ERROR path in a topic carries the thread id" test expected
+    `"Reply to a session notification to use this command."`; under T2.16 a bare command in a session-less
+    topic now correctly yields `"Could not find a session for this topic."`. Verified legitimate — the test's
+    actual purpose, `message_thread_id === threadId`, is untouched and still asserted. Same shape as T2.8's
+    502 → 200 change.
+  - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
+    `:525-566`.
+- [x] T2.17 Docs: migration runbook + skill updates — `16efc79`
+  - **Three factual defects found on review and fixed in `cf1d8bb`** — all three would have misled a human
+    executing against production:
+    1. **The `pigeon-cev` gate list was wrong.** It invented a fourth item ("does Telegram return
+       `message_thread_id` on callback queries?"), **dropped the real item 2** (the unverified
+       `thread_not_found` classifier string), and renumbered the rest — which silently broke `pigeon-cal`'s
+       and this plan's "decided by `pigeon-cev` item 3" cross-reference. Rewritten to match the bead
+       verbatim, with a note that the numbering is load-bearing.
+    2. **The reference DDL omitted `idx_topics_reap`** (`ON topics(state, closed_at)`). A rebuild from
+       scratch would have produced a `topics` table the hourly reaper cannot index-scan. Added, and the
+       block now points at `packages/worker/src/d1-schema.sql` as authoritative rather than duplicating it
+       silently.
+    3. **`wrangler tail --workspace packages/worker` is not a valid invocation** — `wrangler tail` has no
+       `--workspace` flag (confirmed against `wrangler tail --help`; it offers `--cwd` and `-c/--config`).
+       Corrected to `--cwd`.
+  - **Two commands I doubted and verified as CORRECT, so nobody re-litigates them:**
+    `npx --workspace @pigeon/worker wrangler deploy --dry-run` genuinely works — `npx` is `npm exec`, which
+    accepts workspace flags; I ran it and it printed the real bindings including
+    `TELEGRAM_TOPICS_ENABLED ("false")`. And `/run/secrets/ccr_api_key` exists and is `dev`-readable.
+    `pigeon-daemon.service` is a **system** unit, so `sudo systemctl restart` is right.
+  - Created `docs/runbooks/telegram-forum-migration.md` providing step-by-step procedure for Telegram Forum Topics migration, burn-in, monitoring, and rollback.
+  - Updated `.opencode/skills/worker-deployment/SKILL.md` with pointer to runbook and `[vars]` deploy-revert trap warning.
+  - Updated `AGENTS.md` with Telegram Forum Topics architecture section and Skills TOC link.
+  - Stated central invariant first and in bold: **Additive D1 DDL is applied BEFORE any code deploy.**
+  - Noted production state: required DDL (`topics` table/index and `commands.message_thread_id`) was already applied on 2026-07-26, so runbook step 1 is schema verification.
+  - Detailed the `[vars]` trap (`wrangler deploy` re-asserts `[vars]` from `wrangler.toml`, overwriting dashboard UI values) and strict `=== "true"` flag matching.
+  - Documented open beads gate (`pigeon-cev`, `pigeon-cal`, `pigeon-5o7`, `pigeon-wly`) and deferred D1 rate-gate trigger.
+- [~] **Checkpoint 2** — code gate COMPLETE; **runbook execution is blocked on the user** (it needs a phone: create the supergroup, promote the bot, flip the flag).
+  - Test gate ✅ daemon **682**+1 skipped / plugin **290** / worker **279** = **1251**; typecheck clean modulo the 4 known `lease-cas` errors.
+  - Fable adversarial review of `b9fdbc5..7b9ec32` ✅ — verdict **"safe to merge; NOT yet safe to execute the runbook as written"**. It confirmed the parts I most doubted: `tg.sendMessage` appears exactly **once** in `webhook.ts` (so the centralised gate really is the sole wire path, and `telegram.ts:165-166` omits the field entirely when undefined ⇒ flag-off is byte-identical *on the wire*); precedence is correct; no call site fakes the required param; and it hunted a wrong-session route through deleted, reaped, re-registered and NULL-thread rows and **found none**. It also independently verified that Step 4's *forward* ordering is safe, because a failed `createForumTopic` deletes its own reservation row and falls back to General.
+  - **F1 (HIGH, runbook) — the rollback procedure permanently lost notifications.** Fixed. Rollback removed the supergroup from `ALLOWED_CHAT_IDS` in the *same* deploy that turned the flag off, so until every daemon was re-pointed at the DM its notifications 403'd (`notifications.ts:201-203`) while the outbox terminally fails an entry after `MAX_ATTEMPTS = 10` or `MAX_AGE_MS = 15min` (`outbox-sender.ts:26-27,134-139`) — roughly 14 minutes of backoff. Editing sops on two machines and restarting can exceed that, **and this is the procedure you run mid-incident.** Both ids now stay allowed until the daemons are reverted and the outbox has drained; narrowing is a final cleanup step.
+  - **F2 (MEDIUM, code) — flag-off equivalence was conditional. Fixed in `6c3a9d6`.** `isTopicServiceReply` was ungated, so with the flag off an update carrying `message_thread_id === reply_to_message.message_id` skipped Try 1, found Try 2 gated off, and answered *"Reply to a session notification…"* where the deployed code **executes the command**. That made the kill switch depend on the still-unverified assumption that the Bot API never sets `message_thread_id` on private chats — and the corrected F1 rollback leans on flag-off being exactly the old behaviour. Gated **inside the helper**, not at the two call sites, so the callers cannot drift apart. Pinned by a new test; re-ungating it fails with `expected 'Reply to a session notification to us…' to contain 'Killing session …'`. Worker 278 → **279**.
+  - **F3 + F4 (runbook gaps) — fixed.** The runbook warned that a typo'd flag "silently keeps topics disabled" and then verified only `/health`, which does not reflect the flag; it now has a concrete post-flip check (`--dry-run` binding + a `topics` row must appear) and an explicit "if no topic is created, the flag string is wrong". The still-outstanding **manual DM swipe-reply check** was tracked in this plan but missing from the runbook's own gate list — the runbook is the artifact a human executes, so it is now listed there.
+  - **F5 (MEDIUM, flag-on only) — recorded, not fixed.** `pigeon-cal` widened and retitled. Flipping the flag moves *all* traffic into one supergroup, where the bot is capped at ~20 msg/min. Notifications survive a 429 (worker 429 ⇒ outbox pauses/retries); webhook acks do not, because the wrapper discards `TgResult`. Same vanishing-ack symptom as the closed-topic case but a different trigger, and **`pigeon-cev` item 3 does not settle it.** One fix serves both.
+  - **The reviewer's "21 call sites, not 22" nit was right, and so was I** — it was 22 at T2.15 and became 21 when T2.16 collapsed two error returns into one computed message. The artifact actually wrong was the docstring, which had drifted stale *again* (the exact bug T2.15 fixed). Corrected to 21 in `6c3a9d6`.
+  - Declined: the `/cmd TOKEN` shadowing note (pre-existing T2.13 behaviour, reviewed twice, deliberate precedence).
+  - **Remaining before the flip:** `pigeon-cev` (four live-Telegram questions), `pigeon-cal` (decided by `cev` item 3 for the closed-topic half; F5 needs its own call), `pigeon-5o7`, `pigeon-wly`, and the manual DM swipe-reply check. `pigeon-1xt` is **CLOSED** — T2.15 and T2.16 landed.
 
 ---
 
@@ -1056,16 +1194,51 @@ chromebook) still need `git pull && npm install` + a daemon restart when conveni
 (`app.ts:94`, `session-state.ts:12`) is surrogate-blind. Fix the pattern *before* T2.3 clones it. Reuse the guard at
 `split-message.ts:176-180`. This is the single highest-value pre-Phase-2 action.
 
-**0. WHERE YOU ARE (updated at Checkpoint 2a, 2026-07-26).** Work happens in
-`~/projects/pigeon/.worktrees/forum-topics-phase2`, branch `feat/forum-topics-phase2`. `main` is
-fast-forwarded to it (`084db4b`) and the worker is **deployed dark**. Never work in
-`/home/dev/projects/pigeon` itself — that checkout runs the LIVE production daemon from its source, and it
-is also the live routing DB's home (`packages/daemon/data/pigeon-daemon.db`).
+**0. WHERE YOU ARE (rewritten at Checkpoint 2b, 2026-07-27).**
 
-**Beads gating the flag flip:** `pigeon-cev` (P1 — the `[vars]` deploy-revert trap, the unverified
-`thread_not_found` string, whether a bot can post into a closed topic) and `pigeon-5o7` (P2 — scope
-`deleteTopicBySession` to the thread id; currently safe only because the daemon's `fetch` has no timeout,
-so an obviously-reasonable future change silently breaks it).
+Work happens in `~/projects/pigeon/.worktrees/forum-topics-phase2`, branch `feat/forum-topics-phase2`.
+`main` is fast-forwarded to it. **Never work in `/home/dev/projects/pigeon` itself** — that checkout runs
+the LIVE production daemon from its source and is the live routing DB's home
+(`packages/daemon/data/pigeon-daemon.db`).
+
+**Phase 2 is 14/18 done, through Checkpoint 2b.** Remaining: T2.15, T2.16, T2.17, then Checkpoint 2
+(the actual supergroup migration). The worker is **deployed** at version `c790398a` with
+`TELEGRAM_TOPICS_ENABLED = "false"` — see the Checkpoint 2b entry for what was verified post-deploy.
+
+> **⚠️ IF YOUR WORKTREE IS MISSING, YOU HAVE NOT LOST ANYTHING — BUT READ THIS.**
+> A **nightly workspace reset at ~03:00 prunes worktrees.** This one was deleted mid-session on 2026-07-27.
+> Nothing was lost because every task had been committed and pushed, and it was recoverable with
+> `git worktree add .worktrees/forum-topics-phase2 feat/forum-topics-phase2` followed by
+> `git merge --ff-only origin/main`. **Anything uncommitted at 03:00 is gone.** Commit at every task
+> boundary, not at every session boundary. This is a sharper hazard than the shared-worktree rule, because
+> the destroyer is the clock rather than a peer.
+
+> **⚠️ THE DAEMON NOW REQUIRES A BEARER TOKEN (landed mid-phase, PR #7).**
+> `:4731` is deny-by-default; only `GET /health` is anonymous. Hand-curl with:
+> `-H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)"` (owner=dev, no sudo).
+> Note the daemon's `/swarm/send` body field is **`payload`**, not `message`.
+> **Any opencode session that started before the rollout has a stale in-memory plugin and its
+> `swarm_send` tool silently 401s** — use curl until the session restarts. Two sessions hit this.
+
+> **⚠️ THE WORKER USES `Authorization: Bearer <CCR_API_KEY>`, NOT `x-api-key`** (`worker/src/auth.ts:20-26`).
+> To exercise the poll path by hand, **poll a non-existent probe machine id**. A real poll *leases* the
+> command it returns and would steal it from the live daemon.
+
+**Beads gating the flag flip — all five must be settled before `TELEGRAM_TOPICS_ENABLED` goes to `"true"`:**
+- `pigeon-cev` (P1) — four questions only LIVE Telegram can answer: the `[vars]` deploy-revert trap; the
+  unverified `thread_not_found` string; whether a bot can post into a closed topic; what Telegram returns
+  when you reopen an already-open topic (this last one underpins the F1 fix).
+- `pigeon-1xt` (P1) — **T2.15 and T2.16 are blockers, not polish.** Until T2.16, every bare `/kill`,
+  `/interrupt`, `/compact`, `/mcp *`, `/model *` typed *inside a topic* fails; until T2.15 that failure
+  message goes to General, where the user is not looking. This is the feature's flagship interaction.
+- `pigeon-5o7` (P2) — scope `deleteTopicBySession` to the thread id; safe today only because the daemon's
+  `fetch` has no timeout, so an obviously-reasonable future change silently breaks it.
+- `pigeon-cal` (P1) — webhook confirmations have no General fallback, so an ack or error sent into a
+  closed topic vanishes silently. **Decided by `pigeon-cev` item 3**; see the ⚠️ block at T2.15.
+- `pigeon-wly` (P3) — reap-loop generic failures pin head-of-line slots (accepted residual).
+
+**Also still outstanding:** one manual swipe-reply command in the production Telegram DM, which both
+adversarial reviews asked for. It needs a human with the phone.
 
 **2. Use a NEW worktree, and check for collisions.** *(Historical — that work landed on `main` and was merged in at Checkpoint 2a; kept because the discipline still applies.)* A sibling session was working in
 `~/projects/pigeon/.worktrees/registry-fencing` (branch `registry-fencing` off `main@328ecca`) on the serve-registry
@@ -1115,8 +1288,23 @@ schema, it **triplicates** it. There are three independent hardcoded DDL arrays,
 have been speculative scope. **That is safe for T2.1 and NOT safe for T2.14**, which adds a column to `commands` —
 a table the poll tests very much do use. See the warning added at T2.14.
 
-The general hazard: update one array and miss another, and the suite passes locally against a schema production
-does not have. Any future D1 change must check all three.
+**CORRECTED AT T2.14a — the hazard is real but the mechanism is the opposite of what is written above.**
+All three arrays use `CREATE TABLE IF NOT EXISTS`, the pool runs `isolatedStorage: false, singleWorker: true`
+(one shared D1 for the whole file), and **`d1SchemaStatements` executes in a top-level `beforeAll`** (`:138`)
+— i.e. before any `describe`. So by the time `schemaStatements` (`:2992`) and `pollSchemaStatements` (`:3602`)
+run, the tables already exist and **their DDL is silently skipped**. For any table `d1SchemaStatements` defines,
+the other two arrays are decorative.
+
+Proven both directions at T2.14a: removing `commands.message_thread_id` from `pollSchemaStatements` alone
+changed nothing (259/259 still passed), while removing it from `d1SchemaStatements` alone produced
+`D1_ERROR: no such column: message_thread_id` across many tests.
+
+So: **`d1SchemaStatements` is the load-bearing array.** Keep all three in sync anyway — they would matter if
+a describe ever ran standalone, and drift is confusing — but do not expect the 2nd or 3rd to catch a mistake,
+and **do not treat "the poll tests pass" as evidence that `pollSchemaStatements` is correct.**
+
+The original hazard still stands in its true form: the arrays do not read `d1-schema.sql`, so the **suite can
+pass against a schema production does not have**. Only applying the DDL to production D1 closes that gap.
 
 ```sql
 CREATE TABLE IF NOT EXISTS topics (
@@ -1438,9 +1626,11 @@ if (message.reply_to_message && !isTopicServiceReply) {
 **Files:**
 > **⚠️ Three schema arrays, and this task needs at least two of them.** `worker.test.ts` hardcodes the DDL in
 > `d1SchemaStatements` (`:44`), `schemaStatements` (`:2526`), and `pollSchemaStatements` (`:3155`) — see the
-> corrected trap note at T2.1. T2.14 adds `commands.message_thread_id`, and `pollSchemaStatements` is the array
-> backing the **poll and ack** tests, i.e. exactly the code path this task changes. Miss it and
-> `pollNextCommand`'s SELECT references a column the test DB lacks. Grep all three before you finish.
+> corrected trap note at T2.1. T2.14 adds `commands.message_thread_id`. **Superseded by the T2.14a finding:**
+> missing `pollSchemaStatements` is in fact harmless, because `d1SchemaStatements` already created `commands`
+> in a top-level `beforeAll` and every array uses `IF NOT EXISTS`. The array that actually matters is
+> `d1SchemaStatements`. Update all three regardless, but the real gap this task must close is the
+> **production** `ALTER TABLE`, which no test can catch.
 
 **Files:**
 - Worker: `src/d1-schema.sql` + **all three** `test/worker.test.ts` schema arrays as applicable; `src/d1-ops.ts:60-80` (`queueCommand` INSERT) and `:119-131` (`pollNextCommand` SELECT); `src/poll.ts:30-73` (the per-command-type response branches); `src/webhook.ts` (populate from the inbound message)
