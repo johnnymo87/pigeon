@@ -43,6 +43,31 @@ This plan is a **spine**. It is expected to outlive several compactions, subagen
 > This matters more in Phase 2 than it did here: the same class of missing mock would create
 > **real Telegram forum topics** in the production chat, not just DB rows.
 
+> **⚠️ Every subagent you dispatch inherits a live pool identity. Put these in EVERY brief.**
+> On 2026-07-25 three separate mechanisms hijacked a production `opencode serve` slot, each taking the
+> session pool to N-1. Your bash environment carries `OPENCODE_SERVE_ID` and a live `OPENCODE_ROUTING_DB`,
+> and a bare `opencode serve` defaults to **`port: 0`** — so it does *not* collide with the real serve and
+> die; it quietly takes an ephemeral port and claims the slot, then never exits (`Effect.never`). Verbatim
+> prohibitions that belong in every subagent brief:
+>
+> 1. Never run `opencode serve`, opencode in any server mode, or opencode's own test suite (`bun test`
+>    inside `packages/opencode` — its harness spawns children with unfiltered `process.env`; bead `pigeon-050`).
+> 2. **No backticks in shell strings.** One incident was prose containing backticks inside a double-quoted
+>    bash argument, which bash executed via command substitution. Single quotes or a heredoc.
+> 3. Never `git stash` / `reset` / `checkout -- <path>` / `restore` / `clean` / `rebase` / `merge` /
+>    `cherry-pick` / `commit --amend`. Peers share this repo; one already lost uncommitted data. Undo by
+>    editing forward.
+>
+> See the `serve-pool-registry` skill and beads `pigeon-13p`, `pigeon-886`, `pigeon-050`.
+
+> **⚠️ Worker tests share ONE D1 instance across the whole file, and two tables are UNIQUE-constrained.**
+> `topics` has a partial unique index on `(chat_id, message_thread_id)`, and `messages` on
+> `(chat_id, message_id)`. A new test that hardcodes a thread id or message id **will collide with some
+> other test's row** — and it will pass in isolation and fail only in the full suite, with a
+> `D1_ERROR: UNIQUE constraint failed` that looks nothing like a logic bug. This cost two debug cycles
+> during the T2.9 media fix. Pick ids far outside every other test's range. Note also that `nextMsgId()`
+> is scoped to one `describe` block and is not available further down the file.
+
 **Verification commands** (run from repo root):
 
 ```bash
@@ -50,13 +75,24 @@ npm run test         # all workspaces
 npm run typecheck    # all workspaces
 ```
 
-**Baseline for Phase 1 — commit `b8f6b7d` (post-Phase-0)** — measure regressions against this:
+**CURRENT baseline — commit `084db4b`, post-Checkpoint-2a** — measure regressions against this:
 
 | Package | Test files | Tests |
 |---|---|---|
-| `@pigeon/daemon` | 48 | 610 passed, 1 skipped |
-| `@pigeon/opencode-plugin` | 13 | 275 passed |
-| `@pigeon/worker` | 1 | 163 passed |
+| `@pigeon/daemon` | 49 | **674** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | 13 | **279** passed |
+| `@pigeon/worker` | 1 | **231** passed |
+
+The daemon jumped 650 → 674 across a 48 → 49 file change because the **registry-fencing work landed on
+`main` mid-phase** and was merged in at Checkpoint 2a (`endpoint-reconciler.ts` and its 489-line test file).
+That work is unrelated to this plan; don't attribute those tests to it.
+
+<details><summary>Earlier baselines (historical)</summary>
+
+Post-Phase-0 `b8f6b7d`: daemon 48/610+1, plugin 13/275, worker 1/163.
+Post-Phase-1 `328ecca`: daemon 48/645+1, plugin 13/276, worker 1/174.
+
+</details>
 
 <details><summary>Original pre-Phase-0 baseline, commit <code>3c32389</code> (historical)</summary>
 
@@ -1020,7 +1056,18 @@ chromebook) still need `git pull && npm install` + a daemon restart when conveni
 (`app.ts:94`, `session-state.ts:12`) is surrogate-blind. Fix the pattern *before* T2.3 clones it. Reuse the guard at
 `split-message.ts:176-180`. This is the single highest-value pre-Phase-2 action.
 
-**2. Use a NEW worktree, and check for collisions.** A sibling session is working in
+**0. WHERE YOU ARE (updated at Checkpoint 2a, 2026-07-26).** Work happens in
+`~/projects/pigeon/.worktrees/forum-topics-phase2`, branch `feat/forum-topics-phase2`. `main` is
+fast-forwarded to it (`084db4b`) and the worker is **deployed dark**. Never work in
+`/home/dev/projects/pigeon` itself — that checkout runs the LIVE production daemon from its source, and it
+is also the live routing DB's home (`packages/daemon/data/pigeon-daemon.db`).
+
+**Beads gating the flag flip:** `pigeon-cev` (P1 — the `[vars]` deploy-revert trap, the unverified
+`thread_not_found` string, whether a bot can post into a closed topic) and `pigeon-5o7` (P2 — scope
+`deleteTopicBySession` to the thread id; currently safe only because the daemon's `fetch` has no timeout,
+so an obviously-reasonable future change silently breaks it).
+
+**2. Use a NEW worktree, and check for collisions.** *(Historical — that work landed on `main` and was merged in at Checkpoint 2a; kept because the discipline still applies.)* A sibling session was working in
 `~/projects/pigeon/.worktrees/registry-fencing` (branch `registry-fencing` off `main@328ecca`) on the serve-registry
 fencing work (beads `pigeon-13p`, `pigeon-886`). It touches `packages/daemon/src/routing/` and `worker/`. Phase 2
 touches the worker + daemon notification paths, so overlap is possible but not guaranteed — **`git fetch` and check
