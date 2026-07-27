@@ -155,14 +155,24 @@ it is why a wedged serve stays routable. Note the consequences:
 
 ## Related
 
-- `pigeon-886` — liveness/reachability decoupling. **None of the above fixes this.**
-  Bounded to ~8min by the canary, not unbounded.
-- `pigeon-amr` — self-heal clears the operator's drain lever under config skew.
-- `pigeon-f2a` — flap-transition alerting.
-- `pigeon-ntk` — verification items blocking the 886 design.
-- `pigeon-r2e` — fail-closed flip, harness allowlist, runbook.
-- `pigeon-13p` — closed; the original hijack bug.
-- `pigeon-zjv` — closed as FALSIFIED; read its correction note before re-proposing a
-  self-probe in self-heal.
+**Start here if you're picking up serviceability work:** `bd show pigeon-u1u` — the
+epic is the spine document for the whole arc (order of work, five settled decisions,
+what's already been falsified, verification receipts). The design doc is
+`docs/plans/2026-07-27-serve-serviceability-design.md`, whose **§5.1 holds five
+binding amendments** — do not implement from §1–5 alone.
+
+| Bead | |
+|---|---|
+| `pigeon-u1u` | **EPIC** — serve serviceability arc. Read first. |
+| `pigeon-f2a` | increment 1 — flap alerting + shadow-mode sensor. The only ready child. |
+| `pigeon-886` | increment 2 — the liveness/serviceability decoupling itself. |
+| `pigeon-u1u.1` | increment 2.5 — frontdoor outcome hints. |
+| `pigeon-u1u.2` | increment 3 — real readiness endpoint. Deliberately last. |
+| `pigeon-amr` | self-heal clears the operator's drain lever under config skew. Independent. |
+| `pigeon-r2e` | fail-closed flip + the **still-outstanding devbox/darwin deploy**. |
+| `pigeon-13p` | closed — the original hijack bug. |
+| `pigeon-h21` | closed — `sendPrompt` timeout. Its timeouts must **not** feed a health verdict. |
+| `pigeon-ntk` | closed — verification receipts for the 886 design. |
+| `pigeon-zjv` | closed as **FALSIFIED**. Read its correction note before re-proposing a self-probe in self-heal. |
 - workstation `.opencode/skills/monitoring-serve-pool` — the canary that restarts a
   wedged instance (1-min timer, 7-failure threshold).
