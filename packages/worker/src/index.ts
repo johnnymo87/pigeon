@@ -4,6 +4,7 @@ import { handleTelegramWebhook } from "./webhook";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates } from "./d1-ops";
+import { runTopicReaper } from "./topic-reaper";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -68,5 +69,10 @@ export default {
     await cleanupExpiredMedia(env);
     await cleanupCommands(env.DB);
     await cleanupSeenUpdates(env.DB);
+    try {
+      await runTopicReaper(env.DB, env);
+    } catch (err) {
+      console.error("Topic reaper failed:", err);
+    }
   },
 } satisfies ExportedHandler<Env>;

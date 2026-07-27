@@ -36,6 +36,13 @@ import {
 } from "../src/topics";
 import { resolveTopic, RESERVATION_TTL_MS } from "../src/topic-manager";
 import {
+  runTopicReaper,
+  reapTopics,
+  closeOrphanedTopics,
+  REAP_TTL_MS,
+  ORPHAN_TTL_MS,
+} from "../src/topic-reaper";
+import {
   verifyWebhookSecret,
   deduplicateUpdate,
   resolveMessageSession,
@@ -4258,11 +4265,13 @@ describe("/model command", () => {
 describe("swipe-reply to question notification", () => {
   const CHAT_ID = "8248645256";
 
-  beforeEach(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-    fetchMock.get("https://api.telegram.org").cleanMocks();
-  });
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_t211_%'").run();
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
 
   afterEach(() => {
     fetchMock.deactivate();
@@ -6154,6 +6163,406 @@ describe("topics module and topicName", () => {
       expect(telegramCalled).toBe(false);
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
+    });
+  });
+
+  describe("Task T2.11: Topic reaper cron jobs", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const botToken = "fake-bot-token";
+
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_t211_%'").run();
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("(a) reap deletes a closed topic older than 30d: deleteForumTopic called, D1 row gone", async () => {
+      const sessionId = "ses_t211_reap_old";
+      const threadId = 62001;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000); // older than 30d
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap old", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      let deletedThreadId: number | undefined;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          deletedThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
+
+      expect(result.reaped).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(deletedThreadId).toBe(threadId);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(b) reap does NOT touch a closed topic younger than 30d", async () => {
+      const sessionId = "ses_t211_reap_recent";
+      const threadId = 62002;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS - 60_000); // 1 minute younger than 30d
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap recent", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
+
+      expect(result.reaped).toBe(0);
+      expect(result.rateLimited).toBe(false);
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.state).toBe("closed");
+    });
+
+    it("(c) reap on thread_not_found still deletes the D1 row", async () => {
+      const sessionId = "ses_t211_reap_not_found";
+      const threadId = 62003;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap not found", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
+
+      expect(result.reaped).toBe(1);
+      expect(result.rateLimited).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(d) reap cap: with 8 eligible rows, at most 5 are processed in one run", async () => {
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      for (let i = 0; i < 8; i++) {
+        const sessionId = `ses_t211_reap_cap_${i}`;
+        const threadId = 62010 + i;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · cap ${i}`, now: closedAt - 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+        await markClosed(env.DB, { sessionId, now: closedAt });
+      }
+
+      let deleteCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(() => {
+          deleteCalls++;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .persist();
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, limit: 5 });
+
+      expect(result.reaped).toBe(5);
+      expect(deleteCalls).toBe(5);
+    });
+
+    it("NULL message_thread_id reap row -> D1 row deleted, zero Telegram calls", async () => {
+      const sessionId = "ses_t211_null_thread_reap";
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread reap", now: closedAt - 1000 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
+
+      expect(result.reaped).toBe(1);
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(e) orphan-close closes an open topic whose sessions row is absent", async () => {
+      const sessionId = "ses_t211_orphan_no_session";
+      const threadId = 62020;
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan no sess", now: now - 8 * 86400 * 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
+
+      let closedThreadId: number | undefined;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          closedThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(closedThreadId).toBe(threadId);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(typeof row?.closed_at).toBe("number");
+    });
+
+    it("(f) orphan-close closes an open topic whose sessions.updated_at is older than 7d TTL", async () => {
+      const sessionId = "ses_t211_orphan_stale_session";
+      const threadId = 62021;
+      const now = Date.now();
+      const oldTime = now - (ORPHAN_TTL_MS + 1000);
+
+      await registerSession(sessionId, "devbox", "stale session");
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(oldTime, sessionId).run();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan stale sess", now: oldTime });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: oldTime });
+
+      let closedThreadId: number | undefined;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          closedThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(closedThreadId).toBe(threadId);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+    });
+
+    it("(g) orphan-close does NOT touch an open topic with a fresh sessions row", async () => {
+      const sessionId = "ses_t211_fresh_session";
+      const threadId = 62022;
+      const now = Date.now();
+
+      await registerSession(sessionId, "devbox", "fresh session");
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(now - 1000, sessionId).run();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fresh sess", now: now - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 1000 });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.closedOrphans).toBe(0);
+      expect(result.rateLimited).toBe(false);
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+    });
+
+    it("(h) orphan cap: with 8 eligible, at most 5 processed", async () => {
+      const now = Date.now();
+
+      for (let i = 0; i < 8; i++) {
+        const sessionId = `ses_t211_orphan_cap_${i}`;
+        const threadId = 62030 + i;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · orphan cap ${i}`, now: now - 8 * 86400 * 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
+      }
+
+      let closeCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => {
+          closeCalls++;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .persist();
+
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5 });
+
+      expect(result.closedOrphans).toBe(5);
+      expect(closeCalls).toBe(5);
+    });
+
+    it("(i) NULL message_thread_id orphan row -> D1 row closed, zero Telegram calls", async () => {
+      const sessionId = "ses_t211_null_thread_orphan";
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread orphan", now: now - 8 * 86400 * 1000 });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(row?.message_thread_id).toBeNull();
+    });
+
+    it("(j) rate_limited response stops the run early", async () => {
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      for (let i = 0; i < 2; i++) {
+        const sessionId = `ses_t211_rate_reap_${i}`;
+        const threadId = 62040 + i;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · rate reap ${i}`, now: closedAt - 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+        await markClosed(env.DB, { sessionId, now: closedAt });
+      }
+
+      const orphanSessionId = "ses_t211_rate_orphan";
+      await reserve(env.DB, { sessionId: orphanSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · rate orphan", now: now - 8 * 86400 * 1000 });
+      await finalize(env.DB, { sessionId: orphanSessionId, messageThreadId: 62045, now: now - 8 * 86400 * 1000 });
+
+      let telegramCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(() => {
+          telegramCalls++;
+          return {
+            statusCode: 429,
+            data: JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 10 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      let closeCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => {
+          closeCalls++;
+          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
+        });
+
+      const result = await runTopicReaper(env.DB, testEnv, { now });
+
+      expect(result.rateLimited).toBe(true);
+      expect(result.reaped).toBe(0);
+      expect(result.closedOrphans).toBe(0);
+      expect(telegramCalls).toBe(1);
+      expect(closeCalls).toBe(0);
+    });
+
+    it("(k) flag OFF -> zero Telegram calls and no topic rows modified", async () => {
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      const reapSessionId = "ses_t211_flag_off_reap";
+      await reserve(env.DB, { sessionId: reapSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · flag off reap", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId: reapSessionId, messageThreadId: 62050, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId: reapSessionId, now: closedAt });
+
+      const orphanSessionId = "ses_t211_flag_off_orphan";
+      await reserve(env.DB, { sessionId: orphanSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · flag off orphan", now: now - 8 * 86400 * 1000 });
+      await finalize(env.DB, { sessionId: orphanSessionId, messageThreadId: 62051, now: now - 8 * 86400 * 1000 });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const offEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+      const result = await runTopicReaper(env.DB, offEnv, { now });
+
+      expect(result).toEqual({ reaped: 0, closedOrphans: 0, rateLimited: false });
+      expect(telegramCalled).toBe(false);
+
+      const reapRow = await getBySession(env.DB, reapSessionId);
+      expect(reapRow).not.toBeNull();
+
+      const orphanRow = await getBySession(env.DB, orphanSessionId);
+      expect(orphanRow?.state).toBe("open");
     });
   });
 });
