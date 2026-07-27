@@ -560,8 +560,9 @@ describe("Hardened Lease CAS Concurrency Proof", () => {
     } finally {
       for (const child of activeChildren) {
         // Node child uses .connected; Bun process uses child.exitCode/kill
-        const isConnected = "connected" in child ? child.connected : child.exitCode === null;
-        if (isConnected || child.exitCode === null) {
+        const exitCode = (child as unknown as { exitCode?: number | null }).exitCode;
+        const isConnected = child.connected ?? (exitCode === null);
+        if (isConnected || exitCode === null) {
           try {
             child.kill("SIGKILL");
           } catch {}

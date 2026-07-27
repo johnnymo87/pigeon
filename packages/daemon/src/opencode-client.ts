@@ -1,4 +1,5 @@
 import { RequestTimeoutError, type OutcomeObservation } from "./routing/serve-outcome";
+import { resolveServeAuthHeader, invalidateServeAuthHeader } from "./serve-auth";
 
 interface OpencodeClientOptions {
   baseUrl: string;
@@ -62,33 +63,68 @@ export class OpencodeClient {
    * docs/plans/2026-07-27-serve-serviceability-design.md 5.1 C.
    */
   private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
-    try {
-      const response = await this.fetchFn(url, { ...init, signal: controller.signal });
-      this.observe({ status: response.status });
-      return response;
-    } catch (err) {
-      // Distinguish "we gave up" from "the network said no" -- an AbortError
-      // propagated raw is indistinguishable from a caller-initiated cancel.
-      //
-      // Typed (not a bare Error) so the outcome sensor can exclude timeouts by
-      // CLASS rather than by matching the message; the message itself is
-      // unchanged so existing string-matching consumers still work. Timeouts
-      // must never count toward a serve-health verdict — a busy serve delays
-      // even a cheap accept (design 5.1 C).
-      if (controller.signal.aborted) {
-        const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
-        this.observe({ error: timeout });
-        throw timeout;
+    const buildHeaders = (): Record<string, string> => {
+      const authHeader = resolveServeAuthHeader();
+      const authObj: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
+      const callerHeaders = (init.headers as Record<string, string> | undefined) ?? {};
+      return {
+        ...authObj,
+        ...callerHeaders,
+      };
+    };
+
+    const execFetch = async (): Promise<Response> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      try {
+        const response = await this.fetchFn(url, {
+          ...init,
+          headers: buildHeaders(),
+          signal: controller.signal,
+        });
+        return response;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          this.observe({ error: timeout });
+          throw timeout;
+        }
+        this.observe({ error: err as Error });
+        throw err;
+      } finally {
+        clearTimeout(timer);
       }
-      this.observe({ error: err });
-      throw err;
-    } finally {
-      // Unconditional: a leaked timer keeps the daemon's event loop referenced
-      // once per request, and this client is used on every swarm delivery.
-      clearTimeout(timer);
+    };
+
+    let res = await execFetch();
+
+    // Credential rotation self-heal: a 401 may mean the cached header is stale
+    // (the secret file was rewritten under a long-running daemon). Re-resolve and
+    // retry ONCE -- but only if re-resolution actually produced a DIFFERENT, defined
+    // credential. Retrying with the same value, or with no value at all when auth is
+    // off, is guaranteed to 401 again and just doubles the request. A 401 is emitted
+    // by the auth middleware before the body is parsed or any handler runs, so no
+    // side effect can have occurred on the first attempt -- that is what makes this
+    // safe for the non-idempotent methods (prompt_async, summarize, abort, delete).
+    if (res.status === 401) {
+      const staleHeader = resolveServeAuthHeader();
+      invalidateServeAuthHeader();
+      const freshHeader = resolveServeAuthHeader();
+      if (freshHeader !== undefined && freshHeader !== staleHeader) {
+        // Release the discarded response's socket back to the undici pool instead of
+        // waiting for GC; this client runs on every swarm delivery.
+        res.body?.cancel().catch(() => {});
+        res = await execFetch();
+      }
     }
+
+    // Observe the FINAL status only. A transient 401 that succeeded on retry should
+    // not be reported as a failed request. This does not weaken the serve-health
+    // verdict: classifyServeOutcome() already treats 4xx as client_error, and
+    // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
+    // rule B -- "4xx IS NOT ILL-HEALTH").
+    this.observe({ status: res.status });
+    return res;
   }
 
   async healthCheck(): Promise<boolean> {
