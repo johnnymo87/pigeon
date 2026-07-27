@@ -7539,6 +7539,61 @@ describe("topics module and topicName", () => {
       expect(sentPayload.text).toBe("Reply to a session notification to use this command.");
     });
 
+    it("F2: flag OFF + service-reply shape must behave EXACTLY as pre-topics code (guard is flag-gated)", async () => {
+      // Checkpoint 2 adversarial review, F2. The guard used to be ungated, so with the
+      // flag OFF an update carrying message_thread_id === reply_to_message.message_id
+      // would skip Try 1, find Try 2 gated off, and report "Reply to a session
+      // notification..." -- where the deployed code EXECUTES the command. That made
+      // flag-off equivalence conditional on the unverified assumption that the Bot API
+      // never sets message_thread_id on private chats. The flag is the rollback kill
+      // switch, so it must not depend on that. Gating the guard makes it unconditional.
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t216_f2_${now}`;
+      const machineId = `mac_t216_f2_${now}`;
+      const threadId = 992108;
+
+      await registerSession(sessionId, machineId);
+      await touchMachine(env.DB, machineId, now);
+
+      // A real messages row sits AT the thread id.
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: threadId,
+        sessionId,
+        token: `token_t216_f2_${now}`,
+      });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888208 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: threadId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      // Flag off => guard inert => Try 1 resolves the mapping => command executes.
+      expect(sentPayload.text).toContain(`Killing session \`${sessionId}\``);
+      // And no thread id leaks to the wire while dark.
+      expect(sentPayload.message_thread_id).toBeUndefined();
+    });
+
     it("scenario 6: the isTopicServiceReply guard is load-bearing - a messages row COLLIDING with the thread id must not outrank topic membership", async () => {
       // Why this test exists: removing the guard from resolveReplySession breaks NOTHING
       // in the rest of the suite, because the headline pigeon-1xt case is already rescued

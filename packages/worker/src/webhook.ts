@@ -273,7 +273,7 @@ async function relayMediaToR2(
  * Send a message via the Telegram Bot API.
  *
  * Discarding the TgResult is deliberate: these are best-effort user-facing
- * chat messages across 22 call sites, and adding error handling here would
+ * chat messages across 21 call sites, and adding error handling here would
  * change behavior across all of them.
  */
 async function sendTelegramMessage(
@@ -311,8 +311,19 @@ async function answerCallbackQuery(
  * guard. This is accepted because the target chat is a forum supergroup; and even when
  * it misfires the message falls through to topic membership, which resolves to the same session.
  */
-function isTopicServiceReply(message: TelegramMessage): boolean {
+function isTopicServiceReply(
+  message: TelegramMessage,
+  env: { TELEGRAM_TOPICS_ENABLED?: string },
+): boolean {
   return (
+    // Gated on the flag so that flag-off routing is UNCONDITIONALLY identical to
+    // pre-topics behaviour. Without this, an update that carries message_thread_id
+    // while the flag is off diverges: the guard suppresses Try 1 and the command
+    // either fails or reports a different error than it used to. That is only
+    // unreachable if the Bot API never sets message_thread_id on private chats --
+    // an assumption still unverified (pigeon-cev). The flag is the rollback kill
+    // switch, so it must not depend on an unverified external fact.
+    topicsEnabled(env) &&
     message.message_thread_id !== undefined &&
     message.reply_to_message?.message_id === message.message_thread_id
   );
@@ -347,7 +358,7 @@ async function resolveMessageSession(
   const text = message.text || message.caption || "";
 
   // Try 1: reply-to-message lookup
-  if (message.reply_to_message && !isTopicServiceReply(message)) {
+  if (message.reply_to_message && !isTopicServiceReply(message, env)) {
     const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
       const result: { sessionId: string; command: string; questionRequestId?: string } = {
@@ -539,7 +550,7 @@ async function resolveReplySession(
   let triedReply = false;
 
   // Try 1: swipe-reply, unless it is the topic's ForumTopicCreated service message
-  if (message.reply_to_message && !isTopicServiceReply(message)) {
+  if (message.reply_to_message && !isTopicServiceReply(message, env)) {
     triedReply = true;
     const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
     if (mapping) sessionId = mapping.session_id;
