@@ -202,7 +202,26 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 - [x] T2.13 Worker: inbound topic-membership resolution + service-message guard — `80d98db`, `0fc8567`. Worker 248 → **255**. `TelegramMessage` gained `message_thread_id` and `is_topic_message`; precedence is now swipe-reply → topic membership → `/cmd TOKEN`, with the service-message guard exactly as specced. Topic membership resolves regardless of the row's `state` (typing in a closed topic still means that session). Both documented limitations are recorded in code: the 4h metadata-fallback gap for topic-routed question replies, and the non-forum-supergroup reply-thread residual. Non-vacuity proven on all three: delete the guard ⇒ (b) fails; hoist topic membership above swipe-reply ⇒ (c) fails; drop the flag gate ⇒ (d) fails.
   - **Follow-up in `0fc8567`, and the reason matters: `env` was optional.** That is the *exact* half-wired-but-green failure mode this plan warns about at T2.14 — a future call site omits `env`, topic routing silently dies on that path, and typecheck stays clean. There is no caller that legitimately has no env, so optional bought nothing. Making it required is genuinely enforced: omitting it at `webhook.ts:747` is now `TS2554` (verified by injection).
   - **Four pre-existing test call sites were passing only two arguments** and surviving purely because they return early at the swipe-reply branch — they would have thrown a `TypeError` the moment one fell through to the flag check. **`tsc` does not cover `packages/worker/test/`**, so typecheck could never have caught this; only reading the call sites did. Fixed to pass `env` explicitly. Worth remembering for T2.14: *a clean worker typecheck says nothing about the test file.*
-- [ ] T2.14 Worker + daemon: `message_thread_id` round-trip on commands
+- [x] T2.14 Worker + daemon: `message_thread_id` round-trip on commands — **split into two commits**, `55cace6` (worker) + `120228f` (daemon). Worker 255 → **259**, daemon 676 → **680**.
+  - > ### ⚠️ T2.14 IS THE FIRST PHASE-2 CHANGE THAT IS **NOT** DARK. READ BEFORE ANY DEPLOY.
+    > `pollNextCommand`'s SELECT and `queueCommand`'s INSERT reference `message_thread_id`
+    > **unconditionally** — `topicsEnabled` appears **zero** times in `d1-ops.ts` and `poll.ts`, by design,
+    > since the daemon must never need the flag to receive its own commands. Everything before T2.14 was
+    > gated; this is not.
+    >
+    > **Consequence: deploying the worker without the column first fails every poll and every queue with
+    > `no such column` — a total command-delivery outage, flag off or on.** The `topics` DDL was additive
+    > and unused while dark, so Checkpoint 2a's ordering was forgiving. This one is load-bearing immediately.
+    >
+    > **Already applied to production D1 (`pigeon-router`) on 2026-07-26**, ahead of any deploy:
+    > `ALTER TABLE commands ADD COLUMN message_thread_id INTEGER;`
+    > Verified not by inspecting the schema but by running `pollNextCommand`'s **exact** nine-column SELECT
+    > against production and confirming `success: true`.
+  - **The plan's file list for the daemon half was wrong, and following it would have been ~10× the diff.** It called for the input types and `sendTelegramReply` calls of **seven ingest modules** plus eight test files (~54 call sites). But `sendTelegramReply` is an **injected dependency**, wired in `index.ts` at 10 sites as the bare `sendTelegramReply: sendTelegramMessage` — so the thread id binds in a **closure at the wiring layer** and **no ingest module changes at all**. Final daemon diff: 160 insertions / 14 deletions, **zero** files under `src/worker/*-ingest.ts`, zero ingest tests. This is also strictly better encapsulation — the plan's own goal is "keeps the daemon ignorant of topics", and the ingest modules now never learn topics exist either.
+  - **The central hazard was defeated structurally rather than by discipline.** The plan warns `messageThreadId` is optional-shaped everywhere so a half-wired implementation typechecks clean. Both halves converted their choke point to a **required options-object key** (`QueueCommandOpts.messageThreadId` in the worker; `sendTelegramMessage`'s third parameter in the daemon), following T1.6's precedent. Omission is now a compile error, verified by injection at both: `TS2345` in `webhook.ts`, `TS2345` in `index.ts`. The worker's local `queueCommand` was 11 positional params with 4 defaults — a 12th positional would have been silently omittable at all 11 sites, and converting to options touched the same 11 sites anyway, so enforcement cost nothing.
+  - `poll.ts` needed **one** line, not nine: the response body has a **common** object assembled before the per-command-type branches, so `messageThreadId` applies to every type at once. The plan's "per-command-type response branches" predates that code.
+  - Reply routing lives in a new tested `src/worker/reply-factory.ts` (`createTelegramReplySender`) rather than ten repeated closures in the untested composition root — same reasoning as T2.12.
+  - **Deliberate: `/current-state`'s index goes to General** (`messageThreadId: undefined`, explicit). With T2.12 already sending cards unthreaded, routing the index to the invoking topic would split one response across two places. Consistency beat reply-where-asked. **Confirm this feels right during Checkpoint 2b's manual pass** — it is a UX judgement, not a correctness one.
 - [ ] **Checkpoint 2b** — inbound + round-trip verified across all command types
 
 *Polish + migration:*
