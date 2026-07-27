@@ -304,7 +304,14 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     502 → 200 change.
   - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
     `:525-566`.
-- [ ] T2.17 Docs: migration runbook + skill updates
+- [x] T2.17 Docs: migration runbook + skill updates — SHA pending commit
+  - Created `docs/runbooks/telegram-forum-migration.md` providing step-by-step procedure for Telegram Forum Topics migration, burn-in, monitoring, and rollback.
+  - Updated `.opencode/skills/worker-deployment/SKILL.md` with pointer to runbook and `[vars]` deploy-revert trap warning.
+  - Updated `AGENTS.md` with Telegram Forum Topics architecture section and Skills TOC link.
+  - Stated central invariant first and in bold: **Additive D1 DDL is applied BEFORE any code deploy.**
+  - Noted production state: required DDL (`topics` table/index and `commands.message_thread_id`) was already applied on 2026-07-26, so runbook step 1 is schema verification.
+  - Detailed the `[vars]` trap (`wrangler deploy` re-asserts `[vars]` from `wrangler.toml`, overwriting dashboard UI values) and strict `=== "true"` flag matching.
+  - Documented open beads gate (`pigeon-cev`, `pigeon-cal`, `pigeon-5o7`, `pigeon-wly`) and deferred D1 rate-gate trigger.
 - [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
 
 ---

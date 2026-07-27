@@ -43,6 +43,10 @@ The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon sh
 
 The `/model` command sets a per-session model override stored in the daemon's SQLite `sessions` table. When a command is delivered, the override is read and passed through the adapter to the plugin, which includes it in the `prompt_async` request body. The override persists until the session ends or a new `/model` command changes it.
 
+### Telegram Forum Topics
+
+Pigeon supports operating in a Telegram forum supergroup (`TELEGRAM_TOPICS_ENABLED = "true"` in worker `wrangler.toml`). Each opencode session maps to a dedicated forum topic thread named after the session's TUI title. Inbound commands, outbound notifications, and media pass through thread-aware worker endpoints referencing `commands.message_thread_id` and the D1 `topics` table. For migration details, see [`docs/runbooks/telegram-forum-migration.md`](docs/runbooks/telegram-forum-migration.md).
+
 ### Swarm IPC
 
 Cross-session messaging between opencode sessions on the same machine. Senders POST to daemon `/swarm/send` (typically via `~/.local/bin/pigeon-send` from workstation, or transparently via `opencode-send <ses_*>` which auto-routes). The daemon persists in `swarm_messages` and returns 202 immediately. A background `SwarmArbiter` (500ms tick, at-most-one-in-flight per target) delivers via opencode serve `prompt_async`, with the message wrapped in a `<swarm_message v="1" ...>` XML envelope so the receiving agent can structurally distinguish swarm traffic from user prompts. Receivers can also call the `swarm_read` opencode tool (registered by the plugin) to fetch their inbox via `GET /swarm/inbox`.
@@ -120,6 +124,8 @@ Health check URLs are listed in the Quickstart section above.
   - Use when you need endpoint, table, and flow-level system understanding.
 - [worker-deployment](.opencode/skills/worker-deployment/SKILL.md)
   - Use when deploying to Cloudflare and validating production health/auth.
+- [telegram-forum-migration](docs/runbooks/telegram-forum-migration.md)
+  - Runbook for Telegram Forum Topics supergroup migration and rollback steps.
 - [worker-operations](.opencode/skills/worker-operations/SKILL.md)
   - Use for incident triage, log tailing, quick diagnostics, and rollback steps.
 - [worker-troubleshooting](.opencode/skills/worker-troubleshooting/SKILL.md)
