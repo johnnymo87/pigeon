@@ -305,6 +305,25 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
   - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
     `:525-566`.
 - [x] T2.17 Docs: migration runbook + skill updates — `16efc79`
+  - **Three factual defects found on review and fixed in `TBD2`** — all three would have misled a human
+    executing against production:
+    1. **The `pigeon-cev` gate list was wrong.** It invented a fourth item ("does Telegram return
+       `message_thread_id` on callback queries?"), **dropped the real item 2** (the unverified
+       `thread_not_found` classifier string), and renumbered the rest — which silently broke `pigeon-cal`'s
+       and this plan's "decided by `pigeon-cev` item 3" cross-reference. Rewritten to match the bead
+       verbatim, with a note that the numbering is load-bearing.
+    2. **The reference DDL omitted `idx_topics_reap`** (`ON topics(state, closed_at)`). A rebuild from
+       scratch would have produced a `topics` table the hourly reaper cannot index-scan. Added, and the
+       block now points at `packages/worker/src/d1-schema.sql` as authoritative rather than duplicating it
+       silently.
+    3. **`wrangler tail --workspace packages/worker` is not a valid invocation** — `wrangler tail` has no
+       `--workspace` flag (confirmed against `wrangler tail --help`; it offers `--cwd` and `-c/--config`).
+       Corrected to `--cwd`.
+  - **Two commands I doubted and verified as CORRECT, so nobody re-litigates them:**
+    `npx --workspace @pigeon/worker wrangler deploy --dry-run` genuinely works — `npx` is `npm exec`, which
+    accepts workspace flags; I ran it and it printed the real bindings including
+    `TELEGRAM_TOPICS_ENABLED ("false")`. And `/run/secrets/ccr_api_key` exists and is `dev`-readable.
+    `pigeon-daemon.service` is a **system** unit, so `sudo systemctl restart` is right.
   - Created `docs/runbooks/telegram-forum-migration.md` providing step-by-step procedure for Telegram Forum Topics migration, burn-in, monitoring, and rollback.
   - Updated `.opencode/skills/worker-deployment/SKILL.md` with pointer to runbook and `[vars]` deploy-revert trap warning.
   - Updated `AGENTS.md` with Telegram Forum Topics architecture section and Skills TOC link.

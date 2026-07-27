@@ -67,12 +67,27 @@ Values like `"True"`, `"TRUE"`, `"1"`, `""`, or `"true "` evaluate to **`false`*
 
 Do NOT set `TELEGRAM_TOPICS_ENABLED = "true"` until the following beads are settled:
 
-- **`pigeon-cev`** (P1): Four live Telegram questions requiring verification:
-  1. `wrangler deploy` override behavior against Cloudflare Dashboard `[vars]` (Settled: `wrangler.toml` wins).
-  2. Can an admin bot post into a closed topic?
-  3. What error/status does Telegram return when reopening or posting into a closed topic?
-  4. Does Telegram return `message_thread_id` on callback queries / service messages?
-- **`pigeon-cal`** (P1): Webhook confirmations in closed topics (decided by `pigeon-cev` item 3).
+- **`pigeon-cev`** (P1): four questions that only the live Telegram API can answer. **The numbering below
+  is load-bearing — other beads and the plan cross-reference these items by number. Do not renumber.**
+  1. **The `[vars]` revert trap.** Documented in this runbook (see above). Flip via `wrangler.toml`, or move
+     the flag to a secret. Confirm with `--dry-run` first.
+  2. **The `thread_not_found` classifier string** (`packages/worker/src/telegram.ts`). Still an unverified
+     substring match inherited from T1.3. If Telegram's real string differs, T2.7 degrades gracefully — T2.8
+     still delivers to General — but stale rows never clean up and every send double-hits Telegram. Verify by
+     deliberately deleting a topic in the supergroup and reading the actual error description.
+  3. **Can an admin bot post into a CLOSED topic at all?** T2.6 reopens before sending so we never depend on
+     the answer, but it decides whether the reopen call is load-bearing or belt-and-braces, which matters for
+     the 20/min budget. **This item also decides `pigeon-cal`.**
+  4. **What does Telegram return when you reopen an ALREADY-OPEN topic?** The F1 fix assumes a generic
+     non-429, non-`thread_not_found` error and guesses `TOPIC_NOT_MODIFIED`. Safe either way, but confirming
+     tells us whether that branch is the common path or a rarity.
+
+  Verify items 2, 3 and 4 in the **same** live session — all three are "ask the real API" questions.
+- **`pigeon-cal`** (P1): webhook confirmations have no General fallback, so an ack or error sent into a
+  *closed* topic can vanish silently — the webhook wrapper discards `TgResult`, unlike the notification path
+  which gets T2.8's fallback. **Decided by `pigeon-cev` item 3 above:** if an admin bot *can* post into a
+  closed topic, this is a non-issue; if it cannot, mirror T2.8 (on a non-429 failure with a thread id, retry
+  once without it).
 - **`pigeon-5o7`** (P2): Scope `deleteTopicBySession` to thread ID.
 - **`pigeon-wly`** (P3): Reap-loop generic failures pinning head-of-line slots (accepted residual).
 
@@ -102,7 +117,7 @@ npx wrangler d1 execute pigeon-router --remote --command "SELECT * FROM topics L
 **Expected Result:** Both queries succeed without `no such column` or `no such table` errors.
 
 <details>
-<summary>Reference DDL (for new environments / rebuilds from scratch)</summary>
+<summary>Reference DDL (for new environments / rebuilds from scratch) — authoritative copy is <code>packages/worker/src/d1-schema.sql</code></summary>
 
 ```sql
 CREATE TABLE IF NOT EXISTS topics (
@@ -117,9 +132,11 @@ CREATE TABLE IF NOT EXISTS topics (
   closed_at INTEGER
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread 
-  ON topics (chat_id, message_thread_id) 
-  WHERE message_thread_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
+  ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL;
+
+-- Required by the hourly topic reaper (topic-reaper.ts). Do not omit.
+CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at);
 
 ALTER TABLE commands ADD COLUMN message_thread_id INTEGER;
 ```
@@ -207,7 +224,7 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
 
 1. Tail worker logs to monitor real-time activity and rate limits:
    ```bash
-   npx wrangler tail --workspace packages/worker
+   npx wrangler tail --cwd packages/worker
    ```
 2. Check for Telegram 429 rate limits or delivery errors in the logs.
 3. Send a test command in a topic in the supergroup (e.g., `/current-state`).
