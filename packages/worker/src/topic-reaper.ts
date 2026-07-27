@@ -137,12 +137,23 @@ export async function closeOrphanedTopics(
       messageThreadId: row.message_thread_id,
     });
 
-    if (res.ok || res.kind === "thread_not_found") {
-      await markClosed(db, { sessionId: row.session_id, now });
-      closedOrphans++;
-    } else if (res.kind === "rate_limited") {
+    if (!res.ok && res.kind === "rate_limited") {
       return { closedOrphans, rateLimited: true };
     }
+
+    // Everything that is not a 429 marks the row closed — including a GENERIC failure.
+    //
+    // This mirrors Fix A in topic-manager.ts and exists for the same reason: D1 state is what the
+    // reaper reads, so a row we decline to advance is a row that can never age toward reaping.
+    // Leaving a generic failure unmarked meant `listOrphaned` re-selected it on EVERY cron run
+    // forever, and because that query orders by `created_at ASC` each such row permanently pinned
+    // one of the DEFAULT_ORPHAN_CAP slots — five of them starve the orphan-closer completely.
+    //
+    // Safe because the orphan-closer only ever fires on a session that is absent or idle past the
+    // liveness TTL, and `listReapable` independently refuses to reap a topic whose session is live.
+    // So marking closed here cannot strand a topic a live session is still posting to.
+    await markClosed(db, { sessionId: row.session_id, now });
+    closedOrphans++;
   }
 
   return { closedOrphans, rateLimited: false };
@@ -167,6 +178,10 @@ export async function runTopicReaper(
     botToken,
     now: opts.now,
     reapTtlMs: opts.reapTtlMs,
+    // Must be forwarded: it is the reaper's session-liveness cutoff. Omitting it silently split the
+    // system's definition of "live" — the orphan-closer honouring an override while the reaper fell
+    // back to the 7d default — which is exactly the drift the shared constant exists to prevent.
+    orphanTtlMs: opts.orphanTtlMs,
     limit: opts.reapCap,
     tgClient: opts.tgClient,
   });

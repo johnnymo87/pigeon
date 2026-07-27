@@ -7148,6 +7148,76 @@ describe("topics module and topicName", () => {
       expect(rowAfterReap).not.toBeNull();
       expect(rowAfterReap?.state).toBe("open");
     });
+
+    // ── Follow-ups from the second fable review of 601c8d4 ──────────────────
+
+    it("(F-1) orphan-closer marks the row closed even when closeForumTopic fails generically, so it cannot pin a slot forever", async () => {
+      const sessionId = "ses_f1b_generic";
+      const threadId = 66001;
+      const t0 = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+         VALUES (?, 'devbox', ?, ?, 'x', 'open', ?, ?)`,
+      ).bind(sessionId, topicChatId, threadId, t0, t0).run();
+      // No sessions row => orphaned.
+
+      let closeCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(200, () => {
+          closeCalls++;
+          return { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" };
+        })
+        .times(5);
+
+      const now = t0 + 1000;
+      const res1 = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
+      expect(closeCalls).toBe(1);
+      expect(res1.closedOrphans).toBe(1);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(row?.closed_at).not.toBeNull();
+
+      // The point of the fix: a SECOND run must not re-select it, so it cannot pin one of the 5 slots.
+      const res2 = await closeOrphanedTopics(env.DB, { botToken, now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS });
+      expect(res2.closedOrphans).toBe(0);
+      expect(closeCalls).toBe(1);
+    });
+
+    it("(F-2) runTopicReaper forwards orphanTtlMs to reapTopics, so both jobs share one definition of live", async () => {
+      const sessionId = "ses_f1b_ttl";
+      const threadId = 66010;
+      const t0 = Date.now();
+      const closedLongAgo = t0 - REAP_TTL_MS - 10000;
+      await env.DB.prepare(
+        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at, closed_at)
+         VALUES (?, 'devbox', ?, ?, 'x', 'closed', ?, ?, ?)`,
+      ).bind(sessionId, topicChatId, threadId, closedLongAgo, closedLongAgo, closedLongAgo).run();
+      // sessions row is 3 days stale: LIVE under the 7d default, DEAD under a 1d override.
+      await env.DB.prepare(
+        `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, 'devbox', null, ?, ?)`,
+      ).bind(sessionId, closedLongAgo, t0 - 3 * 24 * 60 * 60 * 1000).run();
+
+      let deleted = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, () => { deleted = true; return { ok: true, result: true }; });
+
+      // With a 1-day liveness cutoff the session reads as dead, so the reaper MUST reap.
+      // If orphanTtlMs is not forwarded, reapTopics falls back to 7d, sees a live session, and reaps nothing.
+      const res = await runTopicReaper(
+        env.DB,
+        { TELEGRAM_TOPICS_ENABLED: "true", TELEGRAM_BOT_TOKEN: botToken },
+        { now: t0, orphanTtlMs: 24 * 60 * 60 * 1000 },
+      );
+
+      expect(res.reaped).toBe(1);
+      expect(deleted).toBe(true);
+    });
+
   });
 });
 
