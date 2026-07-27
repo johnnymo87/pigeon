@@ -7539,6 +7539,70 @@ describe("topics module and topicName", () => {
       expect(sentPayload.text).toBe("Reply to a session notification to use this command.");
     });
 
+    it("scenario 6: the isTopicServiceReply guard is load-bearing - a messages row COLLIDING with the thread id must not outrank topic membership", async () => {
+      // Why this test exists: removing the guard from resolveReplySession breaks NOTHING
+      // in the rest of the suite, because the headline pigeon-1xt case is already rescued
+      // by the Try 1 -> Try 2 fall-through (lookupMessage simply misses on an unstored
+      // service message). The guard only earns its place when a messages row EXISTS at the
+      // service-message id. Without this test, a future reader would observe the guard is
+      // removable with a green suite and delete it.
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionTopic = `ses_t216_coll_topic_${now}`;
+      const sessionStale = `ses_t216_coll_stale_${now}`;
+      const machineId = `mac_t216_coll_${now}`;
+      const threadId = 992107;
+
+      await registerSession(sessionTopic, machineId);
+      await registerSession(sessionStale, machineId);
+      await touchMachine(env.DB, machineId, now);
+
+      // The topic maps to sessionTopic - this is the correct answer.
+      await reserve(env.DB, { sessionId: sessionTopic, machineId, chatId: String(CHAT_ID_NUM), name: "coll topic", now });
+      await finalize(env.DB, { sessionId: sessionTopic, messageThreadId: threadId, now });
+
+      // A messages row exists AT the thread id itself, mapping to a DIFFERENT session.
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: threadId,
+        sessionId: sessionStale,
+        token: `token_t216_coll_${now}`,
+      });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888207 } };
+        });
+
+      // Bare /kill in the topic: reply_to_message.message_id === message_thread_id.
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: threadId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      // The guard must skip Try 1 so topic membership wins.
+      expect(sentPayload.text).toContain(`Killing session \`${sessionTopic}\``);
+
+      const rows = await queryQueueByMachine(machineId);
+      const killRows = rows.filter((r) => r.command_type === "kill");
+      expect(killRows.length).toBeGreaterThanOrEqual(1);
+      expect(killRows[killRows.length - 1]!.session_id).toBe(sessionTopic);
+    });
+
     it("scenario 3: precedence - genuine swipe-reply to Session A outranks topic membership for Session B", async () => {
       const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
       const now = Date.now();

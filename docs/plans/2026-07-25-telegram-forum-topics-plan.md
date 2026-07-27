@@ -272,12 +272,38 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     > (which this plan has twice refused to do, at T2.6 and T2.7) *and* making the wrapper stop discarding
     > `TgResult` across all 22 sites — a riskier change than T2.15 itself. Resolve item 3, then either
     > close `pigeon-cal` or mirror T2.8: on a non-429 failure with a thread id, retry once without it.
-- [x] T2.16 Worker: bare slash commands resolve via topic — worker 267 → **277** tests, typecheck clean.
+- [x] T2.16 Worker: bare slash commands resolve via topic — `c68edae` (+ `TBDSHA` follow-up test). Worker 271 → **278**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
   - Extracted shared module-level `isTopicServiceReply(message: TelegramMessage): boolean` helper (with non-forum supergroup thread-root comment carried) used by both `resolveMessageSession` and `resolveReplySession`.
   - Rewrote `resolveReplySession` to 2 ordered attempts: Try 1 (swipe-reply, unless service reply) → Try 2 (topic membership, gated on `topicsEnabled(env)`). Falling through lets evicted swipe-replies still resolve via topic.
   - Failure message selection uses `triedReply` boolean flag so flag-off behavior is byte-identical: reply present & lookup misses ⇒ `"Could not find a session for that message."`; no reply ⇒ `"Reply to a session notification to use this command."`. Flag-on in topic ⇒ `"Could not find a session for this topic."`.
   - Non-vacuity proven via injections: removing `isTopicServiceReply` broke T2.13(b); removing `topicsEnabled` gate on Try 2 broke scenario 2a (resolved topic with flag OFF); hoisting Try 2 above Try 1 broke scenario 3 (topic membership outranked genuine swipe reply).
   - Note on spec line numbers: spec listed `webhook.ts:472-507`, actual pre-edit range was `:525-566`.
+  - > **⚠️ THE `isTopicServiceReply` GUARD IS NOT LOAD-BEARING FOR THE HEADLINE CASE, AND THE ORIGINAL EVIDENCE DID NOT SHOW THAT.**
+    > The implementer's non-vacuity injection for scenario 1 removed the guard from *both* call sites and
+    > reported a failure — but the test that failed was **T2.13's**, not T2.16's. I re-ran the injection
+    > scoped to `resolveReplySession` alone: **all 277 tests still passed.**
+    >
+    > The reason is structural. The `pigeon-1xt` fix is carried entirely by the Try 1 → Try 2
+    > **fall-through**: `lookupMessage` simply misses on a `ForumTopicCreated` service message, because
+    > service messages are never stored in `messages`. The guard only earns its keep when a `messages` row
+    > *exists at the thread id itself*, in which case Try 1 would resolve to the **wrong session**.
+    >
+    > That is a dangerous shape to leave untested — a future reader would observe (as I did) that the guard
+    > is removable with a fully green suite, and delete it. Added **scenario 6**, which seeds a `messages`
+    > row at the thread id mapping to a different session and asserts topic membership still wins.
+    > Proven non-vacuous: with the guard disabled *only* in `resolveReplySession`, it fails with
+    > `expected 'Killing session ses_t216_coll_stale_…' to contain 'ses_t216_coll_topic_…'`. Worker 277 → **278**.
+    >
+    > Generalisable lesson, and the second time this phase it has bitten: **an injection that removes a
+    > shared helper proves the helper matters somewhere, not that it matters at the call site under test.**
+    > Scope the injection to the site you are claiming coverage for.
+  - Pre-existing T2.15 assertion changed: the "an ERROR path in a topic carries the thread id" test expected
+    `"Reply to a session notification to use this command."`; under T2.16 a bare command in a session-less
+    topic now correctly yields `"Could not find a session for this topic."`. Verified legitimate — the test's
+    actual purpose, `message_thread_id === threadId`, is untouched and still asserted. Same shape as T2.8's
+    502 → 200 change.
+  - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
+    `:525-566`.
 - [ ] T2.17 Docs: migration runbook + skill updates
 - [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
 
