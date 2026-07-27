@@ -14,6 +14,7 @@ import { SessionManager, normalizeTitle } from "./session-state"
 import { createSwarmReadTool, SWARM_READ_TOOL_NAME } from "./swarm-tool"
 import { createSwarmSendTool, SWARM_SEND_TOOL_NAME } from "./swarm-send-tool"
 import { createSwarmListTool, SWARM_LIST_TOOL_NAME } from "./swarm-list-tool"
+import { resolveServeAuthHeader } from "./serve-auth"
 import { errorMessage, serializeError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
@@ -83,6 +84,10 @@ const plugin: Plugin = async (ctx) => {
             ctx.serverUrl,
           )
           const headers: Record<string, string> = { "Content-Type": "application/json" }
+          const authHeader = resolveServeAuthHeader()
+          if (authHeader) {
+            headers["Authorization"] = authHeader
+          }
 
           // Build parts array: always include text, optionally include file
           const parts: Array<Record<string, unknown>> = []
@@ -166,13 +171,18 @@ const plugin: Plugin = async (ctx) => {
           // the correct Instance context (where the pending question lives).
           // Without this, opencode serve falls back to process.cwd() which
           // is the wrong project, causing "reply for unknown request".
+          const replyHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+            "x-opencode-directory": ctx.directory,
+          }
+          const authHeader = resolveServeAuthHeader()
+          if (authHeader) {
+            replyHeaders["Authorization"] = authHeader
+          }
           const res = await internalFetch(
             new Request(replyUrl.toString(), {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-opencode-directory": ctx.directory,
-              },
+              headers: replyHeaders,
               body: JSON.stringify({ answers: request.answers }),
               signal: AbortSignal.timeout(10_000),
             }),

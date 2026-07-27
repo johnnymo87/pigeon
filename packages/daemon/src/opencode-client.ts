@@ -1,20 +1,135 @@
+import { RequestTimeoutError, type OutcomeObservation } from "./routing/serve-outcome";
+import { resolveServeAuthHeader, invalidateServeAuthHeader } from "./serve-auth";
+
 interface OpencodeClientOptions {
   baseUrl: string;
   fetchFn?: typeof fetch;
+  /** Per-request ceiling. See `fetchWithTimeout`. Defaults to 30s. */
+  requestTimeoutMs?: number;
+  /**
+   * Shadow-mode observability tap (bead pigeon-f2a). Fires once per request with
+   * the raw status or error; classification happens in the sensor, not here.
+   *
+   * Records only — it must not influence this client's behaviour, and today
+   * nothing reads its output for routing. See routing/serve-outcome.ts.
+   */
+  onOutcome?: (obs: OutcomeObservation) => void;
 }
+
+/**
+ * Deliberately generous (bead pigeon-h21). Every endpoint here should answer in
+ * milliseconds -- `prompt_async` in particular returns at ACCEPT, not at
+ * completion -- so this is a liveness backstop, not a latency budget. A tight
+ * value would abort a serve that is merely busy, which is the false-positive
+ * class that caused the June 2026 lease-flapping incident.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export class OpencodeClient {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly requestTimeoutMs: number;
+  private readonly onOutcome: ((obs: OutcomeObservation) => void) | undefined;
 
   constructor(options: OpencodeClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.fetchFn = options.fetchFn ?? fetch;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.onOutcome = options.onOutcome;
+  }
+
+  /** Never let the observability tap perturb the request it is observing. */
+  private observe(obs: OutcomeObservation): void {
+    try {
+      this.onOutcome?.(obs);
+    } catch {
+      // Deliberately ignored.
+    }
+  }
+
+  /**
+   * Bounds every request so a serve that ACCEPTS the connection but never
+   * responds cannot leave a promise pending forever (bead pigeon-h21).
+   *
+   * That state is worse than a fast failure. The SwarmArbiter is
+   * at-most-one-in-flight per target and releases the slot in a `.finally()`
+   * (`swarm/arbiter.ts:76-77`), so a promise that never settles wedges ALL swarm
+   * delivery to that session permanently: no rejection means no retry, and no
+   * failure means nothing to observe. Silence reads as success.
+   *
+   * The abort is surfaced as a normal Error rather than a bare AbortError so
+   * callers get a message that names the cause. Note the timeout must NOT be fed
+   * into any serve-health verdict -- see
+   * docs/plans/2026-07-27-serve-serviceability-design.md 5.1 C.
+   */
+  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+    const buildHeaders = (): Record<string, string> => {
+      const authHeader = resolveServeAuthHeader();
+      const authObj: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
+      const callerHeaders = (init.headers as Record<string, string> | undefined) ?? {};
+      return {
+        ...authObj,
+        ...callerHeaders,
+      };
+    };
+
+    const execFetch = async (): Promise<Response> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      try {
+        const response = await this.fetchFn(url, {
+          ...init,
+          headers: buildHeaders(),
+          signal: controller.signal,
+        });
+        return response;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          this.observe({ error: timeout });
+          throw timeout;
+        }
+        this.observe({ error: err as Error });
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    let res = await execFetch();
+
+    // Credential rotation self-heal: a 401 may mean the cached header is stale
+    // (the secret file was rewritten under a long-running daemon). Re-resolve and
+    // retry ONCE -- but only if re-resolution actually produced a DIFFERENT, defined
+    // credential. Retrying with the same value, or with no value at all when auth is
+    // off, is guaranteed to 401 again and just doubles the request. A 401 is emitted
+    // by the auth middleware before the body is parsed or any handler runs, so no
+    // side effect can have occurred on the first attempt -- that is what makes this
+    // safe for the non-idempotent methods (prompt_async, summarize, abort, delete).
+    if (res.status === 401) {
+      const staleHeader = resolveServeAuthHeader();
+      invalidateServeAuthHeader();
+      const freshHeader = resolveServeAuthHeader();
+      if (freshHeader !== undefined && freshHeader !== staleHeader) {
+        // Release the discarded response's socket back to the undici pool instead of
+        // waiting for GC; this client runs on every swarm delivery.
+        res.body?.cancel().catch(() => {});
+        res = await execFetch();
+      }
+    }
+
+    // Observe the FINAL status only. A transient 401 that succeeded on retry should
+    // not be reported as a failed request. This does not weaken the serve-health
+    // verdict: classifyServeOutcome() already treats 4xx as client_error, and
+    // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
+    // rule B -- "4xx IS NOT ILL-HEALTH").
+    this.observe({ status: res.status });
+    return res;
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      const response = await this.fetchFn(`${this.baseUrl}/global/health`, {
+      const response = await this.fetchWithTimeout(`${this.baseUrl}/global/health`, {
         method: "GET",
       });
       return response.ok;
@@ -24,7 +139,7 @@ export class OpencodeClient {
   }
 
   async createSession(directory: string): Promise<{ id: string }> {
-    const response = await this.fetchFn(`${this.baseUrl}/session`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session`, {
       method: "POST",
       headers: { "x-opencode-directory": directory },
     });
@@ -43,7 +158,7 @@ export class OpencodeClient {
    * "opencode-serve is unreachable."
    */
   async getSession(sessionId: string): Promise<{ id: string; directory: string } | null> {
-    const response = await this.fetchFn(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
       method: "GET",
     });
 
@@ -66,7 +181,7 @@ export class OpencodeClient {
     directory: string;
     time: { created: number; updated: number };
   } | null> {
-    const response = await this.fetchFn(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
       method: "GET",
     });
 
@@ -99,7 +214,7 @@ export class OpencodeClient {
   }
 
   async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
-    const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
       method: "POST",
       headers: {
         "x-opencode-directory": directory,
@@ -114,7 +229,7 @@ export class OpencodeClient {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}`, {
       method: "DELETE",
     });
 
@@ -124,7 +239,7 @@ export class OpencodeClient {
   }
 
   async abortSession(sessionId: string): Promise<void> {
-    const response = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/abort`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/abort`, {
       method: "POST",
     });
 
@@ -134,7 +249,7 @@ export class OpencodeClient {
   }
 
   async getSessionMessages(sessionId: string): Promise<unknown[]> {
-    const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/message`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/message`, {
       method: "GET",
     });
     if (!res.ok) {
@@ -145,7 +260,7 @@ export class OpencodeClient {
   }
 
   async summarize(sessionId: string, providerID: string, modelID: string): Promise<void> {
-    const res = await this.fetchFn(`${this.baseUrl}/session/${sessionId}/summarize`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/summarize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ providerID, modelID, auto: false }),
@@ -159,7 +274,7 @@ export class OpencodeClient {
   async mcpStatus(directory?: string): Promise<Record<string, { status: string; error?: string }>> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchFn(`${this.baseUrl}/mcp`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp`, {
       method: "GET",
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
@@ -173,7 +288,7 @@ export class OpencodeClient {
   async mcpConnect(name: string, directory?: string): Promise<boolean> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`, {
       method: "POST",
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
@@ -183,7 +298,7 @@ export class OpencodeClient {
   async mcpDisconnect(name: string, directory?: string): Promise<boolean> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchFn(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`, {
       method: "POST",
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
@@ -195,7 +310,7 @@ export class OpencodeClient {
     default: Record<string, string>;
     connected: string[];
   }> {
-    const res = await this.fetchFn(`${this.baseUrl}/provider`, {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/provider`, {
       method: "GET",
     });
     if (!res.ok) {

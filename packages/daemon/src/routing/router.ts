@@ -10,6 +10,7 @@ import type {
   ServeInstanceRecord,
   RouteResult,
 } from "./types";
+import type { ReassignmentEventRepo } from "./reassignment-repo";
 
 export class NoHealthyServeError extends Error {
   constructor() {
@@ -34,6 +35,12 @@ export class IngressRouter {
       assignments: SessionAssignmentRepo;
       leases: SessionLeaseRepo;
       meta: RoutingMetaRepo;
+      /**
+       * Dated log of serve moves (bead pigeon-f2a). OPTIONAL: several call sites
+       * build this repo bag by hand, and observability must never be a
+       * precondition for routing.
+       */
+      reassignments?: Pick<ReassignmentEventRepo, "record">;
     },
     private opts: {
       leaseTtlMs: number;
@@ -203,6 +210,29 @@ export class IngressRouter {
       lastActiveAt: now,
       updatedAt: now,
     });
+
+    // Flap instrumentation (pigeon-f2a). Recorded AFTER the upsert, so the log
+    // reflects moves that were actually committed, and only for genuine moves —
+    // a first placement is session creation, not flapping, and counting it would
+    // drown the rate signal in ordinary traffic.
+    //
+    // Wrapped because this is the live routing path: `owner_generation` is
+    // already durably bumped by the line above, and an observability insert that
+    // hits SQLITE_BUSY (which happens on this shared DB when serves restart
+    // together) must degrade to a missing metric, never to a failed route.
+    if (existing && chosen !== existing.desiredServeId) {
+      try {
+        this.repos.reassignments?.record({
+          sessionId,
+          fromServeId: existing.desiredServeId,
+          toServeId: chosen,
+          ownerGeneration,
+          at: now,
+        });
+      } catch {
+        // Intentionally swallowed. See above.
+      }
+    }
 
     const serve = this.repos.serves.get(chosen)!;
     const acquired = this.repos.leases.acquireCAS(
