@@ -1,4 +1,6 @@
 import { verifyApiKey, unauthorized } from "./auth";
+import { createTelegramClient } from "./telegram";
+import { topicsEnabled, getBySession, markClosed } from "./topics";
 
 const MAX_SESSIONS = 1000;
 
@@ -28,7 +30,7 @@ export async function handleSessionRequest(
     case "register":
       return registerSession(db, request);
     case "unregister":
-      return unregisterSession(db, request);
+      return unregisterSession(db, env, request);
   }
 }
 
@@ -86,6 +88,7 @@ async function registerSession(
 
 async function unregisterSession(
   db: D1Database,
+  env: Env,
   request: Request,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
@@ -93,6 +96,24 @@ async function unregisterSession(
 
   if (!sessionId) {
     return Response.json({ error: "sessionId required" }, { status: 400 });
+  }
+
+  if (topicsEnabled(env)) {
+    const topic = await getBySession(db, sessionId);
+    if (topic) {
+      await markClosed(db, { sessionId });
+      if (topic.message_thread_id !== null) {
+        try {
+          const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+          await client.closeForumTopic({
+            chatId: topic.chat_id,
+            messageThreadId: topic.message_thread_id,
+          });
+        } catch {
+          // best-effort Telegram call
+        }
+      }
+    }
   }
 
   await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();

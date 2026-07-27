@@ -46,6 +46,7 @@ import {
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
+import { handleSessionRequest } from "../src/sessions";
 import {
   sendMessage,
   editMessageText,
@@ -5972,6 +5973,187 @@ describe("topics module and topicName", () => {
       expect(res.status).toBe(200);
       expect(photoCalled).toBe(true);
       expect(photoThreadId).toBeNull();
+    });
+  });
+
+  describe("Task T2.10: Unregister topic closing", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("(a) flag ON, finalized topic row -> row state='closed', closed_at set, closeForumTopic called, topic row still exists", async () => {
+      const sessionId = "ses_t210_case_a";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg a", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61001, now });
+
+      let closeCalledWith: { chatId: unknown; messageThreadId: unknown } | null = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          closeCalledWith = { chatId: String(body.chat_id), messageThreadId: body.message_thread_id };
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: true }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(closeCalledWith).toEqual({ chatId: topicChatId, messageThreadId: 61001 });
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.state).toBe("closed");
+      expect(typeof row?.closed_at).toBe("number");
+      expect(row?.closed_at).toBeGreaterThan(0);
+    });
+
+    it("(b) flag ON, Telegram closeForumTopic fails -> returns 200 {ok:true} and row is STILL marked closed", async () => {
+      const sessionId = "ses_t210_case_b";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg b", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61002, now });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(400, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(typeof row?.closed_at).toBe("number");
+    });
+
+    it("(c) flag ON, reservation row with NULL message_thread_id -> row marked closed, zero Telegram calls", async () => {
+      const sessionId = "ses_t210_case_c";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg c", now });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(row?.message_thread_id).toBeNull();
+    });
+
+    it("(d) flag OFF -> topic row is left completely untouched (still state='open') and zero Telegram calls", async () => {
+      const sessionId = "ses_t210_case_d";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg d", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61004, now });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, env, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+      expect(row?.closed_at).toBeNull();
+    });
+
+    it("(e) flag ON, session with no topic row -> 200, no Telegram call, no crash", async () => {
+      const sessionId = "ses_t210_case_e";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(telegramCalled).toBe(false);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
     });
   });
 });
