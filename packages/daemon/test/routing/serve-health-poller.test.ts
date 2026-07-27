@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { openStorageDb } from "../../src/storage/database";
 import { IngressRouter } from "../../src/routing/router";
 import { ServeHealthPoller } from "../../src/routing/serve-health-poller";
 import { seedServes } from "../../src/routing/serve-registry";
+import { invalidateServeAuthHeader } from "../../src/serve-auth";
 
 describe("serve-health-poller", () => {
   it("marks a healthy serve as healthy and updates heartbeatAt", async () => {
@@ -296,5 +297,66 @@ describe("serve-health-poller", () => {
     expect(reassignedServeIds).toEqual(["serve-stale"]);
 
     s.db.close();
+  });
+
+  describe("authentication", () => {
+    const origEnv = process.env;
+
+    beforeEach(() => {
+      process.env = { ...origEnv };
+      delete process.env.OPENCODE_SERVER_PASSWORD;
+      delete process.env.OPENCODE_SERVER_PASSWORD_FILE;
+      delete process.env.OPENCODE_SERVER_USERNAME;
+      invalidateServeAuthHeader();
+    });
+
+    afterEach(() => {
+      process.env = origEnv;
+      invalidateServeAuthHeader();
+    });
+
+    it("sends Authorization header when OPENCODE_SERVER_PASSWORD is set", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "healthpassword";
+      const s = openStorageDb(":memory:");
+      seedServes(s.serves, ["http://127.0.0.1:4096"], 1000);
+
+      const fetchFn = vi.fn().mockResolvedValue({ ok: true } as Response);
+      const poller = new ServeHealthPoller(s.serves, { reassignFromDeadServe: () => {} }, {
+        healthPollMs: 5000,
+        fetchFn,
+      });
+
+      await poller.pollOnce(2000);
+
+      const expectedHeader = `Basic ${Buffer.from("opencode:healthpassword").toString("base64")}`;
+      expect(fetchFn).toHaveBeenCalledWith(
+        "http://127.0.0.1:4096/global/health",
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: expectedHeader,
+          }),
+        }),
+      );
+
+      s.db.close();
+    });
+
+    it("omits Authorization header when OPENCODE_SERVER_PASSWORD is unset", async () => {
+      const s = openStorageDb(":memory:");
+      seedServes(s.serves, ["http://127.0.0.1:4096"], 1000);
+
+      const fetchFn = vi.fn().mockResolvedValue({ ok: true } as Response);
+      const poller = new ServeHealthPoller(s.serves, { reassignFromDeadServe: () => {} }, {
+        healthPollMs: 5000,
+        fetchFn,
+      });
+
+      await poller.pollOnce(2000);
+
+      const callInit = fetchFn.mock.calls[0]![1];
+      expect(callInit.headers?.Authorization).toBeUndefined();
+
+      s.db.close();
+    });
   });
 });

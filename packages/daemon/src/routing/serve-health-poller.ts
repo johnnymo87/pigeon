@@ -1,5 +1,6 @@
 import type { ServeInstanceRepo } from "./route-repo";
 import type { IngressRouter } from "./router";
+import { resolveServeAuthHeader, invalidateServeAuthHeader } from "../serve-auth";
 
 export class ServeHealthPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -28,7 +29,18 @@ export class ServeHealthPoller {
         let ok = false;
         try {
           const url = `${s.endpoint}/global/health`;
-          const res = await fetchFn(url, { signal: controller.signal });
+          const authHeader = resolveServeAuthHeader();
+          const headers: Record<string, string> = {};
+          if (authHeader) {
+            headers["Authorization"] = authHeader;
+          }
+          const res = await fetchFn(url, {
+            signal: controller.signal,
+            ...(Object.keys(headers).length > 0 ? { headers } : {}),
+          });
+          if (res.status === 401) {
+            invalidateServeAuthHeader();
+          }
           ok = res.ok;
         } catch (err) {
           // ignore error, ok remains false

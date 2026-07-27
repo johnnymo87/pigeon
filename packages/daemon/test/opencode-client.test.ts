@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { OpencodeClient } from "../src/opencode-client";
+import { invalidateServeAuthHeader } from "../src/serve-auth";
 
 describe("OpencodeClient", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
@@ -557,7 +558,7 @@ describe("OpencodeClient", () => {
     });
 
     it("throws on non-ok response", async () => {
-      fetchMock.mockResolvedValueOnce(new Response("not authorized", { status: 401 }));
+      fetchMock.mockResolvedValue(new Response("not authorized", { status: 401 }));
 
       const client = new OpencodeClient({
         baseUrl: "http://localhost:4320",
@@ -709,6 +710,152 @@ describe("OpencodeClient", () => {
       const client = new OpencodeClient({ baseUrl: "http://localhost:4096", fetchFn: fetchMock as unknown as typeof fetch });
 
       await expect(client.getSessionInfo("ses_abc")).rejects.toThrow(/missing id or directory/);
+    });
+  });
+
+  describe("authentication and 401 retry", () => {
+    const origEnv = process.env;
+
+    beforeEach(() => {
+      process.env = { ...origEnv };
+      delete process.env.OPENCODE_SERVER_PASSWORD;
+      delete process.env.OPENCODE_SERVER_PASSWORD_FILE;
+      delete process.env.OPENCODE_SERVER_USERNAME;
+      invalidateServeAuthHeader();
+    });
+
+    afterEach(() => {
+      process.env = origEnv;
+      invalidateServeAuthHeader();
+    });
+
+    it("omits Authorization header entirely when password is unset", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.healthCheck();
+
+      const callInit = fetchMock.mock.calls[0]![1];
+      expect(callInit.headers?.["Authorization"]).toBeUndefined();
+      expect(callInit.headers?.Authorization).toBeUndefined();
+    });
+
+    it("injects Authorization header when OPENCODE_SERVER_PASSWORD is set", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "testpassword";
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.healthCheck();
+
+      const expectedHeader = `Basic ${Buffer.from("opencode:testpassword").toString("base64")}`;
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/global/health",
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: expectedHeader,
+          }),
+        }),
+      );
+    });
+
+    it("preserves caller-supplied headers alongside Authorization", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "testpassword";
+      fetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "s1" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.createSession("/my/dir");
+
+      const expectedHeader = `Basic ${Buffer.from("opencode:testpassword").toString("base64")}`;
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "x-opencode-directory": "/my/dir",
+            Authorization: expectedHeader,
+          }),
+        }),
+      );
+    });
+
+    it("mcpStatus receives Authorization header when no directory is provided (conditional-spread path)", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "testpassword";
+      fetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.mcpStatus();
+
+      const expectedHeader = `Basic ${Buffer.from("opencode:testpassword").toString("base64")}`;
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/mcp",
+        expect.objectContaining({
+          method: "GET",
+          headers: expect.objectContaining({
+            Authorization: expectedHeader,
+          }),
+        }),
+      );
+    });
+
+    it("on 401 response: invalidates header, re-resolves, and retries request once", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "oldpassword";
+      const oldHeader = `Basic ${Buffer.from("opencode:oldpassword").toString("base64")}`;
+      const newHeader = `Basic ${Buffer.from("opencode:newpassword").toString("base64")}`;
+
+      fetchMock
+        .mockImplementationOnce(async (_url, init) => {
+          expect(init.headers.Authorization).toBe(oldHeader);
+          process.env.OPENCODE_SERVER_PASSWORD = "newpassword";
+          return new Response("unauthorized", { status: 401 });
+        })
+        .mockImplementationOnce(async (_url, init) => {
+          expect(init.headers.Authorization).toBe(newHeader);
+          return new Response(null, { status: 200 });
+        });
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const ok = await client.healthCheck();
+
+      expect(ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does NOT retry a second time if the retry also returns 401", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "badpassword";
+      fetchMock.mockResolvedValue(new Response("unauthorized", { status: 401 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const ok = await client.healthCheck();
+
+      expect(ok).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
 });

@@ -1,3 +1,5 @@
+import { resolveServeAuthHeader, invalidateServeAuthHeader } from "../serve-auth";
+
 export interface RegistryOptions {
   baseUrl: string; // opencode serve base, e.g. http://127.0.0.1:4096
   ttlMs: number;
@@ -29,10 +31,22 @@ export class SessionDirectoryRegistry {
     const hit = this.cache.get(sessionId);
     if (hit && hit.expiresAt > now) return hit.directory;
 
+    const authHeader = resolveServeAuthHeader();
+    const headers: Record<string, string> = {};
+    if (authHeader) {
+      headers["Authorization"] = authHeader;
+    }
+
     const res = await this.fetchFn(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}`,
-      { method: "GET" },
+      {
+        method: "GET",
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      },
     );
+    if (res.status === 401) {
+      invalidateServeAuthHeader();
+    }
     if (!res.ok) {
       throw new Error(
         `session lookup failed: ${res.status} ${await res.text()}`,

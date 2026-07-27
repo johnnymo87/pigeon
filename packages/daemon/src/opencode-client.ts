@@ -1,4 +1,5 @@
 import { RequestTimeoutError, type OutcomeObservation } from "./routing/serve-outcome";
+import { resolveServeAuthHeader, invalidateServeAuthHeader } from "./serve-auth";
 
 interface OpencodeClientOptions {
   baseUrl: string;
@@ -62,33 +63,47 @@ export class OpencodeClient {
    * docs/plans/2026-07-27-serve-serviceability-design.md 5.1 C.
    */
   private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
-    try {
-      const response = await this.fetchFn(url, { ...init, signal: controller.signal });
-      this.observe({ status: response.status });
-      return response;
-    } catch (err) {
-      // Distinguish "we gave up" from "the network said no" -- an AbortError
-      // propagated raw is indistinguishable from a caller-initiated cancel.
-      //
-      // Typed (not a bare Error) so the outcome sensor can exclude timeouts by
-      // CLASS rather than by matching the message; the message itself is
-      // unchanged so existing string-matching consumers still work. Timeouts
-      // must never count toward a serve-health verdict — a busy serve delays
-      // even a cheap accept (design 5.1 C).
-      if (controller.signal.aborted) {
-        const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
-        this.observe({ error: timeout });
-        throw timeout;
+    const buildHeaders = (): Record<string, string> => {
+      const authHeader = resolveServeAuthHeader();
+      const authObj: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
+      const callerHeaders = (init.headers as Record<string, string> | undefined) ?? {};
+      return {
+        ...authObj,
+        ...callerHeaders,
+      };
+    };
+
+    const execFetch = async (): Promise<Response> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      try {
+        const response = await this.fetchFn(url, {
+          ...init,
+          headers: buildHeaders(),
+          signal: controller.signal,
+        });
+        return response;
+      } catch (err) {
+        if (controller.signal.aborted) {
+          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          this.observe({ error: timeout });
+          throw timeout;
+        }
+        this.observe({ error: err as Error });
+        throw err;
+      } finally {
+        clearTimeout(timer);
       }
-      this.observe({ error: err });
-      throw err;
-    } finally {
-      // Unconditional: a leaked timer keeps the daemon's event loop referenced
-      // once per request, and this client is used on every swarm delivery.
-      clearTimeout(timer);
+    };
+
+    let res = await execFetch();
+    if (res.status === 401) {
+      invalidateServeAuthHeader();
+      res = await execFetch();
     }
+
+    this.observe({ status: res.status });
+    return res;
   }
 
   async healthCheck(): Promise<boolean> {

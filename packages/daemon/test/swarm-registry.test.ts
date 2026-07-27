@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { SessionDirectoryRegistry } from "../src/swarm/registry";
+import { invalidateServeAuthHeader } from "../src/serve-auth";
 
 function fakeFetch(responses: Array<Response | Error>) {
   let i = 0;
@@ -89,5 +90,69 @@ describe("SessionDirectoryRegistry", () => {
     expect(await reg.resolve("ses_a")).toBe("/a");
     reg.invalidate("ses_a");
     expect(await reg.resolve("ses_a")).toBe("/b");
+  });
+
+  describe("authentication", () => {
+    const origEnv = process.env;
+
+    beforeEach(() => {
+      process.env = { ...origEnv };
+      delete process.env.OPENCODE_SERVER_PASSWORD;
+      delete process.env.OPENCODE_SERVER_PASSWORD_FILE;
+      delete process.env.OPENCODE_SERVER_USERNAME;
+      invalidateServeAuthHeader();
+    });
+
+    afterEach(() => {
+      process.env = origEnv;
+      invalidateServeAuthHeader();
+    });
+
+    it("sends Authorization header when OPENCODE_SERVER_PASSWORD is set", async () => {
+      process.env.OPENCODE_SERVER_PASSWORD = "registrypass";
+      const fetchFn = fakeFetch([
+        new Response(JSON.stringify({ id: "ses_a", directory: "/home/dev/dir" }), {
+          status: 200,
+        }),
+      ]);
+      const reg = new SessionDirectoryRegistry({
+        baseUrl: "http://x",
+        ttlMs: 60_000,
+        fetchFn: fetchFn as unknown as typeof fetch,
+        nowFn: () => 1_000,
+      });
+
+      await reg.resolve("ses_a");
+
+      const expectedHeader = `Basic ${Buffer.from("opencode:registrypass").toString("base64")}`;
+      expect(fetchFn).toHaveBeenCalledWith(
+        "http://x/session/ses_a",
+        expect.objectContaining({
+          method: "GET",
+          headers: expect.objectContaining({
+            Authorization: expectedHeader,
+          }),
+        }),
+      );
+    });
+
+    it("omits Authorization header when OPENCODE_SERVER_PASSWORD is unset", async () => {
+      const fetchFn = fakeFetch([
+        new Response(JSON.stringify({ id: "ses_a", directory: "/home/dev/dir" }), {
+          status: 200,
+        }),
+      ]);
+      const reg = new SessionDirectoryRegistry({
+        baseUrl: "http://x",
+        ttlMs: 60_000,
+        fetchFn: fetchFn as unknown as typeof fetch,
+        nowFn: () => 1_000,
+      });
+
+      await reg.resolve("ses_a");
+
+      const callInit = fetchFn.mock.calls[0]![1];
+      expect((callInit as RequestInit).headers?.["Authorization" as keyof HeadersInit]).toBeUndefined();
+    });
   });
 });
