@@ -14,6 +14,7 @@ import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
 import { initRouteSchema } from "../routing/route-schema";
 import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMetaRepo } from "../routing/route-repo";
+import { initReassignmentSchema, ReassignmentEventRepo } from "../routing/reassignment-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -28,6 +29,8 @@ export interface StorageDb {
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
   meta: RoutingMetaRepo;
+  /** Dated log of serve reassignments — the flap detector's input (pigeon-f2a). */
+  reassignments: ReassignmentEventRepo;
 }
 
 export function openStorageDb(path: string): StorageDb {
@@ -40,6 +43,9 @@ export function openStorageDb(path: string): StorageDb {
   initSchema(db);
   initSwarmSchema(db);
   initRouteSchema(db);
+  // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
+  // whose digest the serve pool validates at startup. See reassignment-repo.ts.
+  initReassignmentSchema(db);
 
   return {
     db,
@@ -54,5 +60,6 @@ export function openStorageDb(path: string): StorageDb {
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),
     meta: new RoutingMetaRepo(db),
+    reassignments: new ReassignmentEventRepo(db),
   };
 }
