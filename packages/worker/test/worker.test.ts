@@ -4407,7 +4407,7 @@ describe("resolveMessageSession question notification parsing", () => {
       chat: { id: Number(chatId) },
       text: "my answer",
       reply_to_message: { message_id: 42 },
-    });
+    }, env);
     expect(r?.questionRequestId).toBe("req123");
   });
 
@@ -4418,7 +4418,7 @@ describe("resolveMessageSession question notification parsing", () => {
       chat: { id: Number(chatId) },
       text: "my answer",
       reply_to_message: { message_id: 43 },
-    });
+    }, env);
     expect(r?.questionRequestId).toBe("req123");
   });
 
@@ -4429,7 +4429,7 @@ describe("resolveMessageSession question notification parsing", () => {
       chat: { id: Number(chatId) },
       text: "my answer",
       reply_to_message: { message_id: 44 },
-    });
+    }, env);
     expect(r?.questionRequestId).toBe("req123");
   });
 
@@ -4440,7 +4440,7 @@ describe("resolveMessageSession question notification parsing", () => {
       chat: { id: Number(chatId) },
       text: "my answer",
       reply_to_message: { message_id: 45 },
-    });
+    }, env);
     expect(r?.questionRequestId).toBe("req#c12_suffix");
   });
 });

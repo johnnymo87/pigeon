@@ -301,31 +301,29 @@ async function answerCallbackQuery(
 }
 
 /**
- * Resolve a session from an incoming Telegram message.
- * Tries: (1) reply-to-message lookup, (2) /cmd TOKEN format.
+ * Resolve a session from an inbound Telegram message.
  * Returns { sessionId, command, questionRequestId? } or null if no session found.
  *
- * When the looked-up message has a notification_id starting with `q:`, the
- * requestId is extracted (format: `q:{sessionId}:{requestId}`) and returned as
- * questionRequestId so that swipe-replies to question notifications can be
- * identified by the daemon.
- */
-/**
- * Resolve a session from an inbound Telegram message.
- * Precedence:
- * 1. Swipe-reply (reply to a message mapped in `messages` table, unless it's a topic service reply)
- * 2. Topic membership (when TELEGRAM_TOPICS_ENABLED="true" and message_thread_id is set)
- * 3. /cmd TOKEN format
+ * Precedence, highest fidelity first:
+ * 1. Swipe-reply — a reply to a message tracked in the `messages` table, unless it is a
+ *    topic service reply (see the guard below).
+ * 2. Topic membership — when TELEGRAM_TOPICS_ENABLED is "true" and `message_thread_id` is set.
+ * 3. `/cmd TOKEN` format.
  *
  * When the looked-up message has a notification_id starting with `q:`, the
  * requestId is extracted (format: `q:{sessionId}:{requestId}`) and returned as
  * questionRequestId so that swipe-replies to question notifications can be
  * identified by the daemon.
+ *
+ * `env` is REQUIRED, deliberately. Making it optional would let a future call site omit it
+ * and silently disable topic routing on that path while still typechecking — the same class
+ * of half-wired-but-green failure this plan flags for T2.14. There is no caller that
+ * legitimately has no env.
  */
 async function resolveMessageSession(
   db: D1Database,
   message: TelegramMessage,
-  env?: { TELEGRAM_TOPICS_ENABLED?: string },
+  env: { TELEGRAM_TOPICS_ENABLED?: string },
 ): Promise<{ sessionId: string; command: string; questionRequestId?: string } | null> {
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
@@ -363,7 +361,7 @@ async function resolveMessageSession(
   // expires at 4h — is unreachable for topic-routed messages. The common case still works
   // because command-ingest.ts:129 checks pendingQuestions.getBySessionId before consulting
   // metadata. For questions older than 4 hours, swipe-reply remains the only reliable answer path.
-  if (env && topicsEnabled(env) && message.message_thread_id !== undefined) {
+  if (topicsEnabled(env) && message.message_thread_id !== undefined) {
     const topic = await getByThread(db, chatId, message.message_thread_id);
     if (topic) {
       return { sessionId: topic.session_id, command: text };
