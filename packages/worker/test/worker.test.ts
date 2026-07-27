@@ -50,6 +50,7 @@ import {
   generateCommandId,
   extractMedia,
   MAX_FILE_SIZE,
+  handleTelegramWebhook,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
@@ -7218,6 +7219,192 @@ describe("topics module and topicName", () => {
       expect(deleted).toBe(true);
     });
 
+  });
+
+  // ─── Task T2.15: Webhook confirmations echo message_thread_id ───────────────
+
+  describe("Task T2.15: Webhook confirmations echo message_thread_id", () => {
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    it("flag ON + thread id => confirmation carries message_thread_id", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t215_flag_on_${now}`;
+      const machineId = `mac_t215_flag_on_${now}`;
+      const threadId = 991501;
+      const notifMsgId = 99150100;
+
+      await registerSession(sessionId, machineId);
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: notifMsgId,
+        sessionId,
+        token: `token_t215_on_${now}`,
+      });
+      await touchMachine(env.DB, machineId, now);
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888111 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: notifMsgId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.message_thread_id).toBe(threadId);
+    });
+
+    it("flag OFF + thread id => NO message_thread_id on the wire", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t215_flag_off_${now}`;
+      const machineId = `mac_t215_flag_off_${now}`;
+      const threadId = 991502;
+      const notifMsgId = 99150200;
+
+      await registerSession(sessionId, machineId);
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: notifMsgId,
+        sessionId,
+        token: `token_t215_off_${now}`,
+      });
+      await touchMachine(env.DB, machineId, now);
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888112 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: notifMsgId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.message_thread_id).toBeUndefined();
+    });
+
+    it("an ERROR path in a topic carries the thread id", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const threadId = 991503;
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888113 } };
+        });
+
+      // Bare /kill in a topic without reply_to_message -> resolveReplySession error
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toBe("Reply to a session notification to use this command.");
+      expect(sentPayload.message_thread_id).toBe(threadId);
+    });
+
+    it("callback-query path threads via update.callback_query.message?.message_thread_id", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const sessionId = "ses_t215_cb_unique_4";
+      const threadId = 991504;
+      const token = "token_t215_cb_unique_4";
+      const msgId = 99150404;
+
+      // Insert message mapping but NO session in sessions table -> resolveSessionMachine sends "Session not found"
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: msgId,
+        sessionId,
+        token,
+      });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888114 } };
+        });
+
+      // Mock answerCallbackQuery
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/answerCallbackQuery/ })
+        .reply(200, { ok: true, result: true });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        callback_query: {
+          id: "cb_t215_4",
+          from: { id: CHAT_ID_NUM },
+          data: `cmd:${token}:yes`,
+          message: {
+            message_id: msgId,
+            chat: { id: CHAT_ID_NUM },
+            message_thread_id: threadId,
+          },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toBe("Session not found");
+      expect(sentPayload.message_thread_id).toBe(threadId);
+    });
   });
 });
 

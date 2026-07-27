@@ -247,7 +247,11 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 *Polish + migration:*
 
-- [ ] T2.15 Worker: webhook confirmations echo `message_thread_id`
+- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — pending commit. All 271 worker tests pass.
+  - Required 4th parameter `opts: { messageThreadId: number | undefined }` added to `sendTelegramMessage` (no default, structural enforcement) with centralized `topicsEnabled(env)` gate inside `sendTelegramMessage` so dark-ship flag-off equivalence is guaranteed in one place.
+  - Exactly 22 call sites of `sendTelegramMessage` updated across `webhook.ts`, plus `resolveSessionMachine` parameter extended to thread `messageThreadId` to its 2 callers (message path and callback-query path).
+  - All 4 test cases added to `worker.test.ts` and verified via regression injections (removing `topicsEnabled` gate failed flag-off test; removing thread id in `resolveReplySession` failed error path test; removing thread id in callback query path failed callback query test).
+  - **UX note for Checkpoint 2:** `/current-state`'s confirmation ("Fetching current state...") and errors go to the topic where typed, while its index and session cards go to General (decided at T2.12/T2.14).
 - [ ] T2.16 Worker: bare slash commands resolve via topic
 - [ ] T2.17 Docs: migration runbook + skill updates
 - [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
