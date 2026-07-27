@@ -10,6 +10,9 @@ describe("OpencodeClient", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    // Unconditional: a test that throws before its own useRealTimers() would
+    // otherwise leak fake timers into every subsequent test in this file.
+    vi.useRealTimers();
   });
 
   describe("healthCheck", () => {
@@ -128,6 +131,64 @@ describe("OpencodeClient", () => {
       await expect(client.sendPrompt("sess-abc", "/home/user/project", "Hello")).rejects.toThrow(
         "sendPrompt failed: 500 Internal Server Error",
       );
+    });
+
+    // pigeon-h21. A serve that ACCEPTS the connection but never responds used to
+    // leave this promise pending forever. The SwarmArbiter is at-most-one-in-flight
+    // per target and releases the slot in a `.finally()` (swarm/arbiter.ts:76-77),
+    // so a promise that never settles wedges ALL swarm delivery to that session --
+    // with no rejection to retry on and no failure to observe.
+    it("aborts and rejects when the serve accepts but never responds", async () => {
+      vi.useFakeTimers();
+
+      // Mimic real fetch: stay pending until the caller's AbortSignal fires.
+      // A stub that ignores the signal would hang here rather than fail, which is
+      // the point -- this test can only pass if sendPrompt actually wires one up.
+      const hangingFetch = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          }),
+      );
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: hangingFetch as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const pending = client.sendPrompt("sess-abc", "/home/user/project", "Hello");
+      // Assert rejection before advancing, so an unhandled rejection can't escape.
+      const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+
+    });
+
+    it("passes an AbortSignal to fetch and clears the timer on success", async () => {
+      vi.useFakeTimers();
+      const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      await client.sendPrompt("sess-abc", "/home/user/project", "Hello");
+
+      // Without this the abort would be unobservable to a stub that ignores signals.
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc/prompt_async",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      // A leaked timer would keep the daemon's event loop referenced per send.
+      expect(clearSpy).toHaveBeenCalled();
+
     });
   });
 
