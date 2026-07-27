@@ -272,7 +272,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     > (which this plan has twice refused to do, at T2.6 and T2.7) *and* making the wrapper stop discarding
     > `TgResult` across all 22 sites — a riskier change than T2.15 itself. Resolve item 3, then either
     > close `pigeon-cal` or mirror T2.8: on a non-429 failure with a thread id, retry once without it.
-- [x] T2.16 Worker: bare slash commands resolve via topic — `c68edae` (+ `TBDSHA` follow-up test). Worker 271 → **278**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
+- [x] T2.16 Worker: bare slash commands resolve via topic — `c68edae` (+ `ad1ec95` follow-up test). Worker 271 → **278**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
   - Extracted shared module-level `isTopicServiceReply(message: TelegramMessage): boolean` helper (with non-forum supergroup thread-root comment carried) used by both `resolveMessageSession` and `resolveReplySession`.
   - Rewrote `resolveReplySession` to 2 ordered attempts: Try 1 (swipe-reply, unless service reply) → Try 2 (topic membership, gated on `topicsEnabled(env)`). Falling through lets evicted swipe-replies still resolve via topic.
   - Failure message selection uses `triedReply` boolean flag so flag-off behavior is byte-identical: reply present & lookup misses ⇒ `"Could not find a session for that message."`; no reply ⇒ `"Reply to a session notification to use this command."`. Flag-on in topic ⇒ `"Could not find a session for this topic."`.
