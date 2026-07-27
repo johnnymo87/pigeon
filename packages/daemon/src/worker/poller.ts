@@ -33,6 +33,7 @@ export interface ExecuteMessage {
   sessionId: string;
   command: string;
   chatId: string;
+  messageThreadId?: number;
   media?: { key: string; mime: string; filename: string; size: number };
   metadata?: { questionRequestId?: string };
 }
@@ -43,6 +44,7 @@ export interface LaunchMessage {
   directory: string;
   prompt: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface KillMessage {
@@ -50,6 +52,7 @@ export interface KillMessage {
   commandType: "kill";
   sessionId: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface InterruptMessage {
@@ -57,6 +60,7 @@ export interface InterruptMessage {
   commandType: "interrupt";
   sessionId: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface CompactMessage {
@@ -64,6 +68,7 @@ export interface CompactMessage {
   commandType: "compact";
   sessionId: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface McpListMessage {
@@ -71,6 +76,7 @@ export interface McpListMessage {
   commandType: "mcp_list";
   sessionId: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface McpEnableMessage {
@@ -79,6 +85,7 @@ export interface McpEnableMessage {
   sessionId: string;
   chatId: string;
   serverName: string;
+  messageThreadId?: number;
 }
 
 export interface McpDisableMessage {
@@ -87,6 +94,7 @@ export interface McpDisableMessage {
   sessionId: string;
   chatId: string;
   serverName: string;
+  messageThreadId?: number;
 }
 
 export interface ModelListMessage {
@@ -94,6 +102,7 @@ export interface ModelListMessage {
   commandType: "model_list";
   sessionId: string;
   chatId: string;
+  messageThreadId?: number;
 }
 
 export interface ModelSetMessage {
@@ -102,12 +111,14 @@ export interface ModelSetMessage {
   sessionId: string;
   chatId: string;
   model: string;
+  messageThreadId?: number;
 }
 
 export interface CurrentStateMessage {
   commandId: string;
   commandType: "current_state";
   chatId: string;
+  messageThreadId?: number;
 }
 
 export type WorkerMessage =

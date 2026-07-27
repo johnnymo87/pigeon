@@ -416,6 +416,46 @@ describe("Poller start/stop", () => {
     expect(callsAfterStop).toBe(callsBeforeStop);
   });
 
+  it("parses messageThreadId off poll response and passes it to callbacks for execute, launch, and mcp_list", async () => {
+    const callbacks = makeCallbacks();
+
+    // 1. Execute message with messageThreadId
+    const execMsg = { ...makeExecuteMsg(), messageThreadId: 101 };
+    const fetchFn1 = makeFetch([() => json200(execMsg), () => ackOk()]);
+    const poller1 = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn1 });
+    poller1.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callbacks.onCommand).toHaveBeenCalledWith(expect.objectContaining({
+      commandType: "execute",
+      messageThreadId: 101,
+    }));
+    poller1.stop();
+
+    // 2. Launch message with messageThreadId
+    const launchMsg = { ...makeLaunchMsg(), messageThreadId: 102 };
+    const fetchFn2 = makeFetch([() => json200(launchMsg), () => ackOk()]);
+    const poller2 = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn2 });
+    poller2.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callbacks.onLaunch).toHaveBeenCalledWith(expect.objectContaining({
+      commandType: "launch",
+      messageThreadId: 102,
+    }));
+    poller2.stop();
+
+    // 3. McpList message with messageThreadId
+    const mcpMsg = { ...makeMcpListMsg(), messageThreadId: 103 };
+    const fetchFn3 = makeFetch([() => json200(mcpMsg), () => ackOk()]);
+    const poller3 = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn3 });
+    poller3.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callbacks.onMcpList).toHaveBeenCalledWith(expect.objectContaining({
+      commandType: "mcp_list",
+      messageThreadId: 103,
+    }));
+    poller3.stop();
+  });
+
   it("prevents overlapping polls", async () => {
     const resolvers: Array<() => void> = [];
     let pollCallCount = 0;

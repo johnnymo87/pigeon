@@ -24,6 +24,7 @@ import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { ingestCurrentStateCommand, buildCardNotification } from "./worker/current-state-ingest";
+import { createTelegramReplySender } from "./worker/reply-factory";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
@@ -78,13 +79,20 @@ const clientFactory = ingressRouter ? new OpencodeClientFactory(ingressRouter) :
 const clientForSession = (sessionId: string): OpencodeClient | undefined =>
   clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
 
-async function sendTelegramMessage(chatId: string, text: string, entities?: TgEntity[]): Promise<void> {
+async function sendTelegramMessage(
+  chatId: string,
+  text: string,
+  opts: { entities?: TgEntity[]; messageThreadId: number | undefined },
+): Promise<void> {
   if (!config.telegramBotToken) return;
   try {
     const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
     const payload: Record<string, unknown> = { chat_id: chatId, text };
-    if (entities && entities.length > 0) {
-      payload.entities = entities;
+    if (opts.entities && opts.entities.length > 0) {
+      payload.entities = opts.entities;
+    }
+    if (opts.messageThreadId !== undefined) {
+      payload.message_thread_id = opts.messageThreadId;
     }
     const res = await fetch(`${apiBase}/sendMessage`, {
       method: "POST",
@@ -124,7 +132,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             editNotification: (nid, text, rm, entities) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }, entities as unknown[] | undefined),
             machineId: config.machineId,
             ...(client ? { opencodeClient: client } : {}),
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onLaunch: async (msg) => {
@@ -144,7 +152,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // the owner. Unconfigured pool => clientForSession returns the
             // serve-0 client, i.e. today's behavior.
             resolveOwnerClient: clientForSession,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onKill: async (msg) => {
@@ -159,7 +167,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onInterrupt: async (msg) => {
@@ -174,7 +182,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onCompact: async (msg) => {
@@ -189,7 +197,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onMcpList: async (msg) => {
@@ -198,7 +206,8 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
           await ingestMcpListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            directory, machineId: config.machineId, opencodeClient: client, sendTelegramReply: sendTelegramMessage,
+            directory, machineId: config.machineId, opencodeClient: client,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onMcpEnable: async (msg) => {
@@ -208,7 +217,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestMcpEnableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onMcpDisable: async (msg) => {
@@ -218,7 +227,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestMcpDisableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: sendTelegramMessage,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
         onModelList: async (msg) => {
@@ -226,7 +235,8 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           if (!client) { console.warn(`[index] onModelList: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           await ingestModelListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
-            machineId: config.machineId, opencodeClient: client, sendTelegramReply: sendTelegramMessage,
+            machineId: config.machineId, opencodeClient: client,
+            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
             allowedProviders: config.allowedProviders,
           });
         },
@@ -236,7 +246,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestModelSetCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             model: msg.model, machineId: config.machineId, opencodeClient: client,
-            storage, sendTelegramReply: sendTelegramMessage,
+            storage, sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
             allowedProviders: config.allowedProviders,
           });
         },
@@ -266,7 +276,8 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
                     throw new Error("sendNotification returned ok=false");
                   }
                 }),
-            sendPlainText: (text, entities) => sendTelegramMessage(msg.chatId, text, entities),
+            // /current-state index is a machine-wide summary sent to General
+            sendPlainText: (text, entities) => sendTelegramMessage(msg.chatId, text, { entities, messageThreadId: undefined }),
           });
         },
       },
