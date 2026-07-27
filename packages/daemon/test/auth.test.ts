@@ -61,7 +61,11 @@ describe("Daemon Auth", () => {
       const res = await app(req);
       expect(res.status).toBe(401);
       const body = await res.json();
-      expect(body).toEqual({ error: "unauthorized" });
+      expect(body.error).toBe("unauthorized");
+      // The hint is the actionable half: it must name the token path and the
+      // stale-client cause, or it is not doing its job.
+      expect(body.hint).toContain("/run/secrets/pigeon_daemon_auth_token");
+      expect(body.hint).toContain("restarted");
     }
   });
 
@@ -127,7 +131,7 @@ describe("Daemon Auth", () => {
     const app = newApp("secret");
     const response = await app(new Request("http://localhost/sessions"));
     expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "unauthorized" });
+    expect((await response.json()).error).toBe("unauthorized");
   });
 
   it("8. Unmatched/unknown path behavior when token set: missing bearer -> 401; correct bearer -> 404", async () => {
