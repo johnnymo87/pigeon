@@ -55,7 +55,7 @@ After deploying and restarting OpenCode:
 
 ```bash
 # Check daemon sessions for backend_kind
-curl -s http://127.0.0.1:4731/sessions | jq '.sessions[] | {session_id, backend_kind, backend_endpoint}'
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/sessions | jq '.sessions[] | {session_id, backend_kind, backend_endpoint}'
 
 # Expect to see:
 # {

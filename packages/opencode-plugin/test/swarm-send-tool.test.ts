@@ -1,4 +1,8 @@
 import { describe, expect, test } from "vitest"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import * as os from "node:os"
+import { invalidateDaemonToken } from "../src/auth-token"
 import {
   swarmSend,
   formatSendResult,
@@ -175,6 +179,80 @@ describe("swarmSend (pure helper)", () => {
       { to: "ses_target", message: "hi" },
     )
     expect(headersOf(noTok.seen[0]!)["Authorization"]).toBeUndefined()
+  })
+
+  test("reads token from secret file when env is unset", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-swarmsend-test-"))
+    const secretPath = path.join(tmpDir, "token")
+    fs.writeFileSync(secretPath, "file-token-789", "utf8")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const fileTok = capturingFetch(() => ok202())
+    try {
+      await swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn: fileTok.fetchFn,
+        },
+        { to: "ses_target", message: "hi" },
+      )
+      expect(headersOf(fileTok.seen[0]!)["Authorization"]).toBe("Bearer file-token-789")
+    } finally {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  test("invalidates token and retries on 401 response", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-swarmsend-test2-"))
+    const secretPath = path.join(tmpDir, "token")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const seenHeaders: Array<Record<string, string>> = []
+    let callCount = 0
+
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++
+      const headers = (init?.headers as Record<string, string>) ?? {}
+      seenHeaders.push({ ...headers })
+
+      if (callCount === 1) {
+        fs.writeFileSync(secretPath, "late-arriving-token", "utf8")
+        return status(401, "Unauthorized")
+      }
+      return ok202("msg_retry_ok")
+    }) as typeof fetch
+
+    try {
+      const result = await swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn,
+          sleepFn: noSleep,
+        },
+        { to: "ses_target", message: "hi" },
+      )
+
+      expect(callCount).toBe(2)
+      expect(result.msg_id).toBe("msg_retry_ok")
+      expect(seenHeaders[0]["Authorization"]).toBeUndefined()
+      expect(seenHeaders[1]["Authorization"]).toBe("Bearer late-arriving-token")
+    } finally {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
   })
 
   test("throws with status + body when the daemon rejects the payload (400 close tag)", async () => {

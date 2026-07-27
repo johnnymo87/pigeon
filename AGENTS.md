@@ -13,9 +13,9 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - Daemon package path: `packages/daemon`
 - OpenCode plugin package path: `packages/opencode-plugin`
 - Worker health (deployed): `curl https://ccr-router.jonathan-mohrbacher.workers.dev/health`
-- Daemon health (local): `curl http://127.0.0.1:4731/health`
+- Daemon health (local): `curl http://127.0.0.1:4731/health` (anonymous by design)
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
-- Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
+- Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
 - Deploy daemon/plugin: `git pull && npm install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
 

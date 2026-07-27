@@ -86,17 +86,16 @@ message lands on the target's serve and not the other, plus failover).
 | `PIGEON_IDLE_MIGRATE_MS` | `60000` | A pinned session migrates to its HRW target only after this idle gap. |
 | `PIGEON_DORMANT_TTL_MS` | `300000` | Stickiness sweep TTL. |
 | `PIGEON_BIND_HOST` | `127.0.0.1` | Daemon HTTP bind host (was previously all-interfaces). |
-| `PIGEON_DAEMON_AUTH_TOKEN` | unset | If set, mutating (POST/DELETE) + `GET /route` routes require `Authorization: Bearer <token>`. **Unset ⇒ no enforcement (back-compat).** |
+| `PIGEON_DAEMON_AUTH_TOKEN` | unset | If set, ALL routes except `GET /health` require `Authorization: Bearer <token>`. **Unset ⇒ no enforcement (back-compat).** |
 
 ## Auth rollout note (IMPORTANT)
 
-Auth is **enforce-when-configured**. When `PIGEON_DAEMON_AUTH_TOKEN` is set (a
-future, Nix/sops-coordinated step), EVERY daemon client must send the bearer:
-- the opencode plugin already does (`daemon-client.ts` `daemonHeaders()`),
-- but the external **`pigeon-send` CLI** (the `/swarm/send` producer) and any other
-  daemon callers (reset-workspace, current-state tooling) must be updated in the
-  SAME change, or their requests will `401`.
-`GET` reads (`/health`, `/sessions`, `/swarm/inbox`) are intentionally unprotected.
+Auth is **enforce-when-configured** (deny-by-default). When `PIGEON_DAEMON_AUTH_TOKEN` is set,
+EVERY daemon client must send the bearer token:
+- the opencode plugin (`daemon-client.ts` `daemonHeaders()`),
+- the `pigeon-send` CLI, workstation tooling, reset-workspace, and current-state tooling.
+All daemon clients have been patched to transmit `PIGEON_DAEMON_AUTH_TOKEN`.
+Only `GET /health` remains in the anonymous allowlist for liveness probing.
 
 ## Design decisions (locked)
 

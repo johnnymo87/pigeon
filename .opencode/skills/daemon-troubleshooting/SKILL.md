@@ -28,6 +28,8 @@ curl -s http://127.0.0.1:4731/health
 
 - service up but no worker flow
   - missing/invalid `CCR_API_KEY`, `CCR_WORKER_URL`, or `CCR_MACHINE_ID`
+- unexpected 401 response from :4731
+  - caller is not sending the bearer token (`Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)`), NOT that the daemon is broken (except `/health`, all daemon routes require auth when token is set)
 - stop notifications not sent
     - notifier configuration missing or sops secret decryption failure
 - reply commands not injected
@@ -66,7 +68,7 @@ curl -s http://127.0.0.1:4731/health
 
 - **Check `nvim_socket` is set on session:**
   ```bash
-  curl -s http://127.0.0.1:4731/sessions | jq '.[] | {id, nvim_socket}'
+  curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/sessions | jq '.[] | {id, nvim_socket}'
   ```
 - **Check pigeon.lua is loaded in nvim:**
   ```bash
