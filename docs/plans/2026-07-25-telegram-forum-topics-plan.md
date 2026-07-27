@@ -1123,8 +1123,23 @@ schema, it **triplicates** it. There are three independent hardcoded DDL arrays,
 have been speculative scope. **That is safe for T2.1 and NOT safe for T2.14**, which adds a column to `commands` —
 a table the poll tests very much do use. See the warning added at T2.14.
 
-The general hazard: update one array and miss another, and the suite passes locally against a schema production
-does not have. Any future D1 change must check all three.
+**CORRECTED AT T2.14a — the hazard is real but the mechanism is the opposite of what is written above.**
+All three arrays use `CREATE TABLE IF NOT EXISTS`, the pool runs `isolatedStorage: false, singleWorker: true`
+(one shared D1 for the whole file), and **`d1SchemaStatements` executes in a top-level `beforeAll`** (`:138`)
+— i.e. before any `describe`. So by the time `schemaStatements` (`:2992`) and `pollSchemaStatements` (`:3602`)
+run, the tables already exist and **their DDL is silently skipped**. For any table `d1SchemaStatements` defines,
+the other two arrays are decorative.
+
+Proven both directions at T2.14a: removing `commands.message_thread_id` from `pollSchemaStatements` alone
+changed nothing (259/259 still passed), while removing it from `d1SchemaStatements` alone produced
+`D1_ERROR: no such column: message_thread_id` across many tests.
+
+So: **`d1SchemaStatements` is the load-bearing array.** Keep all three in sync anyway — they would matter if
+a describe ever ran standalone, and drift is confusing — but do not expect the 2nd or 3rd to catch a mistake,
+and **do not treat "the poll tests pass" as evidence that `pollSchemaStatements` is correct.**
+
+The original hazard still stands in its true form: the arrays do not read `d1-schema.sql`, so the **suite can
+pass against a schema production does not have**. Only applying the DDL to production D1 closes that gap.
 
 ```sql
 CREATE TABLE IF NOT EXISTS topics (
@@ -1446,9 +1461,11 @@ if (message.reply_to_message && !isTopicServiceReply) {
 **Files:**
 > **⚠️ Three schema arrays, and this task needs at least two of them.** `worker.test.ts` hardcodes the DDL in
 > `d1SchemaStatements` (`:44`), `schemaStatements` (`:2526`), and `pollSchemaStatements` (`:3155`) — see the
-> corrected trap note at T2.1. T2.14 adds `commands.message_thread_id`, and `pollSchemaStatements` is the array
-> backing the **poll and ack** tests, i.e. exactly the code path this task changes. Miss it and
-> `pollNextCommand`'s SELECT references a column the test DB lacks. Grep all three before you finish.
+> corrected trap note at T2.1. T2.14 adds `commands.message_thread_id`. **Superseded by the T2.14a finding:**
+> missing `pollSchemaStatements` is in fact harmless, because `d1SchemaStatements` already created `commands`
+> in a top-level `beforeAll` and every array uses `IF NOT EXISTS`. The array that actually matters is
+> `d1SchemaStatements`. Update all three regardless, but the real gap this task must close is the
+> **production** `ALTER TABLE`, which no test can catch.
 
 **Files:**
 - Worker: `src/d1-schema.sql` + **all three** `test/worker.test.ts` schema arrays as applicable; `src/d1-ops.ts:60-80` (`queueCommand` INSERT) and `:119-131` (`pollNextCommand` SELECT); `src/poll.ts:30-73` (the per-command-type response branches); `src/webhook.ts` (populate from the inbound message)
