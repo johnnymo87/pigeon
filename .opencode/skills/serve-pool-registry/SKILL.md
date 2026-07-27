@@ -161,10 +161,17 @@ what's already been falsified, verification receipts). The design doc is
 `docs/plans/2026-07-27-serve-serviceability-design.md`, whose **§5.1 holds five
 binding amendments** — do not implement from §1–5 alone.
 
+**Do not edit `ROUTING_DDL`.** The pool validates `routing_meta.ddl_checksum`
+against a constant compiled into opencode-patched, so a one-character change
+crash-loops every serve until a lockstep release lands. A table in its own DDL
+string is free. `packages/daemon/test/routing/route-schema.test.ts` pins the digest
+and will fail at desk rather than at 3am; read its header before making it green.
+
 | Bead | |
 |---|---|
 | `pigeon-u1u` | **EPIC** — serve serviceability arc. Read first. |
-| `pigeon-f2a` | increment 1 — flap alerting + shadow-mode sensor. The only ready child. |
+| `pigeon-f2a` | increment 1 — flap alerting + shadow sensor. **Shipped** (`ae85c1e`, `0af52b0`). |
+| `pigeon-u1u.3` | increment 1.5 — **calibrate thresholds from a week of shadow data.** Next up; blocks 886. |
 | `pigeon-886` | increment 2 — the liveness/serviceability decoupling itself. |
 | `pigeon-u1u.1` | increment 2.5 — frontdoor outcome hints. |
 | `pigeon-u1u.2` | increment 3 — real readiness endpoint. Deliberately last. |
