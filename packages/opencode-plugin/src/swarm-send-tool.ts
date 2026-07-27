@@ -15,6 +15,7 @@
 
 import { randomUUID } from "node:crypto"
 import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+import { resolveDaemonToken, invalidateDaemonToken } from "./auth-token"
 
 /**
  * Registration name for the swarm send tool. Must satisfy Anthropic's
@@ -129,10 +130,11 @@ export async function swarmSend(
   const kind = args.kind ?? "chat"
   const priority = args.priority ?? "normal"
 
+  const token = opts.authToken ?? resolveDaemonToken()
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
-  if (opts.authToken) headers["Authorization"] = `Bearer ${opts.authToken}`
+  if (token) headers["Authorization"] = `Bearer ${token}`
 
   const body: Record<string, unknown> = {
     from: opts.sessionId,
@@ -146,6 +148,7 @@ export async function swarmSend(
   const bodyJson = JSON.stringify(body)
 
   let lastError: Error | undefined
+  let authRetried = false
 
   for (let attempt = 1; attempt <= SWARM_SEND_MAX_ATTEMPTS; attempt++) {
     const isLast = attempt === SWARM_SEND_MAX_ATTEMPTS
@@ -176,6 +179,31 @@ export async function swarmSend(
     }
 
     const text = await res.text().catch(() => "")
+
+    if (res.status === 401 && !authRetried) {
+      authRetried = true
+      invalidateDaemonToken()
+      const retryToken = opts.authToken ?? resolveDaemonToken()
+      if (retryToken) {
+        headers["Authorization"] = `Bearer ${retryToken}`
+      } else {
+        delete headers["Authorization"]
+      }
+      try {
+        res = await fetchFn(url.toString(), {
+          method: "POST",
+          headers,
+          body: bodyJson,
+        })
+        if (res.ok) {
+          const data = (await res.json()) as { accepted: boolean; msg_id: string }
+          return { msg_id: data.msg_id, to: args.to, kind, priority, attempts: attempt }
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err))
+      }
+    }
+
     if (isTransientStatus(res.status)) {
       lastError = new Error(`swarm_send failed: ${res.status} ${text}`)
       if (isLast) {
@@ -265,7 +293,7 @@ export function createSwarmSendTool(daemonBaseUrl: string): ToolDefinition {
         {
           daemonBaseUrl,
           sessionId: ctx.sessionID,
-          authToken: process.env.PIGEON_DAEMON_AUTH_TOKEN?.trim() || undefined,
+          authToken: resolveDaemonToken(),
         },
         {
           to: args.to,

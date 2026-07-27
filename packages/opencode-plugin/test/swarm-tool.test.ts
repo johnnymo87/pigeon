@@ -1,5 +1,9 @@
 import { describe, expect, test, beforeEach, afterEach } from "vitest"
 import * as http from "node:http"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import * as os from "node:os"
+import { invalidateDaemonToken } from "../src/auth-token"
 import {
   swarmRead,
   formatInbox,
@@ -183,6 +187,50 @@ describe("swarmRead (pure helper)", () => {
       ])
     } finally {
       server.close()
+    }
+  })
+
+  test("sends Authorization header when token exists and retries on 401", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-swarmread-test-"))
+    const secretPath = path.join(tmpDir, "token")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const authHeaders: Array<string | null> = []
+    let callCount = 0
+
+    try {
+      const page = await swarmRead({
+        daemonBaseUrl: "http://daemon.test",
+        sessionId: "ses_target",
+        fetchFn: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          callCount++
+          const headers = new Headers(init?.headers)
+          authHeaders.push(headers.get("authorization"))
+
+          if (callCount === 1) {
+            // Secret file is created while server is returning 401
+            fs.writeFileSync(secretPath, "late-secret-token", "utf8")
+            return new Response("Unauthorized", { status: 401 })
+          }
+          return new Response(JSON.stringify({ messages: SAMPLE_MESSAGES }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }) as typeof fetch,
+      })
+
+      expect(page.messages).toEqual(SAMPLE_MESSAGES)
+      expect(callCount).toBe(2)
+      expect(authHeaders[0]).toBeNull() // First attempt had no token
+      expect(authHeaders[1]).toBe("Bearer late-secret-token") // Retry had token read from file
+    } finally {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
 })

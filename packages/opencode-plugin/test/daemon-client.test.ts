@@ -1,5 +1,9 @@
 import { describe, expect, test, beforeEach, afterEach } from "vitest"
 import * as http from "node:http"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import * as os from "node:os"
+import { invalidateDaemonToken } from "../src/auth-token"
 import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
@@ -841,6 +845,56 @@ describe("daemon-client", () => {
 
       expect(requestLog).toHaveLength(1)
       expect("title" in (requestLog[0]?.body ?? {})).toBe(false)
+    })
+  })
+
+  describe("auth token resolution and 401 retry", () => {
+    test("sends Authorization header when env or file token present, retries on 401", async () => {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-daemon-test-"))
+      const secretPath = path.join(tmpDir, "token")
+      process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+      const seenAuthHeaders: Array<string | null> = []
+      let attempts = 0
+
+      server?.close()
+      server = await createTestServer(async (req) => {
+        attempts++
+        seenAuthHeaders.push(req.headers.get("authorization"))
+        if (attempts === 1) {
+          // On first call, secret file arrives and server returns 401
+          fs.writeFileSync(secretPath, "daemon-secret-file-token", "utf8")
+          return new Response("Unauthorized", { status: 401 })
+        }
+        return Response.json({ ok: true, notified: true })
+      })
+      serverPort = server.port
+
+      const opts = {
+        sessionId: "test-session-auth",
+        cwd: "/home/user",
+        label: "Test Auth",
+        pid: 1,
+        ppid: 0,
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      try {
+        const res = await registerSession(opts)
+        expect(res).toEqual({ ok: true, notified: true })
+        expect(attempts).toBe(2)
+        expect(seenAuthHeaders[0]).toBeNull() // First request had no auth header
+        expect(seenAuthHeaders[1]).toBe("Bearer daemon-secret-file-token") // Retried request sent token read from secret file
+      } finally {
+        delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+        invalidateDaemonToken()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+      }
     })
   })
 })
