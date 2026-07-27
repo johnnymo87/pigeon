@@ -247,11 +247,31 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 *Polish + migration:*
 
-- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — `a7ccb24`. All 271 worker tests pass.
+- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — `a7ccb24` (+ `00d9159` docs). Worker 267 → **271**; daemon 682+1 and plugin 290 unchanged; typecheck clean modulo the 4 known `lease-cas` errors.
   - Required 4th parameter `opts: { messageThreadId: number | undefined }` added to `sendTelegramMessage` (no default, structural enforcement) with centralized `topicsEnabled(env)` gate inside `sendTelegramMessage` so dark-ship flag-off equivalence is guaranteed in one place.
   - Exactly 22 call sites of `sendTelegramMessage` updated across `webhook.ts`, plus `resolveSessionMachine` parameter extended to thread `messageThreadId` to its 2 callers (message path and callback-query path).
   - All 4 test cases added to `worker.test.ts` and verified via regression injections (removing `topicsEnabled` gate failed flag-off test; removing thread id in `resolveReplySession` failed error path test; removing thread id in callback query path failed callback query test).
-  - **UX note for Checkpoint 2:** `/current-state`'s confirmation ("Fetching current state...") and errors go to the topic where typed, while its index and session cards go to General (decided at T2.12/T2.14).
+  - **UX note for Checkpoint 2:** `/current-state`'s confirmation ("Fetching current state...") and errors go to the topic where typed, while its index and session cards go to General (decided at T2.12/T2.14). The error case is what forces it: "cloudbox is not recently seen" is useless in General when the user is looking at a topic. It is a UX judgement, not a correctness one.
+  - **Verified independently rather than taken on report:** all 22 call sites were read to confirm none satisfies the new required parameter with a hardcoded `undefined` — the obvious way to make a required-param fence compile while leaving the feature half-wired. The seven shorthand `{ messageThreadId }` sites bind to real sources (`resolveSessionMachine`'s new required 6th param; `queueCommand`'s destructured `opts.messageThreadId`; `resolveReplySession`'s `message.message_thread_id`). `answerCallbackQuery` is correctly untouched — callback answers are ephemeral popups with no thread. I also re-ran the gate injection myself: removing `topicsEnabled(env)` fails **exactly one** test.
+  - **That "exactly one" is worth stating plainly, because T2.5 set a different precedent.** There, breaking the gate failed 19 pre-existing tests, and that breadth was the real evidence of flag-off equivalence. Here no pre-existing test sets an inbound `message_thread_id`, so none of them can detect this change either way. **T2.15's entire flag-off guarantee rests on one assertion.** That is adequate only because `sendTelegramMessage` is the sole path to the wire; a future call site that reaches for `tg.sendMessage` directly would escape the gate with nothing failing.
+  - > **⚠️ COMPOSITION-LEVEL GAP FOUND AT THIS TASK — bead `pigeon-cal` (P1), deliberately NOT fixed here.**
+    > Chain across three tasks, which is why no single task's tests cover it: T2.10 closes a topic when the
+    > session unregisters → T2.13 routes a message typed in a closed topic to that session *regardless of
+    > row state, by design* → T2.15 now sends the confirmation to that closed thread → `webhook.ts`'s
+    > `sendTelegramMessage` **discards the `TgResult`** (deliberate and pre-existing), and `telegram.ts`'s
+    > `sendMessage` **returns** a result rather than throwing. So a rejected send vanishes with no
+    > exception, no log, and no fallback.
+    >
+    > The notification path is fully defended here — T2.6 reopen, T2.7 `thread_not_found` recovery, T2.8
+    > General fallback. **Webhook confirmations have none of it.** And the messages that vanish are the
+    > *error* messages, so this is `pigeon-1xt`'s "invisible at the point of failure" reintroduced by a
+    > different mechanism, inside the very task meant to cure it.
+    >
+    > **Whether it bites at all depends on `pigeon-cev` item 3** — can a bot admin post into a *closed*
+    > topic? If yes, this is a non-issue. Not fixed now because fixing means guessing a Telegram behaviour
+    > (which this plan has twice refused to do, at T2.6 and T2.7) *and* making the wrapper stop discarding
+    > `TgResult` across all 22 sites — a riskier change than T2.15 itself. Resolve item 3, then either
+    > close `pigeon-cal` or mirror T2.8: on a non-429 failure with a thread id, retry once without it.
 - [ ] T2.16 Worker: bare slash commands resolve via topic
 - [ ] T2.17 Docs: migration runbook + skill updates
 - [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
@@ -1138,7 +1158,7 @@ the LIVE production daemon from its source and is the live routing DB's home
 > To exercise the poll path by hand, **poll a non-existent probe machine id**. A real poll *leases* the
 > command it returns and would steal it from the live daemon.
 
-**Beads gating the flag flip — all four must be settled before `TELEGRAM_TOPICS_ENABLED` goes to `"true"`:**
+**Beads gating the flag flip — all five must be settled before `TELEGRAM_TOPICS_ENABLED` goes to `"true"`:**
 - `pigeon-cev` (P1) — four questions only LIVE Telegram can answer: the `[vars]` deploy-revert trap; the
   unverified `thread_not_found` string; whether a bot can post into a closed topic; what Telegram returns
   when you reopen an already-open topic (this last one underpins the F1 fix).
@@ -1147,6 +1167,8 @@ the LIVE production daemon from its source and is the live routing DB's home
   message goes to General, where the user is not looking. This is the feature's flagship interaction.
 - `pigeon-5o7` (P2) — scope `deleteTopicBySession` to the thread id; safe today only because the daemon's
   `fetch` has no timeout, so an obviously-reasonable future change silently breaks it.
+- `pigeon-cal` (P1) — webhook confirmations have no General fallback, so an ack or error sent into a
+  closed topic vanishes silently. **Decided by `pigeon-cev` item 3**; see the ⚠️ block at T2.15.
 - `pigeon-wly` (P3) — reap-loop generic failures pin head-of-line slots (accepted residual).
 
 **Also still outstanding:** one manual swipe-reply command in the production Telegram DM, which both
