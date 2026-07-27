@@ -75,17 +75,24 @@ npm run test         # all workspaces
 npm run typecheck    # all workspaces
 ```
 
-**CURRENT baseline — commit `084db4b`, post-Checkpoint-2a** — measure regressions against this:
+**CURRENT baseline — post-Checkpoint-2b, 2026-07-27** — measure regressions against this:
 
 | Package | Test files | Tests |
 |---|---|---|
-| `@pigeon/daemon` | 49 | **674** passed, 1 skipped |
-| `@pigeon/opencode-plugin` | 13 | **279** passed |
-| `@pigeon/worker` | 1 | **231** passed |
+| `@pigeon/daemon` | 50 | **682** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | 14 | **290** passed |
+| `@pigeon/worker` | 1 | **267** passed |
 
-The daemon jumped 650 → 674 across a 48 → 49 file change because the **registry-fencing work landed on
-`main` mid-phase** and was merged in at Checkpoint 2a (`endpoint-reconciler.ts` and its 489-line test file).
-That work is unrelated to this plan; don't attribute those tests to it.
+Total **1239**. Two unrelated workstreams landed on `main` mid-phase and inflate these counts — do not
+attribute their tests to this plan: the **registry-fencing** work (`endpoint-reconciler.ts`, merged at
+Checkpoint 2a) and the **dx8p daemon-auth** work (deny-by-default `checkAuth`, plugin `auth-token.ts`,
+merged as PR #7 at Checkpoint 2b). Both are fully integrated and green alongside this phase.
+
+<details><summary>Earlier Phase-2 baselines (historical)</summary>
+
+Post-Checkpoint-2a `084db4b`: daemon 49/674+1, plugin 13/279, worker 1/231.
+
+</details>
 
 <details><summary>Earlier baselines (historical)</summary>
 
@@ -1097,16 +1104,49 @@ chromebook) still need `git pull && npm install` + a daemon restart when conveni
 (`app.ts:94`, `session-state.ts:12`) is surrogate-blind. Fix the pattern *before* T2.3 clones it. Reuse the guard at
 `split-message.ts:176-180`. This is the single highest-value pre-Phase-2 action.
 
-**0. WHERE YOU ARE (updated at Checkpoint 2a, 2026-07-26).** Work happens in
-`~/projects/pigeon/.worktrees/forum-topics-phase2`, branch `feat/forum-topics-phase2`. `main` is
-fast-forwarded to it (`084db4b`) and the worker is **deployed dark**. Never work in
-`/home/dev/projects/pigeon` itself — that checkout runs the LIVE production daemon from its source, and it
-is also the live routing DB's home (`packages/daemon/data/pigeon-daemon.db`).
+**0. WHERE YOU ARE (rewritten at Checkpoint 2b, 2026-07-27).**
 
-**Beads gating the flag flip:** `pigeon-cev` (P1 — the `[vars]` deploy-revert trap, the unverified
-`thread_not_found` string, whether a bot can post into a closed topic) and `pigeon-5o7` (P2 — scope
-`deleteTopicBySession` to the thread id; currently safe only because the daemon's `fetch` has no timeout,
-so an obviously-reasonable future change silently breaks it).
+Work happens in `~/projects/pigeon/.worktrees/forum-topics-phase2`, branch `feat/forum-topics-phase2`.
+`main` is fast-forwarded to it. **Never work in `/home/dev/projects/pigeon` itself** — that checkout runs
+the LIVE production daemon from its source and is the live routing DB's home
+(`packages/daemon/data/pigeon-daemon.db`).
+
+**Phase 2 is 14/18 done, through Checkpoint 2b.** Remaining: T2.15, T2.16, T2.17, then Checkpoint 2
+(the actual supergroup migration). The worker is **deployed** at version `c790398a` with
+`TELEGRAM_TOPICS_ENABLED = "false"` — see the Checkpoint 2b entry for what was verified post-deploy.
+
+> **⚠️ IF YOUR WORKTREE IS MISSING, YOU HAVE NOT LOST ANYTHING — BUT READ THIS.**
+> A **nightly workspace reset at ~03:00 prunes worktrees.** This one was deleted mid-session on 2026-07-27.
+> Nothing was lost because every task had been committed and pushed, and it was recoverable with
+> `git worktree add .worktrees/forum-topics-phase2 feat/forum-topics-phase2` followed by
+> `git merge --ff-only origin/main`. **Anything uncommitted at 03:00 is gone.** Commit at every task
+> boundary, not at every session boundary. This is a sharper hazard than the shared-worktree rule, because
+> the destroyer is the clock rather than a peer.
+
+> **⚠️ THE DAEMON NOW REQUIRES A BEARER TOKEN (landed mid-phase, PR #7).**
+> `:4731` is deny-by-default; only `GET /health` is anonymous. Hand-curl with:
+> `-H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)"` (owner=dev, no sudo).
+> Note the daemon's `/swarm/send` body field is **`payload`**, not `message`.
+> **Any opencode session that started before the rollout has a stale in-memory plugin and its
+> `swarm_send` tool silently 401s** — use curl until the session restarts. Two sessions hit this.
+
+> **⚠️ THE WORKER USES `Authorization: Bearer <CCR_API_KEY>`, NOT `x-api-key`** (`worker/src/auth.ts:20-26`).
+> To exercise the poll path by hand, **poll a non-existent probe machine id**. A real poll *leases* the
+> command it returns and would steal it from the live daemon.
+
+**Beads gating the flag flip — all four must be settled before `TELEGRAM_TOPICS_ENABLED` goes to `"true"`:**
+- `pigeon-cev` (P1) — four questions only LIVE Telegram can answer: the `[vars]` deploy-revert trap; the
+  unverified `thread_not_found` string; whether a bot can post into a closed topic; what Telegram returns
+  when you reopen an already-open topic (this last one underpins the F1 fix).
+- `pigeon-4kb` (P1) — **T2.15 and T2.16 are blockers, not polish.** Until T2.16, every bare `/kill`,
+  `/interrupt`, `/compact`, `/mcp *`, `/model *` typed *inside a topic* fails; until T2.15 that failure
+  message goes to General, where the user is not looking. This is the feature's flagship interaction.
+- `pigeon-5o7` (P2) — scope `deleteTopicBySession` to the thread id; safe today only because the daemon's
+  `fetch` has no timeout, so an obviously-reasonable future change silently breaks it.
+- `pigeon-vga` (P3) — reap-loop generic failures pin head-of-line slots (accepted residual).
+
+**Also still outstanding:** one manual swipe-reply command in the production Telegram DM, which both
+adversarial reviews asked for. It needs a human with the phone.
 
 **2. Use a NEW worktree, and check for collisions.** *(Historical — that work landed on `main` and was merged in at Checkpoint 2a; kept because the discipline still applies.)* A sibling session was working in
 `~/projects/pigeon/.worktrees/registry-fencing` (branch `registry-fencing` off `main@328ecca`) on the serve-registry
