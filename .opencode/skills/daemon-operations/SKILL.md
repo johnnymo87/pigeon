@@ -77,6 +77,6 @@ If media isn't arriving in Telegram or OpenCode:
 Run health + one route smoke call:
 
 ```bash
-curl -s -X POST -H "Content-Type: application/json" http://127.0.0.1:4731/session-start --data '{"session_id":"ops-smoke","notify":false}'
-curl -s -X DELETE http://127.0.0.1:4731/sessions/ops-smoke
+curl -s -X POST -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" -H "Content-Type: application/json" http://127.0.0.1:4731/session-start --data '{"session_id":"ops-smoke","notify":false}'
+curl -s -X DELETE -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/sessions/ops-smoke
 ```

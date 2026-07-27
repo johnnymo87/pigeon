@@ -15,9 +15,10 @@ Use this for day-to-day swarm ops: health-check the routes, inspect the inbox, s
 # Daemon up + swarm routes responding
 curl -s http://127.0.0.1:4731/health
 curl -s -X POST http://127.0.0.1:4731/swarm/send \
+  -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" \
   -H 'content-type: application/json' -d '{}'
 # expect 400 {"error":"from is required"}, NOT 404 — proves /swarm/send route exists
-curl -s 'http://127.0.0.1:4731/swarm/inbox?session=does_not_exist'
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=does_not_exist'
 # expect {"messages":[]}
 ```
 
@@ -57,8 +58,8 @@ nix-shell -p sqlite --run \
 The inbox HTTP view (for verifying what a target session has actually received):
 
 ```bash
-curl -s 'http://127.0.0.1:4731/swarm/inbox?session=ses_X' | jq .
-curl -s 'http://127.0.0.1:4731/swarm/inbox?session=ses_X&since=msg_abc' | jq .
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ses_X' | jq .
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ses_X&since=msg_abc' | jq .
 ```
 
 ## Reading The Arbiter Log
@@ -175,7 +176,7 @@ SENTINEL="OPS-SMOKE-$(uuidgen | head -c 8)"
 # expect: "Queued msg_... -> ses_target ..."
 
 # Wait one arbiter tick, then:
-curl -s 'http://127.0.0.1:4731/swarm/inbox?session=ses_target' \
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ses_target' \
   | jq ".messages[] | select(.payload | contains(\"$SENTINEL\"))"
 # expect the message back, with handed_off_at set
 ```
@@ -203,7 +204,7 @@ nix-shell -p sqlite --run \
 
 ```bash
 curl -s http://127.0.0.1:4731/health
-curl -s 'http://127.0.0.1:4731/swarm/inbox?session=ops-smoke' | jq .
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ops-smoke' | jq .
 journalctl -u pigeon-daemon --no-pager -n 30 | grep -E 'swarm arbiter|listening on'
 ```
 
