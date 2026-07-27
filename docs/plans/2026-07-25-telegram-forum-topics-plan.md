@@ -340,6 +340,20 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
   - **F5 (MEDIUM, flag-on only) — recorded, not fixed.** `pigeon-cal` widened and retitled. Flipping the flag moves *all* traffic into one supergroup, where the bot is capped at ~20 msg/min. Notifications survive a 429 (worker 429 ⇒ outbox pauses/retries); webhook acks do not, because the wrapper discards `TgResult`. Same vanishing-ack symptom as the closed-topic case but a different trigger, and **`pigeon-cev` item 3 does not settle it.** One fix serves both.
   - **The reviewer's "21 call sites, not 22" nit was right, and so was I** — it was 22 at T2.15 and became 21 when T2.16 collapsed two error returns into one computed message. The artifact actually wrong was the docstring, which had drifted stale *again* (the exact bug T2.15 fixed). Corrected to 21 in `6c3a9d6`.
   - Declined: the `/cmd TOKEN` shadowing note (pre-existing T2.13 behaviour, reviewed twice, deliberate precedence).
+  - ### ✅ THE MANUAL DM SWIPE-REPLY CHECK IS DONE (2026-07-27) — the assumption HOLDS.
+    Three consecutive adversarial reviews asked for this. A swipe-reply of `/mcp list` to a session
+    notification in the production DM produced exactly one `commands` row:
+    `command_type=mcp_list`, `chat_id=8248645256`, **`message_thread_id=NULL`**, `status=acked`.
+    - **A private chat does NOT carry `message_thread_id`.** That is the single external fact the whole
+      flag-off path was resting on, and it is now measured rather than assumed.
+    - Observable without a flag flip because T2.14 stores the field **unconditionally** (`topicsEnabled`
+      appears zero times in `d1-ops.ts`), so production D1 records whatever Telegram actually sent. The
+      non-dark property that made T2.14 risky is what made it verifiable.
+    - `status=acked` also proves the full swipe-reply → queue → daemon → plugin round trip is healthy.
+    - **Scope note, stated so it is not over-claimed:** the deployed worker is `c790398a`, which predates
+      T2.15/T2.16. This measures **Telegram's behaviour**, not the new code, which is why it is valid
+      regardless of deployed version. And after the F2 fix the flag-off path no longer *depends* on this
+      fact — the guard is gated — so this is now belt-and-braces rather than load-bearing. Both are good.
   - **Remaining before the flip:** `pigeon-cev` (four live-Telegram questions), `pigeon-cal` (decided by `cev` item 3 for the closed-topic half; F5 needs its own call), `pigeon-5o7`, `pigeon-wly`, and the manual DM swipe-reply check. `pigeon-1xt` is **CLOSED** — T2.15 and T2.16 landed.
 
 ---
