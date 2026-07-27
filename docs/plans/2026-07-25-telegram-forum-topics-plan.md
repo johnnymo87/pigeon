@@ -144,7 +144,13 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
   - Assertions are strong where it matters: `sentThreadIds === [500, undefined]` proves the retry went to General, and on 429 `sendCalls === 1` / `sendMessageCalled === false` prove **no** General fallback call is made against the exhausted budget.
   - One pre-existing T2.7 assertion changed 502 → 200. Verified legitimate: T2.8 genuinely converts that outcome into a General fallback, and the test's actual purpose — `createTopicCalls === 1`, the at-most-once recreate — is preserved.
 - [x] T2.9 Worker: media sends pass `message_thread_id` — `bb9384b`. Worker 228 → **230**. `SendPhotoOptions`/`SendDocumentOptions` did **not** previously carry the field (the media methods predate T2.4a); added to both, appended to `FormData` when present, and threaded through `sendTelegramPhoto`/`sendTelegramDocument` and the media loop in `handleSendNotification`.
-- [~] **Checkpoint 2a** — test gate ✅ **daemon 650+1 / plugin 279 / worker 230 = 1159**, typecheck clean modulo the 4 known `lease-cas` errors. Fable adversarial review + dark deploy: in progress.
+- [x] **Checkpoint 2a** — COMPLETE, **deployed dark 2026-07-26**.
+  - Test gate ✅ daemon **674**+1 skipped / plugin **279** / worker **231** = **1184**; typecheck clean modulo the 4 known `lease-cas` errors.
+  - Fable adversarial review ✅ — verdict *"safe to deploy dark"*. It independently corroborated the flag-off proof, confirmed **no flag-off path touches the `topics` table**, and found one real bug (fixed, `4fa3e54`) plus two flip-gate items (beads below).
+  - **Production D1 DDL applied and verified directly** (not assumed): partial index `idx_topics_thread` accepted with its `WHERE` clause; two NULL-thread rows for one `chat_id` coexist — which the reservation protocol depends on; a duplicate non-NULL thread is rejected with `SQLITE_CONSTRAINT_UNIQUE`. Probe rows cleaned up.
+  - `origin/main` fast-forwarded to `4680aff` (this branch merged the registry-fencing work that landed on main mid-flight — no conflicts; I had never touched `daemon/src/index.ts`). Worker deployed, version `263be9c1-3ae8-4523-8aed-5c2930d5c841`, bindings confirm `TELEGRAM_TOPICS_ENABLED ("false")`. Worker + daemon health `ok`; `topics` row count **0**.
+  - > **⚠️ The dark burn-in gives ZERO signal about anything topic-related**, precisely because no flag-off path queries `topics`. The first evidence of a topic-side problem will be the first flag-on notification. Do not read a quiet burn-in as evidence the topic code works.
+
 
 *Lifecycle + inbound:*
 
