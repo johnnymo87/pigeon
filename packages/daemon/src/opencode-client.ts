@@ -1,8 +1,18 @@
+import { RequestTimeoutError, type OutcomeObservation } from "./routing/serve-outcome";
+
 interface OpencodeClientOptions {
   baseUrl: string;
   fetchFn?: typeof fetch;
   /** Per-request ceiling. See `fetchWithTimeout`. Defaults to 30s. */
   requestTimeoutMs?: number;
+  /**
+   * Shadow-mode observability tap (bead pigeon-f2a). Fires once per request with
+   * the raw status or error; classification happens in the sensor, not here.
+   *
+   * Records only — it must not influence this client's behaviour, and today
+   * nothing reads its output for routing. See routing/serve-outcome.ts.
+   */
+  onOutcome?: (obs: OutcomeObservation) => void;
 }
 
 /**
@@ -18,11 +28,22 @@ export class OpencodeClient {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
   private readonly requestTimeoutMs: number;
+  private readonly onOutcome: ((obs: OutcomeObservation) => void) | undefined;
 
   constructor(options: OpencodeClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.fetchFn = options.fetchFn ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.onOutcome = options.onOutcome;
+  }
+
+  /** Never let the observability tap perturb the request it is observing. */
+  private observe(obs: OutcomeObservation): void {
+    try {
+      this.onOutcome?.(obs);
+    } catch {
+      // Deliberately ignored.
+    }
   }
 
   /**
@@ -44,13 +65,24 @@ export class OpencodeClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
-      return await this.fetchFn(url, { ...init, signal: controller.signal });
+      const response = await this.fetchFn(url, { ...init, signal: controller.signal });
+      this.observe({ status: response.status });
+      return response;
     } catch (err) {
       // Distinguish "we gave up" from "the network said no" -- an AbortError
       // propagated raw is indistinguishable from a caller-initiated cancel.
+      //
+      // Typed (not a bare Error) so the outcome sensor can exclude timeouts by
+      // CLASS rather than by matching the message; the message itself is
+      // unchanged so existing string-matching consumers still work. Timeouts
+      // must never count toward a serve-health verdict — a busy serve delays
+      // even a cheap accept (design 5.1 C).
       if (controller.signal.aborted) {
-        throw new Error(`request timed out after ${this.requestTimeoutMs}ms: ${url}`);
+        const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+        this.observe({ error: timeout });
+        throw timeout;
       }
+      this.observe({ error: err });
       throw err;
     } finally {
       // Unconditional: a leaked timer keeps the daemon's event loop referenced

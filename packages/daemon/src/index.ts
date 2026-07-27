@@ -37,6 +37,7 @@ import {
 } from "./routing/flap-detector";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
+import { ServeOutcomeSensor } from "./routing/serve-outcome";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
 
 const config = loadConfig();
@@ -78,7 +79,40 @@ const opencodeClient = config.opencodeUrl
   ? new OpencodeClient({ baseUrl: config.opencodeUrl })
   : undefined;
 
-const clientFactory = ingressRouter ? new OpencodeClientFactory(ingressRouter) : undefined;
+// Shadow-mode serve outcome sensor (bead pigeon-f2a) — the sensor for the
+// verdict that lands in pigeon-886, shipped ahead of it and wired to nothing
+// that decides anything.
+//
+// It exists because increment 2 needs a threshold ("N serve-directed failures in
+// a window means suspect") and nobody can pick N honestly today: no base rate for
+// refused/5xx on a HEALTHY serve has ever been recorded. Enforcing a blind guess
+// against live routing gets you either a useless alert or an outage.
+//
+// Attribution is resolved HERE, at record time, against the live registry rather
+// than captured when a client was constructed — a restarted serve keeps its
+// endpoint but gets a fresh instance_uuid. An endpoint absent from the registry
+// resolves to undefined and is dropped, which is exactly how the plugin's
+// ephemeral direct-channel port stays out of the signal (design 5.1 B): its
+// failures mean the plugin died, not the serve, and counting them would mark the
+// whole pool suspect every morning after the nightly workspace reset.
+const outcomeSensor = ingressRouter
+  ? new ServeOutcomeSensor({
+      resolve: (endpoint) => {
+        const row = storage.serves.all().find((s) => s.endpoint === endpoint);
+        return row ? { serveId: row.serveId, instanceUuid: row.instanceUuid } : undefined;
+      },
+      log: (msg, fields) =>
+        console.log(`[serve-outcome] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+const clientFactory = ingressRouter
+  ? new OpencodeClientFactory(
+      ingressRouter,
+      Date.now,
+      outcomeSensor ? (endpoint, obs) => outcomeSensor.record(endpoint, obs) : undefined,
+    )
+  : undefined;
 // Resolve the owning-serve client for a session; falls back to the legacy single client when routing is unconfigured.
 const clientForSession = (sessionId: string): OpencodeClient | undefined =>
   clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
@@ -414,6 +448,18 @@ const flapDetector = ingressRouter
         console.warn(`[flap-detector] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
   : undefined;
+
+// Hourly is plenty: this is a base-rate estimate for threshold selection, not a
+// monitoring signal. Emitting it more often would bury the flap alerts.
+const OUTCOME_REPORT_MS = 60 * 60 * 1000;
+if (outcomeSensor) {
+  outcomeSensor.start(OUTCOME_REPORT_MS);
+  console.log("[pigeon-daemon] serve outcome sensor started (SHADOW MODE)", JSON.stringify({
+    reportIntervalMs: OUTCOME_REPORT_MS,
+    note: "records refused/5xx per serve to calibrate pigeon-886; routing is NOT affected",
+    excluded: "timeouts (design 5.1 C), 4xx, and the plugin direct channel",
+  }));
+}
 
 if (flapDetector) {
   flapDetector.start(FLAP_TICK_MS);
