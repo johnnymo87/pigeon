@@ -152,7 +152,8 @@ describe("SessionDirectoryRegistry", () => {
       await reg.resolve("ses_a");
 
       const callInit = fetchFn.mock.calls[0]![1];
-      expect((callInit as RequestInit).headers?.["Authorization" as keyof HeadersInit]).toBeUndefined();
+      // No headers object at all when auth is off -- byte-identical to pre-change.
+      expect((callInit as RequestInit).headers).toBeUndefined();
     });
   });
 });

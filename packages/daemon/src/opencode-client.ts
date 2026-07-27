@@ -97,11 +97,32 @@ export class OpencodeClient {
     };
 
     let res = await execFetch();
+
+    // Credential rotation self-heal: a 401 may mean the cached header is stale
+    // (the secret file was rewritten under a long-running daemon). Re-resolve and
+    // retry ONCE -- but only if re-resolution actually produced a DIFFERENT, defined
+    // credential. Retrying with the same value, or with no value at all when auth is
+    // off, is guaranteed to 401 again and just doubles the request. A 401 is emitted
+    // by the auth middleware before the body is parsed or any handler runs, so no
+    // side effect can have occurred on the first attempt -- that is what makes this
+    // safe for the non-idempotent methods (prompt_async, summarize, abort, delete).
     if (res.status === 401) {
+      const staleHeader = resolveServeAuthHeader();
       invalidateServeAuthHeader();
-      res = await execFetch();
+      const freshHeader = resolveServeAuthHeader();
+      if (freshHeader !== undefined && freshHeader !== staleHeader) {
+        // Release the discarded response's socket back to the undici pool instead of
+        // waiting for GC; this client runs on every swarm delivery.
+        res.body?.cancel().catch(() => {});
+        res = await execFetch();
+      }
     }
 
+    // Observe the FINAL status only. A transient 401 that succeeded on retry should
+    // not be reported as a failed request. This does not weaken the serve-health
+    // verdict: classifyServeOutcome() already treats 4xx as client_error, and
+    // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
+    // rule B -- "4xx IS NOT ILL-HEALTH").
     this.observe({ status: res.status });
     return res;
   }

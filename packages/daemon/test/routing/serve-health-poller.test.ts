@@ -354,7 +354,8 @@ describe("serve-health-poller", () => {
       await poller.pollOnce(2000);
 
       const callInit = fetchFn.mock.calls[0]![1];
-      expect(callInit.headers?.Authorization).toBeUndefined();
+      // No headers object at all when auth is off -- byte-identical to pre-change.
+      expect(callInit.headers).toBeUndefined();
 
       s.db.close();
     });

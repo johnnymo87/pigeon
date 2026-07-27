@@ -739,8 +739,9 @@ describe("OpencodeClient", () => {
       await client.healthCheck();
 
       const callInit = fetchMock.mock.calls[0]![1];
-      expect(callInit.headers?.["Authorization"]).toBeUndefined();
-      expect(callInit.headers?.Authorization).toBeUndefined();
+      // Assert the KEY IS ABSENT, not merely undefined-valued: { Authorization:
+      // undefined } would satisfy a value check while still altering the request.
+      expect(callInit.headers).not.toHaveProperty("Authorization");
     });
 
     it("injects Authorization header when OPENCODE_SERVER_PASSWORD is set", async () => {
@@ -843,9 +844,50 @@ describe("OpencodeClient", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
-    it("does NOT retry a second time if the retry also returns 401", async () => {
+    it("does NOT retry on 401 when re-resolution yields the SAME credential", async () => {
+      // A retry with an identical credential is guaranteed to 401 again; it would
+      // only double the request rate at the exact moment the pool is rejecting us.
       process.env.OPENCODE_SERVER_PASSWORD = "badpassword";
       fetchMock.mockResolvedValue(new Response("unauthorized", { status: 401 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const ok = await client.healthCheck();
+
+      expect(ok).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT retry on 401 when auth is off (no credential to refresh)", async () => {
+      // With no password configured there is nothing to re-resolve, so a 401 from
+      // some other cause must not be amplified into two requests.
+      delete process.env.OPENCODE_SERVER_PASSWORD;
+      fetchMock.mockResolvedValue(new Response("unauthorized", { status: 401 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const ok = await client.healthCheck();
+
+      expect(ok).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries at most ONCE even if the retry also returns 401", async () => {
+      // First attempt 401s and the credential legitimately changes underneath us,
+      // so the retry is warranted -- but it must stop there, never loop.
+      process.env.OPENCODE_SERVER_PASSWORD = "oldpassword";
+      let calls = 0;
+      fetchMock.mockImplementation(async () => {
+        calls += 1;
+        if (calls === 1) process.env.OPENCODE_SERVER_PASSWORD = "newpassword";
+        return new Response("unauthorized", { status: 401 });
+      });
 
       const client = new OpencodeClient({
         baseUrl: "http://localhost:4320",
