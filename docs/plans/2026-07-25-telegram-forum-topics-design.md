@@ -404,8 +404,18 @@ Two UX wins remain:
   currently hard-require a swipe-reply (`resolveReplySession`,
   `webhook.ts:472-507`).
 
-`/launch` stays global and answers in General. A `/launch`ed session's topic
-appears on its first notification.
+`/launch` stays global — it is not scoped to a session — and a `/launch`ed
+session's topic appears on its first notification.
+
+**Corrected at Checkpoint 2b (was: "and answers in General").** T2.14 wires
+`onLaunch` through the same reply factory as every other command
+(`daemon/src/index.ts`), so a `/launch` typed *inside* a topic answers in that
+topic, and only a `/launch` typed in General answers in General. That is
+deliberate and the code is right: the reply — including launch **errors**, which
+are a primary path rather than a break-glass fallback — belongs where the user
+typed the command. Answering in General would strand the error away from the
+person who caused it. The old sentence conflated "the command is not
+session-scoped" with "the reply goes to General"; only the former is true.
 
 ## Migration and rollout
 
