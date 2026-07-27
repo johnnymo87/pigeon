@@ -243,7 +243,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     - **The decisive check on the non-dark T2.14 path:** `GET /machines/:id/next` returned **204**, proving `pollNextCommand`'s new nine-column SELECT executes against production D1. Deliberately polled a **non-existent probe machine id**, not a real one — a real poll *leases* the command it returns, which would have stolen a pending command from the live daemon. Exercises the identical SELECT with zero risk.
     - Auth is `Authorization: Bearer <CCR_API_KEY>` (`auth.ts:20-26`), **not** `x-api-key`. Cost a round trip; noting it so the next person does not repeat it.
     - **STILL OUTSTANDING — the one manual check both reviews asked for:** send a swipe-reply command in the production Telegram DM. It is the only thing that would catch a private chat unexpectedly carrying `message_thread_id`, which would make T2.13's service-message guard suppress a legitimate swipe-reply *silently*. Requires a human with the phone; I cannot do it.
-  - Other findings recorded rather than fixed: `pigeon-4kb` (T2.15/T2.16 are flag-flip **blockers**, not polish — bare reply-commands in a topic fail until T2.16, and their error messages are invisible until T2.15); `pigeon-cev` item 4 (what Telegram actually returns when reopening an already-open topic); F3 settled in the design doc (`/launch` answers where it was typed — the code is right, the design sentence was stale).
+  - Other findings recorded rather than fixed: `pigeon-1xt` (T2.15/T2.16 are flag-flip **blockers**, not polish — bare reply-commands in a topic fail until T2.16, and their error messages are invisible until T2.15); `pigeon-cev` item 4 (what Telegram actually returns when reopening an already-open topic); F3 settled in the design doc (`/launch` answers where it was typed — the code is right, the design sentence was stale).
 
 *Polish + migration:*
 
@@ -1138,12 +1138,12 @@ the LIVE production daemon from its source and is the live routing DB's home
 - `pigeon-cev` (P1) — four questions only LIVE Telegram can answer: the `[vars]` deploy-revert trap; the
   unverified `thread_not_found` string; whether a bot can post into a closed topic; what Telegram returns
   when you reopen an already-open topic (this last one underpins the F1 fix).
-- `pigeon-4kb` (P1) — **T2.15 and T2.16 are blockers, not polish.** Until T2.16, every bare `/kill`,
+- `pigeon-1xt` (P1) — **T2.15 and T2.16 are blockers, not polish.** Until T2.16, every bare `/kill`,
   `/interrupt`, `/compact`, `/mcp *`, `/model *` typed *inside a topic* fails; until T2.15 that failure
   message goes to General, where the user is not looking. This is the feature's flagship interaction.
 - `pigeon-5o7` (P2) — scope `deleteTopicBySession` to the thread id; safe today only because the daemon's
   `fetch` has no timeout, so an obviously-reasonable future change silently breaks it.
-- `pigeon-vga` (P3) — reap-loop generic failures pin head-of-line slots (accepted residual).
+- `pigeon-wly` (P3) — reap-loop generic failures pin head-of-line slots (accepted residual).
 
 **Also still outstanding:** one manual swipe-reply command in the production Telegram DM, which both
 adversarial reviews asked for. It needs a human with the phone.
