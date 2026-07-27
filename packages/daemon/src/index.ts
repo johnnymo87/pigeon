@@ -30,6 +30,11 @@ import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
 import { ServeEndpointReconciler } from "./routing/endpoint-reconciler";
+import {
+  FlapDetector,
+  DEFAULT_WINDOW_MS,
+  DEFAULT_PER_SESSION_MOVES,
+} from "./routing/flap-detector";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
@@ -384,6 +389,41 @@ if (endpointReconciler) {
   console.log("[pigeon-daemon] serve endpoint reconciler started", JSON.stringify({
     intervalMs: config.healthPollMs,
     serves: config.serveEndpoints.length,
+    alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
+  }));
+}
+
+// Flap detector (bead pigeon-f2a) — increment 1 of the serve-serviceability arc.
+//
+// Ships BEFORE the verdict in pigeon-886 on purpose: that change introduces new
+// health transitions, and a flapping slot is the failure mode that makes routing
+// bugs unreproducible. June 2026 flapped for weeks — 2634 cumulative moves, one
+// session moved 24 times, four in-flight turns killed — and was found by
+// root-causing dead turns, never by an alert, because nothing on the path logged
+// anything. The recorder in `placeSession` and this detector close that.
+//
+// Ticked far slower than the reconciler: the window is 15 minutes, so a 60s tick
+// is ample, and it keeps three indexed queries plus a prune off the 5s path.
+const FLAP_TICK_MS = 60_000;
+const flapDetector = ingressRouter
+  ? new FlapDetector({
+      reassignments: storage.reassignments,
+      notifier,
+      machineId: config.machineId,
+      log: (msg, fields) =>
+        console.warn(`[flap-detector] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (flapDetector) {
+  flapDetector.start(FLAP_TICK_MS);
+  console.log("[pigeon-daemon] flap detector started", JSON.stringify({
+    intervalMs: FLAP_TICK_MS,
+    windowMs: DEFAULT_WINDOW_MS,
+    // Stated at boot because the number is a reasoned guess, not a tuned value —
+    // no base rate for reassignment churn has ever been recorded. Re-tune after a
+    // week of data.
+    perSessionMoves: `${DEFAULT_PER_SESSION_MOVES} (PROVISIONAL)`,
     alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
   }));
 }
