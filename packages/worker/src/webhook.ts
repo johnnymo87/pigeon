@@ -140,7 +140,7 @@ interface TelegramMessage {
 interface TelegramCallbackQuery {
   id: string;
   from: { id: number };
-  message?: { chat: { id: number } };
+  message?: { chat: { id: number }; message_thread_id?: number };
   data?: string;
 }
 
@@ -451,6 +451,19 @@ async function resolveSessionMachine(
 
 const MAX_QUEUE_PER_MACHINE = 100;
 
+interface QueueCommandOpts {
+  machineId: string;
+  sessionId: string | null;
+  command: string;
+  chatId: string;
+  label: string | null;
+  messageThreadId: number | undefined;
+  commandType?: CommandType;
+  directory?: string | null;
+  mediaRef?: MediaRef | null;
+  metadataJson?: string | null;
+}
+
 /**
  * Queue a command for delivery to a machine.
  * Returns the command_id, or null if the queue is full.
@@ -458,16 +471,21 @@ const MAX_QUEUE_PER_MACHINE = 100;
 async function queueCommand(
   db: D1Database,
   env: Env,
-  machineId: string,
-  sessionId: string | null,
-  command: string,
-  chatId: string,
-  label: string | null,
-  commandType: CommandType = "execute",
-  directory: string | null = null,
-  mediaRef: MediaRef | null = null,
-  metadataJson: string | null = null,
+  opts: QueueCommandOpts,
 ): Promise<string | null> {
+  const {
+    machineId,
+    sessionId,
+    command,
+    chatId,
+    label,
+    messageThreadId,
+    commandType = "execute",
+    directory = null,
+    mediaRef = null,
+    metadataJson = null,
+  } = opts;
+
   const mediaJson = mediaRef ? JSON.stringify(mediaRef) : null;
 
   const commandId = await d1QueueCommand(db, {
@@ -479,6 +497,7 @@ async function queueCommand(
     directory,
     mediaJson,
     metadataJson,
+    messageThreadId: messageThreadId ?? null,
   });
 
   if (commandId === null) {
@@ -582,7 +601,16 @@ export async function handleTelegramWebhook(
         return OK();
       }
 
-      const commandId = await queueCommand(db, env, machineId, null, prompt, String(launchChatId), null, "launch", directory);
+      const commandId = await queueCommand(db, env, {
+        machineId,
+        sessionId: null,
+        command: prompt,
+        chatId: String(launchChatId),
+        label: null,
+        commandType: "launch",
+        directory,
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`);
@@ -601,7 +629,15 @@ export async function handleTelegramWebhook(
         return OK();
       }
 
-      const commandId = await queueCommand(db, env, machineId, null, "", String(csChatId), null, "current_state");
+      const commandId = await queueCommand(db, env, {
+        machineId,
+        sessionId: null,
+        command: "",
+        chatId: String(csChatId),
+        label: null,
+        commandType: "current_state",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, csChatId, `Fetching current state on ${machineId}...`);
@@ -615,7 +651,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(killChatId), resolved.label, "kill");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(killChatId),
+        label: resolved.label,
+        commandType: "kill",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -629,7 +673,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(interruptChatId), resolved.label, "interrupt");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(interruptChatId),
+        label: resolved.label,
+        commandType: "interrupt",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, interruptChatId, `Interrupting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -643,7 +695,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(compactChatId), resolved.label, "compact");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(compactChatId),
+        label: resolved.label,
+        commandType: "compact",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -657,7 +717,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, "", String(mcpChatId), resolved.label, "mcp_list");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: "",
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_list",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -673,7 +741,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_enable");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: serverName,
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_enable",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -689,7 +765,15 @@ export async function handleTelegramWebhook(
       const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, serverName, String(mcpChatId), resolved.label, "mcp_disable");
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command: serverName,
+        chatId: String(mcpChatId),
+        label: resolved.label,
+        commandType: "mcp_disable",
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`);
@@ -718,7 +802,15 @@ export async function handleTelegramWebhook(
       }
 
       const command = modelCode ?? "";
-      const commandId = await queueCommand(db, env, resolved.machineId, resolved.sessionId, command, String(modelChatId), resolved.label, commandType);
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command,
+        chatId: String(modelChatId),
+        label: resolved.label,
+        commandType,
+        messageThreadId: update.message.message_thread_id,
+      });
       if (!commandId) return OK();
 
       if (commandType === "model_set") {
@@ -772,7 +864,17 @@ export async function handleTelegramWebhook(
     const metadataJson = resolved.questionRequestId
       ? JSON.stringify({ questionRequestId: resolved.questionRequestId })
       : null;
-    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(chatId!), machine.label, "execute", null, mediaRef, metadataJson);
+    const commandId = await queueCommand(db, env, {
+      machineId: machine.machineId,
+      sessionId: resolved.sessionId,
+      command: resolved.command,
+      chatId: String(chatId!),
+      label: machine.label,
+      commandType: "execute",
+      mediaRef,
+      metadataJson,
+      messageThreadId: update.message.message_thread_id,
+    });
     if (!commandId) return OK();
 
     return OK();
@@ -798,7 +900,14 @@ export async function handleTelegramWebhook(
     const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, cbChatId);
     if (!machine) return OK();
 
-    const commandId = await queueCommand(db, env, machine.machineId, resolved.sessionId, resolved.command, String(cbChatId), machine.label);
+    const commandId = await queueCommand(db, env, {
+      machineId: machine.machineId,
+      sessionId: resolved.sessionId,
+      command: resolved.command,
+      chatId: String(cbChatId),
+      label: machine.label,
+      messageThreadId: update.callback_query.message?.message_thread_id,
+    });
     if (!commandId) return OK();
 
     await answerCallbackQuery(env, update.callback_query.id, "Command sent");

@@ -41,6 +41,7 @@ export async function queueCommand(
     directory?: string | null;
     mediaJson?: string | null;
     metadataJson?: string | null;
+    messageThreadId?: number | null;
   },
 ): Promise<string | null> {
   const {
@@ -52,6 +53,7 @@ export async function queueCommand(
     directory = null,
     mediaJson = null,
     metadataJson = null,
+    messageThreadId = null,
   } = opts;
 
   // Check queue depth
@@ -74,10 +76,10 @@ export async function queueCommand(
     .prepare(
       `INSERT INTO commands
          (command_id, machine_id, session_id, command_type, command, chat_id,
-          directory, media_json, metadata_json, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          directory, media_json, metadata_json, message_thread_id, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     )
-    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, metadataJson, now)
+    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, metadataJson, messageThreadId ?? null, now)
     .run();
 
   return commandId;
@@ -94,6 +96,7 @@ export interface PollResult {
   directory: string | null;
   mediaJson: string | null;
   metadataJson: string | null;
+  messageThreadId: number | null;
 }
 
 // ─── pollNextCommand ──────────────────────────────────────────────────────────
@@ -118,7 +121,7 @@ export async function pollNextCommand(
   // either pending, or leased-but-expired
   const row = await db
     .prepare(
-      `SELECT command_id, session_id, command, chat_id, command_type, directory, media_json, metadata_json
+      `SELECT command_id, session_id, command, chat_id, command_type, directory, media_json, metadata_json, message_thread_id
        FROM commands
        WHERE machine_id = ?
          AND (
@@ -138,6 +141,7 @@ export async function pollNextCommand(
       directory: string | null;
       media_json: string | null;
       metadata_json: string | null;
+      message_thread_id?: number | null;
     }>();
 
   if (!row) {
@@ -163,6 +167,7 @@ export async function pollNextCommand(
     directory: row.directory,
     mediaJson: row.media_json,
     metadataJson: row.metadata_json,
+    messageThreadId: row.message_thread_id ?? null,
   };
 }
 

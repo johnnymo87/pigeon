@@ -108,6 +108,7 @@ const d1SchemaStatements = [
     directory     TEXT,
     media_json    TEXT,
     metadata_json TEXT,
+    message_thread_id INTEGER,
     status        TEXT NOT NULL DEFAULT 'pending',
     created_at    INTEGER NOT NULL,
     leased_at     INTEGER,
@@ -1392,6 +1393,47 @@ describe("webhook reply routing", () => {
     mockTelegramSendMessage(); // For "Command queued" sendMessage
     const res = await sendWebhook(makeCallbackQuery(`cmd:${notifBody.token}:yes`));
     expect(res.status).toBe(200);
+  });
+
+  it("carries message_thread_id through callback query webhook path", async () => {
+    const sessionId = "ses_t214_cb";
+    await registerSession(sessionId, "machine-cb");
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mockTelegramSuccess(64003);
+    const notifRes = await sendNotification({
+      sessionId,
+      chatId: String(CHAT_ID_NUM),
+      text: "Callback topic question",
+    });
+    const notifBody = (await notifRes.json()) as { token: string };
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mockTelegramAny(); // For answerCallbackQuery
+    mockTelegramSendMessage(); // For "Command queued" sendMessage
+
+    const cbReq = {
+      update_id: ++webhookUpdateCounter,
+      callback_query: {
+        id: `cb-${++webhookUpdateCounter}`,
+        from: { id: CHAT_ID_NUM },
+        message: {
+          chat: { id: CHAT_ID_NUM },
+          message_thread_id: 64003,
+        },
+        data: `cmd:${notifBody.token}:yes`,
+      },
+    };
+
+    const res = await sendWebhook(cbReq);
+    expect(res.status).toBe(200);
+
+    const rows = await env.DB.prepare(
+      "SELECT * FROM commands WHERE session_id = ?"
+    ).bind(sessionId).all<{ message_thread_id: number | null }>();
+
+    expect(rows.results.length).toBe(1);
+    expect(rows.results[0]!.message_thread_id).toBe(64003);
   });
 
   it("answers 'Session expired' for callback with unknown token", async () => {
@@ -2896,6 +2938,7 @@ describe("d1-ops", () => {
       directory     TEXT,
       media_json    TEXT,
       metadata_json TEXT,
+      message_thread_id INTEGER,
       status        TEXT NOT NULL DEFAULT 'pending',
       created_at    INTEGER NOT NULL,
       leased_at     INTEGER,
@@ -3014,6 +3057,22 @@ describe("d1-ops", () => {
     });
 
     expect(result).toBeNull();
+  });
+
+  it("queueCommand persists messageThreadId and pollNextCommand returns it", async () => {
+    const commandId = await queueCommand(env.DB, {
+      machineId: "machine-t214a",
+      sessionId: "ses_t214_d1ops",
+      command: "test topic command",
+      chatId: "8248645256",
+      messageThreadId: 64001,
+    });
+
+    expect(commandId).not.toBeNull();
+
+    const result = await pollNextCommand(env.DB, "machine-t214a");
+    expect(result).not.toBeNull();
+    expect(result!.messageThreadId).toBe(64001);
   });
 
   // ─── pollNextCommand ──────────────────────────────────────────────────
@@ -3525,6 +3584,7 @@ describe("poll and ack endpoints", () => {
       directory     TEXT,
       media_json    TEXT,
       metadata_json TEXT,
+      message_thread_id INTEGER,
       status        TEXT NOT NULL DEFAULT 'pending',
       created_at    INTEGER NOT NULL,
       leased_at     INTEGER,
@@ -3675,6 +3735,56 @@ describe("poll and ack endpoints", () => {
     expect(row).not.toBeNull();
     expect(row!.last_poll_at).toBeGreaterThanOrEqual(before);
     expect(row!.last_poll_at).toBeLessThanOrEqual(after);
+  });
+
+  it("handlePollNext includes messageThreadId in response body for multiple command types", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, message_thread_id, status, created_at)
+       VALUES (?, ?, ?, 'execute', 'echo test', '8248645256', 64002, 'pending', ?)`
+    ).bind("cmd-t214-exec", "machine-t214b", "ses_t214_exec", now).run();
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, message_thread_id, status, created_at)
+       VALUES (?, ?, ?, 'kill', '', '8248645256', 64002, 'pending', ?)`
+    ).bind("cmd-t214-kill", "machine-t214b", "ses_t214_kill", now + 1).run();
+
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, message_thread_id, status, created_at)
+       VALUES (?, ?, ?, 'mcp_list', '', '8248645256', 64002, 'pending', ?)`
+    ).bind("cmd-t214-mcp", "machine-t214b", "ses_t214_mcp", now + 2).run();
+
+    const res1 = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-t214b/next"), "machine-t214b");
+    expect(res1.status).toBe(200);
+    const body1 = await res1.json() as Record<string, unknown>;
+    expect(body1.commandType).toBe("execute");
+    expect(body1.messageThreadId).toBe(64002);
+
+    const res2 = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-t214b/next"), "machine-t214b");
+    expect(res2.status).toBe(200);
+    const body2 = await res2.json() as Record<string, unknown>;
+    expect(body2.commandType).toBe("kill");
+    expect(body2.messageThreadId).toBe(64002);
+
+    const res3 = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-t214b/next"), "machine-t214b");
+    expect(res3.status).toBe(200);
+    const body3 = await res3.json() as Record<string, unknown>;
+    expect(body3.commandType).toBe("mcp_list");
+    expect(body3.messageThreadId).toBe(64002);
+  });
+
+  it("handlePollNext yields null for messageThreadId when thread id is absent", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'execute', 'echo test', '8248645256', 'pending', ?)`
+    ).bind("cmd-t214-nothread", "machine-t214c", "ses_t214_nothread", now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-t214c/next"), "machine-t214c");
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandId).toBe("cmd-t214-nothread");
+    expect(body.messageThreadId).toBeNull();
   });
 
   // ─── handleAckCommand ────────────────────────────────────────────────
@@ -3829,6 +3939,7 @@ describe("poll and ack endpoints", () => {
       commandId: "cs-cmd-1",
       commandType: "current_state",
       chatId: "8248645256",
+      messageThreadId: null,
     });
   });
 });

@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS commands (
   directory     TEXT,
   media_json    TEXT,
   metadata_json TEXT,
+  message_thread_id INTEGER,
   status        TEXT NOT NULL DEFAULT 'pending',
   created_at    INTEGER NOT NULL,
   leased_at     INTEGER,
