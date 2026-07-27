@@ -17,6 +17,7 @@ export interface ReapTopicsOptions {
   botToken: string;
   now?: number;
   reapTtlMs?: number;
+  orphanTtlMs?: number;
   limit?: number;
   tgClient?: TelegramClient;
 }
@@ -65,10 +66,12 @@ export async function reapTopics(
 ): Promise<ReapResult> {
   const now = opts.now ?? Date.now();
   const reapTtlMs = opts.reapTtlMs ?? REAP_TTL_MS;
+  const orphanTtlMs = opts.orphanTtlMs ?? ORPHAN_TTL_MS;
   const limit = opts.limit ?? DEFAULT_REAP_CAP;
   const closedBefore = now - reapTtlMs;
+  const updatedBefore = now - orphanTtlMs;
 
-  const rows = await listReapable(db, { closedBefore, limit });
+  const rows = await listReapable(db, { closedBefore, updatedBefore, limit });
   if (rows.length === 0) {
     return { reaped: 0, rateLimited: false };
   }

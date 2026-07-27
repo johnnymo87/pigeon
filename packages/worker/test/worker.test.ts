@@ -5032,11 +5032,11 @@ describe("topics module and topicName", () => {
       await markClosed(env.DB, { sessionId: s3, now: now - 500 });
 
       // Query reapable with closedBefore = now - 200
-      const reapable = await listReapable(env.DB, { closedBefore: now - 200, limit: 10 });
+      const reapable = await listReapable(env.DB, { closedBefore: now - 200, updatedBefore: now - 100, limit: 10 });
       expect(reapable.map((r: { session_id: string }) => r.session_id)).toEqual([s2, s3]);
 
       // Test limit
-      const reapableLimit = await listReapable(env.DB, { closedBefore: now - 200, limit: 1 });
+      const reapableLimit = await listReapable(env.DB, { closedBefore: now - 200, updatedBefore: now - 100, limit: 1 });
       expect(reapableLimit.map((r: { session_id: string }) => r.session_id)).toEqual([s2]);
     });
 
@@ -6892,6 +6892,261 @@ describe("topics module and topicName", () => {
 
       const orphanRow = await getBySession(env.DB, orphanSessionId);
       expect(orphanRow?.state).toBe("open");
+    });
+  });
+
+  describe("F1 Defect Fixes: sticky-closed topics and reaper liveness check", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const botToken = "fake-bot-token";
+
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_f1_%'").run();
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("(a) reopen returns a generic error and we proceed with the existing thread -> D1 row state is open afterwards", async () => {
+      const sessionId = "ses_f1_a_generic_err";
+      const threadId = 65001;
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · generic err", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+      await markClosed(env.DB, { sessionId, now });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "generic err",
+        botToken,
+        now: now + 1000,
+      });
+
+      expect(res).toEqual({ ok: true, messageThreadId: threadId });
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+      expect(row?.closed_at).toBeNull();
+    });
+
+    it("(b) 429 and thread_not_found reopen branches are unchanged", async () => {
+      const sessionId429 = "ses_f1_b_429";
+      const threadId429 = 65002;
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId: sessionId429, machineId: "devbox", chatId: topicChatId, name: "pigeon · 429", now });
+      await finalize(env.DB, { sessionId: sessionId429, messageThreadId: threadId429, now });
+      await markClosed(env.DB, { sessionId: sessionId429, now });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 15 } });
+
+      const res429 = await resolveTopic(env.DB, {
+        sessionId: sessionId429,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "429",
+        botToken,
+        now: now + 1000,
+      });
+
+      expect(res429).toEqual({ ok: false, kind: "rate_limited", retryAfter: 15 });
+      const row429 = await getBySession(env.DB, sessionId429);
+      expect(row429?.state).toBe("closed");
+
+      // Test thread_not_found branch
+      const sessionIdTnf = "ses_f1_b_tnf";
+      const threadIdTnf = 65003;
+      const newThreadId = 65004;
+
+      await reserve(env.DB, { sessionId: sessionIdTnf, machineId: "devbox", chatId: topicChatId, name: "pigeon · tnf", now });
+      await finalize(env.DB, { sessionId: sessionIdTnf, messageThreadId: threadIdTnf, now });
+      await markClosed(env.DB, { sessionId: sessionIdTnf, now });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(200, { ok: true, result: { message_thread_id: newThreadId, name: "pigeon · tnf" } });
+
+      const resTnf = await resolveTopic(env.DB, {
+        sessionId: sessionIdTnf,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "tnf",
+        botToken,
+        now: now + 1000,
+      });
+
+      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId });
+      const rowTnf = await getBySession(env.DB, sessionIdTnf);
+      expect(rowTnf?.message_thread_id).toBe(newThreadId);
+      expect(rowTnf?.state).toBe("open");
+    });
+
+    it("(c) listReapable/reapTopics does not return or delete a 30-day-closed topic whose sessions row exists and is fresh", async () => {
+      const sessionId = "ses_f1_c_fresh";
+      const threadId = 65005;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000); // older than 30 days
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fresh sess", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      // Insert fresh session row (updated within last 7 days)
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(sessionId, "devbox", "pigeon", now - 1000, now - 1000).run();
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.reaped).toBe(0);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.state).toBe("closed");
+    });
+
+    it("(d) listReapable/reapTopics does reap a 30-day-closed topic whose sessions row is absent", async () => {
+      const sessionId = "ses_f1_d_no_session";
+      const threadId = 65006;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · no sess", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      // No sessions row created
+
+      let deleteCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, (opts: any) => {
+          deleteCalled = true;
+          return { ok: true, result: true };
+        });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.reaped).toBe(1);
+      expect(deleteCalled).toBe(true);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(e) listReapable/reapTopics does reap a 30-day-closed topic whose sessions row exists but is stale (older than 7d TTL)", async () => {
+      const sessionId = "ses_f1_e_stale_session";
+      const threadId = 65007;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+      const staleSessionTime = now - (ORPHAN_TTL_MS + 1000); // 8 days ago (> 7d TTL)
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · stale sess", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(sessionId, "devbox", "pigeon", staleSessionTime, staleSessionTime).run();
+
+      let deleteCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, (opts: any) => {
+          deleteCalled = true;
+          return { ok: true, result: true };
+        });
+
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(result.reaped).toBe(1);
+      expect(deleteCalled).toBe(true);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(f) end-to-end composition: close topic, generic error on reopen -> state becomes open, then reaper 30d later does NOT delete it", async () => {
+      const sessionId = "ses_f1_f_e2e";
+      const threadId = 65008;
+      const t0 = Date.now();
+
+      // 1. Seed closed topic with active session
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · e2e", now: t0 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: t0 });
+      await markClosed(env.DB, { sessionId, now: t0 });
+
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
+
+      // 2. Notification arrives -> resolveTopic reopen fails generically
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+
+      const resolveRes = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "e2e",
+        botToken,
+        now: t0 + 1000,
+      });
+
+      expect(resolveRes).toEqual({ ok: true, messageThreadId: threadId });
+
+      // Confirm row state is now OPEN
+      const rowAfterResolve = await getBySession(env.DB, sessionId);
+      expect(rowAfterResolve?.state).toBe("open");
+
+      // 3. 30 days later, run reaper
+      const t30d = t0 + REAP_TTL_MS + 10000;
+      // Session receives notifications and stays fresh
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
+
+      let deleteCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, (opts: any) => {
+          deleteCalled = true;
+          return { ok: true, result: true };
+        });
+
+      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(reapRes.reaped).toBe(0);
+      expect(deleteCalled).toBe(false);
+
+      const rowAfterReap = await getBySession(env.DB, sessionId);
+      expect(rowAfterReap).not.toBeNull();
+      expect(rowAfterReap?.state).toBe("open");
     });
   });
 });
