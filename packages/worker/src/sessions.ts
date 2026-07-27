@@ -98,10 +98,27 @@ async function unregisterSession(
     return Response.json({ error: "sessionId required" }, { status: 400 });
   }
 
+  await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+  await db.prepare("DELETE FROM messages WHERE session_id = ?").bind(sessionId).run();
+
+  // Topic closing runs AFTER the deletes, and the order is load-bearing.
+  //
+  // Deleting the session is this endpoint's primary job; closing the topic is auxiliary. If the
+  // topic block throws (the realistic case: the flag is flipped on before the `topics` DDL has
+  // been applied, so `getBySession` hits a missing table) we still want the session gone.
+  //
+  // The failure then self-heals rather than wedging: T2.11's orphan-closer selects open topics
+  // whose `sessions` row is ABSENT, which is exactly the state this leaves behind. Running the
+  // block first would instead 500 the request, leave the session row in place, and give the
+  // daemon's session-reaper a call that fails identically on every retry.
   if (topicsEnabled(env)) {
     const topic = await getBySession(db, sessionId);
     if (topic) {
+      // Mark closed in D1 before touching Telegram, so a failed/timed-out Telegram call still
+      // leaves a row the reaper will collect.
       await markClosed(db, { sessionId });
+      // A reservation row (NULL thread id) has no Telegram topic yet; closeForumTopic on it is a
+      // guaranteed 400.
       if (topic.message_thread_id !== null) {
         try {
           const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
@@ -115,9 +132,6 @@ async function unregisterSession(
       }
     }
   }
-
-  await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
-  await db.prepare("DELETE FROM messages WHERE session_id = ?").bind(sessionId).run();
 
   return Response.json({ ok: true });
 }
