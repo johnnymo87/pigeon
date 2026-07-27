@@ -247,7 +247,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
 
 *Polish + migration:*
 
-- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — pending commit. All 271 worker tests pass.
+- [x] T2.15 Worker: webhook confirmations echo `message_thread_id` — `a7ccb24`. All 271 worker tests pass.
   - Required 4th parameter `opts: { messageThreadId: number | undefined }` added to `sendTelegramMessage` (no default, structural enforcement) with centralized `topicsEnabled(env)` gate inside `sendTelegramMessage` so dark-ship flag-off equivalence is guaranteed in one place.
   - Exactly 22 call sites of `sendTelegramMessage` updated across `webhook.ts`, plus `resolveSessionMachine` parameter extended to thread `messageThreadId` to its 2 callers (message path and callback-query path).
   - All 4 test cases added to `worker.test.ts` and verified via regression injections (removing `topicsEnabled` gate failed flag-off test; removing thread id in `resolveReplySession` failed error path test; removing thread id in callback query path failed callback query test).
