@@ -91,6 +91,14 @@ Do NOT set `TELEGRAM_TOPICS_ENABLED = "true"` until the following beads are sett
 - **`pigeon-5o7`** (P2): Scope `deleteTopicBySession` to thread ID.
 - **`pigeon-wly`** (P3): Reap-loop generic failures pinning head-of-line slots (accepted residual).
 
+### Manual check still outstanding — required before the flip
+
+Send **one swipe-reply command in the production DM** (reply to a session notification with, say, `/kill`)
+and confirm it still works. Both prior adversarial reviews asked for this and it has not been done. It is
+the only thing that would reveal a private chat unexpectedly carrying `message_thread_id` — the single
+assumption the flag-off path leans on. If a DM *does* carry one, T2.13's service-message guard could
+suppress a legitimate swipe-reply silently.
+
 ### Deferred Rate-Limit Gate
 A D1-based chat-level `next_send_at` rate gate was deferred during Phase 2 design.
 - **Trigger to build:** If 429 rate limit responses appear on more than a handful of days during burn-in, implement the rate gate.
@@ -188,6 +196,10 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
    curl -s https://ccr-router.jonathan-mohrbacher.workers.dev/health
    ```
 
+> **Expected during this step, not a fault:** with the supergroup allowed but the flag still off, anything
+> you type in a topic gets its reply routed to **General** — the flag strips the thread id. Do not read that
+> as a broken migration; it is the dark path behaving correctly.
+
 ---
 
 ### Step 4: Enable Forum Topics & Update Machine Configs
@@ -207,7 +219,11 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
    ```bash
    npm run --workspace @pigeon/worker deploy
    ```
-5. Update `TELEGRAM_CHAT_ID` in host secrets on each target machine (devbox, cloudbox) to point to the new supergroup `chat_id`.
+5. Update `TELEGRAM_CHAT_ID` in host secrets on each target machine (devbox, cloudbox) to point to the new
+   supergroup `chat_id`. This is a sops-encrypted secret surfaced at `/run/secrets/`; edit the sops file for
+   the host and re-apply its NixOS configuration so the decrypted value is rewritten, then restart the
+   daemon (next step). The daemon reads `TELEGRAM_CHAT_ID`, falling back to `TELEGRAM_GROUP_ID`
+   (`packages/daemon/src/config.ts`). See the `secrets-and-auth` skill.
 6. Restart daemon service on each host:
    ```bash
    sudo systemctl restart pigeon-daemon
@@ -217,6 +233,18 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
    curl -s http://127.0.0.1:4731/health
    ```
    **Expected Result:** `{"status":"ok"}`
+8. **Verify the flip actually took — `/health` does NOT reflect the flag.** A typo'd flag string looks
+   exactly like a successful flip with a quiet system, because `topicsEnabled` is a strict `=== "true"`
+   match. Confirm the deployed binding, then confirm real behaviour:
+   ```bash
+   # a) the deployed value must print exactly: TELEGRAM_TOPICS_ENABLED ("true")
+   npx --workspace @pigeon/worker wrangler deploy --dry-run
+
+   # b) trigger any session notification, then confirm a topics row appeared
+   npx wrangler d1 execute pigeon-router --remote --command "SELECT session_id, message_thread_id, state FROM topics;"
+   ```
+   **Expected Result:** a new row with a non-NULL `message_thread_id`, and a matching topic visible in the
+   supergroup. **If no topic is created, the flag string is wrong — re-check `[vars]` in `wrangler.toml`.**
 
 ---
 
@@ -254,10 +282,24 @@ Once burn-in passes and all active sessions are operating in topics:
 
 If issues arise with forum topics, revert to DM operation immediately. Reverting worker source code is **not** required or recommended — flipping the feature flag acts as an instant kill switch.
 
-1. Edit `packages/worker/wrangler.toml`:
+> ### ⚠️ DO NOT REMOVE THE SUPERGROUP FROM `ALLOWED_CHAT_IDS` IN THE SAME DEPLOY
+> Rolling the flag back and narrowing the allowlist together **permanently loses notifications.**
+> Between the deploy and the moment every daemon has been re-pointed at the DM, each daemon is still
+> sending with the supergroup chat id. The worker rejects those with **403 `Chat ID not allowed`**
+> (`packages/worker/src/notifications.ts:201-203`), and the daemon outbox marks an entry **terminally
+> failed** after `MAX_ATTEMPTS = 10` or `MAX_AGE_MS = 15 minutes`
+> (`packages/daemon/src/worker/outbox-sender.ts:26-27,134-139`) — a budget the backoff burns through in
+> about 14 minutes. Editing sops on two machines and restarting services can easily exceed that,
+> **especially mid-incident, which is exactly when you are rolling back.**
+>
+> Keep **both** chat ids allowed until the daemons are reverted and the outbox has drained. Flag-off plus
+> supergroup-allowed is a safe combination: notifications land in the supergroup's General until each
+> daemon flips back. Narrowing the allowlist is a **final cleanup step**, never part of the rollback deploy.
+
+1. Edit `packages/worker/wrangler.toml` — flip the flag off but **keep both chat ids**:
    ```toml
    [vars]
-   ALLOWED_CHAT_IDS = "8248645256"  # DM chat ID
+   ALLOWED_CHAT_IDS = "8248645256,-1002345678901"  # BOTH, deliberately
    TELEGRAM_TOPICS_ENABLED = "false"
    ```
 2. Deploy worker:
@@ -269,6 +311,11 @@ If issues arise with forum topics, revert to DM operation immediately. Reverting
    ```bash
    sudo systemctl restart pigeon-daemon
    ```
+5. **Confirm the outbox has drained before narrowing the allowlist.** Watch for terminal failures:
+   ```bash
+   sudo journalctl -u pigeon-daemon -n 100 --no-pager | grep -i "outbox\|failed"
+   ```
+6. **Only now** remove the supergroup from `ALLOWED_CHAT_IDS` and deploy again.
 
 ### What Reverts vs. What Does NOT Revert
 
