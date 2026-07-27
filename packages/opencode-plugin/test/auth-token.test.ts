@@ -12,7 +12,10 @@ describe("resolveDaemonToken", () => {
 
   beforeEach(() => {
     delete process.env.PIGEON_DAEMON_AUTH_TOKEN
-    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    // NOT `delete` -- deleting would fall through to the real
+    // /run/secrets/pigeon_daemon_auth_token, which exists on cloudbox post-deploy.
+    // Point at an unreadable path instead (see test/setup.ts).
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = "/nonexistent/pigeon-test-no-token"
     invalidateDaemonToken()
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-auth-test-"))
     tmpFilePath = path.join(tmpDir, "secret_token")
