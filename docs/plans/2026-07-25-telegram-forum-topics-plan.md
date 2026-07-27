@@ -75,13 +75,25 @@ npm run test         # all workspaces
 npm run typecheck    # all workspaces
 ```
 
-**CURRENT baseline — post-Checkpoint-2b, 2026-07-27** — measure regressions against this:
+**CURRENT baseline — post-Checkpoint-2, 2026-07-27, after merging PR #8** — measure regressions against this:
 
-| Package | Test files | Tests |
-|---|---|---|
-| `@pigeon/daemon` | 50 | **682** passed, 1 skipped |
-| `@pigeon/opencode-plugin` | 14 | **290** passed |
-| `@pigeon/worker` | 1 | **267** passed |
+| Package | Tests |
+|---|---|
+| `@pigeon/daemon` | **778** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | **305** passed |
+| `@pigeon/worker` | **279** passed |
+
+Total **1362**. **`npm run typecheck` is now CLEAN — 0 errors.** The 4 long-standing `lease-cas`
+errors this plan told every task to ignore were fixed by PR #8 (`pigeon-f2a` increment 1); beads
+`pigeon-0zl`/`pigeon-m68`. **Stop writing "clean modulo the 4 known errors" — any typecheck error is
+now a real regression.** The daemon's +96 and the plugin's +15 come from PR #8 (flap detection,
+shadow-mode serve-outcome sensor, serve-auth), not from this plan.
+
+<details><summary>Earlier baseline (historical)</summary>
+
+Post-Checkpoint-2b: daemon 50 files/682+1, plugin 14/290, worker 1/267.
+
+</details>
 
 Total **1239**. Two unrelated workstreams landed on `main` mid-phase and inflate these counts — do not
 attribute their tests to this plan: the **registry-fencing** work (`endpoint-reconciler.ts`, merged at
