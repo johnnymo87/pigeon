@@ -14,6 +14,7 @@
  */
 
 import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+import { resolveServeAuthHeader } from "./serve-auth"
 
 export const SWARM_LIST_TOOL_NAME = "swarm_list" as const
 
@@ -45,8 +46,14 @@ export async function swarmList(
   const url = new URL("/experimental/session", opts.serverUrl)
   url.searchParams.set("limit", String(limit))
 
+  const headers: Record<string, string> = {}
+  const authHeader = resolveServeAuthHeader()
+  if (authHeader) {
+    headers["Authorization"] = authHeader
+  }
+
   const res = await opts.fetchFn(
-    new Request(url.toString(), { method: "GET" }),
+    new Request(url.toString(), { method: "GET", headers }),
   )
   if (!res.ok) {
     const text = await res.text().catch(() => "")
