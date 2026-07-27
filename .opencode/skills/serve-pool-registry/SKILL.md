@@ -167,11 +167,20 @@ crash-loops every serve until a lockstep release lands. A table in its own DDL
 string is free. `packages/daemon/test/routing/route-schema.test.ts` pins the digest
 and will fail at desk rather than at 3am; read its header before making it green.
 
+**In this arc, a closed bead does NOT mean deployed code.** Closed means written and
+reviewed. Production truth is `pigeon-u1u.5`; until that closes, assume nothing in
+the arc is running. As of 2026-07-27 increment 1 is unmerged on branch
+`registry-fencing` with no PR, and `reassignment_event` is absent from the live DB.
+
+Don't trust this table over `bd ready` — it rots, the graph doesn't.
+
 | Bead | |
 |---|---|
 | `pigeon-u1u` | **EPIC** — serve serviceability arc. Read first. |
-| `pigeon-f2a` | increment 1 — flap alerting + shadow sensor. **Shipped** (`ae85c1e`, `0af52b0`). |
-| `pigeon-u1u.3` | increment 1.5 — **calibrate thresholds from a week of shadow data.** Next up; blocks 886. |
+| `pigeon-f2a` | increment 1 — flap alerting + shadow sensor. Written, reviewed, **not deployed**. |
+| `pigeon-u1u.5` | **GATE — land, deploy, soak a week.** Blocks everything below. |
+| `pigeon-u1u.3` | increment 1.5 — calibrate the three flap arms from soak data. |
+| `pigeon-u1u.4` | attribution restart race — fix before the verdict enforces. |
 | `pigeon-886` | increment 2 — the liveness/serviceability decoupling itself. |
 | `pigeon-u1u.1` | increment 2.5 — frontdoor outcome hints. |
 | `pigeon-u1u.2` | increment 3 — real readiness endpoint. Deliberately last. |
