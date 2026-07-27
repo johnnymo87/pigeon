@@ -4445,6 +4445,224 @@ describe("resolveMessageSession question notification parsing", () => {
   });
 });
 
+// ─── Task T2.13: Inbound message resolution by forum topic membership ──
+
+describe("Task T2.13: Inbound message resolution by forum topic membership", () => {
+  const chatId = "123456789";
+  const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+  async function seedTopicRow(opts: {
+    sessionId: string;
+    chatId: string;
+    messageThreadId: number;
+    state?: "open" | "closed";
+  }): Promise<void> {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        opts.sessionId,
+        "devbox",
+        opts.chatId,
+        opts.messageThreadId,
+        "test topic",
+        opts.state ?? "open",
+        Date.now(),
+        Date.now(),
+      )
+      .run();
+  }
+
+  async function seedMessageRow(opts: {
+    chatId: string;
+    messageId: number;
+    sessionId: string;
+    notificationId?: string;
+    token?: string;
+  }): Promise<void> {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO messages (chat_id, message_id, session_id, token, notification_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        opts.chatId,
+        opts.messageId,
+        opts.sessionId,
+        opts.token ?? `token_${opts.messageId}`,
+        opts.notificationId ?? null,
+        Date.now(),
+      )
+      .run();
+  }
+
+  it("(a) bare text in a topic resolves to the topic's session via topics", async () => {
+    const threadId = 63001;
+    const sessionId = "ses_t213_a";
+    await seedTopicRow({ sessionId, chatId, messageThreadId: threadId });
+
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63002,
+        chat: { id: Number(chatId) },
+        text: "hello topic",
+        message_thread_id: threadId,
+      },
+      testEnv,
+    );
+
+    expect(res).toEqual({ sessionId, command: "hello topic" });
+  });
+
+  it("(b) a message whose reply_to_message.message_id === message_thread_id falls through service-message guard to topic membership", async () => {
+    const threadId = 63010;
+    const sessionId = "ses_t213_b_topic";
+    await seedTopicRow({ sessionId, chatId, messageThreadId: threadId });
+    // Seed a message mapping for threadId pointing to a DIFFERENT session to prove swipe-reply is skipped
+    await seedMessageRow({ chatId, messageId: threadId, sessionId: "ses_t213_b_other" });
+
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63011,
+        chat: { id: Number(chatId) },
+        text: "reply to thread creation",
+        message_thread_id: threadId,
+        reply_to_message: { message_id: threadId },
+      },
+      testEnv,
+    );
+
+    expect(res).toEqual({ sessionId, command: "reply to thread creation" });
+  });
+
+  it("(c) genuine swipe-reply inside a topic outranks topic membership", async () => {
+    const threadId = 63020;
+    const topicSessionId = "ses_t213_c_topic";
+    const swipeSessionId = "ses_t213_c_swipe";
+    const repliedMsgId = 63021;
+
+    await seedTopicRow({ sessionId: topicSessionId, chatId, messageThreadId: threadId });
+    await seedMessageRow({
+      chatId,
+      messageId: repliedMsgId,
+      sessionId: swipeSessionId,
+      notificationId: `q:${swipeSessionId}:req63020`,
+    });
+
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63022,
+        chat: { id: Number(chatId) },
+        text: "my answer",
+        message_thread_id: threadId,
+        reply_to_message: { message_id: repliedMsgId },
+      },
+      testEnv,
+    );
+
+    expect(res).toEqual({
+      sessionId: swipeSessionId,
+      command: "my answer",
+      questionRequestId: "req63020",
+    });
+  });
+
+  it("(d) flag OFF -> topic membership is NOT consulted", async () => {
+    const threadId = 63030;
+    const sessionId = "ses_t213_d";
+    await seedTopicRow({ sessionId, chatId, messageThreadId: threadId });
+
+    const offEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63031,
+        chat: { id: Number(chatId) },
+        text: "bare message",
+        message_thread_id: threadId,
+      },
+      offEnv,
+    );
+
+    expect(res).toBeNull();
+  });
+
+  it("(e) topic message with no topics row falls through to /cmd TOKEN or null", async () => {
+    const threadId = 63040;
+
+    const res1 = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63041,
+        chat: { id: Number(chatId) },
+        text: "unmapped topic message",
+        message_thread_id: threadId,
+      },
+      testEnv,
+    );
+
+    expect(res1).toBeNull();
+
+    // Now test /cmd TOKEN fallback in topic
+    const cmdSessionId = "ses_t213_e_cmd";
+    await seedMessageRow({ chatId, messageId: 63042, sessionId: cmdSessionId, token: "tok63040" });
+
+    const res2 = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63043,
+        chat: { id: Number(chatId) },
+        text: "/cmd tok63040 do something",
+        message_thread_id: threadId,
+      },
+      testEnv,
+    );
+
+    expect(res2).toEqual({ sessionId: cmdSessionId, command: "do something" });
+  });
+
+  it("(f) message with no message_thread_id behaves unchanged (swipe-reply and /cmd TOKEN)", async () => {
+    const sessionId = "ses_t213_f";
+    const repliedMsgId = 63050;
+    await seedMessageRow({ chatId, messageId: repliedMsgId, sessionId });
+
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63051,
+        chat: { id: Number(chatId) },
+        text: "general swipe reply",
+        reply_to_message: { message_id: repliedMsgId },
+      },
+      testEnv,
+    );
+
+    expect(res).toEqual({ sessionId, command: "general swipe reply" });
+  });
+
+  it("(g) topic membership resolves even when the topic row state is 'closed'", async () => {
+    const threadId = 63060;
+    const sessionId = "ses_t213_g_closed";
+    await seedTopicRow({ sessionId, chatId, messageThreadId: threadId, state: "closed" });
+
+    const res = await resolveMessageSession(
+      env.DB,
+      {
+        message_id: 63061,
+        chat: { id: Number(chatId) },
+        text: "message in closed topic",
+        message_thread_id: threadId,
+      },
+      testEnv,
+    );
+
+    expect(res).toEqual({ sessionId, command: "message in closed topic" });
+  });
+});
+
 // ─── Topics Module & Topic Name Tests ────────────────────────────────────
 
 function hasUnpairedSurrogate(s: string): boolean {

@@ -1,4 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
+import { getByThread, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
@@ -122,6 +123,8 @@ interface TelegramVoice {
 
 interface TelegramMessage {
   message_id: number;
+  message_thread_id?: number;
+  is_topic_message?: boolean;
   chat: { id: number };
   from?: { id: number };
   text?: string;
@@ -307,15 +310,36 @@ async function answerCallbackQuery(
  * questionRequestId so that swipe-replies to question notifications can be
  * identified by the daemon.
  */
+/**
+ * Resolve a session from an inbound Telegram message.
+ * Precedence:
+ * 1. Swipe-reply (reply to a message mapped in `messages` table, unless it's a topic service reply)
+ * 2. Topic membership (when TELEGRAM_TOPICS_ENABLED="true" and message_thread_id is set)
+ * 3. /cmd TOKEN format
+ *
+ * When the looked-up message has a notification_id starting with `q:`, the
+ * requestId is extracted (format: `q:{sessionId}:{requestId}`) and returned as
+ * questionRequestId so that swipe-replies to question notifications can be
+ * identified by the daemon.
+ */
 async function resolveMessageSession(
   db: D1Database,
   message: TelegramMessage,
+  env?: { TELEGRAM_TOPICS_ENABLED?: string },
 ): Promise<{ sessionId: string; command: string; questionRequestId?: string } | null> {
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
 
+  // Note: in a non-forum supergroup that uses reply threads, message_thread_id is the
+  // thread-root message id, so a genuine reply to that root would be suppressed by the
+  // guard. This is accepted because the target chat is a forum supergroup; and even when
+  // it misfires the message falls through to topic membership, which resolves to the same session.
+  const isTopicServiceReply =
+    message.message_thread_id !== undefined &&
+    message.reply_to_message?.message_id === message.message_thread_id;
+
   // Try 1: reply-to-message lookup
-  if (message.reply_to_message) {
+  if (message.reply_to_message && !isTopicServiceReply) {
     const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
       const result: { sessionId: string; command: string; questionRequestId?: string } = {
@@ -333,7 +357,20 @@ async function resolveMessageSession(
     }
   }
 
-  // Try 2: /cmd TOKEN command format
+  // Try 2: topic membership lookup
+  // Note: Topic membership carries no notification_id, so the metadata fallback in the daemon
+  // (command-ingest.ts:274-305) — which rescues question replies after the pending_questions row
+  // expires at 4h — is unreachable for topic-routed messages. The common case still works
+  // because command-ingest.ts:129 checks pendingQuestions.getBySessionId before consulting
+  // metadata. For questions older than 4 hours, swipe-reply remains the only reliable answer path.
+  if (env && topicsEnabled(env) && message.message_thread_id !== undefined) {
+    const topic = await getByThread(db, chatId, message.message_thread_id);
+    if (topic) {
+      return { sessionId: topic.session_id, command: text };
+    }
+  }
+
+  // Try 3: /cmd TOKEN command format
   const cmdMatch = text.match(/^\/cmd\s+(\S+)\s+(.+)$/s);
   if (cmdMatch) {
     const token = cmdMatch[1]!;
@@ -709,7 +746,7 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    const resolved = await resolveMessageSession(db, update.message);
+    const resolved = await resolveMessageSession(db, update.message, env);
     if (!resolved) {
       if (chatId) {
         await sendTelegramMessage(env, chatId,
