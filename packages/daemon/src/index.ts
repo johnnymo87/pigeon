@@ -34,6 +34,10 @@ import {
   FlapDetector,
   DEFAULT_WINDOW_MS,
   DEFAULT_PER_SESSION_MOVES,
+  DEFAULT_BREADTH_SESSIONS,
+  DEFAULT_BREADTH_MOVES_EACH,
+  DEFAULT_SLOW_BURN_MOVES,
+  DEFAULT_SUMMARY_MS,
 } from "./routing/flap-detector";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
@@ -463,13 +467,27 @@ if (outcomeSensor) {
 
 if (flapDetector) {
   flapDetector.start(FLAP_TICK_MS);
+  // Emit one summary immediately so a restart always leaves a positive record of
+  // the current base rate, rather than a gap until the first hourly tick.
+  flapDetector.reportNow();
   console.log("[pigeon-daemon] flap detector started", JSON.stringify({
     intervalMs: FLAP_TICK_MS,
+    summaryIntervalMs: DEFAULT_SUMMARY_MS,
     windowMs: DEFAULT_WINDOW_MS,
-    // Stated at boot because the number is a reasoned guess, not a tuned value —
-    // no base rate for reassignment churn has ever been recorded. Re-tune after a
-    // week of data.
-    perSessionMoves: `${DEFAULT_PER_SESSION_MOVES} (PROVISIONAL)`,
+    // Three arms, every one restart-invariant: a pool restart moves each session
+    // exactly once, so no floor here can be reached by a deploy. Totals are never
+    // a trigger — a totals rule fires on every deploy and gets muted.
+    //
+    // All PROVISIONAL and stated as such: no base rate for reassignment churn has
+    // ever been recorded, which is why the sensor ships before the fix. The
+    // original "5 is far below June's 24" argument was a category error (24 was
+    // cumulative over WEEKS, ~1.3 moves per 15min window fleet-wide), which is
+    // what the 24h slow-burn arm exists to cover. Re-tune under pigeon-u1u.3.
+    arms: {
+      burst: `${DEFAULT_PER_SESSION_MOVES} moves by one session / 15m (PROVISIONAL)`,
+      breadth: `${DEFAULT_BREADTH_SESSIONS} sessions x ${DEFAULT_BREADTH_MOVES_EACH} moves / 15m (PROVISIONAL)`,
+      slowBurn: `${DEFAULT_SLOW_BURN_MOVES} moves by one session / 24h (PROVISIONAL)`,
+    },
     alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
   }));
 }

@@ -204,9 +204,36 @@ describe("ServeOutcomeSensor", () => {
     expect(String(log.mock.calls[0]![0])).toMatch(/shadow/i);
   });
 
-  it("is silent when there is nothing to report", () => {
+  it("reports even when empty, so silence is verified rather than assumed", () => {
+    // Was previously an early return. The reviewer was right that it made two
+    // very different states byte-identical in the log: "the pool saw no daemon
+    // traffic" and "attribution is broken so every observation was dropped".
+    // A week of calibration could have been silently empty either way.
     const { s, log } = sensor();
     s.reportNow();
-    expect(log).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalled();
+  });
+
+  it("counts unattributable observations so a severed resolver is visible", () => {
+    const { s, log } = sensor({ resolve: () => undefined });
+    s.record("http://127.0.0.1:39481", { status: 500 });
+    s.record("http://127.0.0.1:39482", { status: 500 });
+
+    s.reportNow();
+
+    expect(JSON.stringify(log.mock.calls[0]![1])).toContain('"unattributedObservations":2');
+  });
+
+  it("includes the time base so cumulative counters can be turned into rates", () => {
+    // Counters are cumulative forever; without firstSeen/lastSeen a reader cannot
+    // compute a rate, nor tell a daemon restart from a quiet hour.
+    const { s, log } = sensor();
+    s.record("http://127.0.0.1:4096", { status: 500 });
+
+    s.reportNow();
+
+    const fields = JSON.stringify(log.mock.calls[0]![1]);
+    expect(fields).toContain("firstSeenAt");
+    expect(fields).toContain("lastSeenAt");
   });
 });

@@ -131,6 +131,42 @@ describe("ReassignmentEventRepo.topSessionsSince", () => {
   });
 });
 
+describe("ReassignmentEventRepo.countSessionsWithAtLeastSince", () => {
+  // Feeds the flap detector's BREADTH arm (adversarial review MAJOR-2). The
+  // per-session arm is blind to the shape where a serve oscillates in and out of
+  // the healthy pool and evacuates its whole population each cycle: every session
+  // moves 2-4 times, no single one hits the burst threshold, and 150+ moves pass
+  // in silence. Both documented write-fight classes in this codebase produce
+  // exactly that shape.
+  it("counts sessions meeting the per-session floor, not total moves", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    for (const s of ["ses_a", "ses_b", "ses_c"]) {
+      for (let i = 0; i < 3; i++) repo.record({ sessionId: s, fromServeId: "serve-0", toServeId: "serve-1", ownerGeneration: i + 2, at: T0 - 1_000 });
+    }
+    repo.record({ sessionId: "ses_quiet", fromServeId: "serve-0", toServeId: "serve-1", ownerGeneration: 2, at: T0 - 1_000 });
+
+    expect(repo.countSessionsWithAtLeastSince(T0 - 30_000, 3)).toBe(3);
+    expect(repo.countSessionsWithAtLeastSince(T0 - 30_000, 4)).toBe(0);
+  });
+
+  it("returns zero for a pool restart, at any fleet size", () => {
+    // Restart-invariance of the breadth arm: every session moves exactly once.
+    const repo = new ReassignmentEventRepo(freshDb());
+    for (let i = 0; i < 200; i++) {
+      repo.record({ sessionId: `ses_${i}`, fromServeId: "serve-0", toServeId: "serve-1", ownerGeneration: 2, at: T0 - 1_000 });
+    }
+    expect(repo.countSessionsWithAtLeastSince(T0 - 30_000, 3)).toBe(0);
+  });
+
+  it("respects the window", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    for (let i = 0; i < 5; i++) {
+      repo.record({ sessionId: "ses_old", fromServeId: "serve-0", toServeId: "serve-1", ownerGeneration: i + 2, at: T0 - 90_000 });
+    }
+    expect(repo.countSessionsWithAtLeastSince(T0 - 30_000, 3)).toBe(0);
+  });
+});
+
 describe("ReassignmentEventRepo.pruneBefore", () => {
   it("evicts old rows so an append-only log cannot grow without bound", () => {
     const repo = new ReassignmentEventRepo(freshDb());

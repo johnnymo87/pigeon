@@ -66,6 +66,59 @@ export const DEFAULT_WINDOW_MS = 15 * 60 * 1000;
  */
 export const DEFAULT_PER_SESSION_MOVES = 5;
 
+/**
+ * BREADTH arm (adversarial review MAJOR-2): this many sessions each clearing
+ * `DEFAULT_BREADTH_MOVES_EACH` inside the window.
+ *
+ * The burst arm above is blind to the shape where a serve oscillates in and out
+ * of the healthy pool and evacuates its whole population every cycle: each
+ * session collects 2-4 moves, no single one reaches 5, and 150+ moves pass in
+ * silence. That is not hypothetical here — both documented write-fight classes
+ * (setHealth vs. the 5s heartbeat; reconciler vs. registerSelf endpoint skew)
+ * produce exactly it.
+ *
+ * Still restart-invariant, which is the constraint that matters: a restart gives
+ * every session exactly ONE move, so the per-session floor of 3 is untouched.
+ * False-firing this arm requires three pool restarts inside 15 minutes, which is
+ * itself worth a warning.
+ *
+ * Note a ratio arm (total/distinct >= 2) was considered and REJECTED: a deploy
+ * plus a hotfix redeploy inside one window is ratio 2.0, which is an ordinary
+ * dev afternoon.
+ */
+export const DEFAULT_BREADTH_SESSIONS = 10;
+export const DEFAULT_BREADTH_MOVES_EACH = 3;
+
+/**
+ * SLOW-BURN arm (adversarial review MAJOR-1) and its 24h window.
+ *
+ * The burst threshold was originally justified as "far below June's 24" — a
+ * category error, because 24 was CUMULATIVE OVER WEEKS. 2634 fleet moves across
+ * ~3 weeks is roughly 1.3 moves per 15-minute window fleet-wide. A recurrence at
+ * June's average intensity would therefore never trip a 15-minute arm at all.
+ *
+ * Mechanistically, one stale-heartbeat false positive costs a session ~2 moves
+ * (out, then back). A serve doing that once every 20 minutes flaps forever —
+ * on the order of 360 potential mid-turn kills a day — while sitting under every
+ * short-window threshold. This arm is what sees it.
+ *
+ * 8 in 24h stays restart-invariant unless you deploy eight times in a day, and
+ * if you do, the resulting churn is arguably worth surfacing anyway.
+ */
+export const DEFAULT_SLOW_BURN_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_SLOW_BURN_MOVES = 8;
+
+/**
+ * How often the unconditional base-rate summary is emitted.
+ *
+ * Separate from alerting on purpose. Before this existed the detector logged
+ * ONLY when it fired, so "no output" was indistinguishable from a severed
+ * recorder, and the calibration bead's week of data had no way to reach anyone —
+ * they would have had to remember to hand-query the table. That is the same
+ * "data exists, nobody looks" shape that let June run for weeks.
+ */
+export const DEFAULT_SUMMARY_MS = 60 * 60 * 1000;
+
 /** Telegram throttle. Detection still logs every tick; only delivery is capped. */
 export const DEFAULT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
@@ -75,21 +128,34 @@ export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Cap on how many sessions the alert body names, so a wide incident stays readable. */
 const ALERT_SESSION_LIMIT = 5;
 
+/** Which arm fired. Named so the alert can say WHAT shape was seen, not just "flapping". */
+export type FlapReason = "burst" | "breadth" | "slow-burn";
+
 export interface FlapVerdict {
-  /** True when at least one session exceeded the per-session move threshold. */
+  /** True when any arm fired. */
   flapping: boolean;
+  /** Every arm that fired, in severity-agnostic order. Empty when quiet. */
+  reasons: FlapReason[];
   windowMs: number;
-  /** Context only — deliberately NOT part of the trigger. */
+  /** Context only — deliberately NOT a trigger. A restart inflates this. */
   totalMoves: number;
   /** Context only. `totalMoves / distinctSessions` ~ 1 is the restart signature. */
   distinctSessions: number;
-  /** Worst offenders, descending. Empty when the log is quiet. */
+  /** Sessions clearing the breadth floor. Drives the breadth arm. */
+  breadthSessions: number;
+  /** Worst offender over the 24h slow-burn window. */
+  slowBurnWorstMoves: number;
+  /** Worst offenders in the short window, descending. Empty when the log is quiet. */
   worst: SessionMoveCount[];
 }
 
 export interface FlapThresholds {
   windowMs: number;
   perSessionMoves: number;
+  breadthSessions: number;
+  breadthMovesEach: number;
+  slowBurnWindowMs: number;
+  slowBurnMoves: number;
 }
 
 /**
@@ -97,7 +163,10 @@ export interface FlapThresholds {
  * rule can be tested without notifiers, timers or cooldown state.
  */
 export function evaluateFlapping(
-  reassignments: Pick<ReassignmentEventRepo, "countSince" | "distinctSessionsSince" | "topSessionsSince">,
+  reassignments: Pick<
+    ReassignmentEventRepo,
+    "countSince" | "distinctSessionsSince" | "topSessionsSince" | "countSessionsWithAtLeastSince"
+  >,
   now: number,
   thresholds: FlapThresholds,
 ): FlapVerdict {
@@ -106,11 +175,42 @@ export function evaluateFlapping(
   const totalMoves = reassignments.countSince(since);
   const distinctSessions = reassignments.distinctSessionsSince(since);
   const worst = reassignments.topSessionsSince(since, ALERT_SESSION_LIMIT);
+  const breadthSessions = reassignments.countSessionsWithAtLeastSince(
+    since,
+    thresholds.breadthMovesEach,
+  );
+  const slowBurnWorst = reassignments.topSessionsSince(
+    now - thresholds.slowBurnWindowMs,
+    1,
+  );
+  const slowBurnWorstMoves = slowBurnWorst[0]?.moves ?? 0;
 
-  // The trigger. Restart-invariant by construction: a restart yields worst == 1.
-  const flapping = (worst[0]?.moves ?? 0) >= thresholds.perSessionMoves;
+  // Three arms, every one of them restart-invariant — a pool restart moves each
+  // session EXACTLY ONCE, so none of these floors (5-in-window, 3-each, 8-in-24h)
+  // can be reached by a deploy. That invariant is the design; totals are never a
+  // trigger, because a totals rule fires on every deploy, gets muted, and
+  // reproduces the blindness this whole bead exists to end.
+  const reasons: FlapReason[] = [];
+  if ((worst[0]?.moves ?? 0) >= thresholds.perSessionMoves) {
+    reasons.push("burst"); // one session thrashing hard, fast
+  }
+  if (breadthSessions >= thresholds.breadthSessions) {
+    reasons.push("breadth"); // a serve oscillating and evacuating its population
+  }
+  if (slowBurnWorstMoves >= thresholds.slowBurnMoves) {
+    reasons.push("slow-burn"); // low intensity, sustained — June's likely profile
+  }
 
-  return { flapping, windowMs: thresholds.windowMs, totalMoves, distinctSessions, worst };
+  return {
+    flapping: reasons.length > 0,
+    reasons,
+    windowMs: thresholds.windowMs,
+    totalMoves,
+    distinctSessions,
+    breadthSessions,
+    slowBurnWorstMoves,
+    worst,
+  };
 }
 
 export interface FlapDetectorOptions {
@@ -120,6 +220,11 @@ export interface FlapDetectorOptions {
   nowFn?: () => number;
   windowMs?: number;
   perSessionMoves?: number;
+  breadthSessions?: number;
+  breadthMovesEach?: number;
+  slowBurnWindowMs?: number;
+  slowBurnMoves?: number;
+  summaryMs?: number;
   alertCooldownMs?: number;
   retentionMs?: number;
   machineId?: string;
@@ -132,12 +237,18 @@ export class FlapDetector {
   private readonly nowFn: () => number;
   private readonly windowMs: number;
   private readonly perSessionMoves: number;
+  private readonly breadthSessions: number;
+  private readonly breadthMovesEach: number;
+  private readonly slowBurnWindowMs: number;
+  private readonly slowBurnMoves: number;
+  private readonly summaryMs: number;
   private readonly alertCooldownMs: number;
   private readonly retentionMs: number;
   private readonly machineId: string | undefined;
 
   private lastAlertAt: number | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private summaryTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: FlapDetectorOptions) {
     this.reassignments = opts.reassignments;
@@ -148,6 +259,11 @@ export class FlapDetector {
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
     this.perSessionMoves = opts.perSessionMoves ?? DEFAULT_PER_SESSION_MOVES;
+    this.breadthSessions = opts.breadthSessions ?? DEFAULT_BREADTH_SESSIONS;
+    this.breadthMovesEach = opts.breadthMovesEach ?? DEFAULT_BREADTH_MOVES_EACH;
+    this.slowBurnWindowMs = opts.slowBurnWindowMs ?? DEFAULT_SLOW_BURN_WINDOW_MS;
+    this.slowBurnMoves = opts.slowBurnMoves ?? DEFAULT_SLOW_BURN_MOVES;
+    this.summaryMs = opts.summaryMs ?? DEFAULT_SUMMARY_MS;
     this.alertCooldownMs = opts.alertCooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
     this.retentionMs = opts.retentionMs ?? DEFAULT_RETENTION_MS;
     this.machineId = opts.machineId;
@@ -158,6 +274,10 @@ export class FlapDetector {
     const verdict = evaluateFlapping(this.reassignments, now, {
       windowMs: this.windowMs,
       perSessionMoves: this.perSessionMoves,
+      breadthSessions: this.breadthSessions,
+      breadthMovesEach: this.breadthMovesEach,
+      slowBurnWindowMs: this.slowBurnWindowMs,
+      slowBurnMoves: this.slowBurnMoves,
     });
 
     if (verdict.flapping) {
@@ -165,6 +285,7 @@ export class FlapDetector {
       // record is the thing whose absence made June invisible, so it is never
       // suppressed.
       this.log("serve reassignment flapping detected", {
+        reasons: verdict.reasons.join(","),
         windowMs: verdict.windowMs,
         totalMoves: verdict.totalMoves,
         distinctSessions: verdict.distinctSessions,
@@ -182,6 +303,49 @@ export class FlapDetector {
 
     this.prune(now);
     return verdict;
+  }
+
+  /**
+   * Unconditional base-rate emission (adversarial review MAJOR-1).
+   *
+   * Deliberately NOT gated on `flapping`. Before this existed the detector spoke
+   * only when it fired, which made a quiet pool and a severed recorder produce
+   * byte-identical output — and left the calibration bead with no delivery
+   * mechanism at all. "Zero moves in the last hour" is a positive statement;
+   * no log line is not.
+   *
+   * This is the feed for pigeon-u1u.3. Diff successive lines to get the rate.
+   */
+  reportNow(): void {
+    const now = this.nowFn();
+    const v = evaluateFlapping(this.reassignments, now, {
+      windowMs: this.windowMs,
+      perSessionMoves: this.perSessionMoves,
+      breadthSessions: this.breadthSessions,
+      breadthMovesEach: this.breadthMovesEach,
+      slowBurnWindowMs: this.slowBurnWindowMs,
+      slowBurnMoves: this.slowBurnMoves,
+    });
+
+    this.log("reassignment base-rate summary (calibration feed for pigeon-u1u.3)", {
+      windowMs: v.windowMs,
+      movesInWindow: v.totalMoves,
+      distinctSessionsInWindow: v.distinctSessions,
+      // ~1.0 is the pool-restart signature; sustained >1 is the breadth pathology.
+      movesPerSession:
+        v.distinctSessions > 0
+          ? Number((v.totalMoves / v.distinctSessions).toFixed(2))
+          : 0,
+      sessionsAtBreadthFloor: v.breadthSessions,
+      worstSessionInWindow: v.worst[0]?.moves ?? 0,
+      worstSessionIn24h: v.slowBurnWorstMoves,
+      flappingNow: v.flapping,
+      reasons: v.reasons.join(",") || "none",
+      thresholds:
+        `burst=${this.perSessionMoves}/${Math.round(this.windowMs / 60_000)}m ` +
+        `breadth=${this.breadthSessions}x${this.breadthMovesEach} ` +
+        `slowBurn=${this.slowBurnMoves}/24h (ALL PROVISIONAL)`,
+    });
   }
 
   private prune(now: number): void {
@@ -218,7 +382,7 @@ export class FlapDetector {
       `is a week of data.`;
 
     try {
-      await this.notifier.sendPlainAlert(text, "warning");
+      await this.notifier.sendPlainAlert(text, "error");
     } catch (err) {
       this.log("flap alert send failed", {
         error: err instanceof Error ? err.message : String(err),
@@ -242,9 +406,12 @@ export class FlapDetector {
       this.log("tick failed", { error: err instanceof Error ? err.message : String(err) });
       return {
         flapping: false,
+        reasons: [],
         windowMs: this.windowMs,
         totalMoves: 0,
         distinctSessions: 0,
+        breadthSessions: 0,
+        slowBurnWorstMoves: 0,
         worst: [],
       };
     }
@@ -258,12 +425,29 @@ export class FlapDetector {
       void this.safeTick();
     }, intervalMs);
     this.timer.unref?.();
+
+    // Separate, much slower cadence. Detection needs to be prompt; the base-rate
+    // feed needs to be regular and must not bury the alerts.
+    this.summaryTimer = setInterval(() => {
+      try {
+        this.reportNow();
+      } catch (err) {
+        this.log("summary failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }, this.summaryMs);
+    this.summaryTimer.unref?.();
   }
 
   stop(): void {
     if (this.timer !== null) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.summaryTimer !== null) {
+      clearInterval(this.summaryTimer);
+      this.summaryTimer = null;
     }
   }
 }

@@ -126,6 +126,31 @@ export class ReassignmentEventRepo {
     return rows.map((r) => ({ sessionId: r.session_id, moves: Number(r.moves) }));
   }
 
+  /**
+   * How many distinct sessions moved at least `minMoves` times in the window.
+   *
+   * The breadth arm's primitive. A serve oscillating in and out of the healthy
+   * pool evacuates its whole population on every cycle, so each session picks up
+   * 2-4 moves and NONE of them trips the per-session burst threshold — while the
+   * fleet racks up hundreds of moves. Counting sessions that clear a low floor
+   * catches that, and stays restart-invariant: a restart gives every session
+   * exactly one move, so any floor above 1 yields zero.
+   */
+  countSessionsWithAtLeastSince(since: number, minMoves: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT session_id
+             FROM reassignment_event
+            WHERE at >= ?
+            GROUP BY session_id
+           HAVING COUNT(*) >= ?
+         )`,
+      )
+      .get(since, minMoves) as { n: number };
+    return Number(row.n);
+  }
+
   /** Retention. An append-only log on the hot path must have a reaper. */
   pruneBefore(cutoff: number): number {
     return this.db

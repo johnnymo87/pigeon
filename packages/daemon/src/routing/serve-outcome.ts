@@ -168,6 +168,17 @@ export class ServeOutcomeSensor {
   /** Keyed `serveId\u0000instanceUuid` — amendment D's (serve_id, instance_uuid). */
   private readonly tallies = new Map<string, ServeOutcomeTally>();
 
+  /**
+   * Observations we could not attribute to a pool serve (MINOR-6).
+   *
+   * Almost all of these are the plugin's ephemeral direct channel, which is
+   * correct and expected. Counting them anyway converts "the tally is empty, so
+   * the pool must be quiet" into a checkable statement: if drops are climbing
+   * while tallies stay empty, attribution is broken, not the traffic. Silence
+   * that has not been verified is not evidence.
+   */
+  private dropped = 0;
+
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: ServeOutcomeSensorOptions) {
@@ -189,7 +200,8 @@ export class ServeOutcomeSensor {
     try {
       const attr = this.resolve(endpoint);
       if (!attr) {
-        return; // Not a pool serve — plugin direct channel, or a stale client.
+        this.dropped++; // Not a pool serve — plugin direct channel, or stale client.
+        return;
       }
 
       const outcome = classifyServeOutcome(obs);
@@ -240,11 +252,14 @@ export class ServeOutcomeSensor {
    */
   reportNow(): void {
     const tallies = this.snapshot();
-    if (tallies.length === 0) {
-      return;
-    }
+
+    // Emitted even when empty (MINOR-6). An empty tally with a rising `dropped`
+    // means attribution is broken; an empty tally with zero drops means the pool
+    // genuinely saw no daemon traffic. Those are very different, and returning
+    // early made them look identical.
     this.log("shadow-mode serve outcome tally (recorded only — routing unaffected)", {
       note: "base rate for the pigeon-886 verdict; no serve is evicted on this",
+      unattributedObservations: this.dropped,
       serves: tallies.map((t) => ({
         serveId: t.serveId,
         instanceUuid: t.instanceUuid,
@@ -255,6 +270,10 @@ export class ServeOutcomeSensor {
         excludedTimeouts: t.timeout,
         excludedClientErrors: t.clientError,
         unknown: t.unknown,
+        // Counters are cumulative, so a reader needs the time base to turn them
+        // into a rate — and to notice a daemon restart reset them (MINOR-5).
+        firstSeenAt: t.firstSeenAt,
+        lastSeenAt: t.lastSeenAt,
       })),
     });
   }
