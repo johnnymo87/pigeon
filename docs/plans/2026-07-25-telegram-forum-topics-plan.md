@@ -304,7 +304,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     502 → 200 change.
   - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
     `:525-566`.
-- [x] T2.17 Docs: migration runbook + skill updates — SHA pending commit
+- [x] T2.17 Docs: migration runbook + skill updates — `16efc79`
   - Created `docs/runbooks/telegram-forum-migration.md` providing step-by-step procedure for Telegram Forum Topics migration, burn-in, monitoring, and rollback.
   - Updated `.opencode/skills/worker-deployment/SKILL.md` with pointer to runbook and `[vars]` deploy-revert trap warning.
   - Updated `AGENTS.md` with Telegram Forum Topics architecture section and Skills TOC link.
