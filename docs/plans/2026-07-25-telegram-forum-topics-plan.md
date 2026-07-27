@@ -305,7 +305,7 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
   - Plan spec was stale: it cited `webhook.ts:472-507` for `resolveReplySession`; the real pre-edit range was
     `:525-566`.
 - [x] T2.17 Docs: migration runbook + skill updates — `16efc79`
-  - **Three factual defects found on review and fixed in `TBD2`** — all three would have misled a human
+  - **Three factual defects found on review and fixed in `cf1d8bb`** — all three would have misled a human
     executing against production:
     1. **The `pigeon-cev` gate list was wrong.** It invented a fourth item ("does Telegram return
        `message_thread_id` on callback queries?"), **dropped the real item 2** (the unverified
