@@ -3,6 +3,7 @@ import plugin from "../src/index"
 import { swarmList } from "../src/swarm-list-tool"
 import { invalidateServeAuthHeader } from "../src/serve-auth"
 import * as daemonClient from "../src/daemon-client"
+import * as directChannelModule from "../src/direct-channel"
 import type { PluginInput } from "@opencode-ai/plugin"
 import {
   OpencodeDirectMessageType,
@@ -13,15 +14,29 @@ import {
 describe("Serve HTTP Basic Auth Integration", () => {
   const origPass = process.env.OPENCODE_SERVER_PASSWORD
   const origUser = process.env.OPENCODE_SERVER_USERNAME
+  let createdChannels: directChannelModule.DirectChannelServer[] = []
 
   beforeEach(() => {
     delete process.env.OPENCODE_SERVER_PASSWORD
     delete process.env.OPENCODE_SERVER_USERNAME
     invalidateServeAuthHeader()
     daemonClient._resetBreakerForTesting()
+
+    createdChannels = []
+    const origStart = directChannelModule.startDirectChannelServer
+    vi.spyOn(directChannelModule, "startDirectChannelServer").mockImplementation(async (opts) => {
+      const channel = await origStart(opts)
+      createdChannels.push(channel)
+      return channel
+    })
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const channel of createdChannels) {
+      await channel.close().catch(() => {})
+    }
+    createdChannels = []
+
     if (origPass !== undefined) {
       process.env.OPENCODE_SERVER_PASSWORD = origPass
     } else {
