@@ -189,6 +189,7 @@ interface QueueRow {
   command_type?: string;
   directory?: string | null;
   media_json?: string | null;
+  message_thread_id?: number | null;
 }
 
 // Query D1 `commands` table (used by webhook/sessions/notifications tests)
@@ -196,7 +197,7 @@ async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
   const { results } = await env.DB.prepare(
     `SELECT command_id, machine_id, session_id, command, chat_id, status,
             0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
-            command_type, directory, media_json
+            command_type, directory, media_json, message_thread_id
      FROM commands
      WHERE session_id = ?
      ORDER BY created_at ASC`,
@@ -209,7 +210,7 @@ async function queryQueueByMachine(machineId: string): Promise<QueueRow[]> {
   const { results } = await env.DB.prepare(
     `SELECT command_id, machine_id, session_id, command, chat_id, status,
             0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
-            command_type, directory, media_json
+            command_type, directory, media_json, message_thread_id
      FROM commands
      WHERE machine_id = ?
      ORDER BY created_at ASC`,
@@ -7351,7 +7352,7 @@ describe("topics module and topicName", () => {
       const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
       expect(res.status).toBe(200);
       expect(sentPayload).not.toBeNull();
-      expect(sentPayload.text).toBe("Reply to a session notification to use this command.");
+      expect(sentPayload.text).toBe("Could not find a session for this topic.");
       expect(sentPayload.message_thread_id).toBe(threadId);
     });
 
@@ -7404,6 +7405,280 @@ describe("topics module and topicName", () => {
       expect(sentPayload).not.toBeNull();
       expect(sentPayload.text).toBe("Session not found");
       expect(sentPayload.message_thread_id).toBe(threadId);
+    });
+  });
+
+  // ─── Task T2.16: Bare slash commands resolve via topic ─────────────────
+
+  describe("Task T2.16: Bare slash commands resolve via topic", () => {
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("scenario 1 (pigeon-1xt): bare /kill in topic with service reply resolves via topic and queues command", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t216_head_${now}`;
+      const machineId = `mac_t216_head_${now}`;
+      const threadId = 992101;
+
+      await registerSession(sessionId, machineId);
+      await touchMachine(env.DB, machineId, now);
+      await reserve(env.DB, { sessionId, machineId, chatId: String(CHAT_ID_NUM), name: "test topic", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888201 } };
+        });
+
+      // Bare /kill in topic where reply_to_message.message_id === message_thread_id (ForumTopicCreated service msg)
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: threadId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toContain(`Killing session \`${sessionId}\``);
+      expect(sentPayload.message_thread_id).toBe(threadId);
+
+      // Assert command queued in D1
+      const rows = await queryQueueByMachine(machineId);
+      const killRows = rows.filter((r) => r.command_type === "kill");
+      expect(killRows.length).toBeGreaterThanOrEqual(1);
+      const killRow = killRows[killRows.length - 1]!;
+      expect(killRow.session_id).toBe(sessionId);
+      expect(killRow.message_thread_id).toBe(threadId);
+    });
+
+    it("scenario 2a: flag OFF + reply present + lookup misses => exact text 'Could not find a session for that message.'", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t216_off_${now}`;
+      const machineId = `mac_t216_off_${now}`;
+      const threadId = 992102;
+      const notifMsgId = 99210200;
+
+      await registerSession(sessionId, machineId);
+      await touchMachine(env.DB, machineId, now);
+      await reserve(env.DB, { sessionId, machineId, chatId: String(CHAT_ID_NUM), name: "test topic Off", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888202 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: notifMsgId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toBe("Could not find a session for that message.");
+    });
+
+    it("scenario 2b: flag OFF + no reply present => exact text 'Reply to a session notification to use this command.'", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+      const threadId = 992103;
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888203 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toBe("Reply to a session notification to use this command.");
+    });
+
+    it("scenario 3: precedence - genuine swipe-reply to Session A outranks topic membership for Session B", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionA = `ses_t216_prec_a_${now}`;
+      const sessionB = `ses_t216_prec_b_${now}`;
+      const machineId = `mac_t216_prec_${now}`;
+      const threadId = 992104;
+      const replyMsgId = 99210400;
+
+      await registerSession(sessionA, machineId);
+      await registerSession(sessionB, machineId);
+      await touchMachine(env.DB, machineId, now);
+
+      // Topic threadId maps to Session B
+      await reserve(env.DB, { sessionId: sessionB, machineId, chatId: String(CHAT_ID_NUM), name: "test topic B", now });
+      await finalize(env.DB, { sessionId: sessionB, messageThreadId: threadId, now });
+
+      // replyMsgId maps to Session A
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: replyMsgId,
+        sessionId: sessionA,
+        token: `token_t216_prec_${now}`,
+      });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888204 } };
+        });
+
+      // Swipe reply to replyMsgId inside threadId
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: replyMsgId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toContain(`Killing session \`${sessionA}\``);
+
+      const rows = await queryQueueByMachine(machineId);
+      const killRows = rows.filter((r) => r.command_type === "kill");
+      expect(killRows.length).toBeGreaterThanOrEqual(1);
+      expect(killRows[killRows.length - 1]!.session_id).toBe(sessionA);
+    });
+
+    it("scenario 4: fall-through - swipe-reply missing from messages table falls through to topic membership", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t216_fall_${now}`;
+      const machineId = `mac_t216_fall_${now}`;
+      const threadId = 992105;
+      const missingReplyMsgId = 99210500; // Not inserted into messages table
+
+      await registerSession(sessionId, machineId);
+      await touchMachine(env.DB, machineId, now);
+
+      await reserve(env.DB, { sessionId, machineId, chatId: String(CHAT_ID_NUM), name: "test topic Fall", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888205 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: missingReplyMsgId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toContain(`Killing session \`${sessionId}\``);
+
+      const rows = await queryQueueByMachine(machineId);
+      const killRows = rows.filter((r) => r.command_type === "kill");
+      expect(killRows.length).toBeGreaterThanOrEqual(1);
+      expect(killRows[killRows.length - 1]!.session_id).toBe(sessionId);
+    });
+
+    it("scenario 5: isMachineRecent gate still bites when resolved via topic membership", async () => {
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const now = Date.now();
+      const sessionId = `ses_t216_stale_${now}`;
+      const machineId = `mac_t216_stale_${now}`; // Machine not touched -> isMachineRecent returns false
+      const threadId = 992106;
+
+      await registerSession(sessionId, machineId);
+      await reserve(env.DB, { sessionId, machineId, chatId: String(CHAT_ID_NUM), name: "test topic Stale", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: { body?: string | Buffer | null }) => {
+          sentPayload = JSON.parse(String(opts.body));
+          return { ok: true, result: { message_id: 888206 } };
+        });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: "/kill",
+          message_thread_id: threadId,
+          reply_to_message: { message_id: threadId },
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+      expect(sentPayload).not.toBeNull();
+      expect(sentPayload.text).toBe(`${machineId} is not recently seen.`);
     });
   });
 });

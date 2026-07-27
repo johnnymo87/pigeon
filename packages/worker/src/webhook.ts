@@ -306,6 +306,19 @@ async function answerCallbackQuery(
 }
 
 /**
+ * Note: in a non-forum supergroup that uses reply threads, message_thread_id is the
+ * thread-root message id, so a genuine reply to that root would be suppressed by the
+ * guard. This is accepted because the target chat is a forum supergroup; and even when
+ * it misfires the message falls through to topic membership, which resolves to the same session.
+ */
+function isTopicServiceReply(message: TelegramMessage): boolean {
+  return (
+    message.message_thread_id !== undefined &&
+    message.reply_to_message?.message_id === message.message_thread_id
+  );
+}
+
+/**
  * Resolve a session from an inbound Telegram message.
  * Returns { sessionId, command, questionRequestId? } or null if no session found.
  *
@@ -333,16 +346,8 @@ async function resolveMessageSession(
   const chatId = String(message.chat.id);
   const text = message.text || message.caption || "";
 
-  // Note: in a non-forum supergroup that uses reply threads, message_thread_id is the
-  // thread-root message id, so a genuine reply to that root would be suppressed by the
-  // guard. This is accepted because the target chat is a forum supergroup; and even when
-  // it misfires the message falls through to topic membership, which resolves to the same session.
-  const isTopicServiceReply =
-    message.message_thread_id !== undefined &&
-    message.reply_to_message?.message_id === message.message_thread_id;
-
   // Try 1: reply-to-message lookup
-  if (message.reply_to_message && !isTopicServiceReply) {
+  if (message.reply_to_message && !isTopicServiceReply(message)) {
     const mapping = await lookupMessage(db, chatId, message.reply_to_message.message_id);
     if (mapping) {
       const result: { sessionId: string; command: string; questionRequestId?: string } = {
@@ -518,8 +523,8 @@ async function queueCommand(
 }
 
 /**
- * Resolve a session from a reply-to-message.
- * Used by /kill, /compact, /mcp, /model commands.
+ * Resolve a session from a reply-to-message or topic membership.
+ * Used by /kill, /interrupt, /compact, /mcp, /model commands.
  * Returns session info or sends an error to Telegram and returns null.
  */
 async function resolveReplySession(
@@ -530,24 +535,41 @@ async function resolveReplySession(
   const chatId = message.chat.id;
   const messageThreadId = message.message_thread_id;
 
-  if (!message.reply_to_message) {
-    await sendTelegramMessage(env, chatId, "Reply to a session notification to use this command.", { messageThreadId });
-    return null;
+  let sessionId: string | null = null;
+  let triedReply = false;
+
+  // Try 1: swipe-reply, unless it is the topic's ForumTopicCreated service message
+  if (message.reply_to_message && !isTopicServiceReply(message)) {
+    triedReply = true;
+    const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
+    if (mapping) sessionId = mapping.session_id;
   }
 
-  const mapping = await lookupMessage(db, String(chatId), message.reply_to_message.message_id);
-  if (!mapping) {
-    await sendTelegramMessage(env, chatId, "Could not find a session for that message.", { messageThreadId });
+  // Try 2: topic membership — MUST be gated on the flag
+  if (!sessionId && topicsEnabled(env) && messageThreadId !== undefined) {
+    const topic = await getByThread(db, String(chatId), messageThreadId);
+    if (topic) sessionId = topic.session_id;
+  }
+
+  if (!sessionId) {
+    // topic-aware message only when the flag is on AND we are in a topic
+    const text =
+      topicsEnabled(env) && messageThreadId !== undefined
+        ? "Could not find a session for this topic."
+        : triedReply
+          ? "Could not find a session for that message."
+          : "Reply to a session notification to use this command.";
+    await sendTelegramMessage(env, chatId, text, { messageThreadId });
     return null;
   }
 
   const session = await db
     .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-    .bind(mapping.session_id)
+    .bind(sessionId)
     .first<{ machine_id: string; label: string | null }>();
 
   if (!session) {
-    await sendTelegramMessage(env, chatId, `Session \`${mapping.session_id}\` not found.`, { messageThreadId });
+    await sendTelegramMessage(env, chatId, `Session \`${sessionId}\` not found.`, { messageThreadId });
     return null;
   }
 
@@ -557,7 +579,7 @@ async function resolveReplySession(
     return null;
   }
 
-  return { sessionId: mapping.session_id, machineId: session.machine_id, label: session.label };
+  return { sessionId, machineId: session.machine_id, label: session.label };
 }
 
 /**

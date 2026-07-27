@@ -272,7 +272,12 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
     > (which this plan has twice refused to do, at T2.6 and T2.7) *and* making the wrapper stop discarding
     > `TgResult` across all 22 sites — a riskier change than T2.15 itself. Resolve item 3, then either
     > close `pigeon-cal` or mirror T2.8: on a non-429 failure with a thread id, retry once without it.
-- [ ] T2.16 Worker: bare slash commands resolve via topic
+- [x] T2.16 Worker: bare slash commands resolve via topic — worker 267 → **277** tests, typecheck clean.
+  - Extracted shared module-level `isTopicServiceReply(message: TelegramMessage): boolean` helper (with non-forum supergroup thread-root comment carried) used by both `resolveMessageSession` and `resolveReplySession`.
+  - Rewrote `resolveReplySession` to 2 ordered attempts: Try 1 (swipe-reply, unless service reply) → Try 2 (topic membership, gated on `topicsEnabled(env)`). Falling through lets evicted swipe-replies still resolve via topic.
+  - Failure message selection uses `triedReply` boolean flag so flag-off behavior is byte-identical: reply present & lookup misses ⇒ `"Could not find a session for that message."`; no reply ⇒ `"Reply to a session notification to use this command."`. Flag-on in topic ⇒ `"Could not find a session for this topic."`.
+  - Non-vacuity proven via injections: removing `isTopicServiceReply` broke T2.13(b); removing `topicsEnabled` gate on Try 2 broke scenario 2a (resolved topic with flag OFF); hoisting Try 2 above Try 1 broke scenario 3 (topic membership outranked genuine swipe reply).
+  - Note on spec line numbers: spec listed `webhook.ts:472-507`, actual pre-edit range was `:525-566`.
 - [ ] T2.17 Docs: migration runbook + skill updates
 - [ ] **Checkpoint 2** — adversarial review, then execute the runbook (**DDL before deploy**)
 
