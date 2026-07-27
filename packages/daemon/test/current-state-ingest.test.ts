@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ingestCurrentStateCommand, type CurrentStateIngestInput } from "../src/worker/current-state-ingest";
+import { ingestCurrentStateCommand, buildCardNotification, type CurrentStateIngestInput } from "../src/worker/current-state-ingest";
 
 describe("current-state-ingest TDD tests", () => {
   it("1. Happy path / ordering / no cap", async () => {
@@ -499,5 +499,47 @@ describe("current-state-ingest TDD tests", () => {
 
     expect(registerSession).not.toHaveBeenCalled();
     expect(sendCard).not.toHaveBeenCalled();
+  });
+
+  describe("buildCardNotification", () => {
+    it("builds a card notification with threaded: false and byte-identical payload shape", () => {
+      const entities = [{ type: "bold", offset: 0, length: 4 }];
+      const payload = buildCardNotification({
+        sessionId: "ses_123",
+        chatId: "chat_456",
+        text: "Card text",
+        entities: entities as any,
+      });
+
+      expect(payload).toEqual({
+        sessionId: "ses_123",
+        chatId: "chat_456",
+        text: "Card text",
+        replyMarkup: { inline_keyboard: [] },
+        entities,
+        threaded: false,
+      });
+      expect(payload.threaded).toBe(false);
+    });
+
+    it("passes through entities as undefined when entities is undefined", () => {
+      const payload = buildCardNotification({
+        sessionId: "ses_123",
+        chatId: "chat_456",
+        text: "Card text",
+        entities: undefined,
+      });
+
+      expect(payload.entities).toBeUndefined();
+      expect("entities" in payload).toBe(true);
+      expect(payload).toEqual({
+        sessionId: "ses_123",
+        chatId: "chat_456",
+        text: "Card text",
+        replyMarkup: { inline_keyboard: [] },
+        entities: undefined,
+        threaded: false,
+      });
+    });
   });
 });

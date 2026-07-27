@@ -23,7 +23,7 @@ import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
-import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
+import { ingestCurrentStateCommand, buildCardNotification } from "./worker/current-state-ingest";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
@@ -253,13 +253,14 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
             sendCard: (sid, text, entities) =>
-              poller!.sendNotification({
-                sessionId: sid,
-                chatId: msg.chatId,
-                text,
-                replyMarkup: { inline_keyboard: [] },
-                entities,
-              })
+              poller!.sendNotification(
+                buildCardNotification({
+                  sessionId: sid,
+                  chatId: msg.chatId,
+                  text,
+                  entities,
+                }),
+              )
                 .then((res) => {
                   if (!res.ok) {
                     throw new Error("sendNotification returned ok=false");
