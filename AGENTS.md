@@ -158,6 +158,14 @@ Health check URLs are listed in the Quickstart section above.
 - [swarm-operations](.opencode/skills/swarm-operations/SKILL.md)
   - Use for swarm health checks, inspecting messages, debugging stuck deliveries, and reading the arbiter log.
 
+### Serve Pool / Routing Registry
+
+- [serve-pool-registry](.opencode/skills/serve-pool-registry/SKILL.md)
+  - **Read before spawning ANY `opencode serve`** (directly, from a script, or
+    transitively via a test harness) — your bash env carries a live pool identity.
+    Also for diagnosing a slot pointing at a dead port, stuck draining, or 500ing
+    every prompt.
+
 ### Cross-Cutting
 
 - [secrets-and-auth](.opencode/skills/secrets-and-auth/SKILL.md)

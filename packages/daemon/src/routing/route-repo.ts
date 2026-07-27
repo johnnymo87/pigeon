@@ -137,6 +137,38 @@ export class ServeInstanceRepo {
       );
   }
 
+  /**
+   * Reassert the CONFIGURED endpoint for a pool slot, fenced on the value we
+   * observed. Returns true when the row was actually rewritten.
+   *
+   * Deliberately touches the `endpoint` column ONLY. Every other column on this
+   * row is owned by the serve process itself:
+   *
+   *  - `instance_uuid` is written only by the serve's `registerSelf`. Pigeon
+   *    minting a fresh uuid here would make `placeSession` stamp leases with a
+   *    uuid the live serve does not recognise, so the serve's own lease CAS
+   *    matches 0 rows, fails closed, and every prompt 500s. That is damage #2 of
+   *    the 2026-07-25 incident — a full-row reassert would recreate it from
+   *    pigeon's own hand on every tick.
+   *  - `health_state` / `heartbeat_at` / `binary_epoch` / `draining` are the
+   *    serve's liveness signal; overwriting them would either fake liveness for
+   *    a dead serve or kill a live one.
+   *
+   * The `endpoint = expectedPrevious` fence means a real `registerSelf` that
+   * lands between our read and our write always wins, and we simply re-observe
+   * on the next tick instead of clobbering a newer truth.
+   */
+  reassertEndpoint(serveId: string, endpoint: string, expectedPrevious: string): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE serve_instance
+         SET endpoint = ?
+         WHERE serve_id = ? AND endpoint = ?`,
+      )
+      .run(endpoint, serveId, expectedPrevious);
+    return res.changes > 0;
+  }
+
   setHealthState(serveId: string, state: "healthy" | "unhealthy" | "unknown"): void {
     this.db
       .prepare(
