@@ -81,11 +81,18 @@ copy `-wal`/`-shm` too, or read through SQLite.
    different repos). Dropping it from a unit silently disarms the fence — see
    `pigeon-r2e` for the flip to fail-closed.
 
-2. **Serve self-heal** (~30s). The serve repairs its OWN row: `instance_uuid`,
-   `endpoint`, and a *foreign* `draining`. Uses a dedicated UPDATE, not `registerSelf`,
-   because `registerSelf` re-reads `binary_epoch` and would let a stale binary rejoin
-   the pool. **Respects a `draining=1` whose identity is intact** — that is the
-   operator's eviction lever, not damage.
+2. **Serve self-heal** (~30s, main thread). The serve repairs its OWN row:
+   `instance_uuid`, `endpoint`, and a *foreign* `draining`. Uses a dedicated UPDATE,
+   not `registerSelf`, because `registerSelf` re-reads `binary_epoch` and would let a
+   stale binary rejoin the pool. It is a **no-op unless the row's `instance_uuid` OR
+   `endpoint` disagrees with the serve's own** — so a merely-wedged serve never
+   triggers it.
+
+   Respects a `draining=1` whose identity is intact — the operator's eviction lever.
+   **But that guarantee breaks under config skew** (`pigeon-amr`): the reconciler is a
+   foreign writer of `endpoint`, so a skewed slot looks hijacked, self-heal fires, and
+   clearing `draining` is one of its side effects. During skew the drain lever does
+   not hold.
 
 3. **Pigeon endpoint reconciler** (5s, `packages/daemon/src/routing/endpoint-reconciler.ts`).
    Makes `PIGEON_SERVE_ENDPOINTS` authoritative for `endpoint`, **that column only**.
@@ -131,12 +138,31 @@ readlink -f ~/.nix-profile/bin/opencode | grep -o 'patched-[0-9.]*'   # need >= 
 - **Never `home-manager switch` from inside an OpenCode session** — it swaps the binary
   and kills the session mid-switch (`users/dev/home.base.nix:271`).
 
+## Why liveness ≠ health
+
+The serve heartbeat (5s) writes `health_state='healthy'` **unconditionally**, and it
+runs on a **worker thread** so it survives main-loop starvation. It attests *"a worker
+can write SQLite"*, not *"the serve can serve"*. That is the whole of `pigeon-886`, and
+it is why a wedged serve stays routable. Note the consequences:
+
+- Nothing else asserting health matters much by comparison — any other writer is
+  slower and gets overwritten within 5s.
+- **Do not "fix" this by having pigeon write `health_state='unhealthy'`.** Pigeon's
+  `setHealth` touches the same two columns (`health_state`, `heartbeat_at`) at the same
+  5s cadence, so the two writers just fight and the slot flaps. Flapping also poisons
+  evacuation, because `reassignFromDeadServe` → `placeSession` picks from the healthy
+  set *at that instant*.
+
 ## Related
 
-- `pigeon-886` — a serve that heartbeats but cannot answer HTTP stays routed forever.
-  **None of the above fixes this.**
-- `pigeon-zjv` — self-heal makes a partially-wedged serve self-restoring, widening 886.
+- `pigeon-886` — liveness/reachability decoupling. **None of the above fixes this.**
+  Bounded to ~8min by the canary, not unbounded.
+- `pigeon-amr` — self-heal clears the operator's drain lever under config skew.
+- `pigeon-f2a` — flap-transition alerting.
+- `pigeon-ntk` — verification items blocking the 886 design.
 - `pigeon-r2e` — fail-closed flip, harness allowlist, runbook.
 - `pigeon-13p` — closed; the original hijack bug.
+- `pigeon-zjv` — closed as FALSIFIED; read its correction note before re-proposing a
+  self-probe in self-heal.
 - workstation `.opencode/skills/monitoring-serve-pool` — the canary that restarts a
   wedged instance (1-min timer, 7-failure threshold).
