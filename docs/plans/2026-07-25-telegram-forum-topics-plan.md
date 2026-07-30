@@ -366,6 +366,38 @@ Single test file: `npx vitest run test/<file>.test.ts` from inside the package d
       T2.15/T2.16. This measures **Telegram's behaviour**, not the new code, which is why it is valid
       regardless of deployed version. And after the F2 fix the flag-off path no longer *depends* on this
       fact — the guard is gated — so this is now belt-and-braces rather than load-bearing. Both are good.
+  - ### ✅ ALL FOUR `pigeon-cev` QUESTIONS ANSWERED AGAINST THE LIVE API (2026-07-28) — bead CLOSED.
+    Supergroup **"Pigeon V2"**, `-1004391832753`, `is_forum: true`; bot verified `administrator` with
+    `can_manage_topics` and `can_delete_messages` (via `getChatMember` — note `getChatAdministrators`
+    omits bots by design, so an id-bot's admin list showing only the human is expected, not a fault).
+    Answered with **direct `curl` probes and no flag flip**: create → post → close → post → reopen →
+    reopen again → delete → post. None of our code was involved, which is what made this possible
+    before the flip rather than after.
+    1. **`[vars]` trap** — documented in the runbook.
+    2. **The `thread_not_found` classifier is CORRECT.** Posting into a deleted topic returns
+       `400 "Bad Request: message thread not found"`, and `telegram.ts:134` tests
+       `description.includes("thread not found")` ⇒ matches. **The unverified T1.3 guess was right.**
+       T2.7 stale-thread recovery works; no stale rows, no double-hitting.
+    3. **An admin bot CAN post into a CLOSED topic** — `sendMessage` into a closed thread returned
+       `ok: true` and delivered. Two consequences: **T2.6's reopen-before-send is belt-and-braces, not
+       load-bearing** (one wasted call per notification to a closed topic, which is real against the
+       ~20/min per-group cap and is a future optimisation), and it **decides `pigeon-cal`** — see below.
+    4. **Reopening an already-open topic returns `400 "Bad Request: TOPIC_NOT_MODIFIED"`** — exactly what
+       the code comments guessed. It is a generic non-429/non-`thread_not_found` error, so F1's
+       `markOpen` branch handles it correctly, and we now know that branch is the **common** path for the
+       D1-closed/Telegram-open divergence rather than a rarity.
+  - **`pigeon-cal` downgraded P1 → P2 and rescoped.** Its closed-topic half is a **non-issue**: finding 3
+    means the ack is delivered, so the missing General fallback costs nothing there. What survives is only
+    the F5 429 half, which `pigeon-cev` item 3 does not settle and which no observed load has ever
+    triggered; the deferred chat-level rate gate is the designed response.
+  - **Worth doing, not blocking:** now that the string is known, classify `TOPIC_NOT_MODIFIED` explicitly so
+    `markOpen` fires only on the true "already open" signal rather than on any generic failure. That retires
+    the trade recorded at Checkpoint 2b (a genuine reopen failure currently marks the row open and is never
+    retried again). Lower value now, since finding 3 makes the whole reopen path optional.
+  - > **⚠️ THE NIGHTLY RESET PRUNED THE WORKTREE MID-SESSION AT 03:25, FOR THE SECOND TIME.**
+    > Nothing was lost — everything was committed and pushed to `origin/main` (`d110d22`) and recovery was
+    > one `git worktree add`. This is the second occurrence in two days; treat the commit-at-every-task-
+    > boundary rule as load-bearing, not advisory.
   - **Remaining before the flip:** `pigeon-cev` (four live-Telegram questions), `pigeon-cal` (decided by `cev` item 3 for the closed-topic half; F5 needs its own call), `pigeon-5o7`, `pigeon-wly`, and the manual DM swipe-reply check. `pigeon-1xt` is **CLOSED** — T2.15 and T2.16 landed.
 
 ---
