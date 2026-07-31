@@ -754,4 +754,58 @@ describe("OutboxSender start/stop", () => {
       expect(sendNotification).toHaveBeenCalledTimes(2);
     }
   });
+
+  it("a 429 during card drain results in retry, NOT loss (bug fix verification)", async () => {
+    // Enqueue a card notification with kind 'card'
+    const cardId = "cs:cmd-card-1:ses_1";
+    storage.outbox.upsert({
+      notificationId: cardId,
+      sessionId: "ses_1",
+      requestId: "cs-cs:cmd-card-1:ses_1",
+      kind: "card",
+      payload: JSON.stringify({
+        message: { text: "🟢 active Session 1", entities: [] },
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: cardId,
+        threaded: false,
+      }),
+      token: "tok-card-1",
+    }, 1_000);
+
+    let sendCount = 0;
+    const sendNotification = vi.fn().mockImplementation(async () => {
+      sendCount++;
+      if (sendCount === 1) {
+        return { ok: false, kind: "rate_limited", retryAfter: 10 };
+      }
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // First attempt hits 429
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    // Verify entry is NOT lost/failed, but remains retryable
+    const recordAfter429 = storage.outbox.getByNotificationId(cardId);
+    expect(recordAfter429).not.toBeNull();
+    expect(recordAfter429!.state).toBe("queued");
+    expect(recordAfter429!.attempts).toBe(1);
+    expect(recordAfter429!.nextRetryAt).toBeGreaterThan(now);
+
+    // Fast-forward past pause + retry backoff (10s pause = 10,000ms)
+    now += 15_000;
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    const recordAfterRetry = storage.outbox.getByNotificationId(cardId);
+    expect(recordAfterRetry!.state).toBe("sent");
+  });
 });

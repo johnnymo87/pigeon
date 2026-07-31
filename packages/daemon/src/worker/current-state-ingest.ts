@@ -49,7 +49,12 @@ export interface CurrentStateIngestInput {
   };
   enumerate: () => Promise<{ sids: string[]; homeScreenCount: number }>;
   registerSession: (sid: string, label: string) => Promise<WorkerResult>;
-  sendCard: (sid: string, text: string, entities: TgEntity[] | undefined) => Promise<void>;
+  enqueueCard: (opts: {
+    sid: string;
+    text: string;
+    entities: TgEntity[] | undefined;
+    notificationId: string;
+  }) => void;
   sendPlainText: (text: string, entities?: TgEntity[]) => Promise<void>;
   now?: number; // for deterministic relative-time in tests
 }
@@ -118,11 +123,15 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
   await input.sendPlainText(index.text, index.entities);
 
   // Cards (no cap)
-  // invariant: registerSession MUST precede sendCard per record (the worker swipe-reply handle won't resolve otherwise).
+  // invariant: registerSession MUST precede enqueueCard per record (the worker swipe-reply handle won't resolve otherwise).
   // This loop is intentionally sequential.
   for (const r of records) {
     try {
-      await input.registerSession(r.sid, r.title);
+      const regResult = await input.registerSession(r.sid, r.title);
+      if (!regResult.ok) {
+        console.warn(`[current-state-ingest] registerSession failed for ${r.sid}:`, regResult);
+        continue;
+      }
       const card = formatStateCard(
         {
           title: r.title,
@@ -135,9 +144,15 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
         },
         input.now,
       );
-      await input.sendCard(r.sid, card.text, card.entities);
+      const notificationId = `cs:${input.commandId}:${r.sid}`;
+      input.enqueueCard({
+        sid: r.sid,
+        text: card.text,
+        entities: card.entities,
+        notificationId,
+      });
     } catch (e) {
-      console.warn(`[current-state-ingest] failed to register or send card for ${r.sid}:`, e);
+      console.warn(`[current-state-ingest] failed to register or enqueue card for ${r.sid}:`, e);
     }
   }
 }
