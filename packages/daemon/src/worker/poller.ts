@@ -515,7 +515,7 @@ export class Poller {
     }
   }
 
-  /** Returns the chatId from config (used by WorkerNotificationService). */
+  /** Returns the chatId from config. */
   getConfiguredChatId(): string | undefined {
     return this.config.chatId;
   }

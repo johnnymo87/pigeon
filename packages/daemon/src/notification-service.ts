@@ -58,19 +58,6 @@ export interface StopNotifier {
   sendPlainAlert?(text: string, severity: AlertSeverity): Promise<void>;
 }
 
-export interface WorkerNotificationSender {
-  sendNotification(
-    input: SendNotificationInput,
-  ): Promise<WorkerResult>;
-
-  uploadMedia?(
-    key: string,
-    data: ArrayBuffer,
-    mime: string,
-    filename: string,
-  ): Promise<{ ok: boolean; key: string }>;
-}
-
 const EVENT_EMOJIS: Record<string, string> = {
   Stop: "✅",
   Error: "❌",
@@ -394,40 +381,3 @@ export class TelegramNotificationService implements StopNotifier {
     }
   }
 }
-
-export class WorkerNotificationService implements StopNotifier {
-  constructor(
-    _storage: StorageDb,
-    _workerSender: WorkerNotificationSender,
-    _chatId: string,
-    _nowFn: () => number = Date.now,
-    _machineId?: string,
-  ) {}
-}
-
-export class FallbackNotifier implements StopNotifier {
-  constructor(
-    private readonly primary: StopNotifier,
-    private readonly fallback: StopNotifier,
-  ) {}
-
-  async sendPlainAlert(text: string, severity: AlertSeverity): Promise<void> {
-    if (this.primary.sendPlainAlert) {
-      try {
-        await this.primary.sendPlainAlert(text, severity);
-        return;
-      } catch (err) {
-        if (err instanceof RateLimitError) {
-          throw err;
-        }
-        // fall through to fallback
-      }
-    }
-    if (this.fallback.sendPlainAlert) {
-      await this.fallback.sendPlainAlert(text, severity);
-    }
-  }
-}
-
-/** @deprecated Use FallbackNotifier instead */
-export const FallbackStopNotifier = FallbackNotifier;

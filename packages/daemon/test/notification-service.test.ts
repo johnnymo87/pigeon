@@ -4,7 +4,6 @@ import {
   formatQuestionNotification,
   formatQuestionWizardStep,
   TelegramNotificationService,
-  FallbackNotifier,
   RateLimitError,
   relativeTime,
   formatStateCard,
@@ -641,37 +640,6 @@ describe("current-state formatting helpers", () => {
 
       expect(index2.text).toContain("1 main session(s) · 0 🟢 active · 1 ⚪ idle");
       expect(index2.text).not.toContain("on home screen");
-    });
-  });
-
-  describe("FallbackNotifier with RateLimitError", () => {
-    it("does not fall back to direct Telegram on a rate limit", async () => {
-      const primary = {
-        sendPlainAlert: vi.fn().mockRejectedValue(new RateLimitError("rate limited", 30)),
-      };
-      const fallback = {
-        sendPlainAlert: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const notifier = new FallbackNotifier(primary, fallback);
-
-      await expect(notifier.sendPlainAlert("test alert", "info")).rejects.toThrow(RateLimitError);
-
-      expect(fallback.sendPlainAlert).not.toHaveBeenCalled();
-    });
-
-    it("falls back to secondary notifier on ordinary error", async () => {
-      const primary = {
-        sendPlainAlert: vi.fn().mockRejectedValue(new Error("network error")),
-      };
-      const fallback = {
-        sendPlainAlert: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const notifier = new FallbackNotifier(primary, fallback);
-
-      await notifier.sendPlainAlert("test alert", "info");
-      expect(fallback.sendPlainAlert).toHaveBeenCalledTimes(1);
     });
   });
 });

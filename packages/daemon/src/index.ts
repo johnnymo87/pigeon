@@ -1,9 +1,7 @@
 import { createApp } from "./app";
 import { loadConfig } from "./config";
 import {
-  FallbackStopNotifier,
   TelegramNotificationService,
-  WorkerNotificationService,
   generateToken,
   type StopNotifier,
 } from "./notification-service";
@@ -399,17 +397,11 @@ if (poller) {
   });
 }
 
-const workerNotifier = poller && config.telegramChatId
-  ? new WorkerNotificationService(storage, poller, config.telegramChatId, Date.now, config.machineId)
-  : undefined;
-
 const telegramNotifier = config.telegramBotToken && config.telegramChatId
   ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
   : undefined;
 
-const notifier: StopNotifier | undefined = workerNotifier && telegramNotifier
-  ? new FallbackStopNotifier(workerNotifier, telegramNotifier)
-  : (workerNotifier ?? telegramNotifier);
+const notifier: StopNotifier | undefined = telegramNotifier;
 
 // Registry endpoint fencing (bead pigeon-13p). PIGEON_SERVE_ENDPOINTS is the
 // authority for a pool slot's endpoint; the registry row is not. Any process that
@@ -426,14 +418,13 @@ const notifier: StopNotifier | undefined = workerNotifier && telegramNotifier
 // the failure mode this whole bead is about.
 //
 // NOTE on alert delivery: `StopNotifier.sendPlainAlert` is OPTIONAL
-// (notification-service.ts) and `WorkerNotificationService` does not implement it,
-// so on a host with no TELEGRAM_BOT_TOKEN the notifier resolves to worker-only and
-// drift alerts are silently dropped. The repair still happens. The startup line
-// below states which of the two it is, so an undeliverable alert is visible once
-// rather than invisible forever. Cannot use the durable outbox here: the worker's
-// POST /notifications/send 404s unless `sessionId` exists in its sessions table,
-// and an operational alert has no session — it would retry 10x and be marked
-// failed with no user-visible signal.
+// (notification-service.ts), so on a host with no TELEGRAM_BOT_TOKEN there is no
+// plain-alert notifier at all and drift alerts are dropped. The repair still happens.
+// The startup line below states which of the two it is, so an undeliverable alert
+// is visible once rather than invisible forever. Cannot use the durable outbox here:
+// the worker's POST /notifications/send 404s unless `sessionId` exists in its
+// sessions table, and an operational alert has no session — it would retry 10x and
+// be marked failed with no user-visible signal.
 const endpointReconciler = ingressRouter
   ? new ServeEndpointReconciler({
       serves: storage.serves,
