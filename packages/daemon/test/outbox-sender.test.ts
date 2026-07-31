@@ -1009,7 +1009,42 @@ describe("classified delivery failure actions", () => {
     expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
   });
 
-  it("404 + register fails with 4xx -> terminal", async () => {
+  it("404 + register fails with a definitive 4xx -> terminal", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 400,
+      body: { error: "sessionId and machineId required" },
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+  });
+
+  // A register 429 is "Session limit reached" (packages/worker/src/sessions.ts:69) — a CAPACITY
+  // condition that clears as other sessions are unregistered, not a property of this message.
+  // Terminal here would be permanent loss; retry is bounded by the normal attempt budget.
+  it("404 + register fails with 429 session-limit -> retryable, NOT terminal", async () => {
     storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
@@ -1038,7 +1073,43 @@ describe("classified delivery failure actions", () => {
     await sender.processOnce();
 
     expect(registerSession).toHaveBeenCalledTimes(1);
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+    // The re-register flag must NOT be consumed, so a later attempt can try again.
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(1);
+  });
+
+  // app_rejection is HTTP 2xx carrying ok:false — inherently ambiguous, so it must retry.
+  // Unreachable from /sessions/register today; pinned so it cannot regress into data loss.
+  it("404 + register fails with app_rejection -> retryable, NOT terminal", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "app_rejection",
+      status: 200,
+      body: { ok: false },
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
   });
 
   it("403 at attempts 0 -> retry; 403 at attempts 2 -> terminal", async () => {

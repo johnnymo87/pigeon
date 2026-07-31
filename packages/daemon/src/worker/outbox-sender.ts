@@ -316,9 +316,33 @@ export class OutboxSender {
                   });
                   break;
                 } else {
+                  // Terminal ONLY on a DEFINITIVE 4xx. Everything ambiguous retries.
+                  //
+                  // This asymmetry is deliberate and is the whole point of the cycle that
+                  // introduced it: the failure mode being designed against is losing a message
+                  // FASTER than the old blind-retry loop did. A wrong "retry" costs a few
+                  // attempts out of a bounded budget; a wrong "terminal" is permanent data loss.
+                  //
+                  // - transport_error / 5xx: the worker is briefly down. This is exactly the
+                  //   2026-07-15 incident (bead pigeon-6be), which self-healed about two hours
+                  //   later with no restart. Terminal here would lose the message precisely when
+                  //   a plain retry would have saved it.
+                  // - app_rejection is HTTP 2xx carrying ok:false. POST /sessions/register cannot
+                  //   currently produce it (packages/worker/src/sessions.ts returns 400, 429, or
+                  //   200 ok:true), so this arm is unreachable today. It is written as retryable
+                  //   anyway: "2xx but not ok" is inherently ambiguous, and if the worker ever
+                  //   starts reporting a transient D1 failure that way, the safe default must
+                  //   already be in place. Do not "simplify" this to terminal.
+                  // - 429 "Session limit reached" (sessions.ts:69) is a CAPACITY condition that
+                  //   clears as other sessions are unregistered, not a property of this message.
+                  //   It also carries no retryAfter, so it must never reach the pause path.
+                  //   Retrying is bounded by the normal attempt budget, so the cost of being
+                  //   wrong is a few attempts; the cost of terminal is the message.
                   const isTransient =
                     regResult.kind === "transport_error" ||
-                    ((regResult.kind === "http_error" || regResult.kind === "app_rejection") && regResult.status >= 500);
+                    regResult.kind === "app_rejection" ||
+                    (regResult.kind === "http_error" &&
+                      (regResult.status >= 500 || regResult.status === 429));
 
                   if (isTransient) {
                     const backoff = getBackoff(entry.attempts);
