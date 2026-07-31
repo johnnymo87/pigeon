@@ -1,5 +1,12 @@
 # Telegram Forum Topics Implementation Plan
 
+> **✅ SHIPPED 2026-07-31.** `TELEGRAM_TOPICS_ENABLED` is `"true"` in production (worker
+> `5c7381f3`), the daemon points at supergroup `-1004391832753`, and topics are being created
+> per session. **Follow-on work has moved to
+> [`2026-07-31-delivery-hardening-roadmap.md`](2026-07-31-delivery-hardening-roadmap.md)**
+> (bead `pigeon-l0w`). This file remains the authoritative record of *why* each guard in the
+> topic code exists — read Checkpoint 2a and 2b before changing any of it.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Move Pigeon from a single Telegram DM to a forum supergroup where each opencode session gets its own topic, named from its TUI session title.
