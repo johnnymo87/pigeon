@@ -3,7 +3,7 @@ import { handleSendNotification, handleEditNotification } from "./notifications"
 import { handleTelegramWebhook } from "./webhook";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
-import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert } from "./d1-ops";
+import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper } from "./topic-reaper";
 
 export default {
@@ -73,6 +73,11 @@ export default {
       await checkSessionHighWaterAlert(env.DB, env);
     } catch (err) {
       console.error("Session high-water alert failed:", err);
+    }
+    try {
+      await sweepStaleSessions(env.DB);
+    } catch (err) {
+      console.error("Stale session sweep failed:", err);
     }
     try {
       await runTopicReaper(env.DB, env);

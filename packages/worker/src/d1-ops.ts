@@ -351,3 +351,47 @@ export async function checkSessionHighWaterAlert(
 
   return { count, alerted };
 }
+
+// ─── sweepStaleSessions ───────────────────────────────────────────────────────
+
+export const SESSION_SWEEP_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
+/**
+ * Sweep stale sessions whose updated_at is older than SESSION_SWEEP_TTL_MS (14 days).
+ * Deletes associated messages rows as well in a single transactional db.batch.
+ * Bounds batch size with a subquery LIMIT (default 500).
+ *
+ * Returns counts of deleted sessions and messages.
+ */
+export async function sweepStaleSessions(
+  db: D1Database,
+  opts?: {
+    now?: number;
+    limit?: number;
+    ttlMs?: number;
+  },
+): Promise<{ sessionsDeleted: number; messagesDeleted: number }> {
+  const ttlMs = opts?.ttlMs ?? SESSION_SWEEP_TTL_MS;
+  const cutoff = (opts?.now ?? Date.now()) - ttlMs;
+  const limit = opts?.limit ?? 500;
+
+  const results = await db.batch([
+    db.prepare(
+      `DELETE FROM messages
+       WHERE session_id IN (
+         SELECT session_id FROM sessions WHERE updated_at < ? ORDER BY updated_at LIMIT ?
+       )`,
+    ).bind(cutoff, limit),
+    db.prepare(
+      `DELETE FROM sessions
+       WHERE session_id IN (
+         SELECT session_id FROM sessions WHERE updated_at < ? ORDER BY updated_at LIMIT ?
+       )`,
+    ).bind(cutoff, limit),
+  ]);
+
+  return {
+    messagesDeleted: results[0]?.meta.rows_written ?? 0,
+    sessionsDeleted: results[1]?.meta.rows_written ?? 0,
+  };
+}

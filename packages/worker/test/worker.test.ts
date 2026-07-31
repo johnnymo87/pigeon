@@ -4,6 +4,7 @@
  */
 import { env, SELF, fetchMock } from "cloudflare:test";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { SESSION_TTL_MS as DAEMON_SESSION_TTL_MS } from "../../daemon/src/storage/schema";
 import {
   generateCommandId as d1GenerateCommandId,
   queueCommand,
@@ -14,6 +15,8 @@ import {
   cleanupCommands,
   cleanupSeenUpdates,
   checkSessionHighWaterAlert,
+  sweepStaleSessions,
+  SESSION_SWEEP_TTL_MS,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import { isAllowedChatId, generateToken, handleSendNotification } from "../src/notifications";
@@ -622,6 +625,135 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
     fetchMock.deactivate();
     expect(spy).toHaveBeenCalled();
     spy.mockRestore();
+  });
+});
+
+// ─── Stale Session TTL Sweep (pigeon-bea) ──────────────────────────────────
+
+describe("stale-session TTL sweep (pigeon-bea)", () => {
+  const PREFIX = "ses_sweep_";
+
+  afterEach(async () => {
+    await env.DB.prepare(
+      "DELETE FROM messages WHERE session_id LIKE 'ses_sweep_%'"
+    ).run();
+    await env.DB.prepare(
+      "DELETE FROM sessions WHERE session_id LIKE 'ses_sweep_%'"
+    ).run();
+  });
+
+  test("guard: worker sweep TTL is strictly greater than daemon SESSION_TTL_MS", () => {
+    // Daemon SESSION_TTL_MS is 7 days (7 * 24 * 60 * 60 * 1000) defined in
+    // packages/daemon/src/storage/schema.ts.
+    // The worker sweep TTL (14 days) must be strictly greater than the daemon's
+    // 7-day SESSION_TTL_MS. If the worker TTL dropped below the daemon's TTL,
+    // the worker would mass-expire active sessions that the daemon still holds locally.
+    expect(SESSION_SWEEP_TTL_MS).toBeGreaterThan(DAEMON_SESSION_TTL_MS);
+  });
+
+  test("sweeps session with updated_at older than 14d", async () => {
+    const now = Date.now();
+    const staleTime = now - (SESSION_SWEEP_TTL_MS + 10_000);
+    const sessionId = `${PREFIX}stale_1`;
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(sessionId, "devbox", "stale", staleTime, staleTime).run();
+
+    const result = await sweepStaleSessions(env.DB, { now });
+    expect(result.sessionsDeleted).toBeGreaterThanOrEqual(1);
+
+    const check = await env.DB.prepare(
+      "SELECT * FROM sessions WHERE session_id = ?"
+    ).bind(sessionId).first();
+    expect(check).toBeNull();
+  });
+
+  test("does NOT sweep session with updated_at inside 14d even if created_at is old", async () => {
+    const now = Date.now();
+    const oldCreated = now - (SESSION_SWEEP_TTL_MS + 10 * 24 * 60 * 60 * 1000);
+    const recentUpdated = now - (1 * 24 * 60 * 60 * 1000);
+    const sessionId = `${PREFIX}active_recently_touched`;
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(sessionId, "devbox", "active", oldCreated, recentUpdated).run();
+
+    await sweepStaleSessions(env.DB, { now });
+
+    const check = await env.DB.prepare(
+      "SELECT * FROM sessions WHERE session_id = ?"
+    ).bind(sessionId).first();
+    expect(check).not.toBeNull();
+  });
+
+  test("deletes messages rows belonging to swept session but keeps messages for surviving session", async () => {
+    const now = Date.now();
+    const staleTime = now - (SESSION_SWEEP_TTL_MS + 10_000);
+    const freshTime = now - (1 * 24 * 60 * 60 * 1000);
+
+    const sweptSessionId = `${PREFIX}swept_msg_ses`;
+    const freshSessionId = `${PREFIX}fresh_msg_ses`;
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(sweptSessionId, "devbox", "swept", staleTime, staleTime).run();
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(freshSessionId, "devbox", "fresh", freshTime, freshTime).run();
+
+    const chatId = "9988776655";
+    const sweptMsgId = 993101;
+    const freshMsgId = 993102;
+
+    await env.DB.prepare(
+      "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(chatId, sweptMsgId, sweptSessionId, "tok1", "notif_swept", staleTime).run();
+
+    await env.DB.prepare(
+      "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(chatId, freshMsgId, freshSessionId, "tok2", "notif_fresh", freshTime).run();
+
+    const sweepResult = await sweepStaleSessions(env.DB, { now });
+    expect(sweepResult.messagesDeleted).toBeGreaterThanOrEqual(1);
+
+    const sweptMsgCheck = await env.DB.prepare(
+      "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?"
+    ).bind(chatId, sweptMsgId).first();
+    expect(sweptMsgCheck).toBeNull();
+
+    const freshMsgCheck = await env.DB.prepare(
+      "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?"
+    ).bind(chatId, freshMsgId).first();
+    expect(freshMsgCheck).not.toBeNull();
+  });
+
+  test("respects limit parameter when sweeping stale sessions", async () => {
+    const now = Date.now();
+    const staleTime = now - (SESSION_SWEEP_TTL_MS + 10_000);
+
+    const ses1 = `${PREFIX}limit_1`;
+    const ses2 = `${PREFIX}limit_2`;
+    const ses3 = `${PREFIX}limit_3`;
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(ses1, "devbox", "lim1", staleTime - 3000, staleTime - 3000).run();
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(ses2, "devbox", "lim2", staleTime - 2000, staleTime - 2000).run();
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(ses3, "devbox", "lim3", staleTime - 1000, staleTime - 1000).run();
+
+    const result = await sweepStaleSessions(env.DB, { now, limit: 2 });
+    expect(result.sessionsDeleted).toBe(2);
+
+    const remaining = await env.DB.prepare(
+      "SELECT COUNT(*) as count FROM sessions WHERE session_id LIKE 'ses_sweep_limit_%'"
+    ).first<{ count: number }>();
+    expect(remaining?.count).toBe(1);
   });
 });
 
