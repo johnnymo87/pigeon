@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
 import { chunkNotificationId, OutboxSender } from "../src/worker/outbox-sender";
-import type { SendNotificationFn } from "../src/worker/outbox-sender";
+import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
 const BASE_OUTBOX_INPUT = {
@@ -815,5 +815,425 @@ describe("OutboxSender start/stop", () => {
     expect(sendNotification).toHaveBeenCalledTimes(2);
     const recordAfterRetry = storage.outbox.getByNotificationId(cardId);
     expect(recordAfterRetry!.state).toBe("sent");
+  });
+});
+
+describe("classified delivery failure actions", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("404 + local session present -> registerSession called with session label, markRetry, no re-send in same tick", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true },
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(registerSession).toHaveBeenCalledWith("sess-1", "My Session Label");
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(1);
+  });
+
+  it("404 + local session ABSENT -> terminal, registerSession NOT called", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn() as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(registerSession).not.toHaveBeenCalled();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+  });
+
+  it("404 + register succeeds but local row vanished in between -> unregisterSession called and entry goes terminal", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const unregisterSession = vi.fn().mockResolvedValue(undefined) as unknown as UnregisterSessionFn;
+
+    const registerSession = vi.fn().mockImplementation(async () => {
+      storage.sessions.delete("sess-1");
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      unregisterSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(unregisterSession).toHaveBeenCalledWith("sess-1");
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+  });
+
+  it("404 twice on the same entry -> second time is terminal (flag consumed)", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true },
+    }) as unknown as RegisterSessionFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Tick 1: 404 -> re-registered -> markRetry
+    await sender.processOnce();
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+
+    // Tick 2: 404 again -> alreadyReregistered is true -> terminal
+    now += 6_000;
+    await sender.processOnce();
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+  });
+
+  it("404 + register fails with transport_error -> plain markRetry, and subsequent 404 attempts re-registration AGAIN", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "DNS lookup failed",
+    }) as unknown as RegisterSessionFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Tick 1: 404 -> register fails with transport_error -> plain retry
+    await sender.processOnce();
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+
+    // Tick 2: 404 again -> attempts re-registration again because flag was not set
+    now += 6_000;
+    await sender.processOnce();
+    expect(registerSession).toHaveBeenCalledTimes(2);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+  });
+
+  it("404 + register fails with 4xx -> terminal", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Session Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "Session limit reached" },
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+  });
+
+  it("403 at attempts 0 -> retry; 403 at attempts 2 -> terminal", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 403,
+      body: { error: "Forbidden" },
+    }) as unknown as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Attempt 0: retry
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(1);
+
+    // Attempt 1: retry
+    now += 6_000;
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(2);
+
+    // Attempt 2: terminal
+    now += 12_000;
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+  });
+
+  it("400 -> terminal", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 400,
+      body: { error: "sessionId, chatId, and text required" },
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+  });
+
+  it("502 with details.error_code 400 and entities -> payload rewritten WITHOUT entities and markRetry", async () => {
+    const payloadWithEntities = JSON.stringify({
+      messages: [
+        { text: "Hello", entities: [{ type: "bold", offset: 0, length: 5 }] },
+      ],
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-1",
+    });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: payloadWithEntities }, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { details: { error_code: 400, description: "Bad Request: can't parse entities" } },
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1")!;
+    expect(record.state).toBe("queued");
+    expect(record.attempts).toBe(1);
+
+    const updatedParsed = JSON.parse(record.payload);
+    expect(updatedParsed.messages[0].entities).toBeUndefined();
+  });
+
+  it("successful send marks sent and clears re-register flag", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    let sendCallCount = 0;
+    const sendNotification = vi.fn().mockImplementation(async () => {
+      sendCallCount++;
+      if (sendCallCount === 1) {
+        return { ok: false, kind: "http_error", status: 404, body: {} };
+      }
+      return { ok: true, kind: "success", status: 200, body: {} };
+    }) as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: {},
+    }) as unknown as RegisterSessionFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Tick 1: 404 -> re-register -> queued
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+
+    // Tick 2: send succeeds -> sent and flag cleared
+    now += 6_000;
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("sent");
+  });
+
+  it("composition: 404 -> reregister -> next tick 502-entity -> strip -> next tick success", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "My Label" }, 1_000);
+    const payload = JSON.stringify({
+      messages: [{ text: "Bad [entity](link)", entities: [{ type: "text_link", offset: 4, length: 14 }] }],
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-comp",
+    });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-comp", payload }, 1_000);
+
+    let tickCount = 0;
+    const sendNotification = vi.fn().mockImplementation(async () => {
+      tickCount++;
+      if (tickCount === 1) {
+        return { ok: false, kind: "http_error", status: 404, body: "session missing" };
+      }
+      if (tickCount === 2) {
+        return {
+          ok: false,
+          kind: "http_error",
+          status: 502,
+          body: { details: { error_code: 400, description: "Can't parse entities" } },
+        };
+      }
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
+    }) as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true },
+    }) as unknown as RegisterSessionFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Tick 1: 404 -> reregister
+    await sender.processOnce();
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    const record1 = storage.outbox.getByNotificationId("notif-comp")!;
+    expect(record1.state).toBe("queued");
+    expect(record1.attempts).toBe(1);
+
+    // Tick 2: 502 entity -> strip_entities
+    now += 6_000;
+    await sender.processOnce();
+    const record2 = storage.outbox.getByNotificationId("notif-comp")!;
+    expect(record2.state).toBe("queued");
+    expect(record2.attempts).toBe(2);
+    expect(JSON.parse(record2.payload).messages[0].entities).toBeUndefined();
+
+    // Tick 3: Success
+    now += 12_000;
+    await sender.processOnce();
+    const record3 = storage.outbox.getByNotificationId("notif-comp")!;
+    expect(record3.state).toBe("sent");
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+    expect(record3.attempts).toBe(2); // 2 retries on 2 failed attempts
   });
 });

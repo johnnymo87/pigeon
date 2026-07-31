@@ -8,16 +8,27 @@
 
 import type { StorageDb } from "../storage/database";
 import type { SendNotificationInput, WorkerResult } from "./poller";
+import { classifyDeliveryFailure } from "./delivery-policy";
+import type { DeliveryPolicyContext } from "./delivery-policy";
 
 export type SendNotificationFn = (
   input: SendNotificationInput,
 ) => Promise<WorkerResult>;
+
+export type RegisterSessionFn = (
+  sessionId: string,
+  label?: string,
+) => Promise<WorkerResult>;
+
+export type UnregisterSessionFn = (sessionId: string) => Promise<void>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
 
 export interface OutboxSenderOptions {
   storage: StorageDb;
   sendNotification: SendNotificationFn;
+  registerSession?: RegisterSessionFn;
+  unregisterSession?: UnregisterSessionFn;
   chatId?: string;
   nowFn?: () => number;
   log?: LogFn;
@@ -58,6 +69,8 @@ export function chunkNotificationId(
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
+  private readonly registerSession: RegisterSessionFn | undefined;
+  private readonly unregisterSession: UnregisterSessionFn | undefined;
   private readonly chatId: string | undefined;
   private readonly nowFn: () => number;
   private readonly log: LogFn;
@@ -72,9 +85,17 @@ export class OutboxSender {
    */
   private pausedUntil = 0;
 
+  /**
+   * Set of notificationIds that have already attempted re-registration.
+   * Prevents repeated re-registration loops for the same outbox entry.
+   */
+  private reregisteredEntries = new Set<string>();
+
   constructor(opts: OutboxSenderOptions) {
     this.storage = opts.storage;
     this.sendNotification = opts.sendNotification;
+    this.registerSession = opts.registerSession;
+    this.unregisterSession = opts.unregisterSession;
     this.chatId = opts.chatId;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log = opts.log ?? ((msg, fields) => {
@@ -133,6 +154,7 @@ export class OutboxSender {
         // Check terminal conditions
         if (entry.attempts >= MAX_ATTEMPTS || age > MAX_AGE_MS) {
           this.storage.outbox.markFailed(entry.notificationId, now);
+          this.reregisteredEntries.delete(entry.notificationId);
           this.log("outbox entry marked failed (terminal)", {
             notificationId: entry.notificationId,
             sessionId: entry.sessionId,
@@ -171,11 +193,13 @@ export class OutboxSender {
             err: err instanceof Error ? err.message : String(err),
           });
           this.storage.outbox.markFailed(entry.notificationId, now);
+          this.reregisteredEntries.delete(entry.notificationId);
           continue;
         }
 
         if (messages.length === 0) {
           this.storage.outbox.markFailed(entry.notificationId, now);
+          this.reregisteredEntries.delete(entry.notificationId);
           continue;
         }
 
@@ -199,6 +223,165 @@ export class OutboxSender {
 
             if (!result.ok) {
               allOk = false;
+              const localSession = this.storage.sessions.get(entry.sessionId);
+              const hasLocalSession = localSession !== null;
+              const alreadyReregistered = this.reregisteredEntries.has(entry.notificationId);
+              const payloadHasEntities = messages.some(
+                (m) => Array.isArray(m.entities) && m.entities.length > 0,
+              );
+
+              const ctx: DeliveryPolicyContext = {
+                hasLocalSession,
+                alreadyReregistered,
+                payloadHasEntities,
+                attempts: entry.attempts,
+              };
+
+              const action = classifyDeliveryFailure(result, ctx);
+
+              if (action.action === "pause") {
+                const backoff = getBackoff(entry.attempts);
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                this.log("outbox entry delivery failed, scheduling retry", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  attempts: entry.attempts + 1,
+                  nextRetryIn: backoff,
+                  kind: result.kind,
+                  ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
+                  ...(result.kind === "transport_error" ? { error: result.error } : {}),
+                });
+                const pauseMs = Math.min(action.retryAfterSec * 1000, MAX_PAUSE_MS);
+                this.pausedUntil = now + pauseMs;
+                this.log("outbox paused due to rate limit", {
+                  notificationId: entry.notificationId,
+                  retryAfterSec: action.retryAfterSec,
+                  pauseMs,
+                  pausedUntil: this.pausedUntil,
+                });
+                break batchLoop;
+              }
+
+              if (action.action === "terminal") {
+                this.storage.outbox.markFailed(entry.notificationId, now);
+                this.reregisteredEntries.delete(entry.notificationId);
+                this.log("outbox entry delivery failed (terminal)", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  reason: action.reason,
+                  kind: result.kind,
+                  ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
+                });
+                break;
+              }
+
+              if (action.action === "reregister") {
+                if (!this.registerSession) {
+                  const backoff = getBackoff(entry.attempts);
+                  this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                  this.log("outbox entry delivery failed, scheduling retry (reregister unavailable)", {
+                    notificationId: entry.notificationId,
+                    sessionId: entry.sessionId,
+                    attempts: entry.attempts + 1,
+                    nextRetryIn: backoff,
+                    kind: result.kind,
+                  });
+                  break;
+                }
+
+                const regResult = await this.registerSession(entry.sessionId, localSession?.label ?? undefined);
+                if (regResult.ok) {
+                  const recheck = this.storage.sessions.get(entry.sessionId);
+                  if (recheck === null) {
+                    if (this.unregisterSession) {
+                      await this.unregisterSession(entry.sessionId);
+                    }
+                    this.storage.outbox.markFailed(entry.notificationId, now);
+                    this.reregisteredEntries.delete(entry.notificationId);
+                    this.log("outbox entry re-registration compensated: session deleted during registration", {
+                      notificationId: entry.notificationId,
+                      sessionId: entry.sessionId,
+                    });
+                    break;
+                  }
+
+                  this.reregisteredEntries.add(entry.notificationId);
+                  const backoff = getBackoff(entry.attempts);
+                  this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                  this.log("outbox entry re-registered, scheduling retry", {
+                    notificationId: entry.notificationId,
+                    sessionId: entry.sessionId,
+                    attempts: entry.attempts + 1,
+                    nextRetryIn: backoff,
+                  });
+                  break;
+                } else {
+                  const isTransient =
+                    regResult.kind === "transport_error" ||
+                    ((regResult.kind === "http_error" || regResult.kind === "app_rejection") && regResult.status >= 500);
+
+                  if (isTransient) {
+                    const backoff = getBackoff(entry.attempts);
+                    this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                    this.log("outbox entry re-registration failed (transient), scheduling retry", {
+                      notificationId: entry.notificationId,
+                      sessionId: entry.sessionId,
+                      attempts: entry.attempts + 1,
+                      nextRetryIn: backoff,
+                      kind: regResult.kind,
+                    });
+                    break;
+                  } else {
+                    this.storage.outbox.markFailed(entry.notificationId, now);
+                    this.reregisteredEntries.delete(entry.notificationId);
+                    this.log("outbox entry re-registration failed (terminal)", {
+                      notificationId: entry.notificationId,
+                      sessionId: entry.sessionId,
+                      kind: regResult.kind,
+                      ...("status" in regResult ? { status: regResult.status } : {}),
+                      ...("body" in regResult ? { body: regResult.body } : {}),
+                    });
+                    break;
+                  }
+                }
+              }
+
+              if (action.action === "strip_entities") {
+                try {
+                  const parsedObj = JSON.parse(entry.payload) as {
+                    messages?: Array<{ text: string; entities?: unknown[] }>;
+                    message?: { text: string; entities?: unknown[] };
+                    [key: string]: unknown;
+                  };
+                  if (Array.isArray(parsedObj.messages)) {
+                    for (const m of parsedObj.messages) {
+                      delete m.entities;
+                    }
+                  }
+                  if (parsedObj.message && typeof parsedObj.message === "object") {
+                    delete parsedObj.message.entities;
+                  }
+                  const strippedPayload = JSON.stringify(parsedObj);
+                  this.storage.outbox.updatePayload(entry.notificationId, strippedPayload, now);
+                } catch (err) {
+                  this.log("outbox entry strip_entities payload update failed", {
+                    notificationId: entry.notificationId,
+                    err: err instanceof Error ? err.message : String(err),
+                  });
+                }
+
+                const backoff = getBackoff(entry.attempts);
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                this.log("outbox entry stripped entities, scheduling retry", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  attempts: entry.attempts + 1,
+                  nextRetryIn: backoff,
+                });
+                break;
+              }
+
+              // Default retry arm (action.action === "retry")
               const backoff = getBackoff(entry.attempts);
               this.storage.outbox.markRetry(entry.notificationId, now, backoff);
               this.log("outbox entry delivery failed, scheduling retry", {
@@ -207,31 +390,16 @@ export class OutboxSender {
                 attempts: entry.attempts + 1,
                 nextRetryIn: backoff,
                 kind: result.kind,
-                ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status } : {}),
+                ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
                 ...(result.kind === "transport_error" ? { error: result.error } : {}),
-                ...(result.kind === "http_error" || result.kind === "app_rejection" ? { body: result.body } : {}),
               });
-              if (
-                typeof result.retryAfter === "number" &&
-                Number.isFinite(result.retryAfter) &&
-                result.retryAfter > 0
-              ) {
-                const pauseMs = Math.min(result.retryAfter * 1000, MAX_PAUSE_MS);
-                this.pausedUntil = now + pauseMs;
-                this.log("outbox paused due to rate limit", {
-                  notificationId: entry.notificationId,
-                  retryAfterSec: result.retryAfter,
-                  pauseMs,
-                  pausedUntil: this.pausedUntil,
-                });
-                break batchLoop;
-              }
               break;
             }
           }
 
           if (allOk) {
             this.storage.outbox.markSent(entry.notificationId, now);
+            this.reregisteredEntries.delete(entry.notificationId);
             this.log("outbox entry sent", {
               notificationId: entry.notificationId,
               sessionId: entry.sessionId,

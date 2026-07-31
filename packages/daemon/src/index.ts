@@ -349,6 +349,8 @@ const outboxSender = poller && config.telegramChatId
       // detaches `this`, and the method dereferences `this.fetchFn`/`this.config`,
       // so it would throw at runtime. Do not "simplify" this to a bare reference.
       sendNotification: (input) => poller.sendNotification(input),
+      registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
+      unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
       chatId: config.telegramChatId,
       log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
     })

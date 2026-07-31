@@ -268,4 +268,29 @@ describe("OutboxRepository", () => {
 
     storage.db.close();
   });
+
+  it("updatePayload updates payload and updated_at without touching state, attempts, or next_retry_at", () => {
+    const storage = createStorage();
+
+    storage.outbox.upsert(BASE_INPUT, 1_000);
+    storage.outbox.markRetry("notif-1", 1_000, 5_000);
+
+    const before = storage.outbox.getByNotificationId("notif-1")!;
+    expect(before.payload).toBe('{"text":"Which option?"}');
+    expect(before.attempts).toBe(1);
+    expect(before.nextRetryAt).toBe(6_000);
+    expect(before.state).toBe("queued");
+
+    const newPayload = '{"text":"Which option? (stripped)"}';
+    storage.outbox.updatePayload("notif-1", newPayload, 2_000);
+
+    const after = storage.outbox.getByNotificationId("notif-1")!;
+    expect(after.payload).toBe(newPayload);
+    expect(after.updatedAt).toBe(2_000);
+    expect(after.attempts).toBe(1);
+    expect(after.nextRetryAt).toBe(6_000);
+    expect(after.state).toBe("queued");
+
+    storage.db.close();
+  });
 });
