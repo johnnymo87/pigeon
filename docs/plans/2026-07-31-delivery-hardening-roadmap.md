@@ -529,7 +529,9 @@ those cards are never enqueued at all.
 > - **`app.ts:595`** already unregisters via its `onSessionDelete` hook.
 > - **`current-state-ingest.ts:103` is real** and is probably the dominant source, but fixing it
 >   means synthesizing local session rows. It is now covered by `2b`'s sweep, so it was left for a
->   later cycle rather than bolted on here. **Still open** — carry it forward.
+>   later cycle rather than bolted on here. **Still open as `pigeon-2c6` (P2)** — measure how many
+>   such registrations lack a local row before choosing a design; the sweep makes it safe to take
+>   time over it.
 >
 > A correction on that first point, because I got the credit wrong before checking: the log line
 > that settled it **predates Cycle 0**. It is present in the commit the daemon was actually running
