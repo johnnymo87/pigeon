@@ -219,7 +219,7 @@ Two structural consequences worth holding in mind while doing any of the work be
 
 ### Cycle 0 — `pigeon-t5f` + `pigeon-3h9`: make delivery failures visible, then survivable
 
-- [ ] **0a. `pigeon-3h9` — stop swallowing the failure reason.** `poller.sendNotification` and
+- [x] **0a. `pigeon-3h9` — stop swallowing the failure reason.** DONE `203aeca`. `poller.sendNotification` and
   `registerSession` use a bare catch, so the daemon logs `ok=false` and never the status code. This
   is *why* `t5f` took several steps to diagnose instead of ten seconds.
   **Do this first: it is the instrument you need to verify 0b.** Verifying that a 429 is now retried
