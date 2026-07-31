@@ -5,6 +5,9 @@
  * command-queue.ts with D1-native async queries.
  */
 
+import { createTelegramClient } from "./telegram";
+import { MAX_SESSIONS } from "./sessions";
+
 export const LEASE_TIMEOUT_MS = 60_000; // 60s lease expiry
 export const MAX_QUEUE_PER_MACHINE = 100;
 
@@ -286,4 +289,69 @@ export async function cleanupSeenUpdates(
     .run();
 
   return result.meta.rows_written ?? 0;
+}
+
+// ─── checkSessionHighWaterAlert ───────────────────────────────────────────────
+
+/**
+ * High-water alert check for session capacity.
+ * If session count >= thresholdRatio (default 80%) of maxSessions (default MAX_SESSIONS),
+ * sends a Telegram alert to the first chat ID in env.ALLOWED_CHAT_IDS.
+ * Rejections inside sendMessage are caught and logged so cron execution stays alive.
+ *
+ * Returns the session count and whether an alert was sent.
+ */
+export async function checkSessionHighWaterAlert(
+  db: D1Database,
+  env: Env,
+  opts?: {
+    maxSessions?: number;
+    thresholdRatio?: number;
+    now?: number;
+  },
+): Promise<{ count: number; alerted: boolean }> {
+  const cap =
+    opts?.maxSessions ??
+    (typeof (env as unknown as Record<string, unknown>).MAX_SESSIONS === "number"
+      ? ((env as unknown as Record<string, unknown>).MAX_SESSIONS as number)
+      : MAX_SESSIONS);
+  const thresholdRatio = opts?.thresholdRatio ?? 0.8;
+
+  const countResult = await db
+    .prepare("SELECT COUNT(*) as count FROM sessions")
+    .first<{ count: number }>();
+  const count = countResult?.count ?? 0;
+
+  if (count < cap * thresholdRatio) {
+    return { count, alerted: false };
+  }
+
+  const raw = env.ALLOWED_CHAT_IDS || "";
+  const allowed = raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+  const firstChatId = allowed[0];
+
+  if (!firstChatId) {
+    return { count, alerted: false };
+  }
+
+  const pct = Math.round((count / cap) * 100);
+  const text = `⚠️ Session count high: ${count} / ${cap} sessions (${pct}%)`;
+
+  let alerted = false;
+  try {
+    const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const res = await client.sendMessage({ chatId: firstChatId, text });
+    if (res.ok) {
+      alerted = true;
+    } else {
+      console.error("Failed to send session high-water alert:", res);
+    }
+  } catch (err) {
+    console.error("Failed to send session high-water alert:", err);
+  }
+
+  return { count, alerted };
 }

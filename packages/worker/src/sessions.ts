@@ -2,7 +2,7 @@ import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 
-const MAX_SESSIONS = 1000;
+export const MAX_SESSIONS = 5000;
 
 export type SessionAction = "list" | "register" | "unregister";
 
@@ -28,7 +28,7 @@ export async function handleSessionRequest(
     case "list":
       return listSessions(db);
     case "register":
-      return registerSession(db, request);
+      return registerSession(db, env, request);
     case "unregister":
       return unregisterSession(db, env, request);
   }
@@ -41,6 +41,7 @@ async function listSessions(db: D1Database): Promise<Response> {
 
 async function registerSession(
   db: D1Database,
+  env: Env,
   request: Request,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
@@ -55,6 +56,11 @@ async function registerSession(
     );
   }
 
+  const cap =
+    typeof (env as unknown as Record<string, unknown>).MAX_SESSIONS === "number"
+      ? ((env as unknown as Record<string, unknown>).MAX_SESSIONS as number)
+      : MAX_SESSIONS;
+
   // Check session limit (only for new sessions)
   const existing = await db
     .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
@@ -65,7 +71,9 @@ async function registerSession(
     const countResult = await db
       .prepare("SELECT COUNT(*) as count FROM sessions")
       .first<{ count: number }>();
-    if (countResult && countResult.count >= MAX_SESSIONS) {
+    const count = countResult?.count ?? 0;
+    if (count >= cap) {
+      console.error(`Session limit reached: ${count} / ${cap} sessions`);
       return Response.json({ error: "Session limit reached" }, { status: 429 });
     }
   }

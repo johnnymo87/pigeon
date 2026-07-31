@@ -3,7 +3,7 @@
  * The worker uses D1 + HTTP polling (no Durable Objects).
  */
 import { env, SELF, fetchMock } from "cloudflare:test";
-import { describe, it, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import {
   generateCommandId as d1GenerateCommandId,
   queueCommand,
@@ -13,6 +13,7 @@ import {
   isMachineRecent,
   cleanupCommands,
   cleanupSeenUpdates,
+  checkSessionHighWaterAlert,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import { isAllowedChatId, generateToken, handleSendNotification } from "../src/notifications";
@@ -54,7 +55,7 @@ import {
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
-import { handleSessionRequest } from "../src/sessions";
+import { handleSessionRequest, MAX_SESSIONS } from "../src/sessions";
 import {
   sendMessage,
   editMessageText,
@@ -422,6 +423,207 @@ describe("POST /sessions/register", () => {
     const found = sessions.find((s) => s.session_id === "sess-ts");
     expect(found!.created_at).toBeGreaterThanOrEqual(before);
     expect(found!.created_at).toBeLessThanOrEqual(after);
+  });
+});
+
+// ─── Session Cap & High-Water Alert (pigeon-bea) ──────────────────────────
+
+describe("session cap and high-water alert (pigeon-bea)", () => {
+  afterEach(async () => {
+    try {
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    } catch {}
+    await env.DB.prepare(
+      "DELETE FROM sessions WHERE session_id LIKE 'ses_cap_%' OR session_id LIKE 'ses_hw_%'"
+    ).run();
+  });
+
+  test("registration succeeds below cap and returns 429 only at/above cap (and existing sessions bypass cap)", async () => {
+    const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+    const initialCount = initialRow?.count ?? 0;
+    const customCap = initialCount + 2;
+    const customEnv = { ...env, MAX_SESSIONS: customCap } as unknown as Env;
+
+    const req1 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox" }),
+    });
+    const res1 = await handleSessionRequest(env.DB, customEnv, req1, "register");
+    expect(res1.status).toBe(200);
+
+    const req2 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_2", machineId: "devbox" }),
+    });
+    const res2 = await handleSessionRequest(env.DB, customEnv, req2, "register");
+    expect(res2.status).toBe(200);
+
+    // At cap (initial + 2 registered), a new session request returns 429
+    const req3 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_3", machineId: "devbox" }),
+    });
+    const res3 = await handleSessionRequest(env.DB, customEnv, req3, "register");
+    expect(res3.status).toBe(429);
+    expect(await res3.json()).toEqual({ error: "Session limit reached" });
+
+    // Existing session bypasses cap check and re-registers successfully
+    const reqReReg = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox", label: "updated" }),
+    });
+    const resReReg = await handleSessionRequest(env.DB, customEnv, reqReReg, "register");
+    expect(resReReg.status).toBe(200);
+  });
+
+  test("the 429 path logs via console.error", async () => {
+    const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+    const initialCount = initialRow?.count ?? 0;
+    const customCap = initialCount + 1;
+    const customEnv = { ...env, MAX_SESSIONS: customCap } as unknown as Env;
+
+    const req1 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox" }),
+    });
+    await handleSessionRequest(env.DB, customEnv, req1, "register");
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const req2 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_cap_2", machineId: "devbox" }),
+    });
+    const res2 = await handleSessionRequest(env.DB, customEnv, req2, "register");
+    expect(res2.status).toBe(429);
+
+    expect(spy).toHaveBeenCalled();
+    const loggedStr = spy.mock.calls.map((call) => call.join(" ")).join(" ");
+    expect(loggedStr).toMatch(/Session limit reached/i);
+    expect(loggedStr).toMatch(new RegExp(String(customCap)));
+
+    spy.mockRestore();
+  });
+
+  test("high-water check does NOT alert below 80%", async () => {
+    const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+    const initialCount = initialRow?.count ?? 0;
+
+    // Insert 1 session
+    const req1 = new Request("https://worker/sessions/register", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "ses_hw_1", machineId: "devbox" }),
+    });
+    await handleSessionRequest(env.DB, env, req1, "register");
+
+    // With cap: initialCount + 10, (initialCount + 1) / (initialCount + 10) < 80%
+    const maxSessions = initialCount + 10;
+    const result = await checkSessionHighWaterAlert(env.DB, env, {
+      maxSessions,
+      thresholdRatio: 0.8,
+    });
+    expect(result.alerted).toBe(false);
+  });
+
+  test("high-water check DOES alert at/above 80% and includes count and cap in text", async () => {
+    const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+    const initialCount = initialRow?.count ?? 0;
+
+    // Suppose target total count is 10. We insert (10 - initialCount) sessions or set maxSessions dynamically.
+    // E.g., if targetCap = initialCount + 10, we insert 8 sessions so total = initialCount + 8 (exactly 80%).
+    const maxSessions = initialCount + 10;
+    for (let i = 1; i <= 8; i++) {
+      const req = new Request("https://worker/sessions/register", {
+        method: "POST",
+        headers: { ...authHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: `ses_hw_${i}`, machineId: "devbox" }),
+      });
+      await handleSessionRequest(env.DB, env, req, "register");
+    }
+
+    let sentText = "";
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        200,
+        (opts: Record<string, unknown>) => {
+          try {
+            const rawBody = opts.body;
+            const bodyStr = typeof rawBody === "string" ? rawBody : new TextDecoder().decode(rawBody as ArrayBuffer);
+            const parsed = JSON.parse(bodyStr) as { text?: string };
+            sentText = parsed.text ?? "";
+          } catch {}
+          return JSON.stringify({ ok: true, result: { message_id: 1234 } });
+        },
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const testEnv = { ...env, ALLOWED_CHAT_IDS: "12345678" } as Env;
+    const result = await checkSessionHighWaterAlert(env.DB, testEnv, {
+      maxSessions,
+      thresholdRatio: 0.8,
+    });
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.deactivate();
+
+    const expectedPct = Math.round(((initialCount + 8) / maxSessions) * 100);
+    expect(result.alerted).toBe(true);
+    expect(sentText).toContain(String(initialCount + 8)); // count
+    expect(sentText).toContain(String(maxSessions)); // cap
+    expect(sentText).toContain(`${expectedPct}%`); // percentage
+  });
+
+  test("a sendMessage rejection inside high-water check does not propagate", async () => {
+    const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+    const initialCount = initialRow?.count ?? 0;
+    const maxSessions = initialCount + 10;
+
+    for (let i = 1; i <= 8; i++) {
+      const req = new Request("https://worker/sessions/register", {
+        method: "POST",
+        headers: { ...authHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: `ses_hw_${i}`, machineId: "devbox" }),
+      });
+      await handleSessionRequest(env.DB, env, req, "register");
+    }
+
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(
+        500,
+        JSON.stringify({ ok: false, error_code: 500, description: "Telegram network error" }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const testEnv = { ...env, ALLOWED_CHAT_IDS: "12345678" } as Env;
+    // Should NOT throw
+    await expect(
+      checkSessionHighWaterAlert(env.DB, testEnv, {
+        maxSessions,
+        thresholdRatio: 0.8,
+      }),
+    ).resolves.toBeDefined();
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.deactivate();
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
   });
 });
 
