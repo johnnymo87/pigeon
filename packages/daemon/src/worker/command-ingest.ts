@@ -41,6 +41,8 @@ export interface WorkerCommandIngestOptions {
   opencodeClient?: ReviveAndDeliverDeps["opencodeClient"];
   /** Send a reply to Telegram (used for revive-on-reply error notifications). */
   sendTelegramReply?: (chatId: string, text: string) => Promise<void>;
+  /** Unregister session worker-side when local session is deleted. */
+  unregisterSession?: (sessionId: string) => Promise<unknown>;
   /** Injected spawn for testing (passed through to reviveAndDeliver). */
   spawn?: ReviveAndDeliverDeps["spawn"];
   /**
@@ -508,6 +510,13 @@ async function deliverViaAdapter(
           storage.sessions.delete(msg.sessionId);
           // Drop routing state too so prospective /route can't name a serve for a dead session (workstation-boi9).
           storage.assignments.delete(msg.sessionId);
+          if (options.unregisterSession) {
+            try {
+              await options.unregisterSession(msg.sessionId);
+            } catch {
+              // Best-effort — worker may be unreachable
+            }
+          }
           await options.sendTelegramReply?.(
             msg.chatId,
             `Session no longer exists. The opencode session was deleted from this machine.`,
@@ -554,6 +563,13 @@ async function deliverViaAdapter(
     console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId} (no opencodeClient for revival)`);
     storage.sessions.delete(msg.sessionId);
     storage.assignments.delete(msg.sessionId);
+    if (options.unregisterSession) {
+      try {
+        await options.unregisterSession(msg.sessionId);
+      } catch {
+        // Best-effort — worker may be unreachable
+      }
+    }
     return;
   }
 

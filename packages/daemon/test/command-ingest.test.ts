@@ -934,6 +934,168 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       expect(storage.assignments.get("sess-no-client")).toBeNull();
       storage.db.close();
     });
+
+    it("unregisters worker-side when session is gone in opencode-serve (sessionGone)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-gone-unreg",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-gone-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+
+      const unregistered: string[] = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-gone-unreg", sessionId: "sess-gone-unreg", command: "hello", chatId: "9" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return null; },
+            async sendPrompt() { throw new Error("should not be called"); },
+          },
+          unregisterSession: async (sessionId) => {
+            unregistered.push(sessionId);
+          },
+          spawn: mockSpawn,
+        },
+      );
+
+      // Verify unregistered worker-side
+      expect(unregistered).toEqual(["sess-gone-unreg"]);
+      // Verify local row and assignment deleted
+      expect(storage.sessions.get("sess-gone-unreg")).toBeNull();
+      expect(storage.assignments.get("sess-gone-unreg")).toBeNull();
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("handles unregisterSession rejection gracefully on sessionGone (best-effort)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-gone-reject",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-gone-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-gone-reject", sessionId: "sess-gone-reject", command: "hello", chatId: "9" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return null; },
+            async sendPrompt() { throw new Error("should not be called"); },
+          },
+          unregisterSession: async () => {
+            throw new Error("Worker network error");
+          },
+          spawn: mockSpawn,
+        },
+      );
+
+      // Verify local row and assignment still deleted despite worker unregister error
+      expect(storage.sessions.get("sess-gone-reject")).toBeNull();
+      expect(storage.assignments.get("sess-gone-reject")).toBeNull();
+      // Command still acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("unregisters worker-side when removing dead session (no opencodeClient fallback)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-no-client-unreg",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-no-client-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+
+      const unregistered: string[] = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-no-client-unreg", sessionId: "sess-no-client-unreg", command: "hi", chatId: "12" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          unregisterSession: async (sessionId) => {
+            unregistered.push(sessionId);
+          },
+        },
+      );
+
+      // Verify unregistered worker-side
+      expect(unregistered).toEqual(["sess-no-client-unreg"]);
+      // Local row and assignment deleted
+      expect(storage.sessions.get("sess-no-client-unreg")).toBeNull();
+      expect(storage.assignments.get("sess-no-client-unreg")).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("handles unregisterSession rejection gracefully on no opencodeClient fallback (best-effort)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-no-client-reject",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+      storage.assignments.upsert({ sessionId: "sess-no-client-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-no-client-reject", sessionId: "sess-no-client-reject", command: "hi", chatId: "12" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: false, error: "fetch failed: ECONNREFUSED" };
+            },
+          }),
+          unregisterSession: async () => {
+            throw new Error("Worker network error");
+          },
+        },
+      );
+
+      // Verify local row and assignment still deleted
+      expect(storage.sessions.get("sess-no-client-reject")).toBeNull();
+      expect(storage.assignments.get("sess-no-client-reject")).toBeNull();
+
+      storage.db.close();
+    });
   });
 
   describe("at-least-once delivery on ambiguous timeout (never drop)", () => {
