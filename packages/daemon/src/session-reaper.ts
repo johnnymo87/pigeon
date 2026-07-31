@@ -5,7 +5,10 @@ interface ReapDeps {
   storage: StorageDb;
   // Stale Pigeon routing state is not the same as stale opencode history.
   deleteSession?: (sessionId: string) => Promise<void>;
-  unregisterSession: (sessionId: string) => Promise<void>;
+  // Return value is ignored here on purpose: reaping is best-effort and a failed unregister is
+  // retried by the next hourly cycle only if the local row still exists. The outbox's compensating
+  // unregister DOES inspect the result, because nothing else can clean up after it.
+  unregisterSession: (sessionId: string) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string) => void;
 }

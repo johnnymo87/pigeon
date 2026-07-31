@@ -131,6 +131,14 @@ export class OutboxRepository {
       .run(now, id);
   }
 
+  updatePayload(notificationId: string, payload: string, now = Date.now()): void {
+    this.db
+      .prepare(
+        "UPDATE outbox SET payload = ?, updated_at = ? WHERE notification_id = ?",
+      )
+      .run(payload, now, notificationId);
+  }
+
   /**
    * Delete terminal entries (state 'sent' or 'failed') older than the given cutoff timestamp.
    * Returns the number of deleted rows.

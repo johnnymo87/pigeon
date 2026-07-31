@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import type { StopNotifier, QuestionNotifier } from "./notification-service";
+import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
@@ -99,7 +99,7 @@ function parseTitle(val: unknown): string | undefined {
 
 interface AppOptions {
   nowFn?: () => number;
-  notifier?: StopNotifier & Partial<QuestionNotifier>;
+  notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
   chatId?: string;

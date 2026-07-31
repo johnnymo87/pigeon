@@ -8,17 +8,11 @@ describe("POST /alert", () => {
   let sendPlainAlert: ReturnType<typeof vi.fn>;
 
   function makeNotifier(withSendPlainAlert: boolean): StopNotifier {
-    const notifier: StopNotifier & {
-      sendQuestionNotification: ReturnType<typeof vi.fn>;
-      sendPlainAlert?: ReturnType<typeof vi.fn>;
-    } = {
-      sendStopNotification: vi.fn().mockResolvedValue({ token: "t" }),
-      sendQuestionNotification: vi.fn().mockResolvedValue({ token: "t" }),
-    };
+    const notifier: StopNotifier = {};
     if (withSendPlainAlert) {
       notifier.sendPlainAlert = sendPlainAlert;
     }
-    return notifier as unknown as StopNotifier;
+    return notifier;
   }
 
   beforeEach(() => {

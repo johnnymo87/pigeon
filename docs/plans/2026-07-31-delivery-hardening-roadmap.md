@@ -51,11 +51,17 @@ Do this LAST, as Cycle 6b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **792** passed, 1 skipped |
+| `@pigeon/daemon` | **790** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **305** passed |
 | `@pigeon/worker` | **279** passed |
 
-Total **1376**. **`npm run typecheck` is CLEAN — 0 errors.** The 4 `lease-cas` errors that the
+Total **1374**. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **CORRECTION #2 (2026-07-31, start of Cycle 1).** This table said **792 / 1376** until re-measured at
+> the top of Cycle 1. It was stale: Cycle 0's `9a792c9` deleted the dead `buildCardNotification` tests,
+> dropping the daemon by 2. **The table was written in the same session that deleted them and still was
+> not re-measured** — the identical failure mode as CORRECTION #1 directly below, one cycle later.
+> Re-measure at the START of every cycle, not just after config changes. It costs 90 seconds. The 4 `lease-cas` errors that the
 previous plan told every task to ignore were fixed by PR #8. **Any typecheck error is now a real
 regression.**
 
@@ -274,8 +280,95 @@ is that missing consumer, which is why they belong together.
   - **`288` is a deliberate exception to `bzf`.** A non-rate-limited 400 should get one retry with
     entities stripped so the text still lands unformatted. Whichever of the two lands second will
     silently override the first unless they are written as a single policy.
-  - Net policy: 404 → re-register then retry; deterministic 400 → one entity-stripped retry, then
-    terminal; 403 → terminal; 429 / 5xx / transport → retry as today.
+  - Net policy: see the verified table below — **the naive version of this line is wrong on three
+    counts**, established by reading the worker source and by `oracle-fable` on 2026-07-31.
+
+#### The actual `/notifications/send` status map (verified, not assumed)
+
+| Daemon sees | Cause | Correct action |
+|---|---|---|
+| `400` | **worker-side field validation only** (`notifications.ts:187`) | terminal at once |
+| `403` | `ALLOWED_CHAT_IDS` reject (`notifications.ts:201`) | terminal **only at `attempts >= 2`** |
+| `404` | session not registered (`notifications.ts:197`) | re-register arm, below |
+| `429` | Telegram rate limit | pause + retry (unchanged) |
+| `502` | **every Telegram-level error**, incl. a 400 (`notifications.ts:331`) | inspect `details.error_code` |
+| other 5xx / transport | worker or network | retry (unchanged) |
+
+**Correction 1 — `pigeon-288`'s premise is unsound as written.** A malformed-entity Telegram 400 never
+reaches the daemon as a 400; the worker wraps *every* non-429 Telegram failure as **502 "Telegram API
+error"**, preserving Telegram's own code at `details.error_code` (`telegram.ts:91`). So entity
+stripping must key on **502 + `details.error_code === 400` + entities present**. The only 400 the
+daemon can see is missing-field validation, where stripping is useless. It follows that `bzf` and
+`288` were **never actually in conflict** — they address disjoint status codes. The beads' stated
+reason for pairing them was wrong; the pairing is still right, for the reasons below.
+
+**Correction 2 — the real conflict is `bzf` vs the reaper, and nobody wrote it down.** `bzf`'s own
+motivating scenario is a `/current-state` card whose session the reaper unregisters mid-flight. But
+`6be` wants 404 → re-register. Applied blindly that **resurrects a session the reaper deliberately
+cleaned up**, and `6be` note 4 flags the consequence: the reaper unregisters only sessions it still
+holds locally, and the worker has **no session TTL cron**, so the leaked row lives forever.
+**Discriminator: re-register only if the LOCAL session row still exists.** `app.ts:275` upserts the
+local row *before* registering (6be: row present, worker registration missing → re-register), while
+`session-reaper.ts:27` deletes the local row *before* unregistering (reaped: no row → terminal). The
+local row also carries `label`, which answers `6be` note 4's "no label available at retry time".
+There is still a narrow race — reaper fires between the check and the register — so **after a
+successful re-register, re-check the local row; if it vanished, `unregisterSession` and go terminal.**
+
+**Correction 3 — two arms of the naive policy make data loss FASTER, the exact failure this cycle
+exists to prevent.**
+- **`403` must not be terminal on the first attempt.** A 403 is a property of *worker config*, not of
+  the message. An `ALLOWED_CHAT_IDS` typo in a deploy today leaves a 15-minute window to roll back
+  losing nothing; instant-terminal converts it into immediate mass loss of everything queued. Terminal
+  at `attempts >= 2` keeps deterministic 403s dying in seconds while a bad deploy stays survivable.
+  **This is also live rollback-safety today** — §0 keeps both chat ids allowed precisely because
+  narrowing the allowlist produces 403s.
+- **A failed re-registration must not be terminal if it failed *transiently*.** Register
+  `transport_error`/5xx means the worker is briefly down — plain `markRetry`, do not consume the
+  once-flag. Only a definitive register 4xx is terminal. (Note: `/sessions/register` can return
+  **429 "Session limit reached" with no `retryAfter`** (`sessions.ts:69`) — not a Telegram rate limit,
+  do not feed it to the pause path.)
+- **Do not "strip entities, then terminal if it fails again."** Persist the strip by **rewriting the
+  outbox payload** instead of holding a flag; the entry then stays under the normal retry budget, so a
+  429 arriving after the strip does not kill it. Worker dedup by `notificationId` makes rewriting all
+  chunks safe.
+
+#### Cycle 1 task breakdown
+
+- [x] **1a. `pigeon-m76`** — dead stop/question arms removed. DONE `6233937` + `03539d9`. The second
+  commit deletes the residue: with its methods gone `WorkerNotificationService` was a five-argument
+  constructor with no body, still wired as the "primary" notifier. Alert delivery already fell
+  through to Telegram in all three configurations, so removing it was behaviour-preserving.
+- [x] **1b.** Pure `classifyDeliveryFailure(result, ctx) -> DeliveryAction`, table-driven tests, no
+  I/O. DONE `1fc0e44`.
+- [x] **1c.** Wired into `OutboxSender` + `outbox.updatePayload`. DONE `5b3c79d`, `e67a144`, `938c38c`.
+  **Every arm ends in `markRetry` — never re-send inside the same tick**, so attempt accounting is
+  unchanged and a 404→re-register→502→strip sequence cannot double-count (confirmed by review).
+- Budget constants (`MAX_ATTEMPTS`, `MAX_AGE_MS`, `BACKOFF_SCHEDULE`, `MAX_PAUSE_MS`) are **Cycle 2**.
+
+#### What changed during Cycle 1 vs. what was planned
+
+**`403` is NOT terminal — `pigeon-bzf` is rejected on that point.** Correction 3 above softened it to
+"terminal at `attempts >= 2`". Adversarial review killed even that, on two counts: `ctx.attempts`
+counts failures of *every* kind, so an entry with two unrelated transport failures would die on its
+**first** 403 — two recoverable transients composing into permanent loss; and the threshold bought
+~15 seconds of rollback window while the comment justifying it claimed 15 minutes.
+
+Checking the worker then removed the motive entirely: **a 403 never reaches Telegram.** It is
+rejected at `notifications.ts:202`, before `resolveTopic` (`:230`) and before
+`createTelegramClient` (`:248`), so a retried 403 costs *none* of the shared 20/min budget that
+§3 says is the reason to kill doomed entries early. 400 (`:188`) and 404 (`:197`) return before
+Telegram too — they stay terminal for a **different** reason: they are genuinely deterministic, so
+retrying cannot ever succeed. **Generalise: "terminal" must be justified by determinism, not by
+budget, unless the failure actually spends budget.**
+
+**Two register outcomes were also un-terminalled** (`e67a144`): a 429 "Session limit reached" is a
+capacity condition that clears, and an `app_rejection` (2xx with `ok:false`) is inherently ambiguous.
+Terminal only on a definitive 4xx.
+
+**New beads from review:** `pigeon-bea` (P2 — the worker has **no session TTL cron**, so any leaked
+`sessions` row is permanent; Cycle 1's compensating unregister is a client-side mitigation and now
+logs `LEAKED worker session row` when it fails) and `pigeon-e44` (P3 — entity stripping fires on any
+Telegram 400, not just parse errors).
 
 ### Cycle 2 — the age and attempt budget
 

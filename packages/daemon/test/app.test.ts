@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import type { StopNotifier, QuestionNotifier } from "../src/notification-service";
+import type { StopNotifier } from "../src/notification-service";
 
 /**
  * True when `s` contains no unpaired UTF-16 surrogate. An unpaired surrogate survives
