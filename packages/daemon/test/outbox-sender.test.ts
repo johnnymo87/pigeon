@@ -159,6 +159,39 @@ describe("OutboxSender.processOnce()", () => {
     expect(record!.nextRetryAt).toBe(10_000);
   });
 
+  it("logs structured classification and status on delivery failure", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const logFn = vi.fn();
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "rate_limited" },
+      retryAfter: 30,
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    expect(logFn).toHaveBeenCalledWith(
+      "outbox entry delivery failed, scheduling retry",
+      expect.objectContaining({
+        notificationId: "notif-1",
+        kind: "http_error",
+        status: 429,
+        body: { error: "rate_limited" },
+      }),
+    );
+  });
+
   it("retries on thrown error with backoff", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
@@ -369,9 +402,9 @@ describe("OutboxSender.processOnce()", () => {
       ids.push(notificationId);
       if (failChunk2 && text === "chunk-2") {
         failChunk2 = false;
-        return { ok: false };
+        return { ok: false as const, kind: "http_error" as const, status: 500, body: "error" };
       }
-      return { ok: true };
+      return { ok: true as const, kind: "success" as const, status: 200, body: { ok: true } };
     });
 
     storage.outbox.upsert({
@@ -720,5 +753,67 @@ describe("OutboxSender start/stop", () => {
       await sender.processOnce();
       expect(sendNotification).toHaveBeenCalledTimes(2);
     }
+  });
+
+  it("a 429 during card drain results in retry, NOT loss (bug fix verification)", async () => {
+    // Enqueue a card notification with kind 'card'
+    const cardId = "cs:cmd-card-1:ses_1";
+    storage.outbox.upsert({
+      notificationId: cardId,
+      sessionId: "ses_1",
+      requestId: "cs-cs:cmd-card-1:ses_1",
+      kind: "card",
+      payload: JSON.stringify({
+        message: { text: "🟢 active Session 1", entities: [] },
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: cardId,
+        threaded: false,
+      }),
+      token: "tok-card-1",
+    }, 1_000);
+
+    let sendCount = 0;
+    const sendNotification = vi.fn().mockImplementation(async () => {
+      sendCount++;
+      if (sendCount === 1) {
+        // Exactly what the worker returns when Telegram rate-limits the group:
+        // HTTP 429 with a JSON body carrying retryAfter. See packages/worker/src/notifications.ts.
+        return {
+          ok: false,
+          kind: "http_error",
+          status: 429,
+          body: { error: "rate_limited", retryAfter: 10 },
+          retryAfter: 10,
+        };
+      }
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // First attempt hits 429
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    // Verify entry is NOT lost/failed, but remains retryable
+    const recordAfter429 = storage.outbox.getByNotificationId(cardId);
+    expect(recordAfter429).not.toBeNull();
+    expect(recordAfter429!.state).toBe("queued");
+    expect(recordAfter429!.attempts).toBe(1);
+    expect(recordAfter429!.nextRetryAt).toBeGreaterThan(now);
+
+    // Fast-forward past pause + retry backoff (10s pause = 10,000ms)
+    now += 15_000;
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    const recordAfterRetry = storage.outbox.getByNotificationId(cardId);
+    expect(recordAfterRetry!.state).toBe("sent");
   });
 });

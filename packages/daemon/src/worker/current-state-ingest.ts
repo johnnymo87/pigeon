@@ -1,5 +1,5 @@
 import type { TgEntity } from "../telegram-message";
-import type { SendNotificationInput } from "./poller";
+import type { SendNotificationInput, WorkerResult } from "./poller";
 import {
   classifyActivity,
   snippetFromMessages,
@@ -10,33 +10,6 @@ import {
   formatCurrentStateIndex,
 } from "../notification-service";
 
-/**
- * Builds the notification payload for a /current-state card.
- *
- * `threaded: false` is load-bearing, not incidental: cards go through the same
- * sendNotification endpoint that lazily creates forum topics, once per surveyed
- * session, sequentially and uncapped. Letting them thread would fire a
- * createForumTopic + sendMessage burst (~31 calls on a 15-session machine)
- * against Telegram's ~20/min per-chat ceiling, and would create topics for idle
- * sessions that never notified — defeating lazy creation. Card failures are
- * swallowed with console.warn and have no outbox, so anything past the limit is
- * lost silently.
- */
-export function buildCardNotification(opts: {
-  sessionId: string;
-  chatId: string;
-  text: string;
-  entities: TgEntity[] | undefined;
-}): SendNotificationInput {
-  return {
-    sessionId: opts.sessionId,
-    chatId: opts.chatId,
-    text: opts.text,
-    replyMarkup: { inline_keyboard: [] },
-    entities: opts.entities,
-    threaded: false,
-  };
-}
 
 export interface CurrentStateIngestInput {
   commandId: string;
@@ -48,8 +21,13 @@ export interface CurrentStateIngestInput {
     getSessionMessages: (sid: string) => Promise<unknown[]>;
   };
   enumerate: () => Promise<{ sids: string[]; homeScreenCount: number }>;
-  registerSession: (sid: string, label: string) => Promise<void>;
-  sendCard: (sid: string, text: string, entities: TgEntity[] | undefined) => Promise<void>;
+  registerSession: (sid: string, label: string) => Promise<WorkerResult>;
+  enqueueCard: (opts: {
+    sid: string;
+    text: string;
+    entities: TgEntity[] | undefined;
+    notificationId: string;
+  }) => void;
   sendPlainText: (text: string, entities?: TgEntity[]) => Promise<void>;
   now?: number; // for deterministic relative-time in tests
 }
@@ -118,11 +96,15 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
   await input.sendPlainText(index.text, index.entities);
 
   // Cards (no cap)
-  // invariant: registerSession MUST precede sendCard per record (the worker swipe-reply handle won't resolve otherwise).
+  // invariant: registerSession MUST precede enqueueCard per record (the worker swipe-reply handle won't resolve otherwise).
   // This loop is intentionally sequential.
   for (const r of records) {
     try {
-      await input.registerSession(r.sid, r.title);
+      const regResult = await input.registerSession(r.sid, r.title);
+      if (!regResult.ok) {
+        console.warn(`[current-state-ingest] registerSession failed for ${r.sid}:`, regResult);
+        continue;
+      }
       const card = formatStateCard(
         {
           title: r.title,
@@ -135,9 +117,15 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
         },
         input.now,
       );
-      await input.sendCard(r.sid, card.text, card.entities);
+      const notificationId = `cs:${input.commandId}:${r.sid}`;
+      input.enqueueCard({
+        sid: r.sid,
+        text: card.text,
+        entities: card.entities,
+        notificationId,
+      });
     } catch (e) {
-      console.warn(`[current-state-ingest] failed to register or send card for ${r.sid}:`, e);
+      console.warn(`[current-state-ingest] failed to register or enqueue card for ${r.sid}:`, e);
     }
   }
 }

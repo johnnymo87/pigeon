@@ -4,6 +4,7 @@ import {
   FallbackStopNotifier,
   TelegramNotificationService,
   WorkerNotificationService,
+  generateToken,
   type StopNotifier,
 } from "./notification-service";
 import { OpencodeClient } from "./opencode-client";
@@ -23,7 +24,7 @@ import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
-import { ingestCurrentStateCommand, buildCardNotification } from "./worker/current-state-ingest";
+import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
@@ -305,20 +306,32 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
               () => storage.sessions.list({ active: true }).map(s => ({ sessionId: s.sessionId, pid: s.pid, lastSeen: s.lastSeen })),
             ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
-            sendCard: (sid, text, entities) =>
-              poller!.sendNotification(
-                buildCardNotification({
-                  sessionId: sid,
-                  chatId: msg.chatId,
-                  text,
-                  entities,
-                }),
-              )
-                .then((res) => {
-                  if (!res.ok) {
-                    throw new Error("sendNotification returned ok=false");
-                  }
-                }),
+            enqueueCard: (opts) => {
+              // NOTE: OutboxSender delivers to its configured chatId and ignores this
+              // command's msg.chatId, because the outbox payload carries no chatId. That is
+              // fine while Pigeon is single-tenant, but a /current-state arriving from a
+              // second chat would have its cards silently delivered to the configured one.
+              // threaded:false is load-bearing, not incidental. Cards are delivered via the
+              // same /notifications/send endpoint that lazily creates a forum topic on demand,
+              // once per surveyed session. Letting cards thread would fire a createForumTopic +
+              // sendMessage burst (~31 calls on a 15-session machine) against Telegram's ~20/min
+              // per-chat ceiling, and would spawn topics for idle sessions that never notified,
+              // defeating lazy creation. Cards belong in General.
+              const notificationPayload = {
+                message: { text: opts.text, entities: opts.entities },
+                replyMarkup: { inline_keyboard: [] },
+                notificationId: opts.notificationId,
+                threaded: false,
+              };
+              storage.outbox.upsert({
+                notificationId: opts.notificationId,
+                sessionId: opts.sid,
+                requestId: `cs-${opts.notificationId}`,
+                kind: "card",
+                payload: JSON.stringify(notificationPayload),
+                token: generateToken(),
+              });
+            },
             // /current-state index is a machine-wide summary sent to General
             sendPlainText: (text, entities) => sendTelegramMessage(msg.chatId, text, { entities, messageThreadId: undefined }),
           });

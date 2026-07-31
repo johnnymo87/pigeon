@@ -18,6 +18,120 @@ export interface SendNotificationInput {
   threaded?: boolean;
 }
 
+export type WorkerResultSuccess<T = unknown> = {
+  ok: true;
+  kind: "success";
+  status: number;
+  body: T;
+  retryAfter?: number;
+};
+
+export type WorkerResultAppRejection<T = unknown> = {
+  ok: false;
+  kind: "app_rejection";
+  status: number;
+  body: T;
+  retryAfter?: number;
+};
+
+export type WorkerResultHttpError = {
+  ok: false;
+  kind: "http_error";
+  status: number;
+  body?: unknown;
+  retryAfter?: number;
+};
+
+export type WorkerResultTransportError = {
+  ok: false;
+  kind: "transport_error";
+  error: string;
+  cause?: unknown;
+  retryAfter?: undefined;
+};
+
+export type WorkerResult<T = unknown> =
+  | WorkerResultSuccess<T>
+  | WorkerResultAppRejection<T>
+  | WorkerResultHttpError
+  | WorkerResultTransportError;
+
+function extractRetryAfter(response: Response, body: unknown): number | undefined {
+  if (body && typeof body === "object" && "retryAfter" in body) {
+    const val = (body as { retryAfter?: unknown }).retryAfter;
+    if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+      return val;
+    }
+  }
+  const headerVal = response.headers?.get?.("retry-after");
+  if (headerVal) {
+    const parsed = Number(headerVal);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+async function safeExecuteWorkerFetch<T = unknown>(
+  fetchCall: () => Promise<Response>,
+): Promise<WorkerResult<T>> {
+  let response: Response;
+  try {
+    response = await fetchCall();
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "transport_error",
+      error: err instanceof Error ? err.message : String(err),
+      ...(err instanceof Error && err.cause !== undefined ? { cause: err.cause } : {}),
+    };
+  }
+
+  let body: unknown;
+  try {
+    const rawText = await response.text();
+    if (rawText.trim().length > 0) {
+      try {
+        body = JSON.parse(rawText);
+      } catch {
+        body = rawText;
+      }
+    }
+  } catch {
+    body = undefined;
+  }
+
+  const retryAfter = extractRetryAfter(response, body);
+
+  if (response.ok) {
+    if (body && typeof body === "object" && "ok" in body && (body as { ok?: boolean }).ok === false) {
+      return {
+        ok: false,
+        kind: "app_rejection",
+        status: response.status,
+        body: body as T,
+        ...(retryAfter !== undefined ? { retryAfter } : {}),
+      };
+    }
+    return {
+      ok: true,
+      kind: "success",
+      status: response.status,
+      body: body as T,
+      ...(retryAfter !== undefined ? { retryAfter } : {}),
+    };
+  }
+
+  return {
+    ok: false,
+    kind: "http_error",
+    status: response.status,
+    ...(body !== undefined ? { body } : {}),
+    ...(retryAfter !== undefined ? { retryAfter } : {}),
+  };
+}
+
 export interface PollerConfig {
   workerUrl: string;
   apiKey: string;
@@ -280,9 +394,9 @@ export class Poller {
   // HTTP methods preserved from MachineAgent (already HTTP)
   // -------------------------------------------------------------------------
 
-  async registerSession(sessionId: string, label?: string): Promise<void> {
-    try {
-      const response = await this.fetchFn(`${this.config.workerUrl}/sessions/register`, {
+  async registerSession(sessionId: string, label?: string): Promise<WorkerResult> {
+    const result = await safeExecuteWorkerFetch(() =>
+      this.fetchFn(`${this.config.workerUrl}/sessions/register`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
@@ -293,12 +407,15 @@ export class Poller {
           machineId: this.config.machineId,
           ...(label ? { label } : {}),
         }),
-      });
-      const payload = await response.json() as { ok?: boolean };
-      console.log(`[poller] registerSession sessionId=${sessionId} ok=${Boolean(payload.ok)}`);
-    } catch {
-      console.warn(`[poller] registerSession failed sessionId=${sessionId}`);
+      }),
+    );
+    if (result.ok) {
+      console.log(`[poller] registerSession sessionId=${sessionId} ok=true`);
+    } else {
+      const detail = result.kind === "transport_error" ? result.error : `status=${result.status}`;
+      console.warn(`[poller] registerSession failed sessionId=${sessionId} kind=${result.kind} ${detail}`);
     }
+    return result;
   }
 
   async unregisterSession(sessionId: string): Promise<void> {
@@ -313,17 +430,17 @@ export class Poller {
       });
       const payload = await response.json() as { ok?: boolean };
       console.log(`[poller] unregisterSession sessionId=${sessionId} ok=${Boolean(payload.ok)}`);
-    } catch {
-      console.warn(`[poller] unregisterSession failed sessionId=${sessionId}`);
+    } catch (err) {
+      console.warn(`[poller] unregisterSession failed sessionId=${sessionId}:`, err instanceof Error ? err.message : String(err));
     }
   }
 
   async sendNotification(
     input: SendNotificationInput,
-  ): Promise<{ ok: boolean; retryAfter?: number }> {
+  ): Promise<WorkerResult> {
     const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded } = input;
-    try {
-      const response = await this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
+    return safeExecuteWorkerFetch(() =>
+      this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
@@ -341,21 +458,8 @@ export class Poller {
           ...(dir ? { dir } : {}),
           ...(threaded !== undefined ? { threaded } : {}),
         }),
-      });
-      const payload = (await response.json()) as { ok?: boolean; retryAfter?: unknown };
-      const retryAfter =
-        typeof payload.retryAfter === "number" &&
-        Number.isFinite(payload.retryAfter) &&
-        payload.retryAfter > 0
-          ? payload.retryAfter
-          : undefined;
-      return {
-        ok: Boolean(payload.ok),
-        ...(retryAfter !== undefined ? { retryAfter } : {}),
-      };
-    } catch {
-      return { ok: false };
-    }
+      }),
+    );
   }
 
   async editNotification(
@@ -379,7 +483,8 @@ export class Poller {
         }),
       });
       return await response.json() as { ok: boolean };
-    } catch {
+    } catch (err) {
+      console.warn(`[poller] editNotification failed notificationId=${notificationId}:`, err instanceof Error ? err.message : String(err));
       return { ok: false };
     }
   }
@@ -404,7 +509,8 @@ export class Poller {
         body: form,
       });
       return await response.json() as { ok: boolean; key: string };
-    } catch {
+    } catch (err) {
+      console.warn(`[poller] uploadMedia failed key=${key}:`, err instanceof Error ? err.message : String(err));
       return { ok: false, key: "" };
     }
   }

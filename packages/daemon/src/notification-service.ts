@@ -4,7 +4,7 @@ import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
 import type { Activity } from "./current-state-enrich";
-import type { SendNotificationInput } from "./worker/poller";
+import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
 interface NotificationInput {
   event: string;
@@ -92,7 +92,7 @@ export interface QuestionNotifier {
 export interface WorkerNotificationSender {
   sendNotification(
     input: SendNotificationInput,
-  ): Promise<{ ok: boolean; retryAfter?: number }>;
+  ): Promise<WorkerResult>;
 
   uploadMedia?(
     key: string,
@@ -565,7 +565,12 @@ export class WorkerNotificationService implements StopNotifier, QuestionNotifier
       if (result.retryAfter !== undefined) {
         throw new RateLimitError("Worker notification send rate limited", result.retryAfter);
       }
-      throw new Error("Worker notification send failed");
+      const reason = result.kind === "transport_error"
+        ? result.error
+        : result.kind === "http_error"
+          ? `HTTP ${result.status}`
+          : "App rejection";
+      throw new Error(`Worker notification send failed: ${reason}`);
     }
   }
 

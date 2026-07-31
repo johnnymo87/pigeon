@@ -7,11 +7,11 @@
  */
 
 import type { StorageDb } from "../storage/database";
-import type { SendNotificationInput } from "./poller";
+import type { SendNotificationInput, WorkerResult } from "./poller";
 
 export type SendNotificationFn = (
   input: SendNotificationInput,
-) => Promise<{ ok: boolean; retryAfter?: number }>;
+) => Promise<WorkerResult>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
 
@@ -206,6 +206,10 @@ export class OutboxSender {
                 sessionId: entry.sessionId,
                 attempts: entry.attempts + 1,
                 nextRetryIn: backoff,
+                kind: result.kind,
+                ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status } : {}),
+                ...(result.kind === "transport_error" ? { error: result.error } : {}),
+                ...(result.kind === "http_error" || result.kind === "app_rejection" ? { body: result.body } : {}),
               });
               if (
                 typeof result.retryAfter === "number" &&

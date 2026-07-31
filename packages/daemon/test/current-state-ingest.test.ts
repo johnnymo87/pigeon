@@ -1,14 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { ingestCurrentStateCommand, buildCardNotification, type CurrentStateIngestInput } from "../src/worker/current-state-ingest";
+import { ingestCurrentStateCommand, type CurrentStateIngestInput } from "../src/worker/current-state-ingest";
 
 describe("current-state-ingest TDD tests", () => {
   it("1. Happy path / ordering / no cap", async () => {
     const callOrder: string[] = [];
     const registerSession = vi.fn().mockImplementation(async (sid, label) => {
       callOrder.push(`register:${sid}`);
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
     });
-    const sendCard = vi.fn().mockImplementation(async (sid, text, entities) => {
-      callOrder.push(`card:${sid}`);
+    const enqueueCard = vi.fn().mockImplementation((opts) => {
+      callOrder.push(`card:${opts.sid}`);
     });
     const sendPlainText = vi.fn().mockImplementation(async (text, entities) => {
       callOrder.push(`plain`);
@@ -45,14 +46,14 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
 
     await ingestCurrentStateCommand(input);
 
-    // ONE sendPlainText (the index) called before any sendCard
+    // ONE sendPlainText (the index) called before any enqueueCard
     expect(sendPlainText).toHaveBeenCalledTimes(1);
     expect(callOrder[0]).toBe("plain");
 
@@ -61,8 +62,20 @@ describe("current-state-ingest TDD tests", () => {
     expect(registerSession).toHaveBeenCalledWith("ses_A", "Session A");
     expect(registerSession).toHaveBeenCalledWith("ses_B", "Session B");
 
-    // sendCard called once per sid
-    expect(sendCard).toHaveBeenCalledTimes(2);
+    // enqueueCard called once per sid with deterministic notificationId
+    expect(enqueueCard).toHaveBeenCalledTimes(2);
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_B",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_B",
+    });
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_A",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_A",
+    });
 
     // Cards ordered by last-activity desc (most-recent first: B is 2000, A is 1000)
     // So ses_B actions should happen before ses_A actions
@@ -78,8 +91,8 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("2. Unreadable (404)", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -108,7 +121,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
@@ -117,8 +130,13 @@ describe("current-state-ingest TDD tests", () => {
 
     expect(registerSession).toHaveBeenCalledTimes(1);
     expect(registerSession).toHaveBeenCalledWith("ses_B", "Session B");
-    expect(sendCard).toHaveBeenCalledTimes(1);
-    expect(sendCard).toHaveBeenCalledWith("ses_B", expect.any(String), expect.any(Array));
+    expect(enqueueCard).toHaveBeenCalledTimes(1);
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_B",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_B",
+    });
 
     // The index text reflects the unreadable count (contains "1 unreadable")
     expect(sendPlainText).toHaveBeenCalledTimes(1);
@@ -127,8 +145,8 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("3. Zero sids", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -146,7 +164,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
     };
 
@@ -155,12 +173,12 @@ describe("current-state-ingest TDD tests", () => {
     expect(sendPlainText).toHaveBeenCalledTimes(1);
     expect(sendPlainText).toHaveBeenCalledWith("No main-session TUIs found on devbox.");
     expect(registerSession).not.toHaveBeenCalled();
-    expect(sendCard).not.toHaveBeenCalled();
+    expect(enqueueCard).not.toHaveBeenCalled();
   });
 
   it("4. Serve unhealthy", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -178,7 +196,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
     };
 
@@ -188,15 +206,15 @@ describe("current-state-ingest TDD tests", () => {
     expect(sendPlainText).toHaveBeenCalledWith("opencode serve is not running on devbox.");
     expect(enumerate).not.toHaveBeenCalled();
     expect(registerSession).not.toHaveBeenCalled();
-    expect(sendCard).not.toHaveBeenCalled();
+    expect(enqueueCard).not.toHaveBeenCalled();
   });
 
   it("5. Card failure is best-effort", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    // make first sendCard reject
-    const sendCard = vi.fn()
-      .mockRejectedValueOnce(new Error("Network fail"))
-      .mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    // make first enqueueCard throw
+    const enqueueCard = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("Enqueue fail"); })
+      .mockImplementation(() => {});
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -230,7 +248,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
@@ -238,12 +256,12 @@ describe("current-state-ingest TDD tests", () => {
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
 
     expect(registerSession).toHaveBeenCalledTimes(2);
-    expect(sendCard).toHaveBeenCalledTimes(2);
+    expect(enqueueCard).toHaveBeenCalledTimes(2);
   });
 
   it("6. All unreadable", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -261,22 +279,22 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
     };
 
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
 
     expect(registerSession).not.toHaveBeenCalled();
-    expect(sendCard).not.toHaveBeenCalled();
+    expect(enqueueCard).not.toHaveBeenCalled();
     expect(sendPlainText).toHaveBeenCalledTimes(1);
     const indexText = (sendPlainText.mock.calls[0]?.[0] as string) ?? "";
     expect(indexText).toContain("2 unreadable");
   });
 
   it("7. getSessionMessages throws -> unreadable + continue", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -310,7 +328,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
@@ -320,8 +338,13 @@ describe("current-state-ingest TDD tests", () => {
     // ses_A gets skipped for card because it failed getSessionMessages, counted as unreadable
     expect(registerSession).toHaveBeenCalledTimes(1);
     expect(registerSession).toHaveBeenCalledWith("ses_B", "Session B");
-    expect(sendCard).toHaveBeenCalledTimes(1);
-    expect(sendCard).toHaveBeenCalledWith("ses_B", expect.any(String), expect.any(Array));
+    expect(enqueueCard).toHaveBeenCalledTimes(1);
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_B",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_B",
+    });
 
     expect(sendPlainText).toHaveBeenCalledTimes(1);
     const indexText = (sendPlainText.mock.calls[0]?.[0] as string) ?? "";
@@ -329,11 +352,11 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("8. registerSession failure isolation", async () => {
-    // first registerSession call rejects, second succeeds
+    // first registerSession call returns ok=false (or throws), second succeeds
     const registerSession = vi.fn()
-      .mockRejectedValueOnce(new Error("Register database fail"))
-      .mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+      .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 500 })
+      .mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -367,24 +390,29 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
 
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
 
-    // registerSession is called for both (since first registers B, then B throws, then registers A)
-    // Therefore, ses_B does NOT call sendCard.
-    // Then ses_A is registered successfully and gets its card.
+    // registerSession is called for both (since first registers B, then B fails, then registers A)
+    // Therefore, ses_B does NOT call enqueueCard.
+    // Then ses_A is registered successfully and gets its card enqueued.
     expect(registerSession).toHaveBeenCalledTimes(2);
-    expect(sendCard).toHaveBeenCalledTimes(1);
-    expect(sendCard).toHaveBeenCalledWith("ses_A", expect.any(String), expect.any(Array));
+    expect(enqueueCard).toHaveBeenCalledTimes(1);
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_A",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_A",
+    });
   });
 
   it("9. sort stability", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -410,19 +438,19 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
     };
 
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
 
     expect(registerSession).toHaveBeenCalledTimes(2);
-    expect(sendCard).toHaveBeenCalledTimes(2);
+    expect(enqueueCard).toHaveBeenCalledTimes(2);
   });
 
   it("10. homeScreenCount threads into index", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -450,7 +478,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
       now: 2500,
     };
@@ -461,12 +489,12 @@ describe("current-state-ingest TDD tests", () => {
     const indexText = (sendPlainText.mock.calls[0]?.[0] as string) ?? "";
     expect(indexText).toContain("2 on home screen");
     expect(registerSession).toHaveBeenCalledTimes(1);
-    expect(sendCard).toHaveBeenCalledTimes(1);
+    expect(enqueueCard).toHaveBeenCalledTimes(1);
   });
 
   it("11. only home-screen TUIs (no sessions)", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
-    const sendCard = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
     const opencodeClient = {
@@ -484,7 +512,7 @@ describe("current-state-ingest TDD tests", () => {
       opencodeClient,
       enumerate,
       registerSession,
-      sendCard,
+      enqueueCard,
       sendPlainText,
     };
 
@@ -498,48 +526,7 @@ describe("current-state-ingest TDD tests", () => {
     expect(indexText).toContain("3 on home screen");
 
     expect(registerSession).not.toHaveBeenCalled();
-    expect(sendCard).not.toHaveBeenCalled();
+    expect(enqueueCard).not.toHaveBeenCalled();
   });
 
-  describe("buildCardNotification", () => {
-    it("builds a card notification with threaded: false and byte-identical payload shape", () => {
-      const entities = [{ type: "bold", offset: 0, length: 4 }];
-      const payload = buildCardNotification({
-        sessionId: "ses_123",
-        chatId: "chat_456",
-        text: "Card text",
-        entities: entities as any,
-      });
-
-      expect(payload).toEqual({
-        sessionId: "ses_123",
-        chatId: "chat_456",
-        text: "Card text",
-        replyMarkup: { inline_keyboard: [] },
-        entities,
-        threaded: false,
-      });
-      expect(payload.threaded).toBe(false);
-    });
-
-    it("passes through entities as undefined when entities is undefined", () => {
-      const payload = buildCardNotification({
-        sessionId: "ses_123",
-        chatId: "chat_456",
-        text: "Card text",
-        entities: undefined,
-      });
-
-      expect(payload.entities).toBeUndefined();
-      expect("entities" in payload).toBe(true);
-      expect(payload).toEqual({
-        sessionId: "ses_123",
-        chatId: "chat_456",
-        text: "Card text",
-        replyMarkup: { inline_keyboard: [] },
-        entities: undefined,
-        threaded: false,
-      });
-    });
-  });
 });
