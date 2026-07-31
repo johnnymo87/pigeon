@@ -505,8 +505,9 @@ those cards are never enqueued at all.
   attempts (12:00, 13:00) silently deleted nothing — see §1.-1, and note it was caught by checking
   the effect rather than by any alarm.
 - [x] **2c. `pigeon-a1a` — stop producing the garbage.** Done in `95ab2df` and `01abd0b` (PR #16),
-  but landed as **two** sites rather than four — see the finding below. NOT yet deployed (daemon
-  change; needs a per-machine pull and restart). The bead claimed three daemon paths remove a local
+  but landed as **two** sites rather than four — see the finding below. **Deployed to cloudbox only**
+  (2026-07-31); devbox and macbook are alive and polling but not reachable from cloudbox, so their
+  pull+restart must be run on those hosts. chromebook has not polled in ~4 months. The bead claimed three daemon paths remove a local
   session row without unregistering, or register worker-side with no local row at all:
   - `repos.ts:226` — `cleanupExpired` does `DELETE FROM sessions WHERE expires_at < ?` with no
     unregister, and is called from **inside the reaper itself** (`session-reaper.ts:43`).
@@ -582,8 +583,36 @@ Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sid
   is why the incident was ~150 lost messages instead of ~1 — roughly 150× amplification.** Removing
   the amplifier beats alerting on its output; done in the other order, the first thing the new
   alerting does is page about 150 notifications that should never have existed.
-- [ ] **4b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
-  Telegram**, since Telegram being broken is the common cause.
+- [ ] **4b. `pigeon-2c6` — answer it with the SAME investigation as `4a`.** `/current-state`
+  registers every tmux-surveyed session worker-side (`current-state-ingest.ts:103`), but discovery is
+  tmux-based rather than registry-based, so nothing guarantees a local row exists — and the reaper
+  only unregisters sessions it still holds **locally**. Those rows can therefore never be
+  unregistered by any daemon. This is a different failure mode from `4a` (that one is a
+  notification storm, this one is a registry leak) but it is **the same code and almost certainly the
+  same root**, so investigating it separately would mean reading `current-state-ingest` twice. Now
+  bounded rather than unbounded by Cycle 2's 14-day sweep, which is what makes it safe to take time
+  over. **Measure first** — instrument how many such registrations have no local row — before
+  choosing between synthesizing a local row and not registering untracked sessions.
+- [ ] **4c. `pigeon-cn8` — the other amplifier, and the one the user actually feels.** **Measured
+  2026-07-31: 40 of 82 forum topics created in 7 days are lgtm review sessions — 49% of the entire
+  forum.** Every PR spawns at least two (a gather pass and a review pass, visible in the topic
+  names), and the review pass can be re-summoned repeatedly. With topics enabled each one gets its
+  **own topic**, so this is topic-list noise as well as notification noise, and it spends the §3
+  budget on messages the user reports never once having read.
+  **The obvious approach does not work.** lgtm sessions do **not** live in `~/projects/lgtm` — only
+  the dispatcher does. The review sessions run inside the *target* repo's worktree
+  (`/home/dev/projects/mono/.worktrees/pr-4005`), so a directory denylist cannot catch them without
+  hiding real work in those same repos. (`docs/plans/2026-06-06-current-state-command-design.md`
+  assumes the `~/projects/lgtm` location; that holds for the dispatcher only.) The clean signal is
+  the **title**, which always names the prompt file — `.lgtm-review-prompt.md`,
+  `.lgtm-gather-prompt.md`. Make the match **configurable** rather than hardcoding `.lgtm-`, because
+  `morning-agent` has the same problem and cannot be filtered by directory either (it runs in
+  `~/projects/workstation`, a real work dir). Corral to one shared topic or suppress outright; the
+  user leans suppress and would accept corralling.
+- [ ] **4d. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+  Telegram**, since Telegram being broken is the common cause. **Do this last in the cycle**: it is
+  the same argument as `4a` versus `8l7`, applied to `4c` — alerting before the amplifiers are gone
+  means the first thing the new alerting does is page about noise that should not exist.
 
 ### Cycle 5 — the server side (the track this roadmap was missing)
 
@@ -641,6 +670,20 @@ blast radius but **do not cure the outage**.
 - [ ] **6h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
+- [ ] **6i. `pigeon-cal`** (P2) — webhook acks are fire-and-forget, so an ack Telegram rejects
+  vanishes with no exception, no log and no fallback (`webhook.ts` `sendTelegramMessage` discards the
+  `TgResult` deliberately; `telegram.ts` `sendMessage` returns it and never throws). The messages
+  that vanish are exactly the **error** messages — "Could not find a session for that message" — so
+  the failure class is errors being invisible at the point of failure, reintroduced by a different
+  mechanism in the very work meant to fix it. The notification path is fully defended here (reopen,
+  `thread_not_found` recovery, non-429 fallback); the webhook confirmation path has none of it.
+  **Gated on `pigeon-cev` item 3** — whether a bot admin can post into a *closed* forum topic. If it
+  can, there is no bug at all. **Verify that before building a fallback**, since building one now
+  means guessing a Telegram behaviour, which this plan has twice refused to do.
+  Note this is the same shape as the Cycle 2 sweep bug in §1.-1: a deliberate swallow that converts a
+  hard failure into an invisible one. Whatever is done here, the fix is to make the outcome
+  observable, not merely to add a retry.
+
 ### Cycle 7 — close out the migration
 
 - [ ] **7a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
@@ -674,6 +717,37 @@ whole backlog:
 
 > **Both were found only by re-measuring instead of trusting the inherited list — the same discipline
 > that caught the false test baseline in §0.** Do this at the start of every restructuring.
+
+## §4.2 — Feature track (parallel; no dependency on the hardening spine)
+
+These are **not** delivery-hardening and are deliberately kept off the numbered spine, because the
+Cycle ordering above encodes a risk argument and these carry none of it. They can be picked up in any
+gap, in any order, without disturbing the sequence — with one exception noted below. Same protocol
+as §2 (compact → optional `oracle-fable` → SDD → `adversarial-reviewer-fable` → PR).
+
+Note the one genuine feature that is NOT here: `pigeon-cn8` (lgtm noise) sits at **4c** on the spine
+instead, because it is an amplifier. It halves forum-topic creation and spends the §3 budget, which
+makes it delivery work that happens to also be a quality-of-life win.
+
+- [ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at
+  Telegram's 128-char limit. Measured 2026-07-31 at **77–115 chars**, roughly 19 of them spent on the
+  constant `/home/dev/projects/` prefix before any information appears. Two problems, and the second
+  is not cosmetic: the list reads as a column of identical prefixes, **and the clamp eats the wrong
+  end** — because dir comes first, a long path truncates the *title*, which is the informative half.
+  Put the **title first**, abbreviate `$HOME` to `~` (derive it from the session's own home; macbook
+  is not `/home/dev`), keep the path as the suffix. Decide explicitly what happens to the 82 existing
+  topics — leave, rename-on-next-touch, or backfill via `editForumTopic` — rather than discovering
+  the inconsistency later.
+- [ ] **F2. `pigeon-pnf`** (P3) — add `/rename <new title>`, the manual complement to F1, for when
+  the auto-derived title has gone stale. Follow the existing reply-resolved command pattern
+  (`webhook.ts:712`, `:734`, helper at `:538`); `editForumTopic` already exists in the Telegram
+  client. Rename the **title only** and let `topicName` re-derive the suffix, so the two naming paths
+  cannot drift. Must degrade gracefully with topics disabled. **Sequence after F1** — the only
+  ordering constraint in this track — or the naming logic gets written twice.
+
+**Do `pigeon-cn8` (4c) before F1 if you want the easy win first:** it removes roughly half of all
+topics, which makes the naming change much easier to evaluate against a list that is mostly real
+work.
 
 ## §5 — Reference
 
