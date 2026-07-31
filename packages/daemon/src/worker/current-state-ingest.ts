@@ -1,5 +1,5 @@
 import type { TgEntity } from "../telegram-message";
-import type { SendNotificationInput } from "./poller";
+import type { SendNotificationInput, WorkerResult } from "./poller";
 import {
   classifyActivity,
   snippetFromMessages,
@@ -48,7 +48,7 @@ export interface CurrentStateIngestInput {
     getSessionMessages: (sid: string) => Promise<unknown[]>;
   };
   enumerate: () => Promise<{ sids: string[]; homeScreenCount: number }>;
-  registerSession: (sid: string, label: string) => Promise<void>;
+  registerSession: (sid: string, label: string) => Promise<WorkerResult>;
   sendCard: (sid: string, text: string, entities: TgEntity[] | undefined) => Promise<void>;
   sendPlainText: (text: string, entities?: TgEntity[]) => Promise<void>;
   now?: number; // for deterministic relative-time in tests

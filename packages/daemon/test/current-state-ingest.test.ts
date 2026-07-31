@@ -6,6 +6,7 @@ describe("current-state-ingest TDD tests", () => {
     const callOrder: string[] = [];
     const registerSession = vi.fn().mockImplementation(async (sid, label) => {
       callOrder.push(`register:${sid}`);
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
     });
     const sendCard = vi.fn().mockImplementation(async (sid, text, entities) => {
       callOrder.push(`card:${sid}`);
@@ -78,7 +79,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("2. Unreadable (404)", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -127,7 +128,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("3. Zero sids", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -159,7 +160,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("4. Serve unhealthy", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -192,7 +193,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("5. Card failure is best-effort", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     // make first sendCard reject
     const sendCard = vi.fn()
       .mockRejectedValueOnce(new Error("Network fail"))
@@ -242,7 +243,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("6. All unreadable", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -275,7 +276,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("7. getSessionMessages throws -> unreadable + continue", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -383,7 +384,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("9. sort stability", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -421,7 +422,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("10. homeScreenCount threads into index", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 
@@ -465,7 +466,7 @@ describe("current-state-ingest TDD tests", () => {
   });
 
   it("11. only home-screen TUIs (no sessions)", async () => {
-    const registerSession = vi.fn().mockResolvedValue(undefined);
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
     const sendCard = vi.fn().mockResolvedValue(undefined);
     const sendPlainText = vi.fn().mockResolvedValue(undefined);
 

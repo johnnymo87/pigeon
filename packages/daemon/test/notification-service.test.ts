@@ -688,7 +688,7 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
       return { ok: true, key };
     });
 
-    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true as const, kind: "success" as const, status: 200, body: { ok: true } }));
 
     const workerSender: WorkerNotificationSender = {
       sendNotification: sendNotificationMock,
@@ -752,7 +752,7 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
 
     // uploadMedia always fails
     const uploadMediaMock = vi.fn(async () => ({ ok: false, key: "" }));
-    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true as const, kind: "success" as const, status: 200, body: { ok: true } }));
 
     const workerSender: WorkerNotificationSender = {
       sendNotification: sendNotificationMock,
@@ -806,7 +806,7 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
     }, 1_000);
 
     const uploadMediaMock = vi.fn(async () => ({ ok: true, key: "some-key" }));
-    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true as const, kind: "success" as const, status: 200, body: { ok: true } }));
 
     const workerSender: WorkerNotificationSender = {
       sendNotification: sendNotificationMock,
@@ -856,7 +856,7 @@ describe("WorkerNotificationService.sendStopNotification with media", () => {
       return { ok: true, key };
     });
 
-    const sendNotificationMock = vi.fn(async () => ({ ok: true }));
+    const sendNotificationMock = vi.fn(async () => ({ ok: true as const, kind: "success" as const, status: 200, body: { ok: true } }));
 
     const workerSender: WorkerNotificationSender = {
       sendNotification: sendNotificationMock,

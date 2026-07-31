@@ -843,15 +843,22 @@ describe("Poller dispatch — current_state", () => {
 
   it("sendNotification returns ok: false and retryAfter on rate limit (429)", async () => {
     const poller = new Poller(BASE_CONFIG, makeCallbacks());
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 429,
-      json: async () => ({ error: "rate_limited", retryAfter: 17 }),
-    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "rate_limited", retryAfter: 17 }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
     (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
 
     const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
-    expect(res).toEqual({ ok: false, retryAfter: 17 });
+    expect(res).toEqual({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "rate_limited", retryAfter: 17 },
+      retryAfter: 17,
+    });
   });
 
   it("strips garbage retryAfter from 429 response body", async () => {
@@ -861,20 +868,195 @@ describe("Poller dispatch — current_state", () => {
       { error: "rate_limited", retryAfter: "30" },
       { error: "rate_limited", retryAfter: -5 },
       { error: "rate_limited", retryAfter: 0 },
-      { error: "rate_limited", retryAfter: NaN },
+      { error: "rate_limited", retryAfter: null },
       { error: "rate_limited" },
     ];
 
     for (const payload of garbagePayloads) {
-      const fetchMock = vi.fn().mockResolvedValue({
-        ok: false,
-        status: 429,
-        json: async () => payload,
-      });
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(payload), {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
       (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
 
       const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
-      expect(res).toEqual({ ok: false });
+      expect(res).toEqual({
+        ok: false,
+        kind: "http_error",
+        status: 429,
+        body: payload,
+      });
     }
+  });
+});
+
+describe("Poller.sendNotification() structured results", () => {
+  it("returns transport_error when fetch throws", async () => {
+    const cause = new Error("ECONNREFUSED");
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed", { cause }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: false,
+      kind: "transport_error",
+      error: "fetch failed",
+      cause,
+    });
+  });
+
+  it("returns http_error with status and parsed body for non-2xx with JSON body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "Unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: false,
+      kind: "http_error",
+      status: 401,
+      body: { ok: false, error: "Unauthorized" },
+    });
+  });
+
+  it("returns http_error for non-2xx with NON-JSON body without throwing or misreporting as transport_error", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("<html>502 Bad Gateway</html>", {
+        status: 502,
+        headers: { "Content-Type": "text/html" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: "<html>502 Bad Gateway</html>",
+    });
+  });
+
+  it("returns app_rejection for 2xx response where payload ok is false", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "Chat not found" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: false,
+      kind: "app_rejection",
+      status: 200,
+      body: { ok: false, error: "Chat not found" },
+    });
+  });
+
+  it("returns success with retryAfter on 2xx with ok=true and retryAfter", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, retryAfter: 15 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true, retryAfter: 15 },
+      retryAfter: 15,
+    });
+  });
+
+  it("returns success on 2xx response with ok=true", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, messageId: 100 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    expect(res).toEqual({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true, messageId: 100 },
+    });
+  });
+});
+
+describe("Poller.registerSession() structured results", () => {
+  it("returns success result on 200 ok=true", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.registerSession("sess-1", "Label");
+    expect(res).toEqual({
+      ok: true,
+      kind: "success",
+      status: 200,
+      body: { ok: true },
+    });
+  });
+
+  it("returns transport_error when fetch throws", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("DNS failure"));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.registerSession("sess-1");
+    expect(res).toEqual({
+      ok: false,
+      kind: "transport_error",
+      error: "DNS failure",
+    });
+  });
+
+  it("returns http_error on non-2xx status", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("Internal Error", { status: 500 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.registerSession("sess-1");
+    expect(res).toEqual({
+      ok: false,
+      kind: "http_error",
+      status: 500,
+      body: "Internal Error",
+    });
+  });
+
+  it("returns app_rejection on 200 status with ok=false", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "invalid session" }), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
+
+    const res = await poller.registerSession("sess-1");
+    expect(res).toEqual({
+      ok: false,
+      kind: "app_rejection",
+      status: 200,
+      body: { ok: false, error: "invalid session" },
+    });
   });
 });

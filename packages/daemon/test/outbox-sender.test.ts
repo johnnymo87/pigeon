@@ -159,6 +159,39 @@ describe("OutboxSender.processOnce()", () => {
     expect(record!.nextRetryAt).toBe(10_000);
   });
 
+  it("logs structured classification and status on delivery failure", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const logFn = vi.fn();
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "rate_limited" },
+      retryAfter: 30,
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    expect(logFn).toHaveBeenCalledWith(
+      "outbox entry delivery failed, scheduling retry",
+      expect.objectContaining({
+        notificationId: "notif-1",
+        kind: "http_error",
+        status: 429,
+        body: { error: "rate_limited" },
+      }),
+    );
+  });
+
   it("retries on thrown error with backoff", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
@@ -369,9 +402,9 @@ describe("OutboxSender.processOnce()", () => {
       ids.push(notificationId);
       if (failChunk2 && text === "chunk-2") {
         failChunk2 = false;
-        return { ok: false };
+        return { ok: false as const, kind: "http_error" as const, status: 500, body: "error" };
       }
-      return { ok: true };
+      return { ok: true as const, kind: "success" as const, status: 200, body: { ok: true } };
     });
 
     storage.outbox.upsert({
