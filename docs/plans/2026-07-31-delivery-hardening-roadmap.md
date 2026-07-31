@@ -334,14 +334,41 @@ exists to prevent.**
 
 #### Cycle 1 task breakdown
 
-- [ ] **1a. `pigeon-m76`** — remove the dead stop/question arms (above).
-- [ ] **1b.** Pure `classifyDeliveryFailure(result, ctx) -> DeliveryAction` in its own module, with
-  table-driven tests. No fakes, no I/O. Actions: `retry | pause | terminal | reregister | strip_entities`.
-- [ ] **1c.** Wire it into `OutboxSender`: inject `registerSession` + a local-session lookup, add
-  `outbox.updatePayload`, in-memory re-register set keyed by `notificationId` cleared on sent/failed.
+- [x] **1a. `pigeon-m76`** — dead stop/question arms removed. DONE `6233937` + `03539d9`. The second
+  commit deletes the residue: with its methods gone `WorkerNotificationService` was a five-argument
+  constructor with no body, still wired as the "primary" notifier. Alert delivery already fell
+  through to Telegram in all three configurations, so removing it was behaviour-preserving.
+- [x] **1b.** Pure `classifyDeliveryFailure(result, ctx) -> DeliveryAction`, table-driven tests, no
+  I/O. DONE `1fc0e44`.
+- [x] **1c.** Wired into `OutboxSender` + `outbox.updatePayload`. DONE `5b3c79d`, `e67a144`, `938c38c`.
   **Every arm ends in `markRetry` — never re-send inside the same tick**, so attempt accounting is
-  unchanged and a 404→re-register→502→strip sequence cannot double-count.
+  unchanged and a 404→re-register→502→strip sequence cannot double-count (confirmed by review).
 - Budget constants (`MAX_ATTEMPTS`, `MAX_AGE_MS`, `BACKOFF_SCHEDULE`, `MAX_PAUSE_MS`) are **Cycle 2**.
+
+#### What changed during Cycle 1 vs. what was planned
+
+**`403` is NOT terminal — `pigeon-bzf` is rejected on that point.** Correction 3 above softened it to
+"terminal at `attempts >= 2`". Adversarial review killed even that, on two counts: `ctx.attempts`
+counts failures of *every* kind, so an entry with two unrelated transport failures would die on its
+**first** 403 — two recoverable transients composing into permanent loss; and the threshold bought
+~15 seconds of rollback window while the comment justifying it claimed 15 minutes.
+
+Checking the worker then removed the motive entirely: **a 403 never reaches Telegram.** It is
+rejected at `notifications.ts:202`, before `resolveTopic` (`:230`) and before
+`createTelegramClient` (`:248`), so a retried 403 costs *none* of the shared 20/min budget that
+§3 says is the reason to kill doomed entries early. 400 (`:188`) and 404 (`:197`) return before
+Telegram too — they stay terminal for a **different** reason: they are genuinely deterministic, so
+retrying cannot ever succeed. **Generalise: "terminal" must be justified by determinism, not by
+budget, unless the failure actually spends budget.**
+
+**Two register outcomes were also un-terminalled** (`e67a144`): a 429 "Session limit reached" is a
+capacity condition that clears, and an `app_rejection` (2xx with `ok:false`) is inherently ambiguous.
+Terminal only on a definitive 4xx.
+
+**New beads from review:** `pigeon-bea` (P2 — the worker has **no session TTL cron**, so any leaked
+`sessions` row is permanent; Cycle 1's compensating unregister is a client-side mitigation and now
+logs `LEAKED worker session row` when it fails) and `pigeon-e44` (P3 — entity stripping fires on any
+Telegram 400, not just parse errors).
 
 ### Cycle 2 — the age and attempt budget
 
