@@ -82,6 +82,17 @@ regression.**
 
 ## §1 — OPERATING HAZARDS
 
+> **§1.0 — Merging is not deploying, and the daemon proves it.** Discovered 2026-07-31 while
+> deploying Cycle 2c: the production daemon checkout (`/home/dev/projects/pigeon`) was **44 commits
+> behind main**, meaning **every daemon change from Cycles 0 and 1 had been merged but never run.**
+> The outbox classifier, the priority ordering, the durable `/current-state` cards — none of it was
+> protecting anything. The nightly reset restarts the service but does **not** pull, so a merged
+> daemon commit sits inert until someone runs a pull and a restart on each machine. Earlier notes in
+> this file that said Cycles 0 and 1 "were daemon-only and merging was enough" had it exactly
+> backwards: worker changes need one deploy, daemon changes need a deploy **per machine**. Before
+> claiming a daemon behaviour is live, check `git rev-list --count HEAD..origin/main` in the
+> deployment checkout, not in your worktree.
+
 Each of these cost real time. They are not hypothetical.
 
 ### 1.1 The nightly reset prunes worktrees — this has happened TWICE
@@ -445,7 +456,8 @@ those cards are never enqueued at all.
 > register-429 retryable was still the right call, but it converts instant loss into *delayed* loss,
 > not into delivery. A durability fix downstream of an exhausted registry buys time, not correctness.
 
-- [ ] **2a. Make the cap safe and observable — `pigeon-bea`, first half. Do this FIRST.**
+- [x] **2a. Make the cap safe and observable — `pigeon-bea`, first half.** Done in `fafad8a` and
+  `18abfae` (PR #15); deployed 2026-07-31, worker version `290864ff`.
   Raise `MAX_SESSIONS` 1000 → **5000** and keep it global and dumb. Nothing real constrains it: D1
   allows 10GB, rows are ~100 bytes, and the `COUNT(*)` on new registration is sub-ms at this scale.
   Its only legitimate job is runaway-bug guard, not capacity planning. **Do not build per-machine
@@ -454,7 +466,8 @@ those cards are never enqueued at all.
   rejects in total silence, so even `wrangler tail` shows nothing), and a high-water check in the
   existing cron that sends a Telegram alert at ≥80% of the cap. Note the check-then-insert at
   `sessions.ts:59-71` is not atomic, so the cap is soft — fine for a backstop, do not fix.
-- [ ] **2b. The TTL sweep — `pigeon-bea`, second half.** Expire on **`updated_at`, not
+- [x] **2b. The TTL sweep — `pigeon-bea`, second half.** Done in `c6745d3`, `2e3dc50` and
+  `336a5e0` (PR #15); deployed with 2a. Expire on **`updated_at`, not
   `created_at`**: the touch runs on every notification (`notifications.ts:219`) and every webhook
   reply (`webhook.ts:468`), and its comment says *"Touch session to prevent cleanup"* — **the touch
   was written for a cleanup that was never built.** TTL = **14 days, strictly greater than the
@@ -466,9 +479,13 @@ those cards are never enqueued at all.
   `sessions`** (mirroring unregister at `sessions.ts:101-102`, the *only* deletion path `messages`
   has) in a single transactional `db.batch`. Bound it with a subquery `LIMIT 500` rather than
   `DELETE ... LIMIT`, which is compile-flag-dependent. Run the sweep **before** `runTopicReaper` in
-  `scheduled()` so orphaned topics close in the same tick via `topics.ts` `listOrphaned`. Current
+  `scheduled()` so topics orphaned by the sweep start draining via `topics.ts` `listOrphaned`
+  immediately rather than an hour later. Note *start*: the reaper closes at most
+  `DEFAULT_ORPHAN_CAP` (5) orphans per tick, so a bulk sweep drains over hours, not in one tick. Current
   backlog at 14d: **126 sessions and 701 messages**; orphaned messages today: **0**.
-- [ ] **2c. `pigeon-a1a` — stop producing the garbage.** Three verified daemon paths remove a local
+- [x] **2c. `pigeon-a1a` — stop producing the garbage.** Done in `95ab2df` and `01abd0b` (PR #16),
+  but landed as **two** sites rather than four — see the finding below. NOT yet deployed (daemon
+  change; needs a per-machine pull and restart). The bead claimed three daemon paths remove a local
   session row without unregistering, or register worker-side with no local row at all:
   - `repos.ts:226` — `cleanupExpired` does `DELETE FROM sessions WHERE expires_at < ?` with no
     unregister, and is called from **inside the reaper itself** (`session-reaper.ts:43`).
@@ -477,12 +494,37 @@ those cards are never enqueued at all.
     not registry-based, so nothing guarantees a local row exists.
   The reaper's own unregister is also best-effort (`session-reaper.ts:33-37` swallows errors).
 
+> **Finding, 2026-07-31 — two of the four named sources were not sources.** Checking each before
+> writing code retired half the bead:
+>
+> - **`repos.ts:226` `cleanupExpired` is not a leak source**, despite looking exactly like one (it
+>   deletes with no unregister, from inside the reaper). `expires_at` is always set to
+>   `last_seen + SESSION_TTL_MS` (`repos.ts:82,166`) and no caller overrides `ttlMs`, so its row set
+>   is a strict **subset** of the `listStale` set that the reap loop deleted and unregistered moments
+>   earlier. Confirmed empirically: the reaper's `cleaned N expired session records` log line has
+>   **never** fired in production, while `reaped stale session` fired 52 times in the same window.
+>   Mechanically true, empirically vacuous — the kind of bug that survives code review forever
+>   because the code really does look wrong.
+> - **`app.ts:595`** already unregisters via its `onSessionDelete` hook.
+> - **`current-state-ingest.ts:103` is real** and is probably the dominant source, but fixing it
+>   means synthesizing local session rows. It is now covered by `2b`'s sweep, so it was left for a
+>   later cycle rather than bolted on here. **Still open** — carry it forward.
+>
+> A correction on that first point, because I got the credit wrong before checking: the log line
+> that settled it **predates Cycle 0**. It is present in the commit the daemon was actually running
+> (`4e8156a`, 44 commits behind main), so the "never fired" evidence is sound — but attributing it
+> to recent work was the §1.7 reflex again, reaching for the memorable recent event. Verify which
+> binary produced a log line before crediting anything for it.
+
 **Sequencing: cap before sweep, and in two separate deploys.** The only way this work *loses*
 notifications is: sweep expires a live session → 404 → re-register → **429** → transient retry loop →
 killed at the 15-minute age cap. That chain needs cap pressure **and** the sweep at the same time.
 Raising the cap first breaks the 429 link before the sweep can ever run, so a mid-flight daemon that
 eats a 404 simply re-registers and succeeds. Shipping both at once re-creates exactly the
-"fix makes the loss faster" hazard that Cycle 1's 403 arm produced. `2c` is last: it stops future
+"fix makes the loss faster" hazard that Cycle 1's 403 arm produced.
+**In the event both shipped in one deploy, and that was sound for a reason worth keeping:** the cap
+raise takes effect the instant the worker goes live, while the sweep only fires on the next hourly
+cron tick, so the protective ordering is enforced by the schedule rather than by the deploy count. `2c` is last: it stops future
 garbage but clears none of the 153 rows already there, and the backstop makes it non-urgent.
 
 > **Method note — the same lesson twice, in both directions.** The first measurement of `pigeon-bea`

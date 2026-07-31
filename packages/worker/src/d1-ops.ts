@@ -362,6 +362,16 @@ export async function checkSessionHighWaterAlert(
 export const SESSION_SWEEP_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
 
 /**
+ * Victim ids bound per DELETE. D1 allows a maximum of 100 bound parameters per query, and
+ * that limit applies to each statement inside a `db.batch` individually:
+ * https://developers.cloudflare.com/d1/platform/limits/
+ *
+ * Held below 100 deliberately, and pinned by a test — exceeding it does not degrade, it
+ * throws the entire batch.
+ */
+export const SWEEP_ID_CHUNK = 90;
+
+/**
  * Sweep stale sessions whose `updated_at` is older than SESSION_SWEEP_TTL_MS (14 days),
  * deleting their `messages` rows alongside them.
  *
@@ -406,20 +416,38 @@ export async function sweepStaleSessions(
     return { sessionsDeleted: 0, messagesDeleted: 0 };
   }
 
-  const placeholders = ids.map(() => "?").join(", ");
-  const batchResults = await db.batch([
-    db
-      .prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`)
-      .bind(...ids),
-    db
-      .prepare(`DELETE FROM sessions WHERE session_id IN (${placeholders})`)
-      .bind(...ids),
-  ]);
-
-  // `meta.changes` is the row count. `meta.rows_written` counts index writes too, so it
-  // over-reports on `messages`, which carries a partial unique index on notification_id.
-  const messagesDeleted = batchResults[0]?.meta.changes ?? 0;
-  const sessionsDeleted = batchResults[1]?.meta.changes ?? 0;
+  // Deleted in chunks because D1 caps bound parameters at 100 PER STATEMENT, and that cap
+  // applies to each statement inside a batch. One parameter per victim means a sweep of
+  // more than 100 stale sessions exceeds it and the whole batch throws.
+  //
+  // This is not hypothetical. The first production run of this sweep had 126 victims,
+  // threw on exactly this, was swallowed by the caller's try/catch, and deleted nothing
+  // for two consecutive hourly ticks while appearing healthy. Local tests did not catch it
+  // because miniflare is plain SQLite, whose parameter ceiling is 999, so the limit that
+  // matters does not exist in the environment the tests run in. Keep SWEEP_ID_CHUNK at or
+  // under 100 and keep the guard test that pins it.
+  //
+  // Chunking trades one transaction for several. Each chunk is still atomic in the only
+  // way that matters here -- a session and its messages go together -- and a chunk failing
+  // midway leaves earlier chunks deleted, which is simply less work for the next tick.
+  let messagesDeleted = 0;
+  let sessionsDeleted = 0;
+  for (let i = 0; i < ids.length; i += SWEEP_ID_CHUNK) {
+    const chunk = ids.slice(i, i + SWEEP_ID_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const batchResults = await db.batch([
+      db
+        .prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`)
+        .bind(...chunk),
+      db
+        .prepare(`DELETE FROM sessions WHERE session_id IN (${placeholders})`)
+        .bind(...chunk),
+    ]);
+    // `meta.changes` is the row count. `meta.rows_written` counts index writes too, so it
+    // over-reports on `messages`, which carries a partial unique index on notification_id.
+    messagesDeleted += batchResults[0]?.meta.changes ?? 0;
+    sessionsDeleted += batchResults[1]?.meta.changes ?? 0;
+  }
 
   // The sweep is the only observability there is into the leak it exists to clean, and a
   // silent DELETE is not something to run against production on a timer.
