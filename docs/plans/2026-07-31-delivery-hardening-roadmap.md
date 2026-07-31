@@ -45,7 +45,7 @@ reverted and the outbox has drained — narrowing the allowlist first permanentl
 `docs/runbooks/telegram-forum-migration.md`.
 
 **Still open from the migration:** drop the old DM chat id from `ALLOWED_CHAT_IDS` after burn-in.
-Do this LAST, after §4 is done — it is the only irreversible step.
+Do this LAST, as Cycle 6b — it is the only irreversible step.
 
 ### Test baseline — regressions are measured against this
 
@@ -222,7 +222,7 @@ Two structural consequences worth holding in mind while doing any of the work be
 
 - **Every wasted call costs somebody else's notification.** T2.6 reopens a closed topic before
   sending, but live probing proved a bot **can** post into a closed topic — so that call is
-  belt-and-braces and is spending budget for nothing (§4.4).
+  belt-and-braces and is spending budget for nothing (Cycle 5c).
 - **Durability and budget are the same problem.** A send that is dropped on 429 (rather than
   retried) converts a budget shortfall into permanent data loss. That is `t5f`, `cal`, and `bqo`.
 
@@ -254,68 +254,127 @@ Two structural consequences worth holding in mind while doing any of the work be
 **Definition of done:** a `/current-state` with 25+ live sessions delivers every card, late if
 necessary, and any 429 is visible in the daemon log with its status code.
 
-### Cycle 1 — `pigeon-bqo` + `pigeon-8l7`: the outbox must not drop silently
+### Cycle 1 — consume the classification: act on a classified failure
 
-Cycle 0 turned up three more beads that belong here, because they are all the same `MAX_AGE_MS` /
-attempt-budget mechanism seen from different sides. Do them together.
+`pigeon-3h9` produced classifications that **nothing reads for control flow yet**. Every item here
+is that missing consumer, which is why they belong together.
 
-- [ ] **1a. `pigeon-bqo`** — the outbox permanently drops entries when the worker path is down longer
-  than `MAX_AGE_MS` (15 min) or 10 attempts. Same terminal-failure budget that makes the migration
-  rollback dangerous (runbook F1). ~150 messages have already died this way overnight.
-- [ ] **1b. `pigeon-8e9`** (new, pre-existing) — `upsert` resurrects a `failed` row **without
-  resetting `created_at`**, so anything older than 15 min returns to `queued`, is instantly judged
-  too old, and re-fails having sent nothing — with `attempts` still 0, so the log looks like it never
-  tried. Fix alongside 1a; they are the same budget.
-- [ ] **1c. `pigeon-bzf`** (new) — the outbox retries 4xx exactly like 5xx, so a 404/400/403 burns all
-  10 attempts over ~7 min. Making those terminal is **unfinished work from `pigeon-3h9`**: the whole
-  point of the `WorkerResult` union was to enable this discrimination, and nothing consumes the
-  status for control flow yet.
-- [ ] **1d. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+- [ ] **1a. `pigeon-m76` — clear the refactor trap FIRST, before any behaviour change lands nearby.**
+  `sendStopNotification`, `sendQuestionNotification` and `sendViaWorker` have **zero** production
+  callers (re-verified 2026-07-31), yet they duplicate the real formatting/chunking logic and have
+  passing unit tests. **This trap already fired**: Cycle 0 improved an error message inside
+  `sendViaWorker`, i.e. in dead code, with a green suite throughout. It cost a few lines that time.
+  Cycles 1 and 2 rewrite failure policy and the age budget *in exactly these files*.
+- [ ] **1b. `pigeon-bzf` + `pigeon-6be` + `pigeon-288` — ONE change, one policy.** Splitting these
+  actively harms:
+  - **`bzf` alone is a regression.** Making 404 terminal while `registerSession` is still one-shot
+    turns `6be`'s incident from "ten doomed retries, then dropped" into "one attempt, then dropped".
+    The message is lost *faster* and the logs look better. Correct behaviour: **404 → re-register →
+    retry**; terminal only if re-registration itself fails.
+  - **`288` is a deliberate exception to `bzf`.** A non-rate-limited 400 should get one retry with
+    entities stripped so the text still lands unformatted. Whichever of the two lands second will
+    silently override the first unless they are written as a single policy.
+  - Net policy: 404 → re-register then retry; deterministic 400 → one entity-stripped retry, then
+    terminal; 403 → terminal; 429 / 5xx / transport → retry as today.
+
+### Cycle 2 — the age and attempt budget
+
+Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
+
+- [ ] **2a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
+  than `MAX_AGE_MS` (15 min) or 10 attempts. Same budget that makes the migration rollback dangerous
+  (runbook F1).
+- [ ] **2b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
+  anything older than 15 min returns to `queued`, is instantly judged too old, and re-fails having
+  sent nothing — with `attempts` still 0, so the journal line reads like it never tried.
+
+### Cycle 3 — remove the amplifier, then alert on what remains
+
+- [ ] **3a. `pigeon-9y3` — do this BEFORE `8l7`.** An unidentified overnight job walks historical
+  sessions newest→oldest, ~one every 2 min, firing `registerSession` + a stop notification with
+  `notify=true` for each. During the outage every one burned an outbox entry to terminal. **That job
+  is why the incident was ~150 lost messages instead of ~1 — roughly 150× amplification.** Removing
+  the amplifier beats alerting on its output; done in the other order, the first thing the new
+  alerting does is page about 150 notifications that should never have existed.
+- [ ] **3b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
   Telegram**, since Telegram being broken is the common cause.
 
-### Cycle 2 — `pigeon-cal` + `pigeon-6be`: the remaining fire-and-forget paths
+### Cycle 4 — the server side (the track this roadmap was missing)
 
-- [ ] **2a. `pigeon-cal`** — webhook acks discard `TgResult`, so a 429-ed ack vanishes. Its
-  closed-topic half is already resolved as a non-issue (a bot *can* post into a closed topic); only
-  the 429 half remains. 21 call sites behind one wrapper, so the change is contained.
-- [ ] **2b. `pigeon-6be`** — `registerSession` is one-shot with no retry; a failed registration
-  orphans a session and the outbox retry loop cannot recover it.
+Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
+initially failed to answer: if the worker's session store fails recurrently, client fixes reduce
+blast radius but **do not cure the outage**.
 
-### Cycle 3 — topic-specific residuals
+- [ ] **4a. `pigeon-dul`, re-scoped 2026-07-31.** The original forensics are no longer possible — the
+  outage window is 16 days old and `wrangler.toml` has **no observability, no Logpush, no
+  tail_consumers**, so Cloudflare no longer holds those logs. New scope: enable Workers
+  observability/Logpush, log status+body on the `/sessions/register` and `/notifications/send`
+  failure paths, and surface D1/KV/DO errors distinctly instead of collapsing them into a generic
+  error response.
+  > One inference in the original bead is now known to be over-confident: it reasoned that `ok=false`
+  > proved an *app-level* rejection rather than a transport failure. Under the code of the time that
+  > was not decidable — the old `sendNotification` never inspected `response.status` and called
+  > `response.json()` unconditionally, so a 500 carrying a JSON body produced `ok=false` too. As of
+  > `pigeon-3h9` the two are distinct, so a recurrence is separable **from the client side alone**.
 
-- [ ] **3a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU,
-  currently safe only by architectural accident (sequential outbox, single daemon, and a `fetch`
-  with **no timeout**). Adding a fetch timeout — an obviously reasonable change — silently breaks it.
-- [ ] **3b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Live probing confirmed reopening an
-  already-open topic returns `400 Bad Request: TOPIC_NOT_MODIFIED`. Classifying it retires the trade
-  recorded at Checkpoint 2b, where *any* generic reopen failure marks the row open and never retries.
-- [ ] **3c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces;
-  it spends budget (§3) on every notification to a closed topic. Depends on 3b.
-- [ ] **3d. `pigeon-cx2`** (new) — the `/current-state` **index** message bypasses the outbox *and the
-  worker entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the
-  index best-effort, so the framing message is now the lossiest part of the command. Needs a different
-  fix shape: the worker's `/notifications/send` requires a registered `sessionId` and the index has
-  none. Its deeper significance is that a daemon-direct-to-Telegram path makes any future shared rate
-  gate (Cycle 4a) structurally blind — shrinking that path is a precondition, not a cleanup.
-- [ ] **3e. `pigeon-6hl`** (P3, new) — re-running `/current-state` delivers the previous run's still-queued
-  cards too, stale ones first.
-- [ ] **3f. `pigeon-1rb`** (P3, new) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
+### Cycle 5 — topic-specific residuals
+
+- [ ] **5a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
+  today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
+  timeout**). Adding a fetch timeout — an obviously reasonable change — silently breaks it.
+- [ ] **5b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
+  `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
+  where *any* generic reopen failure marks the row open and never retries.
+- [ ] **5c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces —
+  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. Depends on 5b.
+- [ ] **5d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
+  entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the framing
+  message best-effort, so it is now the lossiest part of the command. Needs a different fix shape:
+  `/notifications/send` requires a registered `sessionId` and the index has none. Its deeper
+  significance: a daemon-direct-to-Telegram path makes any shared rate gate (6a) **structurally
+  blind**, so shrinking that path is a precondition for 6a, not a cleanup.
+- [ ] **5e. `pigeon-6hl`** (P3) — re-running `/current-state` also delivers the previous run's queued
+  cards, stale ones first.
+- [ ] **5f. `pigeon-1rb`** (P3) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
   it now fails **open** where the old code failed closed. Safe today, verified endpoint by endpoint.
-- [ ] **3g. `pigeon-66y`** (new) — flip the worker test default to topics-on and delete the flag-off
+- [ ] **5g. `pigeon-66y`** — flip the worker test default to topics-on and delete the flag-off
   equivalence tests, once the flag is permanent.
-- [ ] **3h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
+- [ ] **5h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
-### Cycle 4 — close out the migration
+### Cycle 6 — close out the migration
 
-- [ ] **4a.** Record the observed 429 rate during burn-in. The design defers a chat-level
-  `next_send_at` gate in D1 with an explicit trigger: **build it if 429s appear on more than a
-  handful of days.** Flip day already produced a burst, so this is now justified by observation —
-  but confirm it is recurring, not a one-off caused by `/current-state` fan-out (which Cycle 0 fixes).
-- [ ] **4b.** Drop `8248645256` from `ALLOWED_CHAT_IDS`. **Last, and only after the daemon has been
-  stable on the supergroup through a full burn-in.** Irreversible in practice.
+- [ ] **6a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
+  in D1 named an explicit trigger: build it if 429s recur on more than a handful of days. Flip day
+  produced a burst, but confirm it recurs rather than being the one-off `/current-state` fan-out that
+  Cycle 0 already fixed. **Blocked on 5d** — the gate is blind while the daemon-direct path exists.
+- [ ] **6b.** Drop `8248645256` from `ALLOWED_CHAT_IDS`. **Last, and only after a full burn-in.**
+  Irreversible in practice.
 
 ---
+
+## §4.1 — Explicitly OUT of scope for this roadmap
+
+Re-measuring on 2026-07-31 found **44 open beads**; this roadmap covers ~20. The rest are real but
+belong to other themes, and are listed here so a future reader does not mistake this file for the
+whole backlog:
+
+- **Launch/TUI:** `pigeon-92q` (headless `/launch` completes with no notification when
+  `oc-auto-attach` fails). Delivery-adjacent in symptom, different subsystem in cause.
+- **Swarm:** `pigeon-3m5`, `pigeon-web`, `pigeon-0ky`.
+- **Serve routing:** the `pigeon-u1u` epic and `pigeon-886`, `pigeon-76k`, `pigeon-amr`, `pigeon-r2e`.
+- **Chores/infra:** `pigeon-0n6`, `pigeon-0pp`, `pigeon-fia`, `pigeon-m68`, `pigeon-0zl`, `pigeon-4v0`,
+  `pigeon-0u5`, `pigeon-f2i`, `pigeon-mud`, `pigeon-ewr`, `pigeon-050`.
+
+### Closed during restructuring
+
+- `pigeon-3tx` (P1) — **already implemented**; a phantom P1 sitting in the ready queue. All three
+  components it specifies exist (`question-queue.ts`, the outbox, worker `deduplicated:true`).
+- `pigeon-vmi` (P3) — superseded: `pigeon-3h9` delivered the structured type, `pigeon-bzf` carries the
+  retry decision.
+
+> **Both were found only by re-measuring instead of trusting the inherited list — the same discipline
+> that caught the false test baseline in §0.** Do this at the start of every restructuring.
 
 ## §5 — Reference
 
