@@ -82,6 +82,17 @@ regression.**
 
 ## §1 — OPERATING HAZARDS
 
+> **§1.0 — Merging is not deploying, and the daemon proves it.** Discovered 2026-07-31 while
+> deploying Cycle 2c: the production daemon checkout (`/home/dev/projects/pigeon`) was **44 commits
+> behind main**, meaning **every daemon change from Cycles 0 and 1 had been merged but never run.**
+> The outbox classifier, the priority ordering, the durable `/current-state` cards — none of it was
+> protecting anything. The nightly reset restarts the service but does **not** pull, so a merged
+> daemon commit sits inert until someone runs a pull and a restart on each machine. Earlier notes in
+> this file that said Cycles 0 and 1 "were daemon-only and merging was enough" had it exactly
+> backwards: worker changes need one deploy, daemon changes need a deploy **per machine**. Before
+> claiming a daemon behaviour is live, check `git rev-list --count HEAD..origin/main` in the
+> deployment checkout, not in your worktree.
+
 Each of these cost real time. They are not hypothetical.
 
 ### 1.1 The nightly reset prunes worktrees — this has happened TWICE
@@ -499,8 +510,11 @@ those cards are never enqueued at all.
 >   means synthesizing local session rows. It is now covered by `2b`'s sweep, so it was left for a
 >   later cycle rather than bolted on here. **Still open** — carry it forward.
 >
-> Note the log line that settled the first point was only reachable because the reaper already
-> logged both outcomes. Cycle 0 bought that.
+> A correction on that first point, because I got the credit wrong before checking: the log line
+> that settled it **predates Cycle 0**. It is present in the commit the daemon was actually running
+> (`4e8156a`, 44 commits behind main), so the "never fired" evidence is sound — but attributing it
+> to recent work was the §1.7 reflex again, reaching for the memorable recent event. Verify which
+> binary produced a log line before crediting anything for it.
 
 **Sequencing: cap before sweep, and in two separate deploys.** The only way this work *loses*
 notifications is: sweep expires a live session → 404 → re-register → **429** → transient retry loop →
