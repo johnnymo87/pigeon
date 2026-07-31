@@ -510,11 +510,16 @@ async function deliverViaAdapter(
           storage.sessions.delete(msg.sessionId);
           // Drop routing state too so prospective /route can't name a serve for a dead session (workstation-boi9).
           storage.assignments.delete(msg.sessionId);
+          // Best-effort, but note this is NOT the reaper's kind of best-effort. The reaper
+          // can afford a failed unregister because the local row survives to be retried
+          // next cycle; here the local row is already gone, so nothing will ever retry
+          // this and a failure strands the worker row permanently. The worker-side 14-day
+          // TTL sweep is the only thing that would eventually collect it.
           if (options.unregisterSession) {
             try {
               await options.unregisterSession(msg.sessionId);
-            } catch {
-              // Best-effort — worker may be unreachable
+            } catch (err) {
+              console.warn(`[command-ingest] worker unregister failed for ${msg.sessionId} (row now stranded until the worker TTL sweep):`, err);
             }
           }
           await options.sendTelegramReply?.(
@@ -563,11 +568,13 @@ async function deliverViaAdapter(
     console.warn(`[command-ingest] removing dead session sessionId=${msg.sessionId} (no opencodeClient for revival)`);
     storage.sessions.delete(msg.sessionId);
     storage.assignments.delete(msg.sessionId);
+    // See the note at the sessionGone site: the local row is already deleted, so a failed
+    // unregister here is permanent rather than retried.
     if (options.unregisterSession) {
       try {
         await options.unregisterSession(msg.sessionId);
-      } catch {
-        // Best-effort — worker may be unreachable
+      } catch (err) {
+        console.warn(`[command-ingest] worker unregister failed for ${msg.sessionId} (row now stranded until the worker TTL sweep):`, err);
       }
     }
     return;

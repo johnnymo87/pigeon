@@ -175,7 +175,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             machineId: config.machineId,
             ...(client ? { opencodeClient: client } : {}),
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
-            unregisterSession: (sessionId) => poller!.unregisterSession(sessionId),
+            unregisterSession: async (sessionId) => { if (poller) await poller.unregisterSession(sessionId); },
           });
         },
         onLaunch: async (msg) => {
