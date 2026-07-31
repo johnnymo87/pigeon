@@ -85,7 +85,7 @@ export class OutboxRepository {
 
   /**
    * Returns entries ready to be delivered: state='queued' AND (next_retry_at IS NULL OR next_retry_at <= now).
-   * Ordered by created_at ASC, limited to `limit` rows.
+   * Ordered by message-class priority FIRST (question before stop before card), then created_at ASC, then rowid ASC.
    */
   getReady(now = Date.now(), limit = 100): OutboxRecord[] {
     const rows = this.db
@@ -93,7 +93,9 @@ export class OutboxRepository {
         `SELECT * FROM outbox
          WHERE state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
-         ORDER BY created_at ASC
+         ORDER BY CASE kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 ELSE 4 END ASC,
+                  created_at ASC,
+                  rowid ASC
          LIMIT ?`,
       )
       .all(now, limit) as SqlRow[];

@@ -231,4 +231,41 @@ describe("OutboxRepository", () => {
 
     storage.db.close();
   });
+
+  it("getReady orders by message-class priority FIRST (question before stop before card)", () => {
+    const storage = createStorage();
+
+    // Insert a card at t=1000 (oldest)
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-old", kind: "card" }, 1_000);
+    // Insert a stop at t=1500
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-mid", kind: "stop" }, 1_500);
+    // Insert a question at t=2000 (newest question)
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-new", kind: "question" }, 2_000);
+    // Insert a card at t=2500
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-new", kind: "card" }, 2_500);
+
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual([
+      "q-new",      // question first despite being newer than card-old/stop-mid
+      "stop-mid",   // stop second
+      "card-old",   // card third, ordered by created_at
+      "card-new",
+    ]);
+
+    storage.db.close();
+  });
+
+  it("getReady uses rowid tiebreaker when created_at is identical", () => {
+    const storage = createStorage();
+
+    // Three cards enqueued at identical created_at timestamp
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-1", kind: "card" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-2", kind: "card" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-3", kind: "card" }, 1_000);
+
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["card-1", "card-2", "card-3"]);
+
+    storage.db.close();
+  });
 });
