@@ -82,6 +82,23 @@ regression.**
 
 ## §1 — OPERATING HAZARDS
 
+> **§1.-1 — Platform limits do not exist in the test environment, and D1 caps bound parameters at
+> 100.** The cap applies to **each statement inside a `db.batch`**, not to the batch
+> (https://developers.cloudflare.com/d1/platform/limits/). The session sweep binds one parameter per
+> victim; production had 126 victims, so its **first run threw, was swallowed by its own try/catch,
+> and deleted nothing for two hourly ticks** while health, analytics and error counts all looked
+> perfect. No test could have caught it: worker tests run on miniflare, which is plain SQLite with a
+> 999-parameter ceiling, so **the limit that broke production does not exist where the tests run.**
+> When code depends on a platform limit, pin it with a guard test on the constant and assert the
+> *call shape* (parameter counts per statement), because the behaviour itself is unobservable
+> locally. Generalise beyond D1: query duration, subrequest counts and payload sizes are all
+> enforced in production and absent in miniflare.
+>
+> Corollary, learned the hard way: **a `try/catch` around a janitorial step converts a hard failure
+> into an invisible one.** The catch was right, but it must log loudly enough to be found, and the
+> step needs an outcome you can measure from outside (here, a stale-row count that should go to
+> zero). Prefer verifying the *effect* over trusting the absence of errors.
+
 > **§1.0 — Merging is not deploying, and the daemon proves it.** Discovered 2026-07-31 while
 > deploying Cycle 2c: the production daemon checkout (`/home/dev/projects/pigeon`) was **44 commits
 > behind main**, meaning **every daemon change from Cycles 0 and 1 had been merged but never run.**
@@ -483,6 +500,10 @@ those cards are never enqueued at all.
   immediately rather than an hour later. Note *start*: the reaper closes at most
   `DEFAULT_ORPHAN_CAP` (5) orphans per tick, so a bulk sweep drains over hours, not in one tick. Current
   backlog at 14d: **126 sessions and 701 messages**; orphaned messages today: **0**.
+  **Verified in production 2026-07-31 14:00** after the `51257ad` chunking hotfix (PR #17): sessions
+  566 → **444**, stale-over-14d 126 → **0**, messages 11124 → **10447**, orphans **0**. The first two
+  attempts (12:00, 13:00) silently deleted nothing — see §1.-1, and note it was caught by checking
+  the effect rather than by any alarm.
 - [x] **2c. `pigeon-a1a` — stop producing the garbage.** Done in `95ab2df` and `01abd0b` (PR #16),
   but landed as **two** sites rather than four — see the finding below. NOT yet deployed (daemon
   change; needs a per-machine pull and restart). The bead claimed three daemon paths remove a local
