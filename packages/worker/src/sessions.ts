@@ -6,6 +6,14 @@ export const MAX_SESSIONS = 5000;
 
 export type SessionAction = "list" | "register" | "unregister";
 
+/**
+ * Test seam. Production always uses MAX_SESSIONS; tests override the cap so they can
+ * exercise the limit without inserting thousands of rows into the shared D1.
+ */
+export interface SessionRequestOptions {
+  maxSessions?: number;
+}
+
 export interface SessionRow {
   session_id: string;
   machine_id: string;
@@ -19,6 +27,7 @@ export async function handleSessionRequest(
   env: Env,
   request: Request,
   action: SessionAction,
+  opts?: SessionRequestOptions,
 ): Promise<Response> {
   if (!verifyApiKey(request, env.CCR_API_KEY)) {
     return unauthorized();
@@ -28,7 +37,7 @@ export async function handleSessionRequest(
     case "list":
       return listSessions(db);
     case "register":
-      return registerSession(db, env, request);
+      return registerSession(db, env, request, opts);
     case "unregister":
       return unregisterSession(db, env, request);
   }
@@ -43,6 +52,7 @@ async function registerSession(
   db: D1Database,
   env: Env,
   request: Request,
+  opts?: SessionRequestOptions,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const sessionId = body.sessionId as string | undefined;
@@ -56,10 +66,7 @@ async function registerSession(
     );
   }
 
-  const cap =
-    typeof (env as unknown as Record<string, unknown>).MAX_SESSIONS === "number"
-      ? ((env as unknown as Record<string, unknown>).MAX_SESSIONS as number)
-      : MAX_SESSIONS;
+  const cap = opts?.maxSessions ?? MAX_SESSIONS;
 
   // Check session limit (only for new sessions)
   const existing = await db

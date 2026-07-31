@@ -442,14 +442,13 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
     const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
     const initialCount = initialRow?.count ?? 0;
     const customCap = initialCount + 2;
-    const customEnv = { ...env, MAX_SESSIONS: customCap } as unknown as Env;
 
     const req1 = new Request("https://worker/sessions/register", {
       method: "POST",
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox" }),
     });
-    const res1 = await handleSessionRequest(env.DB, customEnv, req1, "register");
+    const res1 = await handleSessionRequest(env.DB, env, req1, "register", { maxSessions: customCap });
     expect(res1.status).toBe(200);
 
     const req2 = new Request("https://worker/sessions/register", {
@@ -457,7 +456,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_2", machineId: "devbox" }),
     });
-    const res2 = await handleSessionRequest(env.DB, customEnv, req2, "register");
+    const res2 = await handleSessionRequest(env.DB, env, req2, "register", { maxSessions: customCap });
     expect(res2.status).toBe(200);
 
     // At cap (initial + 2 registered), a new session request returns 429
@@ -466,7 +465,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_3", machineId: "devbox" }),
     });
-    const res3 = await handleSessionRequest(env.DB, customEnv, req3, "register");
+    const res3 = await handleSessionRequest(env.DB, env, req3, "register", { maxSessions: customCap });
     expect(res3.status).toBe(429);
     expect(await res3.json()).toEqual({ error: "Session limit reached" });
 
@@ -476,7 +475,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox", label: "updated" }),
     });
-    const resReReg = await handleSessionRequest(env.DB, customEnv, reqReReg, "register");
+    const resReReg = await handleSessionRequest(env.DB, env, reqReReg, "register", { maxSessions: customCap });
     expect(resReReg.status).toBe(200);
   });
 
@@ -484,14 +483,13 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
     const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
     const initialCount = initialRow?.count ?? 0;
     const customCap = initialCount + 1;
-    const customEnv = { ...env, MAX_SESSIONS: customCap } as unknown as Env;
 
     const req1 = new Request("https://worker/sessions/register", {
       method: "POST",
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_1", machineId: "devbox" }),
     });
-    await handleSessionRequest(env.DB, customEnv, req1, "register");
+    await handleSessionRequest(env.DB, env, req1, "register", { maxSessions: customCap });
 
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -500,7 +498,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       headers: { ...authHeaders, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "ses_cap_2", machineId: "devbox" }),
     });
-    const res2 = await handleSessionRequest(env.DB, customEnv, req2, "register");
+    const res2 = await handleSessionRequest(env.DB, env, req2, "register", { maxSessions: customCap });
     expect(res2.status).toBe(429);
 
     expect(spy).toHaveBeenCalled();

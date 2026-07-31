@@ -310,11 +310,7 @@ export async function checkSessionHighWaterAlert(
     now?: number;
   },
 ): Promise<{ count: number; alerted: boolean }> {
-  const cap =
-    opts?.maxSessions ??
-    (typeof (env as unknown as Record<string, unknown>).MAX_SESSIONS === "number"
-      ? ((env as unknown as Record<string, unknown>).MAX_SESSIONS as number)
-      : MAX_SESSIONS);
+  const cap = opts?.maxSessions ?? MAX_SESSIONS;
   const thresholdRatio = opts?.thresholdRatio ?? 0.8;
 
   const countResult = await db
