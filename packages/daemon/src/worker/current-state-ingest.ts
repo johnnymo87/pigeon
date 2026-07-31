@@ -10,33 +10,6 @@ import {
   formatCurrentStateIndex,
 } from "../notification-service";
 
-/**
- * Builds the notification payload for a /current-state card.
- *
- * `threaded: false` is load-bearing, not incidental: cards go through the same
- * sendNotification endpoint that lazily creates forum topics, once per surveyed
- * session, sequentially and uncapped. Letting them thread would fire a
- * createForumTopic + sendMessage burst (~31 calls on a 15-session machine)
- * against Telegram's ~20/min per-chat ceiling, and would create topics for idle
- * sessions that never notified — defeating lazy creation. Card failures are
- * swallowed with console.warn and have no outbox, so anything past the limit is
- * lost silently.
- */
-export function buildCardNotification(opts: {
-  sessionId: string;
-  chatId: string;
-  text: string;
-  entities: TgEntity[] | undefined;
-}): SendNotificationInput {
-  return {
-    sessionId: opts.sessionId,
-    chatId: opts.chatId,
-    text: opts.text,
-    replyMarkup: { inline_keyboard: [] },
-    entities: opts.entities,
-    threaded: false,
-  };
-}
 
 export interface CurrentStateIngestInput {
   commandId: string;

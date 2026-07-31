@@ -776,7 +776,15 @@ describe("OutboxSender start/stop", () => {
     const sendNotification = vi.fn().mockImplementation(async () => {
       sendCount++;
       if (sendCount === 1) {
-        return { ok: false, kind: "rate_limited", retryAfter: 10 };
+        // Exactly what the worker returns when Telegram rate-limits the group:
+        // HTTP 429 with a JSON body carrying retryAfter. See packages/worker/src/notifications.ts.
+        return {
+          ok: false,
+          kind: "http_error",
+          status: 429,
+          body: { error: "rate_limited", retryAfter: 10 },
+          retryAfter: 10,
+        };
       }
       return { ok: true, kind: "success", status: 200, body: { ok: true } };
     }) as SendNotificationFn;
