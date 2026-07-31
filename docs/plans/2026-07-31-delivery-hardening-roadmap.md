@@ -66,7 +66,7 @@ regression.**
 > by running the suite at that commit in a throwaway worktree. The number survived a whole session
 > because it was *inherited from a previous measurement* rather than re-measured after the change
 > that broke it. `packages/worker/vitest.config.ts` now pins the flag explicitly so test config no
-> longer moves when a production flag is flipped (bead `pigeon-4dz`).
+> longer moves when a production flag is flipped (bead `pigeon-66y`).
 >
 > **Generalise this: re-measure a baseline after any change to shared config. Never carry a count
 > forward across a change that could plausibly affect it.** This is the same failure mode as §1.7 —
@@ -237,21 +237,40 @@ Two structural consequences worth holding in mind while doing any of the work be
   is *why* `t5f` took several steps to diagnose instead of ten seconds.
   **Do this first: it is the instrument you need to verify 0b.** Verifying that a 429 is now retried
   requires being able to see that it was a 429.
-- [ ] **0b. `pigeon-t5f` — route `/current-state` cards through the durable outbox.** `index.ts:308`
-  wires `sendCard` to a bare POST; stop/question go through the outbox and survive a 429. Observed in
-  production: exactly 20 cards delivered, 29 silently lost.
-  Consider also whether `/current-state` should emit one message per session at all — the fan-out is
-  what makes it hit the cap. That is a design question; `oracle-fable` is warranted here.
+- [x] **0b. `pigeon-t5f` — route `/current-state` cards through the durable outbox.** DONE `4c6db4f`.
+  Cards now enqueue with a deterministic id `cs:{commandId}:{sid}`, only after `registerSession`
+  succeeds. **The staleness objection was a trap**: the swipe-reply token and the
+  `messages(chat_id,message_id → session_id)` row are created at Telegram **delivery** time, so a
+  late card is a fully functional handle — only its displayed status is stale, and the index already
+  conveyed that. Design review also rejected threading cards into per-session topics: lazy
+  `createForumTopic` would roughly double the call count and make the budget worse.
+- [x] **0c. `pigeon-vb2` — message-class priority in the outbox.** DONE `97c4466`. Routing 25 cards
+  through one FIFO would have starved *question* notifications (agent blocked on a human) behind the
+  fan-out plus a 5-minute pause. `getReady` now orders question → stop → card, then `created_at`,
+  then `rowid`. **This regression was created by 0b, which is why it shipped with it rather than
+  being deferred.** Adversarial review quantified the residual starvation risk as needing ~300
+  question/stop notifications inside 15 minutes — pathological, not operational.
 
 **Definition of done:** a `/current-state` with 25+ live sessions delivers every card, late if
 necessary, and any 429 is visible in the daemon log with its status code.
 
 ### Cycle 1 — `pigeon-bqo` + `pigeon-8l7`: the outbox must not drop silently
 
+Cycle 0 turned up three more beads that belong here, because they are all the same `MAX_AGE_MS` /
+attempt-budget mechanism seen from different sides. Do them together.
+
 - [ ] **1a. `pigeon-bqo`** — the outbox permanently drops entries when the worker path is down longer
-  than `MAX_AGE_MS` (15 min) or 10 attempts. This is the same terminal-failure budget that makes the
-  migration rollback dangerous (runbook F1). ~150 messages have already died this way overnight.
-- [ ] **1b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+  than `MAX_AGE_MS` (15 min) or 10 attempts. Same terminal-failure budget that makes the migration
+  rollback dangerous (runbook F1). ~150 messages have already died this way overnight.
+- [ ] **1b. `pigeon-8e9`** (new, pre-existing) — `upsert` resurrects a `failed` row **without
+  resetting `created_at`**, so anything older than 15 min returns to `queued`, is instantly judged
+  too old, and re-fails having sent nothing — with `attempts` still 0, so the log looks like it never
+  tried. Fix alongside 1a; they are the same budget.
+- [ ] **1c. `pigeon-bzf`** (new) — the outbox retries 4xx exactly like 5xx, so a 404/400/403 burns all
+  10 attempts over ~7 min. Making those terminal is **unfinished work from `pigeon-3h9`**: the whole
+  point of the `WorkerResult` union was to enable this discrimination, and nothing consumes the
+  status for control flow yet.
+- [ ] **1d. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
   Telegram**, since Telegram being broken is the common cause.
 
 ### Cycle 2 — `pigeon-cal` + `pigeon-6be`: the remaining fire-and-forget paths
@@ -272,7 +291,19 @@ necessary, and any 429 is visible in the daemon log with its status code.
   recorded at Checkpoint 2b, where *any* generic reopen failure marks the row open and never retries.
 - [ ] **3c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces;
   it spends budget (§3) on every notification to a closed topic. Depends on 3b.
-- [ ] **3d. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
+- [ ] **3d. `pigeon-cx2`** (new) — the `/current-state` **index** message bypasses the outbox *and the
+  worker entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the
+  index best-effort, so the framing message is now the lossiest part of the command. Needs a different
+  fix shape: the worker's `/notifications/send` requires a registered `sessionId` and the index has
+  none. Its deeper significance is that a daemon-direct-to-Telegram path makes any future shared rate
+  gate (Cycle 4a) structurally blind — shrinking that path is a precondition, not a cleanup.
+- [ ] **3e. `pigeon-6hl`** (P3, new) — re-running `/current-state` delivers the previous run's still-queued
+  cards too, stale ones first.
+- [ ] **3f. `pigeon-1rb`** (P3, new) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
+  it now fails **open** where the old code failed closed. Safe today, verified endpoint by endpoint.
+- [ ] **3g. `pigeon-66y`** (new) — flip the worker test default to topics-on and delete the flag-off
+  equivalence tests, once the flag is permanent.
+- [ ] **3h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
 ### Cycle 4 — close out the migration
