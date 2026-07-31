@@ -2,7 +2,8 @@
  * All worker tests in a single file.
  * The worker uses D1 + HTTP polling (no Durable Objects).
  */
-import { env, SELF, fetchMock } from "cloudflare:test";
+import { env, SELF, fetchMock, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import worker from "../src/index";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { SESSION_TTL_MS as DAEMON_SESSION_TTL_MS } from "../../daemon/src/storage/schema";
 import {
@@ -633,6 +634,16 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
 describe("stale-session TTL sweep (pigeon-bea)", () => {
   const PREFIX = "ses_sweep_";
 
+  // The sweep is global by design: it deletes every stale row, not just this file's
+  // fixtures. All worker tests share ONE D1 instance, so a stale row left behind by any
+  // other test would land inside the LIMIT window and break the exact-count assertions
+  // here. Clear the stale population first so each test's fixtures are the only rows the
+  // predicate can match. Rows with fresh timestamps -- everything else in this suite --
+  // are untouched by definition.
+  beforeEach(async () => {
+    await sweepStaleSessions(env.DB, { limit: 10_000 });
+  });
+
   afterEach(async () => {
     await env.DB.prepare(
       "DELETE FROM messages WHERE session_id LIKE 'ses_sweep_%'"
@@ -754,6 +765,32 @@ describe("stale-session TTL sweep (pigeon-bea)", () => {
       "SELECT COUNT(*) as count FROM sessions WHERE session_id LIKE 'ses_sweep_limit_%'"
     ).first<{ count: number }>();
     expect(remaining?.count).toBe(1);
+  });
+
+  test("scheduled() actually invokes the sweep (pins the cron wiring, not just the function)", async () => {
+    // Every other test in this block calls sweepStaleSessions directly, which means they
+    // all still pass if the call is deleted from scheduled(). This one fails in that case:
+    // it drives the real cron entry point and asserts the row is gone afterwards.
+    const now = Date.now();
+    const staleTime = now - (SESSION_SWEEP_TTL_MS + 60_000);
+    const sessionId = `${PREFIX}cron_wiring`;
+
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(sessionId, "devbox", "cron", staleTime, staleTime).run();
+
+    const ctx = createExecutionContext();
+    await worker.scheduled(
+      { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    const check = await env.DB.prepare(
+      "SELECT * FROM sessions WHERE session_id = ?"
+    ).bind(sessionId).first();
+    expect(check).toBeNull();
   });
 });
 

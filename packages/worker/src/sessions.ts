@@ -152,17 +152,6 @@ async function unregisterSession(
 }
 
 /**
- * Touch a session to keep it alive (update updated_at).
- * Used internally by notification and command routing.
- */
-export async function touchSession(db: D1Database, sessionId: string): Promise<void> {
-  await db
-    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
-    .bind(Date.now(), sessionId)
-    .run();
-}
-
-/**
  * Look up which machine a session belongs to.
  */
 export async function getSessionMachine(
