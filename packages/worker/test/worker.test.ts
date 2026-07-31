@@ -18,6 +18,7 @@ import {
   checkSessionHighWaterAlert,
   sweepStaleSessions,
   SESSION_SWEEP_TTL_MS,
+  SWEEP_ID_CHUNK,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import { isAllowedChatId, generateToken, handleSendNotification } from "../src/notifications";
@@ -765,6 +766,43 @@ describe("stale-session TTL sweep (pigeon-bea)", () => {
       "SELECT COUNT(*) as count FROM sessions WHERE session_id LIKE 'ses_sweep_limit_%'"
     ).first<{ count: number }>();
     expect(remaining?.count).toBe(1);
+  });
+
+  test("guard: SWEEP_ID_CHUNK stays within D1's 100-bound-parameter limit", () => {
+    // D1 allows at most 100 bound parameters PER STATEMENT, including each statement
+    // inside a db.batch: https://developers.cloudflare.com/d1/platform/limits/
+    // The sweep binds one parameter per victim id, so a chunk over 100 throws the whole
+    // batch rather than degrading. This actually happened in production: the first run had
+    // 126 victims and silently deleted nothing for two hourly ticks.
+    expect(SWEEP_ID_CHUNK).toBeLessThanOrEqual(100);
+  });
+
+  test("chunks deletes so no statement ever exceeds D1's bound-parameter limit", async () => {
+    // The real limit does not exist in miniflare (plain SQLite allows 999 parameters), so
+    // inserting many rows and sweeping them would pass with or without the bug. Assert the
+    // shape of the calls instead: capture every statement's bind count against a stub.
+    const bindCounts: number[] = [];
+    const victims = Array.from({ length: 250 }, (_, i) => ({ session_id: `ses_chunk_${i}` }));
+    const stubDb = {
+      prepare: () => ({
+        bind: (...args: unknown[]) => {
+          bindCounts.push(args.length);
+          return { all: async () => ({ results: victims }) };
+        },
+      }),
+      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+    } as unknown as D1Database;
+
+    await sweepStaleSessions(stubDb, { now: Date.now(), limit: 500 });
+
+    // First bind is the SELECT (cutoff + limit = 2 params); the rest are DELETE chunks.
+    const deleteBinds = bindCounts.slice(1);
+    expect(deleteBinds.length).toBeGreaterThan(2); // 250 ids must span multiple chunks
+    for (const n of deleteBinds) {
+      expect(n).toBeLessThanOrEqual(100);
+    }
+    // Every victim is accounted for across the chunks (two statements per chunk).
+    expect(deleteBinds.reduce((a, b) => a + b, 0)).toBe(250 * 2);
   });
 
   test("scheduled() actually invokes the sweep (pins the cron wiring, not just the function)", async () => {
