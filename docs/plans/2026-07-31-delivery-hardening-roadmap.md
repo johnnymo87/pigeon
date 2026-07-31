@@ -45,7 +45,7 @@ reverted and the outbox has drained — narrowing the allowlist first permanentl
 `docs/runbooks/telegram-forum-migration.md`.
 
 **Still open from the migration:** drop the old DM chat id from `ALLOWED_CHAT_IDS` after burn-in.
-Do this LAST, as Cycle 6b — it is the only irreversible step.
+Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 ### Test baseline — regressions are measured against this
 
@@ -97,6 +97,16 @@ git worktree add .worktrees/<name> <branch>
 
 **Anything uncommitted at 03:00 is gone.** This is a sharper hazard than the shared-worktree rule,
 because the destroyer is a clock rather than a peer.
+
+> **THIRD occurrence, 2026-07-31 — and the stated cause does not fit.** The worktree vanished
+> mid-session at about **10:14 local**, nowhere near the ~03:00 reset window, and the session had
+> been using it continuously beforehand. Nothing was lost, again, only because every task had been
+> pushed. **Do not record this as "the nightly reset did it" (§1.7):** the timing rules out the
+> obvious suspect, and the real cause is unestablished — a peer session or a stray
+> `git worktree prune` are equally consistent with the evidence. The operational lesson is unchanged
+> and now has three data points behind it: **commit and push at every task boundary**, because the
+> worktree can disappear at any hour for reasons you have not identified. Recovery is the same
+> `git worktree add` either way.
 
 ### 1.2 `sudo` appears broken but is not
 
@@ -228,7 +238,7 @@ Two structural consequences worth holding in mind while doing any of the work be
 
 - **Every wasted call costs somebody else's notification.** T2.6 reopens a closed topic before
   sending, but live probing proved a bot **can** post into a closed topic — so that call is
-  belt-and-braces and is spending budget for nothing (Cycle 5c).
+  belt-and-braces and is spending budget for nothing (Cycle 6c).
 - **Durability and budget are the same problem.** A send that is dropped on 429 (rather than
   retried) converts a budget shortfall into permanent data loss. That is `t5f`, `cal`, and `bqo`.
 
@@ -265,13 +275,13 @@ necessary, and any 429 is visible in the daemon log with its status code.
 `pigeon-3h9` produced classifications that **nothing reads for control flow yet**. Every item here
 is that missing consumer, which is why they belong together.
 
-- [ ] **1a. `pigeon-m76` — clear the refactor trap FIRST, before any behaviour change lands nearby.**
+- [x] **1a. `pigeon-m76` — clear the refactor trap FIRST, before any behaviour change lands nearby.**
   `sendStopNotification`, `sendQuestionNotification` and `sendViaWorker` have **zero** production
   callers (re-verified 2026-07-31), yet they duplicate the real formatting/chunking logic and have
   passing unit tests. **This trap already fired**: Cycle 0 improved an error message inside
   `sendViaWorker`, i.e. in dead code, with a green suite throughout. It cost a few lines that time.
   Cycles 1 and 2 rewrite failure policy and the age budget *in exactly these files*.
-- [ ] **1b. `pigeon-bzf` + `pigeon-6be` + `pigeon-288` — ONE change, one policy.** Splitting these
+- [x] **1b. `pigeon-bzf` + `pigeon-6be` + `pigeon-288` — ONE change, one policy.** Splitting these
   actively harms:
   - **`bzf` alone is a regression.** Making 404 terminal while `registerSession` is still one-shot
     turns `6be`'s incident from "ten doomed retries, then dropped" into "one attempt, then dropped".
@@ -343,7 +353,7 @@ exists to prevent.**
 - [x] **1c.** Wired into `OutboxSender` + `outbox.updatePayload`. DONE `5b3c79d`, `e67a144`, `938c38c`.
   **Every arm ends in `markRetry` — never re-send inside the same tick**, so attempt accounting is
   unchanged and a 404→re-register→502→strip sequence cannot double-count (confirmed by review).
-- Budget constants (`MAX_ATTEMPTS`, `MAX_AGE_MS`, `BACKOFF_SCHEDULE`, `MAX_PAUSE_MS`) are **Cycle 2**.
+- Budget constants (`MAX_ATTEMPTS`, `MAX_AGE_MS`, `BACKOFF_SCHEDULE`, `MAX_PAUSE_MS`) are **Cycle 3**.
 
 #### What changed during Cycle 1 vs. what was planned
 
@@ -370,35 +380,105 @@ Terminal only on a definitive 4xx.
 logs `LEAKED worker session row` when it fails) and `pigeon-e44` (P3 — entity stripping fires on any
 Telegram 400, not just parse errors).
 
-### Cycle 2 — the age and attempt budget
+### Cycle 2 — URGENT: the worker session registry is filling up (~1 week of headroom)
+
+**Inserted 2026-07-31, immediately after Cycle 1. Everything below shifted by one.** This jumped the
+queue because it is the only item in this file with a *deadline* rather than a severity.
+
+Cycle 1's adversarial review produced `pigeon-bea` as a tidy P2: "the worker has no session TTL cron,
+so a leaked row lives forever." Measuring it before filing it in the backlog changed the verdict
+completely.
+
+**Measured in production 2026-07-31** (`wrangler d1 execute pigeon-router --remote`, read-only):
+
+| | |
+|---|---|
+| `sessions` rows | **574** |
+| `MAX_SESSIONS` | **1000** (`packages/worker/src/sessions.ts:5`) |
+| creation rate | **~65/day sustained** (Jul 24–31: 43, 38, 29, 72, 59, 78, 75, 37) |
+| rate before Jul 23 | **1–5 per WEEK** |
+| rows older than 7d | **128** (the daemon's own TTL is 7d — these should be gone) |
+| oldest row | 2026-03-14 |
+
+**≈ 6–7 days to the cap.** Essentially nothing is being deleted: 440 of the 574 rows were created in
+the last 10 days, and the remaining 134 line up almost exactly with the 128 that are over 7 days old.
+
+**What happens at the cap is quiet, which is the dangerous part.** The limit is only checked for NEW
+sessions (`sessions.ts:64-71`, guarded by `if (!existing)`), so every already-registered session keeps
+working and nothing looks wrong. New sessions get `429 Session limit reached`, are never registered,
+and every notification they produce 404s. Cycle 1 turns that 404 into a lazy re-registration, which
+returns 429 again, which Cycle 1 deliberately classifies as **retryable** — so the entry retries until
+the 15-minute age cap and is then dropped. **Every notification from every new session is silently
+lost ~15 minutes after it is produced.** `/current-state` is worse: `current-state-ingest.ts:105`
+does `continue` when registration fails, so those cards are never even enqueued.
+
+> **Cycle 1 does not protect against this, and it is worth being honest about that.** Making
+> register-429 retryable was still the right call, but it converts instant loss into *delayed* loss,
+> not into delivery. A durability fix downstream of an exhausted registry buys time, not correctness.
+
+- [ ] **2a. `pigeon-bea` (raised to P1) — the worker-side TTL backstop. Do this FIRST.**
+  Expire on `updated_at`, **not** `created_at`: `notifications.ts` already touches
+  `sessions.updated_at` on every send and the comment there says *"Touch session to prevent
+  cleanup"* — **the touch was written for a cleanup that was never built.** So an actively-used
+  session never expires. Keep the TTL **at or above** the daemon's `SESSION_TTL_MS` (7 days), or a
+  live-but-quiet session gets expired out from under a daemon that still holds it and every
+  subsequent notification pays a 404 plus a re-register round trip.
+- [ ] **2b. `pigeon-a1a` — stop producing the garbage.** Three verified daemon paths remove a local
+  session row without unregistering, or register worker-side with no local row at all. The reaper is
+  the only thing that unregisters, and it can only unregister sessions it still holds locally:
+  - `repos.ts:226` — `cleanupExpired` does `DELETE FROM sessions WHERE expires_at < ?` with no
+    unregister, and is called from **inside the reaper itself** (`session-reaper.ts:43`).
+  - dead-session cleanup in `command-ingest.ts` deletes the local row on a connection error.
+  - `current-state-ingest.ts:103` registers every tmux-surveyed session; discovery is tmux-based,
+    not registry-based, so nothing guarantees a local row exists.
+  Also note the reaper's own unregister is best-effort (`session-reaper.ts:33-37` swallows errors).
+
+**Ordering, and why it is not the obvious one.** `2a` is the backstop and `2b` is the source, so the
+instinct is to fix the source first. Do the backstop first anyway: **which of the three paths
+dominates has not been established**, `2a` bounds the damage regardless of the answer, it is far the
+smaller change, and it is the only one of the two that clears the **574 rows already there**. Doing
+`2b` first means chasing three call sites under a deadline, with no backstop, and still being at 574.
+
+> **Method note.** `pigeon-bea` was filed as a P2 "structural gap" from reading the code, and that
+> was a defensible reading — it just happened to be describing a fire. One read-only query moved it
+> from "someday" to "this week". §1.7 says establish a timeline before attributing a cause; the same
+> discipline applies to *severity*. **Measure a resource-exhaustion bead before you rank it**, because
+> the code tells you the leak exists and only the data tells you how long you have.
+>
+> Conversely, do **not** let this measurement tempt an attribution. The 1–5/week → 65/day jump lines
+> up suspiciously well with the forum-topics work and the `/current-state` fan-out, and that is
+> exactly the memorable-recent-event trap §1.7 describes. The dominant path is unestablished; `2a`
+> is chosen precisely because it does not depend on knowing.
+
+### Cycle 3 — the age and attempt budget
 
 Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
-- [ ] **2a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
+- [ ] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
   than `MAX_AGE_MS` (15 min) or 10 attempts. Same budget that makes the migration rollback dangerous
   (runbook F1).
-- [ ] **2b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
+- [ ] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
   anything older than 15 min returns to `queued`, is instantly judged too old, and re-fails having
   sent nothing — with `attempts` still 0, so the journal line reads like it never tried.
 
-### Cycle 3 — remove the amplifier, then alert on what remains
+### Cycle 4 — remove the amplifier, then alert on what remains
 
-- [ ] **3a. `pigeon-9y3` — do this BEFORE `8l7`.** An unidentified overnight job walks historical
+- [ ] **4a. `pigeon-9y3` — do this BEFORE `8l7`.** An unidentified overnight job walks historical
   sessions newest→oldest, ~one every 2 min, firing `registerSession` + a stop notification with
   `notify=true` for each. During the outage every one burned an outbox entry to terminal. **That job
   is why the incident was ~150 lost messages instead of ~1 — roughly 150× amplification.** Removing
   the amplifier beats alerting on its output; done in the other order, the first thing the new
   alerting does is page about 150 notifications that should never have existed.
-- [ ] **3b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+- [ ] **4b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
   Telegram**, since Telegram being broken is the common cause.
 
-### Cycle 4 — the server side (the track this roadmap was missing)
+### Cycle 5 — the server side (the track this roadmap was missing)
 
 Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
 initially failed to answer: if the worker's session store fails recurrently, client fixes reduce
 blast radius but **do not cure the outage**.
 
-- [ ] **4a. `pigeon-dul`, re-scoped 2026-07-31.** The original forensics are no longer possible — the
+- [ ] **5a. `pigeon-dul`, re-scoped 2026-07-31.** The original forensics are no longer possible — the
   outage window is 16 days old and `wrangler.toml` has **no observability, no Logpush, no
   tail_consumers**, so Cloudflare no longer holds those logs. New scope: enable Workers
   observability/Logpush, log status+body on the `/sessions/register` and `/notifications/send`
@@ -409,39 +489,52 @@ blast radius but **do not cure the outage**.
   > was not decidable — the old `sendNotification` never inspected `response.status` and called
   > `response.json()` unconditionally, so a 500 carrying a JSON body produced `ok=false` too. As of
   > `pigeon-3h9` the two are distinct, so a recurrence is separable **from the client side alone**.
+- [ ] **5b. `pigeon-e44`** (P3) — entity stripping fires on **any** Telegram 400, not just
+  entity-parse errors (Telegram also returns 400 for e.g. "message is too long"). Then the strip is
+  persisted by rewriting the payload, so formatting that was never the problem is discarded
+  permanently. No data-loss regression — the entry dies at the same budget it would have anyway —
+  so this is a precision issue, not a correctness one.
+  **It is here, in the observability cycle, for a specific reason: its own trigger is currently
+  unobservable.** The bead says to fix it "only if a real non-entity 400 is observed", but
+  `outbox-sender.ts:417` logs *that* entities were stripped and never Telegram's `description`, so
+  nothing records **why** a strip happened. **Step one is two lines — log `details.description` on
+  the strip arm — and step two is to look before deciding whether step three is worth doing at all.**
+  This is the same shape as `pigeon-bea` in Cycle 2, inverted: there, measuring turned a tidy P2 into
+  a one-week deadline; here, measuring may well retire a P3 without any code change. Either way the
+  measurement comes first.
 
-### Cycle 5 — topic-specific residuals
+### Cycle 6 — topic-specific residuals
 
-- [ ] **5a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
+- [ ] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
   today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
   timeout**). Adding a fetch timeout — an obviously reasonable change — silently breaks it.
-- [ ] **5b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
+- [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
   `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
   where *any* generic reopen failure marks the row open and never retries.
-- [ ] **5c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces —
-  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. Depends on 5b.
-- [ ] **5d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
+- [ ] **6c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces —
+  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. Depends on 6b.
+- [ ] **6d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
   entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the framing
   message best-effort, so it is now the lossiest part of the command. Needs a different fix shape:
   `/notifications/send` requires a registered `sessionId` and the index has none. Its deeper
   significance: a daemon-direct-to-Telegram path makes any shared rate gate (6a) **structurally
   blind**, so shrinking that path is a precondition for 6a, not a cleanup.
-- [ ] **5e. `pigeon-6hl`** (P3) — re-running `/current-state` also delivers the previous run's queued
+- [ ] **6e. `pigeon-6hl`** (P3) — re-running `/current-state` also delivers the previous run's queued
   cards, stale ones first.
-- [ ] **5f. `pigeon-1rb`** (P3) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
+- [ ] **6f. `pigeon-1rb`** (P3) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
   it now fails **open** where the old code failed closed. Safe today, verified endpoint by endpoint.
-- [ ] **5g. `pigeon-66y`** — flip the worker test default to topics-on and delete the flag-off
+- [ ] **6g. `pigeon-66y`** — flip the worker test default to topics-on and delete the flag-off
   equivalence tests, once the flag is permanent.
-- [ ] **5h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
+- [ ] **6h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
-### Cycle 6 — close out the migration
+### Cycle 7 — close out the migration
 
-- [ ] **6a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
+- [ ] **7a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
   in D1 named an explicit trigger: build it if 429s recur on more than a handful of days. Flip day
   produced a burst, but confirm it recurs rather than being the one-off `/current-state` fan-out that
-  Cycle 0 already fixed. **Blocked on 5d** — the gate is blind while the daemon-direct path exists.
-- [ ] **6b.** Drop `8248645256` from `ALLOWED_CHAT_IDS`. **Last, and only after a full burn-in.**
+  Cycle 0 already fixed. **Blocked on 6d** — the gate is blind while the daemon-direct path exists.
+- [ ] **7b.** Drop `8248645256` from `ALLOWED_CHAT_IDS`. **Last, and only after a full burn-in.**
   Irreversible in practice.
 
 ---
