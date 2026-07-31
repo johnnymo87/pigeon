@@ -380,75 +380,123 @@ Terminal only on a definitive 4xx.
 logs `LEAKED worker session row` when it fails) and `pigeon-e44` (P3 — entity stripping fires on any
 Telegram 400, not just parse errors).
 
-### Cycle 2 — URGENT: the worker session registry is filling up (~1 week of headroom)
+### Cycle 2 — the worker session registry: make the cap safe, then sweep the leak
 
-**Inserted 2026-07-31, immediately after Cycle 1. Everything below shifted by one.** This jumped the
-queue because it is the only item in this file with a *deadline* rather than a severity.
+**Inserted 2026-07-31 after Cycle 1 on an urgency claim that was measured the next hour and
+retracted. Read the retraction first — it is the more useful half of this section.**
 
-Cycle 1's adversarial review produced `pigeon-bea` as a tidy P2: "the worker has no session TTL cron,
-so a leaked row lives forever." Measuring it before filing it in the backlog changed the verdict
-completely.
+#### The retraction: there is no one-week deadline
 
-**Measured in production 2026-07-31** (`wrangler d1 execute pigeon-router --remote`, read-only):
+`pigeon-bea` was filed as a structural P2 from reading the code. A first measurement turned it into
+"574/1000 rows, ~65/day, **≈6–7 days to the cap**" and it jumped the queue on that basis. **That
+estimate was wrong by roughly 60x, and it was wrong in precisely the way §1.7 warns about.**
 
-| | |
-|---|---|
-| `sessions` rows | **574** |
-| `MAX_SESSIONS` | **1000** (`packages/worker/src/sessions.ts:5`) |
-| creation rate | **~65/day sustained** (Jul 24–31: 43, 38, 29, 72, 59, 78, 75, 37) |
-| rate before Jul 23 | **1–5 per WEEK** |
-| rows older than 7d | **128** (the daemon's own TTL is 7d — these should be gone) |
-| oldest row | 2026-03-14 |
+It divided headroom (426) by the session *creation* rate (65/day). That silently assumes every
+created row is permanent. Alive-rows-by-creation-age, measured 2026-07-31 10:35, total 578:
 
-**≈ 6–7 days to the cap.** Essentially nothing is being deleted: 440 of the 574 rows were created in
-the last 10 days, and the remaining 134 line up almost exactly with the 128 that are over 7 days old.
+| age | 0–6d | 7d | 8d | 9d | 10d | 11–130d | 131–138d |
+|---|---|---|---|---|---|---|---|
+| alive | 103,74,56,65,47,23,57 (**425**) | 14 | 4 | 1 | 1 | ~1/day (~30) | **103** frozen |
 
-**What happens at the cap is quiet, which is the dangerous part.** The limit is only checked for NEW
-sessions (`sessions.ts:64-71`, guarded by `if (!existing)`), so every already-registered session keeps
-working and nothing looks wrong. New sessions get `429 Session limit reached`, are never registered,
-and every notification they produce 404s. Cycle 1 turns that 404 into a lazy re-registration, which
-returns 429 again, which Cycle 1 deliberately classifies as **retryable** — so the entry retries until
-the 15-minute age cap and is then dropped. **Every notification from every new session is silently
-lost ~15 minutes after it is produced.** `/current-state` is worse: `current-state-ingest.ts:105`
-does `continue` when registration fails, so those cards are never even enqueued.
+A **93% cliff between 6d and 8d**. And a snapshot cannot distinguish the two hypotheses that both
+predict that exact curve:
+
+- **(A)** high creation **+ a reaper that works at 7d** → a self-limiting equilibrium, safe.
+- **(B)** a creation explosion that began ~7d ago **+ zero deletion** → the entire 0–7d band is
+  leaked and the cap arrives in days.
+
+**(B) was the filed story, and the cliff sitting exactly at the TTL is suspicious enough to look
+like confirmation of it.** The discriminator is the daemon's *own local table* on cloudbox: **389
+rows, nothing older than 7d**, with a by-`last_seen` histogram of 115,67,47,53,36,14,53,4 that
+mirrors the worker curve. The reaper demonstrably deletes locally **and** unregisters worker-side.
+**(A) confirmed.**
+
+Corrected model — `worker total ≈ 7 × creation_rate + leaked`:
+
+- **working set** (0–7d) ≈ **425**, self-limiting, mirrors the daemon's live table — **not a leak**
+- **genuinely leaked** (>7d) = **153** rows over ~138 days ≈ **1.1/day**
+- headroom 422 ÷ 1.1/day ≈ **380 days**
+
+The "essentially nothing is being deleted" claim was inferred from one snapshot (128 rows over 7d)
+with no age curve behind it. The leak is also **not** a uniform trickle: it is bursty
+daemon-state-loss events (the frozen 131–138d cluster; macbook 19/25 and chromebook 4/4 old rows) —
+machines whose local SQLite was wiped or retired, which the reaper can never clean because it only
+unregisters sessions it still *holds locally*. That is why the worker must own this sweep.
+
+#### What survives, and why this cycle still runs
+
+1. **The leak is real, just slow.** 153 rows no daemon will ever unregister, growing in bursts.
+2. **The cap is the real hazard, and it is independent of the leak.** The working set scales
+   linearly with creation rate, which is 60–103/day and trending up, while `MAX_SESSIONS = 1000`
+   (`sessions.ts:5`) is an arbitrary guard rail. A sustained doubling of activity gives
+   ~840 working set + 153 leaked ≈ **993**. The leak buys 380 days; the *cap* is one busy fortnight
+   away, and nothing warns you.
+
+**What happens at the cap is silent, which is the dangerous part.** The limit is checked only for
+NEW sessions (`sessions.ts:64-71`, guarded by `if (!existing)`), so every already-registered session
+keeps working and nothing looks wrong. New sessions get `429 Session limit reached`, are never
+registered, and every notification they produce 404s. Cycle 1 turns that 404 into a lazy
+re-registration, which returns 429 again, which Cycle 1 deliberately classifies as **retryable** — so
+the entry retries until the 15-minute age cap (`outbox-sender.ts:42,159`) and is dropped.
+`/current-state` is worse: `current-state-ingest.ts:106` does `continue` when registration fails, so
+those cards are never enqueued at all.
 
 > **Cycle 1 does not protect against this, and it is worth being honest about that.** Making
 > register-429 retryable was still the right call, but it converts instant loss into *delayed* loss,
 > not into delivery. A durability fix downstream of an exhausted registry buys time, not correctness.
 
-- [ ] **2a. `pigeon-bea` (raised to P1) — the worker-side TTL backstop. Do this FIRST.**
-  Expire on `updated_at`, **not** `created_at`: `notifications.ts` already touches
-  `sessions.updated_at` on every send and the comment there says *"Touch session to prevent
-  cleanup"* — **the touch was written for a cleanup that was never built.** So an actively-used
-  session never expires. Keep the TTL **at or above** the daemon's `SESSION_TTL_MS` (7 days), or a
-  live-but-quiet session gets expired out from under a daemon that still holds it and every
-  subsequent notification pays a 404 plus a re-register round trip.
-- [ ] **2b. `pigeon-a1a` — stop producing the garbage.** Three verified daemon paths remove a local
-  session row without unregistering, or register worker-side with no local row at all. The reaper is
-  the only thing that unregisters, and it can only unregister sessions it still holds locally:
+- [ ] **2a. Make the cap safe and observable — `pigeon-bea`, first half. Do this FIRST.**
+  Raise `MAX_SESSIONS` 1000 → **5000** and keep it global and dumb. Nothing real constrains it: D1
+  allows 10GB, rows are ~100 bytes, and the `COUNT(*)` on new registration is sub-ms at this scale.
+  Its only legitimate job is runaway-bug guard, not capacity planning. **Do not build per-machine
+  caps** — cloudbox's 72% share is legitimate load, and a per-machine cap would starve the busiest
+  *legitimate* machine first. Then make it loud: `console.error` at the 429 return (today the worker
+  rejects in total silence, so even `wrangler tail` shows nothing), and a high-water check in the
+  existing cron that sends a Telegram alert at ≥80% of the cap. Note the check-then-insert at
+  `sessions.ts:59-71` is not atomic, so the cap is soft — fine for a backstop, do not fix.
+- [ ] **2b. The TTL sweep — `pigeon-bea`, second half.** Expire on **`updated_at`, not
+  `created_at`**: the touch runs on every notification (`notifications.ts:219`) and every webhook
+  reply (`webhook.ts:468`), and its comment says *"Touch session to prevent cleanup"* — **the touch
+  was written for a cleanup that was never built.** TTL = **14 days, strictly greater than the
+  daemon's 7-day `SESSION_TTL_MS`**, so the daemon always wins for machines that are alive and the
+  worker only catches structural orphans. Measured: only **4 rows** sit between 7d and 14d, so 14d
+  costs almost nothing versus 7d and is far safer. **Add a test asserting the worker TTL exceeds 7
+  days**, naming the daemon constant — the two live in different packages, and a future edit dropping
+  the worker below the daemon would mass-expire the live working set. **Delete `messages` alongside
+  `sessions`** (mirroring unregister at `sessions.ts:101-102`, the *only* deletion path `messages`
+  has) in a single transactional `db.batch`. Bound it with a subquery `LIMIT 500` rather than
+  `DELETE ... LIMIT`, which is compile-flag-dependent. Run the sweep **before** `runTopicReaper` in
+  `scheduled()` so orphaned topics close in the same tick via `topics.ts` `listOrphaned`. Current
+  backlog at 14d: **126 sessions and 701 messages**; orphaned messages today: **0**.
+- [ ] **2c. `pigeon-a1a` — stop producing the garbage.** Three verified daemon paths remove a local
+  session row without unregistering, or register worker-side with no local row at all:
   - `repos.ts:226` — `cleanupExpired` does `DELETE FROM sessions WHERE expires_at < ?` with no
     unregister, and is called from **inside the reaper itself** (`session-reaper.ts:43`).
   - dead-session cleanup in `command-ingest.ts` deletes the local row on a connection error.
   - `current-state-ingest.ts:103` registers every tmux-surveyed session; discovery is tmux-based,
     not registry-based, so nothing guarantees a local row exists.
-  Also note the reaper's own unregister is best-effort (`session-reaper.ts:33-37` swallows errors).
+  The reaper's own unregister is also best-effort (`session-reaper.ts:33-37` swallows errors).
 
-**Ordering, and why it is not the obvious one.** `2a` is the backstop and `2b` is the source, so the
-instinct is to fix the source first. Do the backstop first anyway: **which of the three paths
-dominates has not been established**, `2a` bounds the damage regardless of the answer, it is far the
-smaller change, and it is the only one of the two that clears the **574 rows already there**. Doing
-`2b` first means chasing three call sites under a deadline, with no backstop, and still being at 574.
+**Sequencing: cap before sweep, and in two separate deploys.** The only way this work *loses*
+notifications is: sweep expires a live session → 404 → re-register → **429** → transient retry loop →
+killed at the 15-minute age cap. That chain needs cap pressure **and** the sweep at the same time.
+Raising the cap first breaks the 429 link before the sweep can ever run, so a mid-flight daemon that
+eats a 404 simply re-registers and succeeds. Shipping both at once re-creates exactly the
+"fix makes the loss faster" hazard that Cycle 1's 403 arm produced. `2c` is last: it stops future
+garbage but clears none of the 153 rows already there, and the backstop makes it non-urgent.
 
-> **Method note.** `pigeon-bea` was filed as a P2 "structural gap" from reading the code, and that
-> was a defensible reading — it just happened to be describing a fire. One read-only query moved it
-> from "someday" to "this week". §1.7 says establish a timeline before attributing a cause; the same
-> discipline applies to *severity*. **Measure a resource-exhaustion bead before you rank it**, because
-> the code tells you the leak exists and only the data tells you how long you have.
+> **Method note — the same lesson twice, in both directions.** The first measurement of `pigeon-bea`
+> promoted it from "someday" to "this week"; the second *demoted it back* and moved the real risk to
+> a different variable entirely. **Measure a resource-exhaustion bead before ranking it — and make
+> sure the measurement can actually discriminate between the hypotheses.** A snapshot of a table tells
+> you a population, never a rate; only an age curve, or two readings separated in time, tells you
+> whether something is accumulating. Cross-check against an independent source of truth where one
+> exists — here the daemon's local table settled in one query what the worker's table could not
+> settle at all.
 >
-> Conversely, do **not** let this measurement tempt an attribution. The 1–5/week → 65/day jump lines
-> up suspiciously well with the forum-topics work and the `/current-state` fan-out, and that is
-> exactly the memorable-recent-event trap §1.7 describes. The dominant path is unestablished; `2a`
-> is chosen precisely because it does not depend on knowing.
+> Note also what the retraction did *not* do: it did not retire the bead. The work survived the
+> collapse of its own justification, in a re-scoped form aimed at the hazard the measurement actually
+> exposed. Discovering that a deadline is fake is a reason to re-aim the work, not to drop it.
 
 ### Cycle 3 — the age and attempt budget
 
@@ -499,9 +547,9 @@ blast radius but **do not cure the outage**.
   `outbox-sender.ts:417` logs *that* entities were stripped and never Telegram's `description`, so
   nothing records **why** a strip happened. **Step one is two lines — log `details.description` on
   the strip arm — and step two is to look before deciding whether step three is worth doing at all.**
-  This is the same shape as `pigeon-bea` in Cycle 2, inverted: there, measuring turned a tidy P2 into
-  a one-week deadline; here, measuring may well retire a P3 without any code change. Either way the
-  measurement comes first.
+  This is the same shape as `pigeon-bea` in Cycle 2: there, measuring first invented a one-week
+  deadline and then destroyed it; here, measuring may well retire a P3 without any code change.
+  Either way the measurement comes first.
 
 ### Cycle 6 — topic-specific residuals
 

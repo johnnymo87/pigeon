@@ -2,9 +2,17 @@ import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 
-const MAX_SESSIONS = 1000;
+export const MAX_SESSIONS = 5000;
 
 export type SessionAction = "list" | "register" | "unregister";
+
+/**
+ * Test seam. Production always uses MAX_SESSIONS; tests override the cap so they can
+ * exercise the limit without inserting thousands of rows into the shared D1.
+ */
+export interface SessionRequestOptions {
+  maxSessions?: number;
+}
 
 export interface SessionRow {
   session_id: string;
@@ -19,6 +27,7 @@ export async function handleSessionRequest(
   env: Env,
   request: Request,
   action: SessionAction,
+  opts?: SessionRequestOptions,
 ): Promise<Response> {
   if (!verifyApiKey(request, env.CCR_API_KEY)) {
     return unauthorized();
@@ -28,7 +37,7 @@ export async function handleSessionRequest(
     case "list":
       return listSessions(db);
     case "register":
-      return registerSession(db, request);
+      return registerSession(db, env, request, opts);
     case "unregister":
       return unregisterSession(db, env, request);
   }
@@ -41,7 +50,9 @@ async function listSessions(db: D1Database): Promise<Response> {
 
 async function registerSession(
   db: D1Database,
+  env: Env,
   request: Request,
+  opts?: SessionRequestOptions,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const sessionId = body.sessionId as string | undefined;
@@ -55,6 +66,8 @@ async function registerSession(
     );
   }
 
+  const cap = opts?.maxSessions ?? MAX_SESSIONS;
+
   // Check session limit (only for new sessions)
   const existing = await db
     .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
@@ -65,7 +78,9 @@ async function registerSession(
     const countResult = await db
       .prepare("SELECT COUNT(*) as count FROM sessions")
       .first<{ count: number }>();
-    if (countResult && countResult.count >= MAX_SESSIONS) {
+    const count = countResult?.count ?? 0;
+    if (count >= cap) {
+      console.error(`Session limit reached: ${count} / ${cap} sessions`);
       return Response.json({ error: "Session limit reached" }, { status: 429 });
     }
   }
@@ -134,17 +149,6 @@ async function unregisterSession(
   }
 
   return Response.json({ ok: true });
-}
-
-/**
- * Touch a session to keep it alive (update updated_at).
- * Used internally by notification and command routing.
- */
-export async function touchSession(db: D1Database, sessionId: string): Promise<void> {
-  await db
-    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
-    .bind(Date.now(), sessionId)
-    .run();
 }
 
 /**

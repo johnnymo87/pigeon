@@ -5,6 +5,9 @@
  * command-queue.ts with D1-native async queries.
  */
 
+import { createTelegramClient } from "./telegram";
+import { MAX_SESSIONS } from "./sessions";
+
 export const LEASE_TIMEOUT_MS = 60_000; // 60s lease expiry
 export const MAX_QUEUE_PER_MACHINE = 100;
 
@@ -286,4 +289,144 @@ export async function cleanupSeenUpdates(
     .run();
 
   return result.meta.rows_written ?? 0;
+}
+
+// ─── checkSessionHighWaterAlert ───────────────────────────────────────────────
+
+/**
+ * High-water alert check for session capacity.
+ * If session count >= thresholdRatio (default 80%) of maxSessions (default MAX_SESSIONS),
+ * sends a Telegram alert to the first chat ID in env.ALLOWED_CHAT_IDS.
+ * Rejections inside sendMessage are caught and logged so cron execution stays alive.
+ *
+ * Returns the session count and whether an alert was sent.
+ */
+export async function checkSessionHighWaterAlert(
+  db: D1Database,
+  env: Env,
+  opts?: {
+    maxSessions?: number;
+    thresholdRatio?: number;
+    now?: number;
+  },
+): Promise<{ count: number; alerted: boolean }> {
+  const cap = opts?.maxSessions ?? MAX_SESSIONS;
+  const thresholdRatio = opts?.thresholdRatio ?? 0.8;
+
+  const countResult = await db
+    .prepare("SELECT COUNT(*) as count FROM sessions")
+    .first<{ count: number }>();
+  const count = countResult?.count ?? 0;
+
+  if (count < cap * thresholdRatio) {
+    return { count, alerted: false };
+  }
+
+  const raw = env.ALLOWED_CHAT_IDS || "";
+  const allowed = raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+  const firstChatId = allowed[0];
+
+  if (!firstChatId) {
+    // Over threshold with nowhere to send. Silence here would mean the alert is disabled
+    // by misconfiguration and nobody ever finds out, which is worse than no alert at all.
+    console.error(
+      `Session high-water alert suppressed: ${count} / ${cap} sessions but ALLOWED_CHAT_IDS is empty`,
+    );
+    return { count, alerted: false };
+  }
+
+  const pct = Math.round((count / cap) * 100);
+  const text = `⚠️ Session count high: ${count} / ${cap} sessions (${pct}%)`;
+
+  let alerted = false;
+  try {
+    const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const res = await client.sendMessage({ chatId: firstChatId, text });
+    if (res.ok) {
+      alerted = true;
+    } else {
+      console.error("Failed to send session high-water alert:", res);
+    }
+  } catch (err) {
+    console.error("Failed to send session high-water alert:", err);
+  }
+
+  return { count, alerted };
+}
+
+// ─── sweepStaleSessions ───────────────────────────────────────────────────────
+
+export const SESSION_SWEEP_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
+/**
+ * Sweep stale sessions whose `updated_at` is older than SESSION_SWEEP_TTL_MS (14 days),
+ * deleting their `messages` rows alongside them.
+ *
+ * This is the ONLY thing that can remove a session whose daemon lost its local state
+ * (machine reinstalled, SQLite wiped, machine retired). The daemon reaper unregisters at
+ * 7 days, but only for sessions it still holds locally, so those rows are otherwise
+ * permanent. `messages` matters just as much: unregister (sessions.ts) is its only other
+ * deletion path anywhere in the worker, so a stranded session strands its messages too.
+ *
+ * The victim ids are SELECTed once and bound explicitly into both deletes, rather than
+ * letting each DELETE re-run the same subquery. Two identical subqueries over identical
+ * data almost certainly return the same rows — but "almost certainly" is doing real work
+ * in that sentence, `updated_at` is not unique, and the failure is asymmetric: if the two
+ * ever disagreed such that the session went and its messages stayed, nothing in the
+ * system would ever collect those messages, because the only other deleter is keyed by a
+ * session id that no longer exists. Selecting once removes the question entirely.
+ * `session_id` is the tiebreaker so the LIMIT window is itself deterministic.
+ *
+ * Returns counts of deleted sessions and messages.
+ */
+export async function sweepStaleSessions(
+  db: D1Database,
+  opts?: {
+    now?: number;
+    limit?: number;
+    ttlMs?: number;
+  },
+): Promise<{ sessionsDeleted: number; messagesDeleted: number }> {
+  const ttlMs = opts?.ttlMs ?? SESSION_SWEEP_TTL_MS;
+  const cutoff = (opts?.now ?? Date.now()) - ttlMs;
+  const limit = opts?.limit ?? 500;
+
+  const { results: victims } = await db
+    .prepare(
+      "SELECT session_id FROM sessions WHERE updated_at < ? ORDER BY updated_at, session_id LIMIT ?",
+    )
+    .bind(cutoff, limit)
+    .all<{ session_id: string }>();
+
+  const ids = (victims ?? []).map((r) => r.session_id);
+  if (ids.length === 0) {
+    return { sessionsDeleted: 0, messagesDeleted: 0 };
+  }
+
+  const placeholders = ids.map(() => "?").join(", ");
+  const batchResults = await db.batch([
+    db
+      .prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`)
+      .bind(...ids),
+    db
+      .prepare(`DELETE FROM sessions WHERE session_id IN (${placeholders})`)
+      .bind(...ids),
+  ]);
+
+  // `meta.changes` is the row count. `meta.rows_written` counts index writes too, so it
+  // over-reports on `messages`, which carries a partial unique index on notification_id.
+  const messagesDeleted = batchResults[0]?.meta.changes ?? 0;
+  const sessionsDeleted = batchResults[1]?.meta.changes ?? 0;
+
+  // The sweep is the only observability there is into the leak it exists to clean, and a
+  // silent DELETE is not something to run against production on a timer.
+  console.log(
+    `Stale session sweep: deleted ${sessionsDeleted} sessions and ${messagesDeleted} messages ` +
+      `(updated_at < ${new Date(cutoff).toISOString()}, limit ${limit})`,
+  );
+
+  return { sessionsDeleted, messagesDeleted };
 }
