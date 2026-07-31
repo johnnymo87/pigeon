@@ -63,22 +63,26 @@ describe("classifyDeliveryFailure", () => {
       expected: { action: "retry" },
     },
     {
-      name: "403 at attempts 2 returns terminal",
+      name: "403 at attempts 2 returns retry (403 is never terminal)",
       result: { ok: false, kind: "http_error", status: 403, body: { error: "Forbidden" } },
       ctx: { attempts: 2 },
-      expected: {
-        action: "terminal",
-        reason: "Forbidden (403) after 2 attempts; chat ID may not be allowed in worker config",
-      },
+      expected: { action: "retry" },
     },
     {
-      name: "403 at attempts 3 returns terminal",
+      name: "403 at attempts 3 returns retry (403 is never terminal)",
       result: { ok: false, kind: "http_error", status: 403, body: { error: "Forbidden" } },
       ctx: { attempts: 3 },
-      expected: {
-        action: "terminal",
-        reason: "Forbidden (403) after 3 attempts; chat ID may not be allowed in worker config",
-      },
+      expected: { action: "retry" },
+    },
+    {
+      // Regression guard for the mixed-cause defect found by adversarial review.
+      // ctx.attempts counts failures of EVERY kind, so an entry that accrued unrelated
+      // transport failures used to hit its FIRST 403 already "over budget" and die instantly:
+      // two individually-recoverable transients combining into permanent loss.
+      name: "403 at high attempts from UNRELATED earlier failures still returns retry",
+      result: { ok: false, kind: "http_error", status: 403, body: { error: "Chat ID not allowed" } },
+      ctx: { attempts: 9 },
+      expected: { action: "retry" },
     },
 
     // --- Rule 4: 400 ---
@@ -221,13 +225,10 @@ describe("classifyDeliveryFailure", () => {
       expected: { action: "retry" },
     },
     {
-      name: "PRECEDENCE: 403 at attempts 2 with retryAfter takes Rule 3 (terminal), NOT pause",
+      name: "PRECEDENCE: 403 at attempts 2 with retryAfter takes Rule 3 (retry), NOT pause",
       result: { ok: false, kind: "http_error", status: 403, body: { error: "Forbidden" }, retryAfter: 30 },
       ctx: { attempts: 2 },
-      expected: {
-        action: "terminal",
-        reason: "Forbidden (403) after 2 attempts; chat ID may not be allowed in worker config",
-      },
+      expected: { action: "retry" },
     },
     {
       name: "PRECEDENCE: 400 with retryAfter takes Rule 4 (terminal), NOT pause",

@@ -37,7 +37,7 @@ function getTelegramErrorCode(body: unknown): number | undefined {
  * Rules precedence order:
  * 1. transport_error -> retry
  * 2. 404 -> reregister (if local session exists and not yet tried) or terminal
- * 3. 403 -> retry (attempts < 2) or terminal (attempts >= 2)
+ * 3. 403 -> retry, never terminal (a 403 never reaches Telegram; see the arm for why)
  * 4. 400 -> terminal
  * 5. positive finite retryAfter on remaining !ok -> pause
  * 6. 502 + Telegram details.error_code 400 + payloadHasEntities -> strip_entities
@@ -78,20 +78,40 @@ export function classifyDeliveryFailure(
     return { action: "terminal", reason };
   }
 
-  // Rule 3: http_error status 403
-  // WHY: 403 is NOT terminal on the first failure. A 403 is a property of WORKER CONFIG
-  // (ALLOWED_CHAT_IDS), not of the message. A typo in a deploy currently leaves a 15-minute window in
-  // which a rollback loses nothing; instant-terminal would convert that into immediate mass loss of
-  // everything queued. This is live rollback-safety right now: production deliberately keeps two chat
-  // ids allowed during the ongoing Telegram forum migration precisely because narrowing that list
-  // produces 403s. Terminal at attempts >= 2 still kills a genuinely-deterministic 403 in seconds.
+  // Rule 3: http_error status 403 -> RETRY, never terminal. Falls through to rule 7.
+  //
+  // Bead pigeon-bzf asked for 403 to be terminal alongside 400 and 404. That is rejected, with
+  // evidence. Making it terminal has no upside and one large downside.
+  //
+  // No upside: the reason to kill a doomed entry early is the shared Telegram budget - roughly 20
+  // messages per minute per group, spent by every session at once, so a wasted call costs somebody
+  // else's notification. A 403 does not spend it. The worker rejects the chat id at
+  // notifications.ts:202, BEFORE resolveTopic (:230) and before createTelegramClient (:248), so a
+  // retried 403 never reaches Telegram at all. It costs one cheap worker request. (Same is true of
+  // 400 at :188 and 404 at :197 - those are terminal for a different reason: they are genuinely
+  // deterministic, so retrying cannot ever succeed.)
+  //
+  // Large downside: a 403 is NOT deterministic. It is a property of WORKER CONFIG (ALLOWED_CHAT_IDS)
+  // and changes the moment the config does. Terminal converts a recoverable misconfiguration into
+  // permanent loss of everything queued at that instant. This is live right now: production
+  // deliberately keeps two chat ids allowed during the Telegram forum migration precisely because
+  // narrowing that list produces 403s.
+  //
+  // An earlier draft compromised with "terminal at attempts >= 2". Adversarial review killed it on
+  // two counts. First, ctx.attempts counts failures of EVERY kind (outbox-repo.ts increments it on
+  // each markRetry), so an entry that had already accrued two unrelated transport failures would hit
+  // its FIRST 403 and die instantly - two individually-recoverable transients combining into
+  // permanent loss. Second, it bought about 15 seconds of rollback window (5s + 10s backoff) while
+  // the comment justifying it claimed 15 minutes. No operator rolls back a worker config in 15
+  // seconds. Retrying under the normal budget restores the real window and needs no extra state.
+  //
+  // Do not "optimise" this back into a terminal arm without first showing that a 403 reaches
+  // Telegram. It does not.
+  //
+  // This returns explicitly rather than falling through to rule 7, so that a 403 can never reach
+  // rule 5 and PAUSE the entire outbox. The worker does not attach retryAfter to a 403 today, but
+  // one stray field should not be able to stall every other session's delivery.
   if (result.kind === "http_error" && result.status === 403) {
-    if (ctx.attempts >= 2) {
-      return {
-        action: "terminal",
-        reason: `Forbidden (403) after ${ctx.attempts} attempts; chat ID may not be allowed in worker config`,
-      };
-    }
     return { action: "retry" };
   }
 

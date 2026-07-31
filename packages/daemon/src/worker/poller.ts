@@ -418,21 +418,35 @@ export class Poller {
     return result;
   }
 
-  async unregisterSession(sessionId: string): Promise<void> {
-    try {
-      const response = await this.fetchFn(`${this.config.workerUrl}/sessions/unregister`, {
+  /**
+   * Unregister a session worker-side.
+   *
+   * Returns a WorkerResult so callers that MUST know whether the row is really gone can check.
+   * The outbox's compensating unregister is one such caller: when a lazy re-registration races the
+   * reaper, the outbox has just recreated a worker row that nothing else will ever remove (the
+   * reaper only unregisters sessions it still holds locally, and the worker has no session TTL
+   * cron). A silently-swallowed failure there leaks that row permanently.
+   *
+   * Existing callers that ignore the return value keep their previous best-effort behaviour.
+   */
+  async unregisterSession(sessionId: string): Promise<WorkerResult> {
+    const result = await safeExecuteWorkerFetch(() =>
+      this.fetchFn(`${this.config.workerUrl}/sessions/unregister`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ sessionId }),
-      });
-      const payload = await response.json() as { ok?: boolean };
-      console.log(`[poller] unregisterSession sessionId=${sessionId} ok=${Boolean(payload.ok)}`);
-    } catch (err) {
-      console.warn(`[poller] unregisterSession failed sessionId=${sessionId}:`, err instanceof Error ? err.message : String(err));
+      }),
+    );
+    if (result.ok) {
+      console.log(`[poller] unregisterSession sessionId=${sessionId} ok=true`);
+    } else {
+      const detail = result.kind === "transport_error" ? result.error : `status=${result.status}`;
+      console.warn(`[poller] unregisterSession failed sessionId=${sessionId} kind=${result.kind} ${detail}`);
     }
+    return result;
   }
 
   async sendNotification(

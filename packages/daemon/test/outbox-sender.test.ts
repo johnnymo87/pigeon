@@ -1112,7 +1112,7 @@ describe("classified delivery failure actions", () => {
     expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
   });
 
-  it("403 at attempts 0 -> retry; 403 at attempts 2 -> terminal", async () => {
+  it("403 keeps retrying and is never terminal, preserving the config-rollback window", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
     const sendNotification = vi.fn().mockResolvedValue({
@@ -1141,10 +1141,14 @@ describe("classified delivery failure actions", () => {
     expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
     expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(2);
 
-    // Attempt 2: terminal
+    // Attempt 2: STILL retrying. A 403 reflects worker config (ALLOWED_CHAT_IDS), not the
+    // message, and never reaches Telegram (rejected at notifications.ts:202, before
+    // createTelegramClient at :248), so it costs none of the shared 20/min group budget.
+    // Killing it early would only convert a recoverable misconfiguration into permanent loss.
     now += 12_000;
     await sender.processOnce();
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(3);
   });
 
   it("400 -> terminal", async () => {
@@ -1201,6 +1205,87 @@ describe("classified delivery failure actions", () => {
 
     const updatedParsed = JSON.parse(record.payload);
     expect(updatedParsed.messages[0].entities).toBeUndefined();
+  });
+
+  // The legacy singular 'message' payload shape is still production-reachable (question
+  // notifications and /current-state cards write it), and the strip arm handles it. Adversarial
+  // review noted it was only ever verified by reading the code, never by a test.
+  it("502 entity-400 strips the LEGACY singular message shape too, preserving replyMarkup", async () => {
+    const legacyPayload = JSON.stringify({
+      message: { text: "Hello", entities: [{ type: "bold", offset: 0, length: 5 }] },
+      replyMarkup: { inline_keyboard: [[{ text: "Reply", callback_data: "cmd:abc" }]] },
+      notificationId: "notif-1",
+    });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: legacyPayload }, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { details: { error_code: 400, description: "Bad Request: can't parse entities" } },
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1")!;
+    expect(record.state).toBe("queued");
+
+    const parsed = JSON.parse(record.payload);
+    expect(parsed.message.entities).toBeUndefined();
+    // The text must survive so it can still be delivered unformatted...
+    expect(parsed.message.text).toBe("Hello");
+    // ...and stripping must not collateral-damage the swipe-reply keyboard.
+    expect(parsed.replyMarkup.inline_keyboard[0][0].callback_data).toBe("cmd:abc");
+  });
+
+  // A failed compensating unregister leaks a worker session row permanently: the reaper only
+  // unregisters sessions it still holds locally, and the worker has no session TTL cron.
+  it("logs a LEAK when the compensating unregister fails after the row vanished", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockImplementation(async () => {
+      // The reaper wins the race: the local row disappears during registration.
+      storage.sessions.delete("sess-1");
+      return { ok: true, kind: "success", status: 200, body: { ok: true } };
+    }) as unknown as RegisterSessionFn;
+
+    const unregisterSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "ECONNREFUSED",
+    });
+
+    const logged: string[] = [];
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      unregisterSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: (msg) => logged.push(msg),
+    });
+
+    await sender.processOnce();
+
+    expect(unregisterSession).toHaveBeenCalledWith("sess-1");
+    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    expect(logged.some((m) => m.includes("LEAKED worker session row"))).toBe(true);
   });
 
   it("successful send marks sent and clears re-register flag", async () => {

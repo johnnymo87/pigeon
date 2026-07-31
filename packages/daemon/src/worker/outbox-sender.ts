@@ -20,7 +20,11 @@ export type RegisterSessionFn = (
   label?: string,
 ) => Promise<WorkerResult>;
 
-export type UnregisterSessionFn = (sessionId: string) => Promise<void>;
+/**
+ * Returns WorkerResult so the compensating-unregister path can tell whether the worker row was
+ * really removed; `void` is still accepted so best-effort callers and existing test doubles work.
+ */
+export type UnregisterSessionFn = (sessionId: string) => Promise<WorkerResult | void>;
 
 export type LogFn = (message: string, fields?: Record<string, unknown>) => void;
 
@@ -293,15 +297,29 @@ export class OutboxSender {
                 if (regResult.ok) {
                   const recheck = this.storage.sessions.get(entry.sessionId);
                   if (recheck === null) {
+                    // The reaper deleted the local row between our check and the register, so we
+                    // have just resurrected a session it deliberately unregistered. Compensate.
+                    // Nothing else can: the reaper only unregisters sessions it still holds
+                    // locally, and the worker has no session TTL cron, so a failure here leaks
+                    // this row forever. Surface it loudly rather than swallowing it.
+                    let compensated: boolean | undefined;
                     if (this.unregisterSession) {
-                      await this.unregisterSession(entry.sessionId);
+                      const unregResult = await this.unregisterSession(entry.sessionId);
+                      compensated = unregResult?.ok ?? undefined;
                     }
                     this.storage.outbox.markFailed(entry.notificationId, now);
                     this.reregisteredEntries.delete(entry.notificationId);
                     this.log("outbox entry re-registration compensated: session deleted during registration", {
                       notificationId: entry.notificationId,
                       sessionId: entry.sessionId,
+                      compensated: compensated ?? false,
                     });
+                    if (compensated === false) {
+                      this.log("LEAKED worker session row: compensating unregister failed, nothing else will remove it", {
+                        sessionId: entry.sessionId,
+                        notificationId: entry.notificationId,
+                      });
+                    }
                     break;
                   }
 
