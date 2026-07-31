@@ -307,9 +307,10 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
             enqueueCard: (opts) => {
-              // NOTE AND COMMENT: OutboxSender sends to its configured chatId and
-              // ignores per-command msg.chatId (the payload carries no chatId). That is fine
-              // while Pigeon is single-tenant, but would misroute if /current-state ever arrived from a second chat.
+              // NOTE: OutboxSender delivers to its configured chatId and ignores this
+              // command's msg.chatId, because the outbox payload carries no chatId. That is
+              // fine while Pigeon is single-tenant, but a /current-state arriving from a
+              // second chat would have its cards silently delivered to the configured one.
               const notificationPayload = {
                 message: { text: opts.text, entities: opts.entities },
                 replyMarkup: { inline_keyboard: [] },

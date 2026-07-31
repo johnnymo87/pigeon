@@ -51,13 +51,26 @@ Do this LAST, after §4 is done — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **778** passed, 1 skipped |
+| `@pigeon/daemon` | **792** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **305** passed |
 | `@pigeon/worker` | **279** passed |
 
-Total **1362**. **`npm run typecheck` is CLEAN — 0 errors.** The 4 `lease-cas` errors that the
+Total **1376**. **`npm run typecheck` is CLEAN — 0 errors.** The 4 `lease-cas` errors that the
 previous plan told every task to ignore were fixed by PR #8. **Any typecheck error is now a real
 regression.**
+
+> **CORRECTION (2026-07-31).** The first version of this table claimed `@pigeon/worker` **279
+> passed** as of the topics flip. That was false. Commit `4c163cb` set
+> `TELEGRAM_TOPICS_ENABLED = "true"` in `wrangler.toml`, Miniflare inherited it, and **20 worker
+> tests broke immediately** — the real state at `34d4389` was **20 failed / 259 passed**, confirmed
+> by running the suite at that commit in a throwaway worktree. The number survived a whole session
+> because it was *inherited from a previous measurement* rather than re-measured after the change
+> that broke it. `packages/worker/vitest.config.ts` now pins the flag explicitly so test config no
+> longer moves when a production flag is flipped (bead `pigeon-4dz`).
+>
+> **Generalise this: re-measure a baseline after any change to shared config. Never carry a count
+> forward across a change that could plausibly affect it.** This is the same failure mode as §1.7 —
+> trusting a memorable prior fact instead of establishing the current one.
 
 ---
 
