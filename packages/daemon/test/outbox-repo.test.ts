@@ -402,4 +402,46 @@ describe("OutboxRepository", () => {
 
     storage.db.close();
   });
+
+  it("getStats returns aggregate counts by state, failed_reason breakdown, and oldestQueuedAgeMs", () => {
+    const storage = createStorage();
+    const now = 10_000;
+
+    // Initially empty
+    expect(storage.outbox.getStats(now)).toEqual({
+      states: { queued: 0, sending: 0, sent: 0, failed: 0 },
+      failedReasons: {},
+      oldestQueuedAgeMs: null,
+    });
+
+    // Enqueue entries
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-1" }, 2_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-2" }, 4_000);
+
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-3" }, 3_000);
+    storage.outbox.markSent("notif-3", 3_500);
+
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-4" }, 5_000);
+    storage.outbox.markFailed("notif-4", 5_500, "expired");
+
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-5" }, 6_000);
+    storage.outbox.markFailed("notif-5", 6_500, "attempts_exhausted");
+
+    const stats = storage.outbox.getStats(now);
+    expect(stats).toEqual({
+      states: {
+        queued: 2,
+        sending: 0,
+        sent: 1,
+        failed: 2,
+      },
+      failedReasons: {
+        expired: 1,
+        attempts_exhausted: 1,
+      },
+      oldestQueuedAgeMs: 8_000,
+    });
+
+    storage.db.close();
+  });
 });

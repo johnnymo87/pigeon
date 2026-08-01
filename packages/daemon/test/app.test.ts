@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createApp } from "../src/app";
+import { createApp, isQuietTitle } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { StopNotifier } from "../src/notification-service";
 
@@ -43,6 +43,38 @@ describe("createApp", () => {
     const response = await app(new Request("http://localhost/health"));
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true, service: "pigeon-daemon" });
+  });
+
+  it("GET /outbox/stats returns outbox aggregate stats", async () => {
+    const app = newApp(10_000);
+
+    storage!.outbox.upsert({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      requestId: "req-1",
+      kind: "question",
+      payload: "{}",
+      token: "tok-1",
+    }, 2_000);
+
+    storage!.outbox.upsert({
+      notificationId: "notif-2",
+      sessionId: "sess-1",
+      requestId: "req-2",
+      kind: "stop",
+      payload: "{}",
+      token: "tok-2",
+    }, 5_000);
+    storage!.outbox.markFailed("notif-2", 6_000, "expired");
+
+    const response = await app(new Request("http://localhost/outbox/stats"));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      states: { queued: 1, sending: 0, sent: 0, failed: 1 },
+      failedReasons: { expired: 1 },
+      oldestQueuedAgeMs: 8_000,
+    });
   });
 
   it("returns not found for unknown routes", async () => {
@@ -867,6 +899,62 @@ describe("createApp", () => {
     expect(outboxRow).toBeTruthy();
   });
 
+  it("POST /question-asked returns 200 failed when existing outbox row is failed and logs warning", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qfailed", notify: true }),
+    }));
+
+    const body = JSON.stringify({
+      session_id: "sess-qfailed",
+      request_id: "question_failed",
+      questions: [{ question: "Failed?", header: "H", options: [] }],
+    });
+
+    // First call to populate outbox
+    const first = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+    expect(first.status).toBe(202);
+
+    // Mark outbox row as failed
+    const notificationId = "q:sess-qfailed:question_failed";
+    storage.outbox.markFailed(notificationId, 51_000, "Delivery failed permanently");
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Second call with same request_id
+    const second = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+
+    expect(second.status).toBe(200);
+    const secondJson = await second.json() as Record<string, unknown>;
+    expect(secondJson).toEqual({
+      ok: false,
+      deliveryState: "failed",
+      notificationId,
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      `[question] outbox row failed sessionId=sess-qfailed notificationId=${notificationId} failedReason=Delivery failed permanently`,
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("POST /question-asked returns notified=false when notify=false", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });
@@ -1162,5 +1250,474 @@ describe("createApp", () => {
     expect(json.ok).toBe(true);
     expect(json.cleared).toBe(true);
     expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
+  });
+
+  describe("isQuietTitle unit tests", () => {
+    it("returns false for null, undefined, or empty string", () => {
+      expect(isQuietTitle(null)).toBe(false);
+      expect(isQuietTitle(undefined)).toBe(false);
+      expect(isQuietTitle("")).toBe(false);
+    });
+
+    it("defaults to case-insensitive \\.lgtm- match", () => {
+      expect(isQuietTitle("Task .lgtm-prompt.md", {})).toBe(true);
+      expect(isQuietTitle("Task .LGTM-prompt.md", {})).toBe(true);
+      expect(isQuietTitle("Review PR using LGTM prompt", {})).toBe(false);
+      expect(isQuietTitle("Fix lgtm dispatcher timeout", {})).toBe(false);
+      expect(isQuietTitle("Feature work", {})).toBe(false);
+    });
+
+    it("uses custom regex pattern when PIGEON_QUIET_TITLE_PATTERN is set", () => {
+      const env = { PIGEON_QUIET_TITLE_PATTERN: "quiet|silent" };
+      expect(isQuietTitle("This is quiet", env)).toBe(true);
+      expect(isQuietTitle("Silent runner", env)).toBe(true);
+      expect(isQuietTitle("LGTM runner", env)).toBe(false);
+    });
+
+    it("falls back to default /\\.lgtm-/i pattern when PIGEON_QUIET_TITLE_PATTERN is invalid regex", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const env = { PIGEON_QUIET_TITLE_PATTERN: "(unclosed" };
+
+      expect(isQuietTitle("Task .lgtm-runner.md", env)).toBe(true);
+      expect(isQuietTitle("Normal runner", env)).toBe(false);
+      expect(errorSpy).toHaveBeenCalled();
+
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("PIGEON_QUIET_TITLE_PATTERN stop notification suppression", () => {
+    const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
+
+    afterEach(() => {
+      if (originalQuietPattern !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_PATTERN = originalQuietPattern;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      }
+    });
+
+    it("does NOT enqueue stop notification for lgtm-titled session and logs suppression", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-1",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-1",
+          event: "Stop",
+          message: "PR review done",
+        }),
+      }));
+
+      expect(res.status).toBe(200);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.notified).toBe(false);
+      expect(json.reason).toBe("quiet_title");
+
+      // Verify no outbox entry was created
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(0);
+
+      // Verify log line was emitted with event=
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\[stop\] quieted sessionId=sess-lgtm-1 event=Stop title="Run \.lgtm-review-prompt\.md task"/),
+      );
+
+      logSpy.mockRestore();
+    });
+
+    it("IS enqueued for an ordinary session title (guard against over-matching)", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-normal-1",
+          notify: true,
+          title: "Fix failing auth test in packages/daemon",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-normal-1",
+          event: "Stop",
+          message: "All tests pass",
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(1);
+      expect(outboxEntries[0]?.sessionId).toBe("sess-normal-1");
+    });
+
+    it("matches case-insensitively (e.g. .LGTM- in uppercase prose)", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-upper",
+          notify: true,
+          title: "PR review from .LGTM-prompt.md",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-upper",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(res.status).toBe(200);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.notified).toBe(false);
+      expect(json.reason).toBe("quiet_title");
+    });
+
+    it("IS enqueued when event is Error, even on lgtm-titled session", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-err",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-err",
+          event: "Error",
+          message: "Unhandled exception in worker",
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(1);
+      expect(outboxEntries[0]?.sessionId).toBe("sess-lgtm-err");
+    });
+
+    it("IS enqueued when event is Retry, even on lgtm-titled session", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-retry",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-retry",
+          event: "Retry",
+          message: "Rate limit hit, retrying in 30s",
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(1);
+      expect(outboxEntries[0]?.sessionId).toBe("sess-lgtm-retry");
+    });
+
+    it("does NOT suppress prose title 'Review PR using LGTM prompt' under default pattern, but DOES suppress '.lgtm-review-prompt.md'", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      // Loose prose title -> NOT suppressed under default \.lgtm- pattern
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-prose",
+          notify: true,
+          title: "Review PR using LGTM prompt",
+        }),
+      }));
+
+      const resProse = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-prose",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(resProse.status).toBe(202);
+      expect((await resProse.json() as Record<string, unknown>).deliveryState).toBe("queued");
+
+      // Title with .lgtm- -> IS suppressed
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-dot-lgtm",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md",
+        }),
+      }));
+
+      const resDot = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-dot-lgtm",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(resDot.status).toBe(200);
+      expect((await resDot.json() as Record<string, unknown>).reason).toBe("quiet_title");
+    });
+
+    it("IS still enqueued and delivered for a question notification even on lgtm-titled session", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-q",
+          notify: true,
+          title: "Review PR using LGTM prompt",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-q",
+          request_id: "req-q-lgtm",
+          questions: [{ type: "text", question: "Merge this PR?", options: [] }],
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("accepted");
+
+      const outboxRow = storage.outbox.getByNotificationId("q:sess-lgtm-q:req-q-lgtm");
+      expect(outboxRow).not.toBeNull();
+      expect(outboxRow?.kind).toBe("question");
+    });
+
+    it("allows PIGEON_QUIET_TITLE_PATTERN to override the default pattern", async () => {
+      process.env.PIGEON_QUIET_TITLE_PATTERN = "custom-quiet";
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      // Custom quiet title -> quieted
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-custom-q",
+          notify: true,
+          title: "Run custom-quiet agent",
+        }),
+      }));
+
+      const res1 = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-custom-q",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(res1.status).toBe(200);
+      expect((await res1.json() as Record<string, unknown>).reason).toBe("quiet_title");
+
+      // LGTM session when pattern is custom-quiet -> NOT quieted
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-notquiet",
+          notify: true,
+          title: "Review PR using LGTM prompt",
+        }),
+      }));
+
+      const res2 = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-notquiet",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(res2.status).toBe(202);
+      expect((await res2.json() as Record<string, unknown>).deliveryState).toBe("queued");
+    });
+
+    it("falls back to default /lgtm/i pattern on invalid regex in PIGEON_QUIET_TITLE_PATTERN without throwing", async () => {
+      process.env.PIGEON_QUIET_TITLE_PATTERN = "[unclosed-bracket";
+      storage = openStorageDb(":memory:");
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      // LGTM session should still be quieted using default fallback
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-invalid-regex-lgtm",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res1 = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-invalid-regex-lgtm",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(res1.status).toBe(200);
+      expect((await res1.json() as Record<string, unknown>).reason).toBe("quiet_title");
+
+      // Verify error logged about invalid regex
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/invalid PIGEON_QUIET_TITLE_PATTERN regex/),
+        expect.anything(),
+      );
+
+      // Normal session should NOT be quieted
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-invalid-regex-normal",
+          notify: true,
+          title: "Normal working session",
+        }),
+      }));
+
+      const res2 = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-invalid-regex-normal",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(res2.status).toBe(202);
+      expect((await res2.json() as Record<string, unknown>).deliveryState).toBe("queued");
+
+      errorSpy.mockRestore();
+    });
   });
 });
