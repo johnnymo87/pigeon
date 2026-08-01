@@ -11,6 +11,7 @@ export interface OutboxRecord {
   payload: string;
   token: string;
   attempts: number;
+  retryCount: number;
   nextRetryAt: number | null;
   failedReason: string | null;
   lastError: string | null;
@@ -37,6 +38,7 @@ function asOutbox(row: SqlRow): OutboxRecord {
     payload: String(row.payload),
     token: String(row.token),
     attempts: Number(row.attempts),
+    retryCount: Number(row.retry_count ?? 0),
     nextRetryAt: (row.next_retry_at as number | null) ?? null,
     failedReason: (row.failed_reason as string | null) ?? null,
     lastError: (row.last_error as string | null) ?? null,
@@ -59,11 +61,12 @@ export class OutboxRepository {
       .prepare(
         `INSERT INTO outbox
            (notification_id, session_id, request_id, kind, state, payload, token,
-            attempts, next_retry_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, NULL, ?, ?)
+            attempts, retry_count, next_retry_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?)
          ON CONFLICT(notification_id) DO UPDATE SET
            state = 'queued',
            attempts = 0,
+           retry_count = 0,
            next_retry_at = NULL,
            failed_reason = NULL,
            last_error = NULL,
@@ -129,6 +132,7 @@ export class OutboxRepository {
         `UPDATE outbox
          SET state = 'queued',
              attempts = attempts + ?,
+             retry_count = retry_count + 1,
              next_retry_at = ?,
              last_error = COALESCE(?, last_error),
              updated_at = ?

@@ -480,6 +480,7 @@ describe("storage schema and repositories", () => {
         const columnNames1 = columns1.map((c) => c.name);
         expect(columnNames1).toContain("failed_reason");
         expect(columnNames1).toContain("last_error");
+        expect(columnNames1).toContain("retry_count");
         storage1.db.close();
 
         // Re-open again (should be idempotent and not throw duplicate column error)

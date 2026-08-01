@@ -1962,4 +1962,73 @@ describe("OutboxSender rate governor", () => {
     expect(storage.outbox.getByNotificationId("notif-low-1")!.state).toBe("sent");
     expect(storage.outbox.getByNotificationId("notif-low-2")!.state).toBe("sent");
   });
+
+  it("escalates backoff under sustained transport failure while attempts stays 0", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "connect ECONNREFUSED",
+    }) as unknown as SendNotificationFn;
+
+    let now = 10_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    const expectedBackoffs = [5_000, 10_000, 30_000, 60_000, 120_000, 120_000];
+
+    for (const expectedBackoff of expectedBackoffs) {
+      await sender.processOnce();
+      const record = storage.outbox.getByNotificationId("notif-1")!;
+      expect(record.state).toBe("queued");
+      expect(record.attempts).toBe(0);
+      expect(record.nextRetryAt! - now).toBe(expectedBackoff);
+
+      now = record.nextRetryAt!;
+    }
+  });
+
+  it("counting failure escalates backoff and terminates at attempts_exhausted after 10 attempts", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 403,
+      body: { error: "Forbidden" },
+    }) as unknown as SendNotificationFn;
+
+    let now = 10_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // 403 is a counting failure (not transport failure)
+    // 10 attempts expected before terminal attempts_exhausted
+    const expectedBackoffs = [5_000, 10_000, 30_000, 60_000, 120_000, 120_000, 120_000, 120_000, 120_000, 120_000];
+
+    for (let i = 0; i <= 10; i++) {
+      await sender.processOnce();
+      const record = storage.outbox.getByNotificationId("notif-1")!;
+      if (i < 10) {
+        expect(record.state).toBe("queued");
+        expect(record.attempts).toBe(i + 1);
+        expect(record.nextRetryAt! - now).toBe(expectedBackoffs[i]);
+        now = record.nextRetryAt!;
+      } else {
+        // Attempt 11 check: MAX_ATTEMPTS (10) reached, processOnce marks terminal before delivery
+        expect(record.state).toBe("failed");
+        expect(record.failedReason).toBe("attempts_exhausted");
+        expect(record.attempts).toBe(10);
+      }
+    }
+  });
 });

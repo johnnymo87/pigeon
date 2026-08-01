@@ -93,8 +93,8 @@ export function formatWorkerError(result: WorkerResult): string {
   return "Unknown error";
 }
 
-function getBackoff(attempts: number): number {
-  return BACKOFF_SCHEDULE[Math.min(attempts, BACKOFF_SCHEDULE.length - 1)] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 120_000;
+function getBackoff(retryCount: number): number {
+  return BACKOFF_SCHEDULE[Math.min(retryCount, BACKOFF_SCHEDULE.length - 1)] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 120_000;
 }
 
 /**
@@ -327,7 +327,7 @@ export class OutboxSender {
               const action = classifyDeliveryFailure(result, ctx);
 
               if (action.action === "pause") {
-                const backoff = getBackoff(entry.attempts);
+                const backoff = getBackoff(entry.retryCount);
                 const countAttempt = !isTransportFailure(result);
                 this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
                 this.log("outbox entry delivery failed, scheduling retry", {
@@ -365,7 +365,7 @@ export class OutboxSender {
 
               if (action.action === "reregister") {
                 if (!this.registerSession) {
-                  const backoff = getBackoff(entry.attempts);
+                  const backoff = getBackoff(entry.retryCount);
                   const countAttempt = !isTransportFailure(result);
                   this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
                   this.log("outbox entry delivery failed, scheduling retry (reregister unavailable)", {
@@ -409,7 +409,7 @@ export class OutboxSender {
                   }
 
                   this.reregisteredEntries.add(entry.notificationId);
-                  const backoff = getBackoff(entry.attempts);
+                  const backoff = getBackoff(entry.retryCount);
                   const countAttempt = !isTransportFailure(result);
                   this.storage.outbox.markRetry(entry.notificationId, now, backoff, undefined, countAttempt);
                   this.log("outbox entry re-registered, scheduling retry", {
@@ -449,7 +449,7 @@ export class OutboxSender {
                       (regResult.status >= 500 || regResult.status === 429));
 
                   if (isTransient) {
-                    const backoff = getBackoff(entry.attempts);
+                    const backoff = getBackoff(entry.retryCount);
                     const countAttempt = !isTransportFailure(regResult);
                     this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(regResult), countAttempt);
                     this.log("outbox entry re-registration failed (transient), scheduling retry", {
@@ -499,7 +499,7 @@ export class OutboxSender {
                   });
                 }
 
-                const backoff = getBackoff(entry.attempts);
+                const backoff = getBackoff(entry.retryCount);
                 // Strip entities retry is caused by malformed entity formatting (per-message payload error).
                 // It MUST count as an attempt even though the worker returned HTTP 502 (Telegram 400).
                 this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), true);
@@ -513,7 +513,7 @@ export class OutboxSender {
               }
 
               // Default retry arm (action.action === "retry")
-              const backoff = getBackoff(entry.attempts);
+              const backoff = getBackoff(entry.retryCount);
               const countAttempt = !isTransportFailure(result);
               this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
               this.log("outbox entry delivery failed, scheduling retry", {
@@ -539,7 +539,7 @@ export class OutboxSender {
             });
           }
         } catch (err) {
-          const backoff = getBackoff(entry.attempts);
+          const backoff = getBackoff(entry.retryCount);
           const errMsg = err instanceof Error ? err.message : String(err);
           // Exception during delivery is ambiguous and may be a bug in our own code;
           // with a long age cap, not counting would retry a genuine code defect thousands of times.

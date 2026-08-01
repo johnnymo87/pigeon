@@ -41,6 +41,7 @@ export const additiveColumns = [
   "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN failed_reason TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN last_error TEXT DEFAULT NULL",
+  "ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
 ];
 
 export function runAdditiveMigrations(
@@ -146,6 +147,7 @@ export function initSchema(db: BetterSqlite3.Database): void {
       payload TEXT NOT NULL,
       token TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
+      retry_count INTEGER NOT NULL DEFAULT 0,
       next_retry_at INTEGER,
       failed_reason TEXT DEFAULT NULL,
       last_error TEXT DEFAULT NULL,

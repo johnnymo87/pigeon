@@ -35,6 +35,7 @@ describe("OutboxRepository", () => {
     expect(record!.payload).toBe('{"text":"Which option?"}');
     expect(record!.token).toBe("tok-abc");
     expect(record!.attempts).toBe(0);
+    expect(record!.retryCount).toBe(0);
     expect(record!.nextRetryAt).toBeNull();
     expect(record!.createdAt).toBe(1_000);
     expect(record!.updatedAt).toBe(1_000);
@@ -207,14 +208,16 @@ describe("OutboxRepository", () => {
     const resurrectTime = 1_000 + 20 * 60 * 1000; // 20 minutes later (past 15m expiration)
 
     storage.outbox.upsert(BASE_INPUT, initialTime);
+    storage.outbox.markRetry("notif-1", initialTime, 5_000, "HTTP 500", false);
     storage.outbox.markFailed("notif-1", failTime, "budget_exhausted", "HTTP 500");
 
-    // Re-upsert of a failed notification should reset to queued and update created_at
+    // Re-upsert of a failed notification should reset to queued, retry_count=0, and update created_at
     storage.outbox.upsert(BASE_INPUT, resurrectTime);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("queued");
     expect(record!.attempts).toBe(0);
+    expect(record!.retryCount).toBe(0);
     expect(record!.nextRetryAt).toBeNull();
     expect(record!.failedReason).toBeNull();
     expect(record!.lastError).toBeNull();
