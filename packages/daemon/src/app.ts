@@ -478,6 +478,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Check if already in outbox (idempotent)
         const existing = storage.outbox.getByNotificationId(notificationId);
         if (existing) {
+          if (existing.state === "failed") {
+            console.warn(`[question] outbox row failed sessionId=${sessionId} notificationId=${notificationId} failedReason=${existing.failedReason}`);
+            return Response.json(
+              { ok: false, deliveryState: "failed", notificationId },
+              { status: 200 },
+            );
+          }
           return Response.json(
             { ok: true, deliveryState: existing.state === "sent" ? "sent" : "queued", notificationId },
             { status: existing.state === "sent" ? 200 : 202 },

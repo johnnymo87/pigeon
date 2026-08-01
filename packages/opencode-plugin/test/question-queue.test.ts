@@ -187,6 +187,21 @@ describe("QuestionDeliveryQueue", () => {
       expect(queue.size()).toBe(0)
     })
 
+    test("deliveryState failed is failure - entry stays in queue and retry scheduled", async () => {
+      const sender: Sender = vi.fn()
+        .mockResolvedValueOnce({ ok: false, deliveryState: "failed", notificationId: "q:sess-1:req-1" })
+        .mockResolvedValueOnce({ ok: true, deliveryState: "sent", notificationId: "q:sess-1:req-1" })
+      queue.enqueue(makeEntry("sess-1", "req-1"))
+      queue.start(sender)
+      await vi.advanceTimersByTimeAsync(600)
+      expect(sender).toHaveBeenCalledTimes(1)
+      expect(queue.size()).toBe(1) // failed = failure, entry stays in queue
+
+      await vi.advanceTimersByTimeAsync(1500)
+      expect(sender).toHaveBeenCalledTimes(2)
+      expect(queue.size()).toBe(0) // removed after retry succeeds
+    })
+
     test("null response is failure", async () => {
       const sender: Sender = vi.fn()
         .mockResolvedValueOnce(null)

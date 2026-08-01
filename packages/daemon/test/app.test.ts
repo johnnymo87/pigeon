@@ -867,6 +867,62 @@ describe("createApp", () => {
     expect(outboxRow).toBeTruthy();
   });
 
+  it("POST /question-asked returns 200 failed when existing outbox row is failed and logs warning", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, {
+      nowFn: () => 50_000,
+      chatId: "chat-123",
+      machineId: "devbox",
+    });
+
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qfailed", notify: true }),
+    }));
+
+    const body = JSON.stringify({
+      session_id: "sess-qfailed",
+      request_id: "question_failed",
+      questions: [{ question: "Failed?", header: "H", options: [] }],
+    });
+
+    // First call to populate outbox
+    const first = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+    expect(first.status).toBe(202);
+
+    // Mark outbox row as failed
+    const notificationId = "q:sess-qfailed:question_failed";
+    storage.outbox.markFailed(notificationId, 51_000, "Delivery failed permanently");
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Second call with same request_id
+    const second = await app(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }));
+
+    expect(second.status).toBe(200);
+    const secondJson = await second.json() as Record<string, unknown>;
+    expect(secondJson).toEqual({
+      ok: false,
+      deliveryState: "failed",
+      notificationId,
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      `[question] outbox row failed sessionId=sess-qfailed notificationId=${notificationId} failedReason=Delivery failed permanently`,
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("POST /question-asked returns notified=false when notify=false", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });
