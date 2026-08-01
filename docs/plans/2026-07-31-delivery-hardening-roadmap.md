@@ -51,11 +51,11 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **986** passed, 1 skipped |
+| `@pigeon/daemon` | **989** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
 | `@pigeon/worker` | **298** passed |
 
-Total **1590**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1593**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
 
 > **Attribution for the +96, because it is NOT this cycle's work.** Cycle 6 added **2** worker tests.
 > The daemon's +94 came from a **parallel swarm track that landed on `main` while this roadmap was
@@ -1199,6 +1199,57 @@ blast radius but **do not cure the outage**.
   hard failure into an invisible one. Whatever is done here, the fix is to make the outcome
   observable, not merely to add a retry.
 
+### Cycle 6.5 — `pigeon-81p` (P1): the outbox delivered a question BEFORE the message explaining it
+
+**Reported by the user mid-session on 2026-08-01, not found by this roadmap.** Worth recording in full,
+because the roadmap has spent six cycles on notifications that never arrive and this was a notification
+that *did* arrive — in the wrong order, which was just as damaging and completely invisible to every
+metric here.
+
+**Symptom as experienced:** the user saw the top of an assistant message, then a pause, then a question
+prompt, and only *after answering* did the rest of the explanation appear. They answered a question
+without the reasoning that was written to precede it.
+
+**Confirmed in production logs** for `ses_066acf5a6ffeVwRh8Qd0XqWNZn`:
+
+```
+15:45:54  [stop]   queued  s:ses_066acf...:1785613554042   (the explanation)
+15:45:59  [outbox] sent    q:ses_066acf...:que_fbedc917... (the question, FIRST)
+15:46:00  [outbox] sent    s:ses_066acf...:1785613554042   (the explanation, 1s LATER)
+```
+
+**Root cause — deliberate, not accidental.** `getReady` (`outbox-repo.ts:112`) sorted by message-class
+priority *before* `created_at`, **globally**, so a queued question jumped every queued stop no matter
+how much earlier the stop was written. `outbox-sender.ts:225` takes `getReady(now, 5)` and sends the
+batch in that order, so this was **deterministic, not a race**: every assistant turn that writes text
+and then asks a question delivered the two backwards. It had been happening on every question ever
+asked over Telegram.
+
+**Fixed** (`816f0d7`) by ranking each session by the best priority among *its own* queued rows and
+ordering strictly by `created_at` within the session. Cross-session preemption — the legitimate
+original intent — is preserved; intra-session inversion is now impossible.
+
+**The instructive part is the diagnosis, twice over.**
+
+1. **The obvious hypothesis was wrong.** Questions have their own in-memory retry queue that bypasses
+   the circuit breaker, so "two competing paths interleaved" is the natural story. Both messages went
+   through the **outbox** and both logged `outbox entry sent`. Fixing the plausible path would have
+   changed nothing.
+2. **A false attribution nearly rode along with the fix.** The full suite came back with
+   `lease-cas-concurrency` failing — the test `pigeon-qpm` labels a known flake. Rather than wave it
+   through, I re-ran it: **3 of 3 failures in isolation**, which looks deterministic, and a baseline
+   run passed. That comparison was **confounded** — baseline ran in a `/tmp` worktree, the fix in
+   `/home`. Running the *same commit* in both locations collapsed the difference, and the real variable
+   was **load average 82 versus 40**. The test is load-sensitive, the assertion is correct, and my
+   change never touched anything it exercises. Recorded on `pigeon-qpm`: **record the load average
+   before calling a failure of that test a real race**, or it will keep getting blamed on whatever
+   landed most recently.
+
+> **The standing lesson for this roadmap: ordering is part of delivery.** Every cycle so far has
+> measured whether a notification arrives. None measured whether it arrives *in the right order*, and a
+> priority queue was silently reordering a causal conversation the whole time. If a future cycle adds
+> delivery metrics (Cycle 5), count inversions, not just losses.
+
 ### Cycle 7 — close out the migration
 
 - [ ] **7a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
@@ -1243,6 +1294,45 @@ as §2 (compact → optional `oracle-fable` → SDD → `adversarial-reviewer-fa
 Note the one genuine feature that is NOT here: `pigeon-cn8` (lgtm noise) sits at **4c** on the spine
 instead, because it is an amplifier. It halves forum-topic creation and spends the §3 budget, which
 makes it delivery work that happens to also be a quality-of-life win.
+
+> **CORRECTION #7 (2026-08-01, start of F1). F1's stated justification is half wrong: the clamp
+> problem is NOT occurring.** Re-measured the live D1 `topics` table before designing, per the standing
+> rule — and the population moved again, as it has every single time. **113 rows now, not the 82 this
+> file claims.**
+>
+> The roadmap says *"the clamp eats the wrong end"* and calls that half *"not cosmetic"*. **Zero of 113
+> topics are clamped.** Longest name is **118 chars** against a 128 limit; on real work the longest is
+> **103**, leaving 25 chars of headroom. The truncation this file treats as an active defect has never
+> once happened. It is latent, not real.
+>
+> **The old measurement was also contaminated.** The quoted "77–115 chars" was taken across *all*
+> topics, and **60 of 113 are lgtm-gather noise** — the exact rows 4c now suppresses, and the entire
+> top-12 by length. Excluding them, the population F1 actually targets is **53 rows, avg 65.9, max
+> 103**. As a side effect this independently confirms 4c's headline claim from a different direction:
+> 60/113 really is "roughly half".
+>
+> **What IS real is a different problem than the one described.** On real rows the directory is **~41
+> of ~66 chars (62%)** and the title only **~25 (38%)** — and the title is **last**. The Telegram topic
+> *list* truncates visually far below 128 chars, so every entry opens with the same 19-char
+> `/home/dev/projects/` and the informative half sits past position 41, off-screen on **every row**.
+> The defect is UI-list truncation, not the 128-char storage clamp; this file conflated the two.
+>
+> **A second constant the file misses:** `/.worktrees/` costs another 11 chars on **20 of 53** real
+> rows (38% — I guessed "most" and was wrong, hence measuring).
+>
+> **Consequence for scope:** F1 is a genuine readability win and correctly ranked **P3**, but it is not
+> the latent-correctness fix the old text implies. Do not let the "not cosmetic" phrasing justify
+> scope it does not deserve.
+>
+> **Third measurement of this system, third time it moved.** Treat any count here as stale by default.
+
+> **Write-once names — established while designing F1, and it changes the migration question.**
+> `topicName` is called at **creation only** (`topic-manager.ts:112`), and `topics.rename`
+> (`topics.ts:186`) has **zero callers in `src/`** — it is dead code waiting for F2. So a topic's name
+> is set once and never updated, even when the TUI title changes. Two consequences: (1) a formatter
+> change reaches **new topics only** unless migration is built deliberately, and (2) "rename on next
+> touch" is **not** existing machinery, it is new work with a real §3 budget cost, because TUI titles
+> drift (every compaction) and each drift would spend an `editForumTopic` call.
 
 - [ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at
   Telegram's 128-char limit. Measured 2026-07-31 at **77–115 chars**, roughly 19 of them spent on the
