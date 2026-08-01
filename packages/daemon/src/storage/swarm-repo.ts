@@ -261,14 +261,15 @@ export class SwarmRepository {
   }
 
   /** Watchdog-initiated redelivery of a message whose handoff was never verified. */
-  requeueForRecovery(msgId: string, now: number, delayMs: number): void {
-    this.db
+  requeueForRecovery(msgId: string, now: number, delayMs: number): boolean {
+    const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET state = 'queued', next_retry_at = ?, updated_at = ?, requeue_count = requeue_count + 1
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND state = 'handed_off'`,
       )
       .run(now + delayMs, now, msgId);
+    return result.changes > 0;
   }
 
   /**

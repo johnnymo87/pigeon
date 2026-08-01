@@ -17,6 +17,11 @@ import { notifySenderOfFailure } from "./notify-sender";
 // Injected client contract
 // ---------------------------------------------------------------------------
 
+/** True when `kind === "wake"` or `kind.startsWith("wake.")`. */
+export function isWakeKind(kind: string): boolean {
+  return kind === "wake" || kind.startsWith("wake.");
+}
+
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
   getSessionMessages(sessionId: string): Promise<unknown[]>;
@@ -625,6 +630,29 @@ export class DeliveryWatchdog {
     if (anchor === null) {
       // The 2xx lied (or the write was lost) — our prompt never made it
       // into the transcript at all.
+      if (isWakeKind(row.kind)) {
+        const blockedAge = now - (row.handedOffAt ?? now);
+        if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
+          this.stuckAlerted.add(row.msgId);
+          counts.alerted++;
+          await this.alert(
+            "warning",
+            `delivery watchdog: wake msg ${row.msgId} to ${sessionId} handed off ${blockedAge}ms (${humanDuration(blockedAge)}) ago and remains unverified (expected for idle target)`,
+          );
+          this.log("alerted", {
+            msgId: row.msgId,
+            sessionId,
+            reason: "idle-wake-unverified",
+          });
+        }
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "wake-suppress-requeue",
+        });
+        return false;
+      }
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
@@ -649,6 +677,29 @@ export class DeliveryWatchdog {
     if (!blocking) {
       // Session is idle — our prompt is sitting there but nothing ever ran
       // it. Nothing to abort.
+      if (isWakeKind(row.kind)) {
+        const blockedAge = now - (row.handedOffAt ?? now);
+        if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
+          this.stuckAlerted.add(row.msgId);
+          counts.alerted++;
+          await this.alert(
+            "warning",
+            `delivery watchdog: wake msg ${row.msgId} to ${sessionId} handed off ${blockedAge}ms (${humanDuration(blockedAge)}) ago and remains unverified (expected for idle target)`,
+          );
+          this.log("alerted", {
+            msgId: row.msgId,
+            sessionId,
+            reason: "idle-wake-unverified",
+          });
+        }
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "wake-suppress-requeue",
+        });
+        return false;
+      }
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
@@ -662,6 +713,15 @@ export class DeliveryWatchdog {
     }
 
     if (row.abortedAt !== null) {
+      if (isWakeKind(row.kind)) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "wake-suppress-stuck-after-recovery",
+        });
+        return false;
+      }
       // We already used our one recovery attempt (abort+redeliver) for this
       // message, and after redelivery it's stuck again. Give up.
       if (interventionAlreadyUsed) {
@@ -711,6 +771,16 @@ export class DeliveryWatchdog {
     if (silence <= this.stuckAbortSilenceMs) {
       counts.skipped++;
       this.log("skipped", { msgId: row.msgId, sessionId, reason: "waiting" });
+      return false;
+    }
+
+    if (isWakeKind(row.kind)) {
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "wake-suppress-abort",
+      });
       return false;
     }
 
