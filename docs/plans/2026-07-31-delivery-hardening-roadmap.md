@@ -570,7 +570,22 @@ garbage but clears none of the 153 rows already there, and the backstop makes it
 > collapse of its own justification, in a re-scoped form aimed at the hazard the measurement actually
 > exposed. Discovering that a deadline is fake is a reason to re-aim the work, not to drop it.
 
-### Cycle 3 — the age and attempt budget
+### Cycle 3 — the age and attempt budget — DONE (PR #18, merged `eafba12`)
+
+**Deployed to cloudbox 2026-07-31 and verified by effect, not by absence of errors** (§1.-1): the
+additive migration applied to the LIVE DB — `retry_count`, `failed_reason` and `last_error` are all
+present on the production `outbox` table and existing rows backfilled to `retry_count = 0` — daemon
+healthy, no migration errors in the journal. The migration having run is itself the proof the new code
+is live, since nothing else creates those columns. A pre-deploy DB backup was taken via the
+`better-sqlite3` backup API (`/tmp/opencode/pigeon-daemon-pre-cycle3.db`) rather than a file copy, so
+it is consistent against a running writer.
+
+**Still undeployed on devbox and macbook** — both were unreachable from cloudbox again at deploy time
+(`devbox` does not resolve, the `mac` reverse tunnel refuses on 127.0.0.1:2222). Their `git pull &&
+npm install` plus restart must be run on those hosts. Beads `pigeon-bqo` and `pigeon-8e9` are closed
+on the strength of the cloudbox deploy.
+
+
 
 Both beads are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
