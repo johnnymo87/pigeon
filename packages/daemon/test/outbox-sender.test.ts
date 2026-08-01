@@ -2069,6 +2069,10 @@ describe("outbox terminal drop uniform logging", () => {
       attempts: 10,
       ageMs: 4000,
     });
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record?.state).toBe("failed");
+    expect(record?.failedReason).toBe("attempts_exhausted");
   });
 
   it("emits outbox terminal drop for expired", async () => {
@@ -2096,6 +2100,10 @@ describe("outbox terminal drop uniform logging", () => {
       ageMs: 14400001,
       expiryMs: 14400000,
     });
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record?.state).toBe("failed");
+    expect(record?.failedReason).toBe("expired");
   });
 
   it("emits outbox terminal drop for payload_parse_failed", async () => {
@@ -2155,6 +2163,10 @@ describe("outbox terminal drop uniform logging", () => {
       attempts: 0,
       ageMs: 4000,
     });
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record?.state).toBe("failed");
+    expect(record?.failedReason).toBe("payload_empty");
   });
 
   it("emits outbox terminal drop for delivery policy terminal action", async () => {

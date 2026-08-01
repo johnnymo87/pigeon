@@ -88,7 +88,7 @@ function maybeNumber(value: unknown): number | undefined {
  */
 const MAX_TITLE_LENGTH = 200;
 
-const DEFAULT_QUIET_TITLE_PATTERN = "lgtm";
+const DEFAULT_QUIET_TITLE_PATTERN = "\\.lgtm-";
 
 export function isQuietTitle(
   title: string | null | undefined,
@@ -104,7 +104,7 @@ export function isQuietTitle(
       regex = new RegExp(rawPattern, "i");
     } catch (err) {
       console.error(
-        `[stop] invalid PIGEON_QUIET_TITLE_PATTERN regex "${rawPattern}", falling back to default /lgtm/i:`,
+        `[stop] invalid PIGEON_QUIET_TITLE_PATTERN regex "${rawPattern}", falling back to default /\\.lgtm-/i:`,
         err,
       );
       regex = new RegExp(DEFAULT_QUIET_TITLE_PATTERN, "i");
@@ -409,8 +409,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         const effectiveTitle = requestTitle ?? session.title;
 
-        if (isQuietTitle(effectiveTitle)) {
-          console.log(`[stop] quieted sessionId=${sessionId} title="${effectiveTitle}"`);
+        if (event === "Stop" && isQuietTitle(effectiveTitle)) {
+          console.log(`[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}"`);
           return Response.json({ ok: true, notified: false, reason: "quiet_title" });
         }
 

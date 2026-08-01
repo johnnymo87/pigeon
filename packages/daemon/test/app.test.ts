@@ -1259,10 +1259,11 @@ describe("createApp", () => {
       expect(isQuietTitle("")).toBe(false);
     });
 
-    it("defaults to case-insensitive lgtm match", () => {
-      expect(isQuietTitle("lgtm", {})).toBe(true);
-      expect(isQuietTitle("LGTM", {})).toBe(true);
-      expect(isQuietTitle("Review PR using LGTM prompt", {})).toBe(true);
+    it("defaults to case-insensitive \\.lgtm- match", () => {
+      expect(isQuietTitle("Task .lgtm-prompt.md", {})).toBe(true);
+      expect(isQuietTitle("Task .LGTM-prompt.md", {})).toBe(true);
+      expect(isQuietTitle("Review PR using LGTM prompt", {})).toBe(false);
+      expect(isQuietTitle("Fix lgtm dispatcher timeout", {})).toBe(false);
       expect(isQuietTitle("Feature work", {})).toBe(false);
     });
 
@@ -1273,11 +1274,11 @@ describe("createApp", () => {
       expect(isQuietTitle("LGTM runner", env)).toBe(false);
     });
 
-    it("falls back to default /lgtm/i pattern when PIGEON_QUIET_TITLE_PATTERN is invalid regex", () => {
+    it("falls back to default /\\.lgtm-/i pattern when PIGEON_QUIET_TITLE_PATTERN is invalid regex", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const env = { PIGEON_QUIET_TITLE_PATTERN: "(unclosed" };
 
-      expect(isQuietTitle("LGTM runner", env)).toBe(true);
+      expect(isQuietTitle("Task .lgtm-runner.md", env)).toBe(true);
       expect(isQuietTitle("Normal runner", env)).toBe(false);
       expect(errorSpy).toHaveBeenCalled();
 
@@ -1312,7 +1313,7 @@ describe("createApp", () => {
         body: JSON.stringify({
           session_id: "sess-lgtm-1",
           notify: true,
-          title: "Review PR using LGTM prompt",
+          title: "Run .lgtm-review-prompt.md task",
         }),
       }));
 
@@ -1336,9 +1337,9 @@ describe("createApp", () => {
       const outboxEntries = storage.outbox.getReady(200_000, 10);
       expect(outboxEntries).toHaveLength(0);
 
-      // Verify log line was emitted
+      // Verify log line was emitted with event=
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/\[stop\] quieted sessionId=sess-lgtm-1 title="Review PR using LGTM prompt"/),
+        expect.stringMatching(/\[stop\] quieted sessionId=sess-lgtm-1 event=Stop title="Run \.lgtm-review-prompt\.md task"/),
       );
 
       logSpy.mockRestore();
@@ -1383,7 +1384,7 @@ describe("createApp", () => {
       expect(outboxEntries[0]?.sessionId).toBe("sess-normal-1");
     });
 
-    it("matches case-insensitively (e.g. LGTM in uppercase prose)", async () => {
+    it("matches case-insensitively (e.g. .LGTM- in uppercase prose)", async () => {
       delete process.env.PIGEON_QUIET_TITLE_PATTERN;
       storage = openStorageDb(":memory:");
 
@@ -1398,7 +1399,7 @@ describe("createApp", () => {
         body: JSON.stringify({
           session_id: "sess-lgtm-upper",
           notify: true,
-          title: "PR review from LGTM prompt",
+          title: "PR review from .LGTM-prompt.md",
         }),
       }));
 
@@ -1417,6 +1418,142 @@ describe("createApp", () => {
       expect(json.ok).toBe(true);
       expect(json.notified).toBe(false);
       expect(json.reason).toBe("quiet_title");
+    });
+
+    it("IS enqueued when event is Error, even on lgtm-titled session", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-err",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-err",
+          event: "Error",
+          message: "Unhandled exception in worker",
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(1);
+      expect(outboxEntries[0]?.sessionId).toBe("sess-lgtm-err");
+    });
+
+    it("IS enqueued when event is Retry, even on lgtm-titled session", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-retry",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md task",
+        }),
+      }));
+
+      const res = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-lgtm-retry",
+          event: "Retry",
+          message: "Rate limit hit, retrying in 30s",
+        }),
+      }));
+
+      expect(res.status).toBe(202);
+      const json = await res.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      const outboxEntries = storage.outbox.getReady(200_000, 10);
+      expect(outboxEntries).toHaveLength(1);
+      expect(outboxEntries[0]?.sessionId).toBe("sess-lgtm-retry");
+    });
+
+    it("does NOT suppress prose title 'Review PR using LGTM prompt' under default pattern, but DOES suppress '.lgtm-review-prompt.md'", async () => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      storage = openStorageDb(":memory:");
+
+      const app = createApp(storage, {
+        nowFn: () => 100_000,
+        chatId: "chat-123",
+      });
+
+      // Loose prose title -> NOT suppressed under default \.lgtm- pattern
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-prose",
+          notify: true,
+          title: "Review PR using LGTM prompt",
+        }),
+      }));
+
+      const resProse = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-prose",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(resProse.status).toBe(202);
+      expect((await resProse.json() as Record<string, unknown>).deliveryState).toBe("queued");
+
+      // Title with .lgtm- -> IS suppressed
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-dot-lgtm",
+          notify: true,
+          title: "Run .lgtm-review-prompt.md",
+        }),
+      }));
+
+      const resDot = await app(new Request("http://localhost/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "sess-dot-lgtm",
+          event: "Stop",
+          message: "Done",
+        }),
+      }));
+
+      expect(resDot.status).toBe(200);
+      expect((await resDot.json() as Record<string, unknown>).reason).toBe("quiet_title");
     });
 
     it("IS still enqueued and delivered for a question notification even on lgtm-titled session", async () => {
@@ -1533,7 +1670,7 @@ describe("createApp", () => {
         body: JSON.stringify({
           session_id: "sess-invalid-regex-lgtm",
           notify: true,
-          title: "Review PR using LGTM prompt",
+          title: "Run .lgtm-review-prompt.md task",
         }),
       }));
 
