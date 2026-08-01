@@ -11,7 +11,10 @@ export interface OutboxRecord {
   payload: string;
   token: string;
   attempts: number;
+  retryCount: number;
   nextRetryAt: number | null;
+  failedReason: string | null;
+  lastError: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -35,7 +38,10 @@ function asOutbox(row: SqlRow): OutboxRecord {
     payload: String(row.payload),
     token: String(row.token),
     attempts: Number(row.attempts),
+    retryCount: Number(row.retry_count ?? 0),
     nextRetryAt: (row.next_retry_at as number | null) ?? null,
+    failedReason: (row.failed_reason as string | null) ?? null,
+    lastError: (row.last_error as string | null) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
@@ -55,12 +61,16 @@ export class OutboxRepository {
       .prepare(
         `INSERT INTO outbox
            (notification_id, session_id, request_id, kind, state, payload, token,
-            attempts, next_retry_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, NULL, ?, ?)
+            attempts, retry_count, next_retry_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?)
          ON CONFLICT(notification_id) DO UPDATE SET
            state = 'queued',
            attempts = 0,
+           retry_count = 0,
            next_retry_at = NULL,
+           failed_reason = NULL,
+           last_error = NULL,
+           created_at = excluded.created_at,
            updated_at = excluded.updated_at
          WHERE outbox.state = 'failed'`,
       )
@@ -110,25 +120,39 @@ export class OutboxRepository {
       .run(now, id);
   }
 
-  markRetry(id: string, now = Date.now(), backoffMs: number): void {
+  markRetry(
+    id: string,
+    now = Date.now(),
+    backoffMs: number,
+    lastError?: string,
+    countAttempt: boolean = true,
+  ): void {
     this.db
       .prepare(
         `UPDATE outbox
          SET state = 'queued',
-             attempts = attempts + 1,
+             attempts = attempts + ?,
+             retry_count = retry_count + 1,
              next_retry_at = ?,
+             last_error = COALESCE(?, last_error),
              updated_at = ?
          WHERE notification_id = ?`,
       )
-      .run(now + backoffMs, now, id);
+      .run(countAttempt ? 1 : 0, now + backoffMs, lastError ?? null, now, id);
   }
 
-  markFailed(id: string, now = Date.now()): void {
+  markFailed(id: string, now = Date.now(), reason?: string, lastError?: string): void {
     this.db
       .prepare(
-        "UPDATE outbox SET state = 'failed', next_retry_at = NULL, updated_at = ? WHERE notification_id = ?",
+        `UPDATE outbox
+         SET state = 'failed',
+             failed_reason = COALESCE(?, failed_reason),
+             last_error = COALESCE(?, last_error),
+             next_retry_at = NULL,
+             updated_at = ?
+         WHERE notification_id = ?`,
       )
-      .run(now, id);
+      .run(reason ?? null, lastError ?? null, now, id);
   }
 
   updatePayload(notificationId: string, payload: string, now = Date.now()): void {
@@ -140,15 +164,19 @@ export class OutboxRepository {
   }
 
   /**
-   * Delete terminal entries (state 'sent' or 'failed') older than the given cutoff timestamp.
+   * Delete terminal entries older than cutoffs:
+   * - state 'sent' older than sentCutoff
+   * - state 'failed' older than failedCutoff (defaults to sentCutoff if omitted)
    * Returns the number of deleted rows.
    */
-  cleanupOlderThan(cutoff: number): number {
+  cleanupOlderThan(sentCutoff: number, failedCutoff: number = sentCutoff): number {
     const result = this.db
       .prepare(
-        "DELETE FROM outbox WHERE state IN ('sent', 'failed') AND updated_at < ?",
+        `DELETE FROM outbox
+         WHERE (state = 'sent' AND updated_at < ?)
+            OR (state = 'failed' AND updated_at < ?)`,
       )
-      .run(cutoff);
+      .run(sentCutoff, failedCutoff);
     return result.changes;
   }
 }

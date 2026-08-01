@@ -51,11 +51,17 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **790** passed, 1 skipped |
+| `@pigeon/daemon` | **832** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **305** passed |
-| `@pigeon/worker` | **279** passed |
+| `@pigeon/worker` | **292** passed |
 
-Total **1374**. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1429**. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **CORRECTION #3 (2026-07-31, start of Cycle 3).** This table said **790 / 305 / 279 = 1374** until
+> re-measured at the top of Cycle 3. Cycles 1 and 2 added tests and the table was never updated —
+> **the third time in three cycles that a carried-forward count was wrong.** Re-measuring took 90
+> seconds and is now the first action of every cycle. Treat any number in this file that you did not
+> personally measure this session as unverified.
 
 > **CORRECTION #2 (2026-07-31, start of Cycle 1).** This table said **792 / 1376** until re-measured at
 > the top of Cycle 1. It was stale: Cycle 0's `9a792c9` deleted the dead `buildCardNotification` tests,
@@ -81,6 +87,23 @@ regression.**
 ---
 
 ## §1 — OPERATING HAZARDS
+
+> **§1.-1 — Platform limits do not exist in the test environment, and D1 caps bound parameters at
+> 100.** The cap applies to **each statement inside a `db.batch`**, not to the batch
+> (https://developers.cloudflare.com/d1/platform/limits/). The session sweep binds one parameter per
+> victim; production had 126 victims, so its **first run threw, was swallowed by its own try/catch,
+> and deleted nothing for two hourly ticks** while health, analytics and error counts all looked
+> perfect. No test could have caught it: worker tests run on miniflare, which is plain SQLite with a
+> 999-parameter ceiling, so **the limit that broke production does not exist where the tests run.**
+> When code depends on a platform limit, pin it with a guard test on the constant and assert the
+> *call shape* (parameter counts per statement), because the behaviour itself is unobservable
+> locally. Generalise beyond D1: query duration, subrequest counts and payload sizes are all
+> enforced in production and absent in miniflare.
+>
+> Corollary, learned the hard way: **a `try/catch` around a janitorial step converts a hard failure
+> into an invisible one.** The catch was right, but it must log loudly enough to be found, and the
+> step needs an outcome you can measure from outside (here, a stale-row count that should go to
+> zero). Prefer verifying the *effect* over trusting the absence of errors.
 
 > **§1.0 — Merging is not deploying, and the daemon proves it.** Discovered 2026-07-31 while
 > deploying Cycle 2c: the production daemon checkout (`/home/dev/projects/pigeon`) was **44 commits
@@ -483,9 +506,14 @@ those cards are never enqueued at all.
   immediately rather than an hour later. Note *start*: the reaper closes at most
   `DEFAULT_ORPHAN_CAP` (5) orphans per tick, so a bulk sweep drains over hours, not in one tick. Current
   backlog at 14d: **126 sessions and 701 messages**; orphaned messages today: **0**.
+  **Verified in production 2026-07-31 14:00** after the `51257ad` chunking hotfix (PR #17): sessions
+  566 → **444**, stale-over-14d 126 → **0**, messages 11124 → **10447**, orphans **0**. The first two
+  attempts (12:00, 13:00) silently deleted nothing — see §1.-1, and note it was caught by checking
+  the effect rather than by any alarm.
 - [x] **2c. `pigeon-a1a` — stop producing the garbage.** Done in `95ab2df` and `01abd0b` (PR #16),
-  but landed as **two** sites rather than four — see the finding below. NOT yet deployed (daemon
-  change; needs a per-machine pull and restart). The bead claimed three daemon paths remove a local
+  but landed as **two** sites rather than four — see the finding below. **Deployed to cloudbox only**
+  (2026-07-31); devbox and macbook are alive and polling but not reachable from cloudbox, so their
+  pull+restart must be run on those hosts. chromebook has not polled in ~4 months. The bead claimed three daemon paths remove a local
   session row without unregistering, or register worker-side with no local row at all:
   - `repos.ts:226` — `cleanupExpired` does `DELETE FROM sessions WHERE expires_at < ?` with no
     unregister, and is called from **inside the reaper itself** (`session-reaper.ts:43`).
@@ -508,7 +536,9 @@ those cards are never enqueued at all.
 > - **`app.ts:595`** already unregisters via its `onSessionDelete` hook.
 > - **`current-state-ingest.ts:103` is real** and is probably the dominant source, but fixing it
 >   means synthesizing local session rows. It is now covered by `2b`'s sweep, so it was left for a
->   later cycle rather than bolted on here. **Still open** — carry it forward.
+>   later cycle rather than bolted on here. **Still open as `pigeon-2c6` (P2)** — measure how many
+>   such registrations lack a local row before choosing a design; the sweep makes it safe to take
+>   time over it.
 >
 > A correction on that first point, because I got the credit wrong before checking: the log line
 > that settled it **predates Cycle 0**. It is present in the commit the daemon was actually running
@@ -542,14 +572,114 @@ garbage but clears none of the 153 rows already there, and the backstop makes it
 
 ### Cycle 3 — the age and attempt budget
 
-Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
+Both beads are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
-- [ ] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
+- [x] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
   than `MAX_AGE_MS` (15 min) or 10 attempts. Same budget that makes the migration rollback dangerous
   (runbook F1).
-- [ ] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
+- [x] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
   anything older than 15 min returns to `queued`, is instantly judged too old, and re-fails having
   sent nothing — with `attempts` still 0, so the journal line reads like it never tried.
+
+**Verified at the top of the cycle (all four claims confirmed against source, plus two additions):**
+the terminal check at `outbox-sender.ts:159` runs **before** the payload parse and before any send, so
+Cycle 1's classifier — which already returns `retry` for `transport_error` and 5xx — **can never veto
+it**. That is precisely why Cycle 1 did not fix `bqo`. Backoff sums to **13.75 min** over 10 attempts,
+so both caps bite together and the attempts cap binds first by a hair.
+
+Two things the roadmap did not know:
+
+- **The `pause` arm charges an attempt.** `outbox-sender.ts:248` calls `markRetry` *before* setting
+  `pausedUntil`, so every 429 burns one message's attempt budget even though a 429 says nothing about
+  that message. This is latent today and becomes severe the moment a backlog exists — which is
+  exactly what fixing `bqo` creates. **It must be fixed before, or with, the age cap.**
+- **`OUTBOX_RETENTION_MS` is 1 hour**, and `cleanupOlderThan` deletes `failed` as well as `sent`. In
+  the 2-hour incident the record of what was lost was **deleted before the outage ended**. Measured
+  the production outbox during planning: 5 rows, all `sent`. There is no dead-letter anywhere, so
+  today a dropped notification is both unrecoverable *and* unauditable.
+
+**Design (oracle-fable consulted; it argued me out of my opening position).** I intended to delete the
+age cap outright on the Cycle 1 principle that *terminal status must be justified by determinism, not
+by budget*. That principle is right but the conclusion was wrong: **staleness is real, not a budget
+excuse.** A 4-hour-old question is not merely old, it is *unanswerable* — `PENDING_QUESTION_TTL_MS`
+has already expired it. So the cap stays and is instead **grounded in affordance TTLs**, which makes
+expiry deterministic rather than budgetary: a message dies when delivery can no longer function.
+
+- **Per-kind expiry** replaces the flat 15 min: `question` **4h** (`PENDING_QUESTION_TTL_MS`),
+  `stop`/`card` **24h** (`REPLY_TOKEN_TTL_MS` — after which reply routing is dead anyway). The
+  2-hour incident survives comfortably.
+- **Attempts becomes cause-aware.** `transport_error`, 5xx and 429 stop incrementing it, so
+  `attempts` finally means "the path was up and this message failed anyway" — a genuine per-message
+  signal, which is what makes `attempts >= MAX_ATTEMPTS` a *deterministic* terminal rather than a
+  budget one.
+- **The 24h cap is itself the growth bound** (a never-heals scenario holds ≤24h of notifications).
+  No depth cap and no dead-letter table: **`failed` rows with 7-day retention are the dead letter**,
+  which also satisfies §1.-1's "measurable from outside the process" requirement — a `sqlite3` query
+  on `failed_reason` is observable without trusting a log line.
+- **A drain governor** is required, not optional. Post-outage the loop would otherwise push 60/min
+  (5 entries per 5s tick) into a **20/min** group ceiling (§3), producing sustained 429s. Counts
+  **chunks**, not entries, since `sendNotification` is per-chunk.
+
+**Dedup blocker checked before committing to the 24h horizon:** worker dedup is a `messages` lookup
+by `notification_id` (`notifications.ts:209`) and those rows are deleted only on session unregister
+or the 14-day sweep. Retention therefore outlives a 24h retry horizon, so the longer window cannot
+resurface as duplicate delivery.
+
+**Order matters and is not arbitrary — 3e last.** It is the change that creates large backlogs, so
+3c and 3d must already be in place or the first drain both floods the group and burns messages
+through the 429-charges-an-attempt bug.
+
+- [x] **3a. Observability first** (`3d93258`) — add `failed_reason` / `last_error`, populate at every `markFailed`
+  site (including line 159 and the parse-failure path, which today record *no reason at all*), and
+  split retention: `sent` 1h, `failed` 7d. Zero behaviour change; it is the safety net for 3b–3e.
+- [x] **3b. `pigeon-8e9`** (`17c57c1`) — reset `created_at` in the `ON CONFLICT` clause. Tiny and independent.
+- [x] **3c. Cause-aware attempts** (`f2fd28e`) — `countAttempt` on `markRetry`; transport/5xx/429 do not charge.
+  **This alone extends outage survival from ~14 min to the age cap** and fixes the pause-arm bug.
+- [x] **3d. Drain governor** (`5966ef7`) — chunk-counting sliding window, ~12/min, leaving headroom for wizard
+  edits, media and topic management. Inert until a backlog exists, so safe to land before 3e.
+- [x] **3e. Per-kind expiry replaces `MAX_AGE_MS`** (`47eacd7`) — reason `expired`. Also rewrite the `MAX_PAUSE_MS`
+  comment at line 47, whose stated rationale ("could exceed MAX_AGE_MS 15m") dies with the flat cap;
+  keep the 5-minute probe ceiling, which is still correct for a different reason.
+
+Deferred rather than dropped: stop-kind newest-first ordering during drain, coalescing stale
+per-session notifications, and an "N dropped during the outage" summary. File as beads, do not
+inline.
+
+**Review outcome — the fix step earned its keep for the third cycle running.** `adversarial-reviewer-fable`
+found a real defect that **3c introduced and 3e made expensive**, and that all five commits' tests
+missed: `getBackoff` was driven by `attempts`, so making `attempts` cause-aware silently **pinned
+retry spacing at 5 seconds** — for precisely the failure class whose horizon 3e had just extended from
+15 minutes to 24 hours. A doomed entry would have retried **17,280 times a day**, each one a real
+Telegram-reaching call spending the §3 budget this whole cycle exists to protect. The two counters
+were the same counter; the fix (`9292b58`) splits them — `attempts` stays the *budget* signal,
+a new always-incrementing `retry_count` becomes the *spacing* signal — and adds the escalation-ladder
+test whose absence hid it. A second, latent incoherence was fixed in `bda0e9c`: `isTransportFailure`
+counted `app_rejection` while the re-registration arm's own comment argued at length that "2xx but not
+ok" must be treated as retryable. Unreachable today, but had it become reachable it would have
+reproduced the original incident timeline through a different door.
+
+**The re-review of the fix came back clean** — the first time in three cycles that it has. It verified
+the migration empirically against `better-sqlite3` rather than by inspection, confirming SQLite accepts
+`NOT NULL` *with* a default in `ALTER TABLE ADD COLUMN` and that a genuine failure would not be
+swallowed by the duplicate-column guard.
+
+Follow-ups filed rather than inlined:
+
+- **`pigeon-93v`** (P2) — `/question-asked` early-returns `deliveryState: "queued"` for a row that is
+  actually `failed`, and never calls `upsert`. 3a's 7-day retention widens that lying window from 1h
+  to **7 days**. It also means **3b is card-only in practice**: questions never reach the resurrection
+  arm, and stop ids are timestamp-unique so they never collide. Note the trap recorded on the bead —
+  resurrecting a question must also reset the `pending_questions` clock, or 3e's own 4h grounding
+  delivers something unanswerable.
+- **`pigeon-m74`** (P3) — the governor's "12 leaves 8 headroom" is asserted, not measured, and counts
+  the wrong unit: one chunk call can cost more than one Telegram message (lazy `createForumTopic`, and
+  the General-fallback path sends twice), while acks, wizard edits and media are invisible to it.
+  Bounded by the reactive 429 pause, so the worst case is oscillatory drain rather than loss.
+  **Measure a real post-outage drain before changing the constant** — do not guess a smaller number.
+
+Accepted deliberately, not filed: the governor window and `pausedUntil` are in-memory and reset on
+daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
+such as a successful re-registration inherit an escalated backoff (≤2 min extra latency, no loss).
 
 ### Cycle 4 — remove the amplifier, then alert on what remains
 
@@ -559,8 +689,36 @@ Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sid
   is why the incident was ~150 lost messages instead of ~1 — roughly 150× amplification.** Removing
   the amplifier beats alerting on its output; done in the other order, the first thing the new
   alerting does is page about 150 notifications that should never have existed.
-- [ ] **4b. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
-  Telegram**, since Telegram being broken is the common cause.
+- [ ] **4b. `pigeon-2c6` — answer it with the SAME investigation as `4a`.** `/current-state`
+  registers every tmux-surveyed session worker-side (`current-state-ingest.ts:103`), but discovery is
+  tmux-based rather than registry-based, so nothing guarantees a local row exists — and the reaper
+  only unregisters sessions it still holds **locally**. Those rows can therefore never be
+  unregistered by any daemon. This is a different failure mode from `4a` (that one is a
+  notification storm, this one is a registry leak) but it is **the same code and almost certainly the
+  same root**, so investigating it separately would mean reading `current-state-ingest` twice. Now
+  bounded rather than unbounded by Cycle 2's 14-day sweep, which is what makes it safe to take time
+  over. **Measure first** — instrument how many such registrations have no local row — before
+  choosing between synthesizing a local row and not registering untracked sessions.
+- [ ] **4c. `pigeon-cn8` — the other amplifier, and the one the user actually feels.** **Measured
+  2026-07-31: 40 of 82 forum topics created in 7 days are lgtm review sessions — 49% of the entire
+  forum.** Every PR spawns at least two (a gather pass and a review pass, visible in the topic
+  names), and the review pass can be re-summoned repeatedly. With topics enabled each one gets its
+  **own topic**, so this is topic-list noise as well as notification noise, and it spends the §3
+  budget on messages the user reports never once having read.
+  **The obvious approach does not work.** lgtm sessions do **not** live in `~/projects/lgtm` — only
+  the dispatcher does. The review sessions run inside the *target* repo's worktree
+  (`/home/dev/projects/mono/.worktrees/pr-4005`), so a directory denylist cannot catch them without
+  hiding real work in those same repos. (`docs/plans/2026-06-06-current-state-command-design.md`
+  assumes the `~/projects/lgtm` location; that holds for the dispatcher only.) The clean signal is
+  the **title**, which always names the prompt file — `.lgtm-review-prompt.md`,
+  `.lgtm-gather-prompt.md`. Make the match **configurable** rather than hardcoding `.lgtm-`, because
+  `morning-agent` has the same problem and cannot be filtered by directory either (it runs in
+  `~/projects/workstation`, a real work dir). Corral to one shared topic or suppress outright; the
+  user leans suppress and would accept corralling.
+- [ ] **4d. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+  Telegram**, since Telegram being broken is the common cause. **Do this last in the cycle**: it is
+  the same argument as `4a` versus `8l7`, applied to `4c` — alerting before the amplifiers are gone
+  means the first thing the new alerting does is page about noise that should not exist.
 
 ### Cycle 5 — the server side (the track this roadmap was missing)
 
@@ -618,6 +776,20 @@ blast radius but **do not cure the outage**.
 - [ ] **6h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
+- [ ] **6i. `pigeon-cal`** (P2) — webhook acks are fire-and-forget, so an ack Telegram rejects
+  vanishes with no exception, no log and no fallback (`webhook.ts` `sendTelegramMessage` discards the
+  `TgResult` deliberately; `telegram.ts` `sendMessage` returns it and never throws). The messages
+  that vanish are exactly the **error** messages — "Could not find a session for that message" — so
+  the failure class is errors being invisible at the point of failure, reintroduced by a different
+  mechanism in the very work meant to fix it. The notification path is fully defended here (reopen,
+  `thread_not_found` recovery, non-429 fallback); the webhook confirmation path has none of it.
+  **Gated on `pigeon-cev` item 3** — whether a bot admin can post into a *closed* forum topic. If it
+  can, there is no bug at all. **Verify that before building a fallback**, since building one now
+  means guessing a Telegram behaviour, which this plan has twice refused to do.
+  Note this is the same shape as the Cycle 2 sweep bug in §1.-1: a deliberate swallow that converts a
+  hard failure into an invisible one. Whatever is done here, the fix is to make the outcome
+  observable, not merely to add a retry.
+
 ### Cycle 7 — close out the migration
 
 - [ ] **7a.** Record the observed 429 rate during burn-in. The deferred chat-level `next_send_at` gate
@@ -651,6 +823,37 @@ whole backlog:
 
 > **Both were found only by re-measuring instead of trusting the inherited list — the same discipline
 > that caught the false test baseline in §0.** Do this at the start of every restructuring.
+
+## §4.2 — Feature track (parallel; no dependency on the hardening spine)
+
+These are **not** delivery-hardening and are deliberately kept off the numbered spine, because the
+Cycle ordering above encodes a risk argument and these carry none of it. They can be picked up in any
+gap, in any order, without disturbing the sequence — with one exception noted below. Same protocol
+as §2 (compact → optional `oracle-fable` → SDD → `adversarial-reviewer-fable` → PR).
+
+Note the one genuine feature that is NOT here: `pigeon-cn8` (lgtm noise) sits at **4c** on the spine
+instead, because it is an amplifier. It halves forum-topic creation and spends the §3 budget, which
+makes it delivery work that happens to also be a quality-of-life win.
+
+- [ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at
+  Telegram's 128-char limit. Measured 2026-07-31 at **77–115 chars**, roughly 19 of them spent on the
+  constant `/home/dev/projects/` prefix before any information appears. Two problems, and the second
+  is not cosmetic: the list reads as a column of identical prefixes, **and the clamp eats the wrong
+  end** — because dir comes first, a long path truncates the *title*, which is the informative half.
+  Put the **title first**, abbreviate `$HOME` to `~` (derive it from the session's own home; macbook
+  is not `/home/dev`), keep the path as the suffix. Decide explicitly what happens to the 82 existing
+  topics — leave, rename-on-next-touch, or backfill via `editForumTopic` — rather than discovering
+  the inconsistency later.
+- [ ] **F2. `pigeon-pnf`** (P3) — add `/rename <new title>`, the manual complement to F1, for when
+  the auto-derived title has gone stale. Follow the existing reply-resolved command pattern
+  (`webhook.ts:712`, `:734`, helper at `:538`); `editForumTopic` already exists in the Telegram
+  client. Rename the **title only** and let `topicName` re-derive the suffix, so the two naming paths
+  cannot drift. Must degrade gracefully with topics disabled. **Sequence after F1** — the only
+  ordering constraint in this track — or the naming logic gets written twice.
+
+**Do `pigeon-cn8` (4c) before F1 if you want the easy win first:** it removes roughly half of all
+topics, which makes the naming change much easier to evaluate against a list that is mostly real
+work.
 
 ## §5 — Reference
 

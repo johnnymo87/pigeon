@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
-import { chunkNotificationId, OutboxSender } from "../src/worker/outbox-sender";
+import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -159,6 +159,149 @@ describe("OutboxSender.processOnce()", () => {
     expect(record!.nextRetryAt).toBe(10_000);
   });
 
+  it("headline incident test: sustained transport outage across 30 ticks does NOT increment attempts or mark entry failed", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "Worker unreachable",
+    }) as unknown as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Run 30 ticks (well past MAX_ATTEMPTS = 10)
+    for (let tick = 0; tick < 30; tick++) {
+      await sender.processOnce();
+      const rec = storage.outbox.getByNotificationId("notif-1");
+      now = (rec?.nextRetryAt ?? now) + 1;
+    }
+
+    expect(sendNotification).toHaveBeenCalledTimes(30);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record).not.toBeNull();
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("complementary test: genuine per-message failure (403) still reaches terminal after MAX_ATTEMPTS", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 403,
+      body: { error: "Forbidden" },
+    }) as unknown as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Run 10 ticks advancing time according to backoff
+    for (let tick = 0; tick < 10; tick++) {
+      await sender.processOnce();
+      const rec = storage.outbox.getByNotificationId("notif-1");
+      now = (rec?.nextRetryAt ?? now) + 1;
+    }
+
+    const recordAfter10 = storage.outbox.getByNotificationId("notif-1");
+    expect(recordAfter10!.attempts).toBe(10);
+
+    // 11th tick: MAX_ATTEMPTS reached, entry marked failed
+    await sender.processOnce();
+    const recordAfter11 = storage.outbox.getByNotificationId("notif-1");
+    expect(recordAfter11!.state).toBe("failed");
+    expect(recordAfter11!.failedReason).toBe("attempts_exhausted");
+  });
+
+  it("429 reschedules and pauses but does NOT increment attempts", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "rate_limited", retryAfter: 10 },
+      retryAfter: 10,
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("transient re-registration failure (transport_error on registerSession) reschedules without incrementing attempts", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "DNS lookup failed",
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("catch-all delivery threw handler increments attempts conservatively", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockRejectedValue(new Error("Code bug")) as unknown as SendNotificationFn;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(1);
+  });
+
   it("logs structured classification and status on delivery failure", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
@@ -238,13 +381,219 @@ describe("OutboxSender.processOnce()", () => {
 
     const afterRecord = storage.outbox.getByNotificationId("notif-1");
     expect(afterRecord!.state).toBe("failed");
+    expect(afterRecord!.failedReason).toBe("attempts_exhausted");
   });
 
-  it("marks terminal failure after max age (15+ minutes)", async () => {
+  it("incident test: stop entry survives a 2-hour transport outage and remains queued", async () => {
     const createdAt = 1_000;
-    const now = createdAt + 15 * 60 * 1000 + 1; // just past 15 minutes
+    // 2 hours later (well past old 15m cap)
+    const now = createdAt + 2 * 60 * 60 * 1000;
 
-    storage.outbox.upsert(BASE_OUTBOX_INPUT, createdAt);
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "stop",
+      notificationId: "notif-stop-outage",
+    }, createdAt);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "Worker unreachable",
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-stop-outage");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("question entry expires at 4 hours with failed_reason = 'expired'", async () => {
+    const createdAt = 1_000;
+    const fourHoursMs = 4 * 60 * 60 * 1000;
+    const now = createdAt + fourHoursMs + 1; // 4 hours + 1ms
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "question",
+      notificationId: "notif-q-expire",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-q-expire");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("stop entry expires at 24 hours with failed_reason = 'expired'", async () => {
+    const createdAt = 1_000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    const now = createdAt + twentyFourHoursMs + 1; // 24 hours + 1ms
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "stop",
+      notificationId: "notif-stop-expire",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-stop-expire");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("question entry at 5 hours old is NOT delivered (expiry evaluated before send attempt)", async () => {
+    const createdAt = 1_000;
+    const fiveHoursMs = 5 * 60 * 60 * 1000;
+    const now = createdAt + fiveHoursMs;
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "question",
+      notificationId: "notif-q-5h",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-q-5h");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("unknown kind falls back to 24h expiry", async () => {
+    const createdAt = 1_000;
+    const twentyThreeHoursMs = 23 * 60 * 60 * 1000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+
+    // At 23h: still queued
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "weird_kind",
+      notificationId: "notif-unknown-kind",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = createdAt + twentyThreeHoursMs;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-unknown-kind")!.state).toBe("sent");
+
+    // Re-upsert for expiry test at 24h + 1ms
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "weird_kind",
+      notificationId: "notif-unknown-kind-2",
+    }, createdAt);
+
+    sendNotification.mockClear();
+    now = createdAt + twentyFourHoursMs + 1;
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-unknown-kind-2");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("attempts_exhausted terminates independently of age and records attempts_exhausted reason", async () => {
+    const now = 5_000;
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000); // 4s old, well within 4h
+
+    // 10 attempts
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.markRetry("notif-1", now, 0);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("attempts_exhausted");
+  });
+
+  it("resurrected failed entry older than 15m gets fresh created_at and is actually sent instead of dropped", async () => {
+    const initialCreatedAt = 1_000;
+    // Entry originally created at t=1,000 and fails at t=2,000
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, initialCreatedAt);
+    storage.outbox.markFailed("notif-1", 2_000, "budget_exhausted", "Max attempts reached");
+
+    // 20 minutes later (past 15 min max age), entry is resurrected via upsert
+    const resurrectTime = initialCreatedAt + 20 * 60 * 1000;
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, resurrectTime);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => resurrectTime,
+    });
+
+    await sender.processOnce();
+
+    // After resurrection, processOnce SHOULD attempt send rather than dropping it as expired
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("sent");
+    expect(record!.createdAt).toBe(resurrectTime);
+  });
+
+  it("marks terminal failure on payload JSON parse error and records reason and error", async () => {
+    const now = 5_000;
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: "invalid-json{" }, 1_000);
 
     const sendNotification = makeSendNotification({ ok: true });
     const sender = new OutboxSender({
@@ -260,6 +609,29 @@ describe("OutboxSender.processOnce()", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("payload_parse_failed");
+    expect(record!.lastError).toBeTruthy();
+  });
+
+  it("marks terminal failure on empty payload messages array", async () => {
+    const now = 5_000;
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: JSON.stringify({ messages: [] }) }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("payload_empty");
   });
 
   it("skips entries not yet ready for retry (next_retry_at in future)", async () => {
@@ -554,6 +926,25 @@ describe("chunkNotificationId unit tests", () => {
   });
 });
 
+describe("expiryForKind unit tests", () => {
+  it("returns PENDING_QUESTION_TTL_MS (4h) for question", () => {
+    expect(expiryForKind("question")).toBe(4 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) for stop", () => {
+    expect(expiryForKind("stop")).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) for card", () => {
+    expect(expiryForKind("card")).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) default for unknown kind", () => {
+    expect(expiryForKind("unknown_kind")).toBe(24 * 60 * 60 * 1000);
+    expect(expiryForKind("")).toBe(24 * 60 * 60 * 1000);
+  });
+});
+
 describe("OutboxSender start/stop", () => {
   let storage: StorageDb;
 
@@ -801,11 +1192,11 @@ describe("OutboxSender start/stop", () => {
     await sender.processOnce();
     expect(sendNotification).toHaveBeenCalledTimes(1);
 
-    // Verify entry is NOT lost/failed, but remains retryable
+    // Verify entry is NOT lost/failed, but remains retryable (attempts = 0 on 429 rate limit)
     const recordAfter429 = storage.outbox.getByNotificationId(cardId);
     expect(recordAfter429).not.toBeNull();
     expect(recordAfter429!.state).toBe("queued");
-    expect(recordAfter429!.attempts).toBe(1);
+    expect(recordAfter429!.attempts).toBe(0);
     expect(recordAfter429!.nextRetryAt).toBeGreaterThan(now);
 
     // Fast-forward past pause + retry backoff (10s pause = 10,000ms)
@@ -893,6 +1284,8 @@ describe("classified delivery failure actions", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("Session not locally known (reaped or never existed)");
+    expect(record!.lastError).toBe('HTTP 404 - {"error":"Session not found"}');
   });
 
   it("404 + register succeeds but local row vanished in between -> unregisterSession called and entry goes terminal", async () => {
@@ -930,6 +1323,7 @@ describe("classified delivery failure actions", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("reregister_compensated");
   });
 
   it("404 twice on the same entry -> second time is terminal (flag consumed)", async () => {
@@ -1038,7 +1432,10 @@ describe("classified delivery failure actions", () => {
     await sender.processOnce();
 
     expect(registerSession).toHaveBeenCalledTimes(1);
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("reregister_failed");
+    expect(record!.lastError).toBe('HTTP 400 - {"error":"sessionId and machineId required"}');
   });
 
   // A register 429 is "Session limit reached" (packages/worker/src/sessions.ts:69) — a CAPACITY
@@ -1074,8 +1471,8 @@ describe("classified delivery failure actions", () => {
 
     expect(registerSession).toHaveBeenCalledTimes(1);
     expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
-    // The re-register flag must NOT be consumed, so a later attempt can try again.
-    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(1);
+    // The re-register flag must NOT be consumed, and 429 transient register failure must NOT count an attempt.
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(0);
   });
 
   // app_rejection is HTTP 2xx carrying ok:false — inherently ambiguous, so it must retry.
@@ -1170,7 +1567,10 @@ describe("classified delivery failure actions", () => {
 
     await sender.processOnce();
 
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("Worker field validation failed (HTTP 400)");
+    expect(record!.lastError).toBe('HTTP 400 - {"error":"sessionId, chatId, and text required"}');
   });
 
   it("502 with details.error_code 400 and entities -> payload rewritten WITHOUT entities and markRetry", async () => {
@@ -1391,5 +1791,244 @@ describe("classified delivery failure actions", () => {
     expect(record3.state).toBe("sent");
     expect(sendNotification).toHaveBeenCalledTimes(3);
     expect(record3.attempts).toBe(2); // 2 retries on 2 failed attempts
+  });
+});
+
+describe("OutboxSender rate governor", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("stops sending after reaching OUTBOX_RATE_LIMIT within sliding window (a)", async () => {
+    for (let i = 0; i < 15; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-gov-${i}`,
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(OUTBOX_RATE_LIMIT);
+    const remainingCount = storage.outbox.getReady(now, 100).length;
+    expect(remainingCount).toBe(3);
+  });
+
+  it("advances window and resumes delivery when nowFn moves past 60s (b)", async () => {
+    for (let i = 0; i < 15; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-gov-${i}`,
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(12);
+
+    now += OUTBOX_RATE_WINDOW_MS + 1_000;
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    expect(storage.outbox.getReady(now, 100).length).toBe(0);
+  });
+
+  it("counts chunks rather than outbox entries (c)", async () => {
+    for (let i = 0; i < 5; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-chunk3-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-chunk3-${i}`,
+        }),
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(12);
+    expect(storage.outbox.getReady(5_000, 100).length).toBe(1);
+  });
+
+  it("never tears an entry: per-entry governor check sends all chunks of a started entry (d)", async () => {
+    for (let i = 0; i < 3; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-multichunk-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-multichunk-${i}`,
+        }),
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    for (let i = 0; i < 3; i++) {
+      const rec = storage.outbox.getByNotificationId(`notif-multichunk-${i}`);
+      expect(rec!.state).toBe("sent");
+    }
+  });
+
+  it("starvation guard: entry with more chunks than limit sends against empty window (e)", async () => {
+    const messages = Array.from({ length: 15 }, (_, i) => ({ text: `msg-${i}` }));
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-large-1",
+      payload: JSON.stringify({
+        messages,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-large-1",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    const rec = storage.outbox.getByNotificationId("notif-large-1");
+    expect(rec!.state).toBe("sent");
+  });
+
+  it("normal low-volume operation is completely unaffected (f)", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-low-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-low-2" }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(storage.outbox.getByNotificationId("notif-low-1")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("notif-low-2")!.state).toBe("sent");
+  });
+
+  it("escalates backoff under sustained transport failure while attempts stays 0", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "connect ECONNREFUSED",
+    }) as unknown as SendNotificationFn;
+
+    let now = 10_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    const expectedBackoffs = [5_000, 10_000, 30_000, 60_000, 120_000, 120_000];
+
+    for (const expectedBackoff of expectedBackoffs) {
+      await sender.processOnce();
+      const record = storage.outbox.getByNotificationId("notif-1")!;
+      expect(record.state).toBe("queued");
+      expect(record.attempts).toBe(0);
+      expect(record.nextRetryAt! - now).toBe(expectedBackoff);
+
+      now = record.nextRetryAt!;
+    }
+  });
+
+  it("counting failure escalates backoff and terminates at attempts_exhausted after 10 attempts", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 403,
+      body: { error: "Forbidden" },
+    }) as unknown as SendNotificationFn;
+
+    let now = 10_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // 403 is a counting failure (not transport failure)
+    // 10 attempts expected before terminal attempts_exhausted
+    const expectedBackoffs = [5_000, 10_000, 30_000, 60_000, 120_000, 120_000, 120_000, 120_000, 120_000, 120_000];
+
+    for (let i = 0; i <= 10; i++) {
+      await sender.processOnce();
+      const record = storage.outbox.getByNotificationId("notif-1")!;
+      if (i < 10) {
+        expect(record.state).toBe("queued");
+        expect(record.attempts).toBe(i + 1);
+        expect(record.nextRetryAt! - now).toBe(expectedBackoffs[i]);
+        now = record.nextRetryAt!;
+      } else {
+        // Attempt 11 check: MAX_ATTEMPTS (10) reached, processOnce marks terminal before delivery
+        expect(record.state).toBe("failed");
+        expect(record.failedReason).toBe("attempts_exhausted");
+        expect(record.attempts).toBe(10);
+      }
+    }
   });
 });

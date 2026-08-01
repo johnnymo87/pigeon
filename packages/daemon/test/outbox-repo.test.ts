@@ -35,6 +35,7 @@ describe("OutboxRepository", () => {
     expect(record!.payload).toBe('{"text":"Which option?"}');
     expect(record!.token).toBe("tok-abc");
     expect(record!.attempts).toBe(0);
+    expect(record!.retryCount).toBe(0);
     expect(record!.nextRetryAt).toBeNull();
     expect(record!.createdAt).toBe(1_000);
     expect(record!.updatedAt).toBe(1_000);
@@ -65,11 +66,12 @@ describe("OutboxRepository", () => {
     // Simulate sending state
     storage.db.prepare("UPDATE outbox SET state = 'sending' WHERE notification_id = ?").run("notif-1");
 
-    // Second upsert should not reset sending state
+    // Second upsert should not reset sending state or update created_at
     storage.outbox.upsert(BASE_INPUT, 2_000);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("sending");
+    expect(record!.createdAt).toBe(1_000);
 
     storage.db.close();
   });
@@ -80,11 +82,12 @@ describe("OutboxRepository", () => {
     storage.outbox.upsert(BASE_INPUT, 1_000);
     storage.outbox.markSent("notif-1", 2_000);
 
-    // Second upsert should not reset sent state
+    // Second upsert should not reset sent state or update created_at
     storage.outbox.upsert(BASE_INPUT, 3_000);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("sent");
+    expect(record!.createdAt).toBe(1_000);
 
     storage.db.close();
   });
@@ -140,16 +143,18 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("marks terminal failure", () => {
+  it("marks terminal failure with reason and last_error", () => {
     const storage = createStorage();
 
     storage.outbox.upsert(BASE_INPUT, 1_000);
-    storage.outbox.markFailed("notif-1", 2_000);
+    storage.outbox.markFailed("notif-1", 2_000, "budget_exhausted", "Max attempts reached");
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
     expect(record!.nextRetryAt).toBeNull();
     expect(record!.updatedAt).toBe(2_000);
+    expect(record!.failedReason).toBe("budget_exhausted");
+    expect(record!.lastError).toBe("Max attempts reached");
 
     // Failed entries are not returned by getReady
     const ready = storage.outbox.getReady(2_000, 10);
@@ -158,24 +163,128 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("resets failed entries to queued on re-upsert", () => {
+  it("markRetry records last_error and preserves it on subsequent markRetry if omitted", () => {
     const storage = createStorage();
+    const now = 10_000;
 
-    storage.outbox.upsert(BASE_INPUT, 1_000);
-    storage.outbox.markFailed("notif-1", 2_000);
+    storage.outbox.upsert(BASE_INPUT, now);
+    storage.outbox.markRetry("notif-1", now, 5_000, "HTTP 500 Server Error");
 
-    // Re-upsert of a failed notification should reset to queued
-    storage.outbox.upsert(BASE_INPUT, 3_000);
+    let record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.attempts).toBe(1);
+    expect(record!.lastError).toBe("HTTP 500 Server Error");
+
+    // Second retry without passing lastError preserves previous lastError
+    storage.outbox.markRetry("notif-1", now + 5_000, 10_000);
+    record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.attempts).toBe(2);
+    expect(record!.lastError).toBe("HTTP 500 Server Error");
+
+    storage.db.close();
+  });
+
+  it("markRetry with countAttempt = false updates retry time without incrementing attempts", () => {
+    const storage = createStorage();
+    const now = 10_000;
+    const backoffMs = 5_000;
+
+    storage.outbox.upsert(BASE_INPUT, now);
+    storage.outbox.markRetry("notif-1", now, backoffMs, "transport_error", false);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("queued");
     expect(record!.attempts).toBe(0);
-    expect(record!.nextRetryAt).toBeNull();
-    expect(record!.updatedAt).toBe(3_000);
+    expect(record!.nextRetryAt).toBe(now + backoffMs);
+    expect(record!.lastError).toBe("transport_error");
 
-    // Should now be ready
-    const ready = storage.outbox.getReady(3_000, 10);
+    storage.db.close();
+  });
+
+  it("resets failed entries (including failedReason and lastError) to queued on re-upsert and updates created_at", () => {
+    const storage = createStorage();
+
+    const initialTime = 1_000;
+    const failTime = 2_000;
+    const resurrectTime = 1_000 + 20 * 60 * 1000; // 20 minutes later (past 15m expiration)
+
+    storage.outbox.upsert(BASE_INPUT, initialTime);
+    storage.outbox.markRetry("notif-1", initialTime, 5_000, "HTTP 500", false);
+    storage.outbox.markFailed("notif-1", failTime, "budget_exhausted", "HTTP 500");
+
+    // Re-upsert of a failed notification should reset to queued, retry_count=0, and update created_at
+    storage.outbox.upsert(BASE_INPUT, resurrectTime);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+    expect(record!.retryCount).toBe(0);
+    expect(record!.nextRetryAt).toBeNull();
+    expect(record!.failedReason).toBeNull();
+    expect(record!.lastError).toBeNull();
+    expect(record!.createdAt).toBe(resurrectTime);
+    expect(record!.updatedAt).toBe(resurrectTime);
+
+    // Should now be ready at resurrectTime
+    const ready = storage.outbox.getReady(resurrectTime, 10);
     expect(ready).toHaveLength(1);
+
+    storage.db.close();
+  });
+
+  it("resurrected entry sorts to back of ready list based on refreshed created_at", () => {
+    const storage = createStorage();
+
+    // Entry 1 created at t=1000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-1" }, 1_000);
+    // Entry 2 created at t=2000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-2" }, 2_000);
+
+    // Entry 1 fails at t=3000
+    storage.outbox.markFailed("notif-1", 3_000, "budget_exhausted");
+
+    // Entry 1 is resurrected at t=4000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-1" }, 4_000);
+
+    // ready order should now be notif-2 (created at 2000), then notif-1 (created at 4000)
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["notif-2", "notif-1"]);
+
+    storage.db.close();
+  });
+
+  it("cleans up old terminal entries with split retention (sent=1h, failed=7d)", () => {
+    const storage = createStorage();
+    const now = 10_000_000;
+    const ONE_HOUR = 60 * 60 * 1000;
+    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+
+    // sent 2 hours ago (> 1 hour)
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "sent-old" }, now - 2 * ONE_HOUR);
+    storage.outbox.markSent("sent-old", now - 2 * ONE_HOUR);
+
+    // sent 30 mins ago (< 1 hour)
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "sent-fresh" }, now - 30 * 60 * 1000);
+    storage.outbox.markSent("sent-fresh", now - 30 * 60 * 1000);
+
+    // failed 2 hours ago (> 1 hour, < 7 days) -> SHOULD SURVIVE
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "failed-2h" }, now - 2 * ONE_HOUR);
+    storage.outbox.markFailed("failed-2h", now - 2 * ONE_HOUR, "budget_exhausted");
+
+    // failed 8 days ago (> 7 days) -> SHOULD BE DELETED
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "failed-8d" }, now - 8 * 24 * ONE_HOUR);
+    storage.outbox.markFailed("failed-8d", now - 8 * 24 * ONE_HOUR, "budget_exhausted");
+
+    const sentCutoff = now - ONE_HOUR;
+    const failedCutoff = now - SEVEN_DAYS;
+
+    const deleted = storage.outbox.cleanupOlderThan(sentCutoff, failedCutoff);
+    expect(deleted).toBe(2); // sent-old and failed-8d
+
+    expect(storage.outbox.getByNotificationId("sent-old")).toBeNull();
+    expect(storage.outbox.getByNotificationId("failed-8d")).toBeNull();
+
+    expect(storage.outbox.getByNotificationId("sent-fresh")).not.toBeNull();
+    expect(storage.outbox.getByNotificationId("failed-2h")).not.toBeNull();
 
     storage.db.close();
   });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyDeliveryFailure,
+  isTransportFailure,
   type DeliveryAction,
   type DeliveryPolicyContext,
 } from "../src/worker/delivery-policy";
@@ -248,5 +249,36 @@ describe("classifyDeliveryFailure", () => {
     const fullCtx: DeliveryPolicyContext = { ...defaultCtx, ...ctx };
     const action = classifyDeliveryFailure(result, fullCtx);
     expect(action).toEqual(expected);
+  });
+});
+
+describe("isTransportFailure", () => {
+  it("returns true for transport_error", () => {
+    expect(isTransportFailure({ ok: false, kind: "transport_error", error: "fetch failed" })).toBe(true);
+  });
+
+  it("returns true for 5xx http_error statuses", () => {
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 500 })).toBe(true);
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 502 })).toBe(true);
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 503 })).toBe(true);
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 504 })).toBe(true);
+  });
+
+  it("returns true for 429 http_error status (rate limit)", () => {
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 429 })).toBe(true);
+  });
+
+  it("returns false for non-5xx, non-429 4xx http_error statuses", () => {
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 400 })).toBe(false);
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 403 })).toBe(false);
+    expect(isTransportFailure({ ok: false, kind: "http_error", status: 404 })).toBe(false);
+  });
+
+  it("returns true for app_rejection", () => {
+    expect(isTransportFailure({ ok: false, kind: "app_rejection", status: 200, body: { ok: false } })).toBe(true);
+  });
+
+  it("returns false for success result", () => {
+    expect(isTransportFailure({ ok: true, kind: "success", status: 200, body: { ok: true } })).toBe(false);
   });
 });
