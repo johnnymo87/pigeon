@@ -6,6 +6,8 @@ import type { QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
+import { parseScheduleTime } from "./swarm/schedule-time";
+import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
 
@@ -112,6 +114,75 @@ const MAX_TITLE_LENGTH = 200;
  */
 const DEFAULT_QUIET_TITLE_PATTERN = "lgtm-(review|gather)-prompt|lgtm[ -]prompt";
 
+export interface SwarmSendFields {
+  from: string;
+  to: string | null;
+  channel: string | null;
+  kind: string;
+  priority: Priority;
+  replyTo: string | null;
+  payload: string;
+  callerMsgId: string | null;
+}
+
+export type ParseSwarmSendBodyResult =
+  | { ok: true; fields: SwarmSendFields }
+  | { ok: false; response: Response };
+
+export function parseSwarmSendBody(
+  body: Record<string, unknown>,
+  defaultKind = "chat",
+): ParseSwarmSendBodyResult {
+  const from = typeof body.from === "string" ? body.from : "";
+  const to = typeof body.to === "string" ? body.to : null;
+  const channel = typeof body.channel === "string" ? body.channel : null;
+  const kind = typeof body.kind === "string" ? body.kind : defaultKind;
+  const priority = (typeof body.priority === "string" ? body.priority : "normal") as Priority;
+  const replyTo = typeof body.reply_to === "string" ? body.reply_to : null;
+  const payload = typeof body.payload === "string" ? body.payload : "";
+  const callerMsgId = typeof body.msg_id === "string" ? body.msg_id : null;
+
+  if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
+  if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
+  if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };
+  if (to && !/^ses_[A-Za-z0-9_-]+$/.test(to)) {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: "to must be a session id starting with 'ses_'" },
+        { status: 400 },
+      ),
+    };
+  }
+  if (!payload) return { ok: false, response: Response.json({ error: "payload is required" }, { status: 400 }) };
+  if (payloadHasCloseTag(payload)) {
+    return {
+      ok: false,
+      response: Response.json(
+        {
+          error:
+            "payload must not contain the literal </swarm_message> close tag",
+        },
+        { status: 400 },
+      ),
+    };
+  }
+
+  return {
+    ok: true,
+    fields: {
+      from,
+      to,
+      channel,
+      kind,
+      priority,
+      replyTo,
+      payload,
+      callerMsgId,
+    },
+  };
+}
+
 export function isQuietTitle(
   title: string | null | undefined,
   env: Record<string, string | undefined> = process.env,
@@ -205,56 +276,156 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
       if (request.method === "POST" && url.pathname === "/swarm/send") {
         const body = await readJsonBody(request);
-        const from = typeof body.from === "string" ? body.from : "";
-        const to = typeof body.to === "string" ? body.to : null;
-        const channel = typeof body.channel === "string" ? body.channel : null;
-        const kind = typeof body.kind === "string" ? body.kind : "chat";
-        const priority = (typeof body.priority === "string" ? body.priority : "normal") as "urgent" | "normal" | "low";
-        const replyTo = typeof body.reply_to === "string" ? body.reply_to : null;
-        const payload = typeof body.payload === "string" ? body.payload : "";
-        const callerMsgId = typeof body.msg_id === "string" ? body.msg_id : null;
+        const parsed = parseSwarmSendBody(body, "chat");
+        if (!parsed.ok) return parsed.response;
 
-        if (!from) return Response.json({ error: "from is required" }, { status: 400 });
-        if (!to && !channel) return Response.json({ error: "to or channel is required" }, { status: 400 });
-        if (to && channel) return Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 });
-        // Cheap shape check: a `to` target must be an opencode session id
-        // (matches opencode-serve's own zod prefix check). This catches typos
-        // and category errors (e.g. passing a coordinator name like "lgtm")
-        // before we burn ~7 minutes of arbiter retries against a 400 from
-        // opencode-serve. We do NOT validate that the session exists — that
-        // is a different problem (real sessions become unreachable when
-        // opencode-serve restarts).
-        if (to && !/^ses_[A-Za-z0-9_-]+$/.test(to)) {
-          return Response.json(
-            { error: "to must be a session id starting with 'ses_'" },
-            { status: 400 },
-          );
-        }
-        if (!payload) return Response.json({ error: "payload is required" }, { status: 400 });
-        // Reject a payload that contains the literal </swarm_message> close
-        // tag at enqueue time. renderEnvelope() guards this too, but that runs
-        // later in the arbiter at delivery time — accepting it here (202) makes
-        // the sender think it succeeded while the arbiter silently burns
-        // retries and drops it. Fail fast so the caller finds out immediately.
-        // (Same "fail fast, don't burn arbiter retries" rationale as the
-        // ses_ shape check above.)
-        if (payloadHasCloseTag(payload)) {
-          return Response.json(
-            {
-              error:
-                "payload must not contain the literal </swarm_message> close tag",
-            },
-            { status: 400 },
-          );
-        }
-
-        const msgId = callerMsgId ?? makeMsgId();
+        const f = parsed.fields;
+        const msgId = f.callerMsgId ?? makeMsgId();
         storage.swarm.insert(
-          { msgId, fromSession: from, toSession: to, channel, kind, priority, replyTo, payload },
+          {
+            msgId,
+            fromSession: f.from,
+            toSession: f.to,
+            channel: f.channel,
+            kind: f.kind,
+            priority: f.priority,
+            replyTo: f.replyTo,
+            payload: f.payload,
+          },
           nowFn(),
         );
 
         return Response.json({ accepted: true, msg_id: msgId }, { status: 202 });
+      }
+
+      if (request.method === "POST" && url.pathname === "/swarm/schedule") {
+        const body = await readJsonBody(request);
+        const parsed = parseSwarmSendBody(body, "wake");
+        if (!parsed.ok) return parsed.response;
+
+        const sched = parseScheduleTime({
+          at: body.at,
+          after: body.after,
+          expiresIn: body.expires_in,
+          now: nowFn(),
+        });
+        if (!sched.ok) {
+          return Response.json({ error: sched.error }, { status: 400 });
+        }
+
+        const f = parsed.fields;
+        if (f.channel) {
+          return Response.json(
+            { error: "scheduled delivery requires a session target (to), not a channel" },
+            { status: 400 },
+          );
+        }
+        const msgId = f.callerMsgId ?? makeMsgId();
+        const inserted = storage.swarm.insert(
+          {
+            msgId,
+            fromSession: f.from,
+            toSession: f.to,
+            channel: f.channel,
+            kind: f.kind,
+            priority: f.priority,
+            replyTo: f.replyTo,
+            payload: f.payload,
+            deliverAt: sched.deliverAt,
+            expiresAt: sched.expiresAt,
+          },
+          nowFn(),
+        );
+
+        if (!inserted) {
+          const stored = storage.swarm.getByMsgId(msgId);
+          return Response.json(
+            {
+              error: `message with msg_id '${msgId}' already exists`,
+              msg_id: msgId,
+              deliver_at: stored?.deliverAt ?? null,
+            },
+            { status: 409 },
+          );
+        }
+
+        return Response.json(
+          {
+            accepted: true,
+            msg_id: msgId,
+            deliver_at: sched.deliverAt,
+            expires_at: sched.expiresAt,
+          },
+          { status: 202 },
+        );
+      }
+
+      if (request.method === "GET" && url.pathname === "/swarm/scheduled") {
+        const sessionId = url.searchParams.get("session");
+        if (!sessionId) {
+          return Response.json({ error: "session is required" }, { status: 400 });
+        }
+
+        const windowMs = 24 * 60 * 60 * 1000;
+        const includeTerminalSince = nowFn() - windowMs;
+        const rows = storage.swarm.listScheduled(sessionId, { includeTerminalSince });
+
+        return Response.json({
+          scheduled: rows.map((m) => ({
+            msg_id: m.msgId,
+            from: m.fromSession,
+            to: m.toSession,
+            kind: m.kind,
+            priority: m.priority,
+            payload: m.payload,
+            state: m.state,
+            deliver_at: m.deliverAt,
+            expires_at: m.expiresAt,
+            created_at: m.createdAt,
+          })),
+        });
+      }
+
+      if (
+        request.method === "POST" &&
+        url.pathname.startsWith("/swarm/scheduled/") &&
+        url.pathname.endsWith("/cancel")
+      ) {
+        const sub = url.pathname.slice("/swarm/scheduled/".length, -"/cancel".length);
+        const msgId = decodeURIComponent(sub);
+
+        const body = await readJsonBody(request);
+        const from = typeof body.from === "string" ? body.from : "";
+        if (!from) {
+          return Response.json({ error: "from is required" }, { status: 400 });
+        }
+
+        const record = storage.swarm.getByMsgId(msgId);
+        if (!record || record.deliverAt === null) {
+          return Response.json({ error: "scheduled message not found" }, { status: 404 });
+        }
+
+        if (record.fromSession !== from) {
+          return Response.json(
+            { error: "only the original sender may cancel a scheduled message" },
+            { status: 403 },
+          );
+        }
+
+        const cancelled = storage.swarm.markCancelled(msgId, nowFn());
+        if (cancelled) {
+          return Response.json({ cancelled: true, msg_id: msgId }, { status: 200 });
+        }
+
+        const currentRecord = storage.swarm.getByMsgId(msgId);
+        const currentState = currentRecord?.state ?? record.state;
+        return Response.json(
+          {
+            error: `cannot cancel message in state '${currentState}'`,
+            state: currentState,
+          },
+          { status: 409 },
+        );
       }
 
       if (request.method === "GET" && url.pathname === "/swarm/inbox") {

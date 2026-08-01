@@ -284,4 +284,37 @@ describe("SwarmArbiter", () => {
     expect(after.attempts).toBe(1);
     expect(after.nextRetryAt).not.toBeNull();
   });
+
+  it("M1: promotes mid-flight cancelled row to handed_off while preserving cancelled_at so getInbox sees delivered message", async () => {
+    fixture = makeFixture();
+    const { storage, arbiter, opencodeClient } = fixture;
+
+    storage.swarm.insert(
+      {
+        msgId: "m_midflight",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "wake up",
+      },
+      1_000,
+    );
+
+    // Cancel lands mid-flight while sendPrompt is executing
+    opencodeClient.sendPrompt.mockImplementationOnce(async () => {
+      storage.swarm.markCancelled("m_midflight", 1_500);
+    });
+
+    await arbiter.processOnce();
+
+    const record = storage.swarm.getByMsgId("m_midflight")!;
+    expect(record.state).toBe("handed_off");
+    expect(record.cancelledAt).toBe(1_500);
+
+    const inbox = storage.swarm.getInbox("ses_b");
+    expect(inbox.messages.map((m) => m.msgId)).toContain("m_midflight");
+  });
 });
