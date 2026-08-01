@@ -51,11 +51,23 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **892** passed, 1 skipped |
+| `@pigeon/daemon` | **986** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
-| `@pigeon/worker` | **296** passed |
+| `@pigeon/worker` | **298** passed |
 
-Total **1494**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1590**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **Attribution for the +96, because it is NOT this cycle's work.** Cycle 6 added **2** worker tests.
+> The daemon's +94 came from a **parallel swarm track that landed on `main` while this roadmap was
+> compacted** — PR #21 (`8171c5e`, swarm scheduling engine W1) and PR #24 (`3b6f627`, watchdog fix W3),
+> both outside this roadmap's scope (§4.1 lists swarm as out of scope). Recorded explicitly so a future
+> reader does not attribute 94 daemon tests to a worker-only cycle.
+>
+> **This is the first cycle where the baseline moved without this roadmap touching it**, which is a new
+> failure mode for the §0 table: the rule "the cycle that adds tests updates the table" does not cover
+> tests *someone else* adds. **Re-measure at the start of every cycle even if this roadmap did nothing
+> in between** — and check `git log HEAD..origin/main` before starting, because concurrent work now
+> lands here.
 
 > **CORRECTION #4 (2026-08-01, start of Cycle 4).** This table said **832 / 1429** until re-measured at
 > the top of Cycle 4. Cycle 3 added 36 daemon tests and the table was not updated — **the fourth time
@@ -1080,7 +1092,7 @@ blast radius but **do not cure the outage**.
 > the one production takes most often. **6b is now the live Cycle 6 item, and it got more valuable, not
 > less, by 6c being declined.**
 
-- [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly — bead `pigeon-c1a` (P2).** Reopening an already-open topic returns
+- [x] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly — DONE (`e4574c1`, review fixes `c490b76`), bead `pigeon-c1a` (P2).** Reopening an already-open topic returns
   `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
   where *any* generic reopen failure marks the row open and never retries.
   **LIVE and now the top Cycle 6 item** — 6c was declined (see the gate check above), so nothing
@@ -1088,6 +1100,34 @@ blast radius but **do not cure the outage**.
   path, so the imprecise "any generic failure marks it open" branch is the one production takes most
   often. Classify `TOPIC_NOT_MODIFIED` explicitly so `markOpen` fires only on the genuine already-open
   signal, and a real reopen failure stays retryable.
+  **Shipped.** A `topic_not_modified` kind was added to `TgResult` and classified in `parseTgResponse`
+  by substring, following the verified `thread not found` classifier. `markOpen` now fires only on that
+  kind; every other generic failure still returns the thread id (**the notification is never dropped**)
+  but leaves the row `closed` so the reopen retries.
+  **Two claims in the old comment were checked and both were overstated** — the justification for the
+  branch being removed did not survive reading the code it cited. (a) "The sticky-closed row arms the
+  reaper": `listReapable` is **double-gated**, requiring `state='closed'` AND `closed_at` old AND the
+  session row missing-or-stale, and the notification path touches `sessions.updated_at` on every send —
+  so an actively-notified session cannot be reaped while stuck closed. (b) "Proceeding-with-the-thread
+  and leaving-it-closed are contradictory": no functional consumer existed to break.
+  **Accepted residuals, both recorded in the code comment rather than left to be rediscovered:** a
+  *permanent* reopen failure now retries once per notification forever (~1 wasted call against the §3
+  budget; bounding it needs an attempt-count column), and because `closed_at` keeps ageing instead of
+  being reset by `markOpen`, a permanent failure followed by >7d session idleness lets the reaper delete
+  the topic up to ~30 days earlier than before.
+  **Composition was checked across units, not just the call site:** `parseTgResponse` is shared by every
+  Telegram call, so the new variant is reachable from `sendMessage`, `closeForumTopic`,
+  `deleteForumTopic` and friends. Every `kind` discrimination in `packages/worker/src/` tests
+  `rate_limited` or `thread_not_found` specifically, so the new kind falls through the existing
+  else-paths unchanged — and in `closeOrphanedTopics` it lands on `markClosed`, which is semantically
+  *right* for an already-closed topic.
+  **The review's most useful finding was test rot, not a code defect:** two pre-existing tests used
+  `TOPIC_NOT_MODIFIED` as their *generic error* fixture, so this commit silently converted them into
+  tests of the new branch while their names still asserted the reversed policy — and the true
+  generic-error path lost its e2e coverage. Fixed in `c490b76` by renaming one and adding a real
+  generic-error e2e that pins state-stays-closed **and** reaper-does-not-delete-while-session-fresh,
+  which is what makes claim (a) above load-bearing rather than a comment. Both new assertions were
+  watched failing against an injected regression.
 - [x] **6c. Drop the T2.6 reopen-before-send call — DECLINED 2026-08-01, deliberately. No code.**
   The call *is* belt-and-braces for delivery (a bot can post into a closed topic regardless), but it is
   **load-bearing for visibility**: it un-collapses the topic so a notification arriving after a session

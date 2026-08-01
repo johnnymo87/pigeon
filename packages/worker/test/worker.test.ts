@@ -1452,7 +1452,7 @@ describe("telegram client module classifier", () => {
       expect(res).toEqual({ ok: true, result: true });
     });
 
-    it("reopenForumTopic error classification path", async () => {
+    it("reopenForumTopic topic_not_modified classification path", async () => {
       fetchMock
         .get("https://api.telegram.org")
         .intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
@@ -1473,9 +1473,7 @@ describe("telegram client module classifier", () => {
 
       expect(res).toEqual({
         ok: false,
-        kind: "error",
-        errorCode: 400,
-        description: "Bad Request: TOPIC_NOT_MODIFIED",
+        kind: "topic_not_modified",
         response: {
           ok: false,
           error_code: 400,
@@ -5839,11 +5837,11 @@ describe("topics module and topicName", () => {
         expect(row?.state).toBe("closed");
       });
 
-      it("reopenForumTopic returns non-429 error -> returns messageThreadId anyway so notification is not dropped", async () => {
+      it("reopenForumTopic returns TOPIC_NOT_MODIFIED -> returns messageThreadId and flips state to open", async () => {
         const now = Date.now();
-        await reserve(env.DB, { sessionId: "ses_closed_err", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed err", now });
-        await finalize(env.DB, { sessionId: "ses_closed_err", messageThreadId: 890, now });
-        await markClosed(env.DB, { sessionId: "ses_closed_err", now });
+        await reserve(env.DB, { sessionId: "ses_closed_not_mod", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed not mod", now });
+        await finalize(env.DB, { sessionId: "ses_closed_not_mod", messageThreadId: 994001, now });
+        await markClosed(env.DB, { sessionId: "ses_closed_not_mod", now });
 
         fetchMock
           .get("https://api.telegram.org")
@@ -5851,16 +5849,46 @@ describe("topics module and topicName", () => {
           .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
 
         const res = await resolveTopic(env.DB, {
-          sessionId: "ses_closed_err",
+          sessionId: "ses_closed_not_mod",
           machineId: "devbox",
           chatId: topicChatId,
           dir: "pigeon",
-          title: "closed err",
+          title: "closed not mod",
           botToken,
           now: now + 1000,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: 890 });
+        expect(res).toEqual({ ok: true, messageThreadId: 994001 });
+
+        const row = await getBySession(env.DB, "ses_closed_not_mod");
+        expect(row?.state).toBe("open");
+      });
+
+      it("reopenForumTopic returns generic error (e.g. not enough rights) -> returns messageThreadId but leaves state closed", async () => {
+        const now = Date.now();
+        await reserve(env.DB, { sessionId: "ses_closed_rights_err", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed rights err", now });
+        await finalize(env.DB, { sessionId: "ses_closed_rights_err", messageThreadId: 994002, now });
+        await markClosed(env.DB, { sessionId: "ses_closed_rights_err", now });
+
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+          .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to manage topics" });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId: "ses_closed_rights_err",
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "closed rights err",
+          botToken,
+          now: now + 1000,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 994002 });
+
+        const row = await getBySession(env.DB, "ses_closed_rights_err");
+        expect(row?.state).toBe("closed");
       });
     });
 
@@ -7321,12 +7349,12 @@ describe("topics module and topicName", () => {
       fetchMock.deactivate();
     });
 
-    it("(a) reopen returns a generic error and we proceed with the existing thread -> D1 row state is open afterwards", async () => {
-      const sessionId = "ses_f1_a_generic_err";
+    it("(a) reopen returns TOPIC_NOT_MODIFIED (already open in Telegram) -> flips D1 row state to open", async () => {
+      const sessionId = "ses_f1_a_not_modified";
       const threadId = 65001;
       const now = Date.now();
 
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · generic err", now });
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · not modified", now });
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
       await markClosed(env.DB, { sessionId, now });
 
@@ -7340,7 +7368,7 @@ describe("topics module and topicName", () => {
         machineId: "devbox",
         chatId: topicChatId,
         dir: "pigeon",
-        title: "generic err",
+        title: "not modified",
         botToken,
         now: now + 1000,
       });
@@ -7499,13 +7527,13 @@ describe("topics module and topicName", () => {
       expect(row).toBeNull();
     });
 
-    it("(f) end-to-end composition: close topic, generic error on reopen -> state becomes open, then reaper 30d later does NOT delete it", async () => {
-      const sessionId = "ses_f1_f_e2e";
+    it("(f) end-to-end composition: close topic, generic error on reopen -> state stays closed, notification gets thread id, reaper 30d later does NOT delete it while session row is fresh", async () => {
+      const sessionId = "ses_f1_f_generic_e2e";
       const threadId = 65008;
       const t0 = Date.now();
 
       // 1. Seed closed topic with active session
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · e2e", now: t0 });
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · generic e2e", now: t0 });
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: t0 });
       await markClosed(env.DB, { sessionId, now: t0 });
 
@@ -7513,7 +7541,67 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
 
-      // 2. Notification arrives -> resolveTopic reopen fails generically
+      // 2. Notification arrives -> resolveTopic reopen fails generically (e.g. lost rights)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to manage topics" });
+
+      const resolveRes = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "generic e2e",
+        botToken,
+        now: t0 + 1000,
+      });
+
+      expect(resolveRes).toEqual({ ok: true, messageThreadId: threadId });
+
+      // Confirm row state STAYS closed (reopen fails generically, retry on next notification)
+      const rowAfterResolve = await getBySession(env.DB, sessionId);
+      expect(rowAfterResolve?.state).toBe("closed");
+
+      // 3. 30 days later, run reaper
+      const t30d = t0 + REAP_TTL_MS + 10000;
+      // Session receives notifications and stays fresh
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
+
+      let deleteCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, (opts: any) => {
+          deleteCalled = true;
+          return { ok: true, result: true };
+        });
+
+      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      expect(reapRes.reaped).toBe(0);
+      expect(deleteCalled).toBe(false);
+
+      const rowAfterReap = await getBySession(env.DB, sessionId);
+      expect(rowAfterReap).not.toBeNull();
+      expect(rowAfterReap?.state).toBe("closed");
+    });
+
+    it("(g) end-to-end composition: close topic, TOPIC_NOT_MODIFIED on reopen -> state becomes open, then reaper 30d later does NOT delete it", async () => {
+      const sessionId = "ses_f1_g_not_mod_e2e";
+      const threadId = 65009;
+      const t0 = Date.now();
+
+      // 1. Seed closed topic with active session
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · not mod e2e", now: t0 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: t0 });
+      await markClosed(env.DB, { sessionId, now: t0 });
+
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
+
+      // 2. Notification arrives -> resolveTopic reopen returns TOPIC_NOT_MODIFIED
       fetchMock
         .get("https://api.telegram.org")
         .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
@@ -7524,14 +7612,14 @@ describe("topics module and topicName", () => {
         machineId: "devbox",
         chatId: topicChatId,
         dir: "pigeon",
-        title: "e2e",
+        title: "not mod e2e",
         botToken,
         now: t0 + 1000,
       });
 
       expect(resolveRes).toEqual({ ok: true, messageThreadId: threadId });
 
-      // Confirm row state is now OPEN
+      // Confirm row state flips to OPEN
       const rowAfterResolve = await getBySession(env.DB, sessionId);
       expect(rowAfterResolve?.state).toBe("open");
 

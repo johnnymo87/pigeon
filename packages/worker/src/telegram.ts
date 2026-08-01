@@ -2,6 +2,7 @@ export type TgResult<T> =
   | { ok: true; result: T }
   | { ok: false; kind: "rate_limited"; retryAfter: number; response?: unknown }
   | { ok: false; kind: "thread_not_found"; response?: unknown }
+  | { ok: false; kind: "topic_not_modified"; response?: unknown }
   | { ok: false; kind: "error"; errorCode?: number; description?: string; response?: unknown };
 
 export interface SendMessageOptions {
@@ -135,6 +136,14 @@ async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
     return {
       ok: false,
       kind: "thread_not_found",
+      response: data ?? undefined,
+    };
+  }
+
+  if (description && description.includes("TOPIC_NOT_MODIFIED")) {
+    return {
+      ok: false,
+      kind: "topic_not_modified",
       response: data ?? undefined,
     };
   }
