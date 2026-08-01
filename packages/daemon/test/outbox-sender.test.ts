@@ -2032,3 +2032,255 @@ describe("OutboxSender rate governor", () => {
     }
   });
 });
+
+describe("outbox terminal drop uniform logging", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("emits outbox terminal drop for attempts_exhausted", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    storage.db.prepare("UPDATE outbox SET attempts = 10 WHERE notification_id = 'notif-1'").run();
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification(),
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "attempts_exhausted",
+      attempts: 10,
+      ageMs: 4000,
+    });
+  });
+
+  it("emits outbox terminal drop for expired", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification(),
+      chatId: "chat-123",
+      nowFn: () => 1_000 + 4 * 3600 * 1000 + 1,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "expired",
+      attempts: 0,
+      ageMs: 14400001,
+      expiryMs: 14400000,
+    });
+  });
+
+  it("emits outbox terminal drop for payload_parse_failed", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      payload: "invalid-json{",
+    }, 1_000);
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification(),
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "payload_parse_failed",
+      attempts: 0,
+      ageMs: 4000,
+      lastError: expect.stringContaining("JSON"),
+    });
+  });
+
+  it("emits outbox terminal drop for payload_empty (previously silent path)", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      payload: JSON.stringify({ messages: [] }),
+    }, 1_000);
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification(),
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "payload_empty",
+      attempts: 0,
+      ageMs: 4000,
+    });
+  });
+
+  it("emits outbox terminal drop for delivery policy terminal action", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 400,
+      body: { error: "bad request" },
+    }) as unknown as SendNotificationFn;
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "Worker field validation failed (HTTP 400)",
+      attempts: 0,
+      ageMs: 4000,
+      lastError: 'HTTP 400 - {"error":"bad request"}',
+    });
+  });
+
+  it("emits outbox terminal drop for reregister_compensated", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    storage.sessions.upsert({
+      sessionId: "sess-1",
+      label: "my-session",
+    });
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockImplementation(async () => {
+      storage.db.prepare("DELETE FROM sessions WHERE session_id = 'sess-1'").run();
+      return { ok: true };
+    }) as unknown as RegisterSessionFn;
+
+    const unregisterSession = vi.fn().mockResolvedValue({ ok: true }) as unknown as UnregisterSessionFn;
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      unregisterSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "reregister_compensated",
+      attempts: 0,
+      ageMs: 4000,
+      compensated: true,
+    });
+  });
+
+  it("emits outbox terminal drop for reregister_failed", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    storage.sessions.upsert({
+      sessionId: "sess-1",
+      label: "my-session",
+    });
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 400,
+      body: { error: "Bad registration request" },
+    }) as unknown as RegisterSessionFn;
+
+    const logFn = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logFn,
+    });
+
+    await sender.processOnce();
+
+    const dropCalls = logFn.mock.calls.filter(([msg]) => msg === "outbox terminal drop");
+    expect(dropCalls).toHaveLength(1);
+    expect(dropCalls[0]![1]).toEqual({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      kind: "question",
+      reason: "reregister_failed",
+      attempts: 0,
+      ageMs: 4000,
+      lastError: 'HTTP 400 - {"error":"Bad registration request"}',
+    });
+  });
+});

@@ -7,6 +7,7 @@
  */
 
 import type { StorageDb } from "../storage/database";
+import type { OutboxRecord } from "../storage/outbox-repo";
 import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, WorkerResult } from "./poller";
 import { classifyDeliveryFailure, isTransportFailure } from "./delivery-policy";
@@ -159,6 +160,29 @@ export class OutboxSender {
     });
   }
 
+  /** Mark an outbox entry failed terminally, clean up, and log uniform outbox terminal drop. */
+  private markTerminal(
+    entry: OutboxRecord,
+    now: number,
+    reason: string,
+    lastError?: string,
+    extraFields?: Record<string, unknown>,
+  ): void {
+    this.storage.outbox.markFailed(entry.notificationId, now, reason, lastError);
+    this.reregisteredEntries.delete(entry.notificationId);
+    const ageMs = now - entry.createdAt;
+    this.log("outbox terminal drop", {
+      notificationId: entry.notificationId,
+      sessionId: entry.sessionId,
+      kind: entry.kind,
+      reason,
+      attempts: entry.attempts,
+      ageMs,
+      ...(lastError ? { lastError } : {}),
+      ...extraFields,
+    });
+  }
+
   /** Start the background delivery loop. */
   start(intervalMs = 5_000): void {
     this.timer = setInterval(() => {
@@ -224,28 +248,12 @@ export class OutboxSender {
 
         // Check terminal conditions
         if (entry.attempts >= MAX_ATTEMPTS) {
-          this.storage.outbox.markFailed(entry.notificationId, now, "attempts_exhausted");
-          this.reregisteredEntries.delete(entry.notificationId);
-          this.log("outbox entry marked failed (attempts exhausted)", {
-            notificationId: entry.notificationId,
-            sessionId: entry.sessionId,
-            attempts: entry.attempts,
-            ageMs: age,
-          });
+          this.markTerminal(entry, now, "attempts_exhausted");
           continue;
         }
 
         if (age > expiryMs) {
-          this.storage.outbox.markFailed(entry.notificationId, now, "expired");
-          this.reregisteredEntries.delete(entry.notificationId);
-          this.log("outbox entry marked failed (expired)", {
-            notificationId: entry.notificationId,
-            sessionId: entry.sessionId,
-            attempts: entry.attempts,
-            ageMs: age,
-            expiryMs,
-            kind: entry.kind,
-          });
+          this.markTerminal(entry, now, "expired", undefined, { expiryMs });
           continue;
         }
 
@@ -274,18 +282,12 @@ export class OutboxSender {
           threaded = parsed.threaded;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          this.log("outbox entry payload parse failed", {
-            notificationId: entry.notificationId,
-            err: errMsg,
-          });
-          this.storage.outbox.markFailed(entry.notificationId, now, "payload_parse_failed", errMsg);
-          this.reregisteredEntries.delete(entry.notificationId);
+          this.markTerminal(entry, now, "payload_parse_failed", errMsg);
           continue;
         }
 
         if (messages.length === 0) {
-          this.storage.outbox.markFailed(entry.notificationId, now, "payload_empty");
-          this.reregisteredEntries.delete(entry.notificationId);
+          this.markTerminal(entry, now, "payload_empty");
           continue;
         }
 
@@ -351,15 +353,7 @@ export class OutboxSender {
               }
 
               if (action.action === "terminal") {
-                this.storage.outbox.markFailed(entry.notificationId, now, action.reason, formatWorkerError(result));
-                this.reregisteredEntries.delete(entry.notificationId);
-                this.log("outbox entry delivery failed (terminal)", {
-                  notificationId: entry.notificationId,
-                  sessionId: entry.sessionId,
-                  reason: action.reason,
-                  kind: result.kind,
-                  ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
-                });
+                this.markTerminal(entry, now, action.reason, formatWorkerError(result));
                 break;
               }
 
@@ -392,11 +386,7 @@ export class OutboxSender {
                       const unregResult = await this.unregisterSession(entry.sessionId);
                       compensated = unregResult?.ok ?? undefined;
                     }
-                    this.storage.outbox.markFailed(entry.notificationId, now, "reregister_compensated");
-                    this.reregisteredEntries.delete(entry.notificationId);
-                    this.log("outbox entry re-registration compensated: session deleted during registration", {
-                      notificationId: entry.notificationId,
-                      sessionId: entry.sessionId,
+                    this.markTerminal(entry, now, "reregister_compensated", undefined, {
                       compensated: compensated ?? false,
                     });
                     if (compensated === false) {
@@ -461,15 +451,7 @@ export class OutboxSender {
                     });
                     break;
                   } else {
-                    this.storage.outbox.markFailed(entry.notificationId, now, "reregister_failed", formatWorkerError(regResult));
-                    this.reregisteredEntries.delete(entry.notificationId);
-                    this.log("outbox entry re-registration failed (terminal)", {
-                      notificationId: entry.notificationId,
-                      sessionId: entry.sessionId,
-                      kind: regResult.kind,
-                      ...("status" in regResult ? { status: regResult.status } : {}),
-                      ...("body" in regResult ? { body: regResult.body } : {}),
-                    });
+                    this.markTerminal(entry, now, "reregister_failed", formatWorkerError(regResult));
                     break;
                   }
                 }
