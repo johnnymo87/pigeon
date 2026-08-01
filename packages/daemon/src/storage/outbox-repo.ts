@@ -117,18 +117,24 @@ export class OutboxRepository {
       .run(now, id);
   }
 
-  markRetry(id: string, now = Date.now(), backoffMs: number, lastError?: string): void {
+  markRetry(
+    id: string,
+    now = Date.now(),
+    backoffMs: number,
+    lastError?: string,
+    countAttempt: boolean = true,
+  ): void {
     this.db
       .prepare(
         `UPDATE outbox
          SET state = 'queued',
-             attempts = attempts + 1,
+             attempts = attempts + ?,
              next_retry_at = ?,
              last_error = COALESCE(?, last_error),
              updated_at = ?
          WHERE notification_id = ?`,
       )
-      .run(now + backoffMs, lastError ?? null, now, id);
+      .run(countAttempt ? 1 : 0, now + backoffMs, lastError ?? null, now, id);
   }
 
   markFailed(id: string, now = Date.now(), reason?: string, lastError?: string): void {

@@ -182,6 +182,23 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
+  it("markRetry with countAttempt = false updates retry time without incrementing attempts", () => {
+    const storage = createStorage();
+    const now = 10_000;
+    const backoffMs = 5_000;
+
+    storage.outbox.upsert(BASE_INPUT, now);
+    storage.outbox.markRetry("notif-1", now, backoffMs, "transport_error", false);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+    expect(record!.nextRetryAt).toBe(now + backoffMs);
+    expect(record!.lastError).toBe("transport_error");
+
+    storage.db.close();
+  });
+
   it("resets failed entries (including failedReason and lastError) to queued on re-upsert and updates created_at", () => {
     const storage = createStorage();
 

@@ -32,6 +32,24 @@ function getTelegramErrorCode(body: unknown): number | undefined {
 }
 
 /**
+ * Returns true if the delivery/registration failure was caused by a transport outage,
+ * worker 5xx error, or worker rate limit (429).
+ *
+ * Such failures indicate the transport or worker infrastructure is down or busy,
+ * NOT that this specific message is defective. Rescheduling a transport failure
+ * must NOT charge the message an attempt against its MAX_ATTEMPTS budget.
+ */
+export function isTransportFailure(result: WorkerResult): boolean {
+  if (result.kind === "transport_error") {
+    return true;
+  }
+  if (result.kind === "http_error") {
+    return result.status >= 500 || result.status === 429;
+  }
+  return false;
+}
+
+/**
  * Pure failure classifier for worker outbox notification delivery results.
  *
  * Rules precedence order:

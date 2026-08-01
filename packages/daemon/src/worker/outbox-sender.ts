@@ -8,7 +8,7 @@
 
 import type { StorageDb } from "../storage/database";
 import type { SendNotificationInput, WorkerResult } from "./poller";
-import { classifyDeliveryFailure } from "./delivery-policy";
+import { classifyDeliveryFailure, isTransportFailure } from "./delivery-policy";
 import type { DeliveryPolicyContext } from "./delivery-policy";
 
 export type SendNotificationFn = (
@@ -38,6 +38,13 @@ export interface OutboxSenderOptions {
   log?: LogFn;
 }
 
+/**
+ * Maximum number of attempts allowed for deterministic per-message failures.
+ * `attempts` now means "the transport was up and this message failed anyway"
+ * (e.g. 403, 400, app_rejection, strip_entities), which is what makes exhausting
+ * it a deterministic terminal rather than a budget one.
+ * Transient transport failures (transport_error, 5xx, 429) do NOT increment attempts.
+ */
 const MAX_ATTEMPTS = 10;
 const MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 const BACKOFF_SCHEDULE = [5_000, 10_000, 30_000, 60_000, 120_000];
@@ -257,11 +264,12 @@ export class OutboxSender {
 
               if (action.action === "pause") {
                 const backoff = getBackoff(entry.attempts);
-                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
+                const countAttempt = !isTransportFailure(result);
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
                 this.log("outbox entry delivery failed, scheduling retry", {
                   notificationId: entry.notificationId,
                   sessionId: entry.sessionId,
-                  attempts: entry.attempts + 1,
+                  attempts: entry.attempts + (countAttempt ? 1 : 0),
                   nextRetryIn: backoff,
                   kind: result.kind,
                   ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
@@ -294,11 +302,12 @@ export class OutboxSender {
               if (action.action === "reregister") {
                 if (!this.registerSession) {
                   const backoff = getBackoff(entry.attempts);
-                  this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
+                  const countAttempt = !isTransportFailure(result);
+                  this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
                   this.log("outbox entry delivery failed, scheduling retry (reregister unavailable)", {
                     notificationId: entry.notificationId,
                     sessionId: entry.sessionId,
-                    attempts: entry.attempts + 1,
+                    attempts: entry.attempts + (countAttempt ? 1 : 0),
                     nextRetryIn: backoff,
                     kind: result.kind,
                   });
@@ -337,11 +346,12 @@ export class OutboxSender {
 
                   this.reregisteredEntries.add(entry.notificationId);
                   const backoff = getBackoff(entry.attempts);
-                  this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                  const countAttempt = !isTransportFailure(result);
+                  this.storage.outbox.markRetry(entry.notificationId, now, backoff, undefined, countAttempt);
                   this.log("outbox entry re-registered, scheduling retry", {
                     notificationId: entry.notificationId,
                     sessionId: entry.sessionId,
-                    attempts: entry.attempts + 1,
+                    attempts: entry.attempts + (countAttempt ? 1 : 0),
                     nextRetryIn: backoff,
                   });
                   break;
@@ -376,11 +386,12 @@ export class OutboxSender {
 
                   if (isTransient) {
                     const backoff = getBackoff(entry.attempts);
-                    this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(regResult));
+                    const countAttempt = !isTransportFailure(regResult);
+                    this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(regResult), countAttempt);
                     this.log("outbox entry re-registration failed (transient), scheduling retry", {
                       notificationId: entry.notificationId,
                       sessionId: entry.sessionId,
-                      attempts: entry.attempts + 1,
+                      attempts: entry.attempts + (countAttempt ? 1 : 0),
                       nextRetryIn: backoff,
                       kind: regResult.kind,
                     });
@@ -425,7 +436,9 @@ export class OutboxSender {
                 }
 
                 const backoff = getBackoff(entry.attempts);
-                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
+                // Strip entities retry is caused by malformed entity formatting (per-message payload error).
+                // It MUST count as an attempt even though the worker returned HTTP 502 (Telegram 400).
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), true);
                 this.log("outbox entry stripped entities, scheduling retry", {
                   notificationId: entry.notificationId,
                   sessionId: entry.sessionId,
@@ -437,11 +450,12 @@ export class OutboxSender {
 
               // Default retry arm (action.action === "retry")
               const backoff = getBackoff(entry.attempts);
-              this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
+              const countAttempt = !isTransportFailure(result);
+              this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
               this.log("outbox entry delivery failed, scheduling retry", {
                 notificationId: entry.notificationId,
                 sessionId: entry.sessionId,
-                attempts: entry.attempts + 1,
+                attempts: entry.attempts + (countAttempt ? 1 : 0),
                 nextRetryIn: backoff,
                 kind: result.kind,
                 ...(result.kind === "http_error" || result.kind === "app_rejection" ? { status: result.status, body: result.body } : {}),
@@ -463,7 +477,10 @@ export class OutboxSender {
         } catch (err) {
           const backoff = getBackoff(entry.attempts);
           const errMsg = err instanceof Error ? err.message : String(err);
-          this.storage.outbox.markRetry(entry.notificationId, now, backoff, errMsg);
+          // Exception during delivery is ambiguous and may be a bug in our own code;
+          // with a long age cap, not counting would retry a genuine code defect thousands of times.
+          // Be conservative here and count as an attempt.
+          this.storage.outbox.markRetry(entry.notificationId, now, backoff, errMsg, true);
           this.log("outbox entry delivery threw, scheduling retry", {
             notificationId: entry.notificationId,
             sessionId: entry.sessionId,

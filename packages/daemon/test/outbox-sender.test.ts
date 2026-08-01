@@ -159,6 +159,149 @@ describe("OutboxSender.processOnce()", () => {
     expect(record!.nextRetryAt).toBe(10_000);
   });
 
+  it("headline incident test: sustained transport outage across 30 ticks does NOT increment attempts or mark entry failed", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "Worker unreachable",
+    }) as unknown as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Run 30 ticks (well past MAX_ATTEMPTS = 10)
+    for (let tick = 0; tick < 30; tick++) {
+      await sender.processOnce();
+      const rec = storage.outbox.getByNotificationId("notif-1");
+      now = (rec?.nextRetryAt ?? now) + 1;
+    }
+
+    expect(sendNotification).toHaveBeenCalledTimes(30);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record).not.toBeNull();
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("complementary test: genuine per-message failure (403) still reaches terminal after MAX_ATTEMPTS", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 403,
+      body: { error: "Forbidden" },
+    }) as unknown as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Run 10 ticks advancing time according to backoff
+    for (let tick = 0; tick < 10; tick++) {
+      await sender.processOnce();
+      const rec = storage.outbox.getByNotificationId("notif-1");
+      now = (rec?.nextRetryAt ?? now) + 1;
+    }
+
+    const recordAfter10 = storage.outbox.getByNotificationId("notif-1");
+    expect(recordAfter10!.attempts).toBe(10);
+
+    // 11th tick: MAX_ATTEMPTS reached, entry marked failed
+    await sender.processOnce();
+    const recordAfter11 = storage.outbox.getByNotificationId("notif-1");
+    expect(recordAfter11!.state).toBe("failed");
+    expect(recordAfter11!.failedReason).toBe("budget_exhausted");
+  });
+
+  it("429 reschedules and pauses but does NOT increment attempts", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 429,
+      body: { error: "rate_limited", retryAfter: 10 },
+      retryAfter: 10,
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("transient re-registration failure (transport_error on registerSession) reschedules without incrementing attempts", async () => {
+    storage.sessions.upsert({ sessionId: "sess-1", label: "Label" }, 1_000);
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 404,
+      body: { error: "Session not found" },
+    }) as unknown as SendNotificationFn;
+
+    const registerSession = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "DNS lookup failed",
+    }) as unknown as RegisterSessionFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      registerSession,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("catch-all delivery threw handler increments attempts conservatively", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    const sendNotification = vi.fn().mockRejectedValue(new Error("Code bug")) as unknown as SendNotificationFn;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(1);
+  });
+
   it("logs structured classification and status on delivery failure", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 
@@ -874,11 +1017,11 @@ describe("OutboxSender start/stop", () => {
     await sender.processOnce();
     expect(sendNotification).toHaveBeenCalledTimes(1);
 
-    // Verify entry is NOT lost/failed, but remains retryable
+    // Verify entry is NOT lost/failed, but remains retryable (attempts = 0 on 429 rate limit)
     const recordAfter429 = storage.outbox.getByNotificationId(cardId);
     expect(recordAfter429).not.toBeNull();
     expect(recordAfter429!.state).toBe("queued");
-    expect(recordAfter429!.attempts).toBe(1);
+    expect(recordAfter429!.attempts).toBe(0);
     expect(recordAfter429!.nextRetryAt).toBeGreaterThan(now);
 
     // Fast-forward past pause + retry backoff (10s pause = 10,000ms)
@@ -1153,8 +1296,8 @@ describe("classified delivery failure actions", () => {
 
     expect(registerSession).toHaveBeenCalledTimes(1);
     expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("queued");
-    // The re-register flag must NOT be consumed, so a later attempt can try again.
-    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(1);
+    // The re-register flag must NOT be consumed, and 429 transient register failure must NOT count an attempt.
+    expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(0);
   });
 
   // app_rejection is HTTP 2xx carrying ok:false — inherently ambiguous, so it must retry.
