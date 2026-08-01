@@ -1063,26 +1063,42 @@ blast radius but **do not cure the outage**.
 > closed, posted again, reopened twice, deleted, posted again* — with no flag flip and no pigeon code
 > involved. **An admin bot CAN post into a closed forum topic** (`ok:true`, message delivered).
 >
-> **The correction: 6c does not depend on 6b — 6c *retires* 6b.** 6b exists to classify the failure of
-> a reopen call; 6c deletes the reopen call. If 6c lands there is no reopen failure left to classify
-> and the Checkpoint 2b trade evaporates on its own. `pigeon-cev`'s own closing note said as much
+> **The correction: 6c does not depend on 6b — 6c would have *retired* 6b.** 6b exists to classify the
+> failure of a reopen call; 6c deletes the reopen call. `pigeon-cev`'s own closing note said as much
 > ("lower value given finding 3 makes the whole reopen path optional") and it never made it into this
-> ordering. **Do 6c first, then close 6b as moot** — the reverse order does work that 6c throws away.
+> ordering.
+>
+> **RESOLVED 2026-08-01 by product decision: the reopen STAYS, so 6c is closed won't-do and 6b is
+> LIVE.** The trade-off named above was put to the user and answered directly: **the un-collapse is
+> wanted behaviour.** A notification arriving after a session ends should raise the topic back up the
+> Telegram UI, not land silently in a collapsed one. That is worth one API call against the §3 budget.
+>
+> **Note the dependency inverts cleanly rather than disappearing.** With 6c dropped, nothing retires
+> 6b any more, so the Checkpoint 2b trade is live again: *any* generic reopen failure currently calls
+> `markOpen` and is never retried. And `pigeon-cev` item 4 established that `TOPIC_NOT_MODIFIED` is the
+> **common** path for the D1-closed/Telegram-open divergence, not a rarity — so the imprecise branch is
+> the one production takes most often. **6b is now the live Cycle 6 item, and it got more valuable, not
+> less, by 6c being declined.**
 
 - [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
   `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
   where *any* generic reopen failure marks the row open and never retries.
-  **Likely moot — see the gate check above. Do 6c first and re-evaluate; expect to close this.**
-- [ ] **6c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces —
-  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. ~~Depends on 6b.~~
-  **Unblocked, and now the highest-value item in this cycle.** The stale comment at
-  `topic-manager.ts:58-59` claiming the question was "Unverified against live Telegram API" is
-  corrected in `d428f74`; the call itself is untouched.
-  **One trade-off still to decide, which is why this was not bundled into the gate check:** the reopen
-  also un-collapses the topic in the Telegram UI. Dropping it means a notification arriving after a
-  session ends lands in a topic that stays visually closed. That is a *visibility* question, not a
-  correctness one — so decide it deliberately rather than discovering it, and consider the conditional
-  form (reopen only when something will actually be read) rather than an unconditional delete.
+  **LIVE and now the top Cycle 6 item** — 6c was declined (see the gate check above), so nothing
+  retires this. `pigeon-cev` item 4 measured the real string and established this is the **common**
+  path, so the imprecise "any generic failure marks it open" branch is the one production takes most
+  often. Classify `TOPIC_NOT_MODIFIED` explicitly so `markOpen` fires only on the genuine already-open
+  signal, and a real reopen failure stays retryable.
+- [x] **6c. Drop the T2.6 reopen-before-send call — DECLINED 2026-08-01, deliberately. No code.**
+  The call *is* belt-and-braces for delivery (a bot can post into a closed topic regardless), but it is
+  **load-bearing for visibility**: it un-collapses the topic so a notification arriving after a session
+  ends raises it back up the Telegram UI instead of landing in a collapsed one. Put to the user and
+  answered directly — that behaviour is wanted, and worth one API call against the §3 budget.
+  **This is a case where the cheaper-looking option was the wrong one**, and the only reason it was
+  caught is that the trade-off was named and asked about rather than being resolved by whoever
+  implemented it. The stale comment at `topic-manager.ts:58-59` is corrected in `d428f74`; the call
+  itself is deliberately untouched.
+  Reopen only if the §3 budget ever becomes the binding constraint — and if so, prefer the conditional
+  form (reopen only when a human will actually read it) over an unconditional delete.
 - [ ] **6d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
   entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the framing
   message best-effort, so it is now the lossiest part of the command. Needs a different fix shape:
