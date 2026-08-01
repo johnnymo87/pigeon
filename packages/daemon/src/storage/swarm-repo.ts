@@ -244,6 +244,39 @@ export class SwarmRepository {
   }
 
   /**
+   * Scheduled rows whose delivery time passed over `thresholdMs` ago AND that
+   * nothing has touched since. Powers the watchdog's "is the delivery loop
+   * even running?" alarm.
+   *
+   * The `updated_at` half is what makes the alarm honest, and it is not
+   * optional. Overdue-and-queued ALONE is the normal, healthy state during an
+   * outage: when no serve is routable the arbiter reschedules the row without
+   * charging its attempt budget, so a wake scheduled for 03:00 sits queued and
+   * overdue for the whole nightly serve bounce while the system does exactly
+   * what it was designed to do. Alarming on that would page at 3am to say the
+   * delivery loop was stopped, which would be false — and a nightly false alarm
+   * is how a real one gets ignored.
+   *
+   * Every retry path bumps `updated_at` (see `markRetry` / `markRetryUncounted`),
+   * so a live loop keeps the timestamp fresh and this query skips the row. A
+   * frozen `updated_at` means nothing is touching the row at all, which is the
+   * condition actually worth waking someone for.
+   */
+  listOverdueQueued(now: number, thresholdMs: number): SwarmMessageRecord[] {
+    const cutoff = now - thresholdMs;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM swarm_messages
+         WHERE state = 'queued'
+           AND deliver_at IS NOT NULL
+           AND deliver_at <= ?
+           AND updated_at <= ?`,
+      )
+      .all(cutoff, cutoff) as Row[];
+    return rows.map(asRecord);
+  }
+
+  /**
    * Confirms an assistant run actually started for a handed-off message.
    * Verified rows are never re-checked.
    *

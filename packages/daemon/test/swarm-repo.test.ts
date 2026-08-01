@@ -625,6 +625,34 @@ describe("SwarmRepository", () => {
       s.db.close();
     });
 
+    it("listOverdueQueued returns queued rows with deliver_at <= now - thresholdMs", () => {
+      const s = createStorage();
+      const now = 1_000_000;
+      const thresholdMs = 300_000; // 5 minutes
+
+      // Overdue queued row: deliver_at = 600_000 <= 700_000 (now - 300_000)
+      s.swarm.insert({ ...BASE, msgId: "m_overdue", deliverAt: 600_000 }, 100_000);
+
+      // Fresh queued row: deliver_at = 950_000 > 700_000
+      s.swarm.insert({ ...BASE, msgId: "m_fresh", deliverAt: 950_000 }, 100_000);
+
+      // Overdue but handed_off row: state != 'queued'
+      s.swarm.insert({ ...BASE, msgId: "m_delivered", deliverAt: 600_000 }, 100_000);
+      s.swarm.markHandedOff("m_delivered", 650_000);
+
+      // Overdue but expired row: state != 'queued'
+      s.swarm.insert({ ...BASE, msgId: "m_expired", deliverAt: 600_000 }, 100_000);
+      s.swarm.markExpired("m_expired", 650_000);
+
+      // Queued row with null deliver_at
+      s.swarm.insert({ ...BASE, msgId: "m_nodeliver", deliverAt: null }, 100_000);
+
+      const overdue = s.swarm.listOverdueQueued(now, thresholdMs);
+      expect(overdue.map((m) => m.msgId)).toEqual(["m_overdue"]);
+
+      s.db.close();
+    });
+
     it("cleanupOlderThan deletes expired and cancelled rows as well as handed_off and failed", () => {
       const s = createStorage();
       s.swarm.insert({ ...BASE, msgId: "m_handed" }, 1_000);

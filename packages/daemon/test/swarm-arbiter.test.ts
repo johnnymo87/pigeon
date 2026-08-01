@@ -626,4 +626,64 @@ describe("SwarmArbiter", () => {
     // Must stay cancelled, NOT resurrected to queued
     expect(storage.swarm.getByMsgId("m_cancel_race")!.state).toBe("cancelled");
   });
+
+  it("populates scheduledFor and deliveredLateMs for scheduled messages", async () => {
+    fixture = makeFixture();
+    const { storage, arbiter, calls } = fixture;
+
+    const deliverAt = 10_000;
+    const now = 15_000;
+    fixture.setNow(now);
+
+    storage.swarm.insert(
+      {
+        msgId: "m_sched_1",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "wake.scheduled",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello scheduled",
+        deliverAt,
+      },
+      now,
+    );
+
+    await arbiter.processOnce();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.prompt).toContain('scheduled_for="1970-01-01T00:00:10.000Z"');
+    expect(calls[0]!.prompt).toContain('delivered_late_ms="5000"');
+  });
+
+  it("renders delivered_late_ms as 0 when delivered on time or early", async () => {
+    fixture = makeFixture();
+    const { storage, arbiter, calls } = fixture;
+
+    const deliverAt = 10_000;
+    const now = 10_000; // on time
+    fixture.setNow(now);
+
+    storage.swarm.insert(
+      {
+        msgId: "m_sched_2",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "wake.scheduled",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello early",
+        deliverAt,
+      },
+      now,
+    );
+
+    await arbiter.processOnce();
+
+    expect(calls).toHaveLength(1);
+    const lateVal = calls[0]!.prompt.match(/delivered_late_ms="([^"]+)"/)?.[1];
+    expect(lateVal).toBe("0");
+  });
 });

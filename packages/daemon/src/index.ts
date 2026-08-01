@@ -560,6 +560,7 @@ const server = startServer(config, createApp(storage, {
   machineId: config.machineId,
   router: ingressRouter,
   authToken: config.authToken,
+  isSchedulerRunning: () => swarmArbiter !== undefined,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
       await poller.registerSession(sessionId, label ?? undefined);

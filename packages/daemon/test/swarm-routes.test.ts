@@ -972,4 +972,125 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
     expect(body.state).toBe("handed_off");
     expect(body.error).toBeTruthy();
   });
+
+  describe("E2: scheduler running guard", () => {
+    it("6. POST /swarm/schedule with isSchedulerRunning: () => false -> 503, and assert NOTHING was persisted", async () => {
+      const storage = openStorageDb(":memory:");
+      const app = createApp(storage, {
+        nowFn: () => 1_000_000,
+        isSchedulerRunning: () => false,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_blocked_sched",
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: "wake me up",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toMatch(/scheduler is not running/i);
+
+      // Assert NOTHING was persisted
+      const stored = storage.swarm.getByMsgId("msg_blocked_sched");
+      expect(stored).toBeNull();
+      const count = storage.db
+        .prepare("SELECT COUNT(*) AS n FROM swarm_messages")
+        .get() as { n: number };
+      expect(count.n).toBe(0);
+
+      storage.db.close();
+    });
+
+    it("7. POST /swarm/schedule with isSchedulerRunning: () => true -> 202 accepted", async () => {
+      const storage = openStorageDb(":memory:");
+      const app = createApp(storage, {
+        nowFn: () => 1_000_000,
+        isSchedulerRunning: () => true,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_running_sched",
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: "wake me up",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const stored = storage.swarm.getByMsgId("msg_running_sched");
+      expect(stored).not.toBeNull();
+
+      storage.db.close();
+    });
+
+    it("8. POST /swarm/schedule with option omitted -> unchanged current behavior (202 accepted)", async () => {
+      const storage = openStorageDb(":memory:");
+      const app = createApp(storage, {
+        nowFn: () => 1_000_000,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_omitted_sched",
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: "wake me up",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const stored = storage.swarm.getByMsgId("msg_omitted_sched");
+      expect(stored).not.toBeNull();
+
+      storage.db.close();
+    });
+
+    it("9. POST /swarm/send still 202s when isSchedulerRunning: () => false (proves scope containment)", async () => {
+      const storage = openStorageDb(":memory:");
+      const app = createApp(storage, {
+        nowFn: () => 1_000_000,
+        isSchedulerRunning: () => false,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_send_scope",
+            from: "ses_a",
+            to: "ses_b",
+            kind: "chat",
+            payload: "regular chat",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const stored = storage.swarm.getByMsgId("msg_send_scope");
+      expect(stored).not.toBeNull();
+
+      storage.db.close();
+    });
+  });
 });

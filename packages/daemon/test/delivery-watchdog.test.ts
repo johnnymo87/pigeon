@@ -1324,6 +1324,37 @@ describe("DeliveryWatchdog", () => {
       kind: "wake",
     });
 
+    // Simulate: a prior cycle somehow marked aborted_at
+    storage.swarm.markAborted("wake_aborted", 100_000);
+
+    fixture.setNow(600_000); // eligible again
+    await watchdog.processOnce();
+
+    expect(client.abortSession).not.toHaveBeenCalled();
+    const row = storage.swarm.getByMsgId("wake_aborted")!;
+    expect(row.state).toBe("handed_off");
+  });
+
+  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({
+      msgId: "wake_aborted",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      handedOffAt: 0,
+      kind: "wake",
+    });
+
     // Pre-set abortedAt to simulate previous abort attempt
     storage.db
       .prepare("UPDATE swarm_messages SET aborted_at = 500_000 WHERE msg_id = ?")
@@ -1393,5 +1424,224 @@ describe("DeliveryWatchdog", () => {
     expect(sendPlainAlert).toHaveBeenCalledTimes(1);
     const [alertText] = sendPlainAlert.mock.calls[0]!;
     expect(alertText).toContain("recovery suppressed");
+  });
+
+  describe("E1: overdue queued alarm", () => {
+    it("1. overdue queued row (deliver_at 6 min in the past, still queued) -> alert at severity error naming msg_id", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      // deliverAt = now - 6 minutes (now - 360_000)
+      storage.swarm.insert(
+        {
+          msgId: "msg_overdue_6m",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+        },
+        now - 360_000,
+      );
+
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const [text, severity] = sendPlainAlert.mock.calls[0]!;
+      expect(severity).toBe("error");
+      expect(text).toContain("msg_overdue_6m");
+      expect(text).toContain("ses_b");
+      expect(text).toContain("overdue");
+    });
+
+    it("does NOT alert for an overdue row the arbiter is actively retrying (the 03:00 nightly-reset case)", async () => {
+      // The headline false-alarm guard. During the nightly serve bounce a wake
+      // scheduled for 03:00 sits queued and overdue ON PURPOSE while the
+      // arbiter retries it without charging its attempt budget — the system
+      // working exactly as designed. Alarming there would page at 3am claiming
+      // the delivery loop was stopped, which is false, and a nightly false
+      // alarm is how a real one gets ignored.
+      //
+      // The discriminator is `updated_at`: every retry path bumps it, so a live
+      // loop keeps it fresh. Here the row is 6 minutes overdue but was touched
+      // 1 second ago, so it must stay silent.
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_overdue_but_retrying",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+        },
+        now - 360_000,
+      );
+
+      // Arbiter just rescheduled it (uncounted outage retry), bumping updated_at.
+      storage.swarm.markRetryUncounted("msg_overdue_but_retrying", now - 1_000, 30_000);
+
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("DOES alert once the arbiter stops touching the row (loop genuinely dead)", async () => {
+      // Complement of the test above: same row, same overdue amount, but
+      // nothing has touched it in a long time. That is the condition actually
+      // worth waking someone for.
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_overdue_abandoned",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+        },
+        now - 360_000,
+      );
+      storage.swarm.markRetryUncounted("msg_overdue_abandoned", now - 400_000, 30_000);
+
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      expect(sendPlainAlert.mock.calls[0]![0]).toContain("msg_overdue_abandoned");
+    });
+
+    it("2. same row on a second watchdog cycle -> NO duplicate alert (dedupe works)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_overdue_dedupe",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+        },
+        now - 360_000,
+      );
+
+      await watchdog.processOnce();
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+      // Second cycle
+      fixture.setNow(now + 60_000);
+      await watchdog.processOnce();
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1); // No new alert
+    });
+
+    it("3. a row deliver_at 1 min in the past -> no alert (under 5min threshold)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_overdue_1m",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 60_000, // 1 minute ago < 5 min threshold
+        },
+        now - 60_000,
+      );
+
+      await watchdog.processOnce();
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("4. a row already delivered (handed_off) -> no alert", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(now - 360_000, `<swarm_message v="1" msg_id="msg_handed_off_overdue">`),
+        assistantMessage({ created: now - 350_000, completed: now - 300_000 }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_handed_off_overdue",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+        },
+        now - 360_000,
+      );
+      storage.swarm.markHandedOff("msg_handed_off_overdue", now - 350_000);
+
+      await watchdog.processOnce();
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("5. an expired row -> no alert (pins the state filter)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      storage.swarm.insert(
+        {
+          msgId: "msg_expired_overdue",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake",
+          deliverAt: now - 360_000,
+          expiresAt: now - 180_000,
+        },
+        now - 360_000,
+      );
+      storage.swarm.markExpired("msg_expired_overdue", now - 180_000);
+
+      await watchdog.processOnce();
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
   });
 });

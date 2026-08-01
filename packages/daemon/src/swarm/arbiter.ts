@@ -167,6 +167,11 @@ export class SwarmArbiter {
             msgId: next.msgId,
             replyTo: next.replyTo,
             priority: next.priority,
+            scheduledFor: next.deliverAt,
+            deliveredLateMs:
+              next.deliverAt !== null
+                ? Math.max(0, now - next.deliverAt)
+                : null,
           },
           next.payload,
         );

@@ -77,6 +77,8 @@ export const DEFAULT_STUCK_ALERT_MS = 900_000;
 export const DEFAULT_STUCK_ABORT_SILENCE_MS = 3_600_000;
 /** MAX_REQUEUES */
 export const DEFAULT_MAX_REQUEUES = 3;
+/** OVERDUE_ALERT_MS */
+export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -92,6 +94,7 @@ export interface DeliveryWatchdogOptions {
   stuckAlertMs?: number;
   stuckAbortSilenceMs?: number;
   maxRequeues?: number;
+  overdueAlertMs?: number;
 }
 
 export interface CycleSummary {
@@ -327,6 +330,7 @@ export class DeliveryWatchdog {
   private readonly stuckAlertMs: number;
   private readonly stuckAbortSilenceMs: number;
   private readonly maxRequeues: number;
+  private readonly overdueAlertMs: number;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
   // for this handoff episode. Pruned when the message verifies or goes
@@ -334,6 +338,8 @@ export class DeliveryWatchdog {
   private readonly stuckAlerted = new Set<string>();
   // Dedupe: msg_id -> the no-healthy-serve age alarm has already fired.
   private readonly ageAlarmed = new Set<string>();
+  // Dedupe: msg_id -> the overdue queued alarm has already fired.
+  private readonly overdueAlerted = new Set<string>();
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -352,6 +358,7 @@ export class DeliveryWatchdog {
     this.stuckAbortSilenceMs =
       opts.stuckAbortSilenceMs ?? DEFAULT_STUCK_ABORT_SILENCE_MS;
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
+    this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -400,6 +407,13 @@ export class DeliveryWatchdog {
   private pruneDedupe(msgId: string): void {
     this.stuckAlerted.delete(msgId);
     this.ageAlarmed.delete(msgId);
+    this.overdueAlerted.delete(msgId);
+  }
+
+  private reconcileOverdueDedupe(overdueIds: ReadonlySet<string>): void {
+    for (const msgId of this.overdueAlerted) {
+      if (!overdueIds.has(msgId)) this.overdueAlerted.delete(msgId);
+    }
   }
 
   /**
@@ -447,6 +461,44 @@ export class DeliveryWatchdog {
   private async runCycle(): Promise<CycleSummary> {
     const now = this.nowFn();
     const counts = emptySummary();
+
+    // PLACEMENT IS THE WHOLE POINT:
+    // The overdue-and-still-queued check lives in DeliveryWatchdog, NOT in the
+    // SwarmArbiter tick where an expiry sweeper naturally wants to go. If it
+    // lived in the arbiter, a dead arbiter would mean a dead alarm — the monitor
+    // would die with the thing it monitors and the silence would look like
+    // health. This alarm exists precisely to catch "the delivery loop is not
+    // running", so it must not run inside that loop.
+    //
+    // `listOverdueQueued` also requires a stale `updated_at`, which is what
+    // keeps this from firing every night: during the 03:00 serve bounce a wake
+    // sits queued and overdue on purpose while the arbiter retries it without
+    // charging its budget. See the query for the full argument.
+    const overdueRows = this.storage.swarm.listOverdueQueued(
+      now,
+      this.overdueAlertMs,
+    );
+    this.reconcileOverdueDedupe(new Set(overdueRows.map((r) => r.msgId)));
+    for (const row of overdueRows) {
+      if (!this.overdueAlerted.has(row.msgId)) {
+        this.overdueAlerted.add(row.msgId);
+        counts.alerted++;
+        const overdueMs = now - (row.deliverAt ?? now);
+        await this.alert(
+          "error",
+          `delivery watchdog: msg ${row.msgId} to ${row.toSession ?? "unknown"} ` +
+            `is overdue by ${humanDuration(overdueMs)} (${overdueMs}ms), still queued, ` +
+            `and untouched for at least that long — the arbiter delivery loop ` +
+            `appears to be stopped. This wake will not fire until it is running.`,
+        );
+        this.log("alerted", {
+          msgId: row.msgId,
+          sessionId: row.toSession,
+          reason: "overdue-queued",
+        });
+      }
+    }
+
     const rows = this.storage.swarm.listUnverifiedHandedOff(
       now,
       this.verifyAfterMs,
