@@ -53,9 +53,9 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 |---|---|
 | `@pigeon/daemon` | **892** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
-| `@pigeon/worker` | **292** passed |
+| `@pigeon/worker` | **296** passed |
 
-Total **1490**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1494**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
 
 > **CORRECTION #4 (2026-08-01, start of Cycle 4).** This table said **832 / 1429** until re-measured at
 > the top of Cycle 4. Cycle 3 added 36 daemon tests and the table was not updated — **the fourth time
@@ -1057,11 +1057,32 @@ blast radius but **do not cure the outage**.
 - [ ] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
   today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
   timeout**). Adding a fetch timeout — an obviously reasonable change — silently breaks it.
+> **GATE CHECK, 2026-08-01 — `pigeon-cev` item 3 was already answered, and the dependency arrow
+> between 6b and 6c points the wrong way.** Checked before building anything, and the evidence is
+> strong: direct live curl probes on 2026-07-28 against the real supergroup — *created a topic, posted,
+> closed, posted again, reopened twice, deleted, posted again* — with no flag flip and no pigeon code
+> involved. **An admin bot CAN post into a closed forum topic** (`ok:true`, message delivered).
+>
+> **The correction: 6c does not depend on 6b — 6c *retires* 6b.** 6b exists to classify the failure of
+> a reopen call; 6c deletes the reopen call. If 6c lands there is no reopen failure left to classify
+> and the Checkpoint 2b trade evaporates on its own. `pigeon-cev`'s own closing note said as much
+> ("lower value given finding 3 makes the whole reopen path optional") and it never made it into this
+> ordering. **Do 6c first, then close 6b as moot** — the reverse order does work that 6c throws away.
+
 - [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
   `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
   where *any* generic reopen failure marks the row open and never retries.
+  **Likely moot — see the gate check above. Do 6c first and re-evaluate; expect to close this.**
 - [ ] **6c. Drop the T2.6 reopen-before-send call**, or make it conditional. Proven belt-and-braces —
-  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. Depends on 6b.
+  a bot *can* post into a closed topic — so it spends budget (§3) for nothing. ~~Depends on 6b.~~
+  **Unblocked, and now the highest-value item in this cycle.** The stale comment at
+  `topic-manager.ts:58-59` claiming the question was "Unverified against live Telegram API" is
+  corrected in `d428f74`; the call itself is untouched.
+  **One trade-off still to decide, which is why this was not bundled into the gate check:** the reopen
+  also un-collapses the topic in the Telegram UI. Dropping it means a notification arriving after a
+  session ends lands in a topic that stays visually closed. That is a *visibility* question, not a
+  correctness one — so decide it deliberately rather than discovering it, and consider the conditional
+  form (reopen only when something will actually be read) rather than an unconditional delete.
 - [ ] **6d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
   entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the framing
   message best-effort, so it is now the lossiest part of the command. Needs a different fix shape:
@@ -1084,9 +1105,23 @@ blast radius but **do not cure the outage**.
   the failure class is errors being invisible at the point of failure, reintroduced by a different
   mechanism in the very work meant to fix it. The notification path is fully defended here (reopen,
   `thread_not_found` recovery, non-429 fallback); the webhook confirmation path has none of it.
-  **Gated on `pigeon-cev` item 3** — whether a bot admin can post into a *closed* forum topic. If it
-  can, there is no bug at all. **Verify that before building a fallback**, since building one now
-  means guessing a Telegram behaviour, which this plan has twice refused to do.
+  **GATE RESOLVED 2026-08-01 — the closed-topic half is DEAD, the invisibility half is REAL and is
+  now fixed (`d428f74`).** `pigeon-cev` item 3 answered YES against the live API, so the motivating
+  scenario (session ends → topic closes → user types there → ack vanishes *because the topic is
+  closed*) **cannot happen**. But the mechanism underneath it survived the collapse of its own
+  trigger: `sendTelegramMessage` (`webhook.ts:279`) is `Promise<void>` and **discards** the `TgResult`,
+  while `telegram.ts` `sendMessage` never throws — so any rejected ack, a **429 being the realistic
+  one** against the §3 budget, vanished with no exception and no log.
+  Fixed by making it **observable, not retried**: the wrapper now inspects the result and emits
+  `[webhook ack send failed]` with the failure kind, chat, thread and error detail. The message `text`
+  is deliberately not logged (these acks carry user content).
+  **A retry or General-thread fallback remains deliberately OUT of scope** — it would require the
+  wrapper to stop discarding `TgResult`, changing behaviour across ~22 call sites, which the bead
+  itself flags as riskier than the change that created the problem. The signature and every call site
+  are untouched.
+  **This is the §1.-1 pattern resolving exactly as that hazard predicts:** the deliberate swallow was
+  the whole bug once its dramatic trigger turned out to be fictional, and the fix is to make the
+  outcome measurable rather than to add machinery.
   Note this is the same shape as the Cycle 2 sweep bug in §1.-1: a deliberate swallow that converts a
   hard failure into an invisible one. Whatever is done here, the fix is to make the outcome
   observable, not merely to add a retry.
