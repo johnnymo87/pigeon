@@ -1080,7 +1080,7 @@ blast radius but **do not cure the outage**.
 > the one production takes most often. **6b is now the live Cycle 6 item, and it got more valuable, not
 > less, by 6c being declined.**
 
-- [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly.** Reopening an already-open topic returns
+- [ ] **6b. Classify `TOPIC_NOT_MODIFIED` explicitly — bead `pigeon-c1a` (P2).** Reopening an already-open topic returns
   `400 Bad Request: TOPIC_NOT_MODIFIED` (measured). Classifying it retires the Checkpoint 2b trade
   where *any* generic reopen failure marks the row open and never retries.
   **LIVE and now the top Cycle 6 item** — 6c was declined (see the gate check above), so nothing
