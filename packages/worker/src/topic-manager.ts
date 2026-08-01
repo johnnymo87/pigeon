@@ -74,12 +74,25 @@ export async function resolveTopic(
         if (reopenRes.kind === "thread_not_found") {
           // Closed topic was deleted out-of-band in Telegram -> delete stale D1 row and fall through to recreate
           await deleteTopicBySession(db, opts.sessionId);
-        } else {
-          // Non-429, non-thread_not_found error (e.g. TOPIC_NOT_MODIFIED)
-          // Do not drop notification -> proceed with existing message_thread_id.
-          // Proceeding-with-the-thread and leaving-it-closed are contradictory states.
-          // The sticky-closed row is what arms the reaper, so mark it open now.
+        } else if (reopenRes.kind === "topic_not_modified") {
+          // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
           await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+          return { ok: true, messageThreadId: existing.message_thread_id };
+        } else {
+          // Genuine reopen failure (e.g. Telegram 5xx, transient network error, bot lost can_manage_topics).
+          // Do not call markOpen so the D1 row remains 'closed' and the reopen is retried on subsequent notifications.
+          // Delivery is unaffected because posting into a closed topic works in Telegram.
+          //
+          // Note on reaper/state:
+          // The reaper is double-gated (listReapable requires state='closed' AND closed_at < closedBefore AND the session
+          // row to be missing or stale), so a closed row does not arm the reaper while the session is actively receiving notifications.
+          // Nothing breaks from posting into a row marked closed, as topics.state has no other consumers.
+          //
+          // Accepted residual:
+          // If a reopen failure is permanent (e.g. the bot loses can_manage_topics), leaving the row closed means
+          // every subsequent notification retries a reopen that always fails (~1 wasted API call per notification
+          // against the ~20/min per-group budget). This is an accepted trade-off so delivery is unaffected without
+          // needing a new attempt-count column.
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
       } else {
