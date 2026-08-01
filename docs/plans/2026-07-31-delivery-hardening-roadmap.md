@@ -1119,6 +1119,11 @@ blast radius but **do not cure the outage**.
   wrapper to stop discarding `TgResult`, changing behaviour across ~22 call sites, which the bead
   itself flags as riskier than the change that created the problem. The signature and every call site
   are untouched.
+  **Deployed to Cloudflare 2026-08-01**, worker version `62d7c94a-a32d-40f3-a3a0-71cd823203ce`;
+  `/health` returns ok. The `[vars]` revert trap (`pigeon-cev` item 1) was checked **before** deploying
+  and the deploy output confirms both survived: `TELEGRAM_TOPICS_ENABLED = "true"` and
+  `ALLOWED_CHAT_IDS = "8248645256,-1004391832753"` — **both chat ids still allowed**, which §0 requires
+  until the migration is closed out in 7b.
   **This is the §1.-1 pattern resolving exactly as that hazard predicts:** the deliberate swallow was
   the whole bug once its dramatic trigger turned out to be fictional, and the fix is to make the
   outcome measurable rather than to add machinery.
