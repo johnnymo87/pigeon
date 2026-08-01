@@ -51,11 +51,11 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **889** passed, 1 skipped |
+| `@pigeon/daemon` | **892** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
 | `@pigeon/worker` | **292** passed |
 
-Total **1487**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1490**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
 
 > **CORRECTION #4 (2026-08-01, start of Cycle 4).** This table said **832 / 1429** until re-measured at
 > the top of Cycle 4. Cycle 3 added 36 daemon tests and the table was not updated — **the fourth time
@@ -899,6 +899,53 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   surfacing `8l7` builds should record the real Telegram-side call rate during a drain, which turns
   this from a guess into a measurement. **Do not tune the constant without that data**; picking a
   smaller number by intuition is exactly the move this roadmap has been burned by.
+
+**Review outcome — the fix step earned its keep for the FOURTH cycle running, and the defect was mine.**
+`adversarial-reviewer-fable` found a genuine cross-component defect in `4c` that all six of its new
+tests missed, plus a design error where I contradicted a rule I had written two paragraphs earlier.
+Both fixed in `071ed25`.
+
+- **The real defect: suppression swallowed `Error` and `Retry`, not just stops.** `POST /stop` carries
+  **three** event classes — the plain idle stop, `event: "Error"` from `session.error`, and
+  `event: "Retry"` from a rate-limited `session.status`. The guard fired on **title alone**, ignoring
+  the `event` variable parsed three lines above it. So a crashing lgtm session was silenced, and — the
+  part that makes it more than an oversight — **it was invisible to `4e`'s brand-new counter too**,
+  because a suppressed event never becomes an outbox row at all. The two halves of this cycle
+  combined into a blind spot neither had alone: exactly the roadmap's recurring finding that
+  **the defect that matters lives *between* tasks.** Now suppresses only `event === "Stop"`, and the
+  log line carries `event=` so a grep can tell a quieted completion from a quieted crash.
+  `Retry` is exempt too, deliberately: silence is the expensive failure, and if Retry proves chatty
+  in a rate-limit storm that is a *tuning* question, whereas a swallowed Error is a correctness one.
+  **Note the shape of my error — I had the right principle and applied it too narrowly.** The same
+  entry reasons carefully about exempting `question` so an automation session cannot be "blocked on a
+  human, silently, forever", and a crashed session is that identical hazard.
+- **The design error: the default pattern inverted my own stated rule.** The `4c` correction says to
+  *"bias the pattern toward precision and let the stragglers through"* — and then specified bare
+  case-insensitive `lgtm`, the **recall**-maximizing option. Concrete false positive, from facts in
+  this same file: the dispatcher *does* live in `~/projects/lgtm`, titles are model-generated, so a
+  real session titled *"Fix lgtm dispatcher timeout"* had **every stop suppressed for its entire
+  life**, visible only in a daemon log line and never in Telegram where the user looks — and before
+  the fix above, its crashes too. Default is now `\.lgtm-`; the 2 prose stragglers leak, as the rule
+  prescribes. Verified: real lgtm titles suppress, `"Review PR using LGTM prompt"` and
+  `"Fix lgtm dispatcher timeout"` both deliver.
+- **Also strengthened:** `4e`'s terminal-drop tests asserted only the shape of the log call, so they
+  would have passed had `markTerminal` logged but never called `markFailed`. They now assert DB state.
+- **Confirmed sound** on inspection: `4d`'s 200-with-`ok:false` against every consumer (the 2-minute
+  retry against a permanently-failed row is bounded at ~8 attempts, not a spin loop); `4e`'s
+  seven-site consolidation as behaviour-preserving (`markFailed` uses `COALESCE(?, last_error)`, so
+  passing `undefined` cannot clobber a prior error); and `/outbox/stats` as leaking nothing —
+  `last_error`, which *does* carry response bodies, is deliberately not exposed.
+- **Nits accepted, not fixed:** the uniform drop line reuses the field name `kind` for the entry kind
+  (`stop`/`question`) where one old site used it for the failure kind (`http_error`); `isQuietTitle`
+  recompiles its regex per call (trivial at ~13 stops/hour, though an invalid pattern will log on
+  every stop forever); and `/outbox/stats` would become externally reachable if anyone ever restored a
+  wide `PIGEON_BIND_HOST` bind.
+- **Filed, not fixed — `pigeon-qpm`** (P3): `test/routing/lease-cas-concurrency.test.ts` fails
+  intermittently in the full suite and passes in isolation. **Pre-existing** — untouched since
+  `563cbc7`, an ancestor of this cycle's base — and it did not reproduce on the following run. Kept
+  because an intermittently-failing *concurrency proof* is either an over-strict assertion (harmless
+  but misnamed) or a real lease-CAS race, and the bead says not to loosen the assertion until which
+  one is established.
 
 **Revised execution order, 2026-08-01: `4d` → `4c` → `4e` → (`4f` only if `4e` produces data).**
 `4a` and `4b` are closed by measurement without code. `4d` goes first because it is a few lines, has no
