@@ -51,11 +51,11 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **868** passed, 1 skipped |
-| `@pigeon/opencode-plugin` | **305** passed |
+| `@pigeon/daemon` | **889** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | **306** passed |
 | `@pigeon/worker` | **292** passed |
 
-Total **1465**. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1487**. Updated by Cycle 4 itself (see CORRECTION #4) rather than left for Cycle 5 to discover. **`npm run typecheck` is CLEAN — 0 errors.**
 
 > **CORRECTION #4 (2026-08-01, start of Cycle 4).** This table said **832 / 1429** until re-measured at
 > the top of Cycle 4. Cycle 3 added 36 daemon tests and the table was not updated — **the fourth time
@@ -861,7 +861,25 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   the TTL reasoning that blocks `bvh`. **Do it before `8l7` for the same reason `cn8` comes before
   `8l7`:** there is no point alerting on terminal drops while one class of drop is still reported as a
   success.
-- [ ] **4e. `pigeon-8l7` — promoted: with `4a` refuted, this is the highest-value item in the cycle.**
+- [x] **4e. `pigeon-8l7`** — DONE `d0f0576` + `9357cab`, in two commits.
+  - **`d0f0576` — one choke point.** All **seven** `markFailed` sites in `outbox-sender.ts` now route
+    through a private `markTerminal(...)` that marks the row, does the `reregisteredEntries` cleanup
+    every site used to repeat, and emits one greppable token: **`outbox terminal drop`** with
+    `notificationId`, `sessionId`, `kind`, `reason`, `attempts`, `ageMs`, `lastError`. Before this there
+    was **no single token** covering terminal drops — five different phrasings — and the
+    `payload_empty` path (line ~287) **logged nothing at all**, so one whole class of drop was
+    invisible. The per-site lines were replaced rather than kept, since they duplicated fields the
+    uniform line carries; verified first that **no doc, skill or runbook greps for the old strings.**
+    The `LEAKED worker session row` warning is deliberately preserved.
+  - **`9357cab` — countable from outside.** `GET /outbox/stats` returns counts by state, `failed`
+    broken down by `failed_reason`, and the age of the oldest queued entry. **Aggregates only — no
+    payloads, no tokens, no session ids** — which is what makes it safe on the anonymous allowlist
+    beside `/health`. This is the non-Telegram path: `curl` it during an outage; it reads the `failed`
+    rows Cycle 3's 7-day retention already keeps.
+  **Deliberately NOT built:** a pager, a Telegram alert, or a background alerting daemon. The first
+  depends on the broken channel; the others are a larger design. This delivers the signal and the
+  counter and leaves the consumer to a follow-up.
+  **Original entry, for the reasoning:** — promoted: with `4a` refuted, this is the highest-value item in the cycle.
   No alerting on terminal drops. **The surfacing path must not depend on Telegram**, since Telegram
   being broken is the common cause. It was held behind `4a` for a cycle on a prerequisite that turned
   out to be fictional; the *only* surviving reason to sequence anything before it is `4c` — alerting
