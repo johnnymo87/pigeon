@@ -31,7 +31,7 @@ then the first unchecked cycle in §4. Do not skim §1 — every entry in it cos
 
 | Thing | Value |
 |---|---|
-| Worker version | `5c7381f3-a970-4916-a29f-49a693a3c1ef` |
+| Worker version | `8d8952ad-6471-4384-85f7-4eabb63a0d7e` (2026-08-01, roadmap 6b) |
 | `TELEGRAM_TOPICS_ENABLED` | `"true"` |
 | `ALLOWED_CHAT_IDS` | `8248645256,-1004391832753` — **both, deliberately** |
 | Supergroup | "Pigeon V2", `-1004391832753`, `is_forum: true` |
@@ -1128,6 +1128,18 @@ blast radius but **do not cure the outage**.
   generic-error e2e that pins state-stays-closed **and** reaper-does-not-delete-while-session-fresh,
   which is what makes claim (a) above load-bearing rather than a comment. Both new assertions were
   watched failing against an injected regression.
+  **Deployed to Cloudflare 2026-08-01**, worker version `8d8952ad-6471-4384-85f7-4eabb63a0d7e`;
+  `/health` returns ok. The `[vars]` revert trap was checked **before** deploying and the deploy output
+  confirms both survived: `TELEGRAM_TOPICS_ENABLED = "true"` and
+  `ALLOWED_CHAT_IDS = "8248645256,-1004391832753"` — both chat ids still allowed, as §0 requires until 7b.
+  **Honest limit on production verification, stated rather than papered over.** The usual step
+  ("verify the effect in production") does **not** apply cleanly here. The *common* path
+  (`TOPIC_NOT_MODIFIED` → `markOpen`) behaves **identically** before and after this change — that is the
+  point of the fix. The only externally different behaviour is on a *genuine* reopen failure, which is
+  rare by construction and cannot be induced without revoking the bot's rights against the live
+  supergroup. So there is no short-term production signal to look for, and claiming one would be
+  CORRECTION #6's error running in reverse: manufacturing confirmation instead of admitting the window
+  is empty. The evidence for this change is the injected-regression test run, not a log line.
 - [x] **6c. Drop the T2.6 reopen-before-send call — DECLINED 2026-08-01, deliberately. No code.**
   The call *is* belt-and-braces for delivery (a bot can post into a closed topic regardless), but it is
   **load-bearing for visibility**: it un-collapses the topic so a notification arriving after a session
