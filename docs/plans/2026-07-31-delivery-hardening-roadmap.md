@@ -570,7 +570,22 @@ garbage but clears none of the 153 rows already there, and the backstop makes it
 > collapse of its own justification, in a re-scoped form aimed at the hazard the measurement actually
 > exposed. Discovering that a deadline is fake is a reason to re-aim the work, not to drop it.
 
-### Cycle 3 — the age and attempt budget
+### Cycle 3 — the age and attempt budget — DONE (PR #18, merged `eafba12`)
+
+**Deployed to cloudbox 2026-07-31 and verified by effect, not by absence of errors** (§1.-1): the
+additive migration applied to the LIVE DB — `retry_count`, `failed_reason` and `last_error` are all
+present on the production `outbox` table and existing rows backfilled to `retry_count = 0` — daemon
+healthy, no migration errors in the journal. The migration having run is itself the proof the new code
+is live, since nothing else creates those columns. A pre-deploy DB backup was taken via the
+`better-sqlite3` backup API (`/tmp/opencode/pigeon-daemon-pre-cycle3.db`) rather than a file copy, so
+it is consistent against a running writer.
+
+**Still undeployed on devbox and macbook** — both were unreachable from cloudbox again at deploy time
+(`devbox` does not resolve, the `mac` reverse tunnel refuses on 127.0.0.1:2222). Their `git pull &&
+npm install` plus restart must be run on those hosts. Beads `pigeon-bqo` and `pigeon-8e9` are closed
+on the strength of the cloudbox deploy.
+
+
 
 Both beads are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
@@ -665,17 +680,26 @@ swallowed by the duplicate-column guard.
 
 Follow-ups filed rather than inlined:
 
-- **`pigeon-93v`** (P2) — `/question-asked` early-returns `deliveryState: "queued"` for a row that is
-  actually `failed`, and never calls `upsert`. 3a's 7-day retention widens that lying window from 1h
-  to **7 days**. It also means **3b is card-only in practice**: questions never reach the resurrection
-  arm, and stop ids are timestamp-unique so they never collide. Note the trap recorded on the bead —
-  resurrecting a question must also reset the `pending_questions` clock, or 3e's own 4h grounding
-  delivers something unanswerable.
+- **`pigeon-93v`** (P2) and **`pigeon-bvh`** (P3) — `/question-asked` early-returns
+  `deliveryState: "queued"` for a row that is actually `failed`, and never calls `upsert`. Split into
+  an honesty half and a resurrection half after measuring; both are placed in Cycle 4. It also means
+  **3b is card-only in practice**: questions never reach the resurrection arm, and stop ids are
+  timestamp-unique so they never collide.
+
+  > **CORRECTION (2026-07-31, same day).** This entry originally claimed 3a's 7-day retention
+  > "widens that lying window from 1h to 7 days". **The arithmetic is right and the conclusion was
+  > wrong; I withdraw it.** Measured afterwards: every re-send path completes within **120 seconds**
+  > (the plugin's question queue has a hard `maxRetryMs = 120_000`), while the old retention was
+  > **1 hour** — already 30x longer than the longest path. So the old window never protected anything
+  > and the new one is **inert** here. The claim was plausible, cheap to check, and I asserted it in a
+  > bead and a commit message before checking. Same lesson as §1.7: a mechanism that *sounds* causal
+  > is not evidence that it *is*.
 - **`pigeon-m74`** (P3) — the governor's "12 leaves 8 headroom" is asserted, not measured, and counts
   the wrong unit: one chunk call can cost more than one Telegram message (lazy `createForumTopic`, and
   the General-fallback path sends twice), while acks, wizard edits and media are invisible to it.
   Bounded by the reactive 429 pause, so the worst case is oscillatory drain rather than loss.
   **Measure a real post-outage drain before changing the constant** — do not guess a smaller number.
+  Placed in Cycle 4 next to the alerting work, since that is what will produce the measurement.
 
 Accepted deliberately, not filed: the governor window and `pausedUntil` are in-memory and reset on
 daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
@@ -715,10 +739,40 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   `morning-agent` has the same problem and cannot be filtered by directory either (it runs in
   `~/projects/workstation`, a real work dir). Corral to one shared topic or suppress outright; the
   user leans suppress and would accept corralling.
-- [ ] **4d. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
+- [ ] **4d. `pigeon-93v`** (P2) — **do this BEFORE `8l7`, it is the cheapest real fix left in the
+  roadmap.** `/question-asked` (`app.ts:479-484`) early-returns for an existing outbox row without
+  inspecting its state, so a `failed` row is reported as `"queued"`. The reason that matters more than
+  it sounds: **the lie is load-bearing.** The plugin's question retry queue treats `"queued"` as
+  *success* (`question-queue.ts:49-54`) and drops the entry (`:163-169`) — so the daemon's false
+  reassurance is exactly what makes the loss permanent, by telling the one component that would have
+  retried not to. The path is also **completely silent**: unlike its stop twin at `app.ts:386` it logs
+  nothing, which is why 7 days of journald containing 687 outbox lines could not have recorded it.
+  This is §1.-1's shape again — a swallow turning a hard failure invisible — except here it turns a
+  failure into a reported *success*. Returning `"failed"` and logging is a few lines and needs none of
+  the TTL reasoning that blocks `bvh`. **Do it before `8l7` for the same reason `cn8` comes before
+  `8l7`:** there is no point alerting on terminal drops while one class of drop is still reported as a
+  success.
+- [ ] **4e. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
   Telegram**, since Telegram being broken is the common cause. **Do this last in the cycle**: it is
   the same argument as `4a` versus `8l7`, applied to `4c` — alerting before the amplifiers are gone
   means the first thing the new alerting does is page about noise that should not exist.
+- [ ] **4f. `pigeon-m74`** (P3) — **evidence-gated; do not schedule it, let `4e` produce it.** Cycle 3's
+  drain governor assumes 12 chunk-sends/min leaves ~8/min of the §3 budget spare, but it counts its own
+  invocations rather than Telegram-side messages: one chunk call can cost more (lazy
+  `createForumTopic`; the General-fallback path sends twice), and acks, wizard edits and media are
+  invisible to it entirely. Bounded by the reactive 429 pause, so the failure mode is oscillatory
+  drain, not loss. It is placed here because **`4e` is the instrument** — whatever non-Telegram
+  surfacing `8l7` builds should record the real Telegram-side call rate during a drain, which turns
+  this from a guess into a measurement. **Do not tune the constant without that data**; picking a
+  smaller number by intuition is exactly the move this roadmap has been burned by.
+
+Deferred out of this cycle: **`pigeon-bvh`** (P3, blocked on `4d`) — actually resurrecting the failed
+question row rather than merely reporting it honestly. It carries a trap that makes it worth its own
+slot rather than a rider on `4d`: Cycle 3 grounded question expiry in `PENDING_QUESTION_TTL_MS` on the
+argument that an expired question is *provably unanswerable*, so resurrecting the outbox row without
+also refreshing the `pending_questions` clock would hand the user a question they cannot answer —
+defeating the reasoning that justifies the expiry design. `pending_questions` is keyed by `session_id`
+with `INSERT OR REPLACE`, which constrains the options.
 
 ### Cycle 5 — the server side (the track this roadmap was missing)
 
