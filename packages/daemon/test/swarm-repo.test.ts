@@ -410,7 +410,13 @@ describe("SwarmRepository", () => {
       const s = createStorage();
 
       type TerminalState = "handed_off" | "failed" | "expired" | "cancelled";
-      type TransitionName = "markHandedOff" | "markRetry" | "markFailed" | "markCancelled" | "markExpired";
+      type TransitionName =
+        | "markHandedOff"
+        | "markRetry"
+        | "markFailed"
+        | "markCancelled"
+        | "markExpired"
+        | "requeueForRecovery";
 
       const terminalStates: TerminalState[] = ["handed_off", "failed", "expired", "cancelled"];
       const transitions: Array<{
@@ -422,6 +428,7 @@ describe("SwarmRepository", () => {
         { name: "markFailed", apply: (id) => s.swarm.markFailed(id, 2_000) },
         { name: "markCancelled", apply: (id) => s.swarm.markCancelled(id, 2_000) },
         { name: "markExpired", apply: (id) => s.swarm.markExpired(id, 2_000) },
+        { name: "requeueForRecovery", apply: (id) => s.swarm.requeueForRecovery(id, 2_000, 5_000) },
       ];
 
       for (const startState of terminalStates) {
@@ -440,12 +447,15 @@ describe("SwarmRepository", () => {
           }
           expect(s.swarm.getByMsgId(msgId)!.state).toBe(startState);
 
-          const isWatchdogException = startState === "handed_off" && t.name === "markFailed";
+          const isWatchdogException =
+            startState === "handed_off" &&
+            (t.name === "markFailed" || t.name === "requeueForRecovery");
           const res = t.apply(msgId);
 
           if (isWatchdogException) {
             expect(res).toBe(true);
-            expect(s.swarm.getByMsgId(msgId)!.state).toBe("failed");
+            const expectedState = t.name === "markFailed" ? "failed" : "queued";
+            expect(s.swarm.getByMsgId(msgId)!.state).toBe(expectedState);
           } else {
             expect(res).toBe(false);
             expect(s.swarm.getByMsgId(msgId)!.state).toBe(startState);

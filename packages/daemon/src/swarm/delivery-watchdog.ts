@@ -17,6 +17,23 @@ import { notifySenderOfFailure } from "./notify-sender";
 // Injected client contract
 // ---------------------------------------------------------------------------
 
+/** True when `kind === "wake"` or `kind.startsWith("wake.")`. */
+export function isWakeKind(kind: string): boolean {
+  return kind === "wake" || kind.startsWith("wake.");
+}
+
+/**
+ * Recovery (requeue/abort ladder) is suppressed for both scheduled messages
+ * (`deliverAt !== null`) and wake-kind messages (`wake` / `wake.*`).
+ * Scheduled-ness is the mechanism (scheduled targets are idle by definition)
+ * and `wake.*` is the label; either is sufficient.
+ */
+export function isSuppressedFromRecovery(
+  row: Pick<SwarmMessageRecord, "kind" | "deliverAt">,
+): boolean {
+  return isWakeKind(row.kind) || row.deliverAt !== null;
+}
+
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
   getSessionMessages(sessionId: string): Promise<unknown[]>;
@@ -406,10 +423,12 @@ export class DeliveryWatchdog {
    * own alert budget anyway, so reconciling it away here just makes that
    * intent actually happen.
    *
-   * The remaining case — and the bug this exists to fix — is the row being
-   * deleted out from under us by the 7-day `cleanupOlderThan` retention
-   * sweep without ever resolving through (a) or (b). That leaves a
-   * dedupe entry with no corresponding row at all, and reconciling against
+    * The remaining case — and the bug this exists to fix — is the row being
+    * deleted out from under us without ever resolving through (a) or (b).
+    * Note: swarm retention (`swarm.cleanupOlderThan`) is NOT currently
+    * wired, so permanently-unverified rows persist indefinitely in storage.
+    * Reconciling against "not in this cycle's eligible set" catches entries
+    * whose row was deleted or moved.
    * "not in this cycle's eligible set" catches it the same way.
    *
    * Rows that are alive but simply too young (handed_off more recently than
@@ -610,6 +629,35 @@ export class DeliveryWatchdog {
     return false;
   }
 
+  /**
+   * Helper for suppressing recovery (requeue/abort) on wake / scheduled messages.
+   * Handles alerting if blocked past threshold and logs skip. Always returns `false`.
+   */
+  private async suppressWakeRecovery(
+    row: SwarmMessageRecord,
+    sessionId: string,
+    now: number,
+    counts: CycleSummary,
+    severity: AlertSeverity,
+    reason: string,
+    alertText: string,
+  ): Promise<boolean> {
+    const blockedAge = now - (row.handedOffAt ?? now);
+    if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
+      this.stuckAlerted.add(row.msgId);
+      counts.alerted++;
+      await this.alert(severity, alertText);
+      this.log("alerted", { msgId: row.msgId, sessionId, reason });
+    }
+    counts.skipped++;
+    this.log("skipped", {
+      msgId: row.msgId,
+      sessionId,
+      reason: "wake-suppress-requeue",
+    });
+    return false;
+  }
+
   private async evaluateRow(
     row: SwarmMessageRecord,
     messages: ParsedMessage[],
@@ -625,6 +673,18 @@ export class DeliveryWatchdog {
     if (anchor === null) {
       // The 2xx lied (or the write was lost) — our prompt never made it
       // into the transcript at all.
+      if (isSuppressedFromRecovery(row)) {
+        const blockedAge = now - (row.handedOffAt ?? now);
+        return this.suppressWakeRecovery(
+          row,
+          sessionId,
+          now,
+          counts,
+          "error",
+          "lost-wake-unverified",
+          `delivery watchdog: prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`,
+        );
+      }
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
@@ -649,6 +709,18 @@ export class DeliveryWatchdog {
     if (!blocking) {
       // Session is idle — our prompt is sitting there but nothing ever ran
       // it. Nothing to abort.
+      if (isSuppressedFromRecovery(row)) {
+        const blockedAge = now - (row.handedOffAt ?? now);
+        return this.suppressWakeRecovery(
+          row,
+          sessionId,
+          now,
+          counts,
+          "warning",
+          "idle-wake-unverified",
+          `delivery watchdog: wake msg ${row.msgId} to ${sessionId} handed off ${blockedAge}ms (${humanDuration(blockedAge)}) ago and remains unverified (expected for idle target)`,
+        );
+      }
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
@@ -662,6 +734,15 @@ export class DeliveryWatchdog {
     }
 
     if (row.abortedAt !== null) {
+      if (isSuppressedFromRecovery(row)) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "wake-suppress-stuck-after-recovery",
+        });
+        return false;
+      }
       // We already used our one recovery attempt (abort+redeliver) for this
       // message, and after redelivery it's stuck again. Give up.
       if (interventionAlreadyUsed) {
@@ -697,9 +778,12 @@ export class DeliveryWatchdog {
       counts.alerted++;
       const fresh = silence <= this.stuckAbortSilenceMs;
       const label = fresh ? "ACTIVE" : "SILENT";
+      const recoveryNote = isSuppressedFromRecovery(row)
+        ? " (recovery suppressed)"
+        : "";
       await this.alert(
         "warning",
-        `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})`,
+        `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})${recoveryNote}`,
       );
       this.log("alerted", {
         msgId: row.msgId,
@@ -711,6 +795,16 @@ export class DeliveryWatchdog {
     if (silence <= this.stuckAbortSilenceMs) {
       counts.skipped++;
       this.log("skipped", { msgId: row.msgId, sessionId, reason: "waiting" });
+      return false;
+    }
+
+    if (isSuppressedFromRecovery(row)) {
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "wake-suppress-abort",
+      });
       return false;
     }
 
@@ -729,14 +823,23 @@ export class DeliveryWatchdog {
     reason: string,
   ): Promise<boolean> {
     if (row.requeueCount < this.maxRequeues) {
-      this.storage.swarm.requeueForRecovery(
+      const requeued = this.storage.swarm.requeueForRecovery(
         row.msgId,
         now,
         RECOVERY_REQUEUE_DELAY_MS,
       );
-      counts.requeued++;
-      this.log("requeued", { msgId: row.msgId, sessionId, reason });
-      return true;
+      if (requeued) {
+        counts.requeued++;
+        this.log("requeued", { msgId: row.msgId, sessionId, reason });
+        return true;
+      }
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "requeue-failed",
+      });
+      return false;
     }
 
     this.storage.swarm.markFailed(row.msgId, now);
