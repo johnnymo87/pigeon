@@ -67,6 +67,7 @@ export class OutboxRepository {
            next_retry_at = NULL,
            failed_reason = NULL,
            last_error = NULL,
+           created_at = excluded.created_at,
            updated_at = excluded.updated_at
          WHERE outbox.state = 'failed'`,
       )

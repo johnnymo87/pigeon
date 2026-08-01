@@ -65,11 +65,12 @@ describe("OutboxRepository", () => {
     // Simulate sending state
     storage.db.prepare("UPDATE outbox SET state = 'sending' WHERE notification_id = ?").run("notif-1");
 
-    // Second upsert should not reset sending state
+    // Second upsert should not reset sending state or update created_at
     storage.outbox.upsert(BASE_INPUT, 2_000);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("sending");
+    expect(record!.createdAt).toBe(1_000);
 
     storage.db.close();
   });
@@ -80,11 +81,12 @@ describe("OutboxRepository", () => {
     storage.outbox.upsert(BASE_INPUT, 1_000);
     storage.outbox.markSent("notif-1", 2_000);
 
-    // Second upsert should not reset sent state
+    // Second upsert should not reset sent state or update created_at
     storage.outbox.upsert(BASE_INPUT, 3_000);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("sent");
+    expect(record!.createdAt).toBe(1_000);
 
     storage.db.close();
   });
@@ -180,14 +182,18 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("resets failed entries (including failedReason and lastError) to queued on re-upsert", () => {
+  it("resets failed entries (including failedReason and lastError) to queued on re-upsert and updates created_at", () => {
     const storage = createStorage();
 
-    storage.outbox.upsert(BASE_INPUT, 1_000);
-    storage.outbox.markFailed("notif-1", 2_000, "budget_exhausted", "HTTP 500");
+    const initialTime = 1_000;
+    const failTime = 2_000;
+    const resurrectTime = 1_000 + 20 * 60 * 1000; // 20 minutes later (past 15m expiration)
 
-    // Re-upsert of a failed notification should reset to queued
-    storage.outbox.upsert(BASE_INPUT, 3_000);
+    storage.outbox.upsert(BASE_INPUT, initialTime);
+    storage.outbox.markFailed("notif-1", failTime, "budget_exhausted", "HTTP 500");
+
+    // Re-upsert of a failed notification should reset to queued and update created_at
+    storage.outbox.upsert(BASE_INPUT, resurrectTime);
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("queued");
@@ -195,11 +201,33 @@ describe("OutboxRepository", () => {
     expect(record!.nextRetryAt).toBeNull();
     expect(record!.failedReason).toBeNull();
     expect(record!.lastError).toBeNull();
-    expect(record!.updatedAt).toBe(3_000);
+    expect(record!.createdAt).toBe(resurrectTime);
+    expect(record!.updatedAt).toBe(resurrectTime);
 
-    // Should now be ready
-    const ready = storage.outbox.getReady(3_000, 10);
+    // Should now be ready at resurrectTime
+    const ready = storage.outbox.getReady(resurrectTime, 10);
     expect(ready).toHaveLength(1);
+
+    storage.db.close();
+  });
+
+  it("resurrected entry sorts to back of ready list based on refreshed created_at", () => {
+    const storage = createStorage();
+
+    // Entry 1 created at t=1000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-1" }, 1_000);
+    // Entry 2 created at t=2000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-2" }, 2_000);
+
+    // Entry 1 fails at t=3000
+    storage.outbox.markFailed("notif-1", 3_000, "budget_exhausted");
+
+    // Entry 1 is resurrected at t=4000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "notif-1" }, 4_000);
+
+    // ready order should now be notif-2 (created at 2000), then notif-1 (created at 4000)
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["notif-2", "notif-1"]);
 
     storage.db.close();
   });

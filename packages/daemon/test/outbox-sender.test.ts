@@ -264,6 +264,34 @@ describe("OutboxSender.processOnce()", () => {
     expect(record!.failedReason).toBe("budget_exhausted");
   });
 
+  it("resurrected failed entry older than 15m gets fresh created_at and is actually sent instead of dropped", async () => {
+    const initialCreatedAt = 1_000;
+    // Entry originally created at t=1,000 and fails at t=2,000
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, initialCreatedAt);
+    storage.outbox.markFailed("notif-1", 2_000, "budget_exhausted", "Max attempts reached");
+
+    // 20 minutes later (past 15 min max age), entry is resurrected via upsert
+    const resurrectTime = initialCreatedAt + 20 * 60 * 1000;
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, resurrectTime);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => resurrectTime,
+    });
+
+    await sender.processOnce();
+
+    // After resurrection, processOnce SHOULD attempt send rather than dropping it as expired
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("sent");
+    expect(record!.createdAt).toBe(resurrectTime);
+  });
+
   it("marks terminal failure on payload JSON parse error and records reason and error", async () => {
     const now = 5_000;
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: "invalid-json{" }, 1_000);
