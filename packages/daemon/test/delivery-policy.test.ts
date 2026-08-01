@@ -274,8 +274,8 @@ describe("isTransportFailure", () => {
     expect(isTransportFailure({ ok: false, kind: "http_error", status: 404 })).toBe(false);
   });
 
-  it("returns false for app_rejection", () => {
-    expect(isTransportFailure({ ok: false, kind: "app_rejection", status: 200, body: { ok: false } })).toBe(false);
+  it("returns true for app_rejection", () => {
+    expect(isTransportFailure({ ok: false, kind: "app_rejection", status: 200, body: { ok: false } })).toBe(true);
   });
 
   it("returns false for success result", () => {

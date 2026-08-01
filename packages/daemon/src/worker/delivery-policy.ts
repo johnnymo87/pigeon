@@ -33,14 +33,20 @@ function getTelegramErrorCode(body: unknown): number | undefined {
 
 /**
  * Returns true if the delivery/registration failure was caused by a transport outage,
- * worker 5xx error, or worker rate limit (429).
+ * worker 5xx error, worker rate limit (429), or application rejection (2xx ok:false).
  *
- * Such failures indicate the transport or worker infrastructure is down or busy,
- * NOT that this specific message is defective. Rescheduling a transport failure
- * must NOT charge the message an attempt against its MAX_ATTEMPTS budget.
+ * Such failures indicate the transport or worker infrastructure is down, busy, or experiencing
+ * an ambiguous application state, NOT that this specific message is defective.
+ * Rescheduling a transport/transient failure must NOT charge the message an attempt
+ * against its MAX_ATTEMPTS budget.
+ *
+ * Asymmetry principle: a wrong "retry" costs a few attempts out of a bounded budget (and
+ * escalates backoff via retry_count); a wrong "terminal" is permanent data loss.
+ * app_rejection (2xx carrying ok:false) is currently unreachable in notification delivery,
+ * but is treated as transport/transient to align with the re-registration failure path.
  */
 export function isTransportFailure(result: WorkerResult): boolean {
-  if (result.kind === "transport_error") {
+  if (result.kind === "transport_error" || result.kind === "app_rejection") {
     return true;
   }
   if (result.kind === "http_error") {
