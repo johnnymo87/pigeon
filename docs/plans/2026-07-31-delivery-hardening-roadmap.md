@@ -51,11 +51,17 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **790** passed, 1 skipped |
+| `@pigeon/daemon` | **832** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **305** passed |
-| `@pigeon/worker` | **279** passed |
+| `@pigeon/worker` | **292** passed |
 
-Total **1374**. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1429**. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **CORRECTION #3 (2026-07-31, start of Cycle 3).** This table said **790 / 305 / 279 = 1374** until
+> re-measured at the top of Cycle 3. Cycles 1 and 2 added tests and the table was never updated —
+> **the third time in three cycles that a carried-forward count was wrong.** Re-measuring took 90
+> seconds and is now the first action of every cycle. Treat any number in this file that you did not
+> personally measure this session as unverified.
 
 > **CORRECTION #2 (2026-07-31, start of Cycle 1).** This table said **792 / 1376** until re-measured at
 > the top of Cycle 1. It was stale: Cycle 0's `9a792c9` deleted the dead `buildCardNotification` tests,
@@ -566,7 +572,7 @@ garbage but clears none of the 153 rows already there, and the backstop makes it
 
 ### Cycle 3 — the age and attempt budget
 
-Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
+Both beads are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
 - [ ] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
   than `MAX_AGE_MS` (15 min) or 10 attempts. Same budget that makes the migration rollback dangerous
@@ -574,6 +580,70 @@ Both items are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sid
 - [ ] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
   anything older than 15 min returns to `queued`, is instantly judged too old, and re-fails having
   sent nothing — with `attempts` still 0, so the journal line reads like it never tried.
+
+**Verified at the top of the cycle (all four claims confirmed against source, plus two additions):**
+the terminal check at `outbox-sender.ts:159` runs **before** the payload parse and before any send, so
+Cycle 1's classifier — which already returns `retry` for `transport_error` and 5xx — **can never veto
+it**. That is precisely why Cycle 1 did not fix `bqo`. Backoff sums to **13.75 min** over 10 attempts,
+so both caps bite together and the attempts cap binds first by a hair.
+
+Two things the roadmap did not know:
+
+- **The `pause` arm charges an attempt.** `outbox-sender.ts:248` calls `markRetry` *before* setting
+  `pausedUntil`, so every 429 burns one message's attempt budget even though a 429 says nothing about
+  that message. This is latent today and becomes severe the moment a backlog exists — which is
+  exactly what fixing `bqo` creates. **It must be fixed before, or with, the age cap.**
+- **`OUTBOX_RETENTION_MS` is 1 hour**, and `cleanupOlderThan` deletes `failed` as well as `sent`. In
+  the 2-hour incident the record of what was lost was **deleted before the outage ended**. Measured
+  the production outbox during planning: 5 rows, all `sent`. There is no dead-letter anywhere, so
+  today a dropped notification is both unrecoverable *and* unauditable.
+
+**Design (oracle-fable consulted; it argued me out of my opening position).** I intended to delete the
+age cap outright on the Cycle 1 principle that *terminal status must be justified by determinism, not
+by budget*. That principle is right but the conclusion was wrong: **staleness is real, not a budget
+excuse.** A 4-hour-old question is not merely old, it is *unanswerable* — `PENDING_QUESTION_TTL_MS`
+has already expired it. So the cap stays and is instead **grounded in affordance TTLs**, which makes
+expiry deterministic rather than budgetary: a message dies when delivery can no longer function.
+
+- **Per-kind expiry** replaces the flat 15 min: `question` **4h** (`PENDING_QUESTION_TTL_MS`),
+  `stop`/`card` **24h** (`REPLY_TOKEN_TTL_MS` — after which reply routing is dead anyway). The
+  2-hour incident survives comfortably.
+- **Attempts becomes cause-aware.** `transport_error`, 5xx and 429 stop incrementing it, so
+  `attempts` finally means "the path was up and this message failed anyway" — a genuine per-message
+  signal, which is what makes `attempts >= MAX_ATTEMPTS` a *deterministic* terminal rather than a
+  budget one.
+- **The 24h cap is itself the growth bound** (a never-heals scenario holds ≤24h of notifications).
+  No depth cap and no dead-letter table: **`failed` rows with 7-day retention are the dead letter**,
+  which also satisfies §1.-1's "measurable from outside the process" requirement — a `sqlite3` query
+  on `failed_reason` is observable without trusting a log line.
+- **A drain governor** is required, not optional. Post-outage the loop would otherwise push 60/min
+  (5 entries per 5s tick) into a **20/min** group ceiling (§3), producing sustained 429s. Counts
+  **chunks**, not entries, since `sendNotification` is per-chunk.
+
+**Dedup blocker checked before committing to the 24h horizon:** worker dedup is a `messages` lookup
+by `notification_id` (`notifications.ts:209`) and those rows are deleted only on session unregister
+or the 14-day sweep. Retention therefore outlives a 24h retry horizon, so the longer window cannot
+resurface as duplicate delivery.
+
+**Order matters and is not arbitrary — 3e last.** It is the change that creates large backlogs, so
+3c and 3d must already be in place or the first drain both floods the group and burns messages
+through the 429-charges-an-attempt bug.
+
+- [ ] **3a. Observability first** — add `failed_reason` / `last_error`, populate at every `markFailed`
+  site (including line 159 and the parse-failure path, which today record *no reason at all*), and
+  split retention: `sent` 1h, `failed` 7d. Zero behaviour change; it is the safety net for 3b–3e.
+- [ ] **3b. `pigeon-8e9`** — reset `created_at` in the `ON CONFLICT` clause. Tiny and independent.
+- [ ] **3c. Cause-aware attempts** — `countAttempt` on `markRetry`; transport/5xx/429 do not charge.
+  **This alone extends outage survival from ~14 min to the age cap** and fixes the pause-arm bug.
+- [ ] **3d. Drain governor** — chunk-counting sliding window, ~12/min, leaving headroom for wizard
+  edits, media and topic management. Inert until a backlog exists, so safe to land before 3e.
+- [ ] **3e. Per-kind expiry replaces `MAX_AGE_MS`** — reason `expired`. Also rewrite the `MAX_PAUSE_MS`
+  comment at line 47, whose stated rationale ("could exceed MAX_AGE_MS 15m") dies with the flat cap;
+  keep the 5-minute probe ceiling, which is still correct for a different reason.
+
+Deferred rather than dropped: stop-kind newest-first ordering during drain, coalescing stale
+per-session notifications, and an "N dropped during the outage" summary. File as beads, do not
+inline.
 
 ### Cycle 4 — remove the amplifier, then alert on what remains
 
