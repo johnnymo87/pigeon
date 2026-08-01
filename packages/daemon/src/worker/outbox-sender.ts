@@ -57,6 +57,15 @@ const BACKOFF_SCHEDULE = [5_000, 10_000, 30_000, 60_000, 120_000];
  */
 export const MAX_PAUSE_MS = 5 * 60 * 1000;
 
+/**
+ * Proactive rate governor limit: max sendNotification calls within 60 seconds.
+ * Telegram supergroups cap bot messages at ~20/min shared globally across all producers
+ * (outbox stop/question notifications, wizard edits, webhook acks, media, topic management).
+ * Setting this to 12 leaves ~8 messages/min headroom for other producers.
+ */
+export const OUTBOX_RATE_LIMIT = 12;
+export const OUTBOX_RATE_WINDOW_MS = 60_000;
+
 export function formatWorkerError(result: WorkerResult): string {
   if (result.kind === "transport_error") {
     return result.error;
@@ -106,6 +115,11 @@ export class OutboxSender {
    * next delivery attempt will receive another 429 and re-establish pausedUntil.
    */
   private pausedUntil = 0;
+
+  /**
+   * Timestamps (ms) of sendNotification calls within the rate governor sliding window.
+   */
+  private sendTimestamps: number[] = [];
 
   /**
    * Set of notificationIds that have already attempted re-registration.
@@ -171,6 +185,24 @@ export class OutboxSender {
       const entries = this.storage.outbox.getReady(now, 5);
 
       batchLoop: for (const entry of entries) {
+        const now = this.nowFn();
+
+        // Prune send timestamps older than 60 seconds
+        const windowStart = now - OUTBOX_RATE_WINDOW_MS;
+        this.sendTimestamps = this.sendTimestamps.filter((t) => t > windowStart);
+
+        // Proactive rate governor check before starting an entry.
+        // Checking per-entry (rather than between chunks) prevents torn messages where chunk 1 is sent
+        // but chunks 2-3 are deferred. An entry with multiple chunks may overshoot the limit slightly,
+        // which is an intended trade-off and why OUTBOX_RATE_LIMIT sits well below the Telegram group cap (20/min).
+        if (this.sendTimestamps.length >= OUTBOX_RATE_LIMIT) {
+          this.log("outbox rate governor limit reached, deferring remaining entries", {
+            countInWindow: this.sendTimestamps.length,
+            limit: OUTBOX_RATE_LIMIT,
+          });
+          break batchLoop;
+        }
+
         const age = now - entry.createdAt;
 
         // Check terminal conditions
@@ -232,6 +264,7 @@ export class OutboxSender {
           for (let i = 0; i < messages.length; i++) {
             const isLast = i === messages.length - 1;
             const msg = messages[i]!;
+            this.sendTimestamps.push(this.nowFn());
             const result = await this.sendNotification({
               sessionId: entry.sessionId,
               chatId: this.chatId,

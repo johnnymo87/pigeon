@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
-import { chunkNotificationId, OutboxSender } from "../src/worker/outbox-sender";
+import { chunkNotificationId, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -1616,5 +1616,175 @@ describe("classified delivery failure actions", () => {
     expect(record3.state).toBe("sent");
     expect(sendNotification).toHaveBeenCalledTimes(3);
     expect(record3.attempts).toBe(2); // 2 retries on 2 failed attempts
+  });
+});
+
+describe("OutboxSender rate governor", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("stops sending after reaching OUTBOX_RATE_LIMIT within sliding window (a)", async () => {
+    for (let i = 0; i < 15; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-gov-${i}`,
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(OUTBOX_RATE_LIMIT);
+    const remainingCount = storage.outbox.getReady(now, 100).length;
+    expect(remainingCount).toBe(3);
+  });
+
+  it("advances window and resumes delivery when nowFn moves past 60s (b)", async () => {
+    for (let i = 0; i < 15; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-gov-${i}`,
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(12);
+
+    now += OUTBOX_RATE_WINDOW_MS + 1_000;
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    expect(storage.outbox.getReady(now, 100).length).toBe(0);
+  });
+
+  it("counts chunks rather than outbox entries (c)", async () => {
+    for (let i = 0; i < 5; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-chunk3-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-chunk3-${i}`,
+        }),
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(12);
+    expect(storage.outbox.getReady(5_000, 100).length).toBe(1);
+  });
+
+  it("never tears an entry: per-entry governor check sends all chunks of a started entry (d)", async () => {
+    for (let i = 0; i < 3; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-multichunk-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-multichunk-${i}`,
+        }),
+      }, 1_000);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    for (let i = 0; i < 3; i++) {
+      const rec = storage.outbox.getByNotificationId(`notif-multichunk-${i}`);
+      expect(rec!.state).toBe("sent");
+    }
+  });
+
+  it("starvation guard: entry with more chunks than limit sends against empty window (e)", async () => {
+    const messages = Array.from({ length: 15 }, (_, i) => ({ text: `msg-${i}` }));
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-large-1",
+      payload: JSON.stringify({
+        messages,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-large-1",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    const rec = storage.outbox.getByNotificationId("notif-large-1");
+    expect(rec!.state).toBe("sent");
+  });
+
+  it("normal low-volume operation is completely unaffected (f)", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-low-1" }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-low-2" }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(storage.outbox.getByNotificationId("notif-low-1")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("notif-low-2")!.state).toBe("sent");
   });
 });
