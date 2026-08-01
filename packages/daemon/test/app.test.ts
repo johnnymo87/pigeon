@@ -45,6 +45,38 @@ describe("createApp", () => {
     expect(await response.json()).toEqual({ ok: true, service: "pigeon-daemon" });
   });
 
+  it("GET /outbox/stats returns outbox aggregate stats", async () => {
+    const app = newApp(10_000);
+
+    storage!.outbox.upsert({
+      notificationId: "notif-1",
+      sessionId: "sess-1",
+      requestId: "req-1",
+      kind: "question",
+      payload: "{}",
+      token: "tok-1",
+    }, 2_000);
+
+    storage!.outbox.upsert({
+      notificationId: "notif-2",
+      sessionId: "sess-1",
+      requestId: "req-2",
+      kind: "stop",
+      payload: "{}",
+      token: "tok-2",
+    }, 5_000);
+    storage!.outbox.markFailed("notif-2", 6_000, "expired");
+
+    const response = await app(new Request("http://localhost/outbox/stats"));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      states: { queued: 1, sending: 0, sent: 0, failed: 1 },
+      failedReasons: { expired: 1 },
+      oldestQueuedAgeMs: 8_000,
+    });
+  });
+
   it("returns not found for unknown routes", async () => {
     const app = newApp();
     const response = await app(new Request("http://localhost/nope"));

@@ -5,10 +5,12 @@
 export function checkAuth(request: Request, url: URL, authToken: string | undefined): Response | null {
   if (!authToken) return null;
 
-  // Anonymous allowlist: EXACTLY GET /health is permitted without auth for liveness probing.
-  // Health checks leak no state ({ ok: true, service: "pigeon-daemon" }) and are required
-  // by process managers / load balancers that do not carry authorization tokens.
-  const isAnonymousAllowed = request.method === "GET" && url.pathname === "/health";
+  // Anonymous allowlist: GET /health and GET /outbox/stats are permitted without auth.
+  // Health checks and stats leak no sensitive state ({ ok: true } or aggregate counts only)
+  // and are required by monitoring/alerting probes that do not carry authorization tokens.
+  const isAnonymousAllowed =
+    request.method === "GET" &&
+    (url.pathname === "/health" || url.pathname === "/outbox/stats");
   if (isAnonymousAllowed) return null;
 
   const header = request.headers.get("authorization") ?? "";

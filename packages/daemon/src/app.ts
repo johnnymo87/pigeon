@@ -154,6 +154,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         return Response.json({ ok: true, service: "pigeon-daemon" });
       }
 
+      if (request.method === "GET" && url.pathname === "/outbox/stats") {
+        return Response.json(storage.outbox.getStats(nowFn()));
+      }
+
       if (request.method === "POST" && url.pathname === "/alert") {
         const body = await readJsonBody(request);
         const text = typeof body.text === "string" ? body.text : "";

@@ -19,6 +19,12 @@ export interface OutboxRecord {
   updatedAt: number;
 }
 
+export interface OutboxStats {
+  states: Record<string, number>;
+  failedReasons: Record<string, number>;
+  oldestQueuedAgeMs: number | null;
+}
+
 export interface UpsertOutboxInput {
   notificationId: string;
   sessionId: string;
@@ -178,5 +184,54 @@ export class OutboxRepository {
       )
       .run(sentCutoff, failedCutoff);
     return result.changes;
+  }
+
+  /**
+   * Return aggregate outbox statistics:
+   * - counts by outbox state
+   * - breakdown of failed rows by failed_reason
+   * - age in ms of the oldest currently-queued entry (null when none)
+   */
+  getStats(now = Date.now()): OutboxStats {
+    const states: Record<string, number> = {
+      queued: 0,
+      sending: 0,
+      sent: 0,
+      failed: 0,
+    };
+
+    const stateRows = this.db
+      .prepare("SELECT state, COUNT(*) as count FROM outbox GROUP BY state")
+      .all() as Array<{ state: string; count: number }>;
+    for (const row of stateRows) {
+      states[row.state] = Number(row.count);
+    }
+
+    const failedReasons: Record<string, number> = {};
+    const failedRows = this.db
+      .prepare(
+        "SELECT COALESCE(failed_reason, 'unknown') as reason, COUNT(*) as count FROM outbox WHERE state = 'failed' GROUP BY reason",
+      )
+      .all() as Array<{ reason: string; count: number }>;
+    for (const row of failedRows) {
+      failedReasons[row.reason] = Number(row.count);
+    }
+
+    const oldestRow = this.db
+      .prepare(
+        "SELECT MIN(created_at) as min_created_at FROM outbox WHERE state = 'queued'",
+      )
+      .get() as { min_created_at: number | null } | undefined;
+
+    const oldestQueuedAgeMs =
+      oldestRow && oldestRow.min_created_at !== null
+        ? Math.max(0, now - Number(oldestRow.min_created_at))
+        : null;
+
+    return {
+      states,
+      failedReasons,
+      oldestQueuedAgeMs,
+    };
   }
 }

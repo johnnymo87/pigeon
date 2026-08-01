@@ -113,6 +113,18 @@ describe("Daemon Auth", () => {
     expect(body).toEqual({ ok: true, service: "pigeon-daemon" });
   });
 
+  it("10. Outbox stats open anonymously with token set: GET /outbox/stats -> 200", async () => {
+    const app = newApp("secret");
+    const response = await app(new Request("http://localhost/outbox/stats"));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      states: { queued: 0, sending: 0, sent: 0, failed: 0 },
+      failedReasons: {},
+      oldestQueuedAgeMs: null,
+    });
+  });
+
   it("6. Control route protected: GET /route?session_id=ses_x with token set + no header -> 401; with correct header -> not 401", async () => {
     const app = newApp("secret");
     
