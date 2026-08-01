@@ -9,6 +9,9 @@ export interface EnvelopeFields {
   msgId: string;
   replyTo: string | null;
   priority: Priority;
+  scheduledFor?: number | null;
+  deliveredLateMs?: number | null;
+  ref?: string | null;
 }
 
 function escAttr(value: string): string {
@@ -66,6 +69,26 @@ export function renderEnvelope(
   if (fields.replyTo !== null)
     attrs.push(`reply_to="${escAttr(fields.replyTo)}"`);
   attrs.push(`priority="${escAttr(fields.priority)}"`);
+  // Finite-guarded for the same reason as `delivered_late_ms` below:
+  // `new Date(NaN).toISOString()` throws a RangeError, and a throw from here
+  // that is not a PermanentDeliveryError is classified by the arbiter as an
+  // ordinary retryable failure, so one corrupt timestamp would burn the
+  // message's whole attempt budget. SQLite is dynamically typed, so a bad
+  // `deliver_at` is not unreachable.
+  if (fields.scheduledFor != null && Number.isFinite(fields.scheduledFor))
+    attrs.push(`scheduled_for="${escAttr(new Date(fields.scheduledFor).toISOString())}"`);
+  // Finite-guard is not paranoia: `BigInt(NaN)` throws a RangeError, and a
+  // throw from here that is NOT a PermanentDeliveryError would be classified by
+  // the arbiter as an ordinary retryable failure, so a single bad timestamp
+  // would burn the message's whole attempt budget for no reason.
+  if (fields.deliveredLateMs != null && Number.isFinite(fields.deliveredLateMs)) {
+    const ms = Math.max(0, Math.floor(fields.deliveredLateMs));
+    // String() on an integer below 1e21 never yields exponent notation, and a
+    // lateness in milliseconds cannot realistically approach that.
+    attrs.push(`delivered_late_ms="${String(ms)}"`);
+  }
+  if (fields.ref != null)
+    attrs.push(`ref="${escAttr(fields.ref)}"`);
 
   return `<swarm_message ${attrs.join(" ")}>\n${payload}\n${CLOSE_TAG}`;
 }

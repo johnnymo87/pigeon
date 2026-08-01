@@ -2,37 +2,13 @@ import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
 import { notifySenderOfFailure } from "./notify-sender";
+import {
+  isWakeKind,
+  isSuppressedFromRecovery,
+  formatWakePayloadAlert,
+} from "./delivery-policy";
 
-/**
- * The delivery watchdog verifies that a message the arbiter marked
- * `handed_off` (2xx from `prompt_async`) actually caused an assistant run to
- * start. A serve can accept the HTTP request while its runner is wedged
- * behind an unrelated in-flight turn — the user row lands in the transcript,
- * but nobody ever reads it. This module periodically re-checks unverified
- * handoffs and escalates: alert -> abort the blocking turn + redeliver ->
- * terminal failure (after a bounded number of recovery attempts).
- */
-
-// ---------------------------------------------------------------------------
-// Injected client contract
-// ---------------------------------------------------------------------------
-
-/** True when `kind === "wake"` or `kind.startsWith("wake.")`. */
-export function isWakeKind(kind: string): boolean {
-  return kind === "wake" || kind.startsWith("wake.");
-}
-
-/**
- * Recovery (requeue/abort ladder) is suppressed for both scheduled messages
- * (`deliverAt !== null`) and wake-kind messages (`wake` / `wake.*`).
- * Scheduled-ness is the mechanism (scheduled targets are idle by definition)
- * and `wake.*` is the label; either is sufficient.
- */
-export function isSuppressedFromRecovery(
-  row: Pick<SwarmMessageRecord, "kind" | "deliverAt">,
-): boolean {
-  return isWakeKind(row.kind) || row.deliverAt !== null;
-}
+export { isWakeKind, isSuppressedFromRecovery };
 
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
@@ -77,6 +53,8 @@ export const DEFAULT_STUCK_ALERT_MS = 900_000;
 export const DEFAULT_STUCK_ABORT_SILENCE_MS = 3_600_000;
 /** MAX_REQUEUES */
 export const DEFAULT_MAX_REQUEUES = 3;
+/** OVERDUE_ALERT_MS */
+export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -92,6 +70,12 @@ export interface DeliveryWatchdogOptions {
   stuckAlertMs?: number;
   stuckAbortSilenceMs?: number;
   maxRequeues?: number;
+  /**
+   * Threshold for the overdue-still-queued alarm. Constructor-only on purpose:
+   * unlike its siblings there is no env knob yet, because nothing has needed to
+   * tune it. Tests use it to drive the clock.
+   */
+  overdueAlertMs?: number;
 }
 
 export interface CycleSummary {
@@ -327,6 +311,7 @@ export class DeliveryWatchdog {
   private readonly stuckAlertMs: number;
   private readonly stuckAbortSilenceMs: number;
   private readonly maxRequeues: number;
+  private readonly overdueAlertMs: number;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
   // for this handoff episode. Pruned when the message verifies or goes
@@ -334,6 +319,8 @@ export class DeliveryWatchdog {
   private readonly stuckAlerted = new Set<string>();
   // Dedupe: msg_id -> the no-healthy-serve age alarm has already fired.
   private readonly ageAlarmed = new Set<string>();
+  // Dedupe: msg_id -> the overdue queued alarm has already fired.
+  private readonly overdueAlerted = new Set<string>();
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -352,6 +339,7 @@ export class DeliveryWatchdog {
     this.stuckAbortSilenceMs =
       opts.stuckAbortSilenceMs ?? DEFAULT_STUCK_ABORT_SILENCE_MS;
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
+    this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -400,6 +388,13 @@ export class DeliveryWatchdog {
   private pruneDedupe(msgId: string): void {
     this.stuckAlerted.delete(msgId);
     this.ageAlarmed.delete(msgId);
+    this.overdueAlerted.delete(msgId);
+  }
+
+  private reconcileOverdueDedupe(overdueIds: ReadonlySet<string>): void {
+    for (const msgId of this.overdueAlerted) {
+      if (!overdueIds.has(msgId)) this.overdueAlerted.delete(msgId);
+    }
   }
 
   /**
@@ -447,6 +442,54 @@ export class DeliveryWatchdog {
   private async runCycle(): Promise<CycleSummary> {
     const now = this.nowFn();
     const counts = emptySummary();
+
+    // PLACEMENT IS THE WHOLE POINT:
+    // The overdue-and-still-queued check lives in DeliveryWatchdog, NOT in the
+    // SwarmArbiter tick where an expiry sweeper naturally wants to go. If it
+    // lived in the arbiter, a dead arbiter would mean a dead alarm — the monitor
+    // would die with the thing it monitors and the silence would look like
+    // health. This alarm exists precisely to catch "the delivery loop is not
+    // running", so it must not run inside that loop.
+    //
+    // `listOverdueQueued` also requires a stale `updated_at`, which is what
+    // keeps this from firing every night: during the 03:00 serve bounce a wake
+    // sits queued and overdue on purpose while the arbiter retries it without
+    // charging its budget. See the query for the full argument.
+    const overdueRows = this.storage.swarm.listOverdueQueued(
+      now,
+      this.overdueAlertMs,
+    );
+    this.reconcileOverdueDedupe(new Set(overdueRows.map((r) => r.msgId)));
+    for (const row of overdueRows) {
+      if (!this.overdueAlerted.has(row.msgId)) {
+        this.overdueAlerted.add(row.msgId);
+        counts.alerted++;
+        const overdueMs = now - (row.deliverAt ?? now);
+        // Report these SEPARATELY. They are only equal when nothing touched
+        // the row since before its delivery time. In the likelier crash shape
+        // — the arbiter retried through a two-hour outage and then died five
+        // minutes ago — the row is overdue by 2h but untouched for 5min, and
+        // collapsing them into one number would state something false. The
+        // gap between the two is also the useful diagnostic: it says how long
+        // delivery was being attempted before it stopped.
+        const untouchedMs = now - row.updatedAt;
+        await this.alert(
+          "error",
+          `delivery watchdog: msg ${row.msgId} to ${row.toSession ?? "unknown"} ` +
+            `is still queued, overdue by ${humanDuration(overdueMs)} (${overdueMs}ms) ` +
+            `and untouched for ${humanDuration(untouchedMs)} (${untouchedMs}ms) — ` +
+            `nothing is retrying it, so the arbiter delivery loop appears to be ` +
+            `stopped or wedged for this target. This wake will not fire until ` +
+            `delivery resumes.`,
+        );
+        this.log("alerted", {
+          msgId: row.msgId,
+          sessionId: row.toSession,
+          reason: "overdue-queued",
+        });
+      }
+    }
+
     const rows = this.storage.swarm.listUnverifiedHandedOff(
       now,
       this.verifyAfterMs,
@@ -550,10 +593,14 @@ export class DeliveryWatchdog {
             this.storage.swarm.markFailed(row.msgId, now);
             counts.terminal++;
             this.pruneDedupe(row.msgId);
-            await this.alert(
-              "error",
-              `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`,
-            );
+            const alertText = isSuppressedFromRecovery(row)
+              ? formatWakePayloadAlert(
+                  row,
+                  `session ${sessionId} no longer exists on opencode-serve`,
+                  "delivery watchdog: session no longer exists",
+                )
+              : `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`;
+            await this.alert("error", alertText);
             notifySenderOfFailure(
               this.storage,
               row,
@@ -675,6 +722,12 @@ export class DeliveryWatchdog {
       // into the transcript at all.
       if (isSuppressedFromRecovery(row)) {
         const blockedAge = now - (row.handedOffAt ?? now);
+        const reason = `prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`;
+        const alertText = formatWakePayloadAlert(
+          row,
+          reason,
+          "delivery watchdog: prompt lost and unverified",
+        );
         return this.suppressWakeRecovery(
           row,
           sessionId,
@@ -682,7 +735,7 @@ export class DeliveryWatchdog {
           counts,
           "error",
           "lost-wake-unverified",
-          `delivery watchdog: prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`,
+          alertText,
         );
       }
       if (interventionAlreadyUsed) {

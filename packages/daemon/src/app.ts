@@ -227,6 +227,7 @@ interface AppOptions {
   machineId?: string;
   router?: IngressRouter;
   authToken?: string;
+  isSchedulerRunning?: () => boolean;
 }
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
@@ -299,6 +300,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       }
 
       if (request.method === "POST" && url.pathname === "/swarm/schedule") {
+        if (options.isSchedulerRunning && !options.isSchedulerRunning()) {
+          return Response.json(
+            {
+              error:
+                "scheduler is not running on this daemon (no opencode URL and no ingress router), " +
+                "so a scheduled message could never be delivered; refusing to accept it rather " +
+                "than banking a wake that will silently never fire",
+            },
+            { status: 503 },
+          );
+        }
         const body = await readJsonBody(request);
         const parsed = parseSwarmSendBody(body, "wake");
         if (!parsed.ok) return parsed.response;

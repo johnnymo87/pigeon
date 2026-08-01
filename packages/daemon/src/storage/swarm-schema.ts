@@ -1,3 +1,4 @@
+import { DEFAULT_EXPIRY_MS } from "../swarm/schedule-time";
 import type BetterSqlite3 from "better-sqlite3";
 
 export const SWARM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -75,6 +76,27 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
         ON swarm_messages(state, verified_at, handed_off_at);
       CREATE INDEX IF NOT EXISTS idx_swarm_scheduled
         ON swarm_messages(state, deliver_at);
+    `);
+
+    // Backfill a terminal clock onto scheduled rows banked BEFORE `expires_at`
+    // got its default. Without this, the first night after deploy is exactly
+    // the bug this feature exists to fix: an already-queued wake has
+    // `expires_at IS NULL`, so the arbiter's outage exemption (which is gated
+    // on the presence of a terminal clock) does not apply to it, and it burns
+    // the old ~324s attempt budget against the restarting serve pool at 03:00.
+    // The rows that motivated the fix would have been the ones it missed.
+    //
+    // Deliberately unguarded and safe to re-run: it only ever touches rows that
+    // have no clock at all, and every post-deploy scheduled row is written with
+    // one (parseScheduleTime defaults it). `deliver_at IS NOT NULL` keeps it off
+    // ordinary /swarm/send rows, which are meant to have no expiry — giving them
+    // one would silently opt them into unbounded uncounted retries.
+    db.exec(`
+      UPDATE swarm_messages
+      SET expires_at = deliver_at + ${DEFAULT_EXPIRY_MS}
+      WHERE state = 'queued'
+        AND deliver_at IS NOT NULL
+        AND expires_at IS NULL
     `);
 
     if (!hadVerifiedAtBeforeMigration) {

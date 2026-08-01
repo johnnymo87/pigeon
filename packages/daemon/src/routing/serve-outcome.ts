@@ -57,6 +57,26 @@ export class RequestTimeoutError extends Error {
   }
 }
 
+/**
+ * Wraps a transport-layer fetch failure (ECONNREFUSED, DNS failure, socket
+ * reset) so callers can classify it by TYPE rather than by matching message
+ * text. Same rationale as {@link RequestTimeoutError} above.
+ *
+ * Lives HERE rather than next to the client that throws it for two reasons:
+ * `opencode-client.ts` already imports from this module, so defining it there
+ * and importing it back would be a cycle; and {@link transportCode} below must
+ * unwrap it, which it can only do with `instanceof` if the class is local.
+ *
+ * The original error is preserved as `cause` — unwrapping it is load-bearing,
+ * see {@link transportCode}.
+ */
+export class TransportError extends Error {
+  constructor(cause: Error) {
+    super(`Transport error: ${cause.message}`, { cause });
+    this.name = "TransportError";
+  }
+}
+
 export type ServeOutcome =
   | "success"
   /** Connection refused — the port is closed. Counts. */
@@ -77,12 +97,25 @@ export interface OutcomeObservation {
   error?: unknown;
 }
 
-/** Node's fetch wraps transport failures as `TypeError` with a `cause` carrying `code`. */
+/**
+ * Node's fetch wraps transport failures as `TypeError` with a `cause` carrying
+ * `code`.
+ *
+ * The unwrap step is LOAD-BEARING, not defensive. `OpencodeClient` wraps
+ * transport throws in {@link TransportError} so the swarm arbiter can tell
+ * "never reached the serve" from "the serve answered badly". That wrap buries
+ * the original `TypeError` one level down, and without unwrapping here an
+ * ECONNREFUSED would extract no code, classify as `unknown` instead of
+ * `refused`, and — since `unknown` never counts toward the verdict — a serve
+ * whose port is closed would never be evicted from the routing pool. A test
+ * pins the wrapped shape; do not delete it.
+ */
 function transportCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) {
+  const unwrapped = error instanceof TransportError ? error.cause : error;
+  if (typeof unwrapped !== "object" || unwrapped === null) {
     return undefined;
   }
-  const cause = (error as { cause?: unknown }).cause;
+  const cause = (unwrapped as { cause?: unknown }).cause;
   const code = (cause as { code?: unknown } | undefined)?.code;
   return typeof code === "string" ? code : undefined;
 }

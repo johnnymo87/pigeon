@@ -1,5 +1,26 @@
-import { RequestTimeoutError, type OutcomeObservation } from "./routing/serve-outcome";
+import {
+  RequestTimeoutError,
+  TransportError,
+  type OutcomeObservation,
+} from "./routing/serve-outcome";
 import { resolveServeAuthHeader, invalidateServeAuthHeader } from "./serve-auth";
+
+export class OpencodeHttpError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+
+  constructor(status: number, statusText: string, message?: string) {
+    super(message ?? `HTTP ${status} ${statusText}`);
+    this.name = "OpencodeHttpError";
+    this.status = status;
+    this.statusText = statusText;
+  }
+}
+
+// Re-exported for callers that classify failures from this client. Defined in
+// ./routing/serve-outcome because that module must `instanceof` it and this
+// module already imports from there.
+export { TransportError };
 
 interface OpencodeClientOptions {
   baseUrl: string;
@@ -89,8 +110,9 @@ export class OpencodeClient {
           this.observe({ error: timeout });
           throw timeout;
         }
-        this.observe({ error: err as Error });
-        throw err;
+        const transportErr = new TransportError(err as Error);
+        this.observe({ error: transportErr });
+        throw transportErr;
       } finally {
         clearTimeout(timer);
       }
@@ -224,7 +246,11 @@ export class OpencodeClient {
     });
 
     if (!response.ok) {
-      throw new Error(`sendPrompt failed: ${response.status} ${response.statusText}`);
+      throw new OpencodeHttpError(
+        response.status,
+        response.statusText,
+        `sendPrompt failed: ${response.status} ${response.statusText}`,
+      );
     }
   }
 

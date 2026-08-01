@@ -207,6 +207,57 @@ describe("TelegramNotificationService", () => {
   });
 });
 
+describe("TelegramNotificationService.sendPlainAlert timeout", () => {
+  it("rejects rather than hanging forever when the socket stalls", async () => {
+    // Regression guard. SwarmArbiter awaits this while holding the target's
+    // `inflight` slot, which is released in a `.finally()`. A promise that
+    // never settles therefore wedges ALL swarm delivery to that session
+    // permanently -- no rejection means no retry, and silence reads as
+    // success. DeliveryWatchdog awaits it under its `processing` guard, so the
+    // same stalled socket would also freeze the overdue alarm whose whole job
+    // is to notice that delivery has stalled.
+    //
+    // A try/catch cannot help: the failure mode is a promise that never
+    // settles, not one that rejects. Only a bound does.
+    //
+    // Same hazard and same fix as pigeon-h21 in opencode-client.ts.
+    vi.useFakeTimers();
+    try {
+      // Never resolves on its own; only the AbortSignal can end it.
+      const fetchMock = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new Error("aborted")),
+            );
+          }),
+      ) as unknown as typeof fetch;
+
+      const service = new TelegramNotificationService(
+        {} as any,
+        "bot-token",
+        "8248645256",
+        () => 2_000,
+        fetchMock,
+      );
+
+      const pending = service.sendPlainAlert("hello", "error");
+      // Surface the rejection immediately so the runtime cannot flag it as an
+      // unhandled rejection while we advance the clock.
+      const settled = pending.then(
+        () => "resolved",
+        (err: unknown) => String(err),
+      );
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(await settled).toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("formatQuestionWizardStep", () => {
   const questions: QuestionInfoData[] = [
     { question: "Which DB?", header: "Database", options: [

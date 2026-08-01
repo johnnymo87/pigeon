@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_EXPIRY_MS,
   parseDuration,
   parseScheduleTime,
   type ParseScheduleInput,
@@ -57,49 +58,49 @@ describe("parseScheduleTime", () => {
       name: "valid after duration in seconds",
       input: { after: "30s", now: NOW },
       expectedDeliverAt: NOW + 30_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 30_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid after duration in minutes",
       input: { after: "90m", now: NOW },
       expectedDeliverAt: NOW + 5_400_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 5_400_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid after duration in hours",
       input: { after: "13h", now: NOW },
       expectedDeliverAt: NOW + 46_800_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 46_800_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid after duration in days",
       input: { after: "2d", now: NOW },
       expectedDeliverAt: NOW + 172_800_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 172_800_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid at with Z timezone",
       input: { at: "2026-08-01T13:00:00Z", now: NOW },
       expectedDeliverAt: NOW + 3_600_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 3_600_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid at with offset (+02:00)",
       input: { at: "2026-08-01T15:00:00+02:00", now: NOW },
       expectedDeliverAt: NOW + 3_600_000,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 3_600_000 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid at with fractional seconds",
       input: { at: "2026-08-01T13:00:00.123Z", now: NOW },
       expectedDeliverAt: NOW + 3_600_000 + 123,
-      expectedExpiresAt: null,
+      expectedExpiresAt: NOW + 3_600_000 + 123 + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid at with real leap day 2028-02-29",
       input: { at: "2028-02-29T00:00:00Z", now: new Date("2028-02-28T12:00:00Z").getTime() },
       expectedDeliverAt: new Date("2028-02-29T00:00:00Z").getTime(),
-      expectedExpiresAt: null,
+      expectedExpiresAt: new Date("2028-02-29T00:00:00Z").getTime() + 6 * 60 * 60 * 1000,
     },
     {
       name: "valid expiresIn present measured from deliverAt",
@@ -120,6 +121,23 @@ describe("parseScheduleTime", () => {
       }
     },
   );
+
+  it("Requirement 8: Default expiry: scheduling without expiresIn yields expiresAt === deliverAt + 6h; explicit expiresIn still wins", () => {
+    const noExpiresIn = parseScheduleTime({ after: "1h", now: NOW });
+    expect(noExpiresIn.ok).toBe(true);
+    if (noExpiresIn.ok) {
+      expect(noExpiresIn.deliverAt).toBe(NOW + 3_600_000);
+      expect(noExpiresIn.expiresAt).toBe(noExpiresIn.deliverAt + DEFAULT_EXPIRY_MS);
+      expect(DEFAULT_EXPIRY_MS).toBe(6 * 60 * 60 * 1000);
+    }
+
+    const explicitExpiresIn = parseScheduleTime({ after: "1h", expiresIn: "2h", now: NOW });
+    expect(explicitExpiresIn.ok).toBe(true);
+    if (explicitExpiresIn.ok) {
+      expect(explicitExpiresIn.deliverAt).toBe(NOW + 3_600_000);
+      expect(explicitExpiresIn.expiresAt).toBe(explicitExpiresIn.deliverAt + 2 * 3_600_000);
+    }
+  });
 
   it("explicitly verifies expiresIn is measured from deliverAt, not from now", () => {
     const result = parseScheduleTime({

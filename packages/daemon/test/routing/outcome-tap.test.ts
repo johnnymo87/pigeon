@@ -17,7 +17,7 @@
  * So: assert the plumbing, end to end, at both boundaries.
  */
 import { describe, expect, it, vi } from "vitest";
-import { OpencodeClient } from "../../src/opencode-client";
+import { OpencodeClient, TransportError } from "../../src/opencode-client";
 import { OpencodeClientFactory } from "../../src/routing/client-factory";
 import {
   RequestTimeoutError,
@@ -75,7 +75,8 @@ describe("OpencodeClient outcome tap", () => {
     await client.healthCheck();
 
     expect(seen).toHaveLength(1);
-    expect(seen[0]!.error).toBe(refused);
+    expect(seen[0]!.error).toBeInstanceOf(TransportError);
+    expect((seen[0]!.error as TransportError).cause).toBe(refused);
   });
 
   it("reports an abort as a typed RequestTimeoutError, not a bare Error", async () => {
