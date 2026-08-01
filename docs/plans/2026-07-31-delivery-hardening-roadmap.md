@@ -722,14 +722,48 @@ so its existence is the proof the new code is running — the same trick Cycle 3
 No schema migration was needed this cycle (`getStats` only reads), so the deploy was low-risk.
 Journal clean after restart: 0 errors, 0 exceptions, no `invalid PIGEON_QUIET_TITLE_PATTERN`.
 
-**One honest gap in the verification.** The 4c suppression has **not** yet been positively confirmed in
-production: no lgtm session has completed a turn since the restart, so no `[stop] quieted` line exists
-yet. What *is* confirmed is the dangerous direction — a real work session's stop (`kafka-to-bq
-at-least-once`) was **delivered** normally, so the pattern is not over-matching, and the three lgtm
-outbox rows present all predate the restart by minutes. 230 of 390 local sessions match the stricter
-`\.lgtm-` default but only 1 was active in the preceding 30 minutes. **To close this out, confirm a
-quieted line appears on the next lgtm review turn:**
-`sudo journalctl -u pigeon-daemon -S '-1 h' | grep '\[stop\] quieted'`.
+> **CORRECTION #6 (2026-08-01, hours after deploy) — I declared a verification gap that was really an
+> under-sampled measurement, and the user caught it. The re-check then found a real defect.**
+> I reported "no lgtm turn has completed since restart, so suppression is unconfirmed". **Wrong on
+> both halves.** Seven `[stop] quieted` lines existed. I had grepped a **9-minute window sampled
+> immediately after the restart**, found zero, and generalised that to a standing claim instead of
+> re-running it later. This is §1.7's shape pointed at my own instrumentation: *absence of evidence in
+> a window too short to contain the event is not evidence of absence.* When a check comes back empty,
+> establish that the window could have contained a positive before reporting the negative.
+>
+> **The re-check found the actual bug: the shipped `\.lgtm-` default was under-catching in
+> production.** A delivered stop read `label=Review PR with lgtm-review-prompt` — **no leading dot**,
+> so it leaked. Measured properly across **181 distinct live session titles** (59 mentioning lgtm),
+> scoring recall against real-work-ON-lgtm probes that must NOT be suppressed:
+>
+> | default pattern | caught | false positives |
+> |---|---|---|
+> | `\.lgtm-` (shipped) | 44/59 — **74.6%** | none |
+> | `lgtm-(review\|gather)-prompt` | 48/59 — 81.4% | none |
+> | **`lgtm-(review\|gather)-prompt\|lgtm[ -]prompt`** (now default, `4444b60`) | 57/59 — **96.6%** | **none** |
+> | bare `lgtm` (original) | 59/59 — 100% | **4** |
+>
+> **The adversarial reviewer's precision argument was right in direction and I over-corrected on the
+> wrong evidence.** I justified `\.lgtm-` with "57 of 110 vs 59 of 110", measured on **topic names**
+> (`dir · title`) rather than on the **title** the guard actually receives at runtime. Right instinct,
+> wrong string. The tuned pattern is strictly better than both earlier attempts — it dominates the
+> shipped one on recall at identical (zero) false-positive cost — because requiring a hyphen or space
+> before `prompt` is what keeps *"Fix lgtm dispatcher timeout"* and *"Fix lgtm-run timer flake"*
+> deliverable.
+>
+> Two titles are still deliberately missed: `LGTM for PR #3944` and `LGTM auto-reviews on reviewer
+> add`. Both are ambiguous and the second is probably genuine work *on* lgtm. **A false positive
+> silently hides real work, so ambiguity resolves toward delivering.**
+>
+> **Generalisable lesson, and it is not "measure first" — I did measure.** I measured the *available*
+> string instead of the *operative* one, and never re-measured after deploy when the real string was
+> finally observable. Pair every classifier with a post-deploy check of what it actually caught and
+> missed in production; a tuning constant validated only against pre-deploy proxies is a guess wearing
+> a measurement's clothes.
+
+**Post-deploy verification, corrected.** Suppression **is** confirmed live: 7 quieted lines, all
+carrying `event=Stop` as designed. The dangerous direction is confirmed too — a real work session's
+stop (`kafka-to-bq at-least-once`) was **delivered**, and none of the real-work-on-lgtm probes match.
 
 **Still undeployed on devbox and macbook**, as with Cycle 3 — both were unreachable from cloudbox
 (`devbox` does not resolve; the `mac` tunnel refuses on 127.0.0.1:2222). Their `git pull && npm install`
