@@ -574,10 +574,10 @@ garbage but clears none of the 153 rows already there, and the backstop makes it
 
 Both beads are the same `MAX_AGE_MS` / attempts mechanism seen from opposite sides.
 
-- [ ] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
+- [x] **3a. `pigeon-bqo`** — the outbox permanently drops entries once the worker path is down longer
   than `MAX_AGE_MS` (15 min) or 10 attempts. Same budget that makes the migration rollback dangerous
   (runbook F1).
-- [ ] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
+- [x] **3b. `pigeon-8e9`** — `upsert` resurrects a `failed` row **without resetting `created_at`**, so
   anything older than 15 min returns to `queued`, is instantly judged too old, and re-fails having
   sent nothing — with `attempts` still 0, so the journal line reads like it never tried.
 
@@ -629,15 +629,15 @@ resurface as duplicate delivery.
 3c and 3d must already be in place or the first drain both floods the group and burns messages
 through the 429-charges-an-attempt bug.
 
-- [ ] **3a. Observability first** — add `failed_reason` / `last_error`, populate at every `markFailed`
+- [x] **3a. Observability first** (`3d93258`) — add `failed_reason` / `last_error`, populate at every `markFailed`
   site (including line 159 and the parse-failure path, which today record *no reason at all*), and
   split retention: `sent` 1h, `failed` 7d. Zero behaviour change; it is the safety net for 3b–3e.
-- [ ] **3b. `pigeon-8e9`** — reset `created_at` in the `ON CONFLICT` clause. Tiny and independent.
-- [ ] **3c. Cause-aware attempts** — `countAttempt` on `markRetry`; transport/5xx/429 do not charge.
+- [x] **3b. `pigeon-8e9`** (`17c57c1`) — reset `created_at` in the `ON CONFLICT` clause. Tiny and independent.
+- [x] **3c. Cause-aware attempts** (`f2fd28e`) — `countAttempt` on `markRetry`; transport/5xx/429 do not charge.
   **This alone extends outage survival from ~14 min to the age cap** and fixes the pause-arm bug.
-- [ ] **3d. Drain governor** — chunk-counting sliding window, ~12/min, leaving headroom for wizard
+- [x] **3d. Drain governor** (`5966ef7`) — chunk-counting sliding window, ~12/min, leaving headroom for wizard
   edits, media and topic management. Inert until a backlog exists, so safe to land before 3e.
-- [ ] **3e. Per-kind expiry replaces `MAX_AGE_MS`** — reason `expired`. Also rewrite the `MAX_PAUSE_MS`
+- [x] **3e. Per-kind expiry replaces `MAX_AGE_MS`** (`47eacd7`) — reason `expired`. Also rewrite the `MAX_PAUSE_MS`
   comment at line 47, whose stated rationale ("could exceed MAX_AGE_MS 15m") dies with the flat cap;
   keep the 5-minute probe ceiling, which is still correct for a different reason.
 
