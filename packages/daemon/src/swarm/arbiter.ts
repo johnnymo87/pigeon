@@ -109,8 +109,20 @@ export class SwarmArbiter {
           next.payload,
         );
         await client.sendPrompt(target, directory, prompt);
-        this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
-        this.log("delivered", { msgId: next.msgId, target });
+        const handedOff = this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
+        if (!handedOff) {
+          const current = this.storage.swarm.getByMsgId(next.msgId);
+          this.log("delivered mid-flight race (cancel lost to delivery)", {
+            msgId: next.msgId,
+            target,
+            currentState: current?.state,
+          });
+          if (current?.state === "cancelled") {
+            this.storage.swarm.markHandedOffAfterCancel(next.msgId, this.nowFn());
+          }
+        } else {
+          this.log("delivered", { msgId: next.msgId, target });
+        }
       } catch (err) {
         // Permanent errors can never succeed on retry (e.g. the payload
         // contains the literal close tag). Fail fast instead of burning

@@ -376,6 +376,86 @@ describe("SwarmRepository", () => {
       s.db.close();
     });
 
+    it("C1: markRetry returns false and does not resurrect a cancelled message", () => {
+      const s = createStorage();
+      s.swarm.insert(BASE, 1_000);
+      expect(s.swarm.markCancelled("msg_01h1", 1_500)).toBe(true);
+      expect(s.swarm.getByMsgId("msg_01h1")!.state).toBe("cancelled");
+
+      const ret = s.swarm.markRetry("msg_01h1", 2_000, 1_000);
+      expect(ret).toBe(false);
+      expect(s.swarm.getByMsgId("msg_01h1")!.state).toBe("cancelled");
+      s.db.close();
+    });
+
+    it("C2: markFailed does not overwrite cancelled state, but permits handed_off -> failed transition for watchdog", () => {
+      const s = createStorage();
+
+      // Case 1: cancelled message cannot be marked failed
+      s.swarm.insert({ ...BASE, msgId: "m_canc" }, 1_000);
+      expect(s.swarm.markCancelled("m_canc", 1_500)).toBe(true);
+      expect(s.swarm.markFailed("m_canc", 2_000)).toBe(false);
+      expect(s.swarm.getByMsgId("m_canc")!.state).toBe("cancelled");
+
+      // Case 2: handed_off message CAN be marked failed (watchdog path)
+      s.swarm.insert({ ...BASE, msgId: "m_handoff" }, 1_000);
+      expect(s.swarm.markHandedOff("m_handoff", 1_500)).toBe(true);
+      expect(s.swarm.markFailed("m_handoff", 2_000)).toBe(true);
+      expect(s.swarm.getByMsgId("m_handoff")!.state).toBe("failed");
+
+      s.db.close();
+    });
+
+    it("terminal states are inescapable", () => {
+      const s = createStorage();
+
+      type TerminalState = "handed_off" | "failed" | "expired" | "cancelled";
+      type TransitionName = "markHandedOff" | "markRetry" | "markFailed" | "markCancelled" | "markExpired";
+
+      const terminalStates: TerminalState[] = ["handed_off", "failed", "expired", "cancelled"];
+      const transitions: Array<{
+        name: TransitionName;
+        apply: (msgId: string) => boolean;
+      }> = [
+        { name: "markHandedOff", apply: (id) => s.swarm.markHandedOff(id, 2_000) },
+        { name: "markRetry", apply: (id) => s.swarm.markRetry(id, 2_000, 1_000) },
+        { name: "markFailed", apply: (id) => s.swarm.markFailed(id, 2_000) },
+        { name: "markCancelled", apply: (id) => s.swarm.markCancelled(id, 2_000) },
+        { name: "markExpired", apply: (id) => s.swarm.markExpired(id, 2_000) },
+      ];
+
+      for (const startState of terminalStates) {
+        for (const t of transitions) {
+          const msgId = `m_${startState}_${t.name}`;
+          s.swarm.insert({ ...BASE, msgId }, 1_000);
+
+          if (startState === "handed_off") {
+            expect(s.swarm.markHandedOff(msgId, 1_500)).toBe(true);
+          } else if (startState === "failed") {
+            expect(s.swarm.markFailed(msgId, 1_500)).toBe(true);
+          } else if (startState === "expired") {
+            expect(s.swarm.markExpired(msgId, 1_500)).toBe(true);
+          } else if (startState === "cancelled") {
+            expect(s.swarm.markCancelled(msgId, 1_500)).toBe(true);
+          }
+          expect(s.swarm.getByMsgId(msgId)!.state).toBe(startState);
+
+          const isWatchdogException = startState === "handed_off" && t.name === "markFailed";
+          const res = t.apply(msgId);
+
+          if (isWatchdogException) {
+            expect(res).toBe(true);
+            expect(s.swarm.getByMsgId(msgId)!.state).toBe("failed");
+          } else {
+            expect(res).toBe(false);
+            expect(s.swarm.getByMsgId(msgId)!.state).toBe(startState);
+          }
+        }
+      }
+
+      s.db.close();
+    });
+
     it("persists and reads back deliverAt, expiresAt, and cancelledAt through asRecord", () => {
       const s = createStorage();
       s.swarm.insert(

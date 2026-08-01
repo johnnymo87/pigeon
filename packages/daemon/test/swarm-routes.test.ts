@@ -373,6 +373,28 @@ describe("POST /swarm/schedule", () => {
     return { app: createApp(storage, { nowFn: () => now }), storage };
   }
 
+  it("M2: rejects scheduled messages targeting a channel with 400", async () => {
+    const { app } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          channel: "general",
+          after: "1h",
+          payload: "scheduled channel message",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe(
+      "scheduled delivery requires a session target (to), not a channel",
+    );
+  });
+
   it("schedules with `after: '13h'` -> 202, not ready initially, ready once now advances past deliver_at", async () => {
     const now = 1_000_000;
     const { app, storage: s } = newApp(now);
@@ -566,25 +588,43 @@ describe("POST /swarm/schedule", () => {
     expect(s.swarm.getByMsgId(b2.msg_id)!.kind).toBe("custom_wake");
   });
 
-  it("honors `msg_id` idempotency: same `msg_id` twice does not create a duplicate row", async () => {
-    const { app, storage: s } = newApp();
+  it("m3: collision on scheduled msg_id returns 409 quoting stored deliver_at and does not overwrite", async () => {
+    const { app, storage: s } = newApp(1_000_000);
 
-    for (let i = 0; i < 2; i++) {
-      const res = await app(
-        new Request("http://localhost/swarm/schedule", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            msg_id: "msg_scheduled_dup",
-            from: "ses_a",
-            to: "ses_b",
-            after: "1h",
-            payload: i === 0 ? "first" : "second",
-          }),
+    const res1 = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_scheduled_dup",
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          payload: "first",
         }),
-      );
-      expect(res.status).toBe(202);
-    }
+      }),
+    );
+    expect(res1.status).toBe(202);
+    const body1 = (await res1.json()) as { deliver_at: number };
+
+    const res2 = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_scheduled_dup",
+          from: "ses_a",
+          to: "ses_b",
+          after: "2h",
+          payload: "second",
+        }),
+      }),
+    );
+    expect(res2.status).toBe(409);
+    const body2 = (await res2.json()) as { error: string; msg_id: string; deliver_at: number };
+    expect(body2.msg_id).toBe("msg_scheduled_dup");
+    expect(body2.deliver_at).toBe(body1.deliver_at);
+    expect(body2.error).toContain("msg_scheduled_dup");
 
     const stored = s.swarm.getByMsgId("msg_scheduled_dup");
     expect(stored!.payload).toBe("first");
@@ -823,6 +863,37 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/from/);
+  });
+
+  it("m4: returns 404 when attempting to cancel an unscheduled message (deliverAt is null)", async () => {
+    const { app, storage: s } = newApp();
+
+    s.swarm.insert(
+      {
+        msgId: "msg_unscheduled",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "plain chat message",
+        deliverAt: null,
+      },
+      1_000,
+    );
+
+    const res = await app(
+      new Request("http://localhost/swarm/scheduled/msg_unscheduled/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "ses_a" }),
+      }),
+    );
+
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("scheduled message not found");
   });
 
   it("returns 403 when `from` does not match original sender", async () => {

@@ -292,8 +292,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const f = parsed.fields;
+        if (f.channel) {
+          return Response.json(
+            { error: "scheduled delivery requires a session target (to), not a channel" },
+            { status: 400 },
+          );
+        }
         const msgId = f.callerMsgId ?? makeMsgId();
-        storage.swarm.insert(
+        const inserted = storage.swarm.insert(
           {
             msgId,
             fromSession: f.from,
@@ -308,6 +314,18 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+
+        if (!inserted) {
+          const stored = storage.swarm.getByMsgId(msgId);
+          return Response.json(
+            {
+              error: `message with msg_id '${msgId}' already exists`,
+              msg_id: msgId,
+              deliver_at: stored?.deliverAt ?? null,
+            },
+            { status: 409 },
+          );
+        }
 
         return Response.json(
           {
@@ -361,7 +379,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const record = storage.swarm.getByMsgId(msgId);
-        if (!record) {
+        if (!record || record.deliverAt === null) {
           return Response.json({ error: "scheduled message not found" }, { status: 404 });
         }
 

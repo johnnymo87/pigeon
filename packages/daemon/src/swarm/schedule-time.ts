@@ -124,6 +124,32 @@ export function parseScheduleTime(
           "`at` must be a valid RFC3339 timestamp string with offset or 'Z'",
       };
     }
+
+    const match = input.at.match(/^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})/);
+    if (match) {
+      const year = parseInt(match[1]!, 10);
+      const month = parseInt(match[2]!, 10);
+      const day = parseInt(match[3]!, 10);
+      const hour = parseInt(match[4]!, 10);
+      const minute = parseInt(match[5]!, 10);
+      const second = parseInt(match[6]!, 10);
+
+      const testUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+      if (
+        testUtc.getUTCFullYear() !== year ||
+        testUtc.getUTCMonth() !== month - 1 ||
+        testUtc.getUTCDate() !== day ||
+        testUtc.getUTCHours() !== hour ||
+        testUtc.getUTCMinutes() !== minute ||
+        testUtc.getUTCSeconds() !== second
+      ) {
+        return {
+          ok: false,
+          error: `\`at\` timestamp contains invalid calendar date or time: '${input.at}'`,
+        };
+      }
+    }
+
     deliverAt = parsedAt;
   }
 

@@ -96,6 +96,12 @@ describe("parseScheduleTime", () => {
       expectedExpiresAt: null,
     },
     {
+      name: "valid at with real leap day 2028-02-29",
+      input: { at: "2028-02-29T00:00:00Z", now: new Date("2028-02-28T12:00:00Z").getTime() },
+      expectedDeliverAt: new Date("2028-02-29T00:00:00Z").getTime(),
+      expectedExpiresAt: null,
+    },
+    {
       name: "valid expiresIn present measured from deliverAt",
       input: { after: "2d", expiresIn: "1h", now: NOW },
       expectedDeliverAt: NOW + 172_800_000,
@@ -225,6 +231,31 @@ describe("parseScheduleTime", () => {
       name: "invalid expiresIn duration string",
       input: { after: "1h", expiresIn: "invalid", now: NOW },
       expectedKeyKeyword: "expiresIn",
+    },
+    {
+      name: "m5 calendar rollover: Feb 30",
+      input: { at: "2026-02-30T09:20:00Z", now: NOW },
+      expectedKeyKeyword: "invalid",
+    },
+    {
+      name: "m5 calendar rollover: Feb 31",
+      input: { at: "2026-02-31T09:20:00Z", now: NOW },
+      expectedKeyKeyword: "invalid",
+    },
+    {
+      name: "m5 calendar rollover: month 13",
+      input: { at: "2026-13-01T09:20:00Z", now: NOW },
+      expectedKeyKeyword: "RFC3339",
+    },
+    {
+      name: "m5 calendar rollover: day 00",
+      input: { at: "2026-08-00T09:20:00Z", now: NOW },
+      expectedKeyKeyword: "RFC3339",
+    },
+    {
+      name: "m5 calendar rollover: T24:00:00Z",
+      input: { at: "2026-08-01T24:00:00Z", now: NOW },
+      expectedKeyKeyword: "invalid",
     },
   ];
 

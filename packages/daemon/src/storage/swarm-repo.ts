@@ -84,8 +84,8 @@ function asRecord(row: Row): SwarmMessageRecord {
 export class SwarmRepository {
   constructor(private readonly db: BetterSqlite3.Database) {}
 
-  insert(input: InsertSwarmInput, now = Date.now()): void {
-    this.db
+  insert(input: InsertSwarmInput, now = Date.now()): boolean {
+    const result = this.db
       .prepare(
         `INSERT INTO swarm_messages
            (msg_id, from_session, to_session, channel, kind, priority, reply_to, payload,
@@ -108,6 +108,7 @@ export class SwarmRepository {
         input.deliverAt ?? null,
         input.expiresAt ?? null,
       );
+    return result.changes > 0;
   }
 
   getByMsgId(msgId: string): SwarmMessageRecord | null {
@@ -156,6 +157,22 @@ export class SwarmRepository {
         `UPDATE swarm_messages
          SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL
          WHERE msg_id = ? AND state = 'queued'`,
+      )
+      .run(now, now, msgId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Promotes a message to `handed_off` when delivery succeeded but a cancel
+   * landed mid-flight (state was `cancelled`). Preserves `cancelled_at` as an
+   * audit trail: `cancelled_at` set on a `handed_off` row means "cancel raced and lost".
+   */
+  markHandedOffAfterCancel(msgId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE msg_id = ? AND state = 'cancelled'`,
       )
       .run(now, now, msgId);
     return result.changes > 0;
@@ -291,24 +308,26 @@ export class SwarmRepository {
     return rows.map(asRecord);
   }
 
-  markRetry(msgId: string, now: number, backoffMs: number): void {
-    this.db
+  markRetry(msgId: string, now: number, backoffMs: number): boolean {
+    const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET attempts = attempts + 1, next_retry_at = ?, updated_at = ?, state = 'queued'
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND state = 'queued'`,
       )
       .run(now + backoffMs, now, msgId);
+    return result.changes > 0;
   }
 
-  markFailed(msgId: string, now = Date.now()): void {
-    this.db
+  markFailed(msgId: string, now = Date.now()): boolean {
+    const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET state = 'failed', updated_at = ?, next_retry_at = NULL
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND state IN ('queued', 'handed_off')`,
       )
       .run(now, msgId);
+    return result.changes > 0;
   }
 
   /**
