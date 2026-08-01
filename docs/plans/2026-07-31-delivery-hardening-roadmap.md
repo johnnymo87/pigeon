@@ -1378,6 +1378,40 @@ makes it delivery work that happens to also be a quality-of-life win.
   is not `/home/dev`), keep the path as the suffix. Decide explicitly what happens to the 82 existing
   topics — leave, rename-on-next-touch, or backfill via `editForumTopic` — rather than discovering
   the inconsistency later.
+> **F1 DECIDED 2026-08-01 by the user. Build exactly this, no more.**
+>
+> **Format — option 1 of three.** Title first, `$HOME` abbreviated to `~`, path kept as the suffix:
+> ```
+> Merge-queue deploy monitoring gap · ~/projects/workstation/.worktrees/monitoring-mergequeue-fix
+> ```
+> The two richer options were **declined**: compressing `.worktrees` to `workstation@branch` (saves 11
+> more chars on 38% of rows but invents a notation that is no longer a real path), and a bare leaf dir
+> (shortest, but loses which repo a worktree belongs to, and leaves like `pr-4600` are ambiguous across
+> several repos here). Keep the suffix a **real path you can paste into `cd`.**
+>
+> **Derive `~` without new plumbing.** The worker never learns the session's home directory, and macbook
+> is not `/home/dev`. Rewrite the prefix by pattern — `^/home/<user>/` and `^/Users/<user>/` both become
+> `~/` — rather than plumbing a home value through the daemon for a P3 cosmetic change.
+>
+> **Existing topics: LEAVE THEM. No migration, no backfill.** Names are write-once, so new topics get
+> the new format and old ones age out. 60 of 113 are dead lgtm noise nobody will open again, so most of
+> the ugly list evaporates on its own. Costs nothing against the §3 budget. Accept a visibly mixed list
+> for a few weeks — that was the explicit trade.
+>
+> **CHECK BEFORE BUILDING — a composition risk, not a style point.** Reversing the field order breaks
+> anything that *parses* a topic name back into its parts. Grep for code splitting on the ` · `
+> separator to recover `dir` (worker reply-resolution, `/current-state`, the daemon card renderer, and
+> the plugin all handle names). If a parser exists, this is no longer a cosmetic change and the scope
+> must be re-decided rather than quietly widened.
+>
+> **THE ASSUMPTION THIS FEATURE RESTS ON IS STILL UNVERIFIED, and it was flagged to the user as such.**
+> The whole justification is that Telegram's topic *list* truncates visually well short of 128 chars, so
+> a trailing title is off-screen. **I never measured that width** — it is precisely the "measured the
+> available proxy instead of the operative value" error of CORRECTION #6. The user approved the fix
+> without confirming it. **If the title turns out to be visible in the list today, F1 is nearly
+> pointless and the right move is to drop it, not to ship it because it was approved.** Look at a real
+> topic list before writing code.
+
 - [ ] **F2. `pigeon-pnf`** (P3) — add `/rename <new title>`, the manual complement to F1, for when
   the auto-derived title has gone stale. Follow the existing reply-resolved command pattern
   (`webhook.ts:712`, `:734`, helper at `:538`); `editForumTopic` already exists in the Telegram
