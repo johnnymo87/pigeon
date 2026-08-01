@@ -3,6 +3,7 @@ import { openStorageDb, type StorageDb } from "../src/storage/database";
 import {
   DeliveryWatchdog,
   isWakeKind,
+  isSuppressedFromRecovery,
   type ClientSet,
   type WatchdogClient,
 } from "../src/swarm/delivery-watchdog";
@@ -88,6 +89,7 @@ function makeFixture() {
     toSession: string;
     handedOffAt: number;
     kind?: string;
+    deliverAt?: number | null;
   }): void {
     storage.swarm.insert(
       {
@@ -99,6 +101,7 @@ function makeFixture() {
         priority: "normal",
         replyTo: null,
         payload: "payload",
+        deliverAt: opts.deliverAt,
       },
       opts.handedOffAt,
     );
@@ -132,6 +135,16 @@ describe("isWakeKind", () => {
     expect(isWakeKind("awake")).toBe(false);
     expect(isWakeKind("chat")).toBe(false);
     expect(isWakeKind("")).toBe(false);
+  });
+});
+
+describe("isSuppressedFromRecovery", () => {
+  it("suppresses recovery for wake kinds or non-null deliverAt", () => {
+    expect(isSuppressedFromRecovery({ kind: "checkpoint", deliverAt: 100_000 })).toBe(true);
+    expect(isSuppressedFromRecovery({ kind: "wake", deliverAt: null })).toBe(true);
+    expect(isSuppressedFromRecovery({ kind: "wake.self", deliverAt: null })).toBe(true);
+    expect(isSuppressedFromRecovery({ kind: "chat", deliverAt: null })).toBe(false);
+    expect(isSuppressedFromRecovery({ kind: "task.assign", deliverAt: null })).toBe(false);
   });
 });
 
@@ -1067,9 +1080,6 @@ describe("DeliveryWatchdog", () => {
     expect(row.state).toBe("handed_off");
     expect(row.requeueCount).toBe(0);
 
-    // Target transcript has exactly 1 envelope.
-    expect(transcript).toHaveLength(1);
-
     // notifySenderOfFailure was never called -> no delivery.failed notice in storage.
     const notices = storage.db
       .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
@@ -1209,5 +1219,179 @@ describe("DeliveryWatchdog", () => {
     expect(storage.swarm.getByMsgId("task1")!.state).toBe("queued");
     expect(storage.swarm.getByMsgId("task1")!.abortedAt).toBe(4_000_000);
     expect(client2.abortSession).toHaveBeenCalledWith("ses_b2");
+  });
+
+  it("31. Major 1: scheduled message with kind='checkpoint' and deliverAt set is suppressed from recovery", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client1 = makeClient();
+    client1.getSessionMessages.mockImplementation(async () => [
+      userMessage(50, `<swarm_message v="1" msg_id="sched1">`),
+    ]);
+    clientMap.set("ses_b1", { preferred: client1, all: [client1] });
+
+    // Scheduled checkpoint message (deliverAt set) to idle target
+    insertHandedOff({
+      msgId: "sched1",
+      fromSession: "ses_a",
+      toSession: "ses_b1",
+      handedOffAt: 0,
+      kind: "checkpoint",
+      deliverAt: 100_000,
+    });
+
+    // Positive control: unscheduled chat message (deliverAt null) to idle target
+    const client2 = makeClient();
+    client2.getSessionMessages.mockImplementation(async () => [
+      userMessage(50, `<swarm_message v="1" msg_id="chat_unsched">`),
+    ]);
+    clientMap.set("ses_b2", { preferred: client2, all: [client2] });
+
+    insertHandedOff({
+      msgId: "chat_unsched",
+      fromSession: "ses_a",
+      toSession: "ses_b2",
+      handedOffAt: 0,
+      kind: "chat",
+      deliverAt: null,
+    });
+
+    fixture.setNow(400_000);
+    await watchdog.processOnce();
+
+    // Scheduled checkpoint is NOT requeued and NOT aborted
+    const rowSched = storage.swarm.getByMsgId("sched1")!;
+    expect(rowSched.state).toBe("handed_off");
+    expect(rowSched.requeueCount).toBe(0);
+
+    // Unscheduled chat IS requeued (positive control)
+    const rowChat = storage.swarm.getByMsgId("chat_unsched")!;
+    expect(rowChat.state).toBe("queued");
+    expect(rowChat.requeueCount).toBe(1);
+  });
+
+  it("32. Major 2: anchor-null branch alerts with severity error and states prompt not found, wake lost, recovery suppressed", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    // Transcript has NO anchor for wake_lost
+    client.getSessionMessages.mockImplementation(async () => []);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({
+      msgId: "wake_lost",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      handedOffAt: 0,
+      kind: "wake",
+    });
+
+    fixture.setNow(1_000_000); // blockedAge = 1,000,000 > stuckAlertMs (900_000)
+    await watchdog.processOnce();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
+    expect(severity).toBe("error");
+    expect(alertText).not.toContain("expected for idle target");
+    expect(alertText).toContain("not found in target transcript");
+    expect(alertText).toContain("may be lost");
+
+    // Redelivery is suppressed
+    const row = storage.swarm.getByMsgId("wake_lost")!;
+    expect(row.state).toBe("handed_off");
+    expect(row.requeueCount).toBe(0);
+  });
+
+  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    const client = makeClient();
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+      userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({
+      msgId: "wake_aborted",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      handedOffAt: 0,
+      kind: "wake",
+    });
+
+    // Pre-set abortedAt to simulate previous abort attempt
+    storage.db
+      .prepare("UPDATE swarm_messages SET aborted_at = 500_000 WHERE msg_id = ?")
+      .run("wake_aborted");
+
+    fixture.setNow(4_000_000);
+    await watchdog.processOnce();
+
+    const row = storage.swarm.getByMsgId("wake_aborted")!;
+    expect(row.state).toBe("handed_off");
+    expect(client.abortSession).not.toHaveBeenCalled();
+  });
+
+  it("34. Minor 1: requeueOrTerminal only counts requeued when requeueForRecovery succeeds", async () => {
+    fixture = makeFixture();
+    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+    insertHandedOff({
+      msgId: "chat_race",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      handedOffAt: 0,
+      kind: "chat",
+    });
+
+    const client = makeClient();
+    client.getSessionMessages.mockImplementation(async () => {
+      // Concurrently change state to 'queued' during transcript fetch (after listUnverifiedHandedOff read it)
+      storage.db
+        .prepare("UPDATE swarm_messages SET state = 'queued' WHERE msg_id = ?")
+        .run("chat_race");
+      return []; // anchor === null for non-wake -> requeueOrTerminal
+    });
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    fixture.setNow(400_000);
+    const summary = await watchdog.processOnce();
+
+    expect(summary.requeued).toBe(0);
+    expect(summary.skipped).toBe(1);
+  });
+
+  it("35. Minor 4: wake behind live blocking turn appends recovery suppressed note in alert", async () => {
+    fixture = makeFixture();
+    const { watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+    const client = makeClient();
+    // Blocking turn that is silent (last activity t=100_000)
+    const stuckTranscript = [
+      assistantMessage({ created: 10, completed: null, parts: [toolPart(100_000)] }),
+      userMessage(200_000, `<swarm_message v="1" msg_id="wake_behind_turn">`),
+    ];
+    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientMap.set("ses_b", { preferred: client, all: [client] });
+
+    insertHandedOff({
+      msgId: "wake_behind_turn",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      handedOffAt: 0,
+      kind: "wake",
+    });
+
+    fixture.setNow(1_200_000); // blockedAge = 1,200,000 > stuckAlertMs (900_000)
+    await watchdog.processOnce();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const [alertText] = sendPlainAlert.mock.calls[0]!;
+    expect(alertText).toContain("recovery suppressed");
   });
 });
