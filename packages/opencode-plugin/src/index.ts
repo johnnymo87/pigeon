@@ -14,6 +14,8 @@ import { SessionManager, normalizeTitle } from "./session-state"
 import { createSwarmReadTool, SWARM_READ_TOOL_NAME } from "./swarm-tool"
 import { createSwarmSendTool, SWARM_SEND_TOOL_NAME } from "./swarm-send-tool"
 import { createSwarmListTool, SWARM_LIST_TOOL_NAME } from "./swarm-list-tool"
+import { createSwarmScheduleTool, SWARM_SCHEDULE_TOOL_NAME } from "./swarm-schedule-tool"
+import { createSwarmScheduledTool, SWARM_SCHEDULED_TOOL_NAME } from "./swarm-scheduled-tool"
 import { resolveServeAuthHeader } from "./serve-auth"
 import { errorMessage, serializeError } from "./utils"
 
@@ -315,6 +317,8 @@ const plugin: Plugin = async (ctx) => {
         [SWARM_READ_TOOL_NAME]: createSwarmReadTool(daemonUrl),
         [SWARM_SEND_TOOL_NAME]: createSwarmSendTool(daemonUrl),
         [SWARM_LIST_TOOL_NAME]: createSwarmListTool(String(ctx.serverUrl), internalFetch),
+        [SWARM_SCHEDULE_TOOL_NAME]: createSwarmScheduleTool(daemonUrl),
+        [SWARM_SCHEDULED_TOOL_NAME]: createSwarmScheduledTool(daemonUrl),
       },
       event: async (input) => {
         const { event } = input

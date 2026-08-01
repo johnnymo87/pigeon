@@ -927,5 +927,55 @@ describe("SwarmArbiter", () => {
       expect(storage.swarm.getByMsgId("m_failnotif_1")!.state).toBe("failed");
       expect(sendPlainAlert).not.toHaveBeenCalled();
     });
+
+    it("renders ref attribute in prompt when ref is set on message", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_ref_1",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          ref: "pigeon-c68",
+        },
+        1_000,
+      );
+
+      await arbiter.processOnce();
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).toContain('ref="pigeon-c68"');
+    });
+
+    it("omits ref attribute in prompt when ref is null", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_noref_1",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          ref: null,
+        },
+        1_000,
+      );
+
+      await arbiter.processOnce();
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).not.toContain("ref=");
+    });
   });
 });
