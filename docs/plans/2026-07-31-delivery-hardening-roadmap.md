@@ -51,11 +51,11 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **986** passed, 1 skipped |
+| `@pigeon/daemon` | **989** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
 | `@pigeon/worker` | **298** passed |
 
-Total **1590**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1593**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
 
 > **Attribution for the +96, because it is NOT this cycle's work.** Cycle 6 added **2** worker tests.
 > The daemon's +94 came from a **parallel swarm track that landed on `main` while this roadmap was
@@ -1198,6 +1198,57 @@ blast radius but **do not cure the outage**.
   Note this is the same shape as the Cycle 2 sweep bug in §1.-1: a deliberate swallow that converts a
   hard failure into an invisible one. Whatever is done here, the fix is to make the outcome
   observable, not merely to add a retry.
+
+### Cycle 6.5 — `pigeon-81p` (P1): the outbox delivered a question BEFORE the message explaining it
+
+**Reported by the user mid-session on 2026-08-01, not found by this roadmap.** Worth recording in full,
+because the roadmap has spent six cycles on notifications that never arrive and this was a notification
+that *did* arrive — in the wrong order, which was just as damaging and completely invisible to every
+metric here.
+
+**Symptom as experienced:** the user saw the top of an assistant message, then a pause, then a question
+prompt, and only *after answering* did the rest of the explanation appear. They answered a question
+without the reasoning that was written to precede it.
+
+**Confirmed in production logs** for `ses_066acf5a6ffeVwRh8Qd0XqWNZn`:
+
+```
+15:45:54  [stop]   queued  s:ses_066acf...:1785613554042   (the explanation)
+15:45:59  [outbox] sent    q:ses_066acf...:que_fbedc917... (the question, FIRST)
+15:46:00  [outbox] sent    s:ses_066acf...:1785613554042   (the explanation, 1s LATER)
+```
+
+**Root cause — deliberate, not accidental.** `getReady` (`outbox-repo.ts:112`) sorted by message-class
+priority *before* `created_at`, **globally**, so a queued question jumped every queued stop no matter
+how much earlier the stop was written. `outbox-sender.ts:225` takes `getReady(now, 5)` and sends the
+batch in that order, so this was **deterministic, not a race**: every assistant turn that writes text
+and then asks a question delivered the two backwards. It had been happening on every question ever
+asked over Telegram.
+
+**Fixed** (`816f0d7`) by ranking each session by the best priority among *its own* queued rows and
+ordering strictly by `created_at` within the session. Cross-session preemption — the legitimate
+original intent — is preserved; intra-session inversion is now impossible.
+
+**The instructive part is the diagnosis, twice over.**
+
+1. **The obvious hypothesis was wrong.** Questions have their own in-memory retry queue that bypasses
+   the circuit breaker, so "two competing paths interleaved" is the natural story. Both messages went
+   through the **outbox** and both logged `outbox entry sent`. Fixing the plausible path would have
+   changed nothing.
+2. **A false attribution nearly rode along with the fix.** The full suite came back with
+   `lease-cas-concurrency` failing — the test `pigeon-qpm` labels a known flake. Rather than wave it
+   through, I re-ran it: **3 of 3 failures in isolation**, which looks deterministic, and a baseline
+   run passed. That comparison was **confounded** — baseline ran in a `/tmp` worktree, the fix in
+   `/home`. Running the *same commit* in both locations collapsed the difference, and the real variable
+   was **load average 82 versus 40**. The test is load-sensitive, the assertion is correct, and my
+   change never touched anything it exercises. Recorded on `pigeon-qpm`: **record the load average
+   before calling a failure of that test a real race**, or it will keep getting blamed on whatever
+   landed most recently.
+
+> **The standing lesson for this roadmap: ordering is part of delivery.** Every cycle so far has
+> measured whether a notification arrives. None measured whether it arrives *in the right order*, and a
+> priority queue was silently reordering a causal conversation the whole time. If a future cycle adds
+> delivery metrics (Cycle 5), count inversions, not just losses.
 
 ### Cycle 7 — close out the migration
 
