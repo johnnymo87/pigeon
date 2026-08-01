@@ -66,7 +66,12 @@ export function formatWakePayloadAlert(
   prefix = "delivery failed for wake/scheduled message",
 ): string {
   const target = row.toSession ?? row.channel ?? "unknown";
-  const scheduledIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
+  // Label honestly. A `kind: "wake"` message sent through plain /swarm/send is
+  // wake-like (so it lands here) but was never scheduled, and printing its
+  // creation time under a `scheduled_for:` heading would invent a schedule
+  // that never existed.
+  const timeLabel = row.deliverAt !== null ? "scheduled_for" : "created_at";
+  const timeIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
   let payloadText = row.payload;
   if (payloadText.length > MAX_PAYLOAD_ALERT_CHARS) {
     payloadText =
@@ -75,7 +80,7 @@ export function formatWakePayloadAlert(
   }
   return (
     `${prefix}: msg ${row.msgId} to ${target}\n` +
-    `scheduled_for: ${scheduledIso}\n` +
+    `${timeLabel}: ${timeIso}\n` +
     `reason: ${reason}\n\n` +
     `payload:\n${payloadText}`
   );

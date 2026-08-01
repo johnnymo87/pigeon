@@ -69,7 +69,13 @@ export function renderEnvelope(
   if (fields.replyTo !== null)
     attrs.push(`reply_to="${escAttr(fields.replyTo)}"`);
   attrs.push(`priority="${escAttr(fields.priority)}"`);
-  if (fields.scheduledFor != null)
+  // Finite-guarded for the same reason as `delivered_late_ms` below:
+  // `new Date(NaN).toISOString()` throws a RangeError, and a throw from here
+  // that is not a PermanentDeliveryError is classified by the arbiter as an
+  // ordinary retryable failure, so one corrupt timestamp would burn the
+  // message's whole attempt budget. SQLite is dynamically typed, so a bad
+  // `deliver_at` is not unreachable.
+  if (fields.scheduledFor != null && Number.isFinite(fields.scheduledFor))
     attrs.push(`scheduled_for="${escAttr(new Date(fields.scheduledFor).toISOString())}"`);
   // Finite-guard is not paranoia: `BigInt(NaN)` throws a RangeError, and a
   // throw from here that is NOT a PermanentDeliveryError would be classified by

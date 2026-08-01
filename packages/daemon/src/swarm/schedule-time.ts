@@ -170,7 +170,7 @@ export function parseScheduleTime(
     };
   }
 
-    let expiresAt: number | null = null;
+  let expiresAt: number | null = null;
   if (input.expiresIn !== undefined && input.expiresIn !== null) {
     if (typeof input.expiresIn !== "string") {
       return {

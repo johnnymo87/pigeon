@@ -6,6 +6,14 @@ import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-mess
 import type { Activity } from "./current-state-enrich";
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
+/**
+ * Upper bound on a plain-alert Telegram request. Deliberately short: the
+ * callers await this on their critical paths (see `sendPlainAlert`), so the
+ * cost of waiting is a stalled delivery loop, while the cost of giving up is
+ * one lost operational alert that is already best-effort.
+ */
+const PLAIN_ALERT_TIMEOUT_MS = 10_000;
+
 interface NotificationInput {
   event: string;
   label: string;
@@ -365,17 +373,52 @@ export class TelegramNotificationService implements StopNotifier {
     this.apiBase = `https://api.telegram.org/bot${this.botToken}`;
   }
 
+  /**
+   * Bounds the request so a stalled socket cannot leave the promise pending
+   * forever. This is the same hazard, and the same fix, as `pigeon-h21` in
+   * `opencode-client.ts` — and the callers make it acute:
+   *
+   *  - `SwarmArbiter` awaits this while holding the target's `inflight` slot,
+   *    which is released in a `.finally()`. A promise that never settles means
+   *    the slot is never released, so ALL swarm delivery to that session wedges
+   *    permanently. No rejection means no retry; silence reads as success.
+   *  - `DeliveryWatchdog` awaits it under its `processing` guard, so the same
+   *    hung connection freezes the watchdog too — including the overdue alarm
+   *    whose entire job is to notice that delivery has stalled.
+   *
+   * One stuck socket would otherwise wedge delivery AND silence the monitor
+   * meant to report it. A try/catch does not help here: the failure mode is a
+   * promise that never settles, not one that rejects.
+   */
   async sendPlainAlert(text: string, severity: AlertSeverity): Promise<void> {
     const prefix =
       severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
-    const response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: this.chatId,
-        text: `${prefix}${text}`,
-      }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      PLAIN_ALERT_TIMEOUT_MS,
+    );
+    let response: Response;
+    try {
+      response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: this.chatId,
+          text: `${prefix}${text}`,
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new Error(
+          `Telegram sendMessage timed out after ${PLAIN_ALERT_TIMEOUT_MS}ms`,
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!response.ok) {
       throw new Error(`Telegram sendMessage returned ${response.status}`);
     }

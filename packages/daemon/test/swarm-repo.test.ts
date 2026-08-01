@@ -2,6 +2,7 @@ import BetterSqlite3 from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { initSwarmSchema } from "../src/storage/swarm-schema";
+import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
 
 function createStorage(): StorageDb {
   return openStorageDb(":memory:");
@@ -756,6 +757,52 @@ describe("swarm_messages verification column migration", () => {
     // requeue_count defaults to 0, aborted_at defaults to NULL for pre-existing rows.
     expect(find("with_handoff").requeue_count).toBe(0);
     expect(find("with_handoff").aborted_at).toBeNull();
+
+    db.close();
+  });
+
+  it("backfills expires_at onto pre-existing queued SCHEDULED rows, and only those", () => {
+    // Without this, the first night after deploy is the very bug the feature
+    // exists to fix: a wake already banked with expires_at NULL is not covered
+    // by the arbiter's outage exemption (gated on having a terminal clock), so
+    // it burns the old ~324s budget against the restarting serve pool at 03:00.
+    const db = oldSchemaDb();
+    initSwarmSchema(db); // get the new columns so we can write deliver_at
+
+    const setSchedule = (msgId: string, deliverAt: number | null, expiresAt: number | null) =>
+      db
+        .prepare("UPDATE swarm_messages SET deliver_at = ?, expires_at = ? WHERE msg_id = ?")
+        .run(deliverAt, expiresAt, msgId);
+
+    insertRaw(db, { msgId: "sched_no_expiry", state: "queued", updatedAt: 1, handedOffAt: null });
+    setSchedule("sched_no_expiry", 100_000, null);
+
+    // Explicit expiry must be preserved, not overwritten.
+    insertRaw(db, { msgId: "sched_with_expiry", state: "queued", updatedAt: 1, handedOffAt: null });
+    setSchedule("sched_with_expiry", 100_000, 123_456);
+
+    // Ordinary /swarm/send row: must stay NULL. Giving it a clock would
+    // silently opt it into unbounded uncounted retries.
+    insertRaw(db, { msgId: "ordinary", state: "queued", updatedAt: 1, handedOffAt: null });
+    setSchedule("ordinary", null, null);
+
+    // Terminal row: no point resurrecting a clock on it.
+    insertRaw(db, { msgId: "sched_handed_off", state: "handed_off", updatedAt: 1, handedOffAt: 1 });
+    setSchedule("sched_handed_off", 100_000, null);
+
+    initSwarmSchema(db);
+
+    const expiryOf = (msgId: string) =>
+      (
+        db
+          .prepare("SELECT expires_at FROM swarm_messages WHERE msg_id = ?")
+          .get(msgId) as { expires_at: number | null }
+      ).expires_at;
+
+    expect(expiryOf("sched_no_expiry")).toBe(100_000 + DEFAULT_EXPIRY_MS);
+    expect(expiryOf("sched_with_expiry")).toBe(123_456);
+    expect(expiryOf("ordinary")).toBeNull();
+    expect(expiryOf("sched_handed_off")).toBeNull();
 
     db.close();
   });

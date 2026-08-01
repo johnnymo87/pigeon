@@ -70,6 +70,11 @@ export interface DeliveryWatchdogOptions {
   stuckAlertMs?: number;
   stuckAbortSilenceMs?: number;
   maxRequeues?: number;
+  /**
+   * Threshold for the overdue-still-queued alarm. Constructor-only on purpose:
+   * unlike its siblings there is no env knob yet, because nothing has needed to
+   * tune it. Tests use it to drive the clock.
+   */
   overdueAlertMs?: number;
 }
 
@@ -460,12 +465,22 @@ export class DeliveryWatchdog {
         this.overdueAlerted.add(row.msgId);
         counts.alerted++;
         const overdueMs = now - (row.deliverAt ?? now);
+        // Report these SEPARATELY. They are only equal when nothing touched
+        // the row since before its delivery time. In the likelier crash shape
+        // — the arbiter retried through a two-hour outage and then died five
+        // minutes ago — the row is overdue by 2h but untouched for 5min, and
+        // collapsing them into one number would state something false. The
+        // gap between the two is also the useful diagnostic: it says how long
+        // delivery was being attempted before it stopped.
+        const untouchedMs = now - row.updatedAt;
         await this.alert(
           "error",
           `delivery watchdog: msg ${row.msgId} to ${row.toSession ?? "unknown"} ` +
-            `is overdue by ${humanDuration(overdueMs)} (${overdueMs}ms), still queued, ` +
-            `and untouched for at least that long — the arbiter delivery loop ` +
-            `appears to be stopped. This wake will not fire until it is running.`,
+            `is still queued, overdue by ${humanDuration(overdueMs)} (${overdueMs}ms) ` +
+            `and untouched for ${humanDuration(untouchedMs)} (${untouchedMs}ms) — ` +
+            `nothing is retrying it, so the arbiter delivery loop appears to be ` +
+            `stopped or wedged for this target. This wake will not fire until ` +
+            `delivery resumes.`,
         );
         this.log("alerted", {
           msgId: row.msgId,
