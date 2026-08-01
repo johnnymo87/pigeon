@@ -450,6 +450,48 @@ describe("storage schema and repositories", () => {
       db.close();
     });
 
+    it("migrates existing outbox table cleanly and idempotently", () => {
+      const dbDir = mkdtempSync(join(tmpdir(), "pigeon-test-db-outbox-"));
+      const dbPath = join(dbDir, "storage.db");
+      try {
+        // Create an unmigrated database with an old outbox schema (no failed_reason / last_error columns)
+        const dbOld = new BetterSqlite3(dbPath);
+        dbOld.exec(`
+          CREATE TABLE outbox (
+            notification_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'question',
+            state TEXT NOT NULL DEFAULT 'queued',
+            payload TEXT NOT NULL,
+            token TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_retry_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+        `);
+        dbOld.close();
+
+        // Open with openStorageDb (should run additive migrations and add columns)
+        const storage1 = openStorageDb(dbPath);
+        // Verify columns were added by querying pragma
+        const columns1 = storage1.db.pragma("table_info(outbox)") as Array<{ name: string }>;
+        const columnNames1 = columns1.map((c) => c.name);
+        expect(columnNames1).toContain("failed_reason");
+        expect(columnNames1).toContain("last_error");
+        storage1.db.close();
+
+        // Re-open again (should be idempotent and not throw duplicate column error)
+        expect(() => {
+          const storage2 = openStorageDb(dbPath);
+          storage2.db.close();
+        }).not.toThrow();
+      } finally {
+        rmSync(dbDir, { recursive: true, force: true });
+      }
+    });
+
     it("preserves idempotency when opened twice against the same file-backed database", () => {
       const dbDir = mkdtempSync(join(tmpdir(), "pigeon-test-db-"));
       const dbPath = join(dbDir, "storage.db");

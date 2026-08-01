@@ -50,6 +50,17 @@ const BACKOFF_SCHEDULE = [5_000, 10_000, 30_000, 60_000, 120_000];
  */
 export const MAX_PAUSE_MS = 5 * 60 * 1000;
 
+export function formatWorkerError(result: WorkerResult): string {
+  if (result.kind === "transport_error") {
+    return result.error;
+  }
+  if (result.kind === "http_error" || result.kind === "app_rejection") {
+    const bodyStr = result.body !== undefined ? ` - ${typeof result.body === "string" ? result.body : JSON.stringify(result.body)}` : "";
+    return `HTTP ${result.status}${bodyStr}`;
+  }
+  return "Unknown error";
+}
+
 function getBackoff(attempts: number): number {
   return BACKOFF_SCHEDULE[Math.min(attempts, BACKOFF_SCHEDULE.length - 1)] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 120_000;
 }
@@ -157,7 +168,7 @@ export class OutboxSender {
 
         // Check terminal conditions
         if (entry.attempts >= MAX_ATTEMPTS || age > MAX_AGE_MS) {
-          this.storage.outbox.markFailed(entry.notificationId, now);
+          this.storage.outbox.markFailed(entry.notificationId, now, "budget_exhausted");
           this.reregisteredEntries.delete(entry.notificationId);
           this.log("outbox entry marked failed (terminal)", {
             notificationId: entry.notificationId,
@@ -192,17 +203,18 @@ export class OutboxSender {
           dir = parsed.dir;
           threaded = parsed.threaded;
         } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
           this.log("outbox entry payload parse failed", {
             notificationId: entry.notificationId,
-            err: err instanceof Error ? err.message : String(err),
+            err: errMsg,
           });
-          this.storage.outbox.markFailed(entry.notificationId, now);
+          this.storage.outbox.markFailed(entry.notificationId, now, "payload_parse_failed", errMsg);
           this.reregisteredEntries.delete(entry.notificationId);
           continue;
         }
 
         if (messages.length === 0) {
-          this.storage.outbox.markFailed(entry.notificationId, now);
+          this.storage.outbox.markFailed(entry.notificationId, now, "payload_empty");
           this.reregisteredEntries.delete(entry.notificationId);
           continue;
         }
@@ -245,7 +257,7 @@ export class OutboxSender {
 
               if (action.action === "pause") {
                 const backoff = getBackoff(entry.attempts);
-                this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
                 this.log("outbox entry delivery failed, scheduling retry", {
                   notificationId: entry.notificationId,
                   sessionId: entry.sessionId,
@@ -267,7 +279,7 @@ export class OutboxSender {
               }
 
               if (action.action === "terminal") {
-                this.storage.outbox.markFailed(entry.notificationId, now);
+                this.storage.outbox.markFailed(entry.notificationId, now, action.reason, formatWorkerError(result));
                 this.reregisteredEntries.delete(entry.notificationId);
                 this.log("outbox entry delivery failed (terminal)", {
                   notificationId: entry.notificationId,
@@ -282,7 +294,7 @@ export class OutboxSender {
               if (action.action === "reregister") {
                 if (!this.registerSession) {
                   const backoff = getBackoff(entry.attempts);
-                  this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                  this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
                   this.log("outbox entry delivery failed, scheduling retry (reregister unavailable)", {
                     notificationId: entry.notificationId,
                     sessionId: entry.sessionId,
@@ -307,7 +319,7 @@ export class OutboxSender {
                       const unregResult = await this.unregisterSession(entry.sessionId);
                       compensated = unregResult?.ok ?? undefined;
                     }
-                    this.storage.outbox.markFailed(entry.notificationId, now);
+                    this.storage.outbox.markFailed(entry.notificationId, now, "reregister_compensated");
                     this.reregisteredEntries.delete(entry.notificationId);
                     this.log("outbox entry re-registration compensated: session deleted during registration", {
                       notificationId: entry.notificationId,
@@ -364,7 +376,7 @@ export class OutboxSender {
 
                   if (isTransient) {
                     const backoff = getBackoff(entry.attempts);
-                    this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                    this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(regResult));
                     this.log("outbox entry re-registration failed (transient), scheduling retry", {
                       notificationId: entry.notificationId,
                       sessionId: entry.sessionId,
@@ -374,7 +386,7 @@ export class OutboxSender {
                     });
                     break;
                   } else {
-                    this.storage.outbox.markFailed(entry.notificationId, now);
+                    this.storage.outbox.markFailed(entry.notificationId, now, "reregister_failed", formatWorkerError(regResult));
                     this.reregisteredEntries.delete(entry.notificationId);
                     this.log("outbox entry re-registration failed (terminal)", {
                       notificationId: entry.notificationId,
@@ -413,7 +425,7 @@ export class OutboxSender {
                 }
 
                 const backoff = getBackoff(entry.attempts);
-                this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+                this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
                 this.log("outbox entry stripped entities, scheduling retry", {
                   notificationId: entry.notificationId,
                   sessionId: entry.sessionId,
@@ -425,7 +437,7 @@ export class OutboxSender {
 
               // Default retry arm (action.action === "retry")
               const backoff = getBackoff(entry.attempts);
-              this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+              this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result));
               this.log("outbox entry delivery failed, scheduling retry", {
                 notificationId: entry.notificationId,
                 sessionId: entry.sessionId,
@@ -450,12 +462,13 @@ export class OutboxSender {
           }
         } catch (err) {
           const backoff = getBackoff(entry.attempts);
-          this.storage.outbox.markRetry(entry.notificationId, now, backoff);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.storage.outbox.markRetry(entry.notificationId, now, backoff, errMsg);
           this.log("outbox entry delivery threw, scheduling retry", {
             notificationId: entry.notificationId,
             sessionId: entry.sessionId,
             attempts: entry.attempts + 1,
-            err: err instanceof Error ? err.message : String(err),
+            err: errMsg,
           });
         }
       }

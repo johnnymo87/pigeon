@@ -8,7 +8,7 @@ import {
 import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
-import { OUTBOX_RETENTION_MS } from "./storage/schema";
+import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
 import { Poller } from "./worker/poller";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
@@ -383,10 +383,11 @@ if (swarmArbiter) {
   console.log("[pigeon-daemon] swarm arbiter NOT started (no opencodeUrl in config)");
 }
 
-// Cleanup terminal outbox entries every hour
+// Cleanup terminal outbox entries every hour (sent after 1h, failed after 7d)
 setInterval(() => {
-  const cutoff = Date.now() - OUTBOX_RETENTION_MS;
-  const cleaned = storage.outbox.cleanupOlderThan(cutoff);
+  const sentCutoff = Date.now() - OUTBOX_RETENTION_MS;
+  const failedCutoff = Date.now() - FAILED_RETENTION_MS;
+  const cleaned = storage.outbox.cleanupOlderThan(sentCutoff, failedCutoff);
   if (cleaned > 0) console.log(`[outbox] cleaned ${cleaned} old entries`);
 }, 60 * 60 * 1000);
 

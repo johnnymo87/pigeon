@@ -238,6 +238,7 @@ describe("OutboxSender.processOnce()", () => {
 
     const afterRecord = storage.outbox.getByNotificationId("notif-1");
     expect(afterRecord!.state).toBe("failed");
+    expect(afterRecord!.failedReason).toBe("budget_exhausted");
   });
 
   it("marks terminal failure after max age (15+ minutes)", async () => {
@@ -260,6 +261,50 @@ describe("OutboxSender.processOnce()", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("budget_exhausted");
+  });
+
+  it("marks terminal failure on payload JSON parse error and records reason and error", async () => {
+    const now = 5_000;
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: "invalid-json{" }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("payload_parse_failed");
+    expect(record!.lastError).toBeTruthy();
+  });
+
+  it("marks terminal failure on empty payload messages array", async () => {
+    const now = 5_000;
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: JSON.stringify({ messages: [] }) }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("payload_empty");
   });
 
   it("skips entries not yet ready for retry (next_retry_at in future)", async () => {
@@ -893,6 +938,8 @@ describe("classified delivery failure actions", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("Session not locally known (reaped or never existed)");
+    expect(record!.lastError).toBe('HTTP 404 - {"error":"Session not found"}');
   });
 
   it("404 + register succeeds but local row vanished in between -> unregisterSession called and entry goes terminal", async () => {
@@ -930,6 +977,7 @@ describe("classified delivery failure actions", () => {
 
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("reregister_compensated");
   });
 
   it("404 twice on the same entry -> second time is terminal (flag consumed)", async () => {
@@ -1038,7 +1086,10 @@ describe("classified delivery failure actions", () => {
     await sender.processOnce();
 
     expect(registerSession).toHaveBeenCalledTimes(1);
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("reregister_failed");
+    expect(record!.lastError).toBe('HTTP 400 - {"error":"sessionId and machineId required"}');
   });
 
   // A register 429 is "Session limit reached" (packages/worker/src/sessions.ts:69) — a CAPACITY
@@ -1170,7 +1221,10 @@ describe("classified delivery failure actions", () => {
 
     await sender.processOnce();
 
-    expect(storage.outbox.getByNotificationId("notif-1")!.state).toBe("failed");
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("Worker field validation failed (HTTP 400)");
+    expect(record!.lastError).toBe('HTTP 400 - {"error":"sessionId, chatId, and text required"}');
   });
 
   it("502 with details.error_code 400 and entities -> payload rewritten WITHOUT entities and markRetry", async () => {

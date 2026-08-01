@@ -6,6 +6,7 @@ export const REPLY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const INBOX_DONE_RETENTION_MS = 60 * 60 * 1000;
 export const PENDING_QUESTION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 export const OUTBOX_RETENTION_MS = 60 * 60 * 1000; // 1 hour
+export const FAILED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
  * True only for SQLite's benign "column already exists" error.
@@ -38,6 +39,8 @@ export const additiveColumns = [
   "ALTER TABLE pending_questions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE sessions ADD COLUMN model_override TEXT DEFAULT NULL",
   "ALTER TABLE sessions ADD COLUMN title TEXT DEFAULT NULL",
+  "ALTER TABLE outbox ADD COLUMN failed_reason TEXT DEFAULT NULL",
+  "ALTER TABLE outbox ADD COLUMN last_error TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(
@@ -144,6 +147,8 @@ export function initSchema(db: BetterSqlite3.Database): void {
       token TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
       next_retry_at INTEGER,
+      failed_reason TEXT DEFAULT NULL,
+      last_error TEXT DEFAULT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
