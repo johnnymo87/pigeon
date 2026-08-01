@@ -341,25 +341,70 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("getReady orders by message-class priority FIRST (question before stop before card)", () => {
+  it("getReady orders by message-class priority across different sessions", () => {
     const storage = createStorage();
 
-    // Insert a card at t=1000 (oldest)
-    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-old", kind: "card" }, 1_000);
-    // Insert a stop at t=1500
-    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-mid", kind: "stop" }, 1_500);
-    // Insert a question at t=2000 (newest question)
-    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-new", kind: "question" }, 2_000);
-    // Insert a card at t=2500
-    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-new", kind: "card" }, 2_500);
+    // Insert a card at t=1000 for sess-1
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-old", kind: "card", sessionId: "sess-1" }, 1_000);
+    // Insert a stop at t=1500 for sess-2
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-mid", kind: "stop", sessionId: "sess-2" }, 1_500);
+    // Insert a question at t=2000 for sess-3
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-new", kind: "question", sessionId: "sess-3" }, 2_000);
+    // Insert a card at t=2500 for sess-4
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-new", kind: "card", sessionId: "sess-4" }, 2_500);
 
     const ready = storage.outbox.getReady(5_000, 10);
     expect(ready.map((r) => r.notificationId)).toEqual([
-      "q-new",      // question first despite being newer than card-old/stop-mid
-      "stop-mid",   // stop second
-      "card-old",   // card third, ordered by created_at
+      "q-new",      // question session first
+      "stop-mid",   // stop session second
+      "card-old",   // card session third, ordered by created_at
       "card-new",
     ]);
+
+    storage.db.close();
+  });
+
+  it("getReady orders strictly by created_at within the same session (stop before question regression)", () => {
+    const storage = createStorage();
+
+    // Stop created at t=1000 for same session
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-1", kind: "stop", sessionId: "sess-1" }, 1_000);
+    // Question created at t=2000 for same session
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-1", kind: "question", sessionId: "sess-1" }, 2_000);
+
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["stop-1", "q-1"]);
+
+    storage.db.close();
+  });
+
+  it("getReady prioritizes session with question over session with older stop", () => {
+    const storage = createStorage();
+
+    // Session A has an older stop at t=1000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-a", kind: "stop", sessionId: "sess-a" }, 1_000);
+    // Session B has a newer question at t=2000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-b", kind: "question", sessionId: "sess-b" }, 2_000);
+
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["q-b", "stop-a"]);
+
+    storage.db.close();
+  });
+
+  it("getReady orders multi-session outbox entries by session priority then created_at", () => {
+    const storage = createStorage();
+
+    // Session A: card created at t=1000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-a", kind: "card", sessionId: "sess-a" }, 1_000);
+    // Session B: stop created at t=2000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "stop-b", kind: "stop", sessionId: "sess-b" }, 2_000);
+    // Session C: card at t=500 and question at t=3000
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "card-c", kind: "card", sessionId: "sess-c" }, 500);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-c", kind: "question", sessionId: "sess-c" }, 3_000);
+
+    const ready = storage.outbox.getReady(5_000, 10);
+    expect(ready.map((r) => r.notificationId)).toEqual(["card-c", "q-c", "stop-b", "card-a"]);
 
     storage.db.close();
   });
