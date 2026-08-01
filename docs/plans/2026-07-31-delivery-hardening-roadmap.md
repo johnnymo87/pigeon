@@ -713,7 +713,32 @@ Accepted deliberately, not filed: the governor window and `pausedUntil` are in-m
 daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
 such as a successful re-registration inherit an escalated backoff (≤2 min extra latency, no loss).
 
-### Cycle 4 — the amplifier was fictional; alert on what is actually there
+### Cycle 4 — the amplifier was fictional; alert on what is actually there — DONE (PR #20, merged `2a95ee4`)
+
+**Deployed to cloudbox 2026-08-01 and verified by effect, not by absence of errors** (§1.-1):
+`curl http://127.0.0.1:4731/outbox/stats` returns live aggregates
+(`{"states":{"queued":0,"sending":0,"sent":60,"failed":0},...}`). **Nothing else creates that route**,
+so its existence is the proof the new code is running — the same trick Cycle 3 used with its migration.
+No schema migration was needed this cycle (`getStats` only reads), so the deploy was low-risk.
+Journal clean after restart: 0 errors, 0 exceptions, no `invalid PIGEON_QUIET_TITLE_PATTERN`.
+
+**One honest gap in the verification.** The 4c suppression has **not** yet been positively confirmed in
+production: no lgtm session has completed a turn since the restart, so no `[stop] quieted` line exists
+yet. What *is* confirmed is the dangerous direction — a real work session's stop (`kafka-to-bq
+at-least-once`) was **delivered** normally, so the pattern is not over-matching, and the three lgtm
+outbox rows present all predate the restart by minutes. 230 of 390 local sessions match the stricter
+`\.lgtm-` default but only 1 was active in the preceding 30 minutes. **To close this out, confirm a
+quieted line appears on the next lgtm review turn:**
+`sudo journalctl -u pigeon-daemon -S '-1 h' | grep '\[stop\] quieted'`.
+
+**Still undeployed on devbox and macbook**, as with Cycle 3 — both were unreachable from cloudbox
+(`devbox` does not resolve; the `mac` tunnel refuses on 127.0.0.1:2222). Their `git pull && npm install`
+plus restart must be run on those hosts. Note 4c changes *notification volume*, so until they are
+deployed those machines keep emitting lgtm stop notifications into the shared 20/min budget.
+
+**Cycle 4f (`pigeon-m74`) remains deliberately OPEN and unscheduled** — it is evidence-gated on a real
+post-outage drain measurement, and `4e` shipped the counter rather than the drain. Do not tune the
+governor constant without that data.
 
 > **CORRECTION #5 (2026-08-01, start of Cycle 4) — this cycle's organizing premise was false, and the
 > file committed §1.7 against itself.** Cycle 4 was titled "remove the amplifier, then alert on what
