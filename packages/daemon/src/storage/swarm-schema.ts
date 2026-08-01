@@ -21,7 +21,10 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       handed_off_at INTEGER,
       verified_at INTEGER,
       requeue_count INTEGER NOT NULL DEFAULT 0,
-      aborted_at INTEGER
+      aborted_at INTEGER,
+      deliver_at INTEGER,
+      expires_at INTEGER,
+      cancelled_at INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -50,6 +53,9 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       "ALTER TABLE swarm_messages ADD COLUMN verified_at INTEGER",
       "ALTER TABLE swarm_messages ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE swarm_messages ADD COLUMN aborted_at INTEGER",
+      "ALTER TABLE swarm_messages ADD COLUMN deliver_at INTEGER",
+      "ALTER TABLE swarm_messages ADD COLUMN expires_at INTEGER",
+      "ALTER TABLE swarm_messages ADD COLUMN cancelled_at INTEGER",
     ];
 
     for (const statement of additiveColumns) {
@@ -67,6 +73,8 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_swarm_unverified
         ON swarm_messages(state, verified_at, handed_off_at);
+      CREATE INDEX IF NOT EXISTS idx_swarm_scheduled
+        ON swarm_messages(state, deliver_at);
     `);
 
     if (!hadVerifiedAtBeforeMigration) {

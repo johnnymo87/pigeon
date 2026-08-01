@@ -321,6 +321,255 @@ describe("SwarmRepository", () => {
       s.db.close();
     });
   });
+
+  describe("scheduled swarm messages", () => {
+    it("row with FUTURE deliver_at is NOT returned by getReadyForTarget or listTargetsWithReady until now advances", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m1", deliverAt: 10_000 }, 1_000);
+
+      // At now = 5_000 (before deliverAt 10_000)
+      expect(s.swarm.getReadyForTarget("ses_b", 5_000)).toHaveLength(0);
+      expect(s.swarm.listTargetsWithReady(5_000)).toEqual([]);
+
+      // At now = 10_000 (equal to deliverAt)
+      const ready = s.swarm.getReadyForTarget("ses_b", 10_000);
+      expect(ready).toHaveLength(1);
+      expect(ready[0]!.msgId).toBe("m1");
+      expect(s.swarm.listTargetsWithReady(10_000)).toEqual(["ses_b"]);
+
+      // At now = 12_000 (past deliverAt)
+      expect(s.swarm.getReadyForTarget("ses_b", 12_000)).toHaveLength(1);
+      expect(s.swarm.listTargetsWithReady(12_000)).toEqual(["ses_b"]);
+
+      s.db.close();
+    });
+
+    it("row with NULL deliver_at is returned immediately (no regression)", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m1", deliverAt: null }, 1_000);
+
+      const ready = s.swarm.getReadyForTarget("ses_b", 1_000);
+      expect(ready).toHaveLength(1);
+      expect(ready[0]!.msgId).toBe("m1");
+      expect(s.swarm.listTargetsWithReady(1_000)).toEqual(["ses_b"]);
+
+      s.db.close();
+    });
+
+    it("deliver_at and next_retry_at are independent", () => {
+      const s = createStorage();
+
+      // Row with future deliver_at (20_000) but elapsed next_retry_at (5_000) -> NOT ready at now=10_000
+      s.swarm.insert({ ...BASE, msgId: "m_fut_deliv", deliverAt: 20_000 }, 1_000);
+      s.swarm.markRetry("m_fut_deliv", 1_000, 4_000); // next_retry_at = 5_000
+      expect(s.swarm.getReadyForTarget("ses_b", 10_000)).toHaveLength(0);
+
+      // Row with elapsed deliver_at (5_000) but future next_retry_at (20_000) -> NOT ready at now=10_000
+      s.swarm.insert({ ...BASE, msgId: "m_fut_retry", deliverAt: 5_000 }, 1_000);
+      s.swarm.markRetry("m_fut_retry", 1_000, 19_000); // next_retry_at = 20_000
+      expect(s.swarm.getReadyForTarget("ses_b", 10_000)).toHaveLength(0);
+
+      // Once now reaches 20_000, both are ready
+      const ready = s.swarm.getReadyForTarget("ses_b", 20_000, 10);
+      expect(ready.map((m) => m.msgId).sort()).toEqual(["m_fut_deliv", "m_fut_retry"]);
+
+      s.db.close();
+    });
+
+    it("persists and reads back deliverAt, expiresAt, and cancelledAt through asRecord", () => {
+      const s = createStorage();
+      s.swarm.insert(
+        {
+          ...BASE,
+          msgId: "m_sched",
+          deliverAt: 10_000,
+          expiresAt: 20_000,
+        },
+        1_000,
+      );
+
+      let m = s.swarm.getByMsgId("m_sched");
+      expect(m).not.toBeNull();
+      expect(m!.deliverAt).toBe(10_000);
+      expect(m!.expiresAt).toBe(20_000);
+      expect(m!.cancelledAt).toBeNull();
+
+      // Mark cancelled
+      const cancelled = s.swarm.markCancelled("m_sched", 15_000);
+      expect(cancelled).toBe(true);
+
+      m = s.swarm.getByMsgId("m_sched");
+      expect(m!.state).toBe("cancelled");
+      expect(m!.cancelledAt).toBe(15_000);
+
+      s.db.close();
+    });
+
+    it("enforces state guards on transitions and returns boolean result", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
+
+      // markCancelled on queued row -> succeeds (returns true, state='cancelled', cancelledAt set)
+      const cancelRes = s.swarm.markCancelled("m1", 2_000);
+      expect(cancelRes).toBe(true);
+      let m = s.swarm.getByMsgId("m1");
+      expect(m!.state).toBe("cancelled");
+      expect(m!.cancelledAt).toBe(2_000);
+
+      // markHandedOff on already cancelled row -> fails (returns false, state remains 'cancelled')
+      const handoffRes = s.swarm.markHandedOff("m1", 3_000);
+      expect(handoffRes).toBe(false);
+      m = s.swarm.getByMsgId("m1");
+      expect(m!.state).toBe("cancelled");
+      expect(m!.handedOffAt).toBeNull();
+
+      // markExpired on already cancelled row -> fails
+      const expireRes = s.swarm.markExpired("m1", 4_000);
+      expect(expireRes).toBe(false);
+      m = s.swarm.getByMsgId("m1");
+      expect(m!.state).toBe("cancelled");
+
+      // Fresh row for markHandedOff -> markCancelled / markExpired
+      s.swarm.insert({ ...BASE, msgId: "m2" }, 1_000);
+      const handoffOk = s.swarm.markHandedOff("m2", 2_000);
+      expect(handoffOk).toBe(true);
+      m = s.swarm.getByMsgId("m2");
+      expect(m!.state).toBe("handed_off");
+
+      // markCancelled on handed_off row -> fails
+      const cancelFail = s.swarm.markCancelled("m2", 3_000);
+      expect(cancelFail).toBe(false);
+      m = s.swarm.getByMsgId("m2");
+      expect(m!.state).toBe("handed_off");
+
+      // markExpired on handed_off row -> fails
+      const expireFail = s.swarm.markExpired("m2", 4_000);
+      expect(expireFail).toBe(false);
+      m = s.swarm.getByMsgId("m2");
+      expect(m!.state).toBe("handed_off");
+
+      // Fresh row for markExpired
+      s.swarm.insert({ ...BASE, msgId: "m3" }, 1_000);
+      const expireOk = s.swarm.markExpired("m3", 2_000);
+      expect(expireOk).toBe(true);
+      m = s.swarm.getByMsgId("m3");
+      expect(m!.state).toBe("expired");
+
+      s.db.close();
+    });
+
+    it("listScheduled matches on from_session or to_session, excludes non-scheduled and non-queued rows, ordered by deliver_at ASC", () => {
+      const s = createStorage();
+      // Scheduled row matching from_session = ses_a
+      s.swarm.insert({ ...BASE, msgId: "m1", fromSession: "ses_a", toSession: "ses_b", deliverAt: 20_000 }, 1_000);
+      // Scheduled row matching to_session = ses_a
+      s.swarm.insert({ ...BASE, msgId: "m2", fromSession: "ses_other", toSession: "ses_a", deliverAt: 10_000 }, 1_000);
+      // Scheduled row matching neither
+      s.swarm.insert({ ...BASE, msgId: "m3", fromSession: "ses_x", toSession: "ses_y", deliverAt: 15_000 }, 1_000);
+      // Non-scheduled row (deliverAt is null) involving ses_a
+      s.swarm.insert({ ...BASE, msgId: "m4", fromSession: "ses_a", toSession: "ses_b", deliverAt: null }, 1_000);
+      // Scheduled row involving ses_a but handed_off
+      s.swarm.insert({ ...BASE, msgId: "m5", fromSession: "ses_a", toSession: "ses_b", deliverAt: 5_000 }, 1_000);
+      s.swarm.markHandedOff("m5", 2_000);
+
+      const scheduled = s.swarm.listScheduled("ses_a");
+      expect(scheduled.map((m) => m.msgId)).toEqual(["m2", "m1"]);
+
+      s.db.close();
+    });
+
+    it("listScheduled with includeTerminalSince includes terminal rows (expired, failed, cancelled) updated >= cutoff", () => {
+      const s = createStorage();
+      const now = 100_000;
+      const cutoff = now - 24 * 60 * 60 * 1000; // 100_000 - 86_400_000 = -86_300_000
+
+      // Queued scheduled row
+      s.swarm.insert({ ...BASE, msgId: "m_queued", deliverAt: now + 5000 }, now - 1000);
+
+      // Expired scheduled row updated recently
+      s.swarm.insert({ ...BASE, msgId: "m_expired", deliverAt: now - 5000 }, now - 10_000);
+      s.swarm.markExpired("m_expired", now - 2000); // updated_at = now - 2000 >= cutoff
+
+      // Failed scheduled row updated recently
+      s.swarm.insert({ ...BASE, msgId: "m_failed", deliverAt: now - 5000 }, now - 10_000);
+      s.swarm.markFailed("m_failed", now - 3000); // updated_at = now - 3000 >= cutoff
+
+      // Cancelled scheduled row updated recently
+      s.swarm.insert({ ...BASE, msgId: "m_cancelled", deliverAt: now - 5000 }, now - 10_000);
+      s.swarm.markCancelled("m_cancelled", now - 4000); // updated_at = now - 4000 >= cutoff
+
+      // Ancient expired scheduled row (updated before cutoff)
+      s.swarm.insert({ ...BASE, msgId: "m_ancient_expired", deliverAt: now - 100_000_000 }, now - 100_000_000);
+      s.swarm.markExpired("m_ancient_expired", now - 90_000_000); // updated_at < cutoff
+
+      // Non-scheduled expired row (deliverAt is null)
+      s.swarm.insert({ ...BASE, msgId: "m_nonsched_expired", deliverAt: null }, now - 10_000);
+      s.swarm.markExpired("m_nonsched_expired", now - 2000);
+
+      // Handed-off scheduled row (not terminal: delivered)
+      s.swarm.insert({ ...BASE, msgId: "m_handed_off", deliverAt: now - 5000 }, now - 10_000);
+      s.swarm.markHandedOff("m_handed_off", now - 2000);
+
+      const res = s.swarm.listScheduled("ses_a", { includeTerminalSince: cutoff });
+      const ids = res.map((m) => m.msgId).sort();
+      expect(ids).toEqual(["m_cancelled", "m_expired", "m_failed", "m_queued"]);
+
+      s.db.close();
+    });
+
+    it("listExpired returns only queued rows past expires_at", () => {
+      const s = createStorage();
+      // Queued row past expires_at (10_000 <= 15_000) -> returned
+      s.swarm.insert({ ...BASE, msgId: "m_exp1", expiresAt: 10_000 }, 1_000);
+      // Queued row future expires_at (20_000 > 15_000) -> not returned
+      s.swarm.insert({ ...BASE, msgId: "m_fut_exp", expiresAt: 20_000 }, 1_000);
+      // Queued row null expires_at -> not returned
+      s.swarm.insert({ ...BASE, msgId: "m_null_exp", expiresAt: null }, 1_000);
+      // Handed off row past expires_at -> not returned (must be queued)
+      s.swarm.insert({ ...BASE, msgId: "m_exp_handed", expiresAt: 5_000 }, 1_000);
+      s.swarm.markHandedOff("m_exp_handed", 2_000);
+
+      const expired = s.swarm.listExpired(15_000);
+      expect(expired.map((m) => m.msgId)).toEqual(["m_exp1"]);
+
+      s.db.close();
+    });
+
+    it("cleanupOlderThan deletes expired and cancelled rows as well as handed_off and failed", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m_handed" }, 1_000);
+      s.swarm.markHandedOff("m_handed", 1_000); // updated_at = 1_000
+
+      s.swarm.insert({ ...BASE, msgId: "m_failed" }, 1_000);
+      s.swarm.markFailed("m_failed", 1_000); // updated_at = 1_000
+
+      s.swarm.insert({ ...BASE, msgId: "m_canc" }, 1_000);
+      s.swarm.markCancelled("m_canc", 1_000); // updated_at = 1_000
+
+      s.swarm.insert({ ...BASE, msgId: "m_exp" }, 1_000);
+      s.swarm.markExpired("m_exp", 1_000); // updated_at = 1_000
+
+      s.swarm.insert({ ...BASE, msgId: "m_queued" }, 1_000); // updated_at = 1_000
+
+      const cleaned = s.swarm.cleanupOlderThan(5_000);
+      expect(cleaned).toBe(4);
+
+      expect(s.swarm.getByMsgId("m_handed")).toBeNull();
+      expect(s.swarm.getByMsgId("m_failed")).toBeNull();
+      expect(s.swarm.getByMsgId("m_canc")).toBeNull();
+      expect(s.swarm.getByMsgId("m_exp")).toBeNull();
+      expect(s.swarm.getByMsgId("m_queued")).not.toBeNull();
+
+      s.db.close();
+    });
+
+    it("has idx_swarm_scheduled index in schema", () => {
+      const s = createStorage();
+      const indexes = s.db.prepare("PRAGMA index_list(swarm_messages)").all() as Array<{ name: string }>;
+      expect(indexes.map((i) => i.name)).toContain("idx_swarm_scheduled");
+      s.db.close();
+    });
+  });
 });
 
 describe("swarm_messages verification column migration", () => {

@@ -13,7 +13,7 @@ export interface SwarmMessageRecord {
   priority: Priority;
   replyTo: string | null;
   payload: string;
-  state: "queued" | "handed_off" | "failed";
+  state: "queued" | "handed_off" | "failed" | "expired" | "cancelled";
   attempts: number;
   nextRetryAt: number | null;
   createdAt: number;
@@ -22,6 +22,9 @@ export interface SwarmMessageRecord {
   verifiedAt: number | null;
   requeueCount: number;
   abortedAt: number | null;
+  deliverAt: number | null;
+  expiresAt: number | null;
+  cancelledAt: number | null;
 }
 
 /** Cursor-based paging options for {@link SwarmRepository.getInbox}. */
@@ -49,6 +52,8 @@ export interface InsertSwarmInput {
   priority: Priority;
   replyTo: string | null;
   payload: string;
+  deliverAt?: number | null;
+  expiresAt?: number | null;
 }
 
 function asRecord(row: Row): SwarmMessageRecord {
@@ -70,6 +75,9 @@ function asRecord(row: Row): SwarmMessageRecord {
     verifiedAt: (row.verified_at as number | null) ?? null,
     requeueCount: Number(row.requeue_count ?? 0),
     abortedAt: (row.aborted_at as number | null) ?? null,
+    deliverAt: (row.deliver_at as number | null) ?? null,
+    expiresAt: (row.expires_at as number | null) ?? null,
+    cancelledAt: (row.cancelled_at as number | null) ?? null,
   };
 }
 
@@ -81,8 +89,9 @@ export class SwarmRepository {
       .prepare(
         `INSERT INTO swarm_messages
            (msg_id, from_session, to_session, channel, kind, priority, reply_to, payload,
-            state, attempts, next_retry_at, created_at, updated_at, handed_off_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, NULL)
+            state, attempts, next_retry_at, created_at, updated_at, handed_off_at,
+            deliver_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, NULL, ?, ?)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -96,6 +105,8 @@ export class SwarmRepository {
         input.payload,
         now,
         now,
+        input.deliverAt ?? null,
+        input.expiresAt ?? null,
       );
   }
 
@@ -117,10 +128,11 @@ export class SwarmRepository {
          WHERE to_session = ?
            AND state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+           AND (deliver_at IS NULL OR deliver_at <= ?)
          ORDER BY created_at ASC
          LIMIT ?`,
       )
-      .all(toSession, now, limit) as Row[];
+      .all(toSession, now, now, limit) as Row[];
     return rows.map(asRecord);
   }
 
@@ -131,20 +143,85 @@ export class SwarmRepository {
          FROM swarm_messages
          WHERE state = 'queued'
            AND to_session IS NOT NULL
-           AND (next_retry_at IS NULL OR next_retry_at <= ?)`,
+           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+           AND (deliver_at IS NULL OR deliver_at <= ?)`,
       )
-      .all(now) as Array<{ to_session: string }>;
+      .all(now, now) as Array<{ to_session: string }>;
     return rows.map((r) => r.to_session);
   }
 
-  markHandedOff(msgId: string, now = Date.now()): void {
-    this.db
+  markHandedOff(msgId: string, now = Date.now()): boolean {
+    const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND state = 'queued'`,
       )
       .run(now, now, msgId);
+    return result.changes > 0;
+  }
+
+  markCancelled(msgId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET state = 'cancelled', cancelled_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE msg_id = ? AND state = 'queued'`,
+      )
+      .run(now, now, msgId);
+    return result.changes > 0;
+  }
+
+  markExpired(msgId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET state = 'expired', updated_at = ?, next_retry_at = NULL
+         WHERE msg_id = ? AND state = 'queued'`,
+      )
+      .run(now, msgId);
+    return result.changes > 0;
+  }
+
+  listScheduled(
+    sessionId: string,
+    opts?: { includeTerminalSince?: number },
+  ): SwarmMessageRecord[] {
+    const includeTerminalSince = opts?.includeTerminalSince;
+    if (typeof includeTerminalSince === "number") {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM swarm_messages
+           WHERE deliver_at IS NOT NULL
+             AND (from_session = ? OR to_session = ?)
+             AND (state = 'queued' OR (state IN ('expired', 'failed', 'cancelled') AND updated_at >= ?))
+           ORDER BY deliver_at ASC`,
+        )
+        .all(sessionId, sessionId, includeTerminalSince) as Row[];
+      return rows.map(asRecord);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM swarm_messages
+         WHERE state = 'queued'
+           AND deliver_at IS NOT NULL
+           AND (from_session = ? OR to_session = ?)
+         ORDER BY deliver_at ASC`,
+      )
+      .all(sessionId, sessionId) as Row[];
+    return rows.map(asRecord);
+  }
+
+  listExpired(now: number): SwarmMessageRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM swarm_messages
+         WHERE state = 'queued'
+           AND expires_at IS NOT NULL
+           AND expires_at <= ?`,
+      )
+      .all(now) as Row[];
+    return rows.map(asRecord);
   }
 
   /**
@@ -301,7 +378,7 @@ export class SwarmRepository {
     const result = this.db
       .prepare(
         `DELETE FROM swarm_messages
-         WHERE state IN ('handed_off', 'failed') AND updated_at < ?`,
+         WHERE state IN ('handed_off', 'failed', 'expired', 'cancelled') AND updated_at < ?`,
       )
       .run(cutoff);
     return result.changes;
