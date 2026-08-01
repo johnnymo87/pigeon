@@ -820,7 +820,16 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   > degradation, whereas a false positive would suppress real work, so **bias the pattern toward
   > precision and let the stragglers through.** A structurally reliable signal would have to come from
   > the launcher tagging its own sessions, which lives in another repo and is out of scope here.
-- [ ] **4d. `pigeon-93v`** (P2) — **do this BEFORE `8l7`, it is the cheapest real fix left in the
+- [x] **4d. `pigeon-93v`** (P2) — DONE `f3231c3`. Returns HTTP **200** with
+  `{ ok: false, deliveryState: "failed" }` plus a `[question]` warn line carrying `failedReason`.
+  **The 2xx is load-bearing and must not be "improved" to a 4xx/5xx**: `sendQuestionAsked` (the retry
+  queue's own path) *throws* on non-2xx, and `notifyQuestionAsked` calls `onFailure()` on non-2xx,
+  tripping the plugin circuit breaker. Signalling failure in the **body** under a 2xx lets the queue
+  see the failure, judge it correctly, and reschedule — with no exception and no breaker damage.
+  The plugin-side composition test is the one that pins the actual consequence (entry stays queued and
+  is retried); the daemon test alone would only pin a string. Both regressions were injected and
+  observed failing.
+  **Original entry, for the reasoning:** — **do this BEFORE `8l7`, it is the cheapest real fix left in the
   roadmap.** `/question-asked` (`app.ts:479-484`) early-returns for an existing outbox row without
   inspecting its state, so a `failed` row is reported as `"queued"`. The reason that matters more than
   it sounds: **the lie is load-bearing.** The plugin's question retry queue treats `"queued"` as
