@@ -33,6 +33,7 @@ import {
   countsTowardVerdict,
   RequestTimeoutError,
   ServeOutcomeSensor,
+  TransportError,
 } from "../../src/routing/serve-outcome";
 
 /** Shape Node's fetch uses: a TypeError wrapping a cause carrying `code`. */
@@ -57,6 +58,21 @@ describe("classifyServeOutcome", () => {
 
   it("classifies connection-refused as refused", () => {
     expect(classifyServeOutcome({ error: transportError("ECONNREFUSED") })).toBe("refused");
+  });
+
+  it("classifies a TransportError-WRAPPED connection-refused as refused", () => {
+    // Regression guard (W2). OpencodeClient wraps transport throws in
+    // TransportError so the swarm arbiter can distinguish "never reached the
+    // serve" (don't charge the retry budget) from "the serve answered badly".
+    // That wrap buries the TypeError one level down. If transportCode stops
+    // unwrapping it, this degrades to `unknown`, which never counts toward the
+    // verdict — so a serve with a closed port would silently never be evicted
+    // from the routing pool. The bug would be invisible: no test failed when
+    // the wrap was first introduced, because every existing case passes the
+    // raw error.
+    expect(
+      classifyServeOutcome({ error: new TransportError(transportError("ECONNREFUSED")) }),
+    ).toBe("refused");
   });
 
   it("classifies a timeout as timeout, NOT as refused or server_error", () => {

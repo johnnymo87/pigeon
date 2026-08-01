@@ -1,4 +1,5 @@
 const MAX_HORIZON_MS = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
+export const DEFAULT_EXPIRY_MS = 6 * 60 * 60 * 1000; // 6 hours in milliseconds
 
 /**
  * Parses a duration string formatted as `<positive integer><unit>` where unit is
@@ -169,7 +170,7 @@ export function parseScheduleTime(
     };
   }
 
-  let expiresAt: number | null = null;
+    let expiresAt: number | null = null;
   if (input.expiresIn !== undefined && input.expiresIn !== null) {
     if (typeof input.expiresIn !== "string") {
       return {
@@ -189,6 +190,8 @@ export function parseScheduleTime(
     // `expiresAt` is measured from `deliverAt` (delivery time), NOT from `now`.
     // It represents "how long after the wake fires is it still worth delivering".
     expiresAt = deliverAt + expiresInMs;
+  } else {
+    expiresAt = deliverAt + DEFAULT_EXPIRY_MS;
   }
 
   return {

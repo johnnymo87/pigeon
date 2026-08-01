@@ -509,4 +509,82 @@ describe("storage schema and repositories", () => {
       }
     });
   });
+
+  describe("swarm repository expiry readiness and uncounted retries", () => {
+    it("readiness predicates (getReadyForTarget & listTargetsWithReady) exclude expired rows", () => {
+      const storage = createStorage();
+      const now = 1_000_000;
+
+      // 1. Expired wake (deliver_at in past, expires_at <= now)
+      storage.swarm.insert({
+        msgId: "msg-expired",
+        fromSession: "ses_sender",
+        toSession: "ses_target",
+        channel: null,
+        kind: "wake",
+        priority: "normal",
+        replyTo: null,
+        payload: "wake payload",
+        deliverAt: now - 10_000,
+        expiresAt: now - 1_000, // expired!
+      }, now - 20_000);
+
+      // 2. Active wake (deliver_at in past, expires_at > now)
+      storage.swarm.insert({
+        msgId: "msg-active",
+        fromSession: "ses_sender",
+        toSession: "ses_target",
+        channel: null,
+        kind: "wake",
+        priority: "normal",
+        replyTo: null,
+        payload: "active payload",
+        deliverAt: now - 5_000,
+        expiresAt: now + 10_000, // active
+      }, now - 10_000);
+
+      const targets = storage.swarm.listTargetsWithReady(now);
+      expect(targets).toEqual(["ses_target"]);
+
+      const ready = storage.swarm.getReadyForTarget("ses_target", now, 10);
+      expect(ready.map((m) => m.msgId)).toEqual(["msg-active"]);
+
+      storage.db.close();
+    });
+
+    it("markRetryUncounted updates next_retry_at without incrementing attempts, guarded by state=queued", () => {
+      const storage = createStorage();
+      const now = 1_000_000;
+
+      storage.swarm.insert({
+        msgId: "msg-1",
+        fromSession: "ses_sender",
+        toSession: "ses_target",
+        channel: null,
+        kind: "wake",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello",
+      }, now);
+
+      const initial = storage.swarm.getByMsgId("msg-1")!;
+      expect(initial.attempts).toBe(0);
+
+      const success = storage.swarm.markRetryUncounted("msg-1", now, 30_000);
+      expect(success).toBe(true);
+
+      const updated = storage.swarm.getByMsgId("msg-1")!;
+      expect(updated.attempts).toBe(0); // attempts unchanged!
+      expect(updated.nextRetryAt).toBe(now + 30_000);
+      expect(updated.state).toBe("queued");
+
+      // Guard check: cancelled message cannot be resurrected by markRetryUncounted
+      storage.swarm.markCancelled("msg-1", now + 1_000);
+      const resAfterCancel = storage.swarm.markRetryUncounted("msg-1", now + 2_000, 30_000);
+      expect(resAfterCancel).toBe(false);
+      expect(storage.swarm.getByMsgId("msg-1")!.state).toBe("cancelled");
+
+      storage.db.close();
+    });
+  });
 });

@@ -130,10 +130,11 @@ export class SwarmRepository {
            AND state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
            AND (deliver_at IS NULL OR deliver_at <= ?)
+           AND (expires_at IS NULL OR expires_at > ?)
          ORDER BY created_at ASC
          LIMIT ?`,
       )
-      .all(toSession, now, now, limit) as Row[];
+      .all(toSession, now, now, now, limit) as Row[];
     return rows.map(asRecord);
   }
 
@@ -145,9 +146,10 @@ export class SwarmRepository {
          WHERE state = 'queued'
            AND to_session IS NOT NULL
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
-           AND (deliver_at IS NULL OR deliver_at <= ?)`,
+           AND (deliver_at IS NULL OR deliver_at <= ?)
+           AND (expires_at IS NULL OR expires_at > ?)`,
       )
-      .all(now, now) as Array<{ to_session: string }>;
+      .all(now, now, now) as Array<{ to_session: string }>;
     return rows.map((r) => r.to_session);
   }
 
@@ -314,6 +316,17 @@ export class SwarmRepository {
       .prepare(
         `UPDATE swarm_messages
          SET attempts = attempts + 1, next_retry_at = ?, updated_at = ?, state = 'queued'
+         WHERE msg_id = ? AND state = 'queued'`,
+      )
+      .run(now + backoffMs, now, msgId);
+    return result.changes > 0;
+  }
+
+  markRetryUncounted(msgId: string, now: number, backoffMs: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET next_retry_at = ?, updated_at = ?, state = 'queued'
          WHERE msg_id = ? AND state = 'queued'`,
       )
       .run(now + backoffMs, now, msgId);

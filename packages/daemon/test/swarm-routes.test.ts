@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
 
 describe("POST /swarm/send", () => {
   let storage: StorageDb | null = null;
@@ -422,7 +423,7 @@ describe("POST /swarm/schedule", () => {
     expect(body.msg_id).toMatch(/^msg_/);
     const expectedDeliverAt = now + 13 * 3600 * 1000;
     expect(body.deliver_at).toBe(expectedDeliverAt);
-    expect(body.expires_at).toBeNull();
+    expect(body.expires_at).toBe(expectedDeliverAt + DEFAULT_EXPIRY_MS);
 
     // Not ready at now
     expect(s.swarm.getReadyForTarget("ses_b", now)).toHaveLength(0);
@@ -512,7 +513,7 @@ describe("POST /swarm/schedule", () => {
     }
   });
 
-  it("maps `expires_in` to `expires_at`, or `expires_at: null` when absent", async () => {
+  it("maps `expires_in` to `expires_at`, or default `expires_at` when absent", async () => {
     const now = 1_000_000;
     const { app } = newApp(now);
 
@@ -550,7 +551,7 @@ describe("POST /swarm/schedule", () => {
     );
     expect(res2.status).toBe(202);
     const body2 = (await res2.json()) as { expires_at: number | null };
-    expect(body2.expires_at).toBeNull();
+    expect(body2.expires_at).toBe(now + 3600 * 1000 + DEFAULT_EXPIRY_MS);
   });
 
   it("defaults kind to 'wake', but explicit kind wins", async () => {
