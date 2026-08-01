@@ -7,6 +7,7 @@
  */
 
 import type { StorageDb } from "../storage/database";
+import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, WorkerResult } from "./poller";
 import { classifyDeliveryFailure, isTransportFailure } from "./delivery-policy";
 import type { DeliveryPolicyContext } from "./delivery-policy";
@@ -46,14 +47,29 @@ export interface OutboxSenderOptions {
  * Transient transport failures (transport_error, 5xx, 429) do NOT increment attempts.
  */
 const MAX_ATTEMPTS = 10;
-const MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
+
+/**
+ * Outbox expiry durations grounded in system affordance TTLs.
+ * - question: PENDING_QUESTION_TTL_MS (4h) - pending question expires after 4h so reply can't route
+ * - stop/card: REPLY_TOKEN_TTL_MS (24h) - reply token expires after 24h so reply can't route
+ * - default: REPLY_TOKEN_TTL_MS (24h)
+ */
+const EXPIRY_BY_KIND: Record<string, number> = {
+  question: PENDING_QUESTION_TTL_MS,
+  stop: REPLY_TOKEN_TTL_MS,
+  card: REPLY_TOKEN_TTL_MS,
+};
+
+export function expiryForKind(kind: string): number {
+  return EXPIRY_BY_KIND[kind] ?? REPLY_TOKEN_TTL_MS;
+}
+
 const BACKOFF_SCHEDULE = [5_000, 10_000, 30_000, 60_000, 120_000];
 
 /**
  * Maximum duration (ms) to pause the outbox on a rate limit response (300s = 5m).
- * Trusting an arbitrarily large upstream retry_after (e.g. 3600s) could cause entries
- * to exceed MAX_AGE_MS (15m) while paused and be permanently marked failed.
- * Probing again after at most 300s is strictly safer than sleeping indefinitely.
+ * Bounded probe interval means we re-check reality rather than trusting an
+ * arbitrarily large upstream retry_after value indefinitely.
  */
 export const MAX_PAUSE_MS = 5 * 60 * 1000;
 
@@ -204,16 +220,31 @@ export class OutboxSender {
         }
 
         const age = now - entry.createdAt;
+        const expiryMs = expiryForKind(entry.kind);
 
         // Check terminal conditions
-        if (entry.attempts >= MAX_ATTEMPTS || age > MAX_AGE_MS) {
-          this.storage.outbox.markFailed(entry.notificationId, now, "budget_exhausted");
+        if (entry.attempts >= MAX_ATTEMPTS) {
+          this.storage.outbox.markFailed(entry.notificationId, now, "attempts_exhausted");
           this.reregisteredEntries.delete(entry.notificationId);
-          this.log("outbox entry marked failed (terminal)", {
+          this.log("outbox entry marked failed (attempts exhausted)", {
             notificationId: entry.notificationId,
             sessionId: entry.sessionId,
             attempts: entry.attempts,
             ageMs: age,
+          });
+          continue;
+        }
+
+        if (age > expiryMs) {
+          this.storage.outbox.markFailed(entry.notificationId, now, "expired");
+          this.reregisteredEntries.delete(entry.notificationId);
+          this.log("outbox entry marked failed (expired)", {
+            notificationId: entry.notificationId,
+            sessionId: entry.sessionId,
+            attempts: entry.attempts,
+            ageMs: age,
+            expiryMs,
+            kind: entry.kind,
           });
           continue;
         }

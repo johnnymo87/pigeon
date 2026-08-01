@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
-import { chunkNotificationId, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
+import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -223,7 +223,7 @@ describe("OutboxSender.processOnce()", () => {
     await sender.processOnce();
     const recordAfter11 = storage.outbox.getByNotificationId("notif-1");
     expect(recordAfter11!.state).toBe("failed");
-    expect(recordAfter11!.failedReason).toBe("budget_exhausted");
+    expect(recordAfter11!.failedReason).toBe("attempts_exhausted");
   });
 
   it("429 reschedules and pauses but does NOT increment attempts", async () => {
@@ -381,14 +381,50 @@ describe("OutboxSender.processOnce()", () => {
 
     const afterRecord = storage.outbox.getByNotificationId("notif-1");
     expect(afterRecord!.state).toBe("failed");
-    expect(afterRecord!.failedReason).toBe("budget_exhausted");
+    expect(afterRecord!.failedReason).toBe("attempts_exhausted");
   });
 
-  it("marks terminal failure after max age (15+ minutes)", async () => {
+  it("incident test: stop entry survives a 2-hour transport outage and remains queued", async () => {
     const createdAt = 1_000;
-    const now = createdAt + 15 * 60 * 1000 + 1; // just past 15 minutes
+    // 2 hours later (well past old 15m cap)
+    const now = createdAt + 2 * 60 * 60 * 1000;
 
-    storage.outbox.upsert(BASE_OUTBOX_INPUT, createdAt);
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "stop",
+      notificationId: "notif-stop-outage",
+    }, createdAt);
+
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "transport_error",
+      error: "Worker unreachable",
+    }) as unknown as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("notif-stop-outage");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+  });
+
+  it("question entry expires at 4 hours with failed_reason = 'expired'", async () => {
+    const createdAt = 1_000;
+    const fourHoursMs = 4 * 60 * 60 * 1000;
+    const now = createdAt + fourHoursMs + 1; // 4 hours + 1ms
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "question",
+      notificationId: "notif-q-expire",
+    }, createdAt);
 
     const sendNotification = makeSendNotification({ ok: true });
     const sender = new OutboxSender({
@@ -401,10 +437,130 @@ describe("OutboxSender.processOnce()", () => {
     await sender.processOnce();
 
     expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-q-expire");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
 
+  it("stop entry expires at 24 hours with failed_reason = 'expired'", async () => {
+    const createdAt = 1_000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    const now = createdAt + twentyFourHoursMs + 1; // 24 hours + 1ms
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "stop",
+      notificationId: "notif-stop-expire",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-stop-expire");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("question entry at 5 hours old is NOT delivered (expiry evaluated before send attempt)", async () => {
+    const createdAt = 1_000;
+    const fiveHoursMs = 5 * 60 * 60 * 1000;
+    const now = createdAt + fiveHoursMs;
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "question",
+      notificationId: "notif-q-5h",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-q-5h");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("unknown kind falls back to 24h expiry", async () => {
+    const createdAt = 1_000;
+    const twentyThreeHoursMs = 23 * 60 * 60 * 1000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+
+    // At 23h: still queued
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "weird_kind",
+      notificationId: "notif-unknown-kind",
+    }, createdAt);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = createdAt + twentyThreeHoursMs;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("notif-unknown-kind")!.state).toBe("sent");
+
+    // Re-upsert for expiry test at 24h + 1ms
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      kind: "weird_kind",
+      notificationId: "notif-unknown-kind-2",
+    }, createdAt);
+
+    sendNotification.mockClear();
+    now = createdAt + twentyFourHoursMs + 1;
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
+    const record = storage.outbox.getByNotificationId("notif-unknown-kind-2");
+    expect(record!.state).toBe("failed");
+    expect(record!.failedReason).toBe("expired");
+  });
+
+  it("attempts_exhausted terminates independently of age and records attempts_exhausted reason", async () => {
+    const now = 5_000;
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000); // 4s old, well within 4h
+
+    // 10 attempts
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.markRetry("notif-1", now, 0);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).not.toHaveBeenCalled();
     const record = storage.outbox.getByNotificationId("notif-1");
     expect(record!.state).toBe("failed");
-    expect(record!.failedReason).toBe("budget_exhausted");
+    expect(record!.failedReason).toBe("attempts_exhausted");
   });
 
   it("resurrected failed entry older than 15m gets fresh created_at and is actually sent instead of dropped", async () => {
@@ -767,6 +923,25 @@ describe("chunkNotificationId unit tests", () => {
   it("returns #c{index} suffix when isLast is false", () => {
     expect(chunkNotificationId("notif-1", 0, false)).toBe("notif-1#c0");
     expect(chunkNotificationId("notif-1", 1, false)).toBe("notif-1#c1");
+  });
+});
+
+describe("expiryForKind unit tests", () => {
+  it("returns PENDING_QUESTION_TTL_MS (4h) for question", () => {
+    expect(expiryForKind("question")).toBe(4 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) for stop", () => {
+    expect(expiryForKind("stop")).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) for card", () => {
+    expect(expiryForKind("card")).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("returns REPLY_TOKEN_TTL_MS (24h) default for unknown kind", () => {
+    expect(expiryForKind("unknown_kind")).toBe(24 * 60 * 60 * 1000);
+    expect(expiryForKind("")).toBe(24 * 60 * 60 * 1000);
   });
 });
 
