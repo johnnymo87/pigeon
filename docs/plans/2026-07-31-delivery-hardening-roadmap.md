@@ -51,11 +51,19 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **832** passed, 1 skipped |
+| `@pigeon/daemon` | **868** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **305** passed |
 | `@pigeon/worker` | **292** passed |
 
-Total **1429**. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1465**. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **CORRECTION #4 (2026-08-01, start of Cycle 4).** This table said **832 / 1429** until re-measured at
+> the top of Cycle 4. Cycle 3 added 36 daemon tests and the table was not updated — **the fourth time
+> in four cycles.** CORRECTION #3 directly below already declared "re-measuring is now the first action
+> of every cycle", and it was: the number was still wrong, because writing the rule did not make the
+> *previous* cycle go back and update the table it had invalidated. The durable fix is not another
+> exhortation — it is that **the cycle that adds tests owns updating this table in its own final
+> commit.** Until that habit exists, assume this table is stale and spend the 90 seconds.
 
 > **CORRECTION #3 (2026-07-31, start of Cycle 3).** This table said **790 / 305 / 279 = 1374** until
 > re-measured at the top of Cycle 3. Cycles 1 and 2 added tests and the table was never updated —
@@ -705,27 +713,89 @@ Accepted deliberately, not filed: the governor window and `pausedUntil` are in-m
 daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
 such as a successful re-registration inherit an escalated backoff (≤2 min extra latency, no loss).
 
-### Cycle 4 — remove the amplifier, then alert on what remains
+### Cycle 4 — the amplifier was fictional; alert on what is actually there
 
-- [ ] **4a. `pigeon-9y3` — do this BEFORE `8l7`.** An unidentified overnight job walks historical
-  sessions newest→oldest, ~one every 2 min, firing `registerSession` + a stop notification with
-  `notify=true` for each. During the outage every one burned an outbox entry to terminal. **That job
-  is why the incident was ~150 lost messages instead of ~1 — roughly 150× amplification.** Removing
-  the amplifier beats alerting on its output; done in the other order, the first thing the new
-  alerting does is page about 150 notifications that should never have existed.
-- [ ] **4b. `pigeon-2c6` — answer it with the SAME investigation as `4a`.** `/current-state`
-  registers every tmux-surveyed session worker-side (`current-state-ingest.ts:103`), but discovery is
-  tmux-based rather than registry-based, so nothing guarantees a local row exists — and the reaper
-  only unregisters sessions it still holds **locally**. Those rows can therefore never be
-  unregistered by any daemon. This is a different failure mode from `4a` (that one is a
-  notification storm, this one is a registry leak) but it is **the same code and almost certainly the
-  same root**, so investigating it separately would mean reading `current-state-ingest` twice. Now
-  bounded rather than unbounded by Cycle 2's 14-day sweep, which is what makes it safe to take time
-  over. **Measure first** — instrument how many such registrations have no local row — before
-  choosing between synthesizing a local row and not registering untracked sessions.
-- [ ] **4c. `pigeon-cn8` — the other amplifier, and the one the user actually feels.** **Measured
-  2026-07-31: 40 of 82 forum topics created in 7 days are lgtm review sessions — 49% of the entire
-  forum.** Every PR spawns at least two (a gather pass and a review pass, visible in the topic
+> **CORRECTION #5 (2026-08-01, start of Cycle 4) — this cycle's organizing premise was false, and the
+> file committed §1.7 against itself.** Cycle 4 was titled "remove the amplifier, then alert on what
+> remains" and its entire ordering argument rested on `pigeon-9y3`: a ~150× overnight amplifier.
+> **It does not exist.** The measurement is in `4a` below. The consequence is that **`8l7` (alerting)
+> was never actually gated on anything** — it was held behind a fictional prerequisite for one cycle.
+>
+> The instructive part is *how* the file was wrong. `9y3`'s stated evidence was "monotonically
+> **decreasing** embedded session-id timestamps ⇒ walking history newest→oldest". OpenCode session ids
+> are **descending-encoded**: a *decreasing* id sequence is a stream of **brand-new** sessions.
+> Verified twice, independently, against the live daemon table — **380 of 390 consecutive pairs
+> ordered by `created_at` ascending have a strictly smaller id**, the smallest id in the table is
+> today's session and the largest is the oldest. The bead read its central clue exactly backwards, and
+> the reading then set the priority of a whole cycle for two weeks.
+>
+> **New sub-rule for §1.7, because "don't blame the memorable event" would not have caught this:**
+> *an ordering is not evidence until you have verified which direction the encoding sorts.* Inferring
+> recency from an id sequence costs one query to check and produces a confident, completely inverted
+> conclusion when skipped.
+
+- [x] **4a. `pigeon-9y3` — CLOSED, REFUTED. No code written.** Investigated and closed 2026-08-01.
+  Three independent findings, each measured:
+  1. **The evidence is inverted** (above): decreasing ids ⇒ newer sessions, not a historical walk.
+  2. **The cadence is baseline.** The journal's longest strictly-decreasing run is 81 distinct sids
+     over 34 continuous hours at a **median 120 s** inter-arrival — "one every ~2 minutes",
+     newest→oldest, exactly as filed. Of 185 registrations in the window, **152 (82%) were sessions
+     the daemon first saw within 10 minutes of registering them**, i.e. brand new. The signature is
+     this machine's ordinary session-creation rate.
+  3. **The counterfactual is off by ~100×.** The bead's force comes from "~150 lost instead of ~1".
+     Measured stop notifications in the *identical* clock window on a normal night: **79** (22:50→05:00
+     on 2026-07-30) and 34 the next. At the measured 13.3 stop-notifications/hour, a 6-hour outage
+     loses ~80–150 messages **with no amplifier at all.** ~150 was never anomalous.
+  Deep-overnight volume (01:00–08:59) is **~5 registrations/night**, all brand new. Ruled out with
+  discriminating evidence: the nightly reset (fires exactly **1** register + 1 stop; its 03:00 run
+  reattaches nothing, and **0** of the 30 sids in its own manifest registered in that hour),
+  `oc-auto-attach` (real, but mid-morning and **non**-monotone ids), systemd timers (`lgtm-run`
+  *creates* sessions — which is precisely what makes new-session traffic look like a walk), cron (does
+  not exist on NixOS here), and the reaper (only ever *un*registers). `registerSession` has exactly
+  three production callers and none performs an ordered historical sweep.
+  **The 2026-07-14/15 journal is gone** (retention starts 2026-07-30), so the original observation
+  cannot be re-read — but its *inference* is invalid regardless of what the log said.
+  **Two real amplifiers were found instead, both burst-shaped rather than walk-shaped**, and Cycle 3d's
+  drain governor already covers that shape: `/current-state` fan-out (~25–31 registrations at ~1/s)
+  and the morning swarm broadcast (31 registrations + ~25 stops in ~2 min — but it **first ran
+  2026-08-01**, so it cannot have amplified a 2026-07-14 incident).
+- [x] **4b. `pigeon-2c6` — MEASURED, downgraded to P3, no code written.** The mechanism is real and
+  `current-state-ingest.ts:103` is the right line: it calls `registerSession` per surveyed session with
+  no local-row upsert anywhere in the file, and `session-reaper.ts:26-44` only unregisters what it
+  holds locally. **The magnitude is negligible.** Cross-referencing all 449 worker `sessions` rows
+  against the daemon's local table (verified twice, independently):
+  **392 cloudbox worker rows vs 391 local rows ⇒ exactly 1 orphan**, 1.5 days old, **0 orphans over
+  14 days**, and 0 local rows missing worker-side. Worker-wide 449 of `MAX_SESSIONS = 5000`.
+  Cycle 2b's sweep is working and bounds this permanently.
+  **Do NOT synthesize local rows** — it requires inventing `pid`/`ppid`/`cwd`/`backend_endpoint` the
+  tmux survey does not have, and it would make the reaper own rows for sessions the daemon does not
+  route: a worse invariant than one orphan a day.
+  > **The bead's stated mechanism is wrong in both directions, and the roadmap repeated it.** "Discovery
+  > is tmux-based, not registry-based" is inaccurate: `main-session-allowlist.ts:143-153` is a
+  > registry-**first** hybrid with a cmdline fallback. But the operative reality is worse than the bead —
+  > **the registry branch never fires at all** (measured **0 of 32** live panes resolve via the registry;
+  > 32 of 32 take the ungated fallback), because it keys on `sessions.pid` (the plugin process) while the
+  > tmux subtree yields the `opencode attach` TUI process. The conclusion held for a reason nobody had
+  > written down. Filed as **`pigeon-toi`** (P3), which notes that the pid-mismatch *cause* is inference
+  > from a 0/32 match rate plus code reading — no single pid was traced end to end — so that must be
+  > confirmed before designing a fix.
+  >
+  > Note also that this bead was ranked **"probably the DOMINANT remaining leak source"** twice without
+  > ever being measured — in the same document whose Cycle 2 retraction says *"Measure a
+  > resource-exhaustion bead before ranking it."* Writing the lesson down did not cause it to be applied.
+
+> **Q3 — "the same code and almost certainly the same root" was also false.** `4b` really is
+> `current-state-ingest.ts`; `4a`'s overnight traffic is `index.ts:565` `onSessionStart`, plugin-driven
+> registration of new sessions, and `/current-state` contributed **zero** of the 10 deep-overnight
+> registrations. Bundling them cost nothing this time (reading the file was ~10 minutes of a
+> multi-hour timestamp forensic) but the premise was unsound. The one genuine overlap is narrow and
+> worth keeping: `/current-state` is the only production path that registers a session the daemon does
+> not own, which is both `4b`'s mechanism **and** the only thing that made `4a`'s "historical session"
+> reading superficially plausible. That coincidence is what let the misreading survive.
+- [ ] **4c. `pigeon-cn8` — with `4a` refuted this is now the ONLY confirmed amplifier, and the one the
+  user actually feels.** **Re-measured 2026-08-01: 59 of 110 forum topics — 53.6%**, up from the
+  40-of-82 (49%) measured a day earlier, so it is growing in both absolute and relative terms. Every PR
+  spawns at least two (a gather pass and a review pass, visible in the topic
   names), and the review pass can be re-summoned repeatedly. With topics enabled each one gets its
   **own topic**, so this is topic-list noise as well as notification noise, and it spends the §3
   budget on messages the user reports never once having read.
@@ -733,12 +803,23 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   the dispatcher does. The review sessions run inside the *target* repo's worktree
   (`/home/dev/projects/mono/.worktrees/pr-4005`), so a directory denylist cannot catch them without
   hiding real work in those same repos. (`docs/plans/2026-06-06-current-state-command-design.md`
-  assumes the `~/projects/lgtm` location; that holds for the dispatcher only.) The clean signal is
-  the **title**, which always names the prompt file — `.lgtm-review-prompt.md`,
-  `.lgtm-gather-prompt.md`. Make the match **configurable** rather than hardcoding `.lgtm-`, because
+  assumes the `~/projects/lgtm` location; that holds for the dispatcher only.) **Confirmed by
+  measurement**: the 57 strict-matching lgtm topics span **32 distinct directories** and **none** is
+  under `~/projects/lgtm`. Make the match **configurable** rather than hardcoding `.lgtm-`, because
   `morning-agent` has the same problem and cannot be filtered by directory either (it runs in
-  `~/projects/workstation`, a real work dir). Corral to one shared topic or suppress outright; the
-  user leans suppress and would accept corralling.
+  `~/projects/workstation`, a real work dir; 3 such topics measured). Corral to one shared topic or
+  suppress outright; the user leans suppress and would accept corralling.
+  > **CORRECTION — "the title *always* names the prompt file" is false, and the signal is softer than
+  > this entry implies.** Measured across all 110 topics: `.lgtm-` as a strict substring matches **57**,
+  > while a case-insensitive `lgtm` matches **59**. The two stragglers are
+  > *"Review PR using LGTM prompt"* and *"PR review from LGTM prompt"* — they name the tool in prose and
+  > never the filename. The reason matters for the design: **the topic name derives from the
+  > model-generated TUI title**, so it is a *description* of the prompt file, not a field containing it.
+  > No exact token can be relied on. Match case-insensitively on `lgtm`, treat the classifier as
+  > best-effort, and accept that a few will leak through — a missed suppression is a cosmetic
+  > degradation, whereas a false positive would suppress real work, so **bias the pattern toward
+  > precision and let the stragglers through.** A structurally reliable signal would have to come from
+  > the launcher tagging its own sessions, which lives in another repo and is out of scope here.
 - [ ] **4d. `pigeon-93v`** (P2) — **do this BEFORE `8l7`, it is the cheapest real fix left in the
   roadmap.** `/question-asked` (`app.ts:479-484`) early-returns for an existing outbox row without
   inspecting its state, so a `failed` row is reported as `"queued"`. The reason that matters more than
@@ -752,10 +833,17 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   the TTL reasoning that blocks `bvh`. **Do it before `8l7` for the same reason `cn8` comes before
   `8l7`:** there is no point alerting on terminal drops while one class of drop is still reported as a
   success.
-- [ ] **4e. `pigeon-8l7`** — no alerting on terminal drops. **The surfacing path must not depend on
-  Telegram**, since Telegram being broken is the common cause. **Do this last in the cycle**: it is
-  the same argument as `4a` versus `8l7`, applied to `4c` — alerting before the amplifiers are gone
-  means the first thing the new alerting does is page about noise that should not exist.
+- [ ] **4e. `pigeon-8l7` — promoted: with `4a` refuted, this is the highest-value item in the cycle.**
+  No alerting on terminal drops. **The surfacing path must not depend on Telegram**, since Telegram
+  being broken is the common cause. It was held behind `4a` for a cycle on a prerequisite that turned
+  out to be fictional; the *only* surviving reason to sequence anything before it is `4c` — alerting
+  while 53.6% of traffic is unread lgtm noise means the first thing the new alerting does is page about
+  messages nobody wants. That argument is real but much weaker than the one it replaces, and it
+  applies to alert **volume**, not correctness.
+  **Note what `4a` measured, because it changes this bead's own framing:** the "~150 messages died
+  overnight" in the bead description is **ordinary traffic for a 6-hour outage on this machine**, not
+  an amplified storm. That makes alerting *more* justified, not less — the steady-state loss rate
+  during an outage is ~13/hour with no pathology required.
 - [ ] **4f. `pigeon-m74`** (P3) — **evidence-gated; do not schedule it, let `4e` produce it.** Cycle 3's
   drain governor assumes 12 chunk-sends/min leaves ~8/min of the §3 budget spare, but it counts its own
   invocations rather than Telegram-side messages: one chunk call can cost more (lazy
@@ -765,6 +853,13 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
   surfacing `8l7` builds should record the real Telegram-side call rate during a drain, which turns
   this from a guess into a measurement. **Do not tune the constant without that data**; picking a
   smaller number by intuition is exactly the move this roadmap has been burned by.
+
+**Revised execution order, 2026-08-01: `4d` → `4c` → `4e` → (`4f` only if `4e` produces data).**
+`4a` and `4b` are closed by measurement without code. `4d` goes first because it is a few lines, has no
+prerequisites, and removes a *reported success* that is actively suppressing a retry — while it stands,
+any alerting built in `4e` is blind to that entire class of drop. `4c` next, because it is the only
+confirmed amplifier and it halves the volume `4e` will alert on. `4e` last, as before, but now for a
+much weaker reason than the one originally given.
 
 Deferred out of this cycle: **`pigeon-bvh`** (P3, blocked on `4d`) — actually resurrecting the failed
 question row rather than merely reporting it honestly. It carries a trap that makes it worth its own
