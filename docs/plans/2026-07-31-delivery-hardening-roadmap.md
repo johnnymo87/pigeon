@@ -1244,6 +1244,45 @@ Note the one genuine feature that is NOT here: `pigeon-cn8` (lgtm noise) sits at
 instead, because it is an amplifier. It halves forum-topic creation and spends the §3 budget, which
 makes it delivery work that happens to also be a quality-of-life win.
 
+> **CORRECTION #7 (2026-08-01, start of F1). F1's stated justification is half wrong: the clamp
+> problem is NOT occurring.** Re-measured the live D1 `topics` table before designing, per the standing
+> rule — and the population moved again, as it has every single time. **113 rows now, not the 82 this
+> file claims.**
+>
+> The roadmap says *"the clamp eats the wrong end"* and calls that half *"not cosmetic"*. **Zero of 113
+> topics are clamped.** Longest name is **118 chars** against a 128 limit; on real work the longest is
+> **103**, leaving 25 chars of headroom. The truncation this file treats as an active defect has never
+> once happened. It is latent, not real.
+>
+> **The old measurement was also contaminated.** The quoted "77–115 chars" was taken across *all*
+> topics, and **60 of 113 are lgtm-gather noise** — the exact rows 4c now suppresses, and the entire
+> top-12 by length. Excluding them, the population F1 actually targets is **53 rows, avg 65.9, max
+> 103**. As a side effect this independently confirms 4c's headline claim from a different direction:
+> 60/113 really is "roughly half".
+>
+> **What IS real is a different problem than the one described.** On real rows the directory is **~41
+> of ~66 chars (62%)** and the title only **~25 (38%)** — and the title is **last**. The Telegram topic
+> *list* truncates visually far below 128 chars, so every entry opens with the same 19-char
+> `/home/dev/projects/` and the informative half sits past position 41, off-screen on **every row**.
+> The defect is UI-list truncation, not the 128-char storage clamp; this file conflated the two.
+>
+> **A second constant the file misses:** `/.worktrees/` costs another 11 chars on **20 of 53** real
+> rows (38% — I guessed "most" and was wrong, hence measuring).
+>
+> **Consequence for scope:** F1 is a genuine readability win and correctly ranked **P3**, but it is not
+> the latent-correctness fix the old text implies. Do not let the "not cosmetic" phrasing justify
+> scope it does not deserve.
+>
+> **Third measurement of this system, third time it moved.** Treat any count here as stale by default.
+
+> **Write-once names — established while designing F1, and it changes the migration question.**
+> `topicName` is called at **creation only** (`topic-manager.ts:112`), and `topics.rename`
+> (`topics.ts:186`) has **zero callers in `src/`** — it is dead code waiting for F2. So a topic's name
+> is set once and never updated, even when the TUI title changes. Two consequences: (1) a formatter
+> change reaches **new topics only** unless migration is built deliberately, and (2) "rename on next
+> touch" is **not** existing machinery, it is new work with a real §3 budget cost, because TUI titles
+> drift (every compaction) and each drift would spend an `editForumTopic` call.
+
 - [ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at
   Telegram's 128-char limit. Measured 2026-07-31 at **77–115 chars**, roughly 19 of them spent on the
   constant `/home/dev/projects/` prefix before any information appears. Two problems, and the second
