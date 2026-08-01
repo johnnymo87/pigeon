@@ -283,11 +283,22 @@ async function sendTelegramMessage(
   opts: { messageThreadId: number | undefined },
 ): Promise<void> {
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-  await tg.sendMessage({
+  const messageThreadId = topicsEnabled(env) ? opts.messageThreadId : undefined;
+  const res = await tg.sendMessage({
     chatId,
     text,
-    messageThreadId: topicsEnabled(env) ? opts.messageThreadId : undefined,
+    messageThreadId,
   });
+  if (!res.ok) {
+    console.error("[webhook ack send failed]", {
+      kind: res.kind,
+      chatId,
+      messageThreadId,
+      ...(res.kind === "rate_limited" ? { retryAfter: res.retryAfter } : {}),
+      ...(res.kind === "error" ? { errorCode: res.errorCode, description: res.description } : {}),
+      ...(res.response !== undefined ? { response: res.response } : {}),
+    });
+  }
 }
 
 /**
@@ -961,4 +972,4 @@ export async function handleTelegramWebhook(
 }
 
 // Exports for testing
-export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, MAX_COMMAND_LENGTH, MAX_QUEUE_PER_MACHINE };
+export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, MAX_COMMAND_LENGTH, MAX_QUEUE_PER_MACHINE, sendTelegramMessage };

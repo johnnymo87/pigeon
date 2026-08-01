@@ -57,6 +57,7 @@ import {
   extractMedia,
   MAX_FILE_SIZE,
   handleTelegramWebhook,
+  sendTelegramMessage,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
@@ -8205,6 +8206,127 @@ describe("topics module and topicName", () => {
       expect(res.status).toBe(200);
       expect(sentPayload).not.toBeNull();
       expect(sentPayload.text).toBe(`${machineId} is not recently seen.`);
+    });
+  });
+
+  describe("sendTelegramMessage observability (pigeon-cal)", () => {
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+    });
+
+    afterEach(() => {
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock.deactivate();
+    });
+
+    it("logs structured error when sendMessage is rate-limited (429)", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(429, JSON.stringify({
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry after 5",
+          parameters: { retry_after: 5 },
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await sendTelegramMessage(env, 998801, "error ack msg", { messageThreadId: 12345 });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[webhook ack send failed]",
+        expect.objectContaining({
+          kind: "rate_limited",
+          chatId: 998801,
+          messageThreadId: undefined,
+          retryAfter: 5,
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("logs structured error when sendMessage fails with non-429 kind (thread_not_found)", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: thread not found",
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await sendTelegramMessage(testEnv, 998802, "error ack msg", { messageThreadId: 12346 });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[webhook ack send failed]",
+        expect.objectContaining({
+          kind: "thread_not_found",
+          chatId: 998802,
+          messageThreadId: 12346,
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("logs structured error when sendMessage fails with generic error kind", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(400, JSON.stringify({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: chat not found",
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await sendTelegramMessage(env, 998803, "error ack msg", { messageThreadId: undefined });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[webhook ack send failed]",
+        expect.objectContaining({
+          kind: "error",
+          chatId: 998803,
+          messageThreadId: undefined,
+          errorCode: 400,
+          description: "Bad Request: chat not found",
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("logs nothing when sendMessage succeeds", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({
+          ok: true,
+          result: { message_id: 998804 },
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await sendTelegramMessage(env, 998804, "success ack msg", { messageThreadId: 12347 });
+
+      expect(spy).not.toHaveBeenCalled();
+
+      spy.mockRestore();
     });
   });
 });

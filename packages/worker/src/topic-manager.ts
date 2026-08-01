@@ -55,8 +55,9 @@ export async function resolveTopic(
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
       const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
-      // Checkpoint 2a question: Can an admin bot post into a closed Telegram forum topic without reopening?
-      // Unverified against live Telegram API. Reopening here ensures the topic is uncollapsed/visible.
+      // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
+      // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
+      // Removing this reopen call is tracked as roadmap item 6c.
       const reopenRes = await tgClient.reopenForumTopic({
         chatId: opts.chatId,
         messageThreadId: existing.message_thread_id,
