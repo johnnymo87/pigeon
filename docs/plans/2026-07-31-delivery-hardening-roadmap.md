@@ -1166,6 +1166,18 @@ blast radius but **do not cure the outage**.
 - [ ] **6h. `pigeon-wly`** (P3) — reap-loop generic failures pin head-of-line slots, degrading the
   reaper to 4 of 5 slots. Accepted residual; fix only if it bites.
 
+- [ ] **6j. `pigeon-kz3`** (P3) — **duplicate stop notifications.** Two `stop` rows queued for the same
+  session **2ms apart with different `notificationId`s**, both delivered:
+  `...:1785613265182` and `...:1785613265184` at 15:41:05 on 2026-08-01. Because the ids differ, the
+  worker's dedup-by-`notificationId` **cannot** collapse them — the user gets the message twice.
+  Found incidentally while diagnosing `pigeon-81p` (Cycle 6.5); it is the second ordering/duplication
+  defect in that one log window, which is weak evidence that this class is under-measured rather than
+  rare. **Not investigated:** unknown whether opencode emits two stop events, the plugin handles one
+  event twice, or a retry re-derives the id. The id is derived from a millisecond timestamp, so
+  *anything* that fires the handler twice in a turn yields two distinct ids and defeats dedup.
+  Establish which before fixing, and grep the journal for frequency first — P3 because this is
+  duplication (annoying) not loss (damaging).
+
 - [ ] **6i. `pigeon-cal`** (P2) — webhook acks are fire-and-forget, so an ack Telegram rejects
   vanishes with no exception, no log and no fallback (`webhook.ts` `sendTelegramMessage` discards the
   `TgResult` deliberately; `telegram.ts` `sendMessage` returns it and never throws). The messages
@@ -1269,8 +1281,17 @@ whole backlog:
 
 - **Launch/TUI:** `pigeon-92q` (headless `/launch` completes with no notification when
   `oc-auto-attach` fails). Delivery-adjacent in symptom, different subsystem in cause.
-- **Swarm:** `pigeon-3m5`, `pigeon-web`, `pigeon-0ky`.
-- **Serve routing:** the `pigeon-u1u` epic and `pigeon-886`, `pigeon-76k`, `pigeon-amr`, `pigeon-r2e`.
+- **Swarm:** `pigeon-3m5`, `pigeon-web`, `pigeon-0ky`, `pigeon-755` (retention sweep declared but
+  never wired).
+- **Swarm scheduled wake — a NEW active track, added 2026-08-01.** Epic `pigeon-mx2` (P1) with
+  `pigeon-c68` (P1, plugin tools) and `pigeon-4yz` (P1, skill guidance + e2e). **This one is not
+  dormant: it landed PRs #21 (`8171c5e`) and #24 (`3b6f627`) into `main` while this roadmap was
+  compacted, and moved the daemon test baseline by +94.** Out of scope here, but a reader of §0 must
+  know it exists or they will misattribute the baseline jump to their own cycle — see the attribution
+  note under the §0 table.
+- **Serve routing:** the `pigeon-u1u` epic, now broken into numbered increments `pigeon-u1u.1`
+  through `pigeon-u1u.5` (`.5` is a P1 deploy-and-soak **gate**), plus `pigeon-886`, `pigeon-76k`,
+  `pigeon-amr`, `pigeon-r2e`.
 - **Chores/infra:** `pigeon-0n6`, `pigeon-0pp`, `pigeon-fia`, `pigeon-m68`, `pigeon-0zl`, `pigeon-4v0`,
   `pigeon-0u5`, `pigeon-f2i`, `pigeon-mud`, `pigeon-ewr`, `pigeon-050`.
 
@@ -1283,6 +1304,20 @@ whole backlog:
 
 > **Both were found only by re-measuring instead of trusting the inherited list — the same discipline
 > that caught the false test baseline in §0.** Do this at the start of every restructuring.
+
+> **BACKLOG AUDIT, 2026-08-01 (prompted by the user, not by this file).** A bead filed mid-cycle
+> (`pigeon-kz3`) was about to be lost — filed correctly, referenced nowhere on the spine. Cross-checking
+> **every** open bead against this file found **10 of 47 unmentioned**: `pigeon-kz3` (now 6j) plus the
+> swarm-wake and routing-increment tracks above.
+>
+> **Filing a bead is not recording it.** `bd` is the queue; this file is the *ordering argument*. A bead
+> that exists only in `bd` competes with months of accumulated builds and loses. **Run this audit at the
+> end of every cycle** — list open beads, grep each id against this file, and either place it on the
+> spine or name it in §4.1 as deliberately out of scope. Cheap, and it is the only thing standing
+> between a real defect and the morass.
+>
+> Corollary that already bit once: I reported this bead's id as `pigeon-yqe` from memory when it was
+> actually `pigeon-kz3`. **Read ids back from `bd list`; do not quote them from recall.**
 
 ## §4.2 — Feature track (parallel; no dependency on the hardening spine)
 
