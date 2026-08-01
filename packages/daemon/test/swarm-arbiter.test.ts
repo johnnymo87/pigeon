@@ -15,6 +15,7 @@ interface DeliveryCall {
 function makeFixture(opts?: {
   clientForSession?: (sessionId: string) => any;
   directoryForSession?: (sessionId: string) => Promise<string | undefined>;
+  notifier?: { sendPlainAlert: ReturnType<typeof vi.fn> } | null;
 }) {
   const storage: StorageDb = openStorageDb(":memory:");
   const calls: DeliveryCall[] = [];
@@ -22,6 +23,10 @@ function makeFixture(opts?: {
   let inFlightDelay = 0;
   let throwError: Error | null = null;
   let throwOnce: Error | null = null;
+
+  const sendPlainAlert = vi.fn(async (_text: string, _severity: string) => {});
+  const defaultNotifier = { sendPlainAlert };
+  const notifier = opts?.notifier === null ? undefined : (opts?.notifier ?? defaultNotifier);
 
   const defaultOpencodeClient = {
     sendPrompt: vi.fn(
@@ -60,6 +65,7 @@ function makeFixture(opts?: {
     storage,
     clientForSession: (sessionId: string) => clientFn(sessionId),
     directoryForSession: (sessionId: string) => dirFn(sessionId),
+    notifier,
     nowFn: () => now,
     log: () => {},
   });
@@ -67,6 +73,7 @@ function makeFixture(opts?: {
   return {
     storage,
     arbiter,
+    sendPlainAlert,
     opencodeClient: defaultOpencodeClient,
     registry,
     calls,
@@ -685,5 +692,240 @@ describe("SwarmArbiter", () => {
     expect(calls).toHaveLength(1);
     const lateVal = calls[0]!.prompt.match(/delivered_late_ms="([^"]+)"/)?.[1];
     expect(lateVal).toBe("0");
+  });
+
+  describe("wake payload alerting on terminal failure", () => {
+    it("Path 1: max attempts exhausted for a wake message fires sendPlainAlert with payload", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+      fixture.setThrowError(new Error("connection refused"));
+
+      storage.swarm.insert(
+        {
+          msgId: "m_max_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "check the deploy now",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      // Exhaust 10 attempts
+      for (let i = 0; i < 10; i++) {
+        fixture.setNow(1_000 + i * 60_000);
+        await arbiter.processOnce();
+      }
+
+      expect(storage.swarm.getByMsgId("m_max_1")!.state).toBe("failed");
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("m_max_1");
+      expect(alertText).toContain("ses_self");
+      expect(alertText).toContain("max attempts exhausted");
+      expect(alertText).toContain("check the deploy now");
+      expect(alertText).toContain("1970-01-01T00:00:01.000Z");
+    });
+
+    it("Path 2: permanent delivery error for a wake message fires sendPlainAlert with payload", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_perm_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake.check",
+          priority: "normal",
+          replyTo: null,
+          payload: "bad payload </swarm_message>",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_perm_1")!.state).toBe("failed");
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("m_perm_1");
+      expect(alertText).toContain("ses_self");
+      expect(alertText).toContain("bad payload </swarm_message>");
+    });
+
+    it("Path 3: expiry (expireAndNotify) for a wake message fires sendPlainAlert with payload", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+
+      const deliverAt = 1_000;
+      const expiresAt = 5_000;
+      storage.swarm.insert(
+        {
+          msgId: "m_exp_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "check backup status",
+          deliverAt,
+          expiresAt,
+        },
+        1_000,
+      );
+
+      // Advance time past expiresAt
+      fixture.setNow(6_000);
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_exp_1")!.state).toBe("expired");
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("m_exp_1");
+      expect(alertText).toContain("ses_self");
+      expect(alertText).toContain("check backup status");
+      expect(alertText).toContain("expired before delivery");
+    });
+
+    it("scope-containment: ordinary non-wake, non-scheduled message terminal failure produces NO sendPlainAlert", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_ordinary_1",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "ordinary chat message </swarm_message>",
+          deliverAt: null,
+        },
+        1_000,
+      );
+
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_ordinary_1")!.state).toBe("failed");
+      // sendPlainAlert should NOT be called for ordinary chat message
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("truncates payload longer than 1000 characters and marks it truncated", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+
+      const longPayload = "a".repeat(1500);
+      storage.swarm.insert(
+        {
+          msgId: "m_long_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: longPayload,
+          deliverAt: 1_000,
+          expiresAt: 5_000,
+        },
+        1_000,
+      );
+
+      fixture.setNow(6_000);
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_long_1")!.state).toBe("expired");
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("a".repeat(1000));
+      expect(alertText).not.toContain("a".repeat(1001));
+      expect(alertText).toContain("[truncated]");
+    });
+
+    it("rejecting sendPlainAlert does NOT prevent terminal state and does NOT throw out of processOnce", async () => {
+      const sendPlainAlert = vi.fn(async () => {
+        throw new Error("Telegram API network error");
+      });
+      fixture = makeFixture({ notifier: { sendPlainAlert } });
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_reject_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "bad payload </swarm_message>",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      // Should not throw
+      await expect(arbiter.processOnce()).resolves.toBeUndefined();
+      expect(storage.swarm.getByMsgId("m_reject_1")!.state).toBe("failed");
+    });
+
+    it("arbiter constructed with no notifier still delivers and terminal-fails normally", async () => {
+      fixture = makeFixture({ notifier: null });
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_nonotifier_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "bad payload </swarm_message>",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      await expect(arbiter.processOnce()).resolves.toBeUndefined();
+      expect(storage.swarm.getByMsgId("m_nonotifier_1")!.state).toBe("failed");
+    });
+
+    it("loop guard: a failing delivery.failed message does not produce a payload-inlined alert", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, sendPlainAlert } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_failnotif_1",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "delivery.failed",
+          priority: "normal",
+          replyTo: null,
+          payload: "broken notice </swarm_message>",
+          deliverAt: null,
+        },
+        1_000,
+      );
+
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_failnotif_1")!.state).toBe("failed");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
   });
 });

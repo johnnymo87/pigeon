@@ -1644,4 +1644,76 @@ describe("DeliveryWatchdog", () => {
       expect(sendPlainAlert).not.toHaveBeenCalled();
     });
   });
+
+  describe("wake payload alerting in watchdog", () => {
+    it("Path 4: 404-confirmed session deleted for wake message includes payload in sendPlainAlert", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      // Preferred client 404s
+      const client1 = makeClient();
+      client1.getSessionMessages.mockRejectedValue(new Error("getSessionMessages failed (404): Not found"));
+      // Second client also 404s -> confirmed session deleted
+      const client2 = makeClient();
+      client2.getSessionMessages.mockRejectedValue(new Error("getSessionMessages failed (404): Not found"));
+
+      clientMap.set("ses_b", { preferred: client1, all: [client1, client2] });
+
+      insertHandedOff({
+        msgId: "m_path4_wake",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: now - 400_000,
+        kind: "wake.check",
+        deliverAt: now - 450_000,
+      });
+      // update payload
+      storage.db.prepare("UPDATE swarm_messages SET payload = ? WHERE msg_id = ?").run("check production deployment", "m_path4_wake");
+
+      await watchdog.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_path4_wake")!.state).toBe("failed");
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("m_path4_wake");
+      expect(alertText).toContain("ses_b");
+      expect(alertText).toContain("check production deployment");
+      expect(alertText).toContain("no longer exists");
+    });
+
+    it("Path 5: lost-wake-unverified (anchor === null) includes payload in sendPlainAlert", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+      const now = 1_000_000;
+      fixture.setNow(now);
+
+      const client = makeClient();
+      // Transcript does NOT contain msg_id -> anchor === null
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(now - 800_000, "unrelated message"),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      insertHandedOff({
+        msgId: "m_path5_wake",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: now - 950_000, // stuckAlertMs = 900_000
+        kind: "wake",
+        deliverAt: now - 1_000_000,
+      });
+      storage.db.prepare("UPDATE swarm_messages SET payload = ? WHERE msg_id = ?").run("run database migrations", "m_path5_wake");
+
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const alertText = sendPlainAlert.mock.calls[0]![0];
+      expect(alertText).toContain("m_path5_wake");
+      expect(alertText).toContain("ses_b");
+      expect(alertText).toContain("run database migrations");
+      expect(alertText).toContain("not found in target transcript");
+    });
+  });
 });

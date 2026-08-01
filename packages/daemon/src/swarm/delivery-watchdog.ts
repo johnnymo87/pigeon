@@ -2,37 +2,13 @@ import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
 import { notifySenderOfFailure } from "./notify-sender";
+import {
+  isWakeKind,
+  isSuppressedFromRecovery,
+  formatWakePayloadAlert,
+} from "./delivery-policy";
 
-/**
- * The delivery watchdog verifies that a message the arbiter marked
- * `handed_off` (2xx from `prompt_async`) actually caused an assistant run to
- * start. A serve can accept the HTTP request while its runner is wedged
- * behind an unrelated in-flight turn — the user row lands in the transcript,
- * but nobody ever reads it. This module periodically re-checks unverified
- * handoffs and escalates: alert -> abort the blocking turn + redeliver ->
- * terminal failure (after a bounded number of recovery attempts).
- */
-
-// ---------------------------------------------------------------------------
-// Injected client contract
-// ---------------------------------------------------------------------------
-
-/** True when `kind === "wake"` or `kind.startsWith("wake.")`. */
-export function isWakeKind(kind: string): boolean {
-  return kind === "wake" || kind.startsWith("wake.");
-}
-
-/**
- * Recovery (requeue/abort ladder) is suppressed for both scheduled messages
- * (`deliverAt !== null`) and wake-kind messages (`wake` / `wake.*`).
- * Scheduled-ness is the mechanism (scheduled targets are idle by definition)
- * and `wake.*` is the label; either is sufficient.
- */
-export function isSuppressedFromRecovery(
-  row: Pick<SwarmMessageRecord, "kind" | "deliverAt">,
-): boolean {
-  return isWakeKind(row.kind) || row.deliverAt !== null;
-}
+export { isWakeKind, isSuppressedFromRecovery };
 
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
@@ -602,10 +578,14 @@ export class DeliveryWatchdog {
             this.storage.swarm.markFailed(row.msgId, now);
             counts.terminal++;
             this.pruneDedupe(row.msgId);
-            await this.alert(
-              "error",
-              `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`,
-            );
+            const alertText = isSuppressedFromRecovery(row)
+              ? formatWakePayloadAlert(
+                  row,
+                  `session ${sessionId} no longer exists on opencode-serve`,
+                  "delivery watchdog: session no longer exists",
+                )
+              : `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`;
+            await this.alert("error", alertText);
             notifySenderOfFailure(
               this.storage,
               row,
@@ -727,6 +707,12 @@ export class DeliveryWatchdog {
       // into the transcript at all.
       if (isSuppressedFromRecovery(row)) {
         const blockedAge = now - (row.handedOffAt ?? now);
+        const reason = `prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`;
+        const alertText = formatWakePayloadAlert(
+          row,
+          reason,
+          "delivery watchdog: prompt lost and unverified",
+        );
         return this.suppressWakeRecovery(
           row,
           sessionId,
@@ -734,7 +720,7 @@ export class DeliveryWatchdog {
           counts,
           "error",
           "lost-wake-unverified",
-          `delivery watchdog: prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`,
+          alertText,
         );
       }
       if (interventionAlreadyUsed) {

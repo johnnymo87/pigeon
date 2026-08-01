@@ -361,6 +361,12 @@ if (outboxSender) {
   outboxSender.start(5_000);
 }
 
+const telegramNotifier = config.telegramBotToken && config.telegramChatId
+  ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
+  : undefined;
+
+const notifier: StopNotifier | undefined = telegramNotifier;
+
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.
 // Requires opencode-client or ingress router.
@@ -371,6 +377,7 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       storage,
       clientForSession,
       directoryForSession,
+      notifier,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
@@ -400,12 +407,6 @@ if (poller) {
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
 }
-
-const telegramNotifier = config.telegramBotToken && config.telegramChatId
-  ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
-  : undefined;
-
-const notifier: StopNotifier | undefined = telegramNotifier;
 
 // Registry endpoint fencing (bead pigeon-13p). PIGEON_SERVE_ENDPOINTS is the
 // authority for a pool slot's endpoint; the registry row is not. Any process that
