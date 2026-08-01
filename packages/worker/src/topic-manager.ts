@@ -86,13 +86,18 @@ export async function resolveTopic(
           // Note on reaper/state:
           // The reaper is double-gated (listReapable requires state='closed' AND closed_at < closedBefore AND the session
           // row to be missing or stale), so a closed row does not arm the reaper while the session is actively receiving notifications.
-          // Nothing breaks from posting into a row marked closed, as topics.state has no other consumers.
+          // Nothing breaks from posting into a row marked closed. Note that because listOrphaned only selects
+          // state='open' rows, a topic stuck closed in D1 but open in Telegram is invisible to the orphan-closer,
+          // so no closeForumTopic call ever fires for it. Graceful session termination still closes it explicitly;
+          // on non-graceful death, the topic simply stays uncollapsed in Telegram until eventual reaping.
           //
           // Accepted residual:
           // If a reopen failure is permanent (e.g. the bot loses can_manage_topics), leaving the row closed means
           // every subsequent notification retries a reopen that always fails (~1 wasted API call per notification
           // against the ~20/min per-group budget). This is an accepted trade-off so delivery is unaffected without
-          // needing a new attempt-count column.
+          // needing a new attempt-count column. Additionally, because closed_at continues aging from the original
+          // close rather than being reset to NULL by markOpen, a permanent reopen failure followed by session idleness
+          // (>7d TTL) allows the reaper to delete the topic up to ~30 days earlier than if it had been re-closed on orphan cleanup.
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
       } else {
