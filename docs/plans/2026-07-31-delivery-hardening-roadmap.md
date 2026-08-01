@@ -792,8 +792,27 @@ such as a successful re-registration inherit an escalated backoff (≤2 min extr
 > worth keeping: `/current-state` is the only production path that registers a session the daemon does
 > not own, which is both `4b`'s mechanism **and** the only thing that made `4a`'s "historical session"
 > reading superficially plausible. That coincidence is what let the misreading survive.
-- [ ] **4c. `pigeon-cn8` — with `4a` refuted this is now the ONLY confirmed amplifier, and the one the
-  user actually feels.** **Re-measured 2026-08-01: 59 of 110 forum topics — 53.6%**, up from the
+- [x] **4c. `pigeon-cn8`** — DONE `ded5a92`. Daemon-side, at the stop-enqueue point: a matched session
+  gets no outbox row, so no worker call, no topic and no budget spend. Configurable via
+  `PIGEON_QUIET_TITLE_PATTERN` (case-insensitive regex; invalid values log and fall back rather than
+  throwing or matching everything), defaulting to `lgtm`. Every suppression logs `[stop] quieted` with
+  the session id and title — a silent suppressor would be exactly the §1.-1 shape this roadmap keeps
+  getting bitten by.
+  **Two design decisions worth keeping, both measured rather than assumed:**
+  - **`question` notifications are deliberately NOT suppressed.** Measured on the live DB: **0 of 55
+    `pending_questions` rows belong to an lgtm-titled session** — they do not ask questions in
+    practice, so exempting the class costs nothing today and removes the one real hazard (an
+    automation session blocked on a human, silently, forever). Because topics are created **lazily on
+    first send**, a matched session now gets a topic *only if it actually asks something* — i.e. only
+    when there is something worth reading.
+  - **`morning-agent` is NOT in the default pattern**, despite this file grouping it with lgtm as "the
+    same problem". It is not the same: the morning workspace-recovery agent is deliberately
+    Telegram-reachable and the user interacts with it. Suppressing it would break a feature. It stays
+    reachable through the env var for anyone who disagrees.
+  Safe because `notifyStop` is fire-and-forget (`index.ts:416`) with no retry queue, so the
+  `notified: false` response cannot induce a retry loop.
+  **Original entry, for the reasoning:** — with `4a` refuted this is now the ONLY confirmed amplifier, and the one the
+  user actually feels. **Re-measured 2026-08-01: 59 of 110 forum topics — 53.6%**, up from the
   40-of-82 (49%) measured a day earlier, so it is growing in both absolute and relative terms. Every PR
   spawns at least two (a gather pass and a review pass, visible in the topic
   names), and the review pass can be re-summoned repeatedly. With topics enabled each one gets its
