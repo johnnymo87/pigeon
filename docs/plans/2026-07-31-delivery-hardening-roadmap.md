@@ -645,6 +645,42 @@ Deferred rather than dropped: stop-kind newest-first ordering during drain, coal
 per-session notifications, and an "N dropped during the outage" summary. File as beads, do not
 inline.
 
+**Review outcome — the fix step earned its keep for the third cycle running.** `adversarial-reviewer-fable`
+found a real defect that **3c introduced and 3e made expensive**, and that all five commits' tests
+missed: `getBackoff` was driven by `attempts`, so making `attempts` cause-aware silently **pinned
+retry spacing at 5 seconds** — for precisely the failure class whose horizon 3e had just extended from
+15 minutes to 24 hours. A doomed entry would have retried **17,280 times a day**, each one a real
+Telegram-reaching call spending the §3 budget this whole cycle exists to protect. The two counters
+were the same counter; the fix (`9292b58`) splits them — `attempts` stays the *budget* signal,
+a new always-incrementing `retry_count` becomes the *spacing* signal — and adds the escalation-ladder
+test whose absence hid it. A second, latent incoherence was fixed in `bda0e9c`: `isTransportFailure`
+counted `app_rejection` while the re-registration arm's own comment argued at length that "2xx but not
+ok" must be treated as retryable. Unreachable today, but had it become reachable it would have
+reproduced the original incident timeline through a different door.
+
+**The re-review of the fix came back clean** — the first time in three cycles that it has. It verified
+the migration empirically against `better-sqlite3` rather than by inspection, confirming SQLite accepts
+`NOT NULL` *with* a default in `ALTER TABLE ADD COLUMN` and that a genuine failure would not be
+swallowed by the duplicate-column guard.
+
+Follow-ups filed rather than inlined:
+
+- **`pigeon-93v`** (P2) — `/question-asked` early-returns `deliveryState: "queued"` for a row that is
+  actually `failed`, and never calls `upsert`. 3a's 7-day retention widens that lying window from 1h
+  to **7 days**. It also means **3b is card-only in practice**: questions never reach the resurrection
+  arm, and stop ids are timestamp-unique so they never collide. Note the trap recorded on the bead —
+  resurrecting a question must also reset the `pending_questions` clock, or 3e's own 4h grounding
+  delivers something unanswerable.
+- **`pigeon-m74`** (P3) — the governor's "12 leaves 8 headroom" is asserted, not measured, and counts
+  the wrong unit: one chunk call can cost more than one Telegram message (lazy `createForumTopic`, and
+  the General-fallback path sends twice), while acks, wizard edits and media are invisible to it.
+  Bounded by the reactive 429 pause, so the worst case is oscillatory drain rather than loss.
+  **Measure a real post-outage drain before changing the constant** — do not guess a smaller number.
+
+Accepted deliberately, not filed: the governor window and `pausedUntil` are in-memory and reset on
+daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
+such as a successful re-registration inherit an escalated backoff (≤2 min extra latency, no loss).
+
 ### Cycle 4 — remove the amplifier, then alert on what remains
 
 - [ ] **4a. `pigeon-9y3` — do this BEFORE `8l7`.** An unidentified overnight job walks historical
