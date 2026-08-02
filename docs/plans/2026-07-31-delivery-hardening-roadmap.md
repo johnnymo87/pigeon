@@ -1375,7 +1375,7 @@ makes it delivery work that happens to also be a quality-of-life win.
 > touch" is **not** existing machinery, it is new work with a real §3 budget cost, because TUI titles
 > drift (every compaction) and each drift would spend an `editForumTopic` call.
 
-- [x] **F1. `pigeon-4ne`** (P3) — DONE 2026-08-01, `f178b38` + review fix, PR #32. Shipped exactly the
+- [x] **F1. `pigeon-4ne`** (P3) — DONE 2026-08-01, `f178b38` + review fix, PR #33. Shipped exactly the
   decided format: `title · ~/path`, home abbreviated by regex (`^/(home|Users)/<user>` → `~`), path kept
   a real pasteable suffix, existing 113 topics left to age out. **The "clamp eats the wrong end" claim
   below is FALSE and CORRECTION #7 already disproved it — zero rows have ever clamped.** The real defect
