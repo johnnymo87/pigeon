@@ -8442,3 +8442,100 @@ describe("topics module and topicName", () => {
   });
 });
 
+// ─── Dispatch Boundary Observability & Boundary Catch (5a-T2) ────────────────
+
+describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.deactivate();
+  });
+
+  it("emits structured outcome log on non-2xx response (status >= 400)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // POST /notifications/send with nonexistent session returns 404
+    const res = await worker.fetch(
+      new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId: "nonexistent", chatId: "8248645256", text: "hello" }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(404);
+    expect(spy).toHaveBeenCalledWith(
+      "[worker] request outcome",
+      {
+        path: "/notifications/send",
+        method: "POST",
+        status: 404,
+      },
+    );
+
+    spy.mockRestore();
+  });
+
+  it("does NOT emit outcome log on successful 2xx/3xx response or /health", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // GET /health returns 200
+    const healthRes = await worker.fetch(new Request("https://worker/health"), env);
+    expect(healthRes.status).toBe(200);
+
+    // GET /sessions returns 200
+    const sessionsRes = await worker.fetch(
+      new Request("https://worker/sessions", { headers: authHeaders }),
+      env,
+    );
+    expect(sessionsRes.status).toBe(200);
+
+    const outcomeCalls = spy.mock.calls.filter(
+      (args) => args[0] === "[worker] request outcome",
+    );
+    expect(outcomeCalls).toHaveLength(0);
+
+    spy.mockRestore();
+  });
+
+  it("catches unhandled throws, logs error, and returns structured 500 JSON", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Pass bad env with DB that throws
+    const badDb = {
+      prepare: () => {
+        throw new Error("D1 database connection failed");
+      },
+    } as unknown as D1Database;
+
+    const badEnv = { ...env, DB: badDb };
+
+    const res = await worker.fetch(
+      new Request("https://worker/sessions", { headers: authHeaders }),
+      badEnv,
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body).toEqual({ error: "internal_error" });
+
+    expect(spy).toHaveBeenCalledWith(
+      "[worker] unhandled error",
+      {
+        path: "/sessions",
+        method: "GET",
+        error: "D1 database connection failed",
+        stack: expect.any(String),
+      },
+    );
+
+    spy.mockRestore();
+  });
+});
+
+
