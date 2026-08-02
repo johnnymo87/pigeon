@@ -782,41 +782,74 @@ export async function handleTelegramWebhook(
       const formattedName = topicName("", rawTitle);
       const now = Date.now();
 
-      await db
-        .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
-        .bind(formattedName, now, resolved.sessionId)
-        .run();
-
-      let editFailed = false;
-
       if (topicsEnabled(env)) {
         const topic = await getBySession(db, resolved.sessionId);
         if (topic && topic.message_thread_id !== null) {
           const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
           const editRes = await tg.editForumTopic({
-            chatId: renameChatId,
+            chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,
             name: formattedName,
           });
 
-          if (editRes.ok) {
-            await renameTopic(db, { sessionId: resolved.sessionId, name: formattedName });
-          } else {
-            editFailed = true;
+          if (!editRes.ok) {
+            await sendTelegramMessage(
+              env,
+              renameChatId,
+              `Failed to rename topic for session \`${resolved.sessionId}\`.`,
+              {
+                messageThreadId: update.message.message_thread_id,
+              },
+            );
+            return OK();
           }
+
+          await renameTopic(db, { sessionId: resolved.sessionId, name: formattedName });
+          await db
+            .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+            .bind(formattedName, now, resolved.sessionId)
+            .run();
+
+          await sendTelegramMessage(
+            env,
+            renameChatId,
+            `Renamed session \`${resolved.sessionId}\` to "${formattedName}".`,
+            {
+              messageThreadId: update.message.message_thread_id,
+            },
+          );
+          return OK();
         }
+
+        await db
+          .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+          .bind(formattedName, now, resolved.sessionId)
+          .run();
+
+        await sendTelegramMessage(
+          env,
+          renameChatId,
+          `Updated label for session \`${resolved.sessionId}\` to "${formattedName}" (no forum topic to rename).`,
+          {
+            messageThreadId: update.message.message_thread_id,
+          },
+        );
+        return OK();
       }
 
-      if (editFailed) {
-        await sendTelegramMessage(env, renameChatId, `Failed to rename topic for session \`${resolved.sessionId}\`.`, {
-          messageThreadId: update.message.message_thread_id,
-        });
-      } else {
-        await sendTelegramMessage(env, renameChatId, `Renamed session \`${resolved.sessionId}\` to "${formattedName}".`, {
-          messageThreadId: update.message.message_thread_id,
-        });
-      }
+      await db
+        .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+        .bind(formattedName, now, resolved.sessionId)
+        .run();
 
+      await sendTelegramMessage(
+        env,
+        renameChatId,
+        `Updated label for session \`${resolved.sessionId}\` to "${formattedName}".`,
+        {
+          messageThreadId: update.message.message_thread_id,
+        },
+      );
       return OK();
     }
 
