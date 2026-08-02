@@ -1583,6 +1583,7 @@ describe("classified delivery failure actions", () => {
     });
     storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, payload: payloadWithEntities }, 1_000);
 
+    const logFn = vi.fn();
     const sendNotification = vi.fn().mockResolvedValue({
       ok: false,
       kind: "http_error",
@@ -1595,6 +1596,7 @@ describe("classified delivery failure actions", () => {
       sendNotification,
       chatId: "chat-123",
       nowFn: () => 5_000,
+      log: logFn,
     });
 
     await sender.processOnce();
@@ -1605,6 +1607,18 @@ describe("classified delivery failure actions", () => {
 
     const updatedParsed = JSON.parse(record.payload);
     expect(updatedParsed.messages[0].entities).toBeUndefined();
+
+    expect(logFn).toHaveBeenCalledWith(
+      "outbox entry stripped entities, scheduling retry",
+      expect.objectContaining({
+        notificationId: "notif-1",
+        sessionId: "sess-1",
+        attempts: 1,
+        nextRetryIn: 5000,
+        telegramErrorCode: 400,
+        telegramErrorDescription: "Bad Request: can't parse entities",
+      }),
+    );
   });
 
   // The legacy singular 'message' payload shape is still production-reachable (question

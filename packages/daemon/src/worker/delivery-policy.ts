@@ -18,13 +18,30 @@ export interface DeliveryPolicyContext {
  * Safely extracts Telegram details.error_code from worker response body.
  * Body may be undefined, a string, or an object without details.
  */
-function getTelegramErrorCode(body: unknown): number | undefined {
+export function getTelegramErrorCode(body: unknown): number | undefined {
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const details = (body as { details?: unknown }).details;
     if (details && typeof details === "object" && !Array.isArray(details)) {
       const errorCode = (details as { error_code?: unknown }).error_code;
       if (typeof errorCode === "number" && Number.isFinite(errorCode)) {
         return errorCode;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Safely extracts Telegram details.description from worker response body.
+ * Body may be undefined, a string, or an object without details.
+ */
+export function getTelegramErrorDescription(body: unknown): string | undefined {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const details = (body as { details?: unknown }).details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      const description = (details as { description?: unknown }).description;
+      if (typeof description === "string") {
+        return description;
       }
     }
   }

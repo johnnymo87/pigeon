@@ -10,7 +10,12 @@ import type { StorageDb } from "../storage/database";
 import type { OutboxRecord } from "../storage/outbox-repo";
 import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, WorkerResult } from "./poller";
-import { classifyDeliveryFailure, isTransportFailure } from "./delivery-policy";
+import {
+  classifyDeliveryFailure,
+  getTelegramErrorCode,
+  getTelegramErrorDescription,
+  isTransportFailure,
+} from "./delivery-policy";
 import type { DeliveryPolicyContext } from "./delivery-policy";
 
 export type SendNotificationFn = (
@@ -490,6 +495,8 @@ export class OutboxSender {
                   sessionId: entry.sessionId,
                   attempts: entry.attempts + 1,
                   nextRetryIn: backoff,
+                  telegramErrorCode: getTelegramErrorCode("body" in result ? result.body : undefined),
+                  telegramErrorDescription: getTelegramErrorDescription("body" in result ? result.body : undefined),
                 });
                 break;
               }
