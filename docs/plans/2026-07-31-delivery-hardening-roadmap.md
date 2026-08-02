@@ -1281,23 +1281,36 @@ original intent — is preserved; intra-session inversion is now impossible.
 
 ## §4.1 — Explicitly OUT of scope for this roadmap
 
-Re-measuring on 2026-07-31 found **44 open beads**; this roadmap covers ~20. The rest are real but
+Re-measured 2026-08-01 after F1: **49 open beads**; this roadmap covers ~20. The rest are real but
 belong to other themes, and are listed here so a future reader does not mistake this file for the
 whole backlog:
+
+> **Write every bead id out in full, never as a range.** The F1 audit greps each open id literally
+> against this file, and `pigeon-u1u.1` **through** `pigeon-u1u.5` silently failed that grep for three
+> of its five members — they looked orphaned when they were in fact placed. A range is readable to a
+> human and invisible to the check that stops beads getting lost, so the ids below are now enumerated.
 
 - **Launch/TUI:** `pigeon-92q` (headless `/launch` completes with no notification when
   `oc-auto-attach` fails). Delivery-adjacent in symptom, different subsystem in cause.
 - **Swarm:** `pigeon-3m5`, `pigeon-web`, `pigeon-0ky`, `pigeon-755` (retention sweep declared but
-  never wired).
+  never wired), and `pigeon-iy4` (P2 — the 401 re-auth path in the `swarm_send`/`swarm_read` tools is
+  dead in production because the token snapshot is stale). **`pigeon-iy4` was genuinely orphaned until
+  the F1 audit caught it** — it appeared on no roadmap at all, neither this one nor the scheduled-wake
+  spine, despite being a P2 production bug. It is parked here rather than adopted, because swarm auth
+  is not delivery hardening; if the swarm track does not claim it, it needs a home of its own.
 - **Swarm scheduled wake — a NEW active track, added 2026-08-01.** Epic `pigeon-mx2` (P1) with
-  `pigeon-c68` (P1, plugin tools) and `pigeon-4yz` (P1, skill guidance + e2e). **This one is not
-  dormant: it landed PRs #21 (`8171c5e`) and #24 (`3b6f627`) into `main` while this roadmap was
-  compacted, and moved the daemon test baseline by +94.** Out of scope here, but a reader of §0 must
-  know it exists or they will misattribute the baseline jump to their own cycle — see the attribution
-  note under the §0 table.
-- **Serve routing:** the `pigeon-u1u` epic, now broken into numbered increments `pigeon-u1u.1`
-  through `pigeon-u1u.5` (`.5` is a P1 deploy-and-soak **gate**), plus `pigeon-886`, `pigeon-76k`,
-  `pigeon-amr`, `pigeon-r2e`.
+  `pigeon-c68` (P1, plugin tools), `pigeon-4yz` (P1, skill guidance + e2e), `pigeon-u5g` (P2, whether a
+  `handed_off`-but-never-verified wake should also expire) and `pigeon-uhh` (P2, the expiry Telegram
+  alert is single-shot and is the ONLY human signal for a self-wake). The last two were unplaced until
+  the F1 audit. **This track is not dormant — it is the most active thing in the repo:** it landed PRs
+  #21 (`8171c5e`), #24 (`3b6f627`), #29 (`ff77898`, W2) and #32 (`0fb0773`, W4) into `main` while this
+  roadmap was compacted, moving the daemon baseline **+94 then +51**. Out of scope here, but a reader of
+  §0 must know it exists or they will misattribute the jump to their own cycle. It also consumed PR
+  number #32 that an F1 commit had already referenced from anticipation — **read numbers back, never
+  predict them.**
+- **Serve routing:** the `pigeon-u1u` epic, broken into increments `pigeon-u1u.1`, `pigeon-u1u.2`,
+  `pigeon-u1u.3`, `pigeon-u1u.4` and `pigeon-u1u.5` (`.5` is a P1 deploy-and-soak **gate**), plus
+  `pigeon-886`, `pigeon-76k`, `pigeon-amr`, `pigeon-r2e`.
 - **Chores/infra:** `pigeon-0n6`, `pigeon-0pp`, `pigeon-fia`, `pigeon-m68`, `pigeon-0zl`, `pigeon-4v0`,
   `pigeon-0u5`, `pigeon-f2i`, `pigeon-mud`, `pigeon-ewr`, `pigeon-050`.
 
