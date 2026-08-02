@@ -18,3 +18,7 @@ crons = ["0 * * * *"]
 [vars]
 ALLOWED_CHAT_IDS = "8248645256,-1004391832753,-1004232934695"
 TELEGRAM_TOPICS_ENABLED = "true"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
