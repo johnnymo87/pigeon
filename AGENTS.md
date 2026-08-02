@@ -77,6 +77,12 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 
+**The `@BotName` suffix.** In a group, Telegram's autocomplete sends `/kill@mohrbacher_01_bot` rather than `/kill`. Every command above accepts either form. The suffix attaches to the **command token**, not the subcommand — Telegram emits `/mcp@mohrbacher_01_bot list`, never `/mcp list@...`. Three things follow from how this is matched (worker `parseTelegramCommand`):
+
+- **Only our own username is accepted**, from `TELEGRAM_BOT_USERNAME` in worker `wrangler.toml`. Pigeon is a group *admin*, so Telegram delivers it every message including commands addressed to other bots; accepting any `@name` would let a command aimed at a different bot trigger a real `/kill` here. A command addressed elsewhere is dropped, never injected into the session as a prompt.
+- **If that var is unset the suffixed form fails closed** — commands are dropped, not executed and not injected — and each drop emits a `console.warn` naming the command token. If autocompleted commands ever silently stop working, check that var first and look for that warning in `wrangler tail`.
+- **A `@word` that cannot be a Telegram bot username is treated as ordinary text**, so a prompt like `/opencode-serve@4098 is stuck` still reaches the agent unchanged. The residue is prose whose first token genuinely looks like a bot address (`/deploy@robot ...`), which is dropped and logged. Media **captions** bypass this normalisation entirely and are always prompts (`pigeon-50l`).
+
 ### Attaching to a headless session
 
 From a terminal on the machine, connect to a session launched via `/launch`:
