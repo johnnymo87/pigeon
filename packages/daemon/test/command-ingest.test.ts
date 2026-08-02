@@ -110,9 +110,10 @@ describe("ingestWorkerCommand", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // Command should be in unfinished (persisted but not marked done)
+    // Marked done: the Poller acks this permanent failure, so leaving the row
+    // unfinished would strand it forever (W2 / pigeon-2k1).
     const unfinished = storage.inbox.listUnfinished();
-    expect(unfinished).toHaveLength(1);
+    expect(unfinished).toHaveLength(0);
     storage.db.close();
   });
 
@@ -215,7 +216,8 @@ describe("ingestWorkerCommand", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: permanent failure, Poller acks, row must not leak (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -237,7 +239,8 @@ describe("ingestWorkerCommand", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: permanent failure, Poller acks, row must not leak (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -1831,5 +1834,178 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
 
       storage.db.close();
     });
+  });
+});
+
+/**
+ * W2 (pigeon-2k1): the inbound command path used to drop messages silently.
+ *
+ * Four sites returned bare, which makes the Poller ack the command: the user was
+ * told nothing and the local inbox row was never marked done. The revive branches
+ * already replied + marked done, so these were the inconsistent minority.
+ *
+ * Each test below asserts BOTH halves (a reply AND markDone), because either one
+ * alone still loses information.
+ */
+describe("ingestWorkerCommand — silent drop sites (W2)", () => {
+  const liveSession = (storage: ReturnType<typeof openStorageDb>, sessionId: string) =>
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+  it("replies and marks done when the plugin terminally rejects the command", async () => {
+    const storage = openStorageDb(":memory:");
+    liveSession(storage, "sess-reject");
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-reject", sessionId: "sess-reject", command: "hi", chatId: "42" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false, error: "INVALID_PAYLOAD" };
+          },
+        }),
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("42");
+    // Minimum-scope wording: surface the machine-readable reject reason verbatim.
+    expect(tgCalls[0]!.text).toContain("INVALID_PAYLOAD");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("still replies and marks done when a terminal rejection carries no error string", async () => {
+    // classifyDeliveryFailure(undefined) === "terminal", so this path is reachable
+    // and must not produce an "undefined" reply or a leaked row.
+    const storage = openStorageDb(":memory:");
+    liveSession(storage, "sess-noerr");
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-noerr", sessionId: "sess-noerr", command: "hi", chatId: "43" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false };
+          },
+        }),
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.text).not.toContain("undefined");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("replies and marks done when the session is not in local storage", async () => {
+    // The user-visible case: replying to a notification whose session the daemon
+    // has since reaped. Was silent, despite the revive path (:508) replying for
+    // the very same "session is gone" condition.
+    const storage = openStorageDb(":memory:");
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-nosess", sessionId: "sess-absent", command: "hi", chatId: "44" }),
+      { sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); } },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("44");
+    expect(tgCalls[0]!.text).toMatch(/session/i);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("replies and marks done when the session has no usable adapter", async () => {
+    // Incomplete registration: backendKind set, endpoint/token missing.
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-noadapter",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+    }, 1_000);
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-noadapter", sessionId: "sess-noadapter", command: "hi", chatId: "45" }),
+      { sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); } },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("45");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("replies and marks done when a dead session is removed with no opencodeClient", async () => {
+    const storage = openStorageDb(":memory:");
+    liveSession(storage, "sess-dead");
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-dead", sessionId: "sess-dead", command: "hi", chatId: "46" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false, error: "fetch failed: ECONNREFUSED" };
+          },
+        }),
+        // no opencodeClient -> legacy "delete dead session" branch
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(storage.sessions.get("sess-dead")).toBeNull();
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("46");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("does not throw when no sendTelegramReply is wired", async () => {
+    // sendTelegramReply is optional; the drop path must stay best-effort.
+    const storage = openStorageDb(":memory:");
+    liveSession(storage, "sess-noreply");
+
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-noreply", sessionId: "sess-noreply", command: "hi", chatId: "47" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "INVALID_PAYLOAD" }; },
+          }),
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    storage.db.close();
   });
 });

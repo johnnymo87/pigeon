@@ -58,6 +58,7 @@ import {
   MAX_FILE_SIZE,
   handleTelegramWebhook,
   sendTelegramMessage,
+  isServiceMessage,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
 import { handlePollNext, handleAckCommand } from "../src/poll";
@@ -9549,3 +9550,129 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
   });
 
 
+
+/**
+ * W1 (pigeon-mmu): Telegram service messages and text-less messages used to be
+ * queued as execute commands with an empty `command`, which the plugin then
+ * rejected with INVALID_PAYLOAD.
+ *
+ * Creating a forum topic emitted exactly one of these per topic — 6 topics, 6
+ * failures, always +5s (the daemon poll interval).
+ */
+describe("isServiceMessage (W1)", () => {
+  it("detects forum_topic_created — the observed producer", () => {
+    expect(isServiceMessage({ forum_topic_created: { name: "some topic" } })).toBe(true);
+  });
+
+  it("detects the other forum lifecycle service messages", () => {
+    expect(isServiceMessage({ forum_topic_edited: { name: "x" } })).toBe(true);
+    expect(isServiceMessage({ forum_topic_closed: {} })).toBe(true);
+    expect(isServiceMessage({ forum_topic_reopened: {} })).toBe(true);
+  });
+
+  it("detects non-forum service messages that also carry no routable text", () => {
+    expect(isServiceMessage({ new_chat_members: [{ id: 1 }] })).toBe(true);
+    expect(isServiceMessage({ left_chat_member: { id: 1 } })).toBe(true);
+    expect(isServiceMessage({ pinned_message: { message_id: 1 } })).toBe(true);
+  });
+
+  it("does NOT flag an ordinary text message", () => {
+    expect(isServiceMessage({ text: "hello" })).toBe(false);
+  });
+
+  it("does NOT flag a message that merely lives in a topic", () => {
+    // message_thread_id is present on every message in a forum topic. Treating
+    // that as a service message would break all topic routing.
+    expect(isServiceMessage({ text: "hello", message_thread_id: 42, is_topic_message: true })).toBe(false);
+  });
+
+  it("does NOT flag a caption-less photo (that is W3, and must stay routable)", () => {
+    expect(isServiceMessage({ photo: [{ file_id: "f", file_unique_id: "u", file_size: 1, width: 1, height: 1 }] })).toBe(false);
+  });
+});
+
+describe("empty-command guard (W1)", () => {
+  const GUARD_SESSION = "sess-empty-guard";
+
+  beforeAll(async () => {
+    await registerSession(GUARD_SESSION, "machine-1", "test");
+  });
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  async function commandsFor(sessionId: string) {
+    const rows = await env.DB.prepare(
+      "SELECT command, command_type FROM commands WHERE session_id = ?"
+    ).bind(sessionId).all<{ command: string; command_type: string }>();
+    return rows.results;
+  }
+
+  async function notifyAndGetMessageId(sessionId: string, messageId: number): Promise<number> {
+    mockTelegramSuccess(messageId);
+    const res = await sendNotification({
+      sessionId,
+      chatId: String(CHAT_ID_NUM),
+      text: "Session idle",
+    });
+    const body = (await res.json()) as { messageId: number };
+    return body.messageId;
+  }
+
+  it("drops a forum_topic_created service message without queueing or replying", async () => {
+    // End-to-end wiring test. The isServiceMessage unit tests pass even if the
+    // guard is never CALLED, and without the call every topic creation would post
+    // "Nothing to send" into the brand-new topic — louder than the silent burn
+    // this change set out to fix.
+    await env.DB.prepare("DELETE FROM commands WHERE session_id = ?").bind(GUARD_SESSION).run();
+    const msgId = await notifyAndGetMessageId(GUARD_SESSION, 7103);
+
+    // Deliberately NO sendMessage mock: fetchMock has net connect disabled, so any
+    // outbound Telegram call here fails the test rather than passing silently.
+    const res = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        message_thread_id: msgId,
+        is_topic_message: true,
+        forum_topic_created: { name: "some session · ~/projects/pigeon" },
+      },
+    });
+    expect(res.status).toBe(200);
+
+    expect(await commandsFor(GUARD_SESSION)).toHaveLength(0);
+  });
+
+  it("does not queue a command for a whitespace-only reply", async () => {
+    await env.DB.prepare("DELETE FROM commands WHERE session_id = ?").bind(GUARD_SESSION).run();
+    const msgId = await notifyAndGetMessageId(GUARD_SESSION, 7101);
+
+    // The daemon-side validator trims, so "   " dies exactly like "" does.
+    mockTelegramSendMessage();
+    const res = await sendWebhook(makeTextReply("   ", msgId));
+    expect(res.status).toBe(200);
+
+    expect(await commandsFor(GUARD_SESSION)).toHaveLength(0);
+  });
+
+  it("still queues a normal text reply", async () => {
+    await env.DB.prepare("DELETE FROM commands WHERE session_id = ?").bind(GUARD_SESSION).run();
+    const msgId = await notifyAndGetMessageId(GUARD_SESSION, 7102);
+
+    mockTelegramSendMessage();
+    const res = await sendWebhook(makeTextReply("do the thing", msgId));
+    expect(res.status).toBe(200);
+
+    const rows = await commandsFor(GUARD_SESSION);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("do the thing");
+  });
+});

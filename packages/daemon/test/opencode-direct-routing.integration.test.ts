@@ -74,7 +74,9 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -107,8 +109,9 @@ describe("opencode direct-channel routing integration", () => {
     ).resolves.toBeUndefined();
 
     expect(onExecute).toHaveBeenCalledTimes(1);
-    // Inbox NOT marked done on failure
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -142,7 +145,9 @@ describe("opencode direct-channel routing integration", () => {
     // *ambiguous* timeouts, in command-ingest's budget loop.) onExecute once.
     // See docs/plans/2026-06-03-triple-injection-idempotency-design.md (§2b).
     expect(onExecute).toHaveBeenCalledTimes(1);
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -245,8 +250,9 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // Command persisted in inbox but not marked done
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -268,7 +274,9 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 });

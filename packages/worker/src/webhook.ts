@@ -135,6 +135,92 @@ interface TelegramMessage {
   video?: TelegramVideo;
   voice?: TelegramVoice;
   reply_to_message?: { message_id: number };
+  // Service messages. Telegram emits these into a chat as bot-visible updates with
+  // no `text`/`caption`. They must never be routed to a session.
+  forum_topic_created?: unknown;
+  forum_topic_edited?: unknown;
+  forum_topic_closed?: unknown;
+  forum_topic_reopened?: unknown;
+  general_forum_topic_hidden?: unknown;
+  general_forum_topic_unhidden?: unknown;
+  new_chat_members?: unknown;
+  left_chat_member?: unknown;
+  new_chat_title?: unknown;
+  new_chat_photo?: unknown;
+  delete_chat_photo?: unknown;
+  pinned_message?: unknown;
+  message_auto_delete_timer_changed?: unknown;
+  video_chat_scheduled?: unknown;
+  video_chat_started?: unknown;
+  video_chat_ended?: unknown;
+  video_chat_participants_invited?: unknown;
+  group_chat_created?: unknown;
+  supergroup_chat_created?: unknown;
+  channel_chat_created?: unknown;
+  migrate_to_chat_id?: unknown;
+  migrate_from_chat_id?: unknown;
+  chat_background_set?: unknown;
+  boost_added?: unknown;
+  users_shared?: unknown;
+  chat_shared?: unknown;
+  write_access_allowed?: unknown;
+  successful_payment?: unknown;
+}
+
+const SERVICE_MESSAGE_FIELDS = [
+  "forum_topic_created",
+  "forum_topic_edited",
+  "forum_topic_closed",
+  "forum_topic_reopened",
+  "general_forum_topic_hidden",
+  "general_forum_topic_unhidden",
+  "new_chat_members",
+  "left_chat_member",
+  "new_chat_title",
+  "new_chat_photo",
+  "delete_chat_photo",
+  "pinned_message",
+  "message_auto_delete_timer_changed",
+  // A video chat started in the supergroup is the most plausible producer here
+  // after forum_topic_created. The rest are cheap to list and cheaper than the
+  // alternative: any service message not named here falls through to the
+  // empty-command guard and posts "Nothing to send" into the chat, which is
+  // user-visible noise rather than the silent no-op these deserve.
+  "video_chat_scheduled",
+  "video_chat_started",
+  "video_chat_ended",
+  "video_chat_participants_invited",
+  "group_chat_created",
+  "supergroup_chat_created",
+  "channel_chat_created",
+  "migrate_to_chat_id",
+  "migrate_from_chat_id",
+  "chat_background_set",
+  "boost_added",
+  "users_shared",
+  "chat_shared",
+  "write_access_allowed",
+  "successful_payment",
+] as const satisfies readonly (keyof TelegramMessage)[];
+
+/**
+ * True when the update is a Telegram *service* message rather than something a
+ * human sent.
+ *
+ * Creating a forum topic makes Telegram emit `forum_topic_created` into the new
+ * topic. The bot is an admin, so it receives it. It has no text, so it used to be
+ * queued as an execute command with `command: ""`, rejected by the plugin with
+ * INVALID_PAYLOAD, and silently acked — one wasted command per topic ever created.
+ *
+ * Detection is by field presence, not by emptiness. Service messages should never
+ * route regardless of what text they happen to carry, and saying so explicitly
+ * beats relying on the emptiness guard to catch them by accident.
+ *
+ * Note this deliberately does NOT key off `message_thread_id` / `is_topic_message`,
+ * which are present on every message inside a forum topic, including real ones.
+ */
+export function isServiceMessage(message: Partial<TelegramMessage>): boolean {
+  return SERVICE_MESSAGE_FIELDS.some((field) => message[field] !== undefined);
 }
 
 interface TelegramCallbackQuery {
@@ -974,6 +1060,13 @@ export async function handleTelegramWebhook(
 
   // Handle message (text, media, reply)
   if (update.message) {
+    // Telegram service messages (topic created/closed, member joined, ...) are chat
+    // noise, not user intent. Drop before routing, and drop *silently* — these are
+    // machine-generated, so replying would just move the noise into the topic.
+    if (isServiceMessage(update.message)) {
+      return OK();
+    }
+
     // Extract media if present
     const media = extractMedia(update.message);
 
@@ -991,6 +1084,24 @@ export async function handleTelegramWebhook(
       if (chatId) {
         await sendTelegramMessage(env, chatId,
           "Could not find session for this message. Please reply to a recent notification or use /cmd TOKEN command format.", { messageThreadId: update.message.message_thread_id });
+      }
+      return OK();
+    }
+
+    // Nothing to send. The daemon-side validator trims before checking, so a
+    // whitespace-only command dies the same way an empty one does — guard with the
+    // same semantics (contracts.ts isNonEmptyString) rather than a naive === "".
+    //
+    // Scoped to this plain-message execute path on purpose. A blanket guard inside
+    // queueCommand would break /kill, /interrupt, /compact, /mcp list, /model list
+    // and /current-state, all of which legitimately queue an empty command.
+    //
+    // Media with no caption is intentionally still routed: that is a separate defect
+    // (W3 / pigeon-tyk) and dropping it here would silently discard the user's file.
+    if (!resolved.command.trim() && !media) {
+      if (chatId) {
+        await sendTelegramMessage(env, chatId,
+          "Nothing to send — that message had no text.", { messageThreadId: update.message.message_thread_id });
       }
       return OK();
     }

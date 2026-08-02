@@ -240,8 +240,9 @@ describe("nvim session routing — command ingest pipeline", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // Inbox should NOT be marked done on failure
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 
@@ -291,7 +292,9 @@ describe("nvim session routing — command ingest pipeline", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(storage.inbox.listUnfinished()).toHaveLength(1);
+    // Marked done: this is a permanent failure, so the Poller acks and the worker
+    // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
     storage.db.close();
   });
 });

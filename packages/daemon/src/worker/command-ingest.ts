@@ -123,7 +123,15 @@ export async function ingestWorkerCommand(
   const session = storage.sessions.get(msg.sessionId);
   if (!session) {
     console.warn(`[command-ingest] session not found sessionId=${msg.sessionId} commandId=${commandId}`);
-    // Permanent failure: retrying won't help if the session doesn't exist
+    // Permanent failure: retrying won't help if the session doesn't exist.
+    // Mirrors the reply the revive path already sends for the same condition.
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      `Session no longer exists on this machine. It may have been closed or reaped.`,
+      options.sendTelegramReply,
+    );
     return;
   }
 
@@ -346,7 +354,17 @@ export async function ingestWorkerCommand(
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
-    // Permanent failure: ack and move on
+    // Permanent failure: ack and move on. Usually an incomplete registration
+    // (backendKind set, endpoint/token missing), which the user cannot see.
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      // Deliberately backend-agnostic: this also fires for nvim-only and
+      // backend-less sessions, where "plugin registration" would be wrong.
+      `Session is not reachable: no usable delivery backend is registered for it. Restart the session to re-register.`,
+      options.sendTelegramReply,
+    );
     return;
   }
 
@@ -413,6 +431,35 @@ function classifyDeliveryFailure(error: string | undefined): DeliveryFailureKind
     return "definitely_not_delivered";
   }
   return "terminal";
+}
+
+/**
+ * Abandon a command that cannot be delivered, without losing it silently.
+ *
+ * Every caller here is a permanent failure: we return normally, so the Poller acks
+ * and the worker will never resend. Before that happens the user must be told, and
+ * the local inbox row must be closed out. Omitting either is what made these paths
+ * invisible (W2 / pigeon-2k1) — the command showed up as `acked` in D1, which is
+ * indistinguishable from success.
+ *
+ * The Telegram send is deliberately best-effort. If it threw, the exception would
+ * propagate out of ingestWorkerCommand, the Poller would skip the ack, and a
+ * permanently-undeliverable command would retry forever. Notifying is important;
+ * it is not important enough to build an infinite loop out of.
+ */
+async function dropCommand(
+  storage: StorageDb,
+  commandId: string,
+  chatId: string,
+  userMessage: string,
+  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+): Promise<void> {
+  try {
+    await sendTelegramReply?.(chatId, userMessage);
+  } catch (err) {
+    console.warn(`[command-ingest] failed to notify user about dropped commandId=${commandId}:`, err);
+  }
+  storage.inbox.markDone(commandId);
 }
 
 function isConnectionError(error: string | undefined): boolean {
@@ -577,9 +624,24 @@ async function deliverViaAdapter(
         console.warn(`[command-ingest] worker unregister failed for ${msg.sessionId} (row now stranded until the worker TTL sweep):`, err);
       }
     }
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      `Session is no longer reachable and was removed. Start a new session and try again.`,
+      options.sendTelegramReply,
+    );
     return;
   }
 
-  // Permanent failure: ack and move on
+  // Permanent failure (the plugin actively rejected this command): ack and move on,
+  // but surface the reject reason instead of dropping the message into the void.
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    `Command rejected: ${result.error ?? "unknown reason"}`,
+    options.sendTelegramReply,
+  );
   return;
 }
