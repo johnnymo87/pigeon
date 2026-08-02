@@ -2009,3 +2009,340 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
     storage.db.close();
   });
 });
+
+describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () => {
+  const twoQuestions = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+    { question: "Q2", header: "H2", options: [{ label: "X", description: "" }, { label: "Y", description: "" }] },
+  ];
+
+  function questionSession(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+    return { storage, now };
+  }
+
+  // ── Terminal delivery failure: notify, but PRESERVE the row ──────────────
+  // The row is deliberately kept. See the retry-ability test below for why.
+
+  it("replies and keeps the wizard retryable when final-step delivery terminally fails", async () => {
+    const { storage, now } = questionSession("sess-w2b-wizfail");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-wizfail", requestId: "req-1", questions: twoQuestions, token: "tok-1",
+    }, now);
+    storage.pendingQuestions.advanceStep("sess-w2b-wizfail", ["A"]);
+
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const editCalls: unknown[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-1", sessionId: "sess-w2b-wizfail", command: "v1:q0", chatId: "70" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
+        }),
+        editNotification: async (...args: unknown[]) => { editCalls.push(args); return { ok: true }; },
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("70");
+    expect(tgCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
+    // Row preserved with its accumulated answers, so the user can retry.
+    const row = storage.pendingQuestions.getBySessionId("sess-w2b-wizfail");
+    expect(row).not.toBeNull();
+    expect(row!.answers).toEqual([["A"]]);
+    // The keyboard is still live and correct, so we must NOT edit it away.
+    expect(editCalls).toHaveLength(0);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("still accepts the same button press after a final-step failure (retry works)", async () => {
+    // This is the evidence for preserving the row. The final step never calls
+    // advanceStep (it builds allAnswers locally), so `version` is unchanged by a
+    // failure and the displayed buttons still pass the stale-version guard.
+    // Deleting the row would destroy this working retry path.
+    const { storage, now } = questionSession("sess-w2b-retry");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-retry", requestId: "req-2", questions: twoQuestions, token: "tok-2",
+    }, now);
+    storage.pendingQuestions.advanceStep("sess-w2b-retry", ["A"]);
+
+    const delivered: string[][][] = [];
+    let failFirst = true;
+    const opts = () => ({
+      createAdapter: () => ({
+        name: "mock-direct",
+        async deliverCommand() { return { ok: false, error: "should not be called" }; },
+        async deliverQuestionReply(_s: unknown, input: QuestionReplyInput) {
+          if (failFirst) { failFirst = false; return { ok: false as const, error: "TRANSIENT_LOOKING_TERMINAL" }; }
+          delivered.push(input.answers);
+          return { ok: true as const };
+        },
+      }),
+      editNotification: async () => ({ ok: true }),
+      sendTelegramReply: async () => {},
+    });
+
+    // First press fails terminally.
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-w2b-2a", sessionId: "sess-w2b-retry", command: "v1:q0", chatId: "71" }), opts());
+    expect(delivered).toHaveLength(0);
+
+    // Second press of the SAME button (same version) is accepted and delivers.
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-w2b-2b", sessionId: "sess-w2b-retry", command: "v1:q0", chatId: "71" }), opts());
+    expect(delivered).toEqual([[["A"], ["X"]]]);
+
+    storage.db.close();
+  });
+
+  it("replies and keeps the row retryable when single-question delivery terminally fails", async () => {
+    const { storage, now } = questionSession("sess-w2b-single");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-single", requestId: "req-3", questions: [twoQuestions[0]!], token: "tok-3",
+    }, now);
+
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-3", sessionId: "sess-w2b-single", command: "my typed answer", chatId: "72" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
+        }),
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
+    expect(storage.pendingQuestions.getBySessionId("sess-w2b-single")).not.toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  // ── Adapter cannot take question replies: notify AND DELETE the row ──────
+  // Asymmetric with the above on purpose. The condition is permanent for this
+  // session, and while the row exists it hijacks every plain-text message into
+  // the question path, so preserving it would loop the failure until TTL.
+
+  it("replies and deletes the row when the adapter cannot take a wizard reply", async () => {
+    const { storage, now } = questionSession("sess-w2b-wiznoadapter");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-wiznoadapter", requestId: "req-4", questions: twoQuestions, token: "tok-4",
+    }, now);
+    storage.pendingQuestions.advanceStep("sess-w2b-wiznoadapter", ["A"]);
+
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-4", sessionId: "sess-w2b-wiznoadapter", command: "v1:q0", chatId: "73" }),
+      {
+        createAdapter: () => ({
+          name: "mock-no-qr",
+          async deliverCommand() { return { ok: true as const }; },
+        }),
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(tgCalls[0]!.chatId).toBe("73");
+    expect(storage.pendingQuestions.getBySessionId("sess-w2b-wiznoadapter")).toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("replies and deletes the row when the adapter cannot take a single-question reply", async () => {
+    const { storage, now } = questionSession("sess-w2b-singlenoadapter");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-singlenoadapter", requestId: "req-5", questions: [twoQuestions[0]!], token: "tok-5",
+    }, now);
+
+    const tgCalls: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-5", sessionId: "sess-w2b-singlenoadapter", command: "typed", chatId: "74" }),
+      {
+        createAdapter: () => ({
+          name: "mock-no-qr",
+          async deliverCommand() { return { ok: true as const }; },
+        }),
+        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+      },
+    );
+
+    expect(tgCalls).toHaveLength(1);
+    expect(storage.pendingQuestions.getBySessionId("sess-w2b-singlenoadapter")).toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("stops hijacking plain text once the un-answerable row is deleted", async () => {
+    // The point of deleting: the next message reaches the session as a normal
+    // prompt instead of looping the same undeliverable question reply.
+    const { storage, now } = questionSession("sess-w2b-unhijack");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-unhijack", requestId: "req-6", questions: [twoQuestions[0]!], token: "tok-6",
+    }, now);
+
+    const deliveredCommands: string[] = [];
+    const opts = () => ({
+      createAdapter: () => ({
+        name: "mock-no-qr",
+        async deliverCommand(_s: unknown, text: string) { deliveredCommands.push(text); return { ok: true as const }; },
+      }),
+      sendTelegramReply: async () => {},
+    });
+
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-w2b-6a", sessionId: "sess-w2b-unhijack", command: "first", chatId: "75" }), opts());
+    expect(deliveredCommands).toEqual([]);
+
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-w2b-6b", sessionId: "sess-w2b-unhijack", command: "second", chatId: "75" }), opts());
+    expect(deliveredCommands).toEqual(["second"]);
+
+    storage.db.close();
+  });
+
+  it("does not throw when no sendTelegramReply is wired on the question path", async () => {
+    const { storage, now } = questionSession("sess-w2b-nosender");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-nosender", requestId: "req-7", questions: [twoQuestions[0]!], token: "tok-7",
+    }, now);
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-7", sessionId: "sess-w2b-nosender", command: "typed", chatId: "76" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
+        }),
+      },
+    )).resolves.toBeUndefined();
+
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    storage.db.close();
+  });
+});
+
+describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b part B)", () => {
+  // These three branches predate dropCommand and hand-rolled it with an
+  // UNGUARDED `await options.sendTelegramReply?.(...)`. That is latent rather
+  // than live today only because the production sender (index.ts) catches
+  // internally and never throws. If it ever did, serveUnreachable would be an
+  // infinite retry loop: it does NOT delete the session, so the command would
+  // come back every poll, gated only on Telegram continuing to fail.
+  const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as ReviveAndDeliverDeps["spawn"];
+
+  function deadSession(sessionId: string) {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+    return storage;
+  }
+
+  const throwingSender = async () => { throw new Error("telegram is down"); };
+  const connError = () => ({
+    name: "mock-direct",
+    async deliverCommand() { return { ok: false, error: "fetch failed: ECONNREFUSED" }; },
+  });
+
+  it("acks despite a throwing sender when opencode-serve is unreachable", async () => {
+    const storage = deadSession("sess-b-unreach");
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-b-1", sessionId: "sess-b-unreach", command: "hi", chatId: "80" }),
+      {
+        createAdapter: connError,
+        opencodeClient: {
+          async getSession() { throw new Error("fetch failed: ECONNREFUSED"); },
+          async sendPrompt() {},
+        },
+        spawn: mockSpawn,
+        sendTelegramReply: throwingSender,
+      },
+    )).resolves.toBeUndefined();
+
+    // The session is deliberately kept on this branch, which is exactly why an
+    // escaping throw here would retry forever.
+    expect(storage.sessions.get("sess-b-unreach")).not.toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("acks despite a throwing sender when the session is gone in opencode-serve", async () => {
+    const storage = deadSession("sess-b-gone");
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-b-2", sessionId: "sess-b-gone", command: "hi", chatId: "81" }),
+      {
+        createAdapter: connError,
+        opencodeClient: {
+          async getSession() { return null; },
+          async sendPrompt() {},
+        },
+        spawn: mockSpawn,
+        sendTelegramReply: throwingSender,
+      },
+    )).resolves.toBeUndefined();
+
+    expect(storage.sessions.get("sess-b-gone")).toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("acks despite a throwing sender when revival delivery fails", async () => {
+    const storage = deadSession("sess-b-delivfail");
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-b-3", sessionId: "sess-b-delivfail", command: "hi", chatId: "82" }),
+      {
+        createAdapter: connError,
+        opencodeClient: {
+          async getSession() { return { id: "sess-b-delivfail", directory: "/tmp/proj" }; },
+          async sendPrompt() { throw new Error("prompt exploded"); },
+        },
+        spawn: mockSpawn,
+        sendTelegramReply: throwingSender,
+      },
+    )).resolves.toBeUndefined();
+
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+});

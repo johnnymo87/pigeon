@@ -219,7 +219,7 @@ export async function ingestWorkerCommand(
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-        storage.inbox.markDone(commandId);
+        await dropUnanswerableQuestion(storage, commandId, msg, options.sendTelegramReply);
         return;
       }
 
@@ -241,7 +241,18 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
-      storage.inbox.markDone(commandId);
+      // Deliberately keep the pending question row and leave the notification
+      // alone. The final step never calls advanceStep, so `version` is unchanged
+      // by this failure and the keyboard still on screen remains valid — the
+      // user can simply tap again. Deleting the row would throw away the
+      // accumulated answers and destroy that retry path.
+      await dropCommand(
+        storage,
+        commandId,
+        msg.chatId,
+        questionReplyFailedMessage(result.error),
+        options.sendTelegramReply,
+      );
       return;
     }
 
@@ -254,7 +265,7 @@ export async function ingestWorkerCommand(
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-      storage.inbox.markDone(commandId);
+      await dropUnanswerableQuestion(storage, commandId, msg, options.sendTelegramReply);
       return;
     }
 
@@ -273,7 +284,15 @@ export async function ingestWorkerCommand(
 
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
-    storage.inbox.markDone(commandId);
+    // Row preserved for the same reason as the wizard final step above: the
+    // single-question path never mutates it, so the keyboard stays valid.
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      questionReplyFailedMessage(result.error),
+      options.sendTelegramReply,
+    );
     return;
   }
 
@@ -462,6 +481,47 @@ async function dropCommand(
   storage.inbox.markDone(commandId);
 }
 
+/**
+ * Reply text for a question answer that could not be delivered.
+ *
+ * The caller keeps the pending question row, so the retry hint is real: the
+ * on-screen keyboard is still valid and a second tap re-attempts delivery.
+ * Retry-able is not the same as retry-will-succeed — a genuinely gone question
+ * fails identically every time — but each attempt now says so, and the row
+ * expires on its own TTL rather than lingering forever.
+ */
+function questionReplyFailedMessage(error: string | undefined): string {
+  const reason = error ?? "unknown error";
+  return `Couldn't deliver your answer: ${reason}\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.`;
+}
+
+/**
+ * The session's adapter cannot accept question replies at all, so this pending
+ * question is permanently unanswerable from Telegram.
+ *
+ * Unlike a delivery failure, the row is DELETED here. While it exists, every
+ * plain-text message to this session is hijacked into the question-reply path
+ * (see the pendingQuestion branch in ingestWorkerCommand), so keeping it would
+ * loop this same failure until the TTL expires and block normal command flow
+ * entirely. Dropping it lets the user's next message through as a regular
+ * prompt.
+ */
+async function dropUnanswerableQuestion(
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+): Promise<void> {
+  storage.pendingQuestions.delete(msg.sessionId);
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    "This session can't receive question answers from Telegram. Answer it directly in the TUI instead.",
+    sendTelegramReply,
+  );
+}
+
 function isConnectionError(error: string | undefined): boolean {
   // Both ambiguous (timeout) and definitely-not-delivered failures warrant the
   // revive fallback; only terminal failures do not.
@@ -569,29 +629,35 @@ async function deliverViaAdapter(
               console.warn(`[command-ingest] worker unregister failed for ${msg.sessionId} (row now stranded until the worker TTL sweep):`, err);
             }
           }
-          await options.sendTelegramReply?.(
+          await dropCommand(
+            storage,
+            commandId,
             msg.chatId,
             `Session no longer exists. The opencode session was deleted from this machine.`,
+            options.sendTelegramReply,
           );
-          storage.inbox.markDone(commandId);
           return;
         }
         case "serveUnreachable": {
           console.warn(`[command-ingest] opencode-serve unreachable for revival sessionId=${msg.sessionId}: ${revived.error}`);
-          await options.sendTelegramReply?.(
+          await dropCommand(
+            storage,
+            commandId,
             msg.chatId,
             `opencode-serve is unreachable. Try again in a moment.`,
+            options.sendTelegramReply,
           );
-          storage.inbox.markDone(commandId);
           return;
         }
         case "deliveryFailed": {
           console.warn(`[command-ingest] revival delivery failed sessionId=${msg.sessionId}: ${revived.error}`);
-          await options.sendTelegramReply?.(
+          await dropCommand(
+            storage,
+            commandId,
             msg.chatId,
             `Delivery failed: ${revived.error}`,
+            options.sendTelegramReply,
           );
-          storage.inbox.markDone(commandId);
           return;
         }
         case "sessionMissing": {
