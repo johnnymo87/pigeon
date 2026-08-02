@@ -63,8 +63,9 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | ID | Item | P | State |
 |----|------|---|-------|
 | `pigeon-az8` | **W0 GATE** — prove a normal text command works in a devbox topic | P1 | ✅ **PASSED** 2026-08-02 |
-| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ready |
-| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ready |
+| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ **PR #39** |
+| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ **PR #39** |
+| `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | new, ready |
 | `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
 | `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
 
@@ -195,3 +196,41 @@ Recorded so nobody re-derives the wrong version from a stale summary:
 - Devbox daemon logs `auth: disabled` — no `PIGEON_DAEMON_AUTH_TOKEN` set. Pre-existing and
   out of scope here, but it means the daemon's non-health routes are unauthenticated on that
   box. Not filed as a bead; raise separately if it matters.
+
+---
+
+## 6. W2 + W1 outcome (PR #39, branch `fix/silent-command-drop`)
+
+Shipped together. W2 alone would have been a UX regression: with the producer still
+in place, every newly created topic would have opened with a visible
+`INVALID_PAYLOAD` error. W1 removes the producer, so there is no noisy window.
+
+**Scope grew during implementation.** The bead named one silent-drop site; an audit
+found four, all the same shape (bare return → Poller acks → no reply, no `markDone`).
+All four now route through a shared `dropCommand()`.
+
+**Ten pre-existing tests asserted the leak as correct** (`listUnfinished() === 1`).
+All ten flipped to `0`. This is the kind of edit that can launder a regression into a
+green suite, so it was verified twice: each failed on that one assertion and nothing
+else (10/10 identical messages), and the adversarial review added the decisive check —
+`listUnfinished()` has no runtime consumers, so those assertions never protected a
+recovery mechanism.
+
+**Process notes.** Oracle consult skipped (step 2) — the design was constrained and
+the fix mechanical; recorded in the bead. Adversarial review (step 4) found no
+must-fix but produced four real improvements, the best being a test gap: the
+`isServiceMessage` unit tests passed even when the guard was never *called*. The
+end-to-end test added to close that is mutation-checked.
+
+### Discovered, filed, not fixed
+
+- `pigeon-k4c.1` (W2b, P1) — the question-reply path has three silent drops of the
+  same class as W2. The wizard case is worst: it drops every accumulated answer,
+  leaves the `pendingQuestions` row, and never edits the notification, soft-locking
+  the question behind buttons that now fail the stale-version check. Also folds in
+  the three revive branches that hand-roll `dropCommand` with an unguarded send —
+  latent today only because the production sender happens never to throw.
+- `pigeon-bru` (W4) — **annotated, scope changed.** This PR's guard removes W4's easy
+  repro without fixing it. The live path is now a caption-less media reply to a
+  question, which submits an empty answer *and* silently discards the file (that
+  second half overlaps `pigeon-tyk`/W3).
