@@ -1,5 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
-import { getByThread, topicsEnabled } from "./topics";
+import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
@@ -760,6 +760,103 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
+      return OK();
+    }
+
+    // Handle /rename command (reply-based)
+    const renameMatch = update.message.text.match(/^\/rename(?:\s+([\s\S]*))?$/);
+    if (renameMatch) {
+      const renameChatId = update.message.chat.id;
+      const rawTitle = renameMatch[1]?.trim();
+
+      if (!rawTitle) {
+        await sendTelegramMessage(env, renameChatId, "Usage: /rename <new title>", {
+          messageThreadId: update.message.message_thread_id,
+        });
+        return OK();
+      }
+
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
+
+      const formattedName = topicName("", rawTitle);
+      const now = Date.now();
+
+      if (topicsEnabled(env)) {
+        const topic = await getBySession(db, resolved.sessionId);
+        if (topic && topic.message_thread_id !== null) {
+          const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+          const editRes = await tg.editForumTopic({
+            chatId: topic.chat_id,
+            messageThreadId: topic.message_thread_id,
+            name: formattedName,
+          });
+
+          // TOPIC_NOT_MODIFIED means Telegram's name already equals the requested one, so the
+          // rename is effectively done — treat it as success and fall through to the D1 writes.
+          // This matches the reopen path (topic-manager.ts:77) and matters for two reasons:
+          // repeating /rename with the same title must not report a failure, and because the
+          // Telegram edit deliberately precedes the D1 writes, a crash in between leaves D1
+          // stale — re-issuing the command is the repair, and it only converges if this is
+          // not treated as an error.
+          if (!editRes.ok && editRes.kind !== "topic_not_modified") {
+            await sendTelegramMessage(
+              env,
+              renameChatId,
+              `Failed to rename topic for session \`${resolved.sessionId}\`.`,
+              {
+                messageThreadId: update.message.message_thread_id,
+              },
+            );
+            return OK();
+          }
+
+          await renameTopic(db, { sessionId: resolved.sessionId, name: formattedName });
+          await db
+            .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+            .bind(formattedName, now, resolved.sessionId)
+            .run();
+
+          await sendTelegramMessage(
+            env,
+            renameChatId,
+            `Renamed session \`${resolved.sessionId}\` to "${formattedName}".`,
+            {
+              messageThreadId: update.message.message_thread_id,
+            },
+          );
+          return OK();
+        }
+
+        await db
+          .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+          .bind(formattedName, now, resolved.sessionId)
+          .run();
+
+        await sendTelegramMessage(
+          env,
+          renameChatId,
+          `Updated label for session \`${resolved.sessionId}\` to "${formattedName}" (no forum topic to rename).`,
+          {
+            messageThreadId: update.message.message_thread_id,
+          },
+        );
+        return OK();
+      }
+
+      await db
+        .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+        .bind(formattedName, now, resolved.sessionId)
+        .run();
+
+      await sendTelegramMessage(
+        env,
+        renameChatId,
+        `Updated label for session \`${resolved.sessionId}\` to "${formattedName}".`,
+        {
+          messageThreadId: update.message.message_thread_id,
+        },
+      );
       return OK();
     }
 

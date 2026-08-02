@@ -47,6 +47,11 @@ The `/model` command sets a per-session model override stored in the daemon's SQ
 
 Pigeon supports operating in a Telegram forum supergroup (`TELEGRAM_TOPICS_ENABLED = "true"` in worker `wrangler.toml`). Each opencode session maps to a dedicated forum topic thread named after the session's TUI title. Inbound commands, outbound notifications, and media pass through thread-aware worker endpoints referencing `commands.message_thread_id` and the D1 `topics` table. For migration details, see [`docs/runbooks/telegram-forum-migration.md`](docs/runbooks/telegram-forum-migration.md).
 
+Topic names are **write-once**: `topicName(dir, title)` renders `title · ~/path` and is called only at topic creation, so a drifting TUI title never re-renames a topic. `/rename <new title>` is the manual override. Two deliberate limits worth knowing before filing a bug against it:
+
+- **A renamed topic loses the ` · ~/path` suffix.** The worker has no durable per-session directory (`topics` has no `dir` column, `sessions` has no dir, and `commands.directory` is `/launch`-only and reaped), so a rename cannot re-derive the path. It calls the same `topicName` formatter with an empty dir, keeping exactly one naming path rather than adding a second formatter.
+- **The `sessions.label` half of a rename is not durable.** The daemon re-registers a session with its own local label at session start and during outbox recovery (`outbox-sender.ts`), which reverts the worker-side label. The renamed **topic** persists; the label may not. Daemon-side preservation was judged disproportionate for a P3.
+
 ### Swarm IPC
 
 Cross-session messaging between opencode sessions on the same machine. Senders POST to daemon `/swarm/send` (typically via `~/.local/bin/pigeon-send` from workstation, or transparently via `opencode-send <ses_*>` which auto-routes). The daemon persists in `swarm_messages` and returns 202 immediately. A background `SwarmArbiter` (500ms tick, at-most-one-in-flight per target) delivers via opencode serve `prompt_async`, with the message wrapped in a `<swarm_message v="1" ...>` XML envelope so the receiving agent can structurally distinguish swarm traffic from user prompts. Receivers can also call the `swarm_read` opencode tool (registered by the plugin) to fetch their inbox via `GET /swarm/inbox`.
@@ -67,6 +72,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/mcp disable <server>` | *(reply to a session notification)* | Disconnects an MCP server |
 | `/model` | *(reply to a session notification)* | Lists available models from allowed providers |
 | `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
+| `/rename <new title>` | *(reply to a session notification)* | Renames the session's forum topic to the given title. Worker-only — never reaches opencode |
 | `/current-state [machine]` | `/current-state cloudbox` | Surveys the machine's `main` tmux opencode TUIs and replies with an index plus one swipe-reply card per session (🟢 active / ⚪ idle). Machine defaults to `cloudbox` |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.

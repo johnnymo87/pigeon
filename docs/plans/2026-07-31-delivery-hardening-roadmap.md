@@ -53,9 +53,24 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 |---|---|
 | `@pigeon/daemon` | **1055** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **345** passed |
-| `@pigeon/worker` | **312** passed |
+| `@pigeon/worker` | **322** passed |
 
-Total **1712**. Updated by Cycle 5 in its own final commit. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1722**, measured at the merged F2 HEAD. F2 added **worker +10** (312 → 322) and touched nothing else. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **Addendum to CORRECTION #5, from F2 (2026-08-02).** F2 independently re-measured at `e582ca4` —
+> **the exact commit F1 recorded 1646 at** — and got **1051 / 340 / 300 = 1691**, deterministic across
+> three consecutive full runs. That pins the mechanism more precisely than "concurrent tracks landed
+> while this file was compacted": F1 **measured before its final merge with `main` and wrote that
+> pre-merge number into a post-merge commit.** Its own worker figure was correct (298 → 300); only the
+> two packages the swarm track touched were wrong.
+>
+> **So CORRECTION #4's rule needs a second half. It is not enough to update the table in your own
+> final commit — you must measure at the commit you are recording, AFTER the final merge with
+> `main`.** A number that was true when you took it is still wrong if the tree moved before you wrote
+> it down. F2 followed that and re-measured post-merge.
+>
+> Also: §1.8's "taken" test-id list was itself stale — it names the 991500s and 992100s, but
+> `993103`-`993107` were taken by later cycles. **Grep the file for ids; do not trust the list.**
 
 > **CORRECTION #5 (2026-08-02, start of Cycle 5).** This table said **1040 / 306 / 300 = 1646** until
 > re-measured at the top of Cycle 5. It was stale AGAIN — but this time entirely from *concurrent
@@ -1504,7 +1519,45 @@ makes it delivery work that happens to also be a quality-of-life win.
 > pointless and the right move is to drop it, not to ship it because it was approved.** Look at a real
 > topic list before writing code.
 
-- [ ] **F2. `pigeon-pnf`** (P3) — add `/rename <new title>`, the manual complement to F1, for when
+- [x] **F2. `pigeon-pnf`** (P3) — DONE 2026-08-02, `4643061` + review fixes `d6c50dd` + `916f9ee`.
+  Worker-only reply-resolved `/rename <new title>`; never reaches opencode.
+
+  **The spec line below — "let `topicName` re-derive the suffix" — turned out to be impossible, and
+  that was established before any code was written.** The worker has **no durable per-session
+  directory**: `topics` has no `dir` column, `sessions` has only a `label`, and `commands.directory`
+  is `/launch`-only and reaped (`d1-ops.ts:261-264`). `dir` arrives per-notification and is consumed
+  only at creation (`topic-manager.ts:112`). Re-deriving the suffix therefore needed a new column and
+  a one-off `ALTER TABLE` against production D1 — **there is no migration runner in the worker**, the
+  schema is `CREATE TABLE IF NOT EXISTS` applied by hand, so an added column reaches production only
+  via a manual ALTER that must land BEFORE the deploy or every notification 500s. **The user was
+  given that cost and chose the lean option:** a renamed topic is `topicName("", title)` — the bare
+  title, no path suffix. Still exactly one formatter and one clamp, so the no-drift intent survives.
+  Parsing `dir` back out of the stored name was rejected outright (it would be the first-ever parser
+  of a display string, and the value is lossy — `~`-abbreviated and possibly clamped).
+
+  Adversarial review found four issues, all fixed in `d6c50dd`: the command reported
+  `Renamed session X` when **nothing had been renamed** (no topic row, or a NULL `message_thread_id`
+  reservation in flight — the confirmed silent-loss race, reachable in production via the
+  General-fallback path); `sessions.label` was written **before** the Telegram edit, so a failed edit
+  was partially applied; `editForumTopic` got the **incoming** chat id rather than `topic.chat_id`
+  (unsafe while two chats are allowlisted); and the usage test asserted only HTTP 200 — **it would
+  have passed with the entire `/rename` branch deleted**, the same weak-assertion pattern F1 shipped.
+
+  **Re-reviewing the fix found a defect the fix itself created**, for the sixth cycle running:
+  `TOPIC_NOT_MODIFIED` was treated as an error. Telegram returns it when the name already matches, so
+  repeating `/rename` reported failure for a completed rename — and worse, since the Telegram edit
+  deliberately precedes the D1 writes, a crash in that window leaves D1 stale with re-issuing the
+  command as the only repair, which could then never converge. Fixed in `916f9ee` to match the
+  existing benign classification in the reopen path (`topic-manager.ts:77`) — the classifier Cycle 6b
+  (`pigeon-c1a`) added, which this new call site had simply not consulted. **A composition defect
+  between two cycles, invisible to every unit test on either side.**
+
+  Two limitations documented in `AGENTS.md` rather than fixed: a renamed topic loses the path suffix
+  (above), and the `sessions.label` half is not durable — the daemon re-registers with its own local
+  label at session start and during outbox recovery, reverting it. The **topic** name persists, which
+  is the part the user sees.
+
+- ~~[ ] **F2. `pigeon-pnf`** (P3) — add `/rename <new title>`, the manual complement to F1, for when~~
   the auto-derived title has gone stale. Follow the existing reply-resolved command pattern
   (`webhook.ts:712`, `:734`, helper at `:538`); `editForumTopic` already exists in the Telegram
   client. Rename the **title only** and let `topicName` re-derive the suffix, so the two naming paths
