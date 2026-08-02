@@ -5557,6 +5557,54 @@ describe("bot username command handling (/cmd@bot)", () => {
     expect(sessRow?.label).toBe("New Bot Title");
   });
 
+  // Telegram's UI always renders the username as "@name", so pasting it verbatim into
+  // wrangler.toml is the natural config edit. Without the leading-@ strip, the configured
+  // value matches no token, so EVERY autocompleted command is classified as addressed to
+  // another bot and silently dropped -- the whole feature dead, with only a console.log.
+  it("configured username tolerates a leading @ (pasted from the Telegram UI)", async () => {
+    const atEnv = { ...env, TELEGRAM_BOT_USERNAME: "@mohrbacher_01_bot" } as Env;
+    const now = Date.now();
+    const sessionId = `ses_bot_atcfg_${now}`;
+    const machineId = `mac_bot_atcfg_${now}`;
+    const msgId = 770040;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/kill@mohrbacher_01_bot", msgId, 770040);
+    const res = await handleTelegramWebhook(env.DB, atEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    expect(rows.filter((r) => r.command_type === "kill").length).toBe(1);
+  });
+
+  // Telegram usernames must start with a letter, so "4098bot" cannot name a real bot.
+  // Without the leading-letter rule it is bot-SHAPED (5+ chars, ends in "bot") and the
+  // message is silently dropped instead of reaching the agent as a prompt.
+  it("digit-leading @-token (/serve@4098bot restart) is not a bot address; queued as prompt", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_digit_${now}`;
+    const machineId = `mac_bot_digit_${now}`;
+    const msgId = 770041;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/serve@4098bot restart", msgId, 770041);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const execRows = rows.filter((r) => r.command_type === "execute");
+    expect(execRows.length).toBe(1);
+    expect(execRows[0]!.command).toBe("/serve@4098bot restart");
+  });
+
   it("(7) /mcp@mohrbacher_01_bot list queues mcp_list command", async () => {
     const now = Date.now();
     const sessionId = `ses_bot_mcpl_${now}`;

@@ -18,7 +18,11 @@ function isBotUsername(targetBot: string): boolean {
   if (targetBot.length < 5 || targetBot.length > 32) {
     return false;
   }
-  if (!/^[a-zA-Z0-9_]+$/.test(targetBot)) {
+  // Telegram usernames must START WITH A LETTER, so a digit- or underscore-leading
+  // token cannot be a real bot address. Without this, "/serve@4098bot restart" is
+  // classified as addressed-to-another-bot and silently dropped, even though no bot
+  // could ever be named "4098bot". Narrows the false-positive drop surface for free.
+  if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(targetBot)) {
     return false;
   }
   return targetBot.toLowerCase().endsWith("bot");
@@ -53,7 +57,11 @@ export function parseTelegramCommand(
     return { kind: "ok", text };
   }
 
-  const normalizedConfigured = configuredBotUsername?.trim().toLowerCase();
+  // Tolerate a leading "@" in the configured value. Telegram's UI always displays the
+  // username as "@name", so pasting it verbatim into wrangler.toml is the natural edit --
+  // and without this strip it would match nothing, so EVERY autocompleted command would
+  // be classified as addressed-to-another-bot and silently dropped.
+  const normalizedConfigured = configuredBotUsername?.trim().replace(/^@/, "").toLowerCase();
 
   // 1) If the @ token case-insensitively equals configured username -> it is OURS
   if (normalizedConfigured && targetBot.toLowerCase() === normalizedConfigured) {
