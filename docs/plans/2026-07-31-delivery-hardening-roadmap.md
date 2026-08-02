@@ -31,7 +31,7 @@ then the first unchecked cycle in §4. Do not skim §1 — every entry in it cos
 
 | Thing | Value |
 |---|---|
-| Worker version | `78a4321b-d712-4ac2-84bc-decf910803b9` (2026-08-02, roadmap F2) — `/health` verified `ok` |
+| Worker version | `9619cdf5-511a-4853-8e82-014a64b976f8` (2026-08-02, roadmap F3) — `/health` verified `ok` |
 | `TELEGRAM_TOPICS_ENABLED` | `"true"` |
 | `ALLOWED_CHAT_IDS` | `8248645256,-1004391832753,-1004232934695` — **three now**; a peer track added the third. Both migration ids stay until Cycle 7b |
 | Supergroup | "Pigeon V2", `-1004391832753`, `is_forum: true` |
@@ -51,11 +51,25 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **1055** passed, 1 skipped |
+| `@pigeon/daemon` | **1061** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **345** passed |
-| `@pigeon/worker` | **322** passed |
+| `@pigeon/worker` | **351** passed |
 
-Total **1722**, measured at the merged F2 HEAD. F2 added **worker +10** (312 → 322) and touched nothing else. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1757**, measured at `f73da09` — the merged F3 commit, AFTER the merge, per the rule below. F3
+added **worker +20** (331 → 351) and touched nothing else. The daemon 1055 → 1061 and worker 322 → 331
+moves in between were **peer PR #39**, not this roadmap. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **WORKFLOW CHANGE that bit F3 (2026-08-02): the repo is now SQUASH-MERGE ONLY.** `gh pr merge --merge`
+> failed with "Merge commits are not allowed on this repository"; `gh api repos/... ` confirms
+> `merge:false, rebase:false, squash:true`. F2 merged with `--merge` hours earlier, so this was changed
+> mid-flight by someone else. Two consequences. **(1) Individual commit SHAs do not survive onto `main`**
+> — record the squash SHA and the PR number, not the working SHAs, or you will cite commits that exist
+> nowhere. **(2) The long-lived branch DIVERGES on every merge** (its N commits vs the one squashed
+> commit), so `git merge --ff-only origin/main` fails afterwards, and `rebase`/`merge`/`reset` are all
+> banned by §1.10. The clean recovery, used here, is to confirm `git diff origin/main..HEAD` is empty
+> (proving the squash preserved the content) and then start the next piece of work on a **fresh branch
+> and worktree off `origin/main`** rather than trying to repair the old one. F3 closed out in
+> `.worktrees/roadmap-f3` on `chore/roadmap-f3` for exactly this reason.
 
 > **Addendum to CORRECTION #5, from F2 (2026-08-02).** F2 independently re-measured at `e582ca4` —
 > **the exact commit F1 recorded 1646 at** — and got **1051 / 340 / 300 = 1691**, deterministic across
@@ -1353,7 +1367,7 @@ original intent — is preserved; intra-session inversion is now impossible.
 
 ## §4.1 — Explicitly OUT of scope for this roadmap
 
-Re-measured 2026-08-02 after F2: **53 open beads**; this roadmap covers ~23. The rest are real but
+Re-measured 2026-08-02 after F3: **53 open beads** (cn1 closed, 50l filed); this roadmap covers ~23. The rest are real but
 belong to other themes, and are listed here so a future reader does not mistake this file for the
 whole backlog:
 
@@ -1570,8 +1584,47 @@ makes it delivery work that happens to also be a quality-of-life win.
   cannot drift. Must degrade gracefully with topics disabled. **Sequence after F1** — the only
   ordering constraint in this track — or the naming logic gets written twice.
 
-- [ ] **F3. `pigeon-cn1`** (P3, bug) — **every reply command silently becomes a prompt when typed via
-  Telegram autocomplete.** All the command regexes are anchored with no bot-username suffix allowed
+- [x] **F3. `pigeon-cn1`** (P3, bug) — DONE 2026-08-02, PR #40, squashed to **`f73da09`**. Deployed as
+  worker version `9619cdf5-511a-4853-8e82-014a64b976f8`, `/health` verified `ok`. All **ten** command
+  matchers now accept the `@BotName` form (the spec text below said "reply commands"; `/launch` and
+  `/current-state` have the same gap, so the real count was ten, not the six named).
+
+  **The obvious fix — an optional `(?:@\w+)?`, which the spec below prescribes — is WRONG, and that was
+  established by measurement before any code.** `getMe` plus `getChatAdministrators` showed pigeon is
+  username `mohrbacher_01_bot` and an **administrator in both allowed chats**; Telegram's docs say bot
+  admins receive *all* group messages, overriding the `can_read_all_group_messages: false` privacy
+  flag, and privacy mode separately delivers "replies to any messages implicitly or explicitly meant
+  for this bot" — the exact shape of every reply-resolved pigeon command. So `/kill@SomeOtherBot` does
+  reach pigeon, and `@\w+` would have made it execute **destructive commands aimed at another bot**.
+  The user chose to match only our own username via a new `TELEGRAM_BOT_USERNAME` var. Unset fails
+  **closed** rather than falling back to accept-any, which would silently restore the hazard. One
+  helper (`parseTelegramCommand`) that all ten call sites converge on, not ten edited regexes.
+
+  **Review found that the first fix was WORSE THAN THE BASELINE for a class of real input.** The `@`
+  token was not required to look like a bot username, so `/opencode-serve@4098 is stuck`,
+  `/etc@host is broken` and `/deploy@staging please look` were classified as foreign-bot commands and
+  **silently dropped** — messages that before the change reached the agent as prompts, and vocabulary
+  this project actually uses. Now gated on Telegram's real username shape. Review also found every
+  drop path log-silent, including the unset-var path, whose symptom under the documented `[vars]`
+  revert trap would be "every command silently no-ops"; split into distinct kinds, `unconfigured`
+  warns with the command token only, never the message body.
+
+  **Re-reviewing that fix found two more, for the seventh cycle running.** A configured value of
+  `@mohrbacher_01_bot` — the natural copy-paste, since Telegram's UI always renders the `@` — matched
+  nothing and would have killed the entire feature silently. And `/serve@4098bot restart` was dropped
+  even though Telegram usernames must start with a letter, so `4098bot` can name no bot.
+
+  **A vacuous assertion was caught here by injection, in my own work, before review saw it:** with the
+  helper neutered, 13 of 14 new tests failed but the `/launch@SomeOtherBot` one still passed — it
+  filtered to `launch` rows when the failure mode is an `execute` prompt, and was not a reply, so
+  nothing could queue regardless. **Every** assertion added afterwards was verified by injection.
+
+  Residual, accepted and now logged: genuinely bot-shaped prose (`/deploy@robot fix this`) still drops.
+  Unfixed adjacent gap, noted by review and filed as `pigeon-50l`: media **captions** bypass
+  normalisation entirely.
+
+- ~~[ ] **F3. `pigeon-cn1`** (P3, bug) — every reply command silently becomes a prompt when typed via~~
+  Telegram autocomplete. All the command regexes are anchored with no bot-username suffix allowed
   (`/^\/kill$/` at `webhook.ts:701`, `/^\/interrupt$/` `:723`, `/^\/compact$/` `:745`, plus `/mcp`,
   `/model` and now `/rename`), but in a supergroup Telegram's autocomplete emits `/kill@MyBot`. That
   matches nothing, falls through to the plain-message handler, and gets **injected into the opencode
