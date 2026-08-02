@@ -2,6 +2,7 @@ import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
+import { withD1, StorageError } from "./d1";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -175,205 +176,228 @@ export async function handleSendNotification(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
-    return unauthorized();
-  }
-
-  const body = (await request.json()) as SendNotificationBody;
-  const { sessionId, chatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
-  const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
-
-  // Validate required fields
-  if (!sessionId || !chatId || !text) {
-    return json({ error: "sessionId, chatId, and text required" }, 400);
-  }
-
-  // Verify session exists
-  const session = await db
-    .prepare("SELECT * FROM sessions WHERE session_id = ?")
-    .bind(sessionId)
-    .first<SessionRow>();
-  if (!session) {
-    return json({ error: "Session not found" }, 404);
-  }
-
-  // Check chat ID allowlist
-  if (!isAllowedChatId(chatId, env)) {
-    return json({ error: "Chat ID not allowed" }, 403);
-  }
-
-  // Idempotency: if notificationId was provided and we already sent this notification,
-  // return the existing message data without calling Telegram again.
-  if (notificationId) {
-    const existing = await db
-      .prepare("SELECT * FROM messages WHERE notification_id = ?")
-      .bind(notificationId)
-      .first<MessageRow>();
-    if (existing) {
-      return json({ ok: true, messageId: existing.message_id, deduplicated: true });
-    }
-  }
-
-  // Touch session to prevent cleanup
-  await db
-    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
-    .bind(Date.now(), sessionId)
-    .run();
-
-  // Use daemon-supplied token from callback_data if present (keeps button callbacks working),
-  // otherwise generate a fresh token for reply-to-message routing.
-  const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
-
-  let messageThreadId: number | undefined;
-
-  if (topicsEnabled(env) && threaded !== false) {
-    const topicRes = await resolveTopic(db, {
-      sessionId,
-      machineId: session.machine_id,
-      chatId: String(chatId),
-      dir: dir ?? "",
-      title: title ?? "",
-      botToken: env.TELEGRAM_BOT_TOKEN,
-    });
-
-    if (!topicRes.ok && topicRes.kind === "rate_limited") {
-      return json({ error: "rate_limited", retryAfter: topicRes.retryAfter }, 429);
+  try {
+    if (!verifyApiKey(request, env.CCR_API_KEY)) {
+      return unauthorized();
     }
 
-    if (topicRes.ok && topicRes.messageThreadId !== null) {
-      messageThreadId = topicRes.messageThreadId;
-    }
-  }
+    const body = (await request.json()) as SendNotificationBody;
+    const { sessionId, chatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
+    const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-
-  // Call Telegram API
-  let telegramResult = await tg.sendMessage({
-    chatId,
-    messageThreadId,
-    text,
-    entities: entities as unknown[] | undefined,
-    replyMarkup,
-  });
-
-  // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band in Telegram)
-  if (
-    !telegramResult.ok &&
-    telegramResult.kind === "thread_not_found" &&
-    messageThreadId !== undefined &&
-    topicsEnabled(env) &&
-    threaded !== false
-  ) {
-    // Delete stale finalized topic row from D1
-    await deleteTopicBySession(db, sessionId);
-
-    // Recreate topic (resolve topic again)
-    const retryTopicRes = await resolveTopic(db, {
-      sessionId,
-      machineId: session.machine_id,
-      chatId: String(chatId),
-      dir: dir ?? "",
-      title: title ?? "",
-      botToken: env.TELEGRAM_BOT_TOKEN,
-    });
-
-    if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
-      return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
+    // Validate required fields
+    if (!sessionId || !chatId || !text) {
+      return json({ error: "sessionId, chatId, and text required" }, 400);
     }
 
-    // Adopt the recreated thread for EVERYTHING downstream, not just this retry.
-    // The media loop below reads messageThreadId; leaving it pointing at the deleted
-    // thread silently dropped every attachment (sendPhoto fails, the item is skipped
-    // with no retry and no log).
-    messageThreadId =
-      retryTopicRes.ok && retryTopicRes.messageThreadId !== null
-        ? retryTopicRes.messageThreadId
-        : undefined;
-
-    // Retry sendMessage exactly once
-    telegramResult = await tg.sendMessage({
-      chatId,
-      messageThreadId,
-      text,
-      entities: entities as unknown[] | undefined,
-      replyMarkup,
-    });
-  }
-
-  // Non-429 topic failure fallback to General.
-  // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
-  // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
-  // Never drop a notification. 429 errors must NOT fall back here.
-  if (
-    !telegramResult.ok &&
-    telegramResult.kind !== "rate_limited" &&
-    messageThreadId !== undefined
-  ) {
-    // Clear the thread for everything downstream: if the topic would not take the text
-    // it will not take the attachments either, so the media loop must follow to General.
-    messageThreadId = undefined;
-    telegramResult = await tg.sendMessage({
-      chatId,
-      messageThreadId,
-      text,
-      entities: entities as unknown[] | undefined,
-      replyMarkup,
-    });
-  }
-
-  // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
-  // The daemon converts to ms when it pauses the outbox; don't change the unit here
-  // without changing that multiplication too.
-  if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
-    return json({ error: "rate_limited", retryAfter: telegramResult.retryAfter }, 429);
-  }
-
-  if (!telegramResult.ok) {
-    return json(
-      { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
-      502,
+    // Verify session exists
+    const session = await withD1(
+      "send.sessionLookup",
+      db
+        .prepare("SELECT * FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<SessionRow>(),
     );
-  }
+    if (!session) {
+      return json({ error: "Session not found" }, 404);
+    }
 
-  const messageId = telegramResult.result.message_id;
+    // Check chat ID allowlist
+    if (!isAllowedChatId(chatId, env)) {
+      return json({ error: "Chat ID not allowed" }, 403);
+    }
 
-  // Store message→session mapping for reply routing
-  await db
-    .prepare(
-      "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(String(chatId), messageId, sessionId, token, notificationId, Date.now())
-    .run();
-
-  // Send media as replies to the text message
-  if (media && media.length > 0) {
-    for (const item of media) {
-      try {
-        const object = await env.MEDIA.get(item.key);
-        if (!object?.body) continue;
-
-        const blob = new Blob([await object.arrayBuffer()], { type: item.mime });
-        const isImage = item.mime.startsWith("image/");
-
-        const mediaResult = isImage
-          ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId)
-          : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId);
-
-        if (mediaResult.ok && mediaResult.result) {
-          await db
-            .prepare(
-              "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
-            .run();
-        }
-      } catch {
-        continue; // Best-effort: text already sent
+    // Idempotency: if notificationId was provided and we already sent this notification,
+    // return the existing message data without calling Telegram again.
+    if (notificationId) {
+      const existing = await withD1(
+        "send.idempotencyLookup",
+        db
+          .prepare("SELECT * FROM messages WHERE notification_id = ?")
+          .bind(notificationId)
+          .first<MessageRow>(),
+      );
+      if (existing) {
+        return json({ ok: true, messageId: existing.message_id, deduplicated: true });
       }
     }
-  }
 
-  return json({ ok: true, messageId, token });
+    // Touch session to prevent cleanup
+    await withD1(
+      "send.touchSession",
+      db
+        .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+        .bind(Date.now(), sessionId)
+        .run(),
+    );
+
+    // Use daemon-supplied token from callback_data if present (keeps button callbacks working),
+    // otherwise generate a fresh token for reply-to-message routing.
+    const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
+
+    let messageThreadId: number | undefined;
+
+    if (topicsEnabled(env) && threaded !== false) {
+      const topicRes = await resolveTopic(db, {
+        sessionId,
+        machineId: session.machine_id,
+        chatId: String(chatId),
+        dir: dir ?? "",
+        title: title ?? "",
+        botToken: env.TELEGRAM_BOT_TOKEN,
+      });
+
+      if (!topicRes.ok && topicRes.kind === "rate_limited") {
+        return json({ error: "rate_limited", retryAfter: topicRes.retryAfter }, 429);
+      }
+
+      if (topicRes.ok && topicRes.messageThreadId !== null) {
+        messageThreadId = topicRes.messageThreadId;
+      }
+    }
+
+    const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+
+    // Call Telegram API
+    let telegramResult = await tg.sendMessage({
+      chatId,
+      messageThreadId,
+      text,
+      entities: entities as unknown[] | undefined,
+      replyMarkup,
+    });
+
+    // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band in Telegram)
+    if (
+      !telegramResult.ok &&
+      telegramResult.kind === "thread_not_found" &&
+      messageThreadId !== undefined &&
+      topicsEnabled(env) &&
+      threaded !== false
+    ) {
+      // Delete stale finalized topic row from D1
+      await deleteTopicBySession(db, sessionId);
+
+      // Recreate topic (resolve topic again)
+      const retryTopicRes = await resolveTopic(db, {
+        sessionId,
+        machineId: session.machine_id,
+        chatId: String(chatId),
+        dir: dir ?? "",
+        title: title ?? "",
+        botToken: env.TELEGRAM_BOT_TOKEN,
+      });
+
+      if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
+        return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
+      }
+
+      // Adopt the recreated thread for EVERYTHING downstream, not just this retry.
+      // The media loop below reads messageThreadId; leaving it pointing at the deleted
+      // thread silently dropped every attachment (sendPhoto fails, the item is skipped
+      // with no retry and no log).
+      messageThreadId =
+        retryTopicRes.ok && retryTopicRes.messageThreadId !== null
+          ? retryTopicRes.messageThreadId
+          : undefined;
+
+      // Retry sendMessage exactly once
+      telegramResult = await tg.sendMessage({
+        chatId,
+        messageThreadId,
+        text,
+        entities: entities as unknown[] | undefined,
+        replyMarkup,
+      });
+    }
+
+    // Non-429 topic failure fallback to General.
+    // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
+    // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
+    // Never drop a notification. 429 errors must NOT fall back here.
+    if (
+      !telegramResult.ok &&
+      telegramResult.kind !== "rate_limited" &&
+      messageThreadId !== undefined
+    ) {
+      // Clear the thread for everything downstream: if the topic would not take the text
+      // it will not take the attachments either, so the media loop must follow to General.
+      messageThreadId = undefined;
+      telegramResult = await tg.sendMessage({
+        chatId,
+        messageThreadId,
+        text,
+        entities: entities as unknown[] | undefined,
+        replyMarkup,
+      });
+    }
+
+    // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
+    // The daemon converts to ms when it pauses the outbox; don't change the unit here
+    // without changing that multiplication too.
+    if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
+      return json({ error: "rate_limited", retryAfter: telegramResult.retryAfter }, 429);
+    }
+
+    if (!telegramResult.ok) {
+      return json(
+        { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
+        502,
+      );
+    }
+
+    const messageId = telegramResult.result.message_id;
+
+    // Store message→session mapping for reply routing
+    await withD1(
+      "send.insertMessage",
+      db
+        .prepare(
+          "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(String(chatId), messageId, sessionId, token, notificationId, Date.now())
+        .run(),
+    );
+
+    // Send media as replies to the text message
+    if (media && media.length > 0) {
+      for (const item of media) {
+        try {
+          const object = await env.MEDIA.get(item.key);
+          if (!object?.body) continue;
+
+          const blob = new Blob([await object.arrayBuffer()], { type: item.mime });
+          const isImage = item.mime.startsWith("image/");
+
+          const mediaResult = isImage
+            ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId)
+            : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId);
+
+          if (mediaResult.ok && mediaResult.result) {
+            await db
+              .prepare(
+                "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+              )
+              .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
+              .run();
+          }
+        } catch {
+          continue; // Best-effort: text already sent
+        }
+      }
+    }
+
+    return json({ ok: true, messageId, token });
+  } catch (err) {
+    if (err instanceof StorageError) {
+      console.error("[worker] storage error", { op: err.op, error: err });
+      return json(
+        { error: "storage_error", store: "d1", op: err.op },
+        503,
+      );
+    }
+    throw err;
+  }
 }
 
 /**

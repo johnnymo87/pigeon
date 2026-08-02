@@ -77,6 +77,7 @@ import {
   reopenForumTopic,
   deleteForumTopic,
 } from "../src/telegram";
+import { withD1, StorageError } from "../src/d1";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
 
@@ -8440,7 +8441,6 @@ describe("topics module and topicName", () => {
       spy.mockRestore();
     });
   });
-});
 
 // ─── Dispatch Boundary Observability & Boundary Catch (5a-T2) ────────────────
 
@@ -8535,6 +8535,124 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
     );
 
     spy.mockRestore();
+    });
+  });
+
+  // ─── D1 Storage Error Classification (5a-T3 / pigeon-dul) ────────────────────
+
+  describe("D1 storage error classification (5a-T3 / pigeon-dul)", () => {
+    it("withD1 helper resolves promise or wraps throw in StorageError", async () => {
+      const val = await withD1("test.op", Promise.resolve(42));
+      expect(val).toBe(42);
+
+      const error = new Error("d1 explosion");
+      await expect(withD1("test.op", Promise.reject(error))).rejects.toThrow(StorageError);
+
+      try {
+        await withD1("test.op", Promise.reject(error));
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(StorageError);
+        expect(err.op).toBe("test.op");
+        expect(err.cause).toBe(error);
+        expect(err.message).toBe("D1 storage error in test.op: d1 explosion");
+      }
+    });
+
+    it("POST /sessions/register returns 503 storage_error when D1 throws", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const badDb = {
+        prepare: () => ({
+          bind: () => ({
+            first: () => Promise.reject(new Error("D1 unavailable")),
+            run: () => Promise.reject(new Error("D1 unavailable")),
+            all: () => Promise.reject(new Error("D1 unavailable")),
+          }),
+          first: () => Promise.reject(new Error("D1 unavailable")),
+          run: () => Promise.reject(new Error("D1 unavailable")),
+          all: () => Promise.reject(new Error("D1 unavailable")),
+        }),
+      } as unknown as D1Database;
+
+      const badEnv = { ...env, DB: badDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993001", machineId: "mach-1" }),
+        }),
+        badEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "registerSession.existing",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "registerSession.existing",
+          error: expect.anything(),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /notifications/send returns 503 storage_error when session lookup D1 throws", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const badDb = {
+        prepare: () => ({
+          bind: () => ({
+            first: () => Promise.reject(new Error("D1 query timeout")),
+            run: () => Promise.reject(new Error("D1 query timeout")),
+            all: () => Promise.reject(new Error("D1 query timeout")),
+          }),
+          first: () => Promise.reject(new Error("D1 query timeout")),
+          run: () => Promise.reject(new Error("D1 query timeout")),
+          all: () => Promise.reject(new Error("D1 query timeout")),
+        }),
+      } as unknown as D1Database;
+
+      const badEnv = { ...env, DB: badDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId: "sess-503-993002",
+            chatId: "8248645256",
+            text: "hello world",
+          }),
+        }),
+        badEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "send.sessionLookup",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "send.sessionLookup",
+          error: expect.anything(),
+        }),
+      );
+
+      spy.mockRestore();
+    });
   });
 });
 

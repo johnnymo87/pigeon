@@ -1,6 +1,7 @@
 import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
+import { withD1, StorageError } from "./d1";
 
 export const MAX_SESSIONS = 5000;
 
@@ -54,51 +55,71 @@ async function registerSession(
   request: Request,
   opts?: SessionRequestOptions,
 ): Promise<Response> {
-  const body = (await request.json()) as Record<string, unknown>;
-  const sessionId = body.sessionId as string | undefined;
-  const machineId = body.machineId as string | undefined;
-  const label = (body.label as string | undefined) ?? null;
+  try {
+    const body = (await request.json()) as Record<string, unknown>;
+    const sessionId = body.sessionId as string | undefined;
+    const machineId = body.machineId as string | undefined;
+    const label = (body.label as string | undefined) ?? null;
 
-  if (!sessionId || !machineId) {
-    return Response.json(
-      { error: "sessionId and machineId required" },
-      { status: 400 },
-    );
-  }
-
-  const cap = opts?.maxSessions ?? MAX_SESSIONS;
-
-  // Check session limit (only for new sessions)
-  const existing = await db
-    .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
-    .bind(sessionId)
-    .first<{ session_id: string }>();
-
-  if (!existing) {
-    const countResult = await db
-      .prepare("SELECT COUNT(*) as count FROM sessions")
-      .first<{ count: number }>();
-    const count = countResult?.count ?? 0;
-    if (count >= cap) {
-      console.error(`Session limit reached: ${count} / ${cap} sessions`);
-      return Response.json({ error: "Session limit reached" }, { status: 429 });
+    if (!sessionId || !machineId) {
+      return Response.json(
+        { error: "sessionId and machineId required" },
+        { status: 400 },
+      );
     }
+
+    const cap = opts?.maxSessions ?? MAX_SESSIONS;
+
+    // Check session limit (only for new sessions)
+    const existing = await withD1(
+      "registerSession.existing",
+      db
+        .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ session_id: string }>(),
+    );
+
+    if (!existing) {
+      const countResult = await withD1(
+        "registerSession.count",
+        db
+          .prepare("SELECT COUNT(*) as count FROM sessions")
+          .first<{ count: number }>(),
+      );
+      const count = countResult?.count ?? 0;
+      if (count >= cap) {
+        console.error(`Session limit reached: ${count} / ${cap} sessions`);
+        return Response.json({ error: "Session limit reached" }, { status: 429 });
+      }
+    }
+
+    const now = Date.now();
+    await withD1(
+      "registerSession.upsert",
+      db
+        .prepare(
+          `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             machine_id = excluded.machine_id,
+             label = excluded.label,
+             updated_at = excluded.updated_at`,
+        )
+        .bind(sessionId, machineId, label, now, now)
+        .run(),
+    );
+
+    return Response.json({ ok: true, sessionId, machineId });
+  } catch (err) {
+    if (err instanceof StorageError) {
+      console.error("[worker] storage error", { op: err.op, error: err });
+      return Response.json(
+        { error: "storage_error", store: "d1", op: err.op },
+        { status: 503 },
+      );
+    }
+    throw err;
   }
-
-  const now = Date.now();
-  await db
-    .prepare(
-      `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET
-         machine_id = excluded.machine_id,
-         label = excluded.label,
-         updated_at = excluded.updated_at`,
-    )
-    .bind(sessionId, machineId, label, now, now)
-    .run();
-
-  return Response.json({ ok: true, sessionId, machineId });
 }
 
 async function unregisterSession(
