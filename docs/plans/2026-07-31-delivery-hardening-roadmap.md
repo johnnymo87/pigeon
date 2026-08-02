@@ -31,9 +31,9 @@ then the first unchecked cycle in §4. Do not skim §1 — every entry in it cos
 
 | Thing | Value |
 |---|---|
-| Worker version | `8d8952ad-6471-4384-85f7-4eabb63a0d7e` (2026-08-01, roadmap 6b) |
+| Worker version | `78a4321b-d712-4ac2-84bc-decf910803b9` (2026-08-02, roadmap F2) — `/health` verified `ok` |
 | `TELEGRAM_TOPICS_ENABLED` | `"true"` |
-| `ALLOWED_CHAT_IDS` | `8248645256,-1004391832753` — **both, deliberately** |
+| `ALLOWED_CHAT_IDS` | `8248645256,-1004391832753,-1004232934695` — **three now**; a peer track added the third. Both migration ids stay until Cycle 7b |
 | Supergroup | "Pigeon V2", `-1004391832753`, `is_forum: true` |
 | Daemon `TELEGRAM_CHAT_ID` | `-1004391832753` (sops, cloudbox) |
 | Branch | `feat/forum-topics-phase2`, fast-forwarded to `origin/main` |
@@ -1353,7 +1353,7 @@ original intent — is preserved; intra-session inversion is now impossible.
 
 ## §4.1 — Explicitly OUT of scope for this roadmap
 
-Re-measured 2026-08-01 after F1: **49 open beads**; this roadmap covers ~20. The rest are real but
+Re-measured 2026-08-02 after F2: **53 open beads**; this roadmap covers ~23. The rest are real but
 belong to other themes, and are listed here so a future reader does not mistake this file for the
 whole backlog:
 
@@ -1370,6 +1370,12 @@ whole backlog:
   the F1 audit caught it** — it appeared on no roadmap at all, neither this one nor the scheduled-wake
   spine, despite being a P2 production bug. It is parked here rather than adopted, because swarm auth
   is not delivery hardening; if the swarm track does not claim it, it needs a home of its own.
+- **`pigeon-s9d`** (P1, bug, added by the swarm track 2026-08-02) — a wake into a session whose
+  working directory was deleted is **silently swallowed**: the daemon records success and the turn
+  never runs. Measured, not theorised. It belongs to the scheduled-wake track below, not here; noted
+  in this section only so the F2 audit's literal id grep finds it. **Same failure shape this roadmap
+  keeps hitting — a success report with no delivery behind it** (cf. `pigeon-cal`, and F2's own
+  "Renamed" message when nothing was renamed), so whoever fixes it may find the reasoning here useful.
 - **Swarm scheduled wake — a NEW active track, added 2026-08-01.** Epic `pigeon-mx2` (P1) with
   `pigeon-c68` (P1, plugin tools), `pigeon-4yz` (P1, skill guidance + e2e), `pigeon-u5g` (P2, whether a
   `handed_off`-but-never-verified wake should also expire) and `pigeon-uhh` (P2, the expiry Telegram
@@ -1564,9 +1570,36 @@ makes it delivery work that happens to also be a quality-of-life win.
   cannot drift. Must degrade gracefully with topics disabled. **Sequence after F1** — the only
   ordering constraint in this track — or the naming logic gets written twice.
 
-**Do `pigeon-cn8` (4c) before F1 if you want the easy win first:** it removes roughly half of all
-topics, which makes the naming change much easier to evaluate against a list that is mostly real
-work.
+- [ ] **F3. `pigeon-cn1`** (P3, bug) — **every reply command silently becomes a prompt when typed via
+  Telegram autocomplete.** All the command regexes are anchored with no bot-username suffix allowed
+  (`/^\/kill$/` at `webhook.ts:701`, `/^\/interrupt$/` `:723`, `/^\/compact$/` `:745`, plus `/mcp`,
+  `/model` and now `/rename`), but in a supergroup Telegram's autocomplete emits `/kill@MyBot`. That
+  matches nothing, falls through to the plain-message handler, and gets **injected into the opencode
+  session as a prompt** — the user believes they issued a command. Pre-existing and family-wide, but
+  it got materially more reachable when everything moved into a supergroup, where autocomplete is the
+  normal way to type a command. **Fix all of them at once** with an optional `(?:@\w+)?`, one test per
+  command; fixing a single command in isolation just moves the trap. Found by F2's adversarial review.
+
+- [ ] **F4. `pigeon-7k9`** (P3) — one-off live probe: does `editForumTopic` work on a **closed** topic?
+  `/rename` does not consult the row's `state` (`webhook.ts:791`), so it can target one. Adjacent
+  behaviour is known from `pigeon-cev` (a bot CAN post into a closed topic; a deleted topic gives
+  `400 "message thread not found"`; reopening an open topic gives `400 TOPIC_NOT_MODIFIED`) but editing
+  a closed topic was never probed. Low stakes — a rejection degrades to an honest "Failed to rename" —
+  so this closes a documentation gap rather than a suspected bug. If it IS rejected, decide between
+  reopen-then-edit (an extra call against the §3 budget) and just reporting the failure.
+
+- [ ] **F5. `pigeon-s0q`** (P3, bug) — `/sessions/register` **NULLs an existing `sessions.label`** when
+  the daemon omits it. The daemon drops a falsy label from the body entirely (`poller.ts:408`), the
+  worker coerces the absent field to `null` (`sessions.ts:62`) and the upsert does
+  `label = excluded.label` (`sessions.ts:91-98`), so "absent" and "explicitly cleared" are conflated.
+  Reachable through outbox `session_not_registered` recovery (`outbox-sender.ts:375`). Display-only
+  today (queue-full message, command labels), so it is filed for the *shape* — silent data loss — and
+  because F2 now writes a user-chosen title into that column, so an unrelated recovery path can wipe a
+  manual rename. Likely `COALESCE(excluded.label, sessions.label)`, but decide whether clearing a label
+  must stay expressible.
+
+**`pigeon-cn8` (4c) is still worth doing early:** it removes roughly half of all topics, which makes
+any naming or topic-list change much easier to evaluate against a list that is mostly real work.
 
 ## §5 — Reference
 
