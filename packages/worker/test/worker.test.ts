@@ -5407,6 +5407,331 @@ describe("/rename command", () => {
   });
 });
 
+// ─── Bot Username Command Suffix (/cmd@bot) Tests ─────────────────────────
+
+describe("bot username command handling (/cmd@bot)", () => {
+  const CHAT_ID = String(CHAT_ID_NUM);
+  const botEnv = { ...env, TELEGRAM_BOT_USERNAME: "mohrbacher_01_bot" } as Env;
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("(1) /launch@mohrbacher_01_bot queues launch command with directory and prompt", async () => {
+    const now = Date.now();
+    const machineId = `mac_bot_launch_${now}`;
+    await touchMachine(env.DB, machineId, now);
+    mockTelegramSendMessage();
+
+    const update = {
+      update_id: 770001,
+      message: {
+        message_id: 770001,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/launch@mohrbacher_01_bot ${machineId} pigeon "do a thing"`,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const launchRows = rows.filter((r) => r.command_type === "launch");
+    expect(launchRows.length).toBe(1);
+    expect(launchRows[0]!.directory).toBe("pigeon");
+    expect(launchRows[0]!.command).toBe('"do a thing"');
+  });
+
+  it("(2) /current-state@mohrbacher_01_bot queues current_state command", async () => {
+    const now = Date.now();
+    const machineId = `mac_bot_cs_${now}`;
+    await touchMachine(env.DB, machineId, now);
+    mockTelegramSendMessage();
+
+    const update = {
+      update_id: 770002,
+      message: {
+        message_id: 770002,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/current-state@mohrbacher_01_bot ${machineId}`,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const csRows = rows.filter((r) => r.command_type === "current_state");
+    expect(csRows.length).toBe(1);
+  });
+
+  it("(3) /kill@mohrbacher_01_bot queues kill command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_kill_${now}`;
+    const machineId = `mac_bot_kill_${now}`;
+    const msgId = 770003;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/kill@mohrbacher_01_bot", msgId, 770003);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const killRows = rows.filter((r) => r.command_type === "kill");
+    expect(killRows.length).toBe(1);
+    expect(killRows[0]!.session_id).toBe(sessionId);
+  });
+
+  it("(4) /interrupt@mohrbacher_01_bot queues interrupt command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_intr_${now}`;
+    const machineId = `mac_bot_intr_${now}`;
+    const msgId = 770004;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/interrupt@mohrbacher_01_bot", msgId, 770004);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const intrRows = rows.filter((r) => r.command_type === "interrupt");
+    expect(intrRows.length).toBe(1);
+    expect(intrRows[0]!.session_id).toBe(sessionId);
+  });
+
+  it("(5) /compact@mohrbacher_01_bot queues compact command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_comp_${now}`;
+    const machineId = `mac_bot_comp_${now}`;
+    const msgId = 770005;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/compact@mohrbacher_01_bot", msgId, 770005);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const compRows = rows.filter((r) => r.command_type === "compact");
+    expect(compRows.length).toBe(1);
+    expect(compRows[0]!.session_id).toBe(sessionId);
+  });
+
+  it("(6) /rename@mohrbacher_01_bot renames session label", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_ren_${now}`;
+    const machineId = `mac_bot_ren_${now}`;
+    const msgId = 770006;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/rename@mohrbacher_01_bot New Bot Title", msgId, 770006);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const sessRow = await env.DB
+      .prepare("SELECT label FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ label: string }>();
+    expect(sessRow?.label).toBe("New Bot Title");
+  });
+
+  it("(7) /mcp@mohrbacher_01_bot list queues mcp_list command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_mcpl_${now}`;
+    const machineId = `mac_bot_mcpl_${now}`;
+    const msgId = 770007;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/mcp@mohrbacher_01_bot list", msgId, 770007);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const mcplRows = rows.filter((r) => r.command_type === "mcp_list");
+    expect(mcplRows.length).toBe(1);
+  });
+
+  it("(8) /mcp@mohrbacher_01_bot enable slack queues mcp_enable command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_mcpe_${now}`;
+    const machineId = `mac_bot_mcpe_${now}`;
+    const msgId = 770008;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/mcp@mohrbacher_01_bot enable slack", msgId, 770008);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const mcpeRows = rows.filter((r) => r.command_type === "mcp_enable");
+    expect(mcpeRows.length).toBe(1);
+    expect(mcpeRows[0]!.command).toBe("slack");
+  });
+
+  it("(9) /mcp@mohrbacher_01_bot disable slack queues mcp_disable command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_mcpd_${now}`;
+    const machineId = `mac_bot_mcpd_${now}`;
+    const msgId = 770009;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/mcp@mohrbacher_01_bot disable slack", msgId, 770009);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const mcpdRows = rows.filter((r) => r.command_type === "mcp_disable");
+    expect(mcpdRows.length).toBe(1);
+    expect(mcpdRows[0]!.command).toBe("slack");
+  });
+
+  it("(10) /model@mohrbacher_01_bot anthropic/claude-3-5-sonnet queues model_set command", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_mod_${now}`;
+    const machineId = `mac_bot_mod_${now}`;
+    const msgId = 770010;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/model@mohrbacher_01_bot anthropic/claude-3-5-sonnet", msgId, 770010);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const modRows = rows.filter((r) => r.command_type === "model_set");
+    expect(modRows.length).toBe(1);
+    expect(modRows[0]!.command).toBe("anthropic/claude-3-5-sonnet");
+  });
+
+  it("foreign bot suffix (/kill@SomeOtherBot) is silently dropped and NOT queued as command or prompt", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_foreign_${now}`;
+    const machineId = `mac_bot_foreign_${now}`;
+    const msgId = 770011;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+
+    const update = makeTextReply("/kill@SomeOtherBot", msgId, 770011);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(0);
+  });
+
+  it("foreign bot suffix (/launch@SomeOtherBot) is silently dropped", async () => {
+    const update = {
+      update_id: 770012,
+      message: {
+        message_id: 770012,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/launch@SomeOtherBot devbox pigeon "hi"`,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    const rows = await queryQueueByMachine("devbox");
+    const launchRows = rows.filter((r) => r.command_type === "launch" && r.command === '"hi"');
+    expect(launchRows.length).toBe(0);
+  });
+
+  it("case-insensitive bot username match (/kill@Mohrbacher_01_Bot)", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_case_${now}`;
+    const machineId = `mac_bot_case_${now}`;
+    const msgId = 770013;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/kill@Mohrbacher_01_Bot", msgId, 770013);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const killRows = rows.filter((r) => r.command_type === "kill");
+    expect(killRows.length).toBe(1);
+  });
+
+  it("degrades when TELEGRAM_BOT_USERNAME is unset/empty (bare works, suffixed ignored)", async () => {
+    const unsetEnv = { ...env, TELEGRAM_BOT_USERNAME: undefined } as Env;
+    const now = Date.now();
+    const sessionId = `ses_bot_unset_${now}`;
+    const machineId = `mac_bot_unset_${now}`;
+    const msgId1 = 770014;
+    const msgId2 = 770015;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId1, sessionId, token: `tok1_${now}` });
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId2, sessionId, token: `tok2_${now}` });
+
+    // Suffixed command when TELEGRAM_BOT_USERNAME is unset -> ignored
+    const suffixedUpdate = makeTextReply("/kill@mohrbacher_01_bot", msgId1, 770014);
+    const res1 = await handleTelegramWebhook(env.DB, unsetEnv, makeWebhookRequest(suffixedUpdate));
+    expect(res1.status).toBe(200);
+
+    let rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(0);
+
+    // Bare command when TELEGRAM_BOT_USERNAME is unset -> works as normal
+    mockTelegramSendMessage();
+    const bareUpdate = makeTextReply("/kill", msgId2, 770015);
+    const res2 = await handleTelegramWebhook(env.DB, unsetEnv, makeWebhookRequest(bareUpdate));
+    expect(res2.status).toBe(200);
+
+    rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.command_type).toBe("kill");
+  });
+});
+
 // ─── Swipe-Reply to Question Notification: Integration Tests ──────────
 
 describe("swipe-reply to question notification", () => {

@@ -9,6 +9,47 @@ type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mc
 // Re-export generateCommandId for tests
 export { generateCommandId };
 
+export type CommandNormalizationResult =
+  | { kind: "ok"; text: string }
+  | { kind: "foreign_bot" };
+
+/**
+ * Normalizes Telegram command text by stripping a matching bot username suffix from the command token.
+ * E.g., "/kill@mohrbacher_01_bot" -> "/kill".
+ *
+ * If the command token has a bot username suffix addressed to a DIFFERENT bot (or if
+ * configuredBotUsername is unset/empty), returns { kind: "foreign_bot" } so the message
+ * can be silently dropped and not fall through as a prompt to the plain-message handler.
+ */
+export function parseTelegramCommand(
+  text: string,
+  configuredBotUsername?: string,
+): CommandNormalizationResult {
+  if (!text.startsWith("/")) {
+    return { kind: "ok", text };
+  }
+
+  const match = text.match(/^\/([a-zA-Z0-9_-]+)(?:@([a-zA-Z0-9_]+))?(?=$|\s)([\s\S]*)$/);
+  if (!match) {
+    return { kind: "ok", text };
+  }
+
+  const cmd = match[1]!;
+  const targetBot = match[2];
+  const rest = match[3] ?? "";
+
+  if (!targetBot) {
+    return { kind: "ok", text };
+  }
+
+  const normalizedConfigured = configuredBotUsername?.trim().toLowerCase();
+  if (normalizedConfigured && targetBot.toLowerCase() === normalizedConfigured) {
+    return { kind: "ok", text: `/${cmd}${rest}` };
+  }
+
+  return { kind: "foreign_bot" };
+}
+
 /**
  * Verify the Telegram webhook secret header (constant-time).
  */
@@ -721,8 +762,14 @@ export async function handleTelegramWebhook(
     return OK(); // silent drop
   }
 
-  // Handle /launch command
+  // Handle commands
   if (update.message?.text) {
+    const cmdNorm = parseTelegramCommand(update.message.text, env.TELEGRAM_BOT_USERNAME);
+    if (cmdNorm.kind === "foreign_bot") {
+      return OK();
+    }
+    update.message.text = cmdNorm.text;
+
     const launchMatch = update.message.text.match(/^\/launch\s+(\S+)\s+(\S+)\s+(.+)$/s);
     if (launchMatch) {
       const machineId = launchMatch[1]!;

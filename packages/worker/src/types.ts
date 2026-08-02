@@ -10,6 +10,7 @@ declare global {
     ALLOWED_CHAT_IDS: string;
     ALLOWED_USER_IDS?: string;
     TELEGRAM_TOPICS_ENABLED?: string;
+    TELEGRAM_BOT_USERNAME?: string;
     MEDIA: R2Bucket;
   }
 }
