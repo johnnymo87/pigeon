@@ -5659,24 +5659,29 @@ describe("bot username command handling (/cmd@bot)", () => {
     expect(rows.length).toBe(0);
   });
 
-  it("foreign bot suffix (/launch@SomeOtherBot) is silently dropped", async () => {
-    const update = {
-      update_id: 770012,
-      message: {
-        message_id: 770012,
-        chat: { id: CHAT_ID_NUM },
-        from: { id: CHAT_ID_NUM },
-        text: `/launch@SomeOtherBot devbox pigeon "hi"`,
-      },
-    };
+  // Sent as a REPLY on purpose. A non-reply cannot resolve a session, so it would
+  // queue nothing even with the feature deleted -- the assertion would be vacuous.
+  // As a reply the session DOES resolve, so if the foreign-bot guard were missing the
+  // text would fall through to the plain-message handler and be injected as a prompt.
+  // Assert zero rows of ANY type, not just zero launch rows.
+  it("foreign bot suffix (/launch@SomeOtherBot) is dropped, not injected as a prompt", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_foreign_launch_${now}`;
+    const machineId = `mac_bot_foreign_launch_${now}`;
+    const msgId = 770020;
 
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply(`/launch@SomeOtherBot devbox pigeon "hi"`, msgId, 770020);
     const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
 
-    const rows = await queryQueueByMachine("devbox");
-    const launchRows = rows.filter((r) => r.command_type === "launch" && r.command === '"hi"');
-    expect(launchRows.length).toBe(0);
+    const rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(0);
   });
 
   it("case-insensitive bot username match (/kill@Mohrbacher_01_Bot)", async () => {
