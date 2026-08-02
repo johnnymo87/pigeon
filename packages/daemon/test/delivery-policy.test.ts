@@ -163,6 +163,28 @@ describe("classifyDeliveryFailure", () => {
       expected: { action: "retry" },
     },
     {
+      name: "503 storage_error (D1 backing-store failure) without retryAfter returns retry (payloadHasEntities: false)",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 503,
+        body: { error: "storage_error", store: "d1", op: "registerSession.existing" },
+      },
+      ctx: { payloadHasEntities: false },
+      expected: { action: "retry" },
+    },
+    {
+      name: "503 storage_error (D1 backing-store failure) without retryAfter returns retry (payloadHasEntities: true)",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 503,
+        body: { error: "storage_error", store: "d1", op: "registerSession.existing" },
+      },
+      ctx: { payloadHasEntities: true },
+      expected: { action: "retry" },
+    },
+    {
       name: "app_rejection without retryAfter returns retry",
       result: { ok: false, kind: "app_rejection", status: 200, body: { error: "Rejected" } },
       expected: { action: "retry" },
