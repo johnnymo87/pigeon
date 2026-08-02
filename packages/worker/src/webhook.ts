@@ -9,6 +9,77 @@ type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mc
 // Re-export generateCommandId for tests
 export { generateCommandId };
 
+export type CommandNormalizationResult =
+  | { kind: "ok"; text: string }
+  | { kind: "foreign_bot"; commandToken: string }
+  | { kind: "unconfigured"; commandToken: string };
+
+function isBotUsername(targetBot: string): boolean {
+  if (targetBot.length < 5 || targetBot.length > 32) {
+    return false;
+  }
+  // Telegram usernames must START WITH A LETTER, so a digit- or underscore-leading
+  // token cannot be a real bot address. Without this, "/serve@4098bot restart" is
+  // classified as addressed-to-another-bot and silently dropped, even though no bot
+  // could ever be named "4098bot". Narrows the false-positive drop surface for free.
+  if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(targetBot)) {
+    return false;
+  }
+  return targetBot.toLowerCase().endsWith("bot");
+}
+
+/**
+ * Normalizes Telegram command text by stripping a matching bot username suffix from the command token.
+ * E.g., "/kill@mohrbacher_01_bot" -> "/kill".
+ *
+ * If the command token has a bot username suffix addressed to a DIFFERENT bot (or if
+ * configuredBotUsername is unset/empty), returns { kind: "foreign_bot" } or { kind: "unconfigured" }
+ * so the message can be dropped and not fall through as a prompt to the plain-message handler.
+ */
+export function parseTelegramCommand(
+  text: string,
+  configuredBotUsername?: string,
+): CommandNormalizationResult {
+  if (!text.startsWith("/")) {
+    return { kind: "ok", text };
+  }
+
+  const match = text.match(/^\/([a-zA-Z0-9_-]+)(?:@([a-zA-Z0-9_]+))?(?=$|\s)([\s\S]*)$/);
+  if (!match) {
+    return { kind: "ok", text };
+  }
+
+  const cmd = match[1]!;
+  const targetBot = match[2];
+  const rest = match[3] ?? "";
+
+  if (!targetBot) {
+    return { kind: "ok", text };
+  }
+
+  // Tolerate a leading "@" in the configured value. Telegram's UI always displays the
+  // username as "@name", so pasting it verbatim into wrangler.toml is the natural edit --
+  // and without this strip it would match nothing, so EVERY autocompleted command would
+  // be classified as addressed-to-another-bot and silently dropped.
+  const normalizedConfigured = configuredBotUsername?.trim().replace(/^@/, "").toLowerCase();
+
+  // 1) If the @ token case-insensitively equals configured username -> it is OURS
+  if (normalizedConfigured && targetBot.toLowerCase() === normalizedConfigured) {
+    return { kind: "ok", text: `/${cmd}${rest}` };
+  }
+
+  // 2) Else if the token looks like a Telegram bot username -> addressed elsewhere / unconfigured
+  if (isBotUsername(targetBot)) {
+    if (!normalizedConfigured) {
+      return { kind: "unconfigured", commandToken: cmd };
+    }
+    return { kind: "foreign_bot", commandToken: cmd };
+  }
+
+  // 3) Else -> NOT a bot address at all; ordinary text. Return text UNCHANGED.
+  return { kind: "ok", text };
+}
+
 /**
  * Verify the Telegram webhook secret header (constant-time).
  */
@@ -721,8 +792,19 @@ export async function handleTelegramWebhook(
     return OK(); // silent drop
   }
 
-  // Handle /launch command
+  // Handle commands
   if (update.message?.text) {
+    const cmdNorm = parseTelegramCommand(update.message.text, env.TELEGRAM_BOT_USERNAME);
+    if (cmdNorm.kind === "unconfigured") {
+      console.warn(`TELEGRAM_BOT_USERNAME is not configured; dropping suffixed command /${cmdNorm.commandToken}`);
+      return OK();
+    }
+    if (cmdNorm.kind === "foreign_bot") {
+      console.log(`Dropping command /${cmdNorm.commandToken} addressed to foreign bot`);
+      return OK();
+    }
+    update.message.text = cmdNorm.text;
+
     const launchMatch = update.message.text.match(/^\/launch\s+(\S+)\s+(\S+)\s+(.+)$/s);
     if (launchMatch) {
       const machineId = launchMatch[1]!;
