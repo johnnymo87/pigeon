@@ -360,7 +360,9 @@ export async function ingestWorkerCommand(
       storage,
       commandId,
       msg.chatId,
-      `Session is not reachable: its opencode plugin registration is incomplete. Restart the session to re-register.`,
+      // Deliberately backend-agnostic: this also fires for nvim-only and
+      // backend-less sessions, where "plugin registration" would be wrong.
+      `Session is not reachable: no usable delivery backend is registered for it. Restart the session to re-register.`,
       options.sendTelegramReply,
     );
     return;

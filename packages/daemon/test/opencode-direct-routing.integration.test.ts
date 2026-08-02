@@ -109,7 +109,6 @@ describe("opencode direct-channel routing integration", () => {
     ).resolves.toBeUndefined();
 
     expect(onExecute).toHaveBeenCalledTimes(1);
-    // Inbox NOT marked done on failure
     // Marked done: this is a permanent failure, so the Poller acks and the worker
     // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -251,7 +250,6 @@ describe("opencode direct-channel routing integration", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // Command persisted in inbox but not marked done
     // Marked done: this is a permanent failure, so the Poller acks and the worker
     // never resends. Leaving the row unfinished stranded it forever (W2 / pigeon-2k1).
     expect(storage.inbox.listUnfinished()).toHaveLength(0);

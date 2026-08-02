@@ -150,6 +150,21 @@ interface TelegramMessage {
   delete_chat_photo?: unknown;
   pinned_message?: unknown;
   message_auto_delete_timer_changed?: unknown;
+  video_chat_scheduled?: unknown;
+  video_chat_started?: unknown;
+  video_chat_ended?: unknown;
+  video_chat_participants_invited?: unknown;
+  group_chat_created?: unknown;
+  supergroup_chat_created?: unknown;
+  channel_chat_created?: unknown;
+  migrate_to_chat_id?: unknown;
+  migrate_from_chat_id?: unknown;
+  chat_background_set?: unknown;
+  boost_added?: unknown;
+  users_shared?: unknown;
+  chat_shared?: unknown;
+  write_access_allowed?: unknown;
+  successful_payment?: unknown;
 }
 
 const SERVICE_MESSAGE_FIELDS = [
@@ -166,6 +181,26 @@ const SERVICE_MESSAGE_FIELDS = [
   "delete_chat_photo",
   "pinned_message",
   "message_auto_delete_timer_changed",
+  // A video chat started in the supergroup is the most plausible producer here
+  // after forum_topic_created. The rest are cheap to list and cheaper than the
+  // alternative: any service message not named here falls through to the
+  // empty-command guard and posts "Nothing to send" into the chat, which is
+  // user-visible noise rather than the silent no-op these deserve.
+  "video_chat_scheduled",
+  "video_chat_started",
+  "video_chat_ended",
+  "video_chat_participants_invited",
+  "group_chat_created",
+  "supergroup_chat_created",
+  "channel_chat_created",
+  "migrate_to_chat_id",
+  "migrate_from_chat_id",
+  "chat_background_set",
+  "boost_added",
+  "users_shared",
+  "chat_shared",
+  "write_access_allowed",
+  "successful_payment",
 ] as const satisfies readonly (keyof TelegramMessage)[];
 
 /**
