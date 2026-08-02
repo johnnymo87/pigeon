@@ -62,25 +62,33 @@ Full detail lives in the beads. Read those before implementing — they carry th
 
 | ID | Item | P | State |
 |----|------|---|-------|
-| `pigeon-az8` | **W0 GATE** — prove a normal text command works in a devbox topic | P1 | ready |
-| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | blocked by W0 |
-| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | blocked by W0 |
-| `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | blocked by W0 |
-| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | blocked by W0 |
+| `pigeon-az8` | **W0 GATE** — prove a normal text command works in a devbox topic | P1 | ✅ **PASSED** 2026-08-02 |
+| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ready |
+| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ready |
+| `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
+| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
 
-### Why W0 gates everything
+### Why W0 gated everything — and how it resolved
 
-Post-migration the daemon logged 0 successful deliveries and 6 failures. The tempting read is
-"command delivery is broken." **That read is wrong.** All 6 failures are self-inflicted (W1),
-and there were zero attempts at a normal text command in the window. The ratio is **0-of-0,
-not 0-of-N**.
+Post-migration the daemon logged 0 successful deliveries and 6 failures. The tempting read was
+"command delivery is broken." **That read was wrong.** All 6 failures are self-inflicted (W1),
+and there were zero attempts at a normal text command in the window — the ratio was **0-of-0,
+not 0-of-N**. Absence of daemon logs cannot distinguish "nobody typed anything" from "the
+worker dropped it upstream", because worker-side failures never reach `journalctl`.
 
-Normal delivery on the new chat id is *untested* — not proven broken, not proven working.
-Absence of daemon logs cannot distinguish "nobody typed anything" from "the worker dropped it
-upstream", because worker-side failures never reach `journalctl`.
+**Resolved 2026-08-02 ~10:58 EDT. Gate PASSED:**
 
-W0 costs about 30 seconds. If it fails, the epic re-prioritises around a live outage and this
-roadmap is wrong. Run it first.
+```
+[command-ingest] delivered commandId=41dda1476493fc538cab1f77754682aa
+                 adapter=direct-channel sessionId=ses_040adb83dffeNcmJh5sUiN8VfH attempts=1
+```
+
+A plain `ping` typed into thread 6 of the devbox supergroup traversed Telegram → worker → D1 →
+daemon → plugin and reached the session, on attempt 1, with no `INVALID_PAYLOAD`.
+
+Normal text delivery on `-1004232934695` is therefore **proven working**, not merely
+un-disproven. The forum split introduced no delivery regression, the 6 failures really are
+confined to W1's empty commands, and this roadmap's premise holds. W1–W4 are unblocked.
 
 ### Suggested order after W0
 
