@@ -25,7 +25,8 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       aborted_at INTEGER,
       deliver_at INTEGER,
       expires_at INTEGER,
-      cancelled_at INTEGER
+      cancelled_at INTEGER,
+      ref TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -57,6 +58,7 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       "ALTER TABLE swarm_messages ADD COLUMN deliver_at INTEGER",
       "ALTER TABLE swarm_messages ADD COLUMN expires_at INTEGER",
       "ALTER TABLE swarm_messages ADD COLUMN cancelled_at INTEGER",
+      "ALTER TABLE swarm_messages ADD COLUMN ref TEXT",
     ];
 
     for (const statement of additiveColumns) {

@@ -315,6 +315,46 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const parsed = parseSwarmSendBody(body, "wake");
         if (!parsed.ok) return parsed.response;
 
+        // Length correlates only loosely with self-containedness: it cannot detect a
+        // 60-char payload that says "continue what you were doing", and it will
+        // occasionally reject a legitimately terse-but-durable wake. It is a speed
+        // bump against the dominant failure mode (forgetting context after compaction),
+        // not strict enforcement.
+        const trimmedPayload = parsed.fields.payload.trim();
+        if (trimmedPayload.length < 40) {
+          return Response.json(
+            {
+              error: `scheduled wake payload is too short (${trimmedPayload.length} chars, minimum 40): a wake must be self-contained because the session receiving it may have compacted away the reason it was scheduled. Include a durable pointer -- a beads id, a PR number, a file path -- not 'check on it'. Example: 'Resume pigeon-c68: run bd show pigeon-c68, then continue the W4 plugin tools in .worktrees/wake-w4.'`,
+            },
+            { status: 400 },
+          );
+        }
+
+        let ref: string | null = null;
+        if (body.ref !== undefined && body.ref !== null) {
+          if (typeof body.ref !== "string") {
+            return Response.json(
+              { error: "ref must be a string" },
+              { status: 400 },
+            );
+          }
+          if (body.ref.length > 200) {
+            return Response.json(
+              { error: "ref exceeds maximum length of 200 characters" },
+              { status: 400 },
+            );
+          }
+          if (/[\r\n\t]/.test(body.ref)) {
+            return Response.json(
+              { error: "ref must not contain control characters (newline, carriage return, tab)" },
+              { status: 400 },
+            );
+          }
+          if (body.ref.length > 0) {
+            ref = body.ref;
+          }
+        }
+
         const sched = parseScheduleTime({
           at: body.at,
           after: body.after,
@@ -345,6 +385,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             payload: f.payload,
             deliverAt: sched.deliverAt,
             expiresAt: sched.expiresAt,
+            ref,
           },
           nowFn(),
         );
@@ -356,6 +397,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               error: `message with msg_id '${msgId}' already exists`,
               msg_id: msgId,
               deliver_at: stored?.deliverAt ?? null,
+              expires_at: stored?.expiresAt ?? null,
             },
             { status: 409 },
           );
@@ -394,6 +436,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             deliver_at: m.deliverAt,
             expires_at: m.expiresAt,
             created_at: m.createdAt,
+            ref: m.ref,
           })),
         });
       }

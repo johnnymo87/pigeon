@@ -25,6 +25,7 @@ export interface SwarmMessageRecord {
   deliverAt: number | null;
   expiresAt: number | null;
   cancelledAt: number | null;
+  ref: string | null;
 }
 
 /** Cursor-based paging options for {@link SwarmRepository.getInbox}. */
@@ -54,6 +55,7 @@ export interface InsertSwarmInput {
   payload: string;
   deliverAt?: number | null;
   expiresAt?: number | null;
+  ref?: string | null;
 }
 
 function asRecord(row: Row): SwarmMessageRecord {
@@ -78,6 +80,7 @@ function asRecord(row: Row): SwarmMessageRecord {
     deliverAt: (row.deliver_at as number | null) ?? null,
     expiresAt: (row.expires_at as number | null) ?? null,
     cancelledAt: (row.cancelled_at as number | null) ?? null,
+    ref: (row.ref as string | null) ?? null,
   };
 }
 
@@ -90,8 +93,8 @@ export class SwarmRepository {
         `INSERT INTO swarm_messages
            (msg_id, from_session, to_session, channel, kind, priority, reply_to, payload,
             state, attempts, next_retry_at, created_at, updated_at, handed_off_at,
-            deliver_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, NULL, ?, ?)
+            deliver_at, expires_at, ref)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, NULL, ?, ?, ?)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -107,6 +110,7 @@ export class SwarmRepository {
         now,
         input.deliverAt ?? null,
         input.expiresAt ?? null,
+        input.ref ?? null,
       );
     return result.changes > 0;
   }

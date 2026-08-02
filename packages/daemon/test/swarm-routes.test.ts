@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { SwarmArbiter } from "../src/swarm/arbiter";
 import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
 
 describe("POST /swarm/send", () => {
@@ -384,7 +385,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           channel: "general",
           after: "1h",
-          payload: "scheduled channel message",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -407,7 +408,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           after: "13h",
-          payload: "wake up!",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -446,7 +447,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           at: targetAt,
-          payload: "wake up!",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -526,7 +527,7 @@ describe("POST /swarm/schedule", () => {
           to: "ses_b",
           after: "1h",
           expires_in: "30m",
-          payload: "wake",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -545,7 +546,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           after: "1h",
-          payload: "wake",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -565,7 +566,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           after: "1h",
-          payload: "wake",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -581,7 +582,7 @@ describe("POST /swarm/schedule", () => {
           to: "ses_b",
           after: "1h",
           kind: "custom_wake",
-          payload: "wake",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
         }),
       }),
     );
@@ -601,7 +602,7 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           after: "1h",
-          payload: "first",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 (first)",
         }),
       }),
     );
@@ -617,18 +618,21 @@ describe("POST /swarm/schedule", () => {
           from: "ses_a",
           to: "ses_b",
           after: "2h",
-          payload: "second",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 (second)",
         }),
       }),
     );
     expect(res2.status).toBe(409);
-    const body2 = (await res2.json()) as { error: string; msg_id: string; deliver_at: number };
+    const body2 = (await res2.json()) as { error: string; msg_id: string; deliver_at: number; expires_at: number };
     expect(body2.msg_id).toBe("msg_scheduled_dup");
     expect(body2.deliver_at).toBe(body1.deliver_at);
+    expect(body2.expires_at).toBeGreaterThan(body1.deliver_at);
     expect(body2.error).toContain("msg_scheduled_dup");
 
     const stored = s.swarm.getByMsgId("msg_scheduled_dup");
-    expect(stored!.payload).toBe("first");
+    expect(stored!.payload).toBe(
+      "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 (first)",
+    );
   });
 });
 
@@ -783,6 +787,7 @@ describe("GET /swarm/scheduled", () => {
       deliver_at: now + 5000,
       expires_at: null,
       created_at: now - 1000,
+      ref: null,
     });
   });
 
@@ -990,7 +995,7 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
             from: "ses_a",
             to: "ses_b",
             after: "1h",
-            payload: "wake me up",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
           }),
         }),
       );
@@ -1026,7 +1031,7 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
             from: "ses_a",
             to: "ses_b",
             after: "1h",
-            payload: "wake me up",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
           }),
         }),
       );
@@ -1053,7 +1058,7 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
             from: "ses_a",
             to: "ses_b",
             after: "1h",
-            payload: "wake me up",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
           }),
         }),
       );
@@ -1091,6 +1096,268 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
       expect(stored).not.toBeNull();
 
       storage.db.close();
+    });
+  });
+
+  describe("W4: ref column and minimum payload guard", () => {
+    let storage: StorageDb | null = null;
+
+    afterEach(() => {
+      if (storage) {
+        storage.db.close();
+        storage = null;
+      }
+    });
+
+    function newApp(now = 1_000_000) {
+      storage = openStorageDb(":memory:");
+      return { app: createApp(storage, { nowFn: () => now }), storage };
+    }
+
+    it("ref round-trips: schedule with ref -> stored -> returned by GET /swarm/scheduled -> rendered in envelope", async () => {
+      const { app, storage: s } = newApp(1_000_000);
+      const validPayload = "Resume pigeon-c68: run bd show pigeon-c68, then continue W4";
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            ref: "pigeon-c68",
+            payload: validPayload,
+          }),
+        }),
+      );
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { msg_id: string };
+
+      const stored = s.swarm.getByMsgId(body.msg_id);
+      expect(stored).not.toBeNull();
+      expect(stored!.ref).toBe("pigeon-c68");
+
+      const getRes = await app(new Request("http://localhost/swarm/scheduled?session=ses_a"));
+      expect(getRes.status).toBe(200);
+      const getBody = (await getRes.json()) as {
+        scheduled: Array<{ msg_id: string; ref: string | null }>;
+      };
+      const row = getBody.scheduled.find((m) => m.msg_id === body.msg_id);
+      expect(row).toBeDefined();
+      expect(row!.ref).toBe("pigeon-c68");
+
+      let promptSent = "";
+      const arbiter = new SwarmArbiter({
+        storage: s,
+        clientForSession: () =>
+          ({
+            sendPrompt: async (_session: string, _dir: string, prompt: string) => {
+              promptSent = prompt;
+            },
+          }) as any,
+        directoryForSession: async () => "/dir/ses_b",
+        nowFn: () => 1_000_000 + 3600 * 1000 + 1,
+        log: () => {},
+      });
+
+      await arbiter.processOnce();
+      expect(promptSent).toContain('ref="pigeon-c68"');
+    });
+
+    it("ref omitted -> column NULL -> returned as null -> NO ref attr in envelope", async () => {
+      const { app, storage: s } = newApp(1_000_000);
+      const validPayload = "Resume pigeon-c68: run bd show pigeon-c68, then continue W4";
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: validPayload,
+          }),
+        }),
+      );
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { msg_id: string };
+
+      const stored = s.swarm.getByMsgId(body.msg_id);
+      expect(stored).not.toBeNull();
+      expect(stored!.ref).toBeNull();
+
+      const getRes = await app(new Request("http://localhost/swarm/scheduled?session=ses_a"));
+      expect(getRes.status).toBe(200);
+      const getBody = (await getRes.json()) as {
+        scheduled: Array<{ msg_id: string; ref: string | null }>;
+      };
+      const row = getBody.scheduled.find((m) => m.msg_id === body.msg_id);
+      expect(row).toBeDefined();
+      expect(row!.ref).toBeNull();
+
+      let promptSent = "";
+      const arbiter = new SwarmArbiter({
+        storage: s,
+        clientForSession: () =>
+          ({
+            sendPrompt: async (_session: string, _dir: string, prompt: string) => {
+              promptSent = prompt;
+            },
+          }) as any,
+        directoryForSession: async () => "/dir/ses_b",
+        nowFn: () => 1_000_000 + 3600 * 1000 + 1,
+        log: () => {},
+      });
+
+      await arbiter.processOnce();
+      expect(promptSent).not.toContain("ref=");
+    });
+
+    it("ref over 200 chars -> 400 error", async () => {
+      const { app } = newApp(1_000_000);
+      const longRef = "x".repeat(201);
+      const validPayload = "Resume pigeon-c68: run bd show pigeon-c68, then continue W4";
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            ref: longRef,
+            payload: validPayload,
+          }),
+        }),
+      );
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("ref exceeds maximum length of 200 characters");
+    });
+
+    it("payload of 39 chars -> 400 with teaching error; 40 chars -> 202 accepted", async () => {
+      const { app } = newApp(1_000_000);
+      const p39 = "a".repeat(39);
+      const p40 = "a".repeat(40);
+
+      const res39 = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: p39,
+          }),
+        }),
+      );
+      expect(res39.status).toBe(400);
+      const body39 = (await res39.json()) as { error: string };
+      expect(body39.error).toContain("scheduled wake payload is too short (39 chars, minimum 40)");
+      expect(body39.error).toContain("a wake must be self-contained");
+      expect(body39.error).toContain("Example:");
+
+      const res40 = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: p40,
+          }),
+        }),
+      );
+      expect(res40.status).toBe(202);
+    });
+
+    it("empty payload returns pre-existing 'payload is required' error", async () => {
+      const { app } = newApp(1_000_000);
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            payload: "",
+          }),
+        }),
+      );
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("payload is required");
+    });
+
+    it("ref of non-string type (e.g. number 123) -> 400 error", async () => {
+      const { app } = newApp(1_000_000);
+      const validPayload = "Resume pigeon-c68: run bd show pigeon-c68, then continue W4";
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            after: "1h",
+            ref: 123,
+            payload: validPayload,
+          }),
+        }),
+      );
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("ref must be a string");
+    });
+
+    it("ref containing control characters (newline, tab) -> 400 error", async () => {
+      const { app } = newApp(1_000_000);
+      const validPayload = "Resume pigeon-c68: run bd show pigeon-c68, then continue W4";
+
+      for (const ctrlChar of ["\n", "\r", "\t"]) {
+        const res = await app(
+          new Request("http://localhost/swarm/schedule", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              from: "ses_a",
+              to: "ses_b",
+              after: "1h",
+              ref: `bad${ctrlChar}ref`,
+              payload: validPayload,
+            }),
+          }),
+        );
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: string };
+        expect(body.error).toContain("control characters");
+      }
+    });
+
+    it("terse payload on POST /swarm/send is still accepted with 202", async () => {
+      const { app } = newApp(1_000_000);
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_a",
+            to: "ses_b",
+            kind: "chat",
+            payload: "hi",
+          }),
+        }),
+      );
+      expect(res.status).toBe(202);
     });
   });
 });

@@ -198,6 +198,7 @@ export class SwarmArbiter {
               next.deliverAt !== null
                 ? Math.max(0, now - next.deliverAt)
                 : null,
+            ref: next.ref,
           },
           next.payload,
         );

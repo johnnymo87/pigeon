@@ -1,6 +1,7 @@
 import BetterSqlite3 from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { SwarmRepository } from "../src/storage/swarm-repo";
 import { initSwarmSchema } from "../src/storage/swarm-schema";
 import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
 
@@ -882,6 +883,23 @@ describe("swarm_messages verification column migration", () => {
     expect(cols).not.toContain("verified_at");
     expect(cols).not.toContain("requeue_count");
     expect(cols).not.toContain("aborted_at");
+
+    db.close();
+  });
+
+  it("migrates a pre-existing database without ref column cleanly and reads back rows with ref === null", () => {
+    const db = oldSchemaDb();
+    insertRaw(db, { msgId: "pre_ref_row", state: "queued", updatedAt: 10_000, handedOffAt: null });
+
+    initSwarmSchema(db);
+
+    const repo = new SwarmRepository(db);
+    const row = repo.getByMsgId("pre_ref_row");
+    expect(row).not.toBeNull();
+    expect(row!.ref).toBeNull();
+
+    const cols = db.pragma("table_info(swarm_messages)") as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toContain("ref");
 
     db.close();
   });
