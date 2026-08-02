@@ -1,5 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
-import { getByThread, topicsEnabled } from "./topics";
+import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
@@ -760,6 +760,63 @@ export async function handleTelegramWebhook(
       if (!commandId) return OK();
 
       await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
+      return OK();
+    }
+
+    // Handle /rename command (reply-based)
+    const renameMatch = update.message.text.match(/^\/rename(?:\s+([\s\S]*))?$/);
+    if (renameMatch) {
+      const renameChatId = update.message.chat.id;
+      const rawTitle = renameMatch[1]?.trim();
+
+      if (!rawTitle) {
+        await sendTelegramMessage(env, renameChatId, "Usage: /rename <new title>", {
+          messageThreadId: update.message.message_thread_id,
+        });
+        return OK();
+      }
+
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
+
+      const formattedName = topicName("", rawTitle);
+      const now = Date.now();
+
+      await db
+        .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
+        .bind(formattedName, now, resolved.sessionId)
+        .run();
+
+      let editFailed = false;
+
+      if (topicsEnabled(env)) {
+        const topic = await getBySession(db, resolved.sessionId);
+        if (topic && topic.message_thread_id !== null) {
+          const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+          const editRes = await tg.editForumTopic({
+            chatId: renameChatId,
+            messageThreadId: topic.message_thread_id,
+            name: formattedName,
+          });
+
+          if (editRes.ok) {
+            await renameTopic(db, { sessionId: resolved.sessionId, name: formattedName });
+          } else {
+            editFailed = true;
+          }
+        }
+      }
+
+      if (editFailed) {
+        await sendTelegramMessage(env, renameChatId, `Failed to rename topic for session \`${resolved.sessionId}\`.`, {
+          messageThreadId: update.message.message_thread_id,
+        });
+      } else {
+        await sendTelegramMessage(env, renameChatId, `Renamed session \`${resolved.sessionId}\` to "${formattedName}".`, {
+          messageThreadId: update.message.message_thread_id,
+        });
+      }
+
       return OK();
     }
 

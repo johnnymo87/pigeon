@@ -4780,6 +4780,333 @@ describe("/model command", () => {
   });
 });
 
+// ─── /rename Command: Integration Tests ─────────────────────────────────
+
+describe("/rename command", () => {
+  const CHAT_ID = String(CHAT_ID_NUM);
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("empty or missing argument: returns usage message without resolving session", async () => {
+    mockTelegramSendMessage();
+
+    const res1 = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/rename",
+      },
+    });
+
+    expect(res1.status).toBe(200);
+    expect(await res1.text()).toBe("ok");
+
+    mockTelegramSendMessage();
+
+    const res2 = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/rename   ",
+      },
+    });
+
+    expect(res2.status).toBe(200);
+    expect(await res2.text()).toBe("ok");
+  });
+
+  it("happy path: updates sessions.label, Telegram forum topic name, topics table in D1, and sends confirmation", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-happy-${now}`;
+    const machineId = `rename-mach-happy-${now}`;
+    const threadId = 996301;
+    const msgId = 996301;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await insertMessageMapping({
+      chatId: CHAT_ID,
+      messageId: msgId,
+      sessionId,
+      token: `rename-token-${now}`,
+    });
+
+    await reserve(env.DB, {
+      sessionId,
+      machineId,
+      chatId: CHAT_ID,
+      name: "Old Title",
+      now,
+    });
+    await finalize(env.DB, {
+      sessionId,
+      messageThreadId: threadId,
+      name: "Old Title",
+      now,
+    });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply(200, JSON.stringify({ ok: true, result: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/rename Brand New Title", msgId);
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    // Check sessions table
+    const sessRow = await env.DB
+      .prepare("SELECT label FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ label: string }>();
+    expect(sessRow?.label).toBe("Brand New Title");
+
+    // Check topics table
+    const topicRow = await getBySession(env.DB, sessionId);
+    expect(topicRow?.name).toBe("Brand New Title");
+  });
+
+  it("formats topic name as topicName('', title) with bare title and no path suffix", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-bare-${now}`;
+    const machineId = `rename-mach-bare-${now}`;
+    const threadId = 996302;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await reserve(env.DB, {
+      sessionId,
+      machineId,
+      chatId: CHAT_ID,
+      name: "Old Title",
+      now,
+    });
+    await finalize(env.DB, {
+      sessionId,
+      messageThreadId: threadId,
+      name: "Old Title",
+      now,
+    });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply(200, JSON.stringify({ ok: true, result: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    mockTelegramSendMessage();
+
+    const update = {
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/rename Bare Title Only",
+        message_thread_id: threadId,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const topicRow = await getBySession(env.DB, sessionId);
+    expect(topicRow?.name).toBe("Bare Title Only");
+    expect(topicRow?.name).not.toContain(" · ");
+  });
+
+  it("clamps long titles using topicName formatter", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-long-${now}`;
+    const machineId = `rename-mach-long-${now}`;
+    const threadId = 996303;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await reserve(env.DB, {
+      sessionId,
+      machineId,
+      chatId: CHAT_ID,
+      name: "Old Title",
+      now,
+    });
+    await finalize(env.DB, {
+      sessionId,
+      messageThreadId: threadId,
+      name: "Old Title",
+      now,
+    });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply(200, JSON.stringify({ ok: true, result: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    mockTelegramSendMessage();
+
+    const longTitle = "A".repeat(200);
+    const expectedClamped = topicName("", longTitle);
+
+    const update = {
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/rename ${longTitle}`,
+        message_thread_id: threadId,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const topicRow = await getBySession(env.DB, sessionId);
+    expect(topicRow?.name).toBe(expectedClamped);
+    expect(topicRow?.name?.length).toBeLessThanOrEqual(128);
+  });
+
+  it("ordering guarantee: if editForumTopic fails, topics.name in D1 is NOT written and error message sent", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-fail-${now}`;
+    const machineId = `rename-mach-fail-${now}`;
+    const threadId = 996304;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await reserve(env.DB, {
+      sessionId,
+      machineId,
+      chatId: CHAT_ID,
+      name: "Old Title",
+      now,
+    });
+    await finalize(env.DB, {
+      sessionId,
+      messageThreadId: threadId,
+      name: "Old Title",
+      now,
+    });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply(400, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request" }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    mockTelegramSendMessage();
+
+    const update = {
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/rename Failed Title",
+        message_thread_id: threadId,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    // Topics name in D1 must NOT be updated
+    const topicRow = await getBySession(env.DB, sessionId);
+    expect(topicRow?.name).toBe("Old Title");
+  });
+
+  it("topics disabled: updates sessions.label, skips editForumTopic, sends confirmation", async () => {
+    const offEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-off-${now}`;
+    const machineId = `rename-mach-off-${now}`;
+    const msgId = 996305;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await insertMessageMapping({
+      chatId: CHAT_ID,
+      messageId: msgId,
+      sessionId,
+      token: `rename-token-${now}`,
+    });
+
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/rename Flag Off Title", msgId);
+    const res = await handleTelegramWebhook(env.DB, offEnv, makeWebhookRequest(update));
+
+    expect(res.status).toBe(200);
+
+    const sessRow = await env.DB
+      .prepare("SELECT label FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ label: string }>();
+    expect(sessRow?.label).toBe("Flag Off Title");
+  });
+
+  it("no topic row: updates sessions.label, skips editForumTopic without error", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-notopic-${now}`;
+    const machineId = `rename-mach-notopic-${now}`;
+    const msgId = 996306;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await insertMessageMapping({
+      chatId: CHAT_ID,
+      messageId: msgId,
+      sessionId,
+      token: `rename-token-${now}`,
+    });
+
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/rename No Topic Row Title", msgId);
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+
+    expect(res.status).toBe(200);
+
+    const sessRow = await env.DB
+      .prepare("SELECT label FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ label: string }>();
+    expect(sessRow?.label).toBe("No Topic Row Title");
+  });
+});
+
 // ─── Swipe-Reply to Question Notification: Integration Tests ──────────
 
 describe("swipe-reply to question notification", () => {
