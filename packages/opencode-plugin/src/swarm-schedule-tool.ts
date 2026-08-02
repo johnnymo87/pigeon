@@ -336,7 +336,10 @@ export function createSwarmScheduleTool(daemonBaseUrl: string): ToolDefinition {
     description:
       "Schedule a swarm message for future delivery. The dominant use is waking yourself later at a scheduled time or after a delay. " +
       "The message MUST be self-contained and carry a durable pointer (such as a beads ID, PR number, or file path) — do NOT write vague messages like 'continue what you were doing', because the receiving session may have compacted away the context that motivated the wake. " +
-      "Example: at: '09:00', message: 'Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.'. " +
+      "Prefer `after` (a relative delay like '13h') — it is unambiguous and needs no timezone reasoning. " +
+      "Example: after: '13h', message: 'Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.'. " +
+      "Use `at` only for a true wall-clock deadline, and note it requires a FULL RFC3339 timestamp with an offset or 'Z' " +
+      "(e.g. '2026-08-02T09:00:00-04:00'); a bare time like '09:00' is REJECTED. " +
       "Messages under 40 chars are rejected. " +
       "A scheduled message expires if undelivered, defaulting to 6 hours after its delivery time (override with expires_in). " +
       "Use ref as an optional durable pointer rendered as an envelope attribute (e.g. bd:pigeon-mx2).",
@@ -356,7 +359,10 @@ export function createSwarmScheduleTool(daemonBaseUrl: string): ToolDefinition {
         .string()
         .optional()
         .describe(
-          "Absolute time spec for delivery (e.g. '09:00', '2026-08-02T10:00:00Z'). Exactly one of 'at' or 'after' is required.",
+          "Absolute delivery time as a FULL RFC3339 timestamp with a mandatory UTC offset or 'Z' " +
+            "(e.g. '2026-08-02T09:00:00-04:00' or '2026-08-02T13:00:00Z'). A bare wall-clock time " +
+            "like '09:00' is rejected as ambiguous — use 'after' instead for relative delays. " +
+            "Exactly one of 'at' or 'after' is required.",
         ),
       after: tool.schema
         .string()
