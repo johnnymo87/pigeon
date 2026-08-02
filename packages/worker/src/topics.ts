@@ -58,6 +58,20 @@ export function clampPreservingSurrogates(s: string, max: number): string {
  *
  * Internal newlines (\r, \n) are replaced with a single space " " because Telegram
  * topic names are single-line UI headers in topic lists and headers.
+ *
+ * Title comes first because the topic LIST truncates a row visually well before 128 chars,
+ * so a trailing title is unreadable — the directory used to eat the visible width. The path
+ * stays a real, pasteable suffix (deliberately not compressed to something like repo@branch).
+ *
+ * Two accepted limitations:
+ *  - The `~` rewrite matches ANY user's home, so `/home/otheruser/x` also renders `~/x`, which
+ *    would expand to the wrong path if pasted. Harmless while each machine runs sessions as a
+ *    single user; the alternative is hardcoding usernames here, which is worse.
+ *  - When a title is long enough to fill the budget, the DIRECTORY is the part that clamps away
+ *    (previously the title was). Live names max out at 103 of 128 units so this does not occur
+ *    today, and the path is still recoverable from the session-id inside the topic. Splitting
+ *    the budget would need surrogate-safe handling at two cut points — not worth it unless a
+ *    >125-char title actually shows up.
  */
 export function topicName(dir: string, title: string): string {
   const cleanDir = dir.replace(/[\r\n]+/g, " ").replace(/ +/g, " ").trim();

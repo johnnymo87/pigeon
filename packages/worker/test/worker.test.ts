@@ -5240,6 +5240,9 @@ describe("topics module and topicName", () => {
       expect(name.startsWith(shortTitle)).toBe(true);
       expect(name.endsWith("…")).toBe(true);
       expect(name.length).toBeLessThanOrEqual(128);
+      // The surviving suffix must still be an abbreviated, usable path. Without this the test
+      // would pass even if clamping dropped the directory entirely.
+      expect(name).toContain("· ~/projects/workstation");
     });
 
     it("handles missing/empty dir or title gracefully", () => {
