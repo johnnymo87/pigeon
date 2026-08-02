@@ -51,11 +51,20 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **1040** passed, 1 skipped |
-| `@pigeon/opencode-plugin` | **306** passed |
-| `@pigeon/worker` | **300** passed |
+| `@pigeon/daemon` | **1055** passed, 1 skipped |
+| `@pigeon/opencode-plugin` | **345** passed |
+| `@pigeon/worker` | **312** passed |
 
-Total **1646**. Updated by cycle F1 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1712**. Updated by Cycle 5 in its own final commit. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **CORRECTION #5 (2026-08-02, start of Cycle 5).** This table said **1040 / 306 / 300 = 1646** until
+> re-measured at the top of Cycle 5. It was stale AGAIN — but this time entirely from *concurrent
+> tracks*, not this roadmap: `git log HEAD..origin/main` showed the forum-split defect track
+> (`42df68a`, `5bef012`, `5fb2101`) and the swarm track had landed **+50 tests** (daemon 1040→1051,
+> plugin 306→345) while this file was compacted. The **fifth** consecutive cycle to open on a wrong
+> baseline, and the second where this roadmap did not itself cause the drift (see the +51 and +96
+> notes above). Cycle 5 then added: worker +12 (300→312), daemon +4 (1051→1055). Re-measuring is
+> non-negotiable; the number above was measured this session.
 
 > **The daemon count moved 989 → 1040 (+51) and F1 did NOT do it.** F1 added **2 worker** tests and
 > nothing else. The +51 is the parallel swarm scheduled-wake track (`pigeon-mx2`, §4.1) landing PR #29
@@ -1039,13 +1048,13 @@ also refreshing the `pending_questions` clock would hand the user a question the
 defeating the reasoning that justifies the expiry design. `pending_questions` is keyed by `session_id`
 with `INSERT OR REPLACE`, which constrains the options.
 
-### Cycle 5 — the server side (the track this roadmap was missing)
+### Cycle 5 — the server side (the track this roadmap was missing) — DONE (PR #36)
 
 Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
 initially failed to answer: if the worker's session store fails recurrently, client fixes reduce
 blast radius but **do not cure the outage**.
 
-- [ ] **5a. `pigeon-dul`, re-scoped 2026-07-31.** The original forensics are no longer possible — the
+- [x] **5a. `pigeon-dul`, re-scoped 2026-07-31.** The original forensics are no longer possible — the
   outage window is 16 days old and `wrangler.toml` has **no observability, no Logpush, no
   tail_consumers**, so Cloudflare no longer holds those logs. New scope: enable Workers
   observability/Logpush, log status+body on the `/sessions/register` and `/notifications/send`
@@ -1056,7 +1065,7 @@ blast radius but **do not cure the outage**.
   > was not decidable — the old `sendNotification` never inspected `response.status` and called
   > `response.json()` unconditionally, so a 500 carrying a JSON body produced `ok=false` too. As of
   > `pigeon-3h9` the two are distinct, so a recurrence is separable **from the client side alone**.
-- [ ] **5b. `pigeon-e44`** (P3) — entity stripping fires on **any** Telegram 400, not just
+- [x] **5b. `pigeon-e44`** (P3) — entity stripping fires on **any** Telegram 400, not just
   entity-parse errors (Telegram also returns 400 for e.g. "message is too long"). Then the strip is
   persisted by rewriting the payload, so formatting that was never the problem is discarded
   permanently. No data-loss regression — the entry dies at the same budget it would have anyway —
@@ -1069,6 +1078,54 @@ blast radius but **do not cure the outage**.
   This is the same shape as `pigeon-bea` in Cycle 2: there, measuring first invented a one-week
   deadline and then destroyed it; here, measuring may well retire a P3 without any code change.
   Either way the measurement comes first.
+
+> **CYCLE 5 DONE — 2026-08-02.** Commits `8d13970` (5a-T1), `3d3859f` (5a-T2), `4310c6f` (5a-T3),
+> `ed3b241` (5a-T4), `21f7e87` (5b-T5), `8be2358` (adversarial-review fixes). `oracle-fable` consult
+> on design; `adversarial-reviewer-fable` on the diff (0 blockers, 3 SHOULD-FIX all resolved).
+> Baseline: worker 300→312, daemon 1051→1055, plugin 345 (unchanged). Typecheck clean.
+>
+> **What shipped (5a):**
+> 1. `[observability] enabled=true, head_sampling_rate=1` in `wrangler.toml` + a guard test.
+> 2. A dispatch-boundary structured outcome log in `index.ts` — every **non-2xx** response on any
+>    route now logs `{path, method, status}` (2xx/`/health` stay silent), and an unhandled throw is
+>    caught into a structured `{error:"internal_error"}` 500 instead of an opaque runtime 500. This
+>    was the **higher-value** move per the oracle: the 07-14 outage may never have *thrown* — handled
+>    404/403/502/429 responses produced **zero** log lines before this.
+> 3. D1 backing-store failures on `/sessions/register` and `/notifications/send` are now classified
+>    **distinctly**: a `withD1(op, promise)` wrapper (call-site classification, not error-shape
+>    sniffing — §1.-1) turns a D1 throw into `503 {error:"storage_error", store:"d1", op}`. Every one
+>    of the 7 wrapped sites has an individual bite-checked test.
+>
+> **What shipped (5b):** the strip-entities log (`outbox-sender.ts`) now carries
+> `telegramErrorDescription` + `telegramErrorCode` (via a new `getTelegramErrorDescription` helper).
+> The strip **decision is unchanged** — this is measurement only. `pigeon-e44` stays **OPEN**: step 1
+> (make the trigger observable) is done; steps 2–3 (look, then maybe narrow the trigger) require
+> production data and only fire "if a real non-entity 400 is observed".
+>
+> **Key scoping finding:** the original bead said "surface D1/**KV/DO** errors" but `wrangler.toml`
+> binds only **D1 (`DB`) and R2 (`MEDIA`)** — no KV, no Durable Objects. R2 on the send path is
+> already per-item best-effort. So the real at-risk store on register+send is **D1 only**; scope was
+> tightened accordingly.
+>
+> **Design decisions (oracle-verified):** status is **503, never 502** (502 collides with the daemon's
+> Telegram-error semantics and its `strip_entities` rule 6) and carries **no `retryAfter`** (a positive
+> `retryAfter` would pause the *entire* outbox via rule 5). A 503-no-retryAfter falls to delivery-policy
+> rule 7 → un-budgeted retry, which correctly survives a self-healing outage; `pigeon-3h9` already made
+> transport-vs-app separable client-side, so 5a is the server half. `5a-T4` pins this contract with a
+> daemon guard test (503 storage_error → retry, not terminal/pause).
+>
+> **Deliberately NOT closed — filed as follow-ups:**
+> - `pigeon-n4v` (P1): Workers Logs retention is ~3–7 days but the outage went undiagnosed >16 days.
+>   Enabling observability does **not** fix "noticed late". Needs Logpush to a durable sink (dashboard/
+>   account config, not wrangler.toml) **and** a daemon-side consecutive-5xx alert. This is the true
+>   server-durability successor to `pigeon-dul`.
+> - `pigeon-kdr` (P3): `send.insertMessage` fails *after* Telegram already sent → retry re-sends →
+>   duplicate messages during a D1 flap. Pre-existing (not a 5a regression); 5a merely made it
+>   observable. Real fix = reserve the dedup row before the Telegram call.
+> - Accepted gap (documented in-code, no bead): D1 inside `resolveTopic`/`deleteTopicBySession` on the
+>   send path is intentionally **not** wrapped as `storage_error` (its throws fall to the boundary 500
+>   → same retry action; wrapping it wholesale would misclassify the Telegram `createForumTopic` inside
+>   it). A total D1 outage still labels correctly because `send.sessionLookup` fails first.
 
 ### Cycle 6 — topic-specific residuals
 

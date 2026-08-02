@@ -77,6 +77,7 @@ import {
   reopenForumTopic,
   deleteForumTopic,
 } from "../src/telegram";
+import { withD1, StorageError } from "../src/d1";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
 
@@ -8441,4 +8442,484 @@ describe("topics module and topicName", () => {
     });
   });
 });
+
+// ─── Dispatch Boundary Observability & Boundary Catch (5a-T2) ────────────────
+
+describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.deactivate();
+  });
+
+  it("emits structured outcome log on non-2xx response (status >= 400)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // POST /notifications/send with nonexistent session returns 404
+    const res = await worker.fetch(
+      new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId: "nonexistent", chatId: "8248645256", text: "hello" }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(404);
+    expect(spy).toHaveBeenCalledWith(
+      "[worker] request outcome",
+      {
+        path: "/notifications/send",
+        method: "POST",
+        status: 404,
+      },
+    );
+
+    spy.mockRestore();
+  });
+
+  it("does NOT emit outcome log on successful 2xx/3xx response or /health", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // GET /health returns 200
+    const healthRes = await worker.fetch(new Request("https://worker/health"), env);
+    expect(healthRes.status).toBe(200);
+
+    // GET /sessions returns 200
+    const sessionsRes = await worker.fetch(
+      new Request("https://worker/sessions", { headers: authHeaders }),
+      env,
+    );
+    expect(sessionsRes.status).toBe(200);
+
+    const outcomeCalls = spy.mock.calls.filter(
+      (args) => args[0] === "[worker] request outcome",
+    );
+    expect(outcomeCalls).toHaveLength(0);
+
+    spy.mockRestore();
+  });
+
+  it("catches unhandled throws, logs error, and returns structured 500 JSON", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Pass bad env with DB that throws
+    const badDb = {
+      prepare: () => {
+        throw new Error("D1 database connection failed");
+      },
+    } as unknown as D1Database;
+
+    const badEnv = { ...env, DB: badDb };
+
+    const res = await worker.fetch(
+      new Request("https://worker/sessions", { headers: authHeaders }),
+      badEnv,
+    );
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body).toEqual({ error: "internal_error" });
+
+    expect(spy).toHaveBeenCalledWith(
+      "[worker] unhandled error",
+      {
+        path: "/sessions",
+        method: "GET",
+        error: "D1 database connection failed",
+        stack: expect.any(String),
+      },
+    );
+
+    spy.mockRestore();
+    });
+  });
+
+  // ─── D1 Storage Error Classification (5a-T3 / pigeon-dul) ────────────────────
+
+  describe("D1 storage error classification (5a-T3 / pigeon-dul)", () => {
+    function createFailingDb(
+      realDb: D1Database,
+      sqlMatcher: (sql: string) => boolean,
+      errorMsg = "D1 failure",
+    ) {
+      return new Proxy(realDb, {
+        get(target, prop, receiver) {
+          if (prop === "prepare") {
+            return (sql: string) => {
+              const stmt = target.prepare(sql);
+              if (sqlMatcher(sql)) {
+                return new Proxy(stmt, {
+                  get(stmtTarget, stmtProp) {
+                    if (stmtProp === "bind") {
+                      return (...args: any[]) => {
+                        const bound = stmtTarget.bind(...args);
+                        return new Proxy(bound, {
+                          get(boundTarget, boundProp) {
+                            if (["first", "run", "all", "raw"].includes(boundProp as string)) {
+                              return () => Promise.reject(new Error(errorMsg));
+                            }
+                            return Reflect.get(boundTarget, boundProp, receiver);
+                          },
+                        });
+                      };
+                    }
+                    if (["first", "run", "all", "raw"].includes(stmtProp as string)) {
+                      return () => Promise.reject(new Error(errorMsg));
+                    }
+                    return Reflect.get(stmtTarget, stmtProp, receiver);
+                  },
+                });
+              }
+              return stmt;
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    }
+
+    it("withD1 helper resolves promise or wraps throw in StorageError", async () => {
+      const val = await withD1("test.op", Promise.resolve(42));
+      expect(val).toBe(42);
+
+      const error = new Error("d1 explosion");
+      await expect(withD1("test.op", Promise.reject(error))).rejects.toThrow(StorageError);
+
+      try {
+        await withD1("test.op", Promise.reject(error));
+      } catch (err: any) {
+        expect(err).toBeInstanceOf(StorageError);
+        expect(err.op).toBe("test.op");
+        expect(err.cause).toBe(error);
+        expect(err.message).toBe("D1 storage error in test.op: d1 explosion");
+      }
+    });
+
+    it("POST /sessions/register fails at registerSession.existing site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("SELECT session_id FROM sessions"),
+        "D1 unavailable on existing check",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993101", machineId: "mach-1" }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "registerSession.existing",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "registerSession.existing",
+          error: expect.stringContaining("D1 unavailable on existing check"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /sessions/register fails at registerSession.count site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("SELECT COUNT(*) as count FROM sessions"),
+        "D1 unavailable on count check",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993102", machineId: "mach-1" }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "registerSession.count",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "registerSession.count",
+          error: expect.stringContaining("D1 unavailable on count check"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /sessions/register fails at registerSession.upsert site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("INSERT INTO sessions"),
+        "D1 unavailable on upsert",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993103", machineId: "mach-1" }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "registerSession.upsert",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "registerSession.upsert",
+          error: expect.stringContaining("D1 unavailable on upsert"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /notifications/send fails at send.sessionLookup site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("SELECT * FROM sessions WHERE session_id"),
+        "D1 query timeout on session lookup",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId: "sess-503-993104",
+            chatId: "8248645256",
+            text: "hello world",
+          }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "send.sessionLookup",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "send.sessionLookup",
+          error: expect.stringContaining("D1 query timeout on session lookup"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /notifications/send fails at send.idempotencyLookup site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993105", machineId: "mach-1" }),
+        }),
+        env,
+      );
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("SELECT * FROM messages WHERE notification_id"),
+        "D1 query timeout on idempotency lookup",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId: "sess-503-993105",
+            notificationId: "notif-503-993105",
+            chatId: "8248645256",
+            text: "hello world",
+          }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "send.idempotencyLookup",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "send.idempotencyLookup",
+          error: expect.stringContaining("D1 query timeout on idempotency lookup"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /notifications/send fails at send.touchSession site", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993106", machineId: "mach-1" }),
+        }),
+        env,
+      );
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("UPDATE sessions SET updated_at"),
+        "D1 error on touch session",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId: "sess-503-993106",
+            chatId: "8248645256",
+            text: "hello world",
+          }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "send.touchSession",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "send.touchSession",
+          error: expect.stringContaining("D1 error on touch session"),
+        }),
+      );
+
+      spy.mockRestore();
+    });
+
+    it("POST /notifications/send fails at send.insertMessage site", async () => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, JSON.stringify({ ok: true, result: { message_id: 993107 } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await worker.fetch(
+        new Request("https://worker/sessions/register", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({ sessionId: "sess-503-993107", machineId: "mach-1" }),
+        }),
+        env,
+      );
+
+      const failingDb = createFailingDb(
+        env.DB,
+        (sql) => sql.includes("INSERT INTO messages"),
+        "D1 error on insert message",
+      );
+      const testEnv = { ...env, DB: failingDb };
+
+      const res = await worker.fetch(
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId: "sess-503-993107",
+            chatId: "8248645256",
+            text: "hello world",
+          }),
+        }),
+        testEnv,
+      );
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body).toEqual({
+        error: "storage_error",
+        store: "d1",
+        op: "send.insertMessage",
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        "[worker] storage error",
+        expect.objectContaining({
+          op: "send.insertMessage",
+          error: expect.stringContaining("D1 error on insert message"),
+        }),
+      );
+
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock.deactivate();
+      spy.mockRestore();
+    });
+  });
+
 

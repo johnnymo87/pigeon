@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyDeliveryFailure,
+  getTelegramErrorCode,
+  getTelegramErrorDescription,
   isTransportFailure,
   type DeliveryAction,
   type DeliveryPolicyContext,
@@ -163,6 +165,28 @@ describe("classifyDeliveryFailure", () => {
       expected: { action: "retry" },
     },
     {
+      name: "503 storage_error (D1 backing-store failure) without retryAfter returns retry (payloadHasEntities: false)",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 503,
+        body: { error: "storage_error", store: "d1", op: "registerSession.existing" },
+      },
+      ctx: { payloadHasEntities: false },
+      expected: { action: "retry" },
+    },
+    {
+      name: "503 storage_error (D1 backing-store failure) without retryAfter returns retry (payloadHasEntities: true)",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 503,
+        body: { error: "storage_error", store: "d1", op: "registerSession.existing" },
+      },
+      ctx: { payloadHasEntities: true },
+      expected: { action: "retry" },
+    },
+    {
       name: "app_rejection without retryAfter returns retry",
       result: { ok: false, kind: "app_rejection", status: 200, body: { error: "Rejected" } },
       expected: { action: "retry" },
@@ -280,5 +304,36 @@ describe("isTransportFailure", () => {
 
   it("returns false for success result", () => {
     expect(isTransportFailure({ ok: true, kind: "success", status: 200, body: { ok: true } })).toBe(false);
+  });
+});
+
+describe("getTelegramErrorCode and getTelegramErrorDescription", () => {
+  it("extracts error_code and description when present in details", () => {
+    const body = {
+      error: "Telegram API error",
+      details: { ok: false, error_code: 400, description: "Bad Request: message is too long" },
+    };
+    expect(getTelegramErrorCode(body)).toBe(400);
+    expect(getTelegramErrorDescription(body)).toBe("Bad Request: message is too long");
+  });
+
+  it("returns undefined for malformed or missing body/details", () => {
+    expect(getTelegramErrorCode(undefined)).toBeUndefined();
+    expect(getTelegramErrorDescription(undefined)).toBeUndefined();
+
+    expect(getTelegramErrorCode("not object")).toBeUndefined();
+    expect(getTelegramErrorDescription("not object")).toBeUndefined();
+
+    expect(getTelegramErrorCode({})).toBeUndefined();
+    expect(getTelegramErrorDescription({})).toBeUndefined();
+
+    expect(getTelegramErrorCode({ details: null })).toBeUndefined();
+    expect(getTelegramErrorDescription({ details: null })).toBeUndefined();
+
+    expect(getTelegramErrorCode({ details: "string details" })).toBeUndefined();
+    expect(getTelegramErrorDescription({ details: "string details" })).toBeUndefined();
+
+    expect(getTelegramErrorCode({ details: { error_code: "400" } })).toBeUndefined();
+    expect(getTelegramErrorDescription({ details: { description: 123 } })).toBeUndefined();
   });
 });

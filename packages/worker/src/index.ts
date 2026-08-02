@@ -10,59 +10,87 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    const db = env.DB;
+    const method = request.method;
 
-    // Health
-    if (path === "/health") {
-      return new Response("ok");
-    }
+    try {
+      const response = await (async (): Promise<Response> => {
+        const db = env.DB;
 
-    // Poll: GET /machines/:id/next
-    const pollMatch = path.match(/^\/machines\/([^/]+)\/next$/);
-    if (pollMatch && request.method === "GET") {
-      return handlePollNext(db, env, request, pollMatch[1]!);
-    }
+        // Health
+        if (path === "/health") {
+          return new Response("ok");
+        }
 
-    // Ack: POST /commands/:id/ack
-    const ackMatch = path.match(/^\/commands\/([^/]+)\/ack$/);
-    if (ackMatch && request.method === "POST") {
-      return handleAckCommand(db, env, request, ackMatch[1]!);
-    }
+        // Poll: GET /machines/:id/next
+        const pollMatch = path.match(/^\/machines\/([^/]+)\/next$/);
+        if (pollMatch && method === "GET") {
+          return handlePollNext(db, env, request, pollMatch[1]!);
+        }
 
-    // Sessions
-    if (path === "/sessions" && request.method === "GET") {
-      return handleSessionRequest(db, env, request, "list");
-    }
-    if (path === "/sessions/register" && request.method === "POST") {
-      return handleSessionRequest(db, env, request, "register");
-    }
-    if (path === "/sessions/unregister" && request.method === "POST") {
-      return handleSessionRequest(db, env, request, "unregister");
-    }
+        // Ack: POST /commands/:id/ack
+        const ackMatch = path.match(/^\/commands\/([^/]+)\/ack$/);
+        if (ackMatch && method === "POST") {
+          return handleAckCommand(db, env, request, ackMatch[1]!);
+        }
 
-    // Media
-    if (path === "/media/upload" && request.method === "POST") {
-      return handleMediaUpload(env, request);
-    }
-    if (path.startsWith("/media/") && request.method === "GET") {
-      const key = decodeURIComponent(path.slice("/media/".length));
-      return handleMediaGet(env, request, key);
-    }
+        // Sessions
+        if (path === "/sessions" && method === "GET") {
+          return handleSessionRequest(db, env, request, "list");
+        }
+        if (path === "/sessions/register" && method === "POST") {
+          return handleSessionRequest(db, env, request, "register");
+        }
+        if (path === "/sessions/unregister" && method === "POST") {
+          return handleSessionRequest(db, env, request, "unregister");
+        }
 
-    // Notifications
-    if (path === "/notifications/send" && request.method === "POST") {
-      return handleSendNotification(db, env, request);
-    }
-    if (path === "/notifications/edit" && request.method === "POST") {
-      return handleEditNotification(db, env, request);
-    }
+        // Media
+        if (path === "/media/upload" && method === "POST") {
+          return handleMediaUpload(env, request);
+        }
+        if (path.startsWith("/media/") && method === "GET") {
+          const key = decodeURIComponent(path.slice("/media/".length));
+          return handleMediaGet(env, request, key);
+        }
 
-    // Telegram webhook
-    if (path.startsWith("/webhook/telegram") && request.method === "POST") {
-      return handleTelegramWebhook(db, env, request);
-    }
+        // Notifications
+        if (path === "/notifications/send" && method === "POST") {
+          return handleSendNotification(db, env, request);
+        }
+        if (path === "/notifications/edit" && method === "POST") {
+          return handleEditNotification(db, env, request);
+        }
 
-    return Response.json({ error: "Not found" }, { status: 404 });
+        // Telegram webhook
+        if (path.startsWith("/webhook/telegram") && method === "POST") {
+          return handleTelegramWebhook(db, env, request);
+        }
+
+        return Response.json({ error: "Not found" }, { status: 404 });
+      })();
+
+      if (response.status >= 400 && path !== "/health") {
+        console.error("[worker] request outcome", {
+          path,
+          method,
+          status: response.status,
+        });
+      }
+
+      return response;
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+
+      console.error("[worker] unhandled error", {
+        path,
+        method,
+        error,
+        stack,
+      });
+
+      return Response.json({ error: "internal_error" }, { status: 500 });
+    }
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
