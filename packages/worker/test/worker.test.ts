@@ -5735,6 +5735,120 @@ describe("bot username command handling (/cmd@bot)", () => {
     expect(rows.length).toBe(1);
     expect(rows[0]!.command_type).toBe("kill");
   });
+
+  it("prompts containing non-bot @-tokens (/opencode-serve@4098 is stuck, /etc@host is broken) pass through unchanged as execute prompts", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_nonbot_${now}`;
+    const machineId = `mac_bot_nonbot_${now}`;
+    const msgId1 = 770030;
+    const msgId2 = 770031;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId1, sessionId, token: `tok1_${now}` });
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId2, sessionId, token: `tok2_${now}` });
+    mockTelegramSendMessage();
+
+    // 1) /opencode-serve@4098 is stuck
+    const update1 = makeTextReply("/opencode-serve@4098 is stuck", msgId1, 770030);
+    const res1 = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update1));
+    expect(res1.status).toBe(200);
+
+    const rows1 = await queryQueueByMachine(machineId);
+    const execRows1 = rows1.filter((r) => r.command_type === "execute");
+    expect(execRows1.length).toBe(1);
+    expect(execRows1[0]!.command).toBe("/opencode-serve@4098 is stuck");
+
+    // 2) /etc@host is broken
+    const update2 = makeTextReply("/etc@host is broken", msgId2, 770031);
+    const res2 = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update2));
+    expect(res2.status).toBe(200);
+
+    const rows2 = await queryQueueByMachine(machineId);
+    const execRows2 = rows2.filter((r) => r.command_type === "execute" && r.command === "/etc@host is broken");
+    expect(execRows2.length).toBe(1);
+  });
+
+  it("differentiates bot-shaped target (/opencode-serve@SomeOtherBot) from non-bot target (/opencode-serve@4098)", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_diff_${now}`;
+    const machineId = `mac_bot_diff_${now}`;
+    const msgId1 = 770032;
+    const msgId2 = 770033;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId1, sessionId, token: `tok1_${now}` });
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId2, sessionId, token: `tok2_${now}` });
+    mockTelegramSendMessage();
+
+    // Bot-shaped token addressed to another bot -> dropped
+    const update1 = makeTextReply("/opencode-serve@SomeOtherBot", msgId1, 770032);
+    const res1 = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update1));
+    expect(res1.status).toBe(200);
+
+    let rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(0);
+
+    // Non-bot token -> passed through as prompt
+    const update2 = makeTextReply("/opencode-serve@4098", msgId2, 770033);
+    const res2 = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update2));
+    expect(res2.status).toBe(200);
+
+    rows = await queryQueueByMachine(machineId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.command_type).toBe("execute");
+    expect(rows[0]!.command).toBe("/opencode-serve@4098");
+  });
+
+  it("unconfigured TELEGRAM_BOT_USERNAME logs warning with command token but NOT full message text", async () => {
+    const unsetEnv = { ...env, TELEGRAM_BOT_USERNAME: undefined } as Env;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const update = {
+        update_id: 770034,
+        message: {
+          message_id: 770034,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text: `/launch@some_bot devbox pigeon "secret prompt text"`,
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, unsetEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      expect(warnSpy).toHaveBeenCalled();
+      const warnArgs = warnSpy.mock.calls.map((args) => args.join(" ")).join("\n");
+      expect(warnArgs).toContain("launch");
+      expect(warnArgs).not.toContain("secret prompt text");
+      expect(warnArgs).not.toContain("/launch@some_bot devbox pigeon");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("non-command message addressed to us (/notacommand@mohrbacher_01_bot hello) strips suffix and queues as prompt", async () => {
+    const now = Date.now();
+    const sessionId = `ses_bot_noncmd_${now}`;
+    const machineId = `mac_bot_noncmd_${now}`;
+    const msgId = 770035;
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+    await insertMessageMapping({ chatId: CHAT_ID, messageId: msgId, sessionId, token: `tok_${now}` });
+    mockTelegramSendMessage();
+
+    const update = makeTextReply("/notacommand@mohrbacher_01_bot hello", msgId, 770035);
+    const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    const rows = await queryQueueByMachine(machineId);
+    const execRows = rows.filter((r) => r.command_type === "execute");
+    expect(execRows.length).toBe(1);
+    expect(execRows[0]!.command).toBe("/notacommand hello");
+  });
 });
 
 // ─── Swipe-Reply to Question Notification: Integration Tests ──────────

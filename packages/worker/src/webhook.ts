@@ -11,15 +11,26 @@ export { generateCommandId };
 
 export type CommandNormalizationResult =
   | { kind: "ok"; text: string }
-  | { kind: "foreign_bot" };
+  | { kind: "foreign_bot"; commandToken: string }
+  | { kind: "unconfigured"; commandToken: string };
+
+function isBotUsername(targetBot: string): boolean {
+  if (targetBot.length < 5 || targetBot.length > 32) {
+    return false;
+  }
+  if (!/^[a-zA-Z0-9_]+$/.test(targetBot)) {
+    return false;
+  }
+  return targetBot.toLowerCase().endsWith("bot");
+}
 
 /**
  * Normalizes Telegram command text by stripping a matching bot username suffix from the command token.
  * E.g., "/kill@mohrbacher_01_bot" -> "/kill".
  *
  * If the command token has a bot username suffix addressed to a DIFFERENT bot (or if
- * configuredBotUsername is unset/empty), returns { kind: "foreign_bot" } so the message
- * can be silently dropped and not fall through as a prompt to the plain-message handler.
+ * configuredBotUsername is unset/empty), returns { kind: "foreign_bot" } or { kind: "unconfigured" }
+ * so the message can be dropped and not fall through as a prompt to the plain-message handler.
  */
 export function parseTelegramCommand(
   text: string,
@@ -43,11 +54,22 @@ export function parseTelegramCommand(
   }
 
   const normalizedConfigured = configuredBotUsername?.trim().toLowerCase();
+
+  // 1) If the @ token case-insensitively equals configured username -> it is OURS
   if (normalizedConfigured && targetBot.toLowerCase() === normalizedConfigured) {
     return { kind: "ok", text: `/${cmd}${rest}` };
   }
 
-  return { kind: "foreign_bot" };
+  // 2) Else if the token looks like a Telegram bot username -> addressed elsewhere / unconfigured
+  if (isBotUsername(targetBot)) {
+    if (!normalizedConfigured) {
+      return { kind: "unconfigured", commandToken: cmd };
+    }
+    return { kind: "foreign_bot", commandToken: cmd };
+  }
+
+  // 3) Else -> NOT a bot address at all; ordinary text. Return text UNCHANGED.
+  return { kind: "ok", text };
 }
 
 /**
@@ -765,7 +787,12 @@ export async function handleTelegramWebhook(
   // Handle commands
   if (update.message?.text) {
     const cmdNorm = parseTelegramCommand(update.message.text, env.TELEGRAM_BOT_USERNAME);
+    if (cmdNorm.kind === "unconfigured") {
+      console.warn(`TELEGRAM_BOT_USERNAME is not configured; dropping suffixed command /${cmdNorm.commandToken}`);
+      return OK();
+    }
     if (cmdNorm.kind === "foreign_bot") {
+      console.log(`Dropping command /${cmdNorm.commandToken} addressed to foreign bot`);
       return OK();
     }
     update.message.text = cmdNorm.text;
