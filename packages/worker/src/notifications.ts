@@ -238,6 +238,10 @@ export async function handleSendNotification(
     let messageThreadId: number | undefined;
 
     if (topicsEnabled(env) && threaded !== false) {
+      // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
+      // intentionally NOT wrapped in withD1. A D1 error here falls to boundary catch as internal_error 500,
+      // which triggers daemon retry identical to 503. Total D1 outage hits send.sessionLookup first (503).
+      // Wrapping resolveTopic wholesale would misclassify Telegram API errors as storage.
       const topicRes = await resolveTopic(db, {
         sessionId,
         machineId: session.machine_id,
@@ -390,7 +394,7 @@ export async function handleSendNotification(
     return json({ ok: true, messageId, token });
   } catch (err) {
     if (err instanceof StorageError) {
-      console.error("[worker] storage error", { op: err.op, error: err });
+      console.error("[worker] storage error", { op: err.op, error: err.message });
       return json(
         { error: "storage_error", store: "d1", op: err.op },
         503,

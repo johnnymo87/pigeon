@@ -112,7 +112,7 @@ async function registerSession(
     return Response.json({ ok: true, sessionId, machineId });
   } catch (err) {
     if (err instanceof StorageError) {
-      console.error("[worker] storage error", { op: err.op, error: err });
+      console.error("[worker] storage error", { op: err.op, error: err.message });
       return Response.json(
         { error: "storage_error", store: "d1", op: err.op },
         { status: 503 },
