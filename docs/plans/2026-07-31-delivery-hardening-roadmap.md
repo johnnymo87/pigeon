@@ -51,11 +51,17 @@ Do this LAST, as Cycle 7b — it is the only irreversible step.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **989** passed, 1 skipped |
+| `@pigeon/daemon` | **1040** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **306** passed |
-| `@pigeon/worker` | **298** passed |
+| `@pigeon/worker` | **300** passed |
 
-Total **1593**. Updated by Cycle 6 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1646**. Updated by cycle F1 itself (see CORRECTION #4) rather than left for the next cycle to discover. **`npm run typecheck` is CLEAN — 0 errors.**
+
+> **The daemon count moved 989 → 1040 (+51) and F1 did NOT do it.** F1 added **2 worker** tests and
+> nothing else. The +51 is the parallel swarm scheduled-wake track (`pigeon-mx2`, §4.1) landing PR #29
+> while this roadmap was compacted — the **third** time that track has shifted the baseline mid-cycle
+> (#21, #24, #29). **Re-measure before starting any cycle and run `git log HEAD..origin/main`; do not
+> attribute a jump to your own work.**
 
 > **Attribution for the +96, because it is NOT this cycle's work.** Cycle 6 added **2** worker tests.
 > The daemon's +94 came from a **parallel swarm track that landed on `main` while this roadmap was
@@ -1369,7 +1375,23 @@ makes it delivery work that happens to also be a quality-of-life win.
 > touch" is **not** existing machinery, it is new work with a real §3 budget cost, because TUI titles
 > drift (every compaction) and each drift would spend an `editForumTopic` call.
 
-- [ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at
+- [x] **F1. `pigeon-4ne`** (P3) — DONE 2026-08-01, `f178b38` + review fix, PR #33. Shipped exactly the
+  decided format: `title · ~/path`, home abbreviated by regex (`^/(home|Users)/<user>` → `~`), path kept
+  a real pasteable suffix, existing 113 topics left to age out. **The "clamp eats the wrong end" claim
+  below is FALSE and CORRECTION #7 already disproved it — zero rows have ever clamped.** The real defect
+  was that the dir is ~62% of the name and the title, the only part identifying a session, sat past the
+  point where the topic LIST truncates a row. The user confirmed by inspection that rows cut off inside
+  the path; **that assumption was explicitly flagged as unmeasured and checked before any code was
+  written, because it would have killed the feature had it been false.** Adversarial review verified the
+  regex against ~12 adversarial paths, independently re-confirmed no consumer parses a topic name, and
+  recomputed the surrogate-boundary arithmetic. Two limitations accepted and documented in the source:
+  any user's home renders `~` (harmless single-user-per-machine; the fix would hardcode usernames), and
+  a >125-char title would now clamp the DIR rather than the title (zero live occurrences, max is 103).
+  Review also caught the truncation test asserting too little — it would have passed if clamping dropped
+  the directory entirely; fixed by pinning the surviving suffix. **Original text kept below for the
+  record:**
+
+- ~~[ ] **F1. `pigeon-4ne`** (P3) — topic names are unreadable: dir first, absolute, and clamped at~~
   Telegram's 128-char limit. Measured 2026-07-31 at **77–115 chars**, roughly 19 of them spent on the
   constant `/home/dev/projects/` prefix before any information appears. Two problems, and the second
   is not cosmetic: the list reads as a column of identical prefixes, **and the clamp eats the wrong

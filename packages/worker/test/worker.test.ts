@@ -5220,18 +5220,40 @@ describe("topics module and topicName", () => {
   });
 
   describe("topicName formatting and surrogate clamping", () => {
-    it("passes short dir and title through unchanged", () => {
-      expect(topicName("pigeon", "Fix flaky auth test")).toBe("pigeon · Fix flaky auth test");
+    it("passes short dir and title through unchanged in title · dir order", () => {
+      expect(topicName("pigeon", "Fix flaky auth test")).toBe("Fix flaky auth test · pigeon");
+    });
+
+    it("abbreviates home directory in dir suffix", () => {
+      expect(topicName("/home/dev/projects/pigeon", "Fix bug")).toBe("Fix bug · ~/projects/pigeon");
+      expect(topicName("/Users/jonathan/projects/pigeon", "Fix bug")).toBe("Fix bug · ~/projects/pigeon");
+      expect(topicName("/var/tmp/build", "Fix bug")).toBe("Fix bug · /var/tmp/build");
+      expect(topicName("/home/dev", "Fix bug")).toBe("Fix bug · ~");
+      expect(topicName("/homework/notes", "Fix bug")).toBe("Fix bug · /homework/notes");
+      expect(topicName("~/projects/pigeon", "Fix bug")).toBe("Fix bug · ~/projects/pigeon");
+    });
+
+    it("truncates long dir suffix while preserving full title", () => {
+      const longPath = "/home/dev/projects/workstation/.worktrees/monitoring-mergequeue-fix-and-very-long-path-segment-that-keeps-going-and-going-until-it-exceeds-128-chars";
+      const shortTitle = "Merge-queue deploy monitoring gap";
+      const name = topicName(longPath, shortTitle);
+      expect(name.startsWith(shortTitle)).toBe(true);
+      expect(name.endsWith("…")).toBe(true);
+      expect(name.length).toBeLessThanOrEqual(128);
+      // The surviving suffix must still be an abbreviated, usable path. Without this the test
+      // would pass even if clamping dropped the directory entirely.
+      expect(name).toContain("· ~/projects/workstation");
     });
 
     it("handles missing/empty dir or title gracefully", () => {
       expect(topicName("", "Fix test")).toBe("Fix test");
       expect(topicName("pigeon", "")).toBe("pigeon");
+      expect(topicName("/home/dev", "")).toBe("~");
       expect(topicName("   ", "   ")).toBe("session");
     });
 
     it("replaces internal newlines with single spaces", () => {
-      expect(topicName("pigeon", "Fix\nflaky\r\nauth\r test")).toBe("pigeon · Fix flaky auth test");
+      expect(topicName("pigeon", "Fix\nflaky\r\nauth\r test")).toBe("Fix flaky auth test · pigeon");
     });
 
     it("clamps 128-emoji title to <= 128 UTF-16 code units", () => {
@@ -5242,17 +5264,18 @@ describe("topics module and topicName", () => {
     });
 
     it("preserves an astral character landing exactly on boundary or drops it safely", () => {
-      // 123 'a's + " · a😀" => 123 + 3 + 1 + 2 = 129 UTF-16 units.
-      // Index 127 falls on high surrogate of 😀.
-      const name1 = topicName("a".repeat(123), "a😀");
+      // 122 'a's (title) + " · " + "a😀b" (dir) => 122 + 3 + 1 + 2 + 1 = 129 UTF-16 units.
+      // Index 126 falls on high surrogate of 😀, index 127 on low surrogate.
+      // max=127 checks index 126, finds high surrogate, drops it safely to prevent orphan high surrogate.
+      const name1 = topicName("a😀b", "a".repeat(122));
       expect(name1.length).toBeLessThanOrEqual(128);
       expect(hasUnpairedSurrogate(name1)).toBe(false);
       expect(name1.endsWith("…")).toBe(true);
 
-      // 122 'a's + " · a😀" => 122 + 3 + 1 + 2 = 128 UTF-16 units (fits exactly).
-      // 122 'a's + " · a😀b" => 128 + 1 = 129 UTF-16 units.
-      // Index 127 falls right between high surrogate (126) and low surrogate (127) of 😀.
-      const name2 = topicName("a".repeat(122), "a😀b");
+      // 122 'a's (title) + " · " + "😀bc" (dir) => 122 + 3 + 2 + 1 + 1 = 129 UTF-16 units.
+      // Index 125 falls on high surrogate of 😀, index 126 on low surrogate.
+      // max=127 checks index 126, finds low surrogate, keeps complete pair.
+      const name2 = topicName("😀bc", "a".repeat(122));
       expect(name2.length).toBeLessThanOrEqual(128);
       expect(hasUnpairedSurrogate(name2)).toBe(false);
       expect(name2.endsWith("…")).toBe(true);
@@ -6180,7 +6203,7 @@ describe("topics module and topicName", () => {
         .reply(200, (opts: any) => {
           const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
           createTopicPayload = JSON.parse(raw);
-          return { ok: true, result: { message_thread_id: 888, name: "pigeon · My Topic" } };
+          return { ok: true, result: { message_thread_id: 888, name: "My Topic · pigeon" } };
         });
 
       fetchMock
@@ -6210,7 +6233,7 @@ describe("topics module and topicName", () => {
       expect(res.status).toBe(200);
       expect(createTopicPayload).toEqual({
         chat_id: topicChatId,
-        name: "pigeon · My Topic",
+        name: "My Topic · pigeon",
         icon_color: 7322096,
       });
       expect(sendMessagePayload).toEqual({
