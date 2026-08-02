@@ -5190,6 +5190,73 @@ describe("/rename command", () => {
     expect(capturedMsg?.text).toBe(`Failed to rename topic for session \`${sessionId}\`.`);
   });
 
+  it("TOPIC_NOT_MODIFIED is success: D1 converges and the user is not told it failed", async () => {
+    // Telegram reports TOPIC_NOT_MODIFIED when the name already equals the requested one.
+    // That is a completed rename, not a failure. It also matters for repair: because the
+    // Telegram edit deliberately precedes the D1 writes, a crash in between leaves D1 stale,
+    // and re-issuing /rename is the only repair — it converges only if this is not an error.
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const now = Date.now();
+    const sessionId = `rename-sess-notmod-${now}`;
+    const machineId = `rename-mach-notmod-${now}`;
+    const threadId = 996312;
+
+    await registerSession(sessionId, machineId, "Old Title");
+    await touchMachine(env.DB, machineId);
+
+    await reserve(env.DB, { sessionId, machineId, chatId: CHAT_ID, name: "Old Title", now });
+    await finalize(env.DB, { sessionId, messageThreadId: threadId, name: "Old Title", now });
+
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply(
+        400,
+        JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+
+    let capturedMsg: any;
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        capturedMsg = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+
+    const update = {
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/rename Converged Title",
+        message_thread_id: threadId,
+      },
+    };
+
+    const res = await handleTelegramWebhook(env.DB, testEnv, makeWebhookRequest(update));
+    expect(res.status).toBe(200);
+
+    // D1 must converge to the requested name even though Telegram reported not-modified.
+    const topicRow = await getBySession(env.DB, sessionId);
+    expect(topicRow?.name).toBe("Converged Title");
+
+    const sessRow = await env.DB
+      .prepare("SELECT label FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ label: string }>();
+    expect(sessRow?.label).toBe("Converged Title");
+
+    // And the user must NOT be told it failed.
+    expect(capturedMsg?.text).toBe(`Renamed session \`${sessionId}\` to "Converged Title".`);
+  });
+
   it("topics disabled: updates sessions.label, skips editForumTopic, sends confirmation", async () => {
     const offEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
     const now = Date.now();

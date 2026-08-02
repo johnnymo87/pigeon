@@ -792,7 +792,14 @@ export async function handleTelegramWebhook(
             name: formattedName,
           });
 
-          if (!editRes.ok) {
+          // TOPIC_NOT_MODIFIED means Telegram's name already equals the requested one, so the
+          // rename is effectively done — treat it as success and fall through to the D1 writes.
+          // This matches the reopen path (topic-manager.ts:77) and matters for two reasons:
+          // repeating /rename with the same title must not report a failure, and because the
+          // Telegram edit deliberately precedes the D1 writes, a crash in between leaves D1
+          // stale — re-issuing the command is the repair, and it only converges if this is
+          // not treated as an error.
+          if (!editRes.ok && editRes.kind !== "topic_not_modified") {
             await sendTelegramMessage(
               env,
               renameChatId,
