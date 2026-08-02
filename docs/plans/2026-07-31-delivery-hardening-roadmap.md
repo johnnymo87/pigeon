@@ -1048,7 +1048,7 @@ also refreshing the `pending_questions` clock would hand the user a question the
 defeating the reasoning that justifies the expiry design. `pending_questions` is keyed by `session_id`
 with `INSERT OR REPLACE`, which constrains the options.
 
-### Cycle 5 — the server side (the track this roadmap was missing) — DONE (PR #TBD)
+### Cycle 5 — the server side (the track this roadmap was missing) — DONE (PR #36)
 
 Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
 initially failed to answer: if the worker's session store fails recurrently, client fixes reduce
