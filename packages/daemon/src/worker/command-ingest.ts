@@ -139,6 +139,7 @@ export async function ingestWorkerCommand(
   const pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
   if (pendingQuestion) {
     console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
+    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options)) return;
     const command = msg.command.trim();
     const wizardMatch = WIZARD_OPTION_RE.exec(command);
     const legacyMatch = !wizardMatch ? QUESTION_OPTION_RE.exec(command) : null;
@@ -348,6 +349,12 @@ export async function ingestWorkerCommand(
   if (msg.metadata?.questionRequestId) {
     console.warn(`[command-ingest] question-reply via metadata fallback sessionId=${msg.sessionId} commandId=${commandId} requestId=${msg.metadata.questionRequestId}`);
 
+    // Same hygiene as the primary question path above. This branch has its own
+    // copy of the empty-answer bug (`[[msg.command.trim()]]` below), so guarding
+    // only the primary path would leave the stale-state rescue route submitting
+    // '' as an answer.
+    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options)) return;
+
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
       : selectAdapter(session);
@@ -459,7 +466,15 @@ export async function ingestWorkerCommand(
     }
   }
 
-  return deliverViaAdapter(adapter, session, msg, commandId, storage, options, mediaPayload);
+  // A file with no caption would otherwise be delivered as `command: ''` and
+  // rejected wholesale by the plugin's validator, discarding the bytes we just
+  // relayed. Gated on media presence: a media-less empty command must stay empty
+  // and fail downstream, never be papered over with a synthetic prompt.
+  const effectiveMsg: ExecuteMessage = !msg.command.trim() && msg.media
+    ? { ...msg, command: mediaPlaceholderCommand(msg.media) }
+    : msg;
+
+  return deliverViaAdapter(adapter, session, effectiveMsg, commandId, storage, options, mediaPayload);
 }
 
 
@@ -621,6 +636,99 @@ async function dropCommand(
   storage.inbox.markDone(commandId);
 }
 
+async function sendBestEffort(
+  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  chatId: string,
+  text: string,
+  commandId: string,
+): Promise<void> {
+  try {
+    await sendTelegramReply?.(chatId, text);
+  } catch (err) {
+    console.warn(`[command-ingest] failed to notify user commandId=${commandId}:`, err);
+  }
+}
+
+/**
+ * Input hygiene for both question-reply paths (W4 / `pigeon-bru`).
+ *
+ * Returns `true` when the caller must stop because this message cannot become
+ * an answer. Two cases, deliberately handled differently because the inputs
+ * genuinely differ:
+ *
+ * - **Nothing answer-shaped at all** (empty text, or a file with no caption):
+ *   refuse outright. The `pendingQuestions` row is kept, so the on-screen
+ *   keyboard stays valid and the user can still answer. Previously the empty
+ *   string was accepted as the answer and the wizard advanced on garbage —
+ *   a failure that *succeeded*, which is worse than one that errors.
+ *
+ * - **A caption plus a file**: the caption is a real answer, so it is still
+ *   delivered. But the file goes nowhere, because `QuestionReplyEnvelope`
+ *   carries only `answers: string[][]` and opencode's own
+ *   `/question/:id/reply` endpoint has no file channel. Say so rather than
+ *   dropping it silently.
+ *
+ * Why the daemon and not the worker: only the daemon knows a question is
+ * pending. `resolveMessageSession` sets `questionRequestId` solely for
+ * swipe-replies to a `q:`-prefixed notification, so topic-routed messages carry
+ * no question context at all — yet `getBySessionId` hijacks them into this path
+ * regardless. A worker-side guard would be a sieve.
+ */
+async function refuseUnanswerableQuestionInput(
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  options: WorkerCommandIngestOptions,
+): Promise<boolean> {
+  const hasAnswerText = msg.command.trim().length > 0;
+
+  if (!hasAnswerText) {
+    console.warn(`[command-ingest] refusing unanswerable question input commandId=${commandId} media=${Boolean(msg.media)}`);
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      msg.media
+        ? `Can't answer a question with a file — only text answers can be delivered.\n\nThe question is still waiting: tap an option, or reply with text. Then send the file again.`
+        : `Can't answer a question with an empty message.\n\nThe question is still waiting: tap an option, or reply with text.`,
+      options.sendTelegramReply,
+    );
+    return true;
+  }
+
+  if (msg.media) {
+    // Proceeding with the caption as the answer, but the file is not going with it.
+    await sendBestEffort(
+      options.sendTelegramReply,
+      msg.chatId,
+      `Answering with your caption — but the attached file wasn't delivered, because a question answer can only carry text.\n\nSend the file again once the question is answered.`,
+      commandId,
+    );
+  }
+
+  return false;
+}
+
+/**
+ * Stand-in prompt for a file sent with no caption (W3 / `pigeon-tyk`).
+ *
+ * Without this the envelope carries `command: ''`, which
+ * `isExecuteCommandEnvelope` rejects — so the bytes are fetched from R2,
+ * relayed, and then thrown away by the plugin's own validator.
+ *
+ * Synthesized in the daemon rather than the worker on purpose. Worker-side
+ * synthesis would flow into the question path above and become a question's
+ * *answer*, manufacturing a fresh instance of the very bug W4 fixes. Doing it
+ * here, after both question branches have returned, structurally cannot.
+ *
+ * Wording is deliberately a flat statement of fact. An agent reads this
+ * verbatim as the user's prompt, so it must not invent an instruction ("analyze
+ * this") the user never gave.
+ */
+function mediaPlaceholderCommand(media: NonNullable<ExecuteMessage["media"]>): string {
+  return `[User sent a file with no caption: ${media.filename} (${media.mime})]`;
+}
+
 /**
  * Reply text for a question answer that could not be delivered.
  *
@@ -756,7 +864,13 @@ async function deliverViaAdapter(
       const revived = await reviveAndDeliver(
         storage,
         msg.sessionId,
-        msg.command,
+        // The revive fallback talks to opencode-serve directly and has no file
+        // channel, so any attachment is lost here. Saying so inline matters more
+        // since W3: without it a caption-less photo arrives as the bare
+        // placeholder text, describing a file the session never received.
+        msg.media
+          ? `${msg.command}\n\n(A file was attached but could not be delivered. Please send it again.)`
+          : msg.command,
         {
           opencodeClient: options.opencodeClient,
           ...(options.spawn ? { spawn: options.spawn } : {}),
