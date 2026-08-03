@@ -182,23 +182,112 @@ function findAnchor(messages: ParsedMessage[], msgId: string): number | null {
   return anchor;
 }
 
+/** Which evidence path verified a handoff — recorded so audits can tell them apart. */
+type VerificationReason = "completed-clean" | "in-flight-progressed";
+
+/**
+ * True when the turn has emitted at least one part carrying a timestamp —
+ * i.e. the model or a tool actually did something at a knowable moment.
+ *
+ * Deliberately NOT `parts.length > 0`. Sampling real transcripts (2026-08-03)
+ * shows every assistant turn carries `step-start` and `step-finish` parts, and
+ * neither carries a timestamp: they are scaffolding emitted around a turn, not
+ * evidence that the turn produced anything. A wedged turn can hold those parts
+ * while having run nothing at all, so counting them would reintroduce exactly
+ * the false confidence this predicate exists to remove. `partTimestamps`
+ * extracts times only from text/reasoning/tool parts, which is the structural
+ * artifact of real execution.
+ */
+function hasProducedOutput(msg: ParsedMessage): boolean {
+  for (const part of msg.parts) {
+    if (partTimestamps(part).length > 0) return true;
+    // A tool part in ANY state — including `pending`, which carries no `time`
+    // at all (sdk types.gen.ts: ToolStatePending is {status,input,raw}) — means
+    // the model already emitted a tool call. That is stronger evidence of
+    // execution than a reasoning timestamp, so it must not depend on timing
+    // fields that this particular state omits.
+    if (isObject(part) && part.type === "tool") return true;
+  }
+  return false;
+}
+
 /**
  * Evidence that our run started/ran: a clean-completed assistant message, or
- * an in-flight assistant message, strictly after `anchor`. A completed
- * assistant message WITH an error is not evidence — it falls through to the
- * stuck rules (something else may still be blocking our prompt).
+ * an in-flight assistant message THAT HAS PRODUCED OUTPUT, strictly after
+ * `anchor`. A completed assistant message WITH an error is not evidence — it
+ * falls through to the stuck rules (something else may still be blocking our
+ * prompt).
+ *
+ * The in-flight branch used to return true on the mere EXISTENCE of an
+ * in-flight row, on the assumption that "in-flight" means "serving our prompt
+ * right now". It does not. A wake delivered into a session whose working
+ * directory was deleted leaves an assistant row at parts=0 / completed=null
+ * FOREVER, and that assumption stamped it verified on the first pass — closing
+ * a wake that never ran as a success, permanently (pigeon-s9d; measured
+ * msg_msbtad7o_8f8596fb, verified 308s after handoff, and 4763-of-4763
+ * handed_off rows verified with zero unverified). Existence is a snapshot;
+ * progress is the structural property. Absence of output is NOT failure here,
+ * only absence of evidence — the caller decides when silence has lasted long
+ * enough to mean wedged.
  */
 function findVerificationEvidence(
   messages: ParsedMessage[],
   anchor: number,
-): boolean {
+): VerificationReason | null {
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     if (m.created <= anchor) continue;
-    if (m.completed === null) return true; // in-flight, serving our prompt right now
-    if (!m.hasError) return true; // ran clean
+    if (m.completed === null) {
+      // in-flight AND actually running
+      if (hasProducedOutput(m)) return "in-flight-progressed";
+      continue; // started but silent: no evidence yet, keep looking
+    }
+    if (!m.hasError) return "completed-clean"; // ran clean
   }
-  return false;
+  return null;
+}
+
+/**
+ * The OLDEST post-anchor in-flight assistant turn that has produced no output.
+ *
+ * Only meaningful once `findVerificationEvidence` has returned false, which
+ * implies no post-anchor in-flight turn has produced anything. Oldest, not
+ * newest: the turn plausibly serving OUR prompt is the earliest one after the
+ * anchor, and keying on the newest would let unrelated later traffic in a busy
+ * session keep resetting the reported silence.
+ *
+ * This is the structural difference between the two states the watchdog
+ * previously could not tell apart: an idle target has NO post-anchor assistant
+ * turn at all (nothing ever started — the benign case W3 reasoned about),
+ * whereas this target HAS one that started and has yet to produce anything.
+ *
+ * IT IS NOT, HOWEVER, PROOF OF A WEDGE, and must never be treated as such.
+ * A turn that has started and gone quiet is produced by at least two very
+ * different causes that the transcript cannot separate:
+ *   - the session can never run it (working directory deleted — pigeon-s9d);
+ *   - the provider told us to wait (a 429 retry, which opencode surfaces as
+ *     ephemeral session STATUS, never as a part, and whose delay honours
+ *     retry-after up to RETRY_MAX_DELAY; the `step-start` part is only written
+ *     from a stream event, so a rate-limit refused before the first event
+ *     leaves exactly zero parts, identical to the wedge).
+ * Failing the first on a false positive of the second would destroy a live
+ * wake that was about to run, and tell a human it never ran. So the caller
+ * treats this state as UNKNOWN. Distinguishing them needs a liveness signal
+ * this transcript does not carry (see pigeon-fnx R4).
+ */
+function findSilentInFlight(
+  messages: ParsedMessage[],
+  anchor: number,
+): ParsedMessage | null {
+  let silent: ParsedMessage | null = null;
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    if (m.completed !== null) continue;
+    if (m.created <= anchor) continue;
+    if (hasProducedOutput(m)) continue;
+    if (silent === null || m.created < silent.created) silent = m;
+  }
+  return silent;
 }
 
 /**
@@ -750,11 +839,39 @@ export class DeliveryWatchdog {
       );
     }
 
-    if (findVerificationEvidence(messages, anchor)) {
+    const verifiedBy = findVerificationEvidence(messages, anchor);
+    if (verifiedBy) {
       this.storage.swarm.markVerified(row.msgId, now);
       this.pruneDedupe(row.msgId);
       counts.verified++;
-      this.log("verified", { msgId: row.msgId, sessionId });
+      // `reason` distinguishes the two evidence paths. Without it the last
+      // audit could not tell a genuinely-completed run from a rubber stamp,
+      // and 4763 verified rows were retroactively unknowable (pigeon-s9d).
+      this.log("verified", { msgId: row.msgId, sessionId, reason: verifiedBy });
+      return false;
+    }
+
+    // A post-anchor turn that STARTED but has produced nothing. Distinct from
+    // the idle case below (where nothing started at all) and from the blocking
+    // case (where the turn predates our prompt). This is the shape a wake into
+    // a deleted working directory leaves behind — and, critically, it is ALSO
+    // the shape a provider rate-limit leaves behind, so the two cannot be told
+    // apart from the transcript alone (see the note on findSilentInFlight).
+    //
+    // So this is where the watchdog says "I do not know", and stops. The row
+    // stays handed_off and unverified, and is re-examined every cycle. It is
+    // deliberately NOT requeued: redelivering a prompt whose turn may simply be
+    // waiting on a retry would inject a duplicate into a live session, and
+    // prompt_async is not idempotent.
+    const silent = findSilentInFlight(messages, anchor);
+    if (silent) {
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "in-flight-no-output-yet",
+        silentForMs: now - silent.created,
+      });
       return false;
     }
 
