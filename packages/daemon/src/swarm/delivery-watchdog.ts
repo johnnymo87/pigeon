@@ -55,6 +55,21 @@ export const DEFAULT_STUCK_ABORT_SILENCE_MS = 3_600_000;
 export const DEFAULT_MAX_REQUEUES = 3;
 /** OVERDUE_ALERT_MS */
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
+/**
+ * WEDGED_NO_OUTPUT_MS — how long a started-but-silent assistant turn may
+ * produce nothing before we call it wedged rather than slow.
+ *
+ * A turn that has started but emitted no timestamped part is AMBIGUOUS at any
+ * single instant: it looks identical whether the model is thinking hard or the
+ * session can never run it at all. Only elapsed time separates them, so this
+ * threshold is the entire difference between "unknown" and "failed".
+ *
+ * Calibrated 2026-08-03 against 159 real assistant turns sampled from 11 live
+ * sessions: time-to-first-timestamped-part was p50 2.3s, p90 5.5s, p99 227s,
+ * max 250.7s (4.2 min). 15 minutes leaves ~3.6x headroom over the slowest real
+ * turn observed. Below this threshold we stay silent and re-check next cycle.
+ */
+export const DEFAULT_WEDGED_NO_OUTPUT_MS = 900_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -76,6 +91,12 @@ export interface DeliveryWatchdogOptions {
    * tune it. Tests use it to drive the clock.
    */
   overdueAlertMs?: number;
+  /**
+   * How long a started-but-silent assistant turn may produce nothing before it
+   * is treated as wedged rather than slow. Constructor-only, like its sibling
+   * above; tests drive it to exercise both sides of the threshold.
+   */
+  wedgedNoOutputMs?: number;
 }
 
 export interface CycleSummary {
@@ -182,23 +203,91 @@ function findAnchor(messages: ParsedMessage[], msgId: string): number | null {
   return anchor;
 }
 
+/** Which evidence path verified a handoff — recorded so audits can tell them apart. */
+type VerificationReason = "completed-clean" | "in-flight-progressed";
+
+/**
+ * True when the turn has emitted at least one part carrying a timestamp —
+ * i.e. the model or a tool actually did something at a knowable moment.
+ *
+ * Deliberately NOT `parts.length > 0`. Sampling real transcripts (2026-08-03)
+ * shows every assistant turn carries `step-start` and `step-finish` parts, and
+ * neither carries a timestamp: they are scaffolding emitted around a turn, not
+ * evidence that the turn produced anything. A wedged turn can hold those parts
+ * while having run nothing at all, so counting them would reintroduce exactly
+ * the false confidence this predicate exists to remove. `partTimestamps`
+ * extracts times only from text/reasoning/tool parts, which is the structural
+ * artifact of real execution.
+ */
+function hasProducedOutput(msg: ParsedMessage): boolean {
+  for (const part of msg.parts) {
+    if (partTimestamps(part).length > 0) return true;
+  }
+  return false;
+}
+
 /**
  * Evidence that our run started/ran: a clean-completed assistant message, or
- * an in-flight assistant message, strictly after `anchor`. A completed
- * assistant message WITH an error is not evidence — it falls through to the
- * stuck rules (something else may still be blocking our prompt).
+ * an in-flight assistant message THAT HAS PRODUCED OUTPUT, strictly after
+ * `anchor`. A completed assistant message WITH an error is not evidence — it
+ * falls through to the stuck rules (something else may still be blocking our
+ * prompt).
+ *
+ * The in-flight branch used to return true on the mere EXISTENCE of an
+ * in-flight row, on the assumption that "in-flight" means "serving our prompt
+ * right now". It does not. A wake delivered into a session whose working
+ * directory was deleted leaves an assistant row at parts=0 / completed=null
+ * FOREVER, and that assumption stamped it verified on the first pass — closing
+ * a wake that never ran as a success, permanently (pigeon-s9d; measured
+ * msg_msbtad7o_8f8596fb, verified 308s after handoff, and 4763-of-4763
+ * handed_off rows verified with zero unverified). Existence is a snapshot;
+ * progress is the structural property. Absence of output is NOT failure here,
+ * only absence of evidence — the caller decides when silence has lasted long
+ * enough to mean wedged.
  */
 function findVerificationEvidence(
   messages: ParsedMessage[],
   anchor: number,
-): boolean {
+): VerificationReason | null {
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     if (m.created <= anchor) continue;
-    if (m.completed === null) return true; // in-flight, serving our prompt right now
-    if (!m.hasError) return true; // ran clean
+    if (m.completed === null) {
+      // in-flight AND actually running
+      if (hasProducedOutput(m)) return "in-flight-progressed";
+      continue; // started but silent: no evidence yet, keep looking
+    }
+    if (!m.hasError) return "completed-clean"; // ran clean
   }
-  return false;
+  return null;
+}
+
+/**
+ * The newest post-anchor in-flight assistant turn that has produced no output.
+ *
+ * Only meaningful once `findVerificationEvidence` has returned false, which
+ * implies no post-anchor in-flight turn has produced anything. Returns the
+ * NEWEST such turn deliberately: it has the smallest elapsed silence, so
+ * ageing off it is the most conservative choice available.
+ *
+ * This is the structural difference between the two states the watchdog
+ * previously could not tell apart: an idle target has NO post-anchor assistant
+ * turn at all (nothing ever started — the benign case W3 reasoned about),
+ * whereas a wedged target HAS one that started and can never progress.
+ */
+function findSilentInFlight(
+  messages: ParsedMessage[],
+  anchor: number,
+): ParsedMessage | null {
+  let silent: ParsedMessage | null = null;
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    if (m.completed !== null) continue;
+    if (m.created <= anchor) continue;
+    if (hasProducedOutput(m)) continue;
+    if (silent === null || m.created > silent.created) silent = m;
+  }
+  return silent;
 }
 
 /**
@@ -312,6 +401,7 @@ export class DeliveryWatchdog {
   private readonly stuckAbortSilenceMs: number;
   private readonly maxRequeues: number;
   private readonly overdueAlertMs: number;
+  private readonly wedgedNoOutputMs: number;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
   // for this handoff episode. Pruned when the message verifies or goes
@@ -340,6 +430,8 @@ export class DeliveryWatchdog {
       opts.stuckAbortSilenceMs ?? DEFAULT_STUCK_ABORT_SILENCE_MS;
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
+    this.wedgedNoOutputMs =
+      opts.wedgedNoOutputMs ?? DEFAULT_WEDGED_NO_OUTPUT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -705,6 +797,82 @@ export class DeliveryWatchdog {
     return false;
   }
 
+  /**
+   * Terminal handling for a turn that started and then produced nothing for
+   * longer than `wedgedNoOutputMs`. The turn can never run, so the message did
+   * not arrive no matter what the 2xx said.
+   *
+   * Wake-like rows are marked failed and alerted durably, in ONE transaction,
+   * rather than redelivered: redelivery would land in the same broken session
+   * and wedge again, and W3 established that blind recovery for wakes does
+   * harm. Nobody is listening in-band for a wake, so the payload is inlined
+   * into the alert and a human can reschedule it by hand.
+   *
+   * Ordinary messages keep today's bounded, loud requeue ladder — a human IS
+   * waiting on those, and the session may simply be sick rather than doomed.
+   */
+  private async failSilentTurn(
+    row: SwarmMessageRecord,
+    sessionId: string,
+    now: number,
+    counts: CycleSummary,
+    silentFor: number,
+    interventionAlreadyUsed: boolean,
+  ): Promise<boolean> {
+    const detail =
+      `assistant turn started but produced no output for ${humanDuration(silentFor)} — ` +
+      `the target session cannot run it (working directory deleted, or serve wedged)`;
+
+    if (!isSuppressedFromRecovery(row)) {
+      if (interventionAlreadyUsed) {
+        return this.skipInterventionBudgetUsed(row, sessionId, counts);
+      }
+      return this.requeueOrTerminal(row, sessionId, now, counts, detail);
+    }
+
+    const reason = `${detail}; the wake did NOT run`;
+    // Enqueue the alert in the SAME transaction as the state change, so a
+    // crash cannot commit "failed" while losing the only human signal.
+    let marked = false;
+    this.storage.db.transaction(() => {
+      if (!this.storage.swarm.markFailed(row.msgId, now)) return;
+      marked = true;
+      notifySenderOfFailure(this.storage, row, reason, now);
+      this.storage.alerts.enqueue({
+        source: "wake-wedged",
+        refMsgId: row.msgId,
+        text: formatWakePayloadAlert(
+          row,
+          reason,
+          "delivery watchdog: wake was delivered but never ran",
+        ),
+        severity: "error",
+        now,
+      });
+    })();
+
+    if (!marked) {
+      // Raced with another terminal transition; it is no longer ours to fail.
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "wedged-row-already-terminal",
+      });
+      return false;
+    }
+
+    this.pruneDedupe(row.msgId);
+    counts.terminal++;
+    this.log("terminal", {
+      msgId: row.msgId,
+      sessionId,
+      reason: "wake-wedged-no-output",
+      silentFor,
+    });
+    return true;
+  }
+
   private async evaluateRow(
     row: SwarmMessageRecord,
     messages: ParsedMessage[],
@@ -750,12 +918,45 @@ export class DeliveryWatchdog {
       );
     }
 
-    if (findVerificationEvidence(messages, anchor)) {
+    const verifiedBy = findVerificationEvidence(messages, anchor);
+    if (verifiedBy) {
       this.storage.swarm.markVerified(row.msgId, now);
       this.pruneDedupe(row.msgId);
       counts.verified++;
-      this.log("verified", { msgId: row.msgId, sessionId });
+      // `reason` distinguishes the two evidence paths. Without it the last
+      // audit could not tell a genuinely-completed run from a rubber stamp,
+      // and 4763 verified rows were retroactively unknowable (pigeon-s9d).
+      this.log("verified", { msgId: row.msgId, sessionId, reason: verifiedBy });
       return false;
+    }
+
+    // A post-anchor turn that STARTED but has produced nothing. Distinct from
+    // the idle case below (where nothing started at all) and from the blocking
+    // case (where the turn predates our prompt). This is the shape a wake into
+    // a deleted working directory leaves behind.
+    const silent = findSilentInFlight(messages, anchor);
+    if (silent) {
+      const silentFor = now - silent.created;
+      if (silentFor <= this.wedgedNoOutputMs) {
+        // Genuinely UNKNOWN: real turns have taken over four minutes to emit
+        // their first part. Say nothing, change nothing, look again next
+        // cycle — the cadence is the second observation.
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "in-flight-no-output-yet",
+        });
+        return false;
+      }
+      return await this.failSilentTurn(
+        row,
+        sessionId,
+        now,
+        counts,
+        silentFor,
+        interventionAlreadyUsed,
+      );
     }
 
     const blocking = findBlockingInFlight(messages, anchor);
