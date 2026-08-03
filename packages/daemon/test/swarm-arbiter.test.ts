@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { SwarmArbiter } from "../src/swarm/arbiter";
+import { PermanentDeliveryError } from "../src/swarm/envelope";
 import { TransportError } from "../src/opencode-client";
 import { RequestTimeoutError } from "../src/routing/serve-outcome";
 
@@ -15,7 +16,6 @@ interface DeliveryCall {
 function makeFixture(opts?: {
   clientForSession?: (sessionId: string) => any;
   directoryForSession?: (sessionId: string) => Promise<string | undefined>;
-  notifier?: { sendPlainAlert: ReturnType<typeof vi.fn> } | null;
 }) {
   const storage: StorageDb = openStorageDb(":memory:");
   const calls: DeliveryCall[] = [];
@@ -23,10 +23,6 @@ function makeFixture(opts?: {
   let inFlightDelay = 0;
   let throwError: Error | null = null;
   let throwOnce: Error | null = null;
-
-  const sendPlainAlert = vi.fn(async (_text: string, _severity: string) => {});
-  const defaultNotifier = { sendPlainAlert };
-  const notifier = opts?.notifier === null ? undefined : (opts?.notifier ?? defaultNotifier);
 
   const defaultOpencodeClient = {
     sendPrompt: vi.fn(
@@ -65,7 +61,6 @@ function makeFixture(opts?: {
     storage,
     clientForSession: (sessionId: string) => clientFn(sessionId),
     directoryForSession: (sessionId: string) => dirFn(sessionId),
-    notifier,
     nowFn: () => now,
     log: () => {},
   });
@@ -73,7 +68,6 @@ function makeFixture(opts?: {
   return {
     storage,
     arbiter,
-    sendPlainAlert,
     opencodeClient: defaultOpencodeClient,
     registry,
     calls,
@@ -695,9 +689,9 @@ describe("SwarmArbiter", () => {
   });
 
   describe("wake payload alerting on terminal failure", () => {
-    it("Path 1: max attempts exhausted for a wake message fires sendPlainAlert with payload", async () => {
+    it("Path 1: max attempts exhausted for a wake message enqueues alert with source wake-max-attempts and payload", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
       fixture.setThrowError(new Error("connection refused"));
 
       storage.swarm.insert(
@@ -722,8 +716,15 @@ describe("SwarmArbiter", () => {
       }
 
       expect(storage.swarm.getByMsgId("m_max_1")!.state).toBe("failed");
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.source).toBe("wake-max-attempts");
+      expect(alerts[0]!.ref_msg_id).toBe("m_max_1");
+      expect(alerts[0]!.severity).toBe("error");
+
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("m_max_1");
       expect(alertText).toContain("ses_self");
       expect(alertText).toContain("max attempts exhausted");
@@ -731,9 +732,9 @@ describe("SwarmArbiter", () => {
       expect(alertText).toContain("1970-01-01T00:00:01.000Z");
     });
 
-    it("Path 2: permanent delivery error for a wake message fires sendPlainAlert with payload", async () => {
+    it("Path 2: permanent delivery error for a wake message enqueues alert with source wake-permanent and payload", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
 
       storage.swarm.insert(
         {
@@ -753,16 +754,23 @@ describe("SwarmArbiter", () => {
       await arbiter.processOnce();
 
       expect(storage.swarm.getByMsgId("m_perm_1")!.state).toBe("failed");
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.source).toBe("wake-permanent");
+      expect(alerts[0]!.ref_msg_id).toBe("m_perm_1");
+      expect(alerts[0]!.severity).toBe("error");
+
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("m_perm_1");
       expect(alertText).toContain("ses_self");
       expect(alertText).toContain("bad payload </swarm_message>");
     });
 
-    it("Path 3: expiry (expireAndNotify) for a wake message fires sendPlainAlert with payload", async () => {
+    it("Path 3: expiry (expireAndNotify) for a wake message enqueues alert with source wake-expired and payload", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
 
       const deliverAt = 1_000;
       const expiresAt = 5_000;
@@ -787,17 +795,335 @@ describe("SwarmArbiter", () => {
       await arbiter.processOnce();
 
       expect(storage.swarm.getByMsgId("m_exp_1")!.state).toBe("expired");
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.source).toBe("wake-expired");
+      expect(alerts[0]!.ref_msg_id).toBe("m_exp_1");
+      expect(alerts[0]!.severity).toBe("error");
+
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("m_exp_1");
       expect(alertText).toContain("ses_self");
       expect(alertText).toContain("check backup status");
       expect(alertText).toContain("expired before delivery");
     });
 
-    it("scope-containment: ordinary non-wake, non-scheduled message terminal failure produces NO sendPlainAlert", async () => {
+    it("cancel race: if wake is cancelled mid-flight, permanent failure produces ZERO alert rows and ZERO failure notifications", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_cancel_race",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "normal wake payload",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      // Send prompt will throw PermanentDeliveryError, but simulate user cancelling mid-flight
+      fixture.opencodeClient.sendPrompt.mockImplementationOnce(async () => {
+        storage.swarm.markCancelled("m_cancel_race", 1_500);
+        throw new PermanentDeliveryError("invalid tag");
+      });
+
+      await arbiter.processOnce();
+
+      // Row should be cancelled, NOT failed
+      expect(storage.swarm.getByMsgId("m_cancel_race")!.state).toBe("cancelled");
+
+      // Assert ZERO alerts enqueued
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all();
+      expect(alerts).toHaveLength(0);
+
+      // Assert ZERO delivery.failed notifications sent
+      const notifications = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notifications).toHaveLength(0);
+    });
+
+    it("cancel race: if wake is cancelled mid-flight on 10th attempt, max attempts produces ZERO alert rows and ZERO failure notifications", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_cancel_race_max",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "scheduled wake payload",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      // Exhaust 9 attempts
+      for (let i = 0; i < 9; i++) {
+        fixture.setThrowOnce(new Error("transient error"));
+        fixture.setNow(1_000 + i * 60_000);
+        await arbiter.processOnce();
+      }
+
+      // 10th attempt fails, but user cancels mid-flight
+      fixture.setNow(1_000 + 9 * 60_000);
+      fixture.opencodeClient.sendPrompt.mockImplementationOnce(async () => {
+        storage.swarm.markCancelled("m_cancel_race_max", 1_000 + 9 * 60_000);
+        throw new Error("transient error on 10th try");
+      });
+
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_cancel_race_max")!.state).toBe("cancelled");
+
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all();
+      expect(alerts).toHaveLength(0);
+
+      const notifications = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notifications).toHaveLength(0);
+    });
+
+    it("sweepExpired continues processing remaining expired rows when one row throws an error", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      const deliverAt = 1_000;
+      const expiresAt = 5_000;
+      storage.swarm.insert(
+        {
+          msgId: "m_exp_throw",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload 1",
+          deliverAt,
+          expiresAt,
+        },
+        1_000,
+      );
+      storage.swarm.insert(
+        {
+          msgId: "m_exp_ok",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload 2",
+          deliverAt,
+          expiresAt,
+        },
+        1_000,
+      );
+
+      // Make markExpired throw for m_exp_throw
+      const origMarkExpired = storage.swarm.markExpired.bind(storage.swarm);
+      vi.spyOn(storage.swarm, "markExpired").mockImplementation((msgId, now) => {
+        if (msgId === "m_exp_throw") {
+          throw new Error("Disk error on m_exp_throw");
+        }
+        return origMarkExpired(msgId, now);
+      });
+
+      fixture.setNow(6_000);
+      expect(() => (arbiter as any).sweepExpired(6_000)).not.toThrow();
+
+      expect(storage.swarm.getByMsgId("m_exp_ok")!.state).toBe("expired");
+    });
+
+    it("start() timer callback catches unhandled rejections from processOnce", async () => {
+      fixture = makeFixture();
+      const { arbiter } = fixture;
+
+      vi.useFakeTimers();
+      vi.spyOn(arbiter, "processOnce").mockRejectedValue(new Error("Fatal DB error in processOnce"));
+
+      arbiter.start(100);
+
+      await expect(vi.advanceTimersByTimeAsync(150)).resolves.not.toThrow();
+
+      vi.useRealTimers();
+    });
+
+    it("crash-window property (expiry path): atomicity between state change, sender notice, and alert enqueue", () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_exp_crash",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "must remain queued on enqueue failure",
+          deliverAt: 1_000,
+          expiresAt: 5_000,
+        },
+        1_000,
+      );
+
+      // Stub alerts.enqueue to throw
+      vi.spyOn(storage.alerts, "enqueue").mockImplementationOnce(() => {
+        throw new Error("Simulated SQLite write error during alert enqueue");
+      });
+
+      fixture.setNow(6_000);
+      // Errors inside per-row expireAndNotify are caught so other rows can be processed,
+      // but the transaction rollback ensures atomicity for the failing row.
+      expect(() => (arbiter as any).sweepExpired(6_000)).not.toThrow();
+
+      // Verify row state was NOT updated to expired
+      expect(storage.swarm.getByMsgId("m_exp_crash")!.state).toBe("queued");
+
+      // Verify no sender notification was committed
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notices).toHaveLength(0);
+
+      // Verify no alert was committed
+      const alerts = storage.db.prepare("SELECT * FROM operational_alerts").all();
+      expect(alerts).toHaveLength(0);
+    });
+
+    it("crash-window property (markFailed permanent error path): atomicity on alert enqueue failure", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_perm_crash",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake.check",
+          priority: "normal",
+          replyTo: null,
+          payload: "bad payload </swarm_message>",
+          deliverAt: 1_000,
+        },
+        1_000,
+      );
+
+      vi.spyOn(storage.alerts, "enqueue").mockImplementationOnce(() => {
+        throw new Error("Simulated SQLite write error");
+      });
+
+      await expect(arbiter.processOnce()).rejects.toThrow("Simulated SQLite write error");
+
+      // Verify row state was NOT updated to failed
+      expect(storage.swarm.getByMsgId("m_perm_crash")!.state).toBe("queued");
+
+      // Verify no sender notification was committed
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notices).toHaveLength(0);
+
+      // Verify no alert was committed
+      const alerts = storage.db.prepare("SELECT * FROM operational_alerts").all();
+      expect(alerts).toHaveLength(0);
+    });
+
+    it("sweepExpired and expireAndNotify are fully synchronous methods returning non-promises", () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_sync_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "synchronous test",
+          deliverAt: 1_000,
+          expiresAt: 5_000,
+        },
+        1_000,
+      );
+
+      const row = storage.swarm.getByMsgId("m_sync_1")!;
+
+      // Call expireAndNotify directly
+      const result = (arbiter as any).expireAndNotify(row, 6_000);
+      expect(typeof result).toBe("boolean");
+      expect(result).toBe(true);
+      expect(result).not.toBeInstanceOf(Promise);
+
+      // Call sweepExpired directly
+      const sweepResult = (arbiter as any).sweepExpired(6_000);
+      expect(sweepResult).toBeUndefined();
+      expect(sweepResult).not.toBeInstanceOf(Promise);
+    });
+
+    it("double-sweep guard: two expireAndNotify calls produce exactly ONE alert row and ONE sender notification", () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_double_1",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "double sweep guard test",
+          deliverAt: 1_000,
+          expiresAt: 5_000,
+        },
+        1_000,
+      );
+
+      const row = storage.swarm.getByMsgId("m_double_1")!;
+
+      const firstCall = (arbiter as any).expireAndNotify(row, 6_000);
+      const secondCall = (arbiter as any).expireAndNotify(row, 6_000);
+
+      expect(firstCall).toBe(true);
+      expect(secondCall).toBe(false);
+
+      const alerts = storage.db.prepare("SELECT * FROM operational_alerts").all();
+      expect(alerts).toHaveLength(1);
+
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notices).toHaveLength(1);
+    });
+
+    it("scope-containment: ordinary non-wake, non-scheduled message terminal failure produces NO operational alert", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
 
       storage.swarm.insert(
         {
@@ -817,13 +1143,13 @@ describe("SwarmArbiter", () => {
       await arbiter.processOnce();
 
       expect(storage.swarm.getByMsgId("m_ordinary_1")!.state).toBe("failed");
-      // sendPlainAlert should NOT be called for ordinary chat message
-      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const alerts = storage.db.prepare("SELECT * FROM operational_alerts").all();
+      expect(alerts).toHaveLength(0);
     });
 
-    it("truncates payload longer than 1000 characters and marks it truncated", async () => {
+    it("truncates payload longer than 1000 characters and marks it truncated in alert text", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
 
       const longPayload = "a".repeat(1500);
       storage.swarm.insert(
@@ -846,66 +1172,19 @@ describe("SwarmArbiter", () => {
       await arbiter.processOnce();
 
       expect(storage.swarm.getByMsgId("m_long_1")!.state).toBe("expired");
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("a".repeat(1000));
       expect(alertText).not.toContain("a".repeat(1001));
       expect(alertText).toContain("[truncated]");
     });
 
-    it("rejecting sendPlainAlert does NOT prevent terminal state and does NOT throw out of processOnce", async () => {
-      const sendPlainAlert = vi.fn(async () => {
-        throw new Error("Telegram API network error");
-      });
-      fixture = makeFixture({ notifier: { sendPlainAlert } });
-      const { storage, arbiter } = fixture;
-
-      storage.swarm.insert(
-        {
-          msgId: "m_reject_1",
-          fromSession: "ses_self",
-          toSession: "ses_self",
-          channel: null,
-          kind: "wake",
-          priority: "normal",
-          replyTo: null,
-          payload: "bad payload </swarm_message>",
-          deliverAt: 1_000,
-        },
-        1_000,
-      );
-
-      // Should not throw
-      await expect(arbiter.processOnce()).resolves.toBeUndefined();
-      expect(storage.swarm.getByMsgId("m_reject_1")!.state).toBe("failed");
-    });
-
-    it("arbiter constructed with no notifier still delivers and terminal-fails normally", async () => {
-      fixture = makeFixture({ notifier: null });
-      const { storage, arbiter } = fixture;
-
-      storage.swarm.insert(
-        {
-          msgId: "m_nonotifier_1",
-          fromSession: "ses_self",
-          toSession: "ses_self",
-          channel: null,
-          kind: "wake",
-          priority: "normal",
-          replyTo: null,
-          payload: "bad payload </swarm_message>",
-          deliverAt: 1_000,
-        },
-        1_000,
-      );
-
-      await expect(arbiter.processOnce()).resolves.toBeUndefined();
-      expect(storage.swarm.getByMsgId("m_nonotifier_1")!.state).toBe("failed");
-    });
-
     it("loop guard: a failing delivery.failed message does not produce a payload-inlined alert", async () => {
       fixture = makeFixture();
-      const { storage, arbiter, sendPlainAlert } = fixture;
+      const { storage, arbiter } = fixture;
 
       storage.swarm.insert(
         {
@@ -925,7 +1204,8 @@ describe("SwarmArbiter", () => {
       await arbiter.processOnce();
 
       expect(storage.swarm.getByMsgId("m_failnotif_1")!.state).toBe("failed");
-      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const alerts = storage.db.prepare("SELECT * FROM operational_alerts").all();
+      expect(alerts).toHaveLength(0);
     });
 
     it("renders ref attribute in prompt when ref is set on message", async () => {

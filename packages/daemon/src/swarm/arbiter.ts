@@ -1,7 +1,6 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { OpencodeClient } from "../opencode-client";
-import type { StopNotifier, AlertSeverity } from "../notification-service";
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
@@ -13,13 +12,10 @@ import {
 
 export { DELIVERY_FAILED_KIND };
 
-export type ArbiterNotifier = Pick<StopNotifier, "sendPlainAlert">;
-
 export interface ArbiterOptions {
   storage: StorageDb;
   clientForSession: (sessionId: string) => OpencodeClient | undefined;   // replaces opencodeClient
   directoryForSession: (sessionId: string) => Promise<string | undefined>; // replaces registry
-  notifier?: ArbiterNotifier;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -46,7 +42,6 @@ export class SwarmArbiter {
   private readonly storage: StorageDb;
   private readonly clientForSession: (sessionId: string) => OpencodeClient | undefined;
   private readonly directoryForSession: (sessionId: string) => Promise<string | undefined>;
-  private readonly notifier?: ArbiterNotifier;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -63,25 +58,19 @@ export class SwarmArbiter {
     this.storage = opts.storage;
     this.clientForSession = opts.clientForSession;
     this.directoryForSession = opts.directoryForSession;
-    this.notifier = opts.notifier;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
   }
 
-  private async alert(severity: AlertSeverity, text: string): Promise<void> {
-    if (!this.notifier?.sendPlainAlert) return;
-    try {
-      await this.notifier.sendPlainAlert(text, severity);
-    } catch (err) {
-      this.log("alert send failed", { error: String(err) });
-    }
-  }
-
   start(intervalMs = 500): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.processOnce();
+      void this.processOnce().catch((err) => {
+        this.log("processOnce unhandled error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }, intervalMs);
   }
 
@@ -94,7 +83,7 @@ export class SwarmArbiter {
 
   async processOnce(): Promise<void> {
     const now = this.nowFn();
-    await this.sweepExpired(now);
+    this.sweepExpired(now);
     const targets = this.storage.swarm.listTargetsWithReady(now);
     await Promise.all(targets.map((t) => this.drainTarget(t)));
   }
@@ -110,21 +99,26 @@ export class SwarmArbiter {
    * is guarded on `state = 'queued'`, so a row already taken by cancel or by a
    * concurrent sweep produces no second notification.
    */
-  private async expireAndNotify(row: SwarmMessageRecord, now: number): Promise<boolean> {
-    if (!this.storage.swarm.markExpired(row.msgId, now)) return false;
-    this.log("expired", { msgId: row.msgId, target: row.toSession ?? row.channel });
-    const scheduledIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
-    const reason =
-      `expired before delivery (scheduled for ${scheduledIso}, ` +
-      `expired at ${new Date(now).toISOString()})`;
-    notifySenderOfFailure(this.storage, row, reason, now);
-    if (isSuppressedFromRecovery(row)) {
-      await this.alert(
-        "error",
-        formatWakePayloadAlert(row, reason, "expired before delivery"),
-      );
-    }
-    return true;
+  private expireAndNotify(row: SwarmMessageRecord, now: number): boolean {
+    return this.storage.db.transaction(() => {
+      if (!this.storage.swarm.markExpired(row.msgId, now)) return false;
+      this.log("expired", { msgId: row.msgId, target: row.toSession ?? row.channel });
+      const scheduledIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
+      const reason =
+        `expired before delivery (scheduled for ${scheduledIso}, ` +
+        `expired at ${new Date(now).toISOString()})`;
+      notifySenderOfFailure(this.storage, row, reason, now);
+      if (isSuppressedFromRecovery(row)) {
+        this.storage.alerts.enqueue({
+          source: "wake-expired",
+          refMsgId: row.msgId,
+          text: formatWakePayloadAlert(row, reason, "expired before delivery"),
+          severity: "error",
+          now,
+        });
+      }
+      return true;
+    })();
   }
 
   /**
@@ -138,10 +132,23 @@ export class SwarmArbiter {
    * `created_at ASC`, so an expired 13h-old wake would otherwise sort first and
    * wedge every later message to the same target behind a row that can never
    * deliver.
+   *
+   * processOnce runs every 500ms with NO reentrancy guard and awaits
+   * sweepExpired BEFORE drainTarget. With the old inline alerts, N expired
+   * rows meant up to N×10s of Telegram latency inside the sweep, stalling live
+   * deliveries behind it and stacking ~20 overlapping processOnce calls per
+   * wedged send. Making the sweep synchronous removes that structurally.
    */
-  private async sweepExpired(now: number): Promise<void> {
+  private sweepExpired(now: number): void {
     for (const row of this.storage.swarm.listExpired(now)) {
-      await this.expireAndNotify(row, now);
+      try {
+        this.expireAndNotify(row, now);
+      } catch (err) {
+        this.log("sweepExpired error for row", {
+          msgId: row.msgId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -170,7 +177,7 @@ export class SwarmArbiter {
       // await in it. Cheap to check and the alternative is delivering a wake
       // the caller already declared worthless.
       if (next.expiresAt !== null && next.expiresAt <= now) {
-        await this.expireAndNotify(next, now);
+        this.expireAndNotify(next, now);
         continue;
       }
 
@@ -222,20 +229,30 @@ export class SwarmArbiter {
         // contains the literal close tag). Fail fast instead of burning
         // MAX_ATTEMPTS retries over ~6 minutes.
         if (err instanceof PermanentDeliveryError) {
-          this.storage.swarm.markFailed(next.msgId, this.nowFn());
-          this.log("failed (permanent)", {
-            msgId: next.msgId,
-            error: String(err),
-          });
-          notifySenderOfFailure(this.storage, next, String(err), this.nowFn());
-          if (isSuppressedFromRecovery(next)) {
-            await this.alert(
-              "error",
-              formatWakePayloadAlert(
-                next,
-                `permanent delivery error (${String(err)})`,
-              ),
-            );
+          const now = this.nowFn();
+          let marked = false;
+          this.storage.db.transaction(() => {
+            if (!this.storage.swarm.markFailed(next.msgId, now)) return;
+            marked = true;
+            notifySenderOfFailure(this.storage, next, String(err), now);
+            if (isSuppressedFromRecovery(next)) {
+              this.storage.alerts.enqueue({
+                source: "wake-permanent",
+                refMsgId: next.msgId,
+                text: formatWakePayloadAlert(
+                  next,
+                  `permanent delivery error (${String(err)})`,
+                ),
+                severity: "error",
+                now,
+              });
+            }
+          })();
+          if (marked) {
+            this.log("failed (permanent)", {
+              msgId: next.msgId,
+              error: String(err),
+            });
           }
           return; // stop draining this target until next tick
         }
@@ -275,20 +292,30 @@ export class SwarmArbiter {
           const after = this.storage.swarm.getByMsgId(next.msgId);
           const attempts = (after?.attempts ?? 0) + 1;
           if (attempts >= MAX_ATTEMPTS) {
-            this.storage.swarm.markFailed(next.msgId, this.nowFn());
-            this.log("failed (max attempts)", {
-              msgId: next.msgId,
-              error: String(err),
-            });
-            notifySenderOfFailure(this.storage, next, String(err), this.nowFn());
-            if (isSuppressedFromRecovery(next)) {
-              await this.alert(
-                "error",
-                formatWakePayloadAlert(
-                  next,
-                  `max attempts exhausted (${String(err)})`,
-                ),
-              );
+            const now = this.nowFn();
+            let marked = false;
+            this.storage.db.transaction(() => {
+              if (!this.storage.swarm.markFailed(next.msgId, now)) return;
+              marked = true;
+              notifySenderOfFailure(this.storage, next, String(err), now);
+              if (isSuppressedFromRecovery(next)) {
+                this.storage.alerts.enqueue({
+                  source: "wake-max-attempts",
+                  refMsgId: next.msgId,
+                  text: formatWakePayloadAlert(
+                    next,
+                    `max attempts exhausted (${String(err)})`,
+                  ),
+                  severity: "error",
+                  now,
+                });
+              }
+            })();
+            if (marked) {
+              this.log("failed (max attempts)", {
+                msgId: next.msgId,
+                error: String(err),
+              });
             }
           } else {
             this.storage.swarm.markRetry(

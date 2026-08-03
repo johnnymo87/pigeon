@@ -10,6 +10,7 @@ import {
   SessionTokenRepository,
 } from "./repos";
 import { OutboxRepository } from "./outbox-repo";
+import { initAlertSchema, AlertRepository } from "./alert-repo";
 import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
 import { initRouteSchema } from "../routing/route-schema";
@@ -24,6 +25,7 @@ export interface StorageDb {
   inbox: InboxRepository;
   pendingQuestions: PendingQuestionRepository;
   outbox: OutboxRepository;
+  alerts: AlertRepository;
   swarm: SwarmRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
@@ -42,6 +44,7 @@ export function openStorageDb(path: string): StorageDb {
   db.exec("PRAGMA foreign_keys = ON;");
   initSchema(db);
   initSwarmSchema(db);
+  initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
   // whose digest the serve pool validates at startup. See reassignment-repo.ts.
@@ -55,6 +58,7 @@ export function openStorageDb(path: string): StorageDb {
     inbox: new InboxRepository(db),
     pendingQuestions: new PendingQuestionRepository(db),
     outbox: new OutboxRepository(db),
+    alerts: new AlertRepository(db),
     swarm: new SwarmRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
