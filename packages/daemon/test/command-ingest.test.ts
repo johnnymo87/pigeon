@@ -1423,8 +1423,69 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       expect(capturedReply).toBeNull();
       // Must drop command and reply to user explaining question was superseded and echoing text
       expect(sentTelegramText).not.toBeNull();
-      expect(sentTelegramText!).toContain("superseded");
+      expect(sentTelegramText!).toContain("replaced by a newer one");
+      // Typed text is echoed back so the user does not have to retype it.
       expect(sentTelegramText!).toContain("Use MongoDB");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not echo the raw option token when a superseded answer was a button press", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-2b",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-meta-2b",
+        requestId: "req-pending",
+        questions: [{
+          question: "Which DB?",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now);
+
+      let capturedReply: QuestionReplyInput | null = null;
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-2b",
+          sessionId: "sess-meta-2b",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-stale" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      expect(capturedReply).toBeNull();
+      expect(sentTelegramText).not.toBeNull();
+      expect(sentTelegramText!).toContain("replaced by a newer one");
+      // The user pressed a button; "q0" is an internal wire token they never
+      // typed, so quoting it back would be gibberish.
+      expect(sentTelegramText!).not.toContain("q0");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
