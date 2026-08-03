@@ -3068,3 +3068,475 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
     storage.db.close();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3 (pigeon-tyk) + W4 (pigeon-bru): media/empty-command hygiene.
+//
+// These two beads share one repro — a caption-less photo replying to a pending
+// question — which is why they are fixed together. That single message proves
+// both defects at once: the empty string is submitted as the ANSWER (W4) and the
+// file is discarded (W3), because the question path returns long before the
+// media fetch at the bottom of ingestWorkerCommand.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => {
+  const photo = { key: "inbound/1-a/photo.jpg", mime: "image/jpeg", filename: "photo.jpg", size: 999 };
+
+  const twoQuestions = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+    { question: "Q2", header: "H2", options: [{ label: "X", description: "" }, { label: "Y", description: "" }] },
+  ];
+  const oneQuestion = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+  ];
+
+  function questionSession(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+    return { storage, now };
+  }
+
+  // ── W4: a file must never become a question's answer ──────────────────────
+
+  it("refuses a caption-less media reply to a single question instead of answering with ''", async () => {
+    const { storage, now } = questionSession("sess-w4-single");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w4-single", requestId: "req-1", questions: oneQuestion, token: "tok-1",
+    }, now);
+
+    const replies: string[] = [];
+    const answersSeen: unknown[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w4-1", sessionId: "sess-w4-single", command: "", chatId: "80", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply(_s: unknown, payload: { answers: unknown }) {
+            answersSeen.push(payload.answers);
+            return { ok: true as const };
+          },
+        }),
+        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+      },
+    );
+
+    // The empty string must NOT have been submitted as the answer.
+    expect(answersSeen).toHaveLength(0);
+    // The question is still waiting, so the user can still answer it.
+    expect(storage.pendingQuestions.getBySessionId("sess-w4-single")).not.toBeNull();
+    // And they were told why nothing happened.
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatch(/question/i);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("refuses a caption-less media reply to a wizard without advancing the step", async () => {
+    const { storage, now } = questionSession("sess-w4-wiz");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w4-wiz", requestId: "req-2", questions: twoQuestions, token: "tok-2",
+    }, now);
+    const before = storage.pendingQuestions.getBySessionId("sess-w4-wiz")!;
+
+    const replies: string[] = [];
+    const editCalls: unknown[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w4-2", sessionId: "sess-w4-wiz", command: "", chatId: "81", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        editNotification: async (...args: unknown[]) => { editCalls.push(args); return { ok: true }; },
+        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+      },
+    );
+
+    const after = storage.pendingQuestions.getBySessionId("sess-w4-wiz")!;
+    // No advance: step, version and accumulated answers are all untouched.
+    expect(after.currentStep).toBe(before.currentStep);
+    expect(after.version).toBe(before.version);
+    expect(after.answers).toEqual(before.answers);
+    // The on-screen keyboard is still valid, so it must not be edited away.
+    expect(editCalls).toHaveLength(0);
+    expect(replies).toHaveLength(1);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("delivers the caption as the answer but warns that the file was not delivered", async () => {
+    const { storage, now } = questionSession("sess-w4-cap");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w4-cap", requestId: "req-3", questions: oneQuestion, token: "tok-3",
+    }, now);
+
+    const replies: string[] = [];
+    const answersSeen: unknown[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w4-3", sessionId: "sess-w4-cap", command: "my answer", chatId: "82", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply(_s: unknown, payload: { answers: unknown }) {
+            answersSeen.push(payload.answers);
+            return { ok: true as const };
+          },
+        }),
+        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+      },
+    );
+
+    // A captioned reply carries a real answer, so it is still delivered.
+    expect(answersSeen).toEqual([[["my answer"]]]);
+    // But the file went nowhere, and silence about that is the defect this epic exists to kill.
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatch(/file/i);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("refuses an empty text-only message to a pending question (the bead's literal criterion)", async () => {
+    const { storage, now } = questionSession("sess-w4-empty");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w4-empty", requestId: "req-4", questions: oneQuestion, token: "tok-4",
+    }, now);
+
+    const answersSeen: unknown[] = [];
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w4-4", sessionId: "sess-w4-empty", command: "   ", chatId: "83" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply(_s: unknown, payload: { answers: unknown }) {
+            answersSeen.push(payload.answers);
+            return { ok: true as const };
+          },
+        }),
+        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+      },
+    );
+
+    expect(answersSeen).toHaveLength(0);
+    expect(storage.pendingQuestions.getBySessionId("sess-w4-empty")).not.toBeNull();
+    expect(replies).toHaveLength(1);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("refuses media on the metadata-fallback question path too", async () => {
+    // No local pending row: this is the stale-state rescue path, which has its
+    // own copy of the empty-answer bug at `[[msg.command.trim()]]`.
+    const { storage } = questionSession("sess-w4-meta");
+
+    const answersSeen: unknown[] = [];
+    const replies: string[] = [];
+    const delivered: unknown[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-w4-5", sessionId: "sess-w4-meta", command: "", chatId: "84",
+        media: photo, metadata: { questionRequestId: "req-5" },
+      }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_s: unknown, cmd: unknown) { delivered.push(cmd); return { ok: true as const }; },
+          async deliverQuestionReply(_s: unknown, payload: { answers: unknown }) {
+            answersSeen.push(payload.answers);
+            return { ok: true as const };
+          },
+        }),
+        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+      },
+    );
+
+    expect(answersSeen).toHaveLength(0);
+    expect(replies).toHaveLength(1);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  // ── W3: a caption-less file must still reach the session ──────────────────
+
+  it("substitutes a placeholder so caption-less media is delivered instead of rejected", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-w3-1", notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, Date.now());
+
+    const bytes = Buffer.from("img");
+    const fetchFn = vi.fn(async () => new Response(bytes, { status: 200 }));
+
+    let deliveredCommand: string | null = null;
+    let deliveredCtx: CommandDeliveryContext | null = null;
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w3-1", sessionId: "sess-w3-1", command: "", chatId: "85", media: photo }),
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "k",
+        fetchFn: fetchFn as unknown as typeof fetch,
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_s: unknown, cmd: string, ctx: CommandDeliveryContext) {
+            deliveredCommand = cmd;
+            deliveredCtx = ctx;
+            return { ok: true as const };
+          },
+        }),
+      },
+    );
+
+    // The whole point: it is delivered, not rejected as an empty envelope.
+    const cmd = deliveredCommand as string | null;
+    expect(cmd).toBeTruthy();
+    expect(cmd!.trim().length).toBeGreaterThan(0);
+    // The placeholder must describe the file factually — the agent reads it verbatim.
+    expect(cmd).toContain("photo.jpg");
+    // And the bytes still ride along.
+    expect((deliveredCtx as CommandDeliveryContext | null)?.media).toBeDefined();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("leaves a captioned media command exactly as the user wrote it", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-w3-2", notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, Date.now());
+
+    const fetchFn = vi.fn(async () => new Response(Buffer.from("img"), { status: 200 }));
+    let deliveredCommand: string | null = null;
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w3-2", sessionId: "sess-w3-2", command: "what is this?", chatId: "86", media: photo }),
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "k",
+        fetchFn: fetchFn as unknown as typeof fetch,
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_s: unknown, cmd: string) { deliveredCommand = cmd; return { ok: true as const }; },
+        }),
+      },
+    );
+
+    expect(deliveredCommand).toBe("what is this?");
+
+    storage.db.close();
+  });
+
+  it("never synthesizes a placeholder for a media-less empty command", async () => {
+    // The hard constraint from the bead: synthesizing here would inject a
+    // garbage prompt into an agent at 3am. Empty-and-media-less must stay empty
+    // and be rejected downstream, exactly as it is today.
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-w3-3", notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, Date.now());
+
+    let deliveredCommand: string | null = null;
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w3-3", sessionId: "sess-w3-3", command: "", chatId: "87" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand(_s: unknown, cmd: string) { deliveredCommand = cmd; return { ok: true as const }; },
+        }),
+      },
+    );
+
+    expect(deliveredCommand).toBe("");
+
+    storage.db.close();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3/W4 follow-ups from adversarial review of the first cut.
+//
+// The "your file wasn't delivered" warning originally fired at question-path
+// entry, before delivery was attempted. Two ways that misleads, both of which
+// are the exact defect class this epic exists to kill:
+//   1. a transient failure re-ingests the command, re-sending the warning once
+//      per lease cycle, unbounded;
+//   2. on the metadata-fallback branch a terminal failure falls through to
+//      regular delivery, which DOES deliver the file — so the warning was a lie.
+// It now fires only once the caption has actually been accepted as the answer.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("ingestWorkerCommand — media warning fires only on a delivered answer (W3/W4)", () => {
+  const photo = { key: "inbound/2-b/doc.pdf", mime: "application/pdf", filename: "doc.pdf", size: 10 };
+  const oneQuestion = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+  ];
+
+  function questionSession(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId, notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, now);
+    return { storage, now };
+  }
+
+  it("does not warn about the file when the answer transiently fails (no retry spam)", async () => {
+    const { storage, now } = questionSession("sess-spam");
+    storage.pendingQuestions.store({
+      sessionId: "sess-spam", requestId: "req-s", questions: oneQuestion, token: "t",
+    }, now);
+
+    const replies: string[] = [];
+
+    // A connection error is transient: it throws so the Poller retries the whole
+    // command. Any message sent before that point is sent again on every retry.
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-spam", sessionId: "sess-spam", command: "my answer", chatId: "90", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "ECONNREFUSED" }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    )).rejects.toThrow();
+
+    expect(replies).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("does not warn about the file when the answer terminally fails", async () => {
+    const { storage, now } = questionSession("sess-term");
+    storage.pendingQuestions.store({
+      sessionId: "sess-term", requestId: "req-t", questions: oneQuestion, token: "t",
+    }, now);
+
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-term", sessionId: "sess-term", command: "my answer", chatId: "91", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    // Exactly one message: the delivery failure. Adding a "your file wasn't
+    // delivered" note here would contradict it — nothing was delivered at all.
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain("QUESTION_NOT_FOUND");
+    expect(replies.some((r) => /file/i.test(r))).toBe(false);
+
+    storage.db.close();
+  });
+
+  it("does not claim the question is still waiting on the metadata-fallback branch", async () => {
+    // There is no local pending row here by definition — that is why this branch
+    // exists. Telling the user to "tap an option" may be false.
+    const { storage } = questionSession("sess-fb");
+
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-fb", sessionId: "sess-fb", command: "", chatId: "92",
+        media: photo, metadata: { questionRequestId: "req-f" },
+      }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).not.toMatch(/still waiting/i);
+
+    storage.db.close();
+  });
+
+  it("tells the user the file was lost when delivery falls back to revive", async () => {
+    // The revive fallback talks to opencode-serve directly and has no file
+    // channel. Without the notice the session receives the placeholder text
+    // describing a file that never arrived.
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-revive-media", notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, Date.now());
+
+    const prompts: string[] = [];
+    const fetchFn = vi.fn(async () => new Response(Buffer.from("img"), { status: 200 }));
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-revive-media", sessionId: "sess-revive-media", command: "", chatId: "93", media: photo }),
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "k",
+        fetchFn: fetchFn as unknown as typeof fetch,
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false as const, error: "ECONNREFUSED" }; },
+        }),
+        opencodeClient: {
+          async getSession() { return { id: "sess-revive-media", directory: "/tmp/proj" }; },
+          async sendPrompt(_sid: string, _dir: string, prompt: string) { prompts.push(prompt); },
+        } as never,
+      },
+    );
+
+    expect(prompts).toHaveLength(1);
+    // Both halves matter: what the file was, and that it did not arrive.
+    expect(prompts[0]).toContain("doc.pdf");
+    expect(prompts[0]).toMatch(/could not be delivered/i);
+
+    storage.db.close();
+  });
+});
