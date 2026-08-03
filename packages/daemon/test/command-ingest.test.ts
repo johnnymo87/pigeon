@@ -1549,6 +1549,120 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       storage.db.close();
     });
 
+    it("deletes a resurrected row when opencode says the question is gone, so later replies are not trapped", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-gone",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-gone",
+        requestId: "req-gone-1",
+        questions: [{
+          question: "Pick database",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now - 5 * 3600 * 1000);
+
+      let sentTelegramText: string | null = null;
+
+      // opencode no longer knows this question: a terminal (non-transient) failure.
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-res-gone",
+          sessionId: "sess-res-gone",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-gone-1" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "OpenCode question reply failed: 404 question not found" };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      // The row must be gone. Keeping it would re-resurrect on every retry —
+      // resurrection ignores expires_at, so the row would never age out — and
+      // trap every future swipe-reply to this card against a dead question.
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-gone")).toBeNull();
+      expect(sentTelegramText).not.toBeNull();
+      // Must not repeat the live-row advice, which cannot work here.
+      expect(sentTelegramText!).not.toContain("Tap the option again, or reply with text, to retry");
+      expect(sentTelegramText!).toContain("no longer open");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("keeps a LIVE row on terminal failure so the on-screen keyboard stays retryable", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-live-keep",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-live-keep",
+        requestId: "req-live-keep",
+        questions: [{
+          question: "Pick database",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now);
+
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-live-keep",
+          sessionId: "sess-live-keep",
+          command: "q0",
+          chatId: "1",
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "OpenCode question reply failed: 500 boom" };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      // Unchanged pre-existing behavior: the row survives so a second tap retries.
+      expect(storage.pendingQuestions.getBySessionId("sess-live-keep")).not.toBeNull();
+      expect(sentTelegramText!).toContain("Tap the option again");
+
+      storage.db.close();
+    });
+
     it("advances a resurrected wizard mid-step rather than soft-locking", async () => {
       const now = Date.now();
       const storage = openStorageDb(":memory:");

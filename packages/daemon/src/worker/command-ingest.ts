@@ -153,10 +153,12 @@ export async function ingestWorkerCommand(
   // Deliberately does not extend expires_at: a live row hijacks EVERY plain
   // message to the session into the question-reply path below, so re-arming
   // that for ordinary prompts would be a regression.
+  let resurrected = false;
   if (!pendingQuestion && msg.metadata?.questionRequestId) {
     const expired = storage.pendingQuestions.getBySessionIdIncludingExpired(msg.sessionId);
     if (expired && expired.requestId === msg.metadata.questionRequestId) {
       pendingQuestion = expired;
+      resurrected = true;
       console.log(`[command-ingest] resurrected expired pending question sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
     }
   }
@@ -328,6 +330,9 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
+      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+        return;
+      }
       // Deliberately keep the pending question row and leave the notification
       // alone. The final step never calls advanceStep, so `version` is unchanged
       // by this failure and the keyboard still on screen remains valid — the
@@ -371,6 +376,9 @@ export async function ingestWorkerCommand(
 
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
+    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+      return;
+    }
     // Row preserved for the same reason as the wizard final step above: the
     // single-question path never mutates it, so the keyboard stays valid.
     await dropCommand(
@@ -690,6 +698,40 @@ async function dropCommand(
  * fails identically every time — but each attempt now says so, and the row
  * expires on its own TTL rather than lingering forever.
  */
+/**
+ * A resurrected question that opencode then refused is a question that really
+ * is gone — the row outlived the thing it described.
+ *
+ * Handled apart from the live-row failure paths, which keep the row on purpose
+ * so the on-screen keyboard stays valid for a retry. That reasoning inverts
+ * here: the retry cannot ever succeed, and because resurrection ignores
+ * `expires_at`, keeping the row would re-resurrect on every attempt and trap
+ * every future swipe-reply to this card in the same wall forever. Deleting it
+ * restores the pre-resurrection escape hatch — the next message to the session
+ * is treated as an ordinary prompt and reaches opencode.
+ *
+ * Returns true when it handled the command.
+ */
+async function dropResurrectedQuestionThatIsGone(
+  resurrected: boolean,
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  options: WorkerCommandIngestOptions,
+): Promise<boolean> {
+  if (!resurrected) return false;
+  storage.pendingQuestions.delete(msg.sessionId);
+  console.warn(`[command-ingest] resurrected question is gone, dropping row sessionId=${msg.sessionId} commandId=${commandId}`);
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    "That question is no longer open in the session, so your answer wasn't recorded. Tapping again won't help — send it as a normal message if you still want it to reach the session.",
+    options.sendTelegramReply,
+  );
+  return true;
+}
+
 /**
  * Reply text for an answer to a question that a newer one has replaced.
  *
