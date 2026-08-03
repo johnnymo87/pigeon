@@ -69,8 +69,9 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | 🔵 in review (#43) |
 | `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | ready |
 | `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | ready |
-| `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
-| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
+| `pigeon-tyk` | W3 — caption-less media dropped (not silently — see §9) | P2 | 🔵 in review (#45) |
+| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | 🔵 in review (#45) |
+| `pigeon-k4c.5` | R2 media fetch treats a 404 as transient and retries forever | P2 | ready |
 
 ### Why W0 gated everything — and how it resolved
 
@@ -115,9 +116,9 @@ PR #39 for the reason recorded in §6.
 
 | Next | Why |
 |------|-----|
-| `pigeon-tyk` + `pigeon-bru` (W3 + W4) | Now genuinely coupled by the caption-less-media case; W3 has an open design fork (placeholder caption vs. contract relaxation) worth an oracle consult. Only remaining items that are not question-path work. |
 | `pigeon-k4c.4` (W2e) | Small and well-scoped: apply the version guard whenever the payload is wizard-shaped, not only when the *current* question is a wizard. Pairs naturally with W2d since both concern stale question state. |
-| `pigeon-k4c.3` (W2d) | Lowest urgency: noisy rather than silent, and strictly better than what it replaced. |
+| `pigeon-k4c.3` (W2d) | Noisy rather than silent, and strictly better than what it replaced. |
+| `pigeon-k4c.5` | Independent of the question path entirely — a stuck-retry bug in the media fetch. Can be done any time, by anyone. |
 
 All three P1s are now merged or in review; everything remaining is P2. Status column mirrors
 `bd`: ✅ = closed, 🔵 = in_progress (PR open, bead stays open until it merges), ready = open.
@@ -389,3 +390,79 @@ closed" is holding up.
 `pigeon-k4c.4` (W2e): a stale wizard button can answer a **new single question**, because the
 version guard at `:148` only runs when the *current* question is a wizard. A wizard-shaped payload
 arriving for a single question is stale by definition, but its version is never examined.
+
+---
+
+## 9. W3 + W4 outcome (PR #45, `pigeon-tyk` + `pigeon-bru`)
+
+Shipped together because they are **one repro**: a caption-less photo replying to a question
+notification submits `''` as the answer (W4) *and* discards the file (W3). Fixing either alone
+leaves that user action broken.
+
+W4 is the nastiest shape this epic has produced. Every other item fails loudly or silently;
+this one **succeeds with garbage** — the wizard advances, the answer is recorded, and nothing
+anywhere reports a problem. The validator permitted it because `answers` only has to satisfy
+`Array.isArray`.
+
+### The fork resolved to an option that was not on the bead
+
+The bead offered (a) synthesize a placeholder caption at the worker, or (b) relax the contract
+to allow an empty command iff media is present. The answer was **neither**: synthesize in the
+*daemon*, on the execute path, after both question branches have returned.
+
+(a) is actively unsafe in a way the bead did not anticipate — worker-synthesized text flows
+into the question path and becomes a question's **answer**, manufacturing a fresh instance of
+the very bug W4 fixes. (b) is safe but ineffective: the plugin is loaded into long-lived
+opencode TUI processes holding the old validator, so it would take effect only as each TUI
+restarted, and a media-only prompt reaches opencode with no text context at all.
+
+A third option — carry the file *as* the answer — was ruled **impossible here**, not merely
+expensive. The plugin's `onQuestionReply` POSTs `{answers}` to opencode's own
+`/question/:id/reply`, which has no file channel. That is an upstream opencode change.
+
+### Both beads were wrong about something, in opposite directions
+
+- **`pigeon-bru` had the fix layer inverted.** It argued "only a worker-side guard closes it".
+  The worker *cannot*: `resolveMessageSession` sets `questionRequestId` only for swipe-replies
+  to a `q:` notification, so topic-routed messages carry no question context — yet
+  `getBySessionId` hijacks them into the question path anyway. Only the daemon knows a
+  question is pending. A worker guard would be a sieve.
+- **`pigeon-tyk` was stale on severity.** "Silently dropped" stopped being true at #39, which
+  made terminal rejections reply `Command rejected: Invalid execute envelope`. Loud, cryptic,
+  and still lossy.
+
+That is now **three consecutive cycles** in which a bead's own stated conclusion had to be
+overturned by reading the code (W2b's inverted criterion, W4's repro change, and now W4's
+layer claim). Beads record what was believed when they were filed; verify before obeying.
+
+### What the review changed
+
+The "your file wasn't delivered" warning originally fired at question-path *entry*. Two ways
+that misleads, both the same class this epic exists to kill: a transient failure throws so the
+Poller retries the whole command, re-sending the warning once per lease cycle **unbounded**;
+and on the metadata-fallback branch a terminal failure falls through to regular delivery which
+*does* carry the file, making the warning an outright lie. It now fires only where an answer
+has actually been accepted.
+
+### Mutation testing, fourth cycle running
+
+Ten mutants, **one survivor**: reverting the revive-path "file could not be delivered" notice
+left the suite entirely green — that string appeared in zero tests. The lesson is the same one
+as §8's, in a new costume: the code was *correct* and completely unprotected, so the next
+refactor would have silently removed it.
+
+Zero pre-existing assertions changed, verified rather than assumed — `main` has no test
+asserting empty-answer acceptance, and its media tests are all captioned.
+
+### Discovered, filed, not fixed
+
+`pigeon-k4c.5` (P2): the R2 media fetch throws on any non-`ok` response, which the ingest
+contract reads as transient. A 404 — the *normal* outcome once R2's 24h TTL sweeps the object —
+therefore retries forever and is never acked. Pre-existing; unchanged by this PR.
+
+### A note on `pigeon-m68`
+
+The flaky-test bead is no longer flaky. `lease-cas-concurrency.test.ts` now fails
+**deterministically**, verified 1/1 in a throwaway worktree at clean `origin/main`. Prior
+guidance to "re-run it in isolation" is stale and actively misleading: re-running no longer
+clears it, so anyone treating a red there as noise will be wrong.
