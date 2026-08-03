@@ -309,6 +309,36 @@ describe("reapStaleSessions", () => {
     expect(result.orphanedQuestions).toBe(0);
     expect(storage.pendingQuestions.getBySessionIdIncludingExpired("live-q-1")).not.toBeNull();
   });
+
+  it("runs orphan question sweep unconditionally every cycle even when reaped and expired are zero", async () => {
+    storage = openStorageDb(":memory:");
+    const now = Date.now();
+
+    storage.sessions.upsert({ sessionId: "sess-direct-del", notify: true }, now);
+    storage.pendingQuestions.store({
+      sessionId: "sess-direct-del",
+      requestId: "req-direct-del",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, now);
+
+    // Simulate direct deletion (e.g. DELETE /sessions/:id or connection error cleanup)
+    storage.sessions.delete("sess-direct-del");
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const result = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(result.reaped).toBe(0);
+    expect(result.expired).toBe(0);
+    expect(result.orphanedQuestions).toBe(1);
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-direct-del")).toBeNull();
+  });
 });
 
 describe("startSessionReaper", () => {

@@ -460,6 +460,10 @@ export class PendingQuestionRepository {
   /**
    * Delete pending questions whose session no longer exists in `sessions`.
    *
+   * Uses `NOT EXISTS` rather than `NOT IN` because a single NULL `session_id`
+   * in `sessions` would silently disable `NOT IN` in SQLite without error, and
+   * the column is not declared `NOT NULL`.
+   *
    * Orphan rows are unreachable because `command-ingest` checks `sessions.get`
    * before any `pending_questions` read; do NOT add an age/expiry-based sweep
    * here — expired-but-live rows are load-bearing for question resurrection
@@ -469,7 +473,7 @@ export class PendingQuestionRepository {
     const result = this.db
       .prepare(
         `DELETE FROM pending_questions
-         WHERE session_id NOT IN (SELECT session_id FROM sessions)`,
+         WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = pending_questions.session_id)`,
       )
       .run();
     return result.changes;
