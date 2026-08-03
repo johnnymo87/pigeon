@@ -356,7 +356,8 @@ describe("storage schema and repositories", () => {
     it("advanceStep records answer and bumps version", () => {
       const storage = createStorage();
       storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" });
-      const updated = storage.pendingQuestions.advanceStep("s1", ["PostgreSQL"]);
+      const record = storage.pendingQuestions.getBySessionId("s1")!;
+      const updated = storage.pendingQuestions.advanceStep(record, ["PostgreSQL"]);
       expect(updated).not.toBeNull();
       expect(updated!.currentStep).toBe(1);
       expect(updated!.answers).toEqual([["PostgreSQL"]]);
@@ -364,16 +365,141 @@ describe("storage schema and repositories", () => {
       storage.db.close();
     });
 
-    it("advanceStep returns null for missing session", () => {
+    it("advanceStep returns null for missing session row in db", () => {
       const storage = createStorage();
-      expect(storage.pendingQuestions.advanceStep("missing", ["x"])).toBeNull();
+      const dummyRecord = {
+        sessionId: "missing",
+        requestId: "r1",
+        questions: [q1, q2],
+        token: "t1",
+        createdAt: 1000,
+        expiresAt: 2000,
+        currentStep: 0,
+        answers: [],
+        version: 0,
+      };
+      expect(storage.pendingQuestions.advanceStep(dummyRecord, ["x"])).toBeNull();
       storage.db.close();
     });
 
-    it("advanceStep returns null for expired session", () => {
+    it("getBySessionIdIncludingExpired returns row whose expires_at is in past where getBySessionId returns null", () => {
       const storage = createStorage();
-      storage.pendingQuestions.store({ sessionId: "s1", requestId: "r1", questions: [q1, q2], token: "t1" }, 1000, 100);
-      expect(storage.pendingQuestions.advanceStep("s1", ["x"], 2000)).toBeNull();
+      const createdAt = 1_000;
+      const ttlMs = 4 * 60 * 60 * 1000; // 4h
+      storage.pendingQuestions.store({
+        sessionId: "sess-expired-1",
+        requestId: "req-expired-1",
+        questions: [{ question: "Expired?", header: "H", options: [] }],
+      }, createdAt, ttlMs);
+
+      const futureNow = createdAt + ttlMs + 1000; // past expiry
+
+      // getBySessionId returns null because row is expired
+      expect(storage.pendingQuestions.getBySessionId("sess-expired-1", futureNow)).toBeNull();
+
+      // getBySessionIdIncludingExpired returns the record despite being expired
+      const expiredRecord = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-expired-1");
+      expect(expiredRecord).not.toBeNull();
+      expect(expiredRecord!.sessionId).toBe("sess-expired-1");
+      expect(expiredRecord!.requestId).toBe("req-expired-1");
+      expect(expiredRecord!.expiresAt).toBe(createdAt + ttlMs);
+
+      storage.db.close();
+    });
+
+    it("advanceStep successfully advances an expired row and leaves expires_at unchanged", () => {
+      const storage = createStorage();
+      const createdAt = 1_000;
+      const ttlMs = 4 * 60 * 60 * 1000;
+      storage.pendingQuestions.store({
+        sessionId: "sess-expired-2",
+        requestId: "req-expired-2",
+        questions: [
+          { question: "Q1", header: "H1", options: [{ label: "Opt1", description: "" }] },
+          { question: "Q2", header: "H2", options: [{ label: "Opt2", description: "" }] },
+        ],
+      }, createdAt, ttlMs);
+
+      const futureNow = createdAt + ttlMs + 1000; // past expiry
+      // Verify getBySessionId is null
+      expect(storage.pendingQuestions.getBySessionId("sess-expired-2", futureNow)).toBeNull();
+
+      const record = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-expired-2")!;
+      expect(record.expiresAt).toBe(createdAt + ttlMs);
+
+      const updated = storage.pendingQuestions.advanceStep(record, ["Opt1"]);
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["Opt1"]]);
+      expect(updated!.version).toBe(1);
+      expect(updated!.expiresAt).toBe(createdAt + ttlMs);
+
+      // Assert actual stored value in database before and after
+      const reloaded = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-expired-2")!;
+      expect(reloaded.currentStep).toBe(1);
+      expect(reloaded.answers).toEqual([["Opt1"]]);
+      expect(reloaded.version).toBe(1);
+      expect(reloaded.expiresAt).toBe(createdAt + ttlMs);
+
+      storage.db.close();
+    });
+
+    it("advanceStep refuses to write through a record that went stale, leaving the replacing row intact", () => {
+      const storage = createStorage();
+      const questions = [
+        { question: "Q1", header: "H1", options: [{ label: "Opt1", description: "" }] },
+        { question: "Q2", header: "H2", options: [{ label: "Opt2", description: "" }] },
+      ];
+      storage.pendingQuestions.store({
+        sessionId: "sess-stale",
+        requestId: "req-old",
+        questions,
+      }, 1_000);
+
+      const stale = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+
+      // Something advances the row, so the record the caller is holding is now
+      // a version behind what is stored.
+      storage.pendingQuestions.advanceStep(stale, ["Opt1"]);
+      const afterFirst = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+      expect(afterFirst.version).toBe(1);
+
+      // Replaying the same stale record must not advance a second time.
+      expect(storage.pendingQuestions.advanceStep(stale, ["Opt1"])).toBeNull();
+
+      const reloaded = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+      expect(reloaded.version).toBe(1);
+      expect(reloaded.currentStep).toBe(1);
+      expect(reloaded.answers).toEqual([["Opt1"]]);
+
+      storage.db.close();
+    });
+
+    it("advanceStep preserves existing behavior for live rows (bumps current_step, appends answers, increments version)", () => {
+      const storage = createStorage();
+      const createdAt = 1_000;
+      storage.pendingQuestions.store({
+        sessionId: "sess-live-1",
+        requestId: "req-live-1",
+        questions: [
+          { question: "Q1", header: "H1", options: [{ label: "Opt1", description: "" }] },
+          { question: "Q2", header: "H2", options: [{ label: "Opt2", description: "" }] },
+        ],
+      }, createdAt);
+
+      const record = storage.pendingQuestions.getBySessionId("sess-live-1", createdAt + 100)!;
+      const updated = storage.pendingQuestions.advanceStep(record, ["Opt1"]);
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["Opt1"]]);
+      expect(updated!.version).toBe(1);
+
+      const reloaded = storage.pendingQuestions.getBySessionId("sess-live-1", createdAt + 200)!;
+      expect(reloaded).not.toBeNull();
+      expect(reloaded!.currentStep).toBe(1);
+      expect(reloaded!.answers).toEqual([["Opt1"]]);
+      expect(reloaded!.version).toBe(1);
+
       storage.db.close();
     });
   });

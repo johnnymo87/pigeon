@@ -136,8 +136,52 @@ export async function ingestWorkerCommand(
   }
 
   // Check for pending question: if session has a pending question, route as question reply
-  const pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
+  let pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
+
+  // The row above is hidden once it passes its 4h TTL, but it is not deleted —
+  // nothing calls cleanupExpired — so a late answer can still be matched to it.
+  // Resurrect it when the worker tells us which question this answer is for and
+  // that id matches. Because the table is keyed on session_id with INSERT OR
+  // REPLACE, a newer question would have destroyed this row; an expired row
+  // with a matching requestId is therefore provably the same question, and its
+  // currentStep/answers are real progress. Every way a question legitimately
+  // goes away DELETES the row (answered in the TUI, answered here, superseded),
+  // so a surviving row means we never saw it answered. If it did die unobserved,
+  // opencode rejects the unknown requestId and the user gets a visible failure —
+  // opencode, not this TTL, is the correctness boundary.
+  //
+  // Deliberately does not extend expires_at: a live row hijacks EVERY plain
+  // message to the session into the question-reply path below, so re-arming
+  // that for ordinary prompts would be a regression.
+  let resurrected = false;
+  if (!pendingQuestion && msg.metadata?.questionRequestId) {
+    const expired = storage.pendingQuestions.getBySessionIdIncludingExpired(msg.sessionId);
+    if (expired && expired.requestId === msg.metadata.questionRequestId) {
+      pendingQuestion = expired;
+      resurrected = true;
+      console.log(`[command-ingest] resurrected expired pending question sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
+    }
+  }
+
   if (pendingQuestion) {
+    // Identity check for a LIVE row. A resurrected row cannot reach this — it is
+    // only adopted above on an exact requestId match — so this fires exactly
+    // when the user answered a question that has since been superseded by a
+    // newer one occupying the same session_id. Without it the answer would be
+    // applied to the current question by option index, answering something the
+    // user never read.
+    if (msg.metadata?.questionRequestId && msg.metadata.questionRequestId !== pendingQuestion.requestId) {
+      console.warn(`[command-ingest] question answer metadata mismatched sessionId=${msg.sessionId} commandId=${commandId} expected=${pendingQuestion.requestId} got=${msg.metadata.questionRequestId}`);
+      await dropCommand(
+        storage,
+        commandId,
+        msg.chatId,
+        supersededQuestionMessage(msg.command.trim()),
+        options.sendTelegramReply,
+      );
+      return;
+    }
+
     console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
     const command = msg.command.trim();
     const wizardMatch = WIZARD_OPTION_RE.exec(command);
@@ -182,7 +226,7 @@ export async function ingestWorkerCommand(
 
       if (!isLastStep) {
         // Advance wizard to next step
-        const updated = storage.pendingQuestions.advanceStep(msg.sessionId, [stepAnswer]);
+        const updated = storage.pendingQuestions.advanceStep(pendingQuestion, [stepAnswer]);
         if (!updated) {
           console.warn(`[command-ingest] wizard advance failed commandId=${commandId}`);
           storage.inbox.markDone(commandId);
@@ -286,6 +330,9 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
+      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+        return;
+      }
       // Deliberately keep the pending question row and leave the notification
       // alone. The final step never calls advanceStep, so `version` is unchanged
       // by this failure and the keyboard still on screen remains valid — the
@@ -329,6 +376,9 @@ export async function ingestWorkerCommand(
 
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
+    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+      return;
+    }
     // Row preserved for the same reason as the wizard final step above: the
     // single-question path never mutates it, so the keyboard stays valid.
     await dropCommand(
@@ -336,6 +386,31 @@ export async function ingestWorkerCommand(
       commandId,
       msg.chatId,
       questionReplyFailedMessage(result.error),
+      options.sendTelegramReply,
+    );
+    return;
+  }
+
+  // No pending question was resolved and the command is a raw option token, so
+  // there is nothing left to map it against. Drop it, and tell the user —
+  // silence here is the original defect: a press landing after the row expired
+  // was acked and discarded while Telegram had already toasted "Command sent".
+  //
+  // MUST STAY AHEAD OF THE METADATA FALLBACK BELOW. Reordering these silently
+  // reintroduces a transcript-corruption bug: the single-question success path
+  // deletes the row but leaves the keyboard on screen, so a second press is
+  // routine. It carries metadata and finds no row, so the fallback would send
+  // the literal "q0" as the answer text, opencode would reject it, and the
+  // fallback's deliberate fall-through would then inject "q0" into the session
+  // as a user prompt. An option token is never a prompt and never an answer
+  // payload — it is meaningless without a row to resolve it against.
+  if (isOptionToken(msg.command.trim())) {
+    console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      "That question is no longer answerable — it was already answered, or the session has moved on.",
       options.sendTelegramReply,
     );
     return;
@@ -376,13 +451,6 @@ export async function ingestWorkerCommand(
     } else {
       console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}, falling through to regular delivery`);
     }
-  }
-
-  // If command looks like a question option but no pending question, it's stale
-  if (QUESTION_OPTION_RE.test(msg.command.trim()) || WIZARD_OPTION_RE.test(msg.command.trim())) {
-    console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);
-    storage.inbox.markDone(commandId);
-    return;
   }
 
   // Legacy executeDirect support: wrap in an adapter shim for backward compat
@@ -630,6 +698,59 @@ async function dropCommand(
  * fails identically every time — but each attempt now says so, and the row
  * expires on its own TTL rather than lingering forever.
  */
+/**
+ * A resurrected question that opencode then refused is a question that really
+ * is gone — the row outlived the thing it described.
+ *
+ * Handled apart from the live-row failure paths, which keep the row on purpose
+ * so the on-screen keyboard stays valid for a retry. That reasoning inverts
+ * here: the retry cannot ever succeed, and because resurrection ignores
+ * `expires_at`, keeping the row would re-resurrect on every attempt and trap
+ * every future swipe-reply to this card in the same wall forever. Deleting it
+ * restores the pre-resurrection escape hatch — the next message to the session
+ * is treated as an ordinary prompt and reaches opencode.
+ *
+ * Returns true when it handled the command.
+ */
+async function dropResurrectedQuestionThatIsGone(
+  resurrected: boolean,
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  options: WorkerCommandIngestOptions,
+): Promise<boolean> {
+  if (!resurrected) return false;
+  storage.pendingQuestions.delete(msg.sessionId);
+  console.warn(`[command-ingest] resurrected question is gone, dropping row sessionId=${msg.sessionId} commandId=${commandId}`);
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    "That question is no longer open in the session, so your answer wasn't recorded. Tapping again won't help — send it as a normal message if you still want it to reach the session.",
+    options.sendTelegramReply,
+  );
+  return true;
+}
+
+/**
+ * Reply text for an answer to a question that a newer one has replaced.
+ *
+ * A button press arrives as an internal wire token (`q0`, `v0:q1`), so echoing
+ * the raw command back would show the user a string they never typed. Only
+ * genuinely typed text is quoted — that is the part worth returning, since the
+ * user would otherwise have to retype it.
+ */
+function supersededQuestionMessage(command: string): string {
+  const tail = isOptionToken(command)
+    ? ""
+    : `\n\nYour reply wasn't applied: "${command}"`;
+  return `That question was replaced by a newer one, so your answer wasn't recorded. Answer the latest question above.${tail}`;
+}
+
+function isOptionToken(command: string): boolean {
+  return QUESTION_OPTION_RE.test(command) || WIZARD_OPTION_RE.test(command);
+}
+
 function questionReplyFailedMessage(error: string | undefined): string {
   const reason = error ?? "unknown error";
   return `Couldn't deliver your answer: ${reason}\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.`;

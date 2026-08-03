@@ -498,6 +498,20 @@ function isTopicServiceReply(
 }
 
 /**
+ * Extract questionRequestId from notification_id format q:{sessionId}:{requestId}.
+ * Strips any trailing #cN split-chunk suffix.
+ */
+function parseQuestionRequestId(notificationId: string | null | undefined): string | undefined {
+  if (notificationId && notificationId.startsWith("q:")) {
+    const parts = notificationId.split(":");
+    if (parts.length >= 3) {
+      return parts.slice(2).join(":").replace(/#c\d+$/, "");
+    }
+  }
+  return undefined;
+}
+
+/**
  * Resolve a session from an inbound Telegram message.
  * Returns { sessionId, command, questionRequestId? } or null if no session found.
  *
@@ -534,11 +548,9 @@ async function resolveMessageSession(
         command: text,
       };
       // Detect question notification replies: notification_id format is q:{sessionId}:{requestId}
-      if (mapping.notification_id && mapping.notification_id.startsWith("q:")) {
-        const parts = mapping.notification_id.split(":");
-        if (parts.length >= 3) {
-          result.questionRequestId = parts.slice(2).join(":").replace(/#c\d+$/, "");
-        }
+      const questionRequestId = parseQuestionRequestId(mapping.notification_id);
+      if (questionRequestId) {
+        result.questionRequestId = questionRequestId;
       }
       return result;
     }
@@ -574,12 +586,12 @@ async function resolveMessageSession(
 /**
  * Resolve a session from a callback query.
  * Expects data format: cmd:TOKEN:ACTION
- * Returns { sessionId, command } or null.
+ * Returns { sessionId, command, questionRequestId? } or null.
  */
 async function resolveCallbackSession(
   db: D1Database,
   callbackQuery: TelegramCallbackQuery,
-): Promise<{ sessionId: string; command: string } | null> {
+): Promise<{ sessionId: string; command: string; questionRequestId?: string } | null> {
   const chatId = callbackQuery.message?.chat?.id;
   if (!chatId) return null;
 
@@ -596,8 +608,17 @@ async function resolveCallbackSession(
   if (!mapping) return null;
 
   const command = action;
+  const questionRequestId = parseQuestionRequestId(mapping.notification_id);
 
-  return { sessionId: mapping.session_id, command };
+  const result: { sessionId: string; command: string; questionRequestId?: string } = {
+    sessionId: mapping.session_id,
+    command,
+  };
+  if (questionRequestId) {
+    result.questionRequestId = questionRequestId;
+  }
+
+  return result;
 }
 
 /**
@@ -1243,12 +1264,17 @@ export async function handleTelegramWebhook(
     const machine = await resolveSessionMachine(db, env, resolved.sessionId, resolved.command, cbChatId, update.callback_query.message?.message_thread_id);
     if (!machine) return OK();
 
+    const metadataJson = resolved.questionRequestId
+      ? JSON.stringify({ questionRequestId: resolved.questionRequestId })
+      : null;
+
     const commandId = await queueCommand(db, env, {
       machineId: machine.machineId,
       sessionId: resolved.sessionId,
       command: resolved.command,
       chatId: String(cbChatId),
       label: machine.label,
+      metadataJson,
       messageThreadId: update.callback_query.message?.message_thread_id,
     });
     if (!commandId) return OK();

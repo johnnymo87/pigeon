@@ -6084,6 +6084,187 @@ describe("resolveMessageSession question notification parsing", () => {
   });
 });
 
+// ─── resolveCallbackSession Question Notification Parsing ───────────────────
+
+describe("resolveCallbackSession question notification parsing", () => {
+  const chatId = "123456789";
+
+  async function seedMessageWithToken(opts: {
+    chatId: string;
+    messageId: number;
+    sessionId: string;
+    token: string;
+    notificationId?: string;
+  }): Promise<void> {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO messages (chat_id, message_id, session_id, token, notification_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        opts.chatId,
+        opts.messageId,
+        opts.sessionId,
+        opts.token,
+        opts.notificationId ?? null,
+        Date.now(),
+      )
+      .run();
+  }
+
+  it("returns questionRequestId for a q:-prefixed notification_id", async () => {
+    await seedMessageWithToken({
+      chatId,
+      messageId: 201,
+      sessionId: "ses_cb1",
+      token: "tok_cb1",
+      notificationId: "q:ses_cb1:req_cb_123",
+    });
+
+    const r = await resolveCallbackSession(env.DB, {
+      id: "cb_1",
+      from: { id: Number(chatId) },
+      message: { chat: { id: Number(chatId) } },
+      data: "cmd:tok_cb1:q0",
+    });
+
+    expect(r?.sessionId).toBe("ses_cb1");
+    expect(r?.command).toBe("q0");
+    expect(r?.questionRequestId).toBe("req_cb_123");
+  });
+
+  it("strips a #c2 chunk suffix from questionRequestId", async () => {
+    await seedMessageWithToken({
+      chatId,
+      messageId: 202,
+      sessionId: "ses_cb2",
+      token: "tok_cb2",
+      notificationId: "q:ses_cb2:req_cb_456#c2",
+    });
+
+    const r = await resolveCallbackSession(env.DB, {
+      id: "cb_2",
+      from: { id: Number(chatId) },
+      message: { chat: { id: Number(chatId) } },
+      data: "cmd:tok_cb2:q1",
+    });
+
+    expect(r?.sessionId).toBe("ses_cb2");
+    expect(r?.command).toBe("q1");
+    expect(r?.questionRequestId).toBe("req_cb_456");
+  });
+
+  it("returns no questionRequestId when notification_id is NOT q:-prefixed", async () => {
+    await seedMessageWithToken({
+      chatId,
+      messageId: 203,
+      sessionId: "ses_cb3",
+      token: "tok_cb3",
+      notificationId: "stop:ses_cb3:xyz",
+    });
+
+    const r = await resolveCallbackSession(env.DB, {
+      id: "cb_3",
+      from: { id: Number(chatId) },
+      message: { chat: { id: Number(chatId) } },
+      data: "cmd:tok_cb3:q0",
+    });
+
+    expect(r?.sessionId).toBe("ses_cb3");
+    expect(r?.command).toBe("q0");
+    expect(r?.questionRequestId).toBeUndefined();
+  });
+});
+
+describe("callback query question notification threading", () => {
+  const CHAT_ID = "8248645256";
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  it("threads metadataJson into queueCommand when pressing button on question notification", async () => {
+    const now = Date.now();
+    const sessionId = `sess-cb-q-${now}-${Math.random()}`;
+    const machineId = `cb-q-machine-${now}`;
+    const msgId = 7_000_000 + Math.floor(Math.random() * 500_000);
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mockTelegramSuccess(msgId);
+    const notifRes = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Pick an option:",
+      notificationId: `q:${sessionId}:req-cb-789#c1`,
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "Option A", callback_data: "cmd:tok-cb:q0" }],
+        ],
+      },
+    });
+    expect(notifRes.status).toBe(200);
+    const notifBody = (await notifRes.json()) as { ok: boolean; messageId: number; token: string };
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mockTelegramAny(); // for answerCallbackQuery
+
+    const cbRes = await sendWebhook(makeCallbackQuery(`cmd:${notifBody.token}:q0`));
+    expect(cbRes.status).toBe(200);
+
+    const rows = await env.DB.prepare(
+      "SELECT * FROM commands WHERE session_id = ?"
+    ).bind(sessionId).all<{ metadata_json: string | null }>();
+
+    expect(rows.results.length).toBe(1);
+    expect(rows.results[0]!.metadata_json).toBe(JSON.stringify({ questionRequestId: "req-cb-789" }));
+  });
+
+  it("passes metadataJson as null when pressing button on non-question notification", async () => {
+    const now = Date.now();
+    const sessionId = `sess-cb-nq-${now}-${Math.random()}`;
+    const machineId = `cb-nq-machine-${now}`;
+    const msgId = 7_500_000 + Math.floor(Math.random() * 500_000);
+
+    await registerSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId, now);
+
+    mockTelegramSuccess(msgId);
+    const notifRes = await sendNotification({
+      sessionId,
+      chatId: CHAT_ID,
+      text: "Stopped session notification",
+      notificationId: `stop:${sessionId}:req-stop-123`,
+      replyMarkup: {
+        inline_keyboard: [
+          [{ text: "Restart", callback_data: "cmd:tok-cb-nq:restart" }],
+        ],
+      },
+    });
+    expect(notifRes.status).toBe(200);
+    const notifBody = (await notifRes.json()) as { ok: boolean; messageId: number; token: string };
+
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mockTelegramAny(); // for answerCallbackQuery
+
+    const cbRes = await sendWebhook(makeCallbackQuery(`cmd:${notifBody.token}:restart`));
+    expect(cbRes.status).toBe(200);
+
+    const rows = await env.DB.prepare(
+      "SELECT * FROM commands WHERE session_id = ?"
+    ).bind(sessionId).all<{ metadata_json: string | null }>();
+
+    expect(rows.results.length).toBe(1);
+    expect(rows.results[0]!.metadata_json).toBeNull();
+  });
+});
+
 // ─── Task T2.13: Inbound message resolution by forum topic membership ──
 
 describe("Task T2.13: Inbound message resolution by forum topic membership", () => {

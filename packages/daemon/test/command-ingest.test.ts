@@ -1368,7 +1368,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       storage.db.close();
     });
 
-    it("prefers pending question over metadata fallback (happy path unchanged)", async () => {
+    it("rejects answer when live pending question exists but metadata requestId is mismatched (pigeon-wzk)", async () => {
       const now = Date.now();
       const storage = openStorageDb(":memory:");
       storage.sessions.upsert({
@@ -1392,6 +1392,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       let capturedReply: QuestionReplyInput | null = null;
+      let sentTelegramText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1400,8 +1401,132 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
           sessionId: "sess-meta-2",
           command: "Use MongoDB",
           chatId: "1",
-          // metadata has a stale requestId — pending question should win
+          // metadata has a mismatched requestId — question was superseded
           metadata: { questionRequestId: "req-stale" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      // Must NOT deliver question reply to the live row
+      expect(capturedReply).toBeNull();
+      // Must drop command and reply to user explaining question was superseded and echoing text
+      expect(sentTelegramText).not.toBeNull();
+      expect(sentTelegramText!).toContain("replaced by a newer one");
+      // Typed text is echoed back so the user does not have to retype it.
+      expect(sentTelegramText!).toContain("Use MongoDB");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not echo the raw option token when a superseded answer was a button press", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-2b",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-meta-2b",
+        requestId: "req-pending",
+        questions: [{
+          question: "Which DB?",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now);
+
+      let capturedReply: QuestionReplyInput | null = null;
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-2b",
+          sessionId: "sess-meta-2b",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-stale" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+              capturedReply = reply;
+              return { ok: true as const };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      expect(capturedReply).toBeNull();
+      expect(sentTelegramText).not.toBeNull();
+      expect(sentTelegramText!).toContain("replaced by a newer one");
+      // The user pressed a button; "q0" is an internal wire token they never
+      // typed, so quoting it back would be gibberish.
+      expect(sentTelegramText!).not.toContain("q0");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("resurrects an expired question when metadata questionRequestId matches", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-1",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Store a question that expired 5 hours ago
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-1",
+        requestId: "req-exp-1",
+        questions: [{
+          question: "Pick database",
+          header: "DB",
+          options: [
+            { label: "PostgreSQL", description: "" },
+            { label: "SQLite", description: "" },
+          ],
+        }],
+      }, now - 5 * 3600 * 1000);
+
+      let capturedReply: QuestionReplyInput | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-res-1",
+          sessionId: "sess-res-1",
+          command: "q1",
+          chatId: "1",
+          metadata: { questionRequestId: "req-exp-1" },
         }),
         {
           createAdapter: () => ({
@@ -1415,10 +1540,290 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         },
       );
 
-      // Must use pending question's requestId, NOT the metadata's
-      expect(capturedReply).not.toBeNull();
-      expect(capturedReply!.questionRequestId).toBe("req-pending");
-      expect(capturedReply!.answers).toEqual([["Use MongoDB"]]);
+      expect(capturedReply).toEqual({
+        questionRequestId: "req-exp-1",
+        answers: [["SQLite"]],
+      });
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("deletes a resurrected row when opencode says the question is gone, so later replies are not trapped", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-gone",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-gone",
+        requestId: "req-gone-1",
+        questions: [{
+          question: "Pick database",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now - 5 * 3600 * 1000);
+
+      let sentTelegramText: string | null = null;
+
+      // opencode no longer knows this question: a terminal (non-transient) failure.
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-res-gone",
+          sessionId: "sess-res-gone",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-gone-1" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "OpenCode question reply failed: 404 question not found" };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      // The row must be gone. Keeping it would re-resurrect on every retry —
+      // resurrection ignores expires_at, so the row would never age out — and
+      // trap every future swipe-reply to this card against a dead question.
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-gone")).toBeNull();
+      expect(sentTelegramText).not.toBeNull();
+      // Must not repeat the live-row advice, which cannot work here.
+      expect(sentTelegramText!).not.toContain("Tap the option again, or reply with text, to retry");
+      expect(sentTelegramText!).toContain("no longer open");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("keeps a LIVE row on terminal failure so the on-screen keyboard stays retryable", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-live-keep",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-live-keep",
+        requestId: "req-live-keep",
+        questions: [{
+          question: "Pick database",
+          header: "DB",
+          options: [{ label: "PostgreSQL", description: "" }],
+        }],
+      }, now);
+
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-live-keep",
+          sessionId: "sess-live-keep",
+          command: "q0",
+          chatId: "1",
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "OpenCode question reply failed: 500 boom" };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      // Unchanged pre-existing behavior: the row survives so a second tap retries.
+      expect(storage.pendingQuestions.getBySessionId("sess-live-keep")).not.toBeNull();
+      expect(sentTelegramText!).toContain("Tap the option again");
+
+      storage.db.close();
+    });
+
+    it("advances a resurrected wizard mid-step rather than soft-locking", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-wiz",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Store expired wizard at step 0
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-wiz",
+        requestId: "req-exp-wiz",
+        questions: [
+          { question: "Q1?", header: "H1", options: [{ label: "Opt1A", description: "" }, { label: "Opt1B", description: "" }] },
+          { question: "Q2?", header: "H2", options: [{ label: "Opt2A", description: "" }] },
+        ],
+      }, now - 5 * 3600 * 1000);
+
+      let deliverQuestionReplyCalled = false;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-res-wiz",
+          sessionId: "sess-res-wiz",
+          command: "v0:q1",
+          chatId: "1",
+          metadata: { questionRequestId: "req-exp-wiz" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              deliverQuestionReplyCalled = true;
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // Final deliverQuestionReply not called yet because wizard is at step 1 now
+      expect(deliverQuestionReplyCalled).toBe(false);
+
+      // Verify row in storage advanced to step 1
+      const updated = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-wiz");
+      expect(updated).not.toBeNull();
+      expect(updated!.currentStep).toBe(1);
+      expect(updated!.answers).toEqual([["Opt1B"]]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not resurrect expired row if metadata requestId is mismatched and drops command", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-mismatch",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Store expired row with req-old
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-mismatch",
+        requestId: "req-old",
+        questions: [{ question: "Old?", header: "H", options: [{ label: "A", description: "" }] }],
+      }, now - 5 * 3600 * 1000);
+
+      let deliverQuestionReplyCalled = false;
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-res-mismatch",
+          sessionId: "sess-res-mismatch",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-different" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              deliverQuestionReplyCalled = true;
+              return { ok: true as const };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      expect(deliverQuestionReplyCalled).toBe(false);
+      expect(sentTelegramText).not.toBeNull();
+      expect(sentTelegramText!).toContain("no longer answerable");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("drops double button press (no pending question row) before metadata fallback and never injects raw token", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-double-press",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // No pending question in storage (deleted after first successful press)
+      let deliverCommandCalled = false;
+      let deliverQuestionReplyCalled = false;
+      let sentTelegramText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-double-press",
+          sessionId: "sess-double-press",
+          command: "q0",
+          chatId: "1",
+          metadata: { questionRequestId: "req-already-deleted" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              deliverCommandCalled = true;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              deliverQuestionReplyCalled = true;
+              return { ok: true as const };
+            },
+          }),
+          sendTelegramReply: async (_chatId, text) => {
+            sentTelegramText = text;
+          },
+        },
+      );
+
+      expect(deliverQuestionReplyCalled).toBe(false);
+      expect(deliverCommandCalled).toBe(false);
+      expect(sentTelegramText).not.toBeNull();
+      expect(sentTelegramText!).toContain("no longer answerable");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
     });
@@ -1654,7 +2059,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       // Advance to step 1 manually (simulates answering Q1 with "A")
-      storage.pendingQuestions.advanceStep("sess-wiz-2", ["A"]);
+      const wiz2Record = storage.pendingQuestions.getBySessionId("sess-wiz-2")!;
+      storage.pendingQuestions.advanceStep(wiz2Record, ["A"]);
 
       const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
       let capturedReply: QuestionReplyInput | null = null;
@@ -1707,7 +2113,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       // Advance to step 1 (version=1)
-      storage.pendingQuestions.advanceStep("sess-wiz-3", ["A"]);
+      const wiz3Record = storage.pendingQuestions.getBySessionId("sess-wiz-3")!;
+      storage.pendingQuestions.advanceStep(wiz3Record, ["A"]);
 
       let adapterCalled = false;
 
@@ -2038,7 +2445,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-wizfail", requestId: "req-1", questions: twoQuestions, token: "tok-1",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-wizfail", ["A"]);
+    const wizFailRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wizfail")!;
+    storage.pendingQuestions.advanceStep(wizFailRecord, ["A"]);
 
     const tgCalls: Array<{ chatId: string; text: string }> = [];
     const editCalls: unknown[] = [];
@@ -2080,7 +2488,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-retry", requestId: "req-2", questions: twoQuestions, token: "tok-2",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-retry", ["A"]);
+    const wizRetryRecord = storage.pendingQuestions.getBySessionId("sess-w2b-retry")!;
+    storage.pendingQuestions.advanceStep(wizRetryRecord, ["A"]);
 
     const delivered: string[][][] = [];
     let failFirst = true;
@@ -2148,7 +2557,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-wiznoadapter", requestId: "req-4", questions: twoQuestions, token: "tok-4",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-wiznoadapter", ["A"]);
+    const wizNoAdapterRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wiznoadapter")!;
+    storage.pendingQuestions.advanceStep(wizNoAdapterRecord, ["A"]);
 
     const tgCalls: Array<{ chatId: string; text: string }> = [];
 
@@ -2484,7 +2894,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
 
   it("stays silent on completion when no editNotification is wired", async () => {
     const storage = makeWizardStorage("sess-w2c-9");
-    storage.pendingQuestions.advanceStep("sess-w2c-9", ["Postgres"]);
+    const rec9 = storage.pendingQuestions.getBySessionId("sess-w2c-9")!;
+    storage.pendingQuestions.advanceStep(rec9, ["Postgres"]);
     const replies: string[] = [];
 
     await ingestWorkerCommand(
@@ -2553,7 +2964,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
     // execute path and reaches opencode as a stray prompt.
     const storage = makeWizardStorage("sess-w2c-10");
     // The adapter-lacks branch is only reached on the final step.
-    storage.pendingQuestions.advanceStep("sess-w2c-10", ["Postgres"]);
+    const rec10 = storage.pendingQuestions.getBySessionId("sess-w2c-10")!;
+    storage.pendingQuestions.advanceStep(rec10, ["Postgres"]);
     const replies: string[] = [];
 
     await expect(ingestWorkerCommand(
@@ -2633,7 +3045,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
   it("warns the buttons are stale when the completion edit fails on the final step", async () => {
     const storage = makeWizardStorage("sess-w2c-7");
     // Move to the final step so the next press completes the wizard.
-    storage.pendingQuestions.advanceStep("sess-w2c-7", ["Postgres"]);
+    const rec7 = storage.pendingQuestions.getBySessionId("sess-w2c-7")!;
+    storage.pendingQuestions.advanceStep(rec7, ["Postgres"]);
     const replies: string[] = [];
 
     await ingestWorkerCommand(

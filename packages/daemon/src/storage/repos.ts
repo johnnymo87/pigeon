@@ -401,6 +401,25 @@ export class PendingQuestionRepository {
     return row ? asPendingQuestion(row) : null;
   }
 
+  /**
+   * Read the row ignoring `expires_at`. Expired rows are hidden, not deleted —
+   * `cleanupExpired` has no caller — so the row survives its TTL and can still
+   * be identified.
+   *
+   * Use ONLY where the caller has independent proof of *which* question it is
+   * holding, i.e. an incoming `metadata.questionRequestId` that it then checks
+   * against `requestId` (the resurrection path in command-ingest). Never use it
+   * for ordinary routing: `getBySessionId`'s TTL is what stops an ordinary
+   * prompt, typed hours later, from being hijacked into an answer to a
+   * long-dead question.
+   */
+  getBySessionIdIncludingExpired(sessionId: string): PendingQuestionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM pending_questions WHERE session_id = ?")
+      .get(sessionId) as SqlRow | null;
+    return row ? asPendingQuestion(row) : null;
+  }
+
   delete(sessionId: string): boolean {
     const result = this.db
       .prepare("DELETE FROM pending_questions WHERE session_id = ?")
@@ -408,15 +427,32 @@ export class PendingQuestionRepository {
     return result.changes > 0;
   }
 
-  advanceStep(sessionId: string, answer: string[], now = Date.now()): PendingQuestionRecord | null {
-    const current = this.getBySessionId(sessionId, now);
-    if (!current) return null;
+  /**
+   * Advance a wizard by one step, using a record the caller already holds.
+   *
+   * Takes the record rather than re-reading by session id because the caller
+   * may be holding a deliberately resurrected (expired) row, which a re-read
+   * through `getBySessionId` would filter out — leaving the wizard soft-locked.
+   *
+   * The write is guarded on `version`, so a record that went stale between load
+   * and write updates nothing and returns null instead of clobbering whatever
+   * replaced it. Today no `await` separates the two in `ingestWorkerCommand`
+   * and better-sqlite3 is synchronous, so that cannot happen; the guard is here
+   * so it still cannot happen once someone adds one.
+   *
+   * `expires_at` is deliberately not touched: a resurrected row must stay
+   * expired, or every later plain message to the session gets hijacked into a
+   * question reply.
+   */
+  advanceStep(current: PendingQuestionRecord, answer: string[]): PendingQuestionRecord | null {
     const newAnswers = [...current.answers, answer];
     const newStep = current.currentStep + 1;
     const newVersion = current.version + 1;
-    this.db.prepare(
-      `UPDATE pending_questions SET current_step = ?, answers_json_v2 = ?, version = ? WHERE session_id = ?`,
-    ).run(newStep, JSON.stringify(newAnswers), newVersion, sessionId);
+    const result = this.db.prepare(
+      `UPDATE pending_questions SET current_step = ?, answers_json_v2 = ?, version = ?
+       WHERE session_id = ? AND version = ?`,
+    ).run(newStep, JSON.stringify(newAnswers), newVersion, current.sessionId, current.version);
+    if (result.changes === 0) return null;
     return { ...current, currentStep: newStep, answers: newAnswers, version: newVersion };
   }
 

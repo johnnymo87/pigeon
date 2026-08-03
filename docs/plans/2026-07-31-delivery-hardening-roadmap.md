@@ -1077,6 +1077,26 @@ also refreshing the `pending_questions` clock would hand the user a question the
 defeating the reasoning that justifies the expiry design. `pending_questions` is keyed by `session_id`
 with `INSERT OR REPLACE`, which constrains the options.
 
+> **Amended 2026-08-03 by `pigeon-5d0`.** The premise above — "an expired question is *provably
+> unanswerable*" — no longer holds, and the constraint it derives is now the load-bearing part.
+> `PENDING_QUESTION_TTL_MS` only ever *hid* the row; nothing deleted it (`cleanupExpired` had no
+> caller). An answer that arrives carrying `metadata.questionRequestId` is now matched against that
+> hidden row and, on an exact `requestId` match, **resurrects** it — so a press hours past the TTL is
+> answerable again. The correctness boundary was never the daemon's clock: opencode validates the
+> requestId at reply time and a genuinely dead question fails visibly.
+>
+> What that means for `pigeon-bvh`: the trap is milder than stated. Resurrecting an outbox row does
+> not require refreshing the `pending_questions` clock, because the clock is no longer what makes the
+> question answerable — the id match is. Refreshing it would in fact be harmful; while a row is live,
+> *every* plain message to that session is hijacked into the question-reply path, so extending expiry
+> re-arms that hijack for ordinary prompts. What still matters is exactly the `INSERT OR REPLACE`
+> keying noted above: it is what proves a surviving row is the *same question instance*, and hence
+> what makes resurrection safe at all.
+>
+> One coupling to respect: a resurrected notification is only answerable while the worker still holds
+> the `messages` row backing its callback token (14-day retention). Past that, the press cannot
+> resolve a session in the worker at all and never reaches the daemon.
+
 ### Cycle 5 — the server side (the track this roadmap was missing) — DONE (PR #36)
 
 Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
