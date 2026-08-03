@@ -65,7 +65,9 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | `pigeon-az8` | **W0 GATE** — prove a normal text command works in a devbox topic | P1 | ✅ **PASSED** 2026-08-02 |
 | `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ **PR #39** |
 | `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ **PR #39** |
-| `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | new, ready |
+| `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | ✅ **PR #42** |
+| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | new, ready |
+| `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | new, ready |
 | `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
 | `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
 
@@ -234,3 +236,63 @@ end-to-end test added to close that is mutation-checked.
   repro without fixing it. The live path is now a caption-less media reply to a
   question, which submits an empty answer *and* silently discards the file (that
   second half overlaps `pigeon-tyk`/W3).
+
+---
+
+## 7. W2b outcome (PR #42, branch `fix/question-reply-silent-drop`)
+
+Same defect class as W2, one path over: the question-reply path dropped four
+things silently. Worse than W2, because what vanishes is an answer the user
+actually typed rather than machine-generated noise.
+
+**The bead's acceptance criterion was wrong, and the fix inverts it.** The
+criterion — written by the adversarial review of #39 — said the wizard
+final-step failure soft-locks the question and demanded the row be deleted and
+the notification edited to a terminal state. But the final step builds its
+answers locally and never calls `advanceStep`, which is the only thing that
+bumps `version`; a failure therefore leaves the row untouched and the on-screen
+keyboard still valid. The state was always retry-able and the defect is silence
+alone.
+
+The evidence is mechanical, not rhetorical. The test `still accepts the same
+button press after a final-step failure` **passes against unfixed code**, and
+the review's mutation run showed that implementing the original criterion breaks
+two tests — converting a working retry into a silent drop. So the row is
+preserved and the keyboard left alone.
+
+**The asymmetry is the other half.** The adapter-lacks sites do the opposite:
+delete the row *and* clear the keyboard. An oracle consult caught what the
+implementer had missed — a live `pendingQuestions` row hijacks every plain-text
+message to that session, so preserving it on a permanent condition blocks normal
+command flow until the 4h TTL. The keyboard clear then came out of review:
+deleting the row alone left buttons that resolve to nothing, reintroducing the
+defect being fixed. The original criterion's edit-the-notification instinct was
+wrong for one branch and right for the other.
+
+Also collapsed the three revive branches into `dropCommand`; they hand-rolled it
+with an unguarded send, latent only because the production sender never throws.
+
+**Process notes.** The oracle consult (step 2) earned its slot for the first time
+this epic — it both confirmed the refutation and supplied the hijack asymmetry.
+The adversarial review (step 4) returned no must-fix but ran its own five-mutation
+check in a throwaway worktree, all five killed, which is a stronger form of the
+verification used in §6. One should-fix (the dead keyboard) was taken; two
+findings were filed rather than absorbed.
+
+Unlike §6, **zero pre-existing assertions needed flipping** and all 49 existing
+tests still passed. That was flagged as potentially suspicious and checked: it is
+legitimate, because the old silent drops were simply untested — which is why they
+stayed silent.
+
+### Discovered, filed, not fixed
+
+- `pigeon-k4c.2` (W2c, P1) — the wizard non-final step mutates via `advanceStep`
+  then ignores `editNotification`'s `{ok:false}`. Storage advances while the
+  user's screen does not, and every later press dies on the stale-version guard.
+  Review found a second entrance: if the edit *throws*, the ack is skipped and
+  the retry hits the same stale guard. Any fix must close both doors. Rollback,
+  reorder, and throw-to-retry were each considered and rejected on the bead.
+- `pigeon-k4c.3` (W2d, P2) — the residual cost of the inversion. A question that
+  is genuinely gone keeps its row, hijacks every message for up to 4h, and
+  answers each one with a retry hint that can never succeed. Noisy rather than
+  silent, so still better than the behaviour it replaced.
