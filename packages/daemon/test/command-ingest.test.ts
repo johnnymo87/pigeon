@@ -2457,6 +2457,49 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
     storage.db.close();
   });
 
+  it("treats a worker error body with no ok field as a failure", async () => {
+    const storage = makeWizardStorage("sess-w2c-8");
+    const replies: string[] = [];
+
+    // The real failure shape. poller.editNotification returns the worker's JSON
+    // verbatim regardless of status, and every worker failure path answers
+    // {error:...} with NO ok field — a 404 for a swept messages row being the
+    // most persistent. A laxer check like `ok !== false` would read undefined
+    // as success and restore the soft-lock for exactly this case.
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-8", sessionId: "sess-w2c-8", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ error: "Message not found for notificationId" }) as never,
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!).toContain("Which region?");
+
+    storage.db.close();
+  });
+
+  it("stays silent on completion when no editNotification is wired", async () => {
+    const storage = makeWizardStorage("sess-w2c-9");
+    storage.pendingQuestions.advanceStep("sess-w2c-9", ["Postgres"]);
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-9", sessionId: "sess-w2c-9", command: "v1:q0", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toEqual([]);
+    storage.db.close();
+  });
+
   it("keeps storage authoritative after a failed edit", async () => {
     const storage = makeWizardStorage("sess-w2c-2");
 
