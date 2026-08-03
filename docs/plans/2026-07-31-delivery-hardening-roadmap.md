@@ -14,6 +14,7 @@ two worktree deletions, and five checkpoints. Same discipline applies here.
 
 **On resuming:** read §0 (where you are), §1 (the operating hazards), §2 (the cycle protocol),
 then the first unchecked cycle in §4. Do not skim §1 — every entry in it cost real time to learn.
+**Priorities in §4 are stale snapshots — read them from `bd list`, not from this file (CORRECTION #9).**
 
 **Exception, added 2026-08-02: "the first unchecked item" is the WRONG rule inside Cycle 6.** Cycles
 0–5 encode a risk argument in their ordering; Cycle 6 is a grab-bag whose letters record discovery
@@ -66,7 +67,7 @@ is not the spine; it is residuals, one real P2, and the migration close-out:
 
 | What | State |
 |---|---|
-| **Cycle 6 residuals** | 8 open. **`6i` (`pigeon-cal`, P2) is the highest-value item left anywhere in this file.** The rest are P3. |
+| **Cycle 6 residuals** | 8 open. The P2s are **`6a`, `6d`, `6g`** (read from `bd`, not from the inline labels — see CORRECTION #9 in Cycle 6). The rest, including `6i`, are P3. |
 | **Cycle 7 close-out** | `7a` (record the burn-in 429 rate), then `7b` (drop the old chat id — irreversible, do it last). |
 | **§4.2 feature track** | `F4`, `F5` open; independent of everything above, pick up in any gap. |
 | **`4f`** | Evidence-gated. **Do not schedule it** — `4e` is supposed to produce the evidence first. |
@@ -1190,20 +1191,41 @@ blast radius but **do not cure the outage**.
 > encode a risk argument in their ordering, so "do the next unchecked item" was the right rule there.
 > Cycle 6 is residuals swept up after the migration: the letters record *discovery order*, not
 > priority and not dependency. Following §"How to use this file" literally lands you on **6a**, a
-> latent P3 TOCTOU, while **6i** — a live P2 that silently loses webhook acks — sits at the bottom
-> because it was found last. Only one real dependency survives in here (6b↔6c, and it is resolved).
+> **P2** TOCTOU, while **6i** — which silently loses webhook acks — sits at the bottom because it was
+> found last. (6a turns out to be the higher-priority of the two; see CORRECTION #9 below.) Only one real dependency survives in here (6b↔6c, and it is resolved).
 >
-> **Recommended order, by value:**
+> **CORRECTION #9 (2026-08-02, within the hour). The first version of this very block was built on
+> stale inline priority labels and was WRONG.** It called `6i` "the only P2 left on the spine". Read
+> back from `bd`, **`pigeon-cal` is P3**, and the actual P2s in this cycle are **`6a`, `6d` and `6g`**.
+> The inline `(P2)`/`(P3)` annotations scattered through §4 are **snapshots taken when each item was
+> written** and several have since drifted from the tracker. **Read priorities from `bd list`, never
+> from this file.** Filed as the ninth correction because it is the same error the file keeps
+> recording — trusting a memorable local claim instead of establishing the current fact — committed
+> here while in the act of repairing the file's shape.
 >
-> 1. **6i** (`pigeon-cal`, **P2**) — the only P2 left on the spine, and the same
->    reports-success-delivers-nothing shape as `t5f`/`bqo`. Do this first.
-> 2. **6j** (`pigeon-kz3`, P3) — duplicate stop notifications defeating dedup; still uninvestigated,
->    so it may be cheap or may be a real puzzle. Size it before committing.
-> 3. **6d** (`pigeon-cx2`) then **6e** (`pigeon-6hl`) — both `/current-state`, adjacent code.
-> 4. **6g** (`pigeon-66y`) — test-only, mechanical, no production risk.
-> 5. **6a**, **6f**, **6h** — latent/documentation P3s, safe to leave indefinitely.
+> **True priorities, read from `bd` 2026-08-02:**
 >
-> This ordering is advisory. The one hard rule is that **6i outranks everything else in this cycle.**
+> | Item | Bead | `bd` priority |
+> |---|---|---|
+> | 6a | `pigeon-5o7` | **P2** |
+> | 6d | `pigeon-cx2` | **P2** |
+> | 6g | `pigeon-66y` | **P2** |
+> | 6e | `pigeon-6hl` | P3 |
+> | 6f | `pigeon-1rb` | P3 |
+> | 6h | `pigeon-wly` | P3 |
+> | 6i | `pigeon-cal` | P3 |
+> | 6j | `pigeon-kz3` | P3 |
+>
+> **Recommended order.** Priority is the default tie-breaker, so the three P2s lead: **6a**, **6d**,
+> **6g**. Take **6d** and **6e** together — same `/current-state` code. **6g** is test-only and
+> mechanical. Then the P3s, of which **6i** is the most interesting on *theme* — it is the same
+> reports-success-delivers-nothing shape as `t5f`/`bqo`, and the messages it drops are precisely the
+> error messages — but note its own title records that the closed-topic half is **already resolved as
+> a non-issue**, so scope it before assuming it is a full cycle's work. **6f** and **6h** are safe to
+> leave indefinitely.
+>
+> The one hard rule: **do not infer priority from position in this list, and do not infer it from the
+> inline labels either.** Check `bd`.
 
 - [ ] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
   today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
