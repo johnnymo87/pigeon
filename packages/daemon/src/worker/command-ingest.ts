@@ -640,19 +640,6 @@ async function dropCommand(
   storage.inbox.markDone(commandId);
 }
 
-async function sendBestEffort(
-  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
-  chatId: string,
-  text: string,
-  commandId: string,
-): Promise<void> {
-  try {
-    await sendTelegramReply?.(chatId, text);
-  } catch (err) {
-    console.warn(`[command-ingest] failed to notify user commandId=${commandId}:`, err);
-  }
-}
-
 /**
  * Input hygiene for both question-reply paths (W4 / `pigeon-bru`).
  *
