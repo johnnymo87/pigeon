@@ -280,7 +280,7 @@ export async function handleSendNotification(
       threaded !== false
     ) {
       // Delete stale finalized topic row from D1
-      await deleteTopicBySession(db, sessionId);
+      await deleteTopicBySession(db, sessionId, messageThreadId);
 
       // Recreate topic (resolve topic again)
       const retryTopicRes = await resolveTopic(db, {

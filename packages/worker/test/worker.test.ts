@@ -34,6 +34,7 @@ import {
   markClosed,
   markOpen,
   deleteBySession,
+  deleteTopicBySession,
   stealReservation,
   listReapable,
   listOrphaned,
@@ -6808,6 +6809,124 @@ describe("topics module and topicName", () => {
       expect(orphanedIds).toContain(sStale);
       expect(orphanedIds).not.toContain(sActive);
       expect(orphanedIds).not.toContain(sClosedNoSession);
+    });
+  });
+
+  describe("deleteTopicBySession scoping and reaper counter honesty (pigeon-5o7)", () => {
+    const chatId = "-1001234567890";
+    const botToken = "fake-bot-token";
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("1. The race: a late delete scoped to stale thread T is a no-op; T2 row survives", async () => {
+      const sessionId = "ses_5o7_race";
+      const staleThreadId = 885501;
+      const newThreadId = 885502;
+      const now = Date.now();
+
+      // Finalized topic row exists for newThreadId T2
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "race topic", now });
+      await finalize(env.DB, { sessionId, messageThreadId: newThreadId, now });
+
+      // Late caller B observed stale thread T1 and attempts to delete it
+      const deleted = await deleteTopicBySession(env.DB, sessionId, staleThreadId);
+      expect(deleted).toBe(false);
+
+      // Finalized T2 row must still exist in D1
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.message_thread_id).toBe(newThreadId);
+    });
+
+    it("2. Normal path: delete scoped to matching thread id removes the row", async () => {
+      const sessionId = "ses_5o7_normal";
+      const threadId = 885503;
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "normal topic", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
+
+      const deleted = await deleteTopicBySession(env.DB, sessionId, threadId);
+      expect(deleted).toBe(true);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("3. NULL-thread row: delete scoped to null removes reservation row with message_thread_id IS NULL", async () => {
+      const sessionId = "ses_5o7_null";
+      const now = Date.now();
+
+      // Reservation row with message_thread_id IS NULL
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "reservation topic", now });
+
+      const deleted = await deleteTopicBySession(env.DB, sessionId, null);
+      expect(deleted).toBe(true);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("4. Reaper NULL branch end-to-end: reapTopics reaps a NULL-thread row and reports it", async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      const sessionId = "ses_5o7_reap_null";
+      const now = Date.now();
+      const closedLongAgo = now - REAP_TTL_MS - 10000;
+
+      // Seed closed topic row with message_thread_id IS NULL
+      await env.DB.prepare(
+        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at, closed_at)
+         VALUES (?, 'devbox', ?, NULL, 'reap null topic', 'closed', ?, ?, ?)`
+      ).bind(sessionId, chatId, closedLongAgo, closedLongAgo, closedLongAgo).run();
+
+      const res = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      expect(res.reaped).toBe(1);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("5. Reaper counter honesty: a reaper delete that no-ops does not inflate reaped counter", async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      const sessionId = "ses_5o7_reap_honesty";
+      const oldThreadId = 885504;
+      const newThreadId = 885505;
+      const now = Date.now();
+      const closedLongAgo = now - REAP_TTL_MS - 10000;
+
+      await env.DB.prepare(
+        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at, closed_at)
+         VALUES (?, 'devbox', ?, ?, 'reap honesty topic', 'closed', ?, ?, ?)`
+      ).bind(sessionId, chatId, oldThreadId, closedLongAgo, closedLongAgo, closedLongAgo).run();
+
+      // Mock deleteForumTopic, but concurrently update the topic's thread ID in D1 before deleteTopicBySession runs
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
+        .reply(200, async () => {
+          // Simulate concurrent topic recreation / update to newThreadId
+          await env.DB.prepare("UPDATE topics SET message_thread_id = ? WHERE session_id = ?")
+            .bind(newThreadId, sessionId)
+            .run();
+          return { ok: true, result: true };
+        });
+
+      const res = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+
+      // Because deleteTopicBySession was scoped to oldThreadId, it no-ops on the newThreadId row and returns false.
+      // Therefore reaped must NOT be incremented.
+      expect(res.reaped).toBe(0);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.message_thread_id).toBe(newThreadId);
     });
   });
 
