@@ -60,14 +60,14 @@ reverted and the outbox has drained — narrowing the allowlist first permanentl
 **Still open from the migration:** drop the old DM chat id from `ALLOWED_CHAT_IDS` after burn-in.
 Do this LAST, as Cycle 7b — it is the only irreversible step.
 
-**WHERE THE SPINE STANDS (2026-08-02, after F3): 30 items checked, 13 open.** The hardening argument
+**WHERE THE SPINE STANDS (2026-08-03, after 6a): 31 items checked, 12 open.** The hardening argument
 itself — make failures visible (Cycle 0), then act on them (1), then bound them (2–3), then alert on
 what is really there (4), then fix the server side (5) — **is complete and deployed.** What remains
-is not the spine; it is residuals, one real P2, and the migration close-out:
+is not the spine; it is residuals, two real P2s, and the migration close-out:
 
 | What | State |
 |---|---|
-| **Cycle 6 residuals** | 8 open. The P2s are **`6a`, `6d`, `6g`** (read from `bd`, not from the inline labels — see CORRECTION #9 in Cycle 6). The rest, including `6i`, are P3. |
+| **Cycle 6 residuals** | 7 open. `6a` is **DONE**. The remaining P2s are **`6d`** and **`6g`** (read from `bd`, not from the inline labels — see CORRECTION #9 in Cycle 6). The rest, including `6i`, are P3. |
 | **Cycle 7 close-out** | `7a` (record the burn-in 429 rate), then `7b` (drop the old chat id — irreversible, do it last). |
 | **§4.2 feature track** | `F4`, `F5` open; independent of everything above, pick up in any gap. |
 | **`4f`** | Evidence-gated. **Do not schedule it** — `4e` is supposed to produce the evidence first. |
@@ -80,13 +80,15 @@ meant two whole cycles of daemon work had never actually run.
 
 | Package | Tests |
 |---|---|
-| `@pigeon/daemon` | **1061** passed, 1 skipped |
+| `@pigeon/daemon` | **1145** passed, 1 skipped |
 | `@pigeon/opencode-plugin` | **345** passed |
-| `@pigeon/worker` | **351** passed |
+| `@pigeon/worker` | **361** passed |
 
-Total **1757**, measured at `f73da09` — the merged F3 commit, AFTER the merge, per the rule below. F3
-added **worker +20** (331 → 351) and touched nothing else. The daemon 1055 → 1061 and worker 322 → 331
-moves in between were **peer PR #39**, not this roadmap. **`npm run typecheck` is CLEAN — 0 errors.**
+Total **1851**, measured at `543f5e6` — the merged 6a commit, AFTER the merge, per the rule below. 6a
+added **worker +10** (351 → 361) and touched nothing else. The daemon **1061 → 1145 (+84)** in between
+was **peer work, not this roadmap** — PRs #45, #47 and #51 all landed while 6a was in flight. Per
+CORRECTION #4, do not read that jump as anything this cycle did. **`npm run typecheck` is CLEAN — 0
+errors.**
 
 > **WORKFLOW CHANGE that bit F3 (2026-08-02): the repo is now SQUASH-MERGE ONLY.** `gh pr merge --merge`
 > failed with "Merge commits are not allowed on this repository"; `gh api repos/... ` confirms
@@ -1227,9 +1229,41 @@ blast radius but **do not cure the outage**.
 > The one hard rule: **do not infer priority from position in this list, and do not infer it from the
 > inline labels either.** Check `bd`.
 
-- [ ] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
+- [x] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
   today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
   timeout**). Adding a fetch timeout — an obviously reasonable change — silently breaks it.
+  **DONE 2026-08-03, squash `543f5e6`, PR #52.** Worker deployed, version
+  `694b4ec0-5cdc-45c1-8b95-859c5e8c1550`, `/health` ok, 145 live topic rows unchanged across the deploy.
+> **The bead's own fix was wrong, and the wrongness was the interesting part.** Two corrections found
+> before writing any code, both by checking the code instead of trusting the bead:
+>
+> 1. **It names two call sites. There are four.** `topic-reaper.ts` has two the bead never mentions
+>    (`reapTopics`, both branches). Making the new thread-id parameter **required** rather than optional
+>    is what forced them to surface — as compile errors — instead of silently retaining the old
+>    unscoped behaviour. An optional parameter would have "fixed" two sites and left two racing.
+> 2. **One of those four passes `NULL`, and the bead prescribes `AND message_thread_id = ?`.** In SQL
+>    `= NULL` is never true. Applied literally, the bead's fix would have stopped the reaper deleting
+>    NULL-thread rows **while still counting them as reaped** — converting a latent race into a live
+>    reports-success-delivers-nothing bug, which is the exact failure shape this whole roadmap exists to
+>    chase. The fix uses SQLite's NULL-safe `IS` instead, proven against real D1 by a test rather than
+>    assumed.
+>
+> **Generalise it:** a bead that arrives with a ready-made patch is still a *claim*, not a spec — and a
+> well-specified one invites you to skip the verification precisely because it looks finished. The
+> caller inventory and the NULL case both cost about ten minutes to check.
+>
+> Verification: 5 tests, and **both mutations were run twice** — once by the implementer, once
+> independently by the reviewer. Neutering the `WHERE` fails tests 1 and 5; swapping `IS` for `=` fails
+> tests 3 and 4 *plus* a pre-existing reaper test. Adversarial review (fable) traced all four no-op
+> fall-throughs and found **no blockers**: each lands on the pre-existing single-winner reservation
+> protocol, because `topics.session_id` is PRIMARY KEY, so the recreate path conflicts and routes to the
+> loser path returning the winner's thread. Review also noted the scoped delete closes a **second** race
+> for free — the old version could kill a rival's in-flight NULL *reservation* row.
+>
+> Left knowingly undone: `closeOrphans` has the same counter-honesty gap that `reapTopics` just had,
+> filed as **`pigeon-j55`** (P3). Nothing consumes either count today — `index.ts` discards the reaper
+> result — so this is truthfulness-of-instrumentation, not behaviour. Fix it before anything ever gates
+> or logs on those numbers.
 > **GATE CHECK, 2026-08-01 — `pigeon-cev` item 3 was already answered, and the dependency arrow
 > between 6b and 6c points the wrong way.** Checked before building anything, and the evidence is
 > strong: direct live curl probes on 2026-07-28 against the real supergroup — *created a topic, posted,
@@ -1436,7 +1470,8 @@ original intent — is preserved; intra-session inversion is now impossible.
 
 ## §4.1 — Explicitly OUT of scope for this roadmap
 
-Re-measured 2026-08-02 after F3: **53 open beads** (cn1 closed, 50l filed); this roadmap covers ~23. The rest are real but
+Re-measured 2026-08-03 after 6a: **56 open beads** (`5o7` closed; `j55` filed by 6a; the rest are new
+peer work); this roadmap covers ~23. The rest are real but
 belong to other themes, and are listed here so a future reader does not mistake this file for the
 whole backlog:
 
@@ -1474,6 +1509,31 @@ whole backlog:
   `pigeon-886`, `pigeon-76k`, `pigeon-amr`, `pigeon-r2e`.
 - **Chores/infra:** `pigeon-0n6`, `pigeon-0pp`, `pigeon-fia`, `pigeon-m68`, `pigeon-0zl`, `pigeon-4v0`,
   `pigeon-0u5`, `pigeon-f2i`, `pigeon-mud`, `pigeon-ewr`, `pigeon-050`.
+- **TWO NEW PEER SPINE DOCS, both filed 2026-08-03 — this is now the largest block of open work in the
+  repo, and none of it is ours.** The 6a audit found ten unplaced ids, and all ten belong to one of
+  these two:
+  - **`pigeon-fnx` (P1, spine doc)** — *make "delivered" mean delivered: close the swarm silent-drop
+    and false-signal paths.* With `pigeon-fww` (P2, the delivery-watchdog still sends wake alerts
+    inline — the same lost-alert bug as `pigeon-uhh`), `pigeon-xa5` (P3, wizard advance failure is a
+    silent swallow) and `pigeon-fas` (P3, clear the keyboard after a single-question answer).
+  - **`pigeon-hsa` (P1, spine doc)** — *kill the cap-filter flap engine and make the flap alert
+    honest.* With `pigeon-8cz` (P1, per-arm rendering and stop re-alerting a latched slow-burn),
+    `pigeon-pov` (P1, `placeSession` via `ensureRouted` can clobber a LIVE lease — the June
+    "session lease lost mid-run" path is still open), `pigeon-f02` (P2, routing observability),
+    `pigeon-y8p` (P2, harden `lease-cas-concurrency` by asserting the CAS invariant at execution order
+    rather than by wall-clock overlap — this is the flaky test §1 warns about, and someone is fixing it
+    properly) and `pigeon-psj` (P3, `session_assignment` grows without bound).
+
+  **Note what `pigeon-fnx` is.** A peer independently started a spine whose thesis — *a success report
+  with nothing behind it is the bug* — is this roadmap's thesis, applied to the swarm subsystem. That
+  is convergent evidence the shape is real, not an artefact of this file. Do not adopt those beads; do
+  read that doc before arguing about delivery semantics.
+
+> **Audit method note (2026-08-03).** The literal-grep audit produced one **false positive**:
+> `pigeon-5d0` came back unplaced, but it is **CLOSED** — it surfaced only because it appears inside
+> another bead's *title* (`pigeon-xa5`, "the one branch `pigeon-5d0` left un-notified"). Grepping ids
+> out of `bd list` output catches ids in titles as well as ids in the id column. Confirm status with
+> `bd show` before treating an audit hit as orphaned work.
 
 ### Closed during restructuring
 
