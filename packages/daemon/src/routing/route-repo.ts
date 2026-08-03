@@ -295,12 +295,16 @@ export class SessionAssignmentRepo {
     return rows.map(asAssignment);
   }
 
-  countActiveForServe(serveId: string): number {
-    const res = this.db
-      .prepare(`SELECT COUNT(*) as count FROM session_assignment WHERE desired_serve_id = ? AND state = 'assigned'`)
-      .get(serveId) as { count: number } | undefined;
-    return res?.count ?? 0;
-  }
+  // NOTE: there is deliberately no `countActiveForServe` here any more. It counted
+  // `state = 'assigned'`, which reads like a concurrency measure and is not one: the
+  // only transition out of 'assigned' is lease EXPIRY (sweep -> listExpired ->
+  // setDormantFenced), while a normal end-of-turn cleanly DELETEs the lease row and
+  // leaves the assignment 'assigned' forever. The count therefore only ratcheted up
+  // (253 rows against six live leases on cloudbox) until it exceeded any cap, and
+  // then — when one serve was evacuated back under the cap — inverted the
+  // bounded-load filter into a magnet that funnelled every placement onto that one
+  // serve for 30 hours. See bead pigeon-76k. Live load is
+  // `SessionLeaseRepo.countLiveForServe`.
 }
 
 export class SessionLeaseRepo {
@@ -419,6 +423,60 @@ export class SessionLeaseRepo {
         epoch: binaryEpoch,
       });
     return res.changes > 0;
+  }
+
+  /**
+   * Live pigeon-routed load on a serve: sessions holding an unexpired lease at the
+   * current epoch. This is the pool's load measure (bead pigeon-76k).
+   *
+   * What it actually means, precisely — NOT "turns in flight". A lease is taken by
+   * `placeSession` at placement and renewed on `touch`, and `withSessionLease` holds
+   * one for the duration of a turn. So a live lease means "placed, renewed, or
+   * running a turn within the last TTL". That is a bounded, self-correcting proxy:
+   * unlike the assignment rows it replaces, it decays on its own and a finished turn
+   * gives capacity back. It also does not see turns where the serve-side lease
+   * wrapper fails open (unregistered identity, flag off) — those are load the pool
+   * never routed and cannot account for.
+   *
+   * Both filters are load-bearing:
+   *
+   *  - `lease_expires_at > @now`: sweep() is periodic, so expired rows linger between
+   *    sweeps. Charging a serve for a corpse lease is charging it for a turn that
+   *    already ended.
+   *  - `binary_epoch = @epoch`: after a pool restart bumps the epoch, a re-registered
+   *    serve is healthy immediately while its previous-epoch leases survive for up to
+   *    one TTL. Those leases belong to a process that is gone, and its turns died
+   *    with it; without the fence, load reads high exactly during the restart window,
+   *    which is when placements are heaviest.
+   *
+   * `excludeSessionId` keeps a session from counting as load against ITSELF, which is
+   * what makes re-placement a fixed point. A session being re-placed already holds a
+   * live lease on its current serve; counting it means that at a low cap the session's
+   * own lease can rule out the serve it is already on, and HRW then diverts it —
+   * a per-session replay of the very magnet this bead exists to kill. Today that
+   * window is empty in production only because leaseTtlMs (30s) <= idleMigrateMs
+   * (60s) leaves the sticky pin alive for the whole lease, but both are independently
+   * env-tunable and that coupling is not an invariant anyone declared.
+   *
+   * Leases belonging to a DEAD serve need no special handling: an unhealthy serve is
+   * not in `listHealthy`, so its count is never consulted.
+   */
+  countLiveForServe(
+    serveId: string,
+    now: number,
+    binaryEpoch: number,
+    excludeSessionId?: string,
+  ): number {
+    const res = this.db
+      .prepare(
+        `SELECT COUNT(*) as count FROM session_lease
+         WHERE serve_id = @serve AND lease_expires_at > @now AND binary_epoch = @epoch
+           AND (@exclude IS NULL OR session_id != @exclude)`,
+      )
+      .get({ serve: serveId, now, epoch: binaryEpoch, exclude: excludeSessionId ?? null }) as
+      | { count: number }
+      | undefined;
+    return res?.count ?? 0;
   }
 
   listExpired(now: number): LeaseRecord[] {

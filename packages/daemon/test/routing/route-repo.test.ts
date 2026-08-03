@@ -198,11 +198,10 @@ describe("Routing Repositories", () => {
     expect(allAssignments).toHaveLength(2);
     expect(allAssignments.find(x => x.sessionId === "session-1")?.state).toBe("migrating");
 
-    // 5c. countActiveForServe
-    // Right now, both assignments are non-assigned ('migrating' and 'dormant')
-    expect(s.assignments.countActiveForServe("serve-1")).toBe(0);
-
-    // Upsert an 'assigned' one
+    // 5c. setState round-trips through every state.
+    // (There is no longer an assignment-derived load counter to assert here: it was
+    // removed in pigeon-76k because 'assigned' counts placements, not turns. Live
+    // load lives on the lease repo — see countLiveForServe below.)
     const a3: AssignmentRecord = {
       sessionId: "session-3",
       directoryKey: null,
@@ -213,14 +212,13 @@ describe("Routing Repositories", () => {
       updatedAt: 10_000,
     };
     s.assignments.upsert(a3);
-    expect(s.assignments.countActiveForServe("serve-1")).toBe(1);
+    expect(s.assignments.get("session-3")?.state).toBe("assigned");
 
-    // Upsert other states
     s.assignments.setState("session-3", "draining", 11_000);
-    expect(s.assignments.countActiveForServe("serve-1")).toBe(0);
+    expect(s.assignments.get("session-3")?.state).toBe("draining");
 
     s.assignments.setState("session-3", "assigned", 11_000);
-    expect(s.assignments.countActiveForServe("serve-1")).toBe(1);
+    expect(s.assignments.get("session-3")?.state).toBe("assigned");
 
     // bumpGeneration on missing assignment throws
     expect(() => s.assignments.bumpGeneration("nonexistent", 12_000)).toThrow(

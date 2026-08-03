@@ -4,6 +4,24 @@ import { pickServe } from "../../src/routing/rendezvous";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "../../src/routing/router";
 import type { ServeInstanceRecord } from "../../src/routing/types";
 
+/**
+ * Find a session id whose HRW top choice within `pool` is `serveId`.
+ *
+ * HRW is a pure hash of (serveId, sessionId), so capacity tests have to search
+ * for an id rather than assert one: the point of the bounded-load tests is that a
+ * session is diverted AWAY from the serve it actually prefers, which is only
+ * meaningful if we know which serve that is.
+ */
+function sessionPreferring(serveId: string, pool: string[], ...exclude: string[]): string {
+  for (let i = 0; i < 10_000; i++) {
+    const sid = `session-prefers-${serveId}-${i}`;
+    if (!exclude.includes(sid) && pickServe(sid, pool) === serveId) {
+      return sid;
+    }
+  }
+  throw new Error(`no session id found preferring ${serveId}`);
+}
+
 describe("IngressRouter Service Logic", () => {
   // Test 1: New placement
   it("New placement: one healthy serve seeded -> route assignment + lease", () => {
@@ -446,7 +464,12 @@ describe("IngressRouter Service Logic", () => {
   });
 
   // Test 8: Bounded-load skip
-  it("Bounded-load skip: avoids over-utilized serves unless all are at capacity", () => {
+  //
+  // The cap is measured in LIVE LEASES, not in `session_assignment` rows (bead
+  // pigeon-76k). An unexpired lease means the session was placed, renewed, or ran a
+  // turn within the last TTL — a decaying proxy for load, where an assignment row is
+  // a permanent record of having once been placed.
+  it("Bounded-load skip: avoids serves with too many live leases unless all are at capacity", () => {
     const s = openStorageDb(":memory:");
     const router = new IngressRouter(s, {
       leaseTtlMs: 5000,
@@ -478,61 +501,242 @@ describe("IngressRouter Service Logic", () => {
     s.serves.upsert(s1);
     s.serves.upsert(s2);
 
-    let dormantPickSid = "";
-    for (let i = 0; i < 1000; i++) {
-      const candidate = `session-dormant-pick-${i}`;
-      if (pickServe(candidate, ["serve-1", "serve-2"]) === "serve-1") {
-        dormantPickSid = candidate;
-        break;
-      }
+    const serve1Sid = sessionPreferring("serve-1", ["serve-1", "serve-2"]);
+
+    // A pile of `assigned` rows on serve-1 with NO live lease is NOT load. This is
+    // the exact state the 2026-08-02 flap ran on: 253 'assigned' rows against six
+    // real leases. serve-1 must still be eligible.
+    for (let i = 0; i < 5; i++) {
+      s.assignments.upsert({
+        sessionId: `session-stale-assigned-${i}`,
+        directoryKey: null,
+        desiredServeId: "serve-1",
+        ownerGeneration: 1,
+        state: "assigned",
+        lastActiveAt: now,
+        updatedAt: now,
+      });
     }
-    expect(dormantPickSid).not.toBe("");
 
-    // Force a dormant assignment on serve-1 (should NOT count toward capacity)
-    s.assignments.upsert({
-      sessionId: "session-dormant-temp",
-      directoryKey: null,
-      desiredServeId: "serve-1",
-      ownerGeneration: 1,
-      state: "dormant",
-      lastActiveAt: now,
-      updatedAt: now,
-    });
+    const resIdle = router.placeSession(serve1Sid, now);
+    expect(resIdle.serveId).toBe("serve-1");
 
-    // Place session. Since serve-1's only assignment is dormant, active count is 0 < activeTurnCap (1).
-    // So serve-1 is eligible and picked by HRW.
-    const resDormant = router.placeSession(dormantPickSid, now);
-    expect(resDormant.serveId).toBe("serve-1");
-
-    // Force one active assignment on serve-1
-    s.assignments.upsert({
-      sessionId: "session-forced-1",
-      directoryKey: null,
-      desiredServeId: "serve-1",
-      ownerGeneration: 1,
-      state: "assigned",
-      lastActiveAt: now,
-      updatedAt: now,
-    });
-
-    // Place a new session. It should pick serve-2 since serve-1 is at capacity (1 >= activeTurnCap=1)
-    const res1 = router.placeSession("session-new", now);
+    // Now give serve-1 a genuine in-flight turn. serve1Sid's own placement above
+    // took a lease on serve-1, so serve-1 is already at cap (1 >= activeTurnCap).
+    const other = sessionPreferring("serve-1", ["serve-1", "serve-2"], serve1Sid);
+    const res1 = router.placeSession(other, now);
     expect(res1.serveId).toBe("serve-2");
 
-    // Force both serves to be at capacity by adding an active assignment on serve-2
-    s.assignments.upsert({
-      sessionId: "session-forced-2",
-      directoryKey: null,
-      desiredServeId: "serve-2",
-      ownerGeneration: 1,
-      state: "assigned",
-      lastActiveAt: now,
-      updatedAt: now,
+    // Both serves now hold one live lease each => filter empties => fall back to
+    // the full pool, so HRW rank 0 wins and placement stays deterministic.
+    const fallbackSid = sessionPreferring("serve-1", ["serve-1", "serve-2"], serve1Sid, other);
+    const res2 = router.placeSession(fallbackSid, now);
+    expect(res2.serveId).toBe("serve-1");
+  });
+
+  // Test 8a: the accounting property under pigeon-76k, at the repo level.
+  //
+  // A cleanly-released lease must return capacity. The old counter read
+  // `session_assignment.state='assigned'`, whose only exit is lease EXPIRY, while
+  // the normal end-of-turn path DELETEs the lease row and leaves the assignment
+  // 'assigned' forever. So the count only ever ratcheted up, drifted past any cap,
+  // and — once a mass evacuation put exactly one serve back under it — inverted the
+  // cap into a magnet.
+  //
+  // This test states the invariant; it does NOT by itself prove the router honors it
+  // (with one serve, every filter outcome picks that serve). Test 8 is the router-
+  // level guard and is the one that fails against the old counter's behavior. Keep
+  // both.
+  it("Capacity accounting: a cleanly released lease returns capacity to the serve", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
     });
 
-    // Now both serves are at cap. Next placeSession falls back to the full pool (and picks one of them)
-    const res2 = router.placeSession("session-fallback", now);
-    expect(["serve-1", "serve-2"]).toContain(res2.serveId);
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    expect(s.leases.countLiveForServe("serve-1", now, 0)).toBe(0);
+
+    const res = router.placeSession("session-1", now);
+    expect(s.leases.countLiveForServe("serve-1", now, 0)).toBe(1);
+
+    // A session is never load against itself — that is what keeps re-placement from
+    // evicting a session off its own serve once the sticky pin expires.
+    expect(s.leases.countLiveForServe("serve-1", now, 0, "session-1")).toBe(0);
+
+    // The end-of-turn path: withSessionLease's finalizer releases the lease.
+    const released = s.leases.release(
+      "session-1",
+      res.serveId,
+      res.instanceUuid,
+      res.ownerGeneration,
+      0,
+    );
+    expect(released).toBe(true);
+
+    // Capacity is back. The assignment row is still 'assigned' — that is fine, it
+    // records placement, not concurrency.
+    expect(s.leases.countLiveForServe("serve-1", now, 0)).toBe(0);
+    expect(s.assignments.get("session-1")?.state).toBe("assigned");
+  });
+
+  // Test 8b: expired and wrong-epoch leases are not load.
+  it("Capacity accounting: expired leases and stale-epoch leases do not count", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    router.placeSession("session-1", now);
+    expect(s.leases.countLiveForServe("serve-1", now, 0)).toBe(1);
+
+    // Expired: sweep is periodic, so corpse rows linger between sweeps and must
+    // not be charged to the serve.
+    expect(s.leases.countLiveForServe("serve-1", now + 5001, 0)).toBe(0);
+
+    // Wrong epoch: after a pool restart bumps the epoch, a re-registered serve is
+    // healthy again while its old-epoch leases live on for up to one TTL. Charging
+    // those to the serve would inflate exactly during the restart window.
+    expect(s.leases.countLiveForServe("serve-1", now, 1)).toBe(0);
+  });
+
+  // Test 8c: repeated placement of one idle session is a fixed point.
+  //
+  // The 2026-08-02 bug was bistable: place -> serve crosses cap -> filter empties
+  // -> fallback -> HRW yanks the session back -> serve dips under cap -> magnet
+  // again. Placement of an unchanging session against an unchanging pool must not
+  // move it, and must not emit reassignment events.
+  it("Placement is a fixed point: re-placing one idle session never moves it", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      // Deliberately > the dt used below, so the serves stay healthy across the
+      // second half of this test and the only thing under examination is the cap.
+      staleServeMs: 20_000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 1,
+    });
+
+    const now = 10_000;
+    for (const [id, uuid, port] of [
+      ["serve-0", "uuid-0", 8000],
+      ["serve-1", "uuid-1", 8001],
+      ["serve-2", "uuid-2", 8002],
+      ["serve-3", "uuid-3", 8003],
+    ] as const) {
+      s.serves.upsert({
+        serveId: id,
+        instanceUuid: uuid,
+        endpoint: `http://localhost:${port}`,
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: now,
+        draining: false,
+      });
+    }
+
+    const first = router.placeSession("session-1", now);
+    for (let i = 0; i < 10; i++) {
+      const again = router.placeSession("session-1", now);
+      expect(again.serveId).toBe(first.serveId);
+      expect(again.ownerGeneration).toBe(first.ownerGeneration);
+    }
+    expect(s.reassignments.countSince(0)).toBe(0);
+
+    // And again with the sticky pin EXPIRED but the session's own lease still
+    // live (idleMigrateMs < dt < leaseTtlMs). This is the window where a session
+    // can evict itself: its own placement lease is load on its own serve, so a
+    // low cap would rule out the serve it is already on and HRW would divert it —
+    // a per-session version of the magnet. Nothing but the counter can prevent
+    // that here, because the pin is gone.
+    const later = now + 4000; // pin (3000) dead, lease (5000) alive
+    const afterPinExpiry = router.placeSession("session-1", later);
+    expect(afterPinExpiry.serveId).toBe(first.serveId);
+    expect(s.reassignments.countSince(0)).toBe(0);
+  });
+
+  // Test 8d: narrowing the eligible set is a deliberate, LOGGED overload decision.
+  //
+  // Invariant from pigeon-76k: the filter may never quietly shrink the pool. The
+  // 2026-08-02 magnet ran for 30 hours with no record of the narrowing that caused
+  // it, which is why root-causing it took DB archaeology.
+  it("Bounded-load skip logs whenever it narrows the eligible set", () => {
+    const s = openStorageDb(":memory:");
+    const logged: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 1,
+      log: (msg, fields) => logged.push({ msg, fields }),
+    });
+
+    const now = 10_000;
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+    s.serves.upsert({
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now,
+      draining: false,
+    });
+
+    // Nobody is loaded: no narrowing, no log.
+    const serve1Sid = sessionPreferring("serve-1", ["serve-1", "serve-2"]);
+    router.placeSession(serve1Sid, now);
+    expect(logged).toHaveLength(0);
+
+    // serve-1 now holds a live lease and is at cap => the pool narrows to
+    // [serve-2]. That must be visible.
+    const other = sessionPreferring("serve-1", ["serve-1", "serve-2"], serve1Sid);
+    router.placeSession(other, now);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]?.fields).toMatchObject({
+      sessionId: other,
+      candidates: ["serve-1", "serve-2"],
+      eligible: ["serve-2"],
+      activeTurnCap: 1,
+    });
   });
 
   // Test 9: Sweep marks dormant + prunes lease
