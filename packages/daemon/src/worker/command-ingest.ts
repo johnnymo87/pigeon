@@ -136,8 +136,28 @@ export async function ingestWorkerCommand(
   }
 
   // Check for pending question: if session has a pending question, route as question reply
-  const pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
+  let pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
+  if (!pendingQuestion && msg.metadata?.questionRequestId) {
+    const expired = storage.pendingQuestions.getBySessionIdIncludingExpired(msg.sessionId);
+    if (expired && expired.requestId === msg.metadata.questionRequestId) {
+      pendingQuestion = expired;
+      console.log(`[command-ingest] resurrected expired pending question sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
+    }
+  }
+
   if (pendingQuestion) {
+    if (msg.metadata?.questionRequestId && msg.metadata.questionRequestId !== pendingQuestion.requestId) {
+      console.warn(`[command-ingest] question answer metadata mismatched sessionId=${msg.sessionId} commandId=${commandId} expected=${pendingQuestion.requestId} got=${msg.metadata.questionRequestId}`);
+      await dropCommand(
+        storage,
+        commandId,
+        msg.chatId,
+        `This question was superseded by a newer question. Your message was not delivered: "${msg.command.trim()}"`,
+        options.sendTelegramReply,
+      );
+      return;
+    }
+
     console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
     const command = msg.command.trim();
     const wizardMatch = WIZARD_OPTION_RE.exec(command);
@@ -341,6 +361,19 @@ export async function ingestWorkerCommand(
     return;
   }
 
+  // If command looks like a question option but no pending question was resolved, it's stale
+  if (QUESTION_OPTION_RE.test(msg.command.trim()) || WIZARD_OPTION_RE.test(msg.command.trim())) {
+    console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);
+    await dropCommand(
+      storage,
+      commandId,
+      msg.chatId,
+      "This question is no longer answerable (it was already answered, or it is gone).",
+      options.sendTelegramReply,
+    );
+    return;
+  }
+
   // Metadata fallback: if no pending question found locally but command has
   // question metadata from the worker, route as a question reply anyway.
   // This handles the case where the daemon's pending_questions state is stale
@@ -376,13 +409,6 @@ export async function ingestWorkerCommand(
     } else {
       console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}, falling through to regular delivery`);
     }
-  }
-
-  // If command looks like a question option but no pending question, it's stale
-  if (QUESTION_OPTION_RE.test(msg.command.trim()) || WIZARD_OPTION_RE.test(msg.command.trim())) {
-    console.log(`[command-ingest] stale question option commandId=${commandId} sessionId=${msg.sessionId}`);
-    storage.inbox.markDone(commandId);
-    return;
   }
 
   // Legacy executeDirect support: wrap in an adapter shim for backward compat
