@@ -15,6 +15,18 @@ two worktree deletions, and five checkpoints. Same discipline applies here.
 **On resuming:** read §0 (where you are), §1 (the operating hazards), §2 (the cycle protocol),
 then the first unchecked cycle in §4. Do not skim §1 — every entry in it cost real time to learn.
 
+**Exception, added 2026-08-02: "the first unchecked item" is the WRONG rule inside Cycle 6.** Cycles
+0–5 encode a risk argument in their ordering; Cycle 6 is a grab-bag whose letters record discovery
+order. Taken literally the rule sends you to `6a` (latent P3) while `6i` (live P2) waits at the
+bottom. Cycle 6 carries its own recommended ordering — read that block before picking an item.
+
+**Item labels are scoped to their block, and Cycles 1 and 3 each reuse them.** Those two cycles list
+their *beads* as `1a/1b` and `3a/3b`, then re-use the same letters for a finer-grained *task
+breakdown* covering different work — so "3a" names both `pigeon-bqo` and "Observability first".
+Prose cross-references (`3e`, `4c`, `6c` …) always mean the **task breakdown**. Both cycles are long
+since done; this is recorded so a reader chasing a reference does not conclude the file contradicts
+itself.
+
 **Rules:**
 
 - Mark a cycle `[x]` only after its tests pass AND it is merged. Never on intent.
@@ -46,6 +58,22 @@ reverted and the outbox has drained — narrowing the allowlist first permanentl
 
 **Still open from the migration:** drop the old DM chat id from `ALLOWED_CHAT_IDS` after burn-in.
 Do this LAST, as Cycle 7b — it is the only irreversible step.
+
+**WHERE THE SPINE STANDS (2026-08-02, after F3): 30 items checked, 13 open.** The hardening argument
+itself — make failures visible (Cycle 0), then act on them (1), then bound them (2–3), then alert on
+what is really there (4), then fix the server side (5) — **is complete and deployed.** What remains
+is not the spine; it is residuals, one real P2, and the migration close-out:
+
+| What | State |
+|---|---|
+| **Cycle 6 residuals** | 8 open. **`6i` (`pigeon-cal`, P2) is the highest-value item left anywhere in this file.** The rest are P3. |
+| **Cycle 7 close-out** | `7a` (record the burn-in 429 rate), then `7b` (drop the old chat id — irreversible, do it last). |
+| **§4.2 feature track** | `F4`, `F5` open; independent of everything above, pick up in any gap. |
+| **`4f`** | Evidence-gated. **Do not schedule it** — `4e` is supposed to produce the evidence first. |
+
+**Not tracked as a cycle but owed: `devbox` and `macbook` still run stale daemon code.** F1–F3 were
+worker-only so nothing is blocked today, but see §1.0 — merging is not deploying, and that gap once
+meant two whole cycles of daemon work had never actually run.
 
 ### Test baseline — regressions are measured against this
 
@@ -769,7 +797,7 @@ Accepted deliberately, not filed: the governor window and `pausedUntil` are in-m
 daemon restart (worst case ~24/min across the boundary, self-correcting via 429), and progress paths
 such as a successful re-registration inherit an escalated backoff (≤2 min extra latency, no loss).
 
-### Cycle 4 — the amplifier was fictional; alert on what is actually there — DONE (PR #20, merged `2a95ee4`)
+### Cycle 4 — the amplifier was fictional; alert on what is actually there — DONE except `4f` (PR #20, merged `2a95ee4`)
 
 **Deployed to cloudbox 2026-08-01 and verified by effect, not by absence of errors** (§1.-1):
 `curl http://127.0.0.1:4731/outbox/stats` returns live aggregates
@@ -1157,6 +1185,25 @@ blast radius but **do not cure the outage**.
 >   it). A total D1 outage still labels correctly because `send.sessionLookup` fails first.
 
 ### Cycle 6 — topic-specific residuals
+
+> **READ THIS BEFORE PICKING AN ITEM — Cycle 6 is a GRAB-BAG, not a sequence.** Cycles 0–5 each
+> encode a risk argument in their ordering, so "do the next unchecked item" was the right rule there.
+> Cycle 6 is residuals swept up after the migration: the letters record *discovery order*, not
+> priority and not dependency. Following §"How to use this file" literally lands you on **6a**, a
+> latent P3 TOCTOU, while **6i** — a live P2 that silently loses webhook acks — sits at the bottom
+> because it was found last. Only one real dependency survives in here (6b↔6c, and it is resolved).
+>
+> **Recommended order, by value:**
+>
+> 1. **6i** (`pigeon-cal`, **P2**) — the only P2 left on the spine, and the same
+>    reports-success-delivers-nothing shape as `t5f`/`bqo`. Do this first.
+> 2. **6j** (`pigeon-kz3`, P3) — duplicate stop notifications defeating dedup; still uninvestigated,
+>    so it may be cheap or may be a real puzzle. Size it before committing.
+> 3. **6d** (`pigeon-cx2`) then **6e** (`pigeon-6hl`) — both `/current-state`, adjacent code.
+> 4. **6g** (`pigeon-66y`) — test-only, mechanical, no production risk.
+> 5. **6a**, **6f**, **6h** — latent/documentation P3s, safe to leave indefinitely.
+>
+> This ordering is advisory. The one hard rule is that **6i outranks everything else in this cycle.**
 
 - [ ] **6a. `pigeon-5o7`** — scope `deleteTopicBySession` to the stale thread id. Latent TOCTOU, safe
   today only by architectural accident (sequential outbox, single daemon, and a `fetch` with **no
