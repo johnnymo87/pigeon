@@ -2972,3 +2972,158 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
     storage.db.close();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3/W4 follow-ups from adversarial review of the first cut.
+//
+// The "your file wasn't delivered" warning originally fired at question-path
+// entry, before delivery was attempted. Two ways that misleads, both of which
+// are the exact defect class this epic exists to kill:
+//   1. a transient failure re-ingests the command, re-sending the warning once
+//      per lease cycle, unbounded;
+//   2. on the metadata-fallback branch a terminal failure falls through to
+//      regular delivery, which DOES deliver the file — so the warning was a lie.
+// It now fires only once the caption has actually been accepted as the answer.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("ingestWorkerCommand — media warning fires only on a delivered answer (W3/W4)", () => {
+  const photo = { key: "inbound/2-b/doc.pdf", mime: "application/pdf", filename: "doc.pdf", size: 10 };
+  const oneQuestion = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+  ];
+
+  function questionSession(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId, notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, now);
+    return { storage, now };
+  }
+
+  it("does not warn about the file when the answer transiently fails (no retry spam)", async () => {
+    const { storage, now } = questionSession("sess-spam");
+    storage.pendingQuestions.store({
+      sessionId: "sess-spam", requestId: "req-s", questions: oneQuestion, token: "t",
+    }, now);
+
+    const replies: string[] = [];
+
+    // A connection error is transient: it throws so the Poller retries the whole
+    // command. Any message sent before that point is sent again on every retry.
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-spam", sessionId: "sess-spam", command: "my answer", chatId: "90", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "ECONNREFUSED" }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    )).rejects.toThrow();
+
+    expect(replies).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("does not warn about the file when the answer terminally fails", async () => {
+    const { storage, now } = questionSession("sess-term");
+    storage.pendingQuestions.store({
+      sessionId: "sess-term", requestId: "req-t", questions: oneQuestion, token: "t",
+    }, now);
+
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-term", sessionId: "sess-term", command: "my answer", chatId: "91", media: photo }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    // Exactly one message: the delivery failure. Adding a "your file wasn't
+    // delivered" note here would contradict it — nothing was delivered at all.
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain("QUESTION_NOT_FOUND");
+    expect(replies.some((r) => /file/i.test(r))).toBe(false);
+
+    storage.db.close();
+  });
+
+  it("does not claim the question is still waiting on the metadata-fallback branch", async () => {
+    // There is no local pending row here by definition — that is why this branch
+    // exists. Telling the user to "tap an option" may be false.
+    const { storage } = questionSession("sess-fb");
+
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-fb", sessionId: "sess-fb", command: "", chatId: "92",
+        media: photo, metadata: { questionRequestId: "req-f" },
+      }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: true as const }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).not.toMatch(/still waiting/i);
+
+    storage.db.close();
+  });
+
+  it("tells the user the file was lost when delivery falls back to revive", async () => {
+    // The revive fallback talks to opencode-serve directly and has no file
+    // channel. Without the notice the session receives the placeholder text
+    // describing a file that never arrived.
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-revive-media", notify: true, backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1, backendEndpoint: "http://127.0.0.1:7777/x", backendAuthToken: "tok",
+    }, Date.now());
+
+    const prompts: string[] = [];
+    const fetchFn = vi.fn(async () => new Response(Buffer.from("img"), { status: 200 }));
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-revive-media", sessionId: "sess-revive-media", command: "", chatId: "93", media: photo }),
+      {
+        workerUrl: "https://worker.example.com",
+        apiKey: "k",
+        fetchFn: fetchFn as unknown as typeof fetch,
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false as const, error: "ECONNREFUSED" }; },
+        }),
+        opencodeClient: {
+          async getSession() { return { id: "sess-revive-media", directory: "/tmp/proj" }; },
+          async sendPrompt(_sid: string, _dir: string, prompt: string) { prompts.push(prompt); },
+        } as never,
+      },
+    );
+
+    expect(prompts).toHaveLength(1);
+    // Both halves matter: what the file was, and that it did not arrive.
+    expect(prompts[0]).toContain("doc.pdf");
+    expect(prompts[0]).toMatch(/could not be delivered/i);
+
+    storage.db.close();
+  });
+});

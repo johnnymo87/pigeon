@@ -139,7 +139,7 @@ export async function ingestWorkerCommand(
   const pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
   if (pendingQuestion) {
     console.log(`[command-ingest] routing as question reply sessionId=${msg.sessionId} commandId=${commandId} requestId=${pendingQuestion.requestId}`);
-    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options)) return;
+    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options, "pending")) return;
     const command = msg.command.trim();
     const wizardMatch = WIZARD_OPTION_RE.exec(command);
     const legacyMatch = !wizardMatch ? QUESTION_OPTION_RE.exec(command) : null;
@@ -232,6 +232,7 @@ export async function ingestWorkerCommand(
 
         console.log(`[command-ingest] wizard advanced to step ${updated.currentStep} commandId=${commandId}`);
         storage.inbox.markDone(commandId);
+        await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
 
@@ -282,6 +283,7 @@ export async function ingestWorkerCommand(
             commandId,
           );
         }
+        await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
 
@@ -325,6 +327,7 @@ export async function ingestWorkerCommand(
       console.log(`[command-ingest] question reply delivered commandId=${commandId}`);
       storage.inbox.markDone(commandId);
       storage.pendingQuestions.delete(msg.sessionId);
+      await warnMediaNotDelivered(msg, commandId, options);
       return;
     }
 
@@ -353,7 +356,7 @@ export async function ingestWorkerCommand(
     // copy of the empty-answer bug (`[[msg.command.trim()]]` below), so guarding
     // only the primary path would leave the stale-state rescue route submitting
     // '' as an answer.
-    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options)) return;
+    if (await refuseUnanswerableQuestionInput(storage, commandId, msg, options, "fallback")) return;
 
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
@@ -372,6 +375,7 @@ export async function ingestWorkerCommand(
         storage.inbox.markDone(commandId);
         // Clean up any stale pending question just in case
         storage.pendingQuestions.delete(msg.sessionId);
+        await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
 
@@ -662,51 +666,71 @@ async function sendBestEffort(
  *   string was accepted as the answer and the wizard advanced on garbage —
  *   a failure that *succeeded*, which is worse than one that errors.
  *
- * - **A caption plus a file**: the caption is a real answer, so it is still
- *   delivered. But the file goes nowhere, because `QuestionReplyEnvelope`
- *   carries only `answers: string[][]` and opencode's own
- *   `/question/:id/reply` endpoint has no file channel. Say so rather than
- *   dropping it silently.
+ * A caption plus a file is NOT refused: the caption is a real answer, so it is
+ * delivered, and `warnMediaNotDelivered` reports the dropped file *after* the
+ * answer lands. See that function for why the timing matters.
  *
  * Why the daemon and not the worker: only the daemon knows a question is
  * pending. `resolveMessageSession` sets `questionRequestId` solely for
  * swipe-replies to a `q:`-prefixed notification, so topic-routed messages carry
  * no question context at all — yet `getBySessionId` hijacks them into this path
  * regardless. A worker-side guard would be a sieve.
+ *
+ * `origin` only affects wording. On the metadata-fallback branch there is by
+ * definition no local pending row — that is why that branch exists — so telling
+ * the user the question is "still waiting" there would assert something the
+ * daemon does not know.
  */
 async function refuseUnanswerableQuestionInput(
   storage: StorageDb,
   commandId: string,
   msg: ExecuteMessage,
   options: WorkerCommandIngestOptions,
+  origin: "pending" | "fallback",
 ): Promise<boolean> {
-  const hasAnswerText = msg.command.trim().length > 0;
+  if (msg.command.trim().length > 0) return false;
 
-  if (!hasAnswerText) {
-    console.warn(`[command-ingest] refusing unanswerable question input commandId=${commandId} media=${Boolean(msg.media)}`);
-    await dropCommand(
-      storage,
-      commandId,
-      msg.chatId,
-      msg.media
-        ? `Can't answer a question with a file — only text answers can be delivered.\n\nThe question is still waiting: tap an option, or reply with text. Then send the file again.`
-        : `Can't answer a question with an empty message.\n\nThe question is still waiting: tap an option, or reply with text.`,
-      options.sendTelegramReply,
-    );
-    return true;
-  }
+  console.warn(`[command-ingest] refusing unanswerable question input commandId=${commandId} media=${Boolean(msg.media)} origin=${origin}`);
 
-  if (msg.media) {
-    // Proceeding with the caption as the answer, but the file is not going with it.
-    await sendBestEffort(
-      options.sendTelegramReply,
-      msg.chatId,
-      `Answering with your caption — but the attached file wasn't delivered, because a question answer can only carry text.\n\nSend the file again once the question is answered.`,
-      commandId,
-    );
-  }
+  const cause = msg.media
+    ? `Can't answer a question with a file — only text answers can be delivered.`
+    : `Can't answer a question with an empty message.`;
+  const next = origin === "pending"
+    ? `The question is still waiting: tap an option, or reply with text.`
+    : `If that question is still open, tap an option on it, or reply with text.`;
+  const trailer = msg.media ? ` Then send the file again.` : ``;
 
-  return false;
+  await dropCommand(storage, commandId, msg.chatId, `${cause}\n\n${next}${trailer}`, options.sendTelegramReply);
+  return true;
+}
+
+/**
+ * Report a file that rode along with a question answer and went nowhere.
+ *
+ * `QuestionReplyEnvelope` carries only `answers: string[][]`, and opencode's own
+ * `/question/:id/reply` endpoint has no file channel, so the attachment is
+ * unavoidably dropped. Silence about that is the defect class this epic exists
+ * to kill.
+ *
+ * Called only once the answer has actually been accepted, which is load-bearing
+ * in two ways. A transient failure throws so the Poller retries the whole
+ * command, and anything sent before that point is re-sent once per lease cycle
+ * for as long as the failure lasts. And on the metadata-fallback branch a
+ * terminal failure falls through to regular delivery, which *does* carry the
+ * file — so warning early would have been an outright lie.
+ */
+async function warnMediaNotDelivered(
+  msg: ExecuteMessage,
+  commandId: string,
+  options: WorkerCommandIngestOptions,
+): Promise<void> {
+  if (!msg.media) return;
+  await sendBestEffort(
+    options.sendTelegramReply,
+    msg.chatId,
+    `Your answer was delivered, but the attached file was not — a question answer can only carry text.\n\nSend the file again now that the question is answered.`,
+    commandId,
+  );
 }
 
 /**
