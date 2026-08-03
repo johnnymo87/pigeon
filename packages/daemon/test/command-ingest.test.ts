@@ -2545,6 +2545,37 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
     storage.db.close();
   });
 
+  it("still notifies and acks when the keyboard-clearing edit throws", async () => {
+    // dropUnanswerableQuestion deletes the row and then clears the keyboard.
+    // An unguarded throw there escapes before dropCommand runs: the row is
+    // gone, the command is never acked, and the user is never told. On retry
+    // there is no pending question, so a typed answer falls through to the
+    // execute path and reaches opencode as a stray prompt.
+    const storage = makeWizardStorage("sess-w2c-10");
+    // The adapter-lacks branch is only reached on the final step.
+    storage.pendingQuestions.advanceStep("sess-w2c-10", ["Postgres"]);
+    const replies: string[] = [];
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-10", sessionId: "sess-w2c-10", command: "v1:q0", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-no-question-support",
+          async deliverCommand() { return { ok: false as const, error: "should not be called" }; },
+        }),
+        editNotification: async () => { throw new Error("network down"); },
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    )).resolves.toBeUndefined();
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!).toContain("can't receive question answers");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
   it("stays silent when the edit succeeds", async () => {
     const storage = makeWizardStorage("sess-w2c-4");
     const replies: string[] = [];

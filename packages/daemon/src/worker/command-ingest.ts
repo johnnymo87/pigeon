@@ -661,7 +661,12 @@ async function dropUnanswerableQuestion(
   editNotification: WorkerCommandIngestOptions["editNotification"],
 ): Promise<void> {
   storage.pendingQuestions.delete(msg.sessionId);
-  await editNotification?.(
+  // Contained: an unguarded throw here escapes before dropCommand runs, so the
+  // row is already deleted, the command is never acked, and the user is never
+  // told. The retry then finds no pending question and a typed answer falls
+  // through to the execute path, reaching opencode as a stray prompt.
+  await tryEditNotification(
+    editNotification,
     `q:${msg.sessionId}:${requestId}`,
     "This session can't receive question answers from Telegram.",
     { inline_keyboard: [] },
