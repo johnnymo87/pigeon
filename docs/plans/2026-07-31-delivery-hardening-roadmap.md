@@ -1543,12 +1543,17 @@ whole backlog:
   because the second was test-merged before landing. Anyone opening a cycle that touches the question
   path should `git log origin/main -- packages/daemon/src/worker/command-ingest.ts` first.
 
-  **#46 also silently closed most of `pigeon-k4c.4`** — supplying `questionRequestId` on the button
-  path means a stale press is caught by the new supersede check instead of misrouting by option index.
-  Verified by probe, both ways: with metadata the misroute is unreachable; **without** metadata it
-  still fires *silently*, answering a question the user never read. Recorded on that bead. This is the
-  same lesson as CORRECTION #9 — a fix in one track can move another track's ground without either
-  bead noticing.
+  **#46 also mooted the primary path of `pigeon-k4c.4`** (the bead stays open — this narrowed it, it
+  did not close it). Supplying `questionRequestId` on the button path means a stale press is caught by
+  the new supersede check instead of misrouting by option index. Verified by probe, both ways: with
+  metadata the misroute is unreachable; **without** metadata it still fires *silently*, answering a
+  question the user never read. The route that keeps it alive is the one §0 already flags — `devbox`
+  and `macbook` run stale daemon code, and a pre-#46 daemon has no supersede check at all. Recorded on
+  that bead. Same lesson as CORRECTION #9: a fix in one track can move another track's ground without
+  either bead noticing.
+
+  *Status labels in this bullet are a snapshot; read current state from `bd`. The ids are the durable
+  part, and they are what the F1/F2 grep needs.*
 
 > **Audit method note (2026-08-03).** The literal-grep audit produced one **false positive**:
 > `pigeon-5d0` came back unplaced, but it is **CLOSED** — it surfaced only because it appears inside

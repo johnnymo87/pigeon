@@ -23,10 +23,16 @@ This is **not** the whole backlog, and it is not the only spine touching this su
 | Swarm delivery semantics | epic `pigeon-fnx` | Low — same thesis, different subsystem. |
 | Serve routing | epic `pigeon-u1u` | None. |
 
-**The overlap is not theoretical.** PR #45 (this track) and PR #46 (delivery hardening) independently
-rewrote the same question-reply path in parallel. They merged clean only because #45 was test-merged
-against #46 before landing, and the `sendBestEffort` collision surfaced as a compile error rather than
-two diverging copies — that was deliberate, not luck. Before opening any cycle here, run:
+**The overlap is not theoretical, and do not take false comfort from how it went.** PR #45 (this
+track) and PR #46 (delivery hardening) independently rewrote the same question-reply path in parallel.
+They merged textually clean — **silently**. Nothing warned either author.
+
+Do not confuse this with the `sendBestEffort` collision, which was **intra-track**: #45 duplicated a
+helper from my own open #43 on purpose, so whichever landed second got a hard
+`Duplicate function implementation` error. That tripwire was deliberate, and it worked — but it says
+nothing about cross-track safety, because #46 never touched that helper. **A cross-track collision
+here has no tripwire at all**; the only thing that checked #45 against #46 was a manual test-merge in
+a throwaway worktree, and it is not automatic. Before opening any cycle here, run:
 
 ```
 git log origin/main -- packages/daemon/src/worker/command-ingest.ts
@@ -514,8 +520,9 @@ convince you it is genuine.
 ## 10. Re-verification against post-#46 `main` (2026-08-03)
 
 PR #46, from the delivery-hardening track, rewrote the question-reply path this epic has been working
-all week. Both remaining question-path beads were re-verified against `c0358e6` **by probe test, not
-by reading**, because this epic has repeatedly punished reasoning.
+all week. Both remaining question-path beads were re-verified **by probe test, not by reading**,
+because this epic has repeatedly punished reasoning. Probed against `origin/main` at `e373821`, which
+includes #45, #46, #47 and #51–#53 — not against #46's own commit, which is what the beads describe.
 
 ### `pigeon-k4c.4` (W2e) — mostly closed by someone else's PR, and the residue is the interesting part
 
@@ -529,10 +536,19 @@ not match the pending row. The probe, run both ways against `origin/main`:
 | **Without** metadata | `[["Yes, deploy"]]` | **nothing** |
 
 So the bead's mechanism is untouched — the version guard at `:193` still only runs when the *current*
-question is a wizard — and #46 masked it upstream rather than fixing it. Where metadata is absent
-(commands queued by the pre-#46 worker and still in D1, a `notification_id` that does not parse, any
-future caller that omits it) it still fires, and fires **silently**, answering a question the user
-never read with an option chosen by position.
+question is a wizard — and #46 masked it upstream rather than fixing it. Where the supersede check does
+not run, it still fires, and fires **silently**, answering a question the user never read with an
+option chosen by position. Reachable routes, strongest first:
+
+1. **Stale daemons.** The sibling roadmap records that `devbox` and `macbook` still run stale daemon
+   code. A pre-#46 daemon has no supersede check *at all*, so the misroute is live on those machines
+   today regardless of metadata. This is the route that actually justifies the fix.
+2. **Rollout skew** — commands queued by the pre-#46 worker and still sitting in D1.
+3. ~~A `notification_id` that does not parse~~ — **probably not reachable**, and the bead should not
+   lean on it. The `q:` notification format predates `WIZARD_OPTION_RE`, so every wizard keyboard ever
+   rendered maps to a `q:`-prefixed row, and the parser handles the `#cN` chunk suffix. A missing
+   mapping makes `resolveCallbackSession` return null, so the command is never queued at all. Listed
+   here only so nobody re-derives it as live.
 
 The originally-proposed fix is still the right one *because* it does not depend on metadata: apply the
 version guard whenever the payload is wizard-**shaped**. That is defense-in-depth behind #46's identity
