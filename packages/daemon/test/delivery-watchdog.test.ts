@@ -1732,142 +1732,107 @@ describe("DeliveryWatchdog", () => {
   // The turn starts, produces nothing, and never completes. Previously the
   // mere existence of that in-flight row stamped the row verified on the
   // first pass, closing a wake that never ran as a permanent success.
+  //
+  // The fix makes that state HONESTLY UNKNOWN rather than falsely successful.
+  // It deliberately does NOT condemn it: a provider rate-limit produces a
+  // byte-identical transcript (opencode surfaces retries as ephemeral session
+  // status, never as a part), so failing on this evidence would destroy live
+  // wakes that were about to run.
   // -------------------------------------------------------------------------
   describe("pigeon-s9d: started-but-silent turns", () => {
-    const WEDGED_MS = 900_000;
-
-    it("s9d-1. wake wedged past threshold: markFailed + DURABLE alert with payload, never verified", async () => {
-      fixture = makeFixture();
-      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
-
+    function silentWakeFixture(msgId: string) {
+      const f = makeFixture();
+      fixture = f;
+      const { clientMap, insertHandedOff } = f;
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
-        userMessage(50, `<swarm_message v="1" msg_id="m_wedged">`),
+        userMessage(50, `<swarm_message v="1" msg_id="${msgId}">`),
         // The measured signature: started, zero parts, completed=null forever.
         assistantMessage({ created: 100, completed: null, parts: [] }),
       ]);
       clientMap.set("ses_b", { preferred: client, all: [client] });
-
       insertHandedOff({
-        msgId: "m_wedged",
+        msgId,
         fromSession: "ses_a",
         toSession: "ses_b",
         handedOffAt: 60,
         kind: "wake",
         deliverAt: 60,
       });
-      storage.db
-        .prepare("UPDATE swarm_messages SET payload = ? WHERE msg_id = ?")
-        .run("check the prod cron at 09:15", "m_wedged");
-      fixture.setNow(100 + WEDGED_MS + 1);
+      return { client, f };
+    }
+
+    it("s9d-1. THE BUG: a started-but-silent turn is never verified", async () => {
+      const msgId = "m_wedged";
+      const { f } = silentWakeFixture(msgId);
+      const { storage, watchdog } = f;
+      f.setNow(400_000); // past verifyAfterMs, when the stamp used to land
 
       await watchdog.processOnce();
 
-      const row = storage.swarm.getByMsgId("m_wedged")!;
-      // The whole point: the record must NOT say this succeeded.
+      const row = storage.swarm.getByMsgId(msgId)!;
+      // Previously this was 400_000: a wake that never ran, recorded as a
+      // confirmed success, permanently removed from every queue that could
+      // have caught it.
       expect(row.verifiedAt).toBeNull();
-      expect(row.state).toBe("failed");
-
-      // Durable substrate, not fire-and-forget: it must survive a crash.
-      const alerts = storage.db
-        .prepare("SELECT * FROM operational_alerts WHERE ref_msg_id = ?")
-        .all("m_wedged") as Array<Record<string, unknown>>;
-      expect(alerts).toHaveLength(1);
-      expect(alerts[0]!.source).toBe("wake-wedged");
-      expect(alerts[0]!.severity).toBe("error");
-      // Payload inlined so a human can reschedule the lost wake by hand.
-      expect(String(alerts[0]!.text)).toContain("check the prod cron at 09:15");
-      expect(String(alerts[0]!.text)).toContain("never ran");
-
-      // Wakes are never redelivered into the same broken session.
-      expect(client.abortSession).not.toHaveBeenCalled();
-      expect(row.requeueCount).toBe(0);
-
-      // The sender is told in-band too.
-      const notice = storage.db
-        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
-        .get() as Record<string, unknown> | undefined;
-      expect(notice).toBeDefined();
+      expect(row.state).toBe("handed_off");
     });
 
-    it("s9d-2. BELOW threshold is UNKNOWN, not failure: nothing changes, no alert", async () => {
-      fixture = makeFixture();
-      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
-
-      const client = makeClient();
-      client.getSessionMessages.mockResolvedValue([
-        userMessage(50, `<swarm_message v="1" msg_id="m_slow">`),
-        assistantMessage({ created: 100, completed: null, parts: [] }),
-      ]);
-      clientMap.set("ses_b", { preferred: client, all: [client] });
-
-      insertHandedOff({
-        msgId: "m_slow",
-        fromSession: "ses_a",
-        toSession: "ses_b",
-        handedOffAt: 60,
-        kind: "wake",
-        deliverAt: 60,
-      });
-      // Real turns have taken 4.2 min to emit a first part; well inside this.
-      fixture.setNow(100 + WEDGED_MS - 1);
+    it("s9d-2. unknown is not failure: hours of silence still does not condemn or requeue the wake", async () => {
+      const msgId = "m_patient";
+      const { client, f } = silentWakeFixture(msgId);
+      const { storage, watchdog, sendPlainAlert } = f;
+      f.setNow(6 * 60 * 60 * 1000); // six hours
 
       await watchdog.processOnce();
+      await watchdog.processOnce();
 
-      const row = storage.swarm.getByMsgId("m_slow")!;
-      expect(row.state).toBe("handed_off");
-      expect(row.verifiedAt).toBeNull(); // not verified...
-      expect(sendPlainAlert).not.toHaveBeenCalled(); // ...but not condemned either
-      const alertCount = storage.db
+      const row = storage.swarm.getByMsgId(msgId)!;
+      expect(row.state).toBe("handed_off"); // not failed
+      expect(row.verifiedAt).toBeNull(); // and not verified
+      expect(row.requeueCount).toBe(0); // and not redelivered
+      expect(client.abortSession).not.toHaveBeenCalled();
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const alerts = storage.db
         .prepare("SELECT COUNT(*) c FROM operational_alerts")
         .get() as { c: number };
-      expect(alertCount.c).toBe(0);
+      expect(alerts.c).toBe(0);
     });
 
-    it("s9d-3. a slow turn that later emits a part verifies on a subsequent cycle", async () => {
-      fixture = makeFixture();
-      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+    it("s9d-3. a rate-limited turn (zero parts, retry surfaced only as session status) is NOT destroyed, and verifies once it finally runs", async () => {
+      const msgId = "m_ratelimited";
+      const { client, f } = silentWakeFixture(msgId);
+      const { storage, watchdog } = f;
 
-      const client = makeClient();
-      client.getSessionMessages.mockResolvedValue([
-        userMessage(50, `<swarm_message v="1" msg_id="m_late">`),
-        assistantMessage({ created: 100, completed: null, parts: [] }),
-      ]);
-      clientMap.set("ses_b", { preferred: client, all: [client] });
-      insertHandedOff({
-        msgId: "m_late",
-        fromSession: "ses_a",
-        toSession: "ses_b",
-        handedOffAt: 60,
-        kind: "wake",
-        deliverAt: 60,
-      });
-
-      fixture.setNow(400_000);
+      // 429 with a long retry-after: opencode writes no part at all, because
+      // `step-start` only lands on the first stream event.
+      f.setNow(60 * 60 * 1000);
       await watchdog.processOnce();
-      expect(storage.swarm.getByMsgId("m_late")!.verifiedAt).toBeNull();
+      expect(storage.swarm.getByMsgId(msgId)!.state).toBe("handed_off");
 
-      // First token finally lands.
+      // Limit clears; the turn runs for real.
       client.getSessionMessages.mockResolvedValue([
-        userMessage(50, `<swarm_message v="1" msg_id="m_late">`),
-        assistantMessage({ created: 100, completed: null, parts: [textPart(460_000)] }),
+        userMessage(50, `<swarm_message v="1" msg_id="${msgId}">`),
+        assistantMessage({
+          created: 100,
+          completed: null,
+          parts: [textPart(3_600_500)],
+        }),
       ]);
-      fixture.setNow(500_000);
+      f.setNow(3_601_000);
       await watchdog.processOnce();
 
-      const row = storage.swarm.getByMsgId("m_late")!;
-      expect(row.verifiedAt).toBe(500_000);
+      const row = storage.swarm.getByMsgId(msgId)!;
+      expect(row.verifiedAt).toBe(3_601_000);
       expect(row.state).toBe("handed_off");
     });
 
-    it("s9d-4. long-running tool call (start, no end) counts as progress — no false alarm", async () => {
+    it("s9d-4. long-running tool call (start, no end) counts as progress", async () => {
       fixture = makeFixture();
       const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
-
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
         userMessage(50, `<swarm_message v="1" msg_id="m_tool">`),
-        // A 40-minute build: in-flight, one running tool part, no end time.
         assistantMessage({ created: 100, completed: null, parts: [toolPart(150)] }),
       ]);
       clientMap.set("ses_b", { preferred: client, all: [client] });
@@ -1879,25 +1844,55 @@ describe("DeliveryWatchdog", () => {
         kind: "wake",
         deliverAt: 60,
       });
-      fixture.setNow(100 + WEDGED_MS * 3);
+      fixture.setNow(3 * 900_000);
 
       await watchdog.processOnce();
 
-      const row = storage.swarm.getByMsgId("m_tool")!;
-      expect(row.verifiedAt).toBe(100 + WEDGED_MS * 3);
-      expect(row.state).toBe("handed_off");
+      expect(storage.swarm.getByMsgId("m_tool")!.verifiedAt).toBe(3 * 900_000);
       expect(sendPlainAlert).not.toHaveBeenCalled();
     });
 
-    it("s9d-5. untimed step-start/step-finish parts are NOT evidence of execution", async () => {
+    it("s9d-5. a PENDING tool call (no timestamps at all) still counts as evidence the model ran", async () => {
       fixture = makeFixture();
       const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_pending">`),
+        // ToolStatePending is {status,input,raw} — no `time` field exists.
+        // The model emitted a tool call and is blocked on a permission ask.
+        assistantMessage({
+          created: 100,
+          completed: null,
+          parts: [
+            stepPart("step-start"),
+            { type: "tool", state: { status: "pending", input: {}, raw: "" } },
+          ],
+        }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "m_pending",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+        kind: "wake",
+        deliverAt: 60,
+      });
+      fixture.setNow(400_000);
 
+      await watchdog.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_pending")!.verifiedAt).toBe(400_000);
+    });
+
+    it("s9d-6. untimed step-start/step-finish scaffolding alone is NOT evidence of execution", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
         userMessage(50, `<swarm_message v="1" msg_id="m_scaffold">`),
-        // Sampling real transcripts: every turn carries these, neither has a
-        // timestamp. Counting them would reintroduce the rubber stamp.
+        // Every real turn carries these and neither has a timestamp; counting
+        // them would reintroduce the rubber stamp.
         assistantMessage({
           created: 100,
           completed: null,
@@ -1913,23 +1908,21 @@ describe("DeliveryWatchdog", () => {
         kind: "wake",
         deliverAt: 60,
       });
-      fixture.setNow(100 + WEDGED_MS + 1);
+      fixture.setNow(400_000);
 
       await watchdog.processOnce();
 
       const row = storage.swarm.getByMsgId("m_scaffold")!;
       expect(row.verifiedAt).toBeNull();
-      expect(row.state).toBe("failed");
+      expect(row.state).toBe("handed_off");
     });
 
-    it("s9d-6. IDLE (no assistant turn at all) still takes the W3 suppression path, not the wedged path", async () => {
+    it("s9d-7. IDLE (no assistant turn at all) still takes the W3 suppression path, unchanged", async () => {
       fixture = makeFixture();
       const { storage, watchdog, clientMap, insertHandedOff } = fixture;
-
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
         userMessage(50, `<swarm_message v="1" msg_id="m_idle">`),
-        // Nothing started. This is the benign dormant-target case.
       ]);
       clientMap.set("ses_b", { preferred: client, all: [client] });
       insertHandedOff({
@@ -1940,23 +1933,16 @@ describe("DeliveryWatchdog", () => {
         kind: "wake",
         deliverAt: 60,
       });
-      fixture.setNow(100 + WEDGED_MS + 1);
+      fixture.setNow(400_000);
 
       await watchdog.processOnce();
 
-      const row = storage.swarm.getByMsgId("m_idle")!;
-      // Unchanged by this work: suppressed, left alone, NOT failed.
-      expect(row.state).toBe("handed_off");
-      const alertCount = storage.db
-        .prepare("SELECT COUNT(*) c FROM operational_alerts")
-        .get() as { c: number };
-      expect(alertCount.c).toBe(0);
+      expect(storage.swarm.getByMsgId("m_idle")!.state).toBe("handed_off");
     });
 
-    it("s9d-7. ORDINARY (non-wake) wedged message keeps the bounded requeue ladder, no durable alert", async () => {
+    it("s9d-8. REGRESSION: an ORDINARY message whose turn is silent is NOT requeued (no duplicate injection)", async () => {
       fixture = makeFixture();
       const { storage, watchdog, clientMap, insertHandedOff } = fixture;
-
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
         userMessage(50, `<swarm_message v="1" msg_id="m_chat">`),
@@ -1970,17 +1956,55 @@ describe("DeliveryWatchdog", () => {
         handedOffAt: 60,
         kind: "chat",
       });
-      fixture.setNow(100 + WEDGED_MS + 1);
+      fixture.setNow(400_000);
 
       await watchdog.processOnce();
 
+      // Ordinary messages are NOT suppressed from recovery, so without the
+      // silent-turn branch they would fall into the idle branch and be
+      // redelivered — injecting a duplicate prompt into a session that may
+      // merely be waiting on a provider retry. prompt_async is not idempotent.
       const row = storage.swarm.getByMsgId("m_chat")!;
-      expect(row.state).toBe("queued"); // requeued for another try
-      expect(row.requeueCount).toBe(1);
-      const alertCount = storage.db
-        .prepare("SELECT COUNT(*) c FROM operational_alerts")
-        .get() as { c: number };
-      expect(alertCount.c).toBe(0);
+      expect(row.state).toBe("handed_off");
+      expect(row.requeueCount).toBe(0);
+    });
+
+    it("s9d-9. oldest post-anchor silent turn is reported, so later traffic cannot mask it", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_multi">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }),
+        assistantMessage({ created: 350_000, completed: null, parts: [] }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "m_multi",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+        kind: "wake",
+        deliverAt: 60,
+      });
+      fixture.setNow(400_000);
+
+      const logged: Array<Record<string, unknown>> = [];
+      const spy = new DeliveryWatchdog({
+        storage,
+        resolveClients: () => ({ preferred: client, all: [client] }),
+        notifier: { sendPlainAlert: async () => {} },
+        nowFn: () => 400_000,
+        log: (_event: string, fields?: Record<string, unknown>) => {
+          if (fields) logged.push(fields);
+        },
+      });
+      await spy.processOnce();
+
+      const skip = logged.find((f) => f.reason === "in-flight-no-output-yet");
+      expect(skip).toBeDefined();
+      // Anchored on the OLDEST silent turn (created=100), not the newest.
+      expect(skip!.silentForMs).toBe(399_900);
     });
   });
 });
