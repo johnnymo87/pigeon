@@ -63,12 +63,12 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | ID | Item | P | State |
 |----|------|---|-------|
 | `pigeon-az8` | **W0 GATE** — prove a normal text command works in a devbox topic | P1 | ✅ **PASSED** 2026-08-02 |
-| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ **PR #39** |
-| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ **PR #39** |
-| `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | ✅ **PR #42** |
-| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | ✅ **PR #43** |
+| `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ merged (#39, `3fa7a7c`) |
+| `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ merged (#39, `3fa7a7c`) |
+| `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | ✅ merged (#42, `03b5c14`) |
+| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | 🔵 in review (#43) |
 | `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | ready |
-| `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | new, ready |
+| `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | ready |
 | `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
 | `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
 
@@ -119,7 +119,9 @@ PR #39 for the reason recorded in §6.
 | `pigeon-k4c.4` (W2e) | Small and well-scoped: apply the version guard whenever the payload is wizard-shaped, not only when the *current* question is a wizard. Pairs naturally with W2d since both concern stale question state. |
 | `pigeon-k4c.3` (W2d) | Lowest urgency: noisy rather than silent, and strictly better than what it replaced. |
 
-All three P1s are now done or in review. What remains is P2.
+All three P1s are now merged or in review; everything remaining is P2. Status column mirrors
+`bd`: ✅ = closed, 🔵 = in_progress (PR open, bead stays open until it merges), ready = open.
+Squash SHAs are recorded because the repo is squash-merge only — working SHAs do not survive.
 
 ---
 
