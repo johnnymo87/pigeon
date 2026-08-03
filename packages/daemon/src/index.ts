@@ -12,6 +12,7 @@ import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
 import { Poller } from "./worker/poller";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
+import { AlertDrainer, DEFAULT_DRAIN_INTERVAL_MS, type AlertDrainerNotifier } from "./swarm/alert-drainer";
 import { DeliveryWatchdog } from "./swarm/delivery-watchdog";
 import { makeWatchdogResolveClients } from "./swarm/watchdog-client-resolver";
 import { SessionDirectoryRegistry } from "./swarm/registry";
@@ -43,6 +44,11 @@ import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
 import { ServeOutcomeSensor } from "./routing/serve-outcome";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
+
+const ALERT_ABANDON_MS = 72 * 60 * 60 * 1000;
+const ALERT_SENT_RETENTION_MS = 1 * 60 * 60 * 1000;
+// Retention for abandoned alerts measured from created_at (age since creation, not since abandonment).
+const ALERT_ABANDONED_CREATED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
@@ -377,7 +383,6 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       storage,
       clientForSession,
       directoryForSession,
-      notifier,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
@@ -390,12 +395,50 @@ if (swarmArbiter) {
   console.log("[pigeon-daemon] swarm arbiter NOT started (no opencodeUrl in config)");
 }
 
-// Cleanup terminal outbox entries every hour (sent after 1h, failed after 7d)
+// Operational alert drainer: sends queued operational alerts to Telegram.
+// Note on notifier capability gate: sendPlainAlert is optional on StopNotifier. On a host
+// with no TELEGRAM_BOT_TOKEN, there is no plain-alert notifier. Alerts are still enqueued in DB
+// as an honest record of events; they are simply never drained. Do NOT mark them sent when no
+// notifier exists — that would record a configuration fact as a delivery fact.
+const alertDrainer = notifier?.sendPlainAlert
+  ? new AlertDrainer({
+      storage,
+      notifier: notifier as AlertDrainerNotifier,
+      log: (msg, fields) =>
+        console.log(`[alert-drainer] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (alertDrainer) {
+  alertDrainer.start(DEFAULT_DRAIN_INTERVAL_MS);
+  console.log(`[pigeon-daemon] alert drainer started (interval=${DEFAULT_DRAIN_INTERVAL_MS}ms)`);
+} else {
+  console.log(
+    "[pigeon-daemon] alert drainer NOT started (no plain-alert notifier on this host; operational alerts recorded in DB, GET /swarm/scheduled is only channel)",
+  );
+}
+
+// Cleanup terminal outbox entries and operational alerts every hour.
+// Ordering property: abandonment MUST happen before cleanup in the same tick.
+// A queued alert must never be deleted directly by cleanupOlderThan — only
+// abandonOlderThan may retire it to 'abandoned', which is a recorded state change,
+// not a deletion.
 setInterval(() => {
-  const sentCutoff = Date.now() - OUTBOX_RETENTION_MS;
-  const failedCutoff = Date.now() - FAILED_RETENTION_MS;
+  const now = Date.now();
+  const sentCutoff = now - OUTBOX_RETENTION_MS;
+  const failedCutoff = now - FAILED_RETENTION_MS;
   const cleaned = storage.outbox.cleanupOlderThan(sentCutoff, failedCutoff);
   if (cleaned > 0) console.log(`[outbox] cleaned ${cleaned} old entries`);
+
+  const alertAbandonCutoff = now - ALERT_ABANDON_MS;
+  const alertSentCutoff = now - ALERT_SENT_RETENTION_MS;
+  const alertAbandonedCutoff = now - ALERT_ABANDONED_CREATED_RETENTION_MS;
+
+  const abandoned = storage.alerts.abandonOlderThan(alertAbandonCutoff, now);
+  if (abandoned > 0) console.warn(`[alerts] abandoned ${abandoned} unsent alerts older than 72h`);
+
+  const alertsCleaned = storage.alerts.cleanupOlderThan(alertSentCutoff, alertAbandonedCutoff);
+  if (alertsCleaned > 0) console.log(`[alerts] cleaned ${alertsCleaned} old entries`);
 }, 60 * 60 * 1000);
 
 // Reap stale Pigeon registry entries every hour. This must not delete opencode
