@@ -2382,3 +2382,202 @@ describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b
     storage.db.close();
   });
 });
+
+describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
+  const twoQuestions = [
+    {
+      question: "Which database?",
+      header: "H1",
+      options: [
+        { label: "Postgres", description: "relational" },
+        { label: "MongoDB", description: "" },
+      ],
+    },
+    {
+      question: "Which region?",
+      header: "H2",
+      options: [
+        { label: "us-east-1", description: "Virginia" },
+        { label: "eu-west-1", description: "" },
+      ],
+    },
+  ];
+
+  function makeWizardStorage(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+    storage.pendingQuestions.store({
+      sessionId,
+      requestId: `req-${sessionId}`,
+      questions: twoQuestions,
+      token: `tok-${sessionId}`,
+    }, now);
+    return storage;
+  }
+
+  const adapter = () => ({
+    name: "mock-direct",
+    async deliverCommand() { return { ok: false as const, error: "should not be called" }; },
+    async deliverQuestionReply() { return { ok: true as const }; },
+  });
+
+  it("tells the user the buttons are dead when the step edit reports failure", async () => {
+    const storage = makeWizardStorage("sess-w2c-1");
+    const replies: Array<{ chatId: string; text: string }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-1", sessionId: "sess-w2c-1", command: "v0:q1", chatId: "77" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ ok: false }),
+        sendTelegramReply: async (chatId, text) => { replies.push({ chatId, text }); },
+      },
+    );
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!.chatId).toBe("77");
+    // Names the question storage is actually waiting on (step 2), not the stale one.
+    expect(replies[0]!.text).toContain("Which region?");
+    expect(replies[0]!.text).toContain("Question 2 of 2");
+    // Lists the options as text, since typed answers are stored verbatim.
+    expect(replies[0]!.text).toContain("us-east-1");
+    expect(replies[0]!.text).toContain("eu-west-1");
+    // Warns the on-screen buttons no longer work.
+    expect(replies[0]!.text.toLowerCase()).toContain("button");
+
+    storage.db.close();
+  });
+
+  it("keeps storage authoritative after a failed edit", async () => {
+    const storage = makeWizardStorage("sess-w2c-2");
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-2", sessionId: "sess-w2c-2", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ ok: false }),
+        sendTelegramReply: async () => {},
+      },
+    );
+
+    // No rollback: the advance stands, and the command is acked.
+    const updated = storage.pendingQuestions.getBySessionId("sess-w2c-2");
+    expect(updated!.currentStep).toBe(1);
+    expect(updated!.answers).toEqual([["MongoDB"]]);
+    expect(updated!.version).toBe(1);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("contains a throwing editNotification instead of letting it escape", async () => {
+    const storage = makeWizardStorage("sess-w2c-3");
+    const replies: string[] = [];
+
+    // A throw would escape ingestWorkerCommand, skip the ack, and the retry
+    // would die on the stale-version guard the advance just created.
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-3", sessionId: "sess-w2c-3", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => { throw new Error("network down"); },
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    )).resolves.toBeUndefined();
+
+    expect(replies).toHaveLength(1);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("stays silent when the edit succeeds", async () => {
+    const storage = makeWizardStorage("sess-w2c-4");
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-4", sessionId: "sess-w2c-4", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ ok: true }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toEqual([]);
+    storage.db.close();
+  });
+
+  it("stays silent when no editNotification is wired at all", async () => {
+    const storage = makeWizardStorage("sess-w2c-5");
+    const replies: string[] = [];
+
+    // `editNotification?.()` yields undefined when unwired. A naive `!res?.ok`
+    // check would treat that as a failure and warn about buttons nobody saw.
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-5", sessionId: "sess-w2c-5", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    expect(replies).toEqual([]);
+    storage.db.close();
+  });
+
+  it("still acks when the fallback reply itself throws", async () => {
+    const storage = makeWizardStorage("sess-w2c-6");
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-6", sessionId: "sess-w2c-6", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ ok: false }),
+        sendTelegramReply: async () => { throw new Error("telegram down"); },
+      },
+    )).resolves.toBeUndefined();
+
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    storage.db.close();
+  });
+
+  it("warns the buttons are stale when the completion edit fails on the final step", async () => {
+    const storage = makeWizardStorage("sess-w2c-7");
+    // Move to the final step so the next press completes the wizard.
+    storage.pendingQuestions.advanceStep("sess-w2c-7", ["Postgres"]);
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2c-7", sessionId: "sess-w2c-7", command: "v1:q0", chatId: "1" }),
+      {
+        createAdapter: adapter,
+        editNotification: async () => ({ ok: false }),
+        sendTelegramReply: async (_c, text) => { replies.push(text); },
+      },
+    );
+
+    // Answers were delivered and the row is gone; only the keyboard is stale.
+    expect(storage.pendingQuestions.getBySessionId("sess-w2c-7")).toBeNull();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!.toLowerCase()).toContain("button");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+});

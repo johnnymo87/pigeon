@@ -203,7 +203,31 @@ export async function ingestWorkerCommand(
           machineId: options.machineId,
         });
 
-        await options.editNotification?.(notificationId, message.text, replyMarkup, message.entities);
+        const edit = await tryEditNotification(
+          options.editNotification,
+          notificationId,
+          message.text,
+          replyMarkup,
+          message.entities,
+        );
+        if (edit.attempted && !edit.ok) {
+          // Storage is now at step N+1 / version V+1 but the on-screen message
+          // still shows step N with buttons carrying version V, so every later
+          // press dies on the stale-version guard above. We do NOT roll the
+          // advance back: {ok:false} is ambiguous (the edit may have been
+          // applied before the reply failed), and rolling back would create the
+          // same skew in the opposite direction. Storage stays authoritative;
+          // the user gets working instructions for the step it actually wants.
+          console.warn(
+            `[command-ingest] wizard step edit failed commandId=${commandId} notificationId=${notificationId} version=${updated.version}`,
+          );
+          await sendBestEffort(
+            options.sendTelegramReply,
+            msg.chatId,
+            staleKeyboardStepMessage(pendingQuestion.questions, updated.currentStep),
+            commandId,
+          );
+        }
 
         console.log(`[command-ingest] wizard advanced to step ${updated.currentStep} commandId=${commandId}`);
         storage.inbox.markDone(commandId);
@@ -235,7 +259,28 @@ export async function ingestWorkerCommand(
         storage.pendingQuestions.delete(msg.sessionId);
 
         const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
-        await options.editNotification?.(notificationId, "All answers submitted ✅", { inline_keyboard: [] });
+        const doneEdit = await tryEditNotification(
+          options.editNotification,
+          notificationId,
+          "All answers submitted ✅",
+          { inline_keyboard: [] },
+        );
+        if (doneEdit.attempted && !doneEdit.ok) {
+          // The answers are delivered and the row is gone, so this is not a
+          // soft-lock — but the keyboard survives a wizard that no longer
+          // exists. A later tap lands on the stale-option guard and vanishes,
+          // and if a NEW question arrives first it can even be misrouted, so
+          // say plainly that the buttons are dead.
+          console.warn(
+            `[command-ingest] wizard completion edit failed commandId=${commandId} notificationId=${notificationId}`,
+          );
+          await sendBestEffort(
+            options.sendTelegramReply,
+            msg.chatId,
+            STALE_KEYBOARD_DONE_MESSAGE,
+            commandId,
+          );
+        }
         return;
       }
 
@@ -466,6 +511,101 @@ function classifyDeliveryFailure(error: string | undefined): DeliveryFailureKind
  * permanently-undeliverable command would retry forever. Notifying is important;
  * it is not important enough to build an infinite loop out of.
  */
+/**
+ * Perform a notification edit, reporting whether it was attempted and whether
+ * it succeeded.
+ *
+ * Two distinctions the call sites depend on:
+ *
+ * - `attempted` separates "the edit failed" from "no editNotification was
+ *   wired at all". `options.editNotification?.()` yields `undefined` in the
+ *   unwired case, so a bare `!result?.ok` check would report a failure for an
+ *   edit nobody ever asked for.
+ * - Throws are contained. The production wiring (poller.editNotification)
+ *   catches internally and returns {ok:false}, but a throw here would escape
+ *   ingestWorkerCommand, skip the ack, and trigger a Poller retry that then
+ *   dies on the stale-version guard the wizard advance just created. Checking
+ *   the ok flag alone is not sufficient if the call can also throw.
+ */
+async function tryEditNotification(
+  editNotification: WorkerCommandIngestOptions["editNotification"],
+  notificationId: string,
+  text: string,
+  replyMarkup: unknown,
+  entities?: unknown[],
+): Promise<{ attempted: boolean; ok: boolean }> {
+  if (!editNotification) return { attempted: false, ok: false };
+  try {
+    const result = await editNotification(notificationId, text, replyMarkup, entities);
+    return { attempted: true, ok: result?.ok === true };
+  } catch (err) {
+    console.warn(`[command-ingest] editNotification threw notificationId=${notificationId}:`, err);
+    return { attempted: true, ok: false };
+  }
+}
+
+/** Best-effort user notification. Never throws; see dropCommand for the rationale. */
+async function sendBestEffort(
+  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  chatId: string,
+  text: string,
+  commandId: string,
+): Promise<void> {
+  try {
+    await sendTelegramReply?.(chatId, text);
+  } catch (err) {
+    console.warn(`[command-ingest] failed to notify user commandId=${commandId}:`, err);
+  }
+}
+
+const STALE_KEYBOARD_DONE_MESSAGE =
+  "✅ All answers submitted.\n\n" +
+  "⚠️ I couldn't update the question message, so its buttons are still showing. " +
+  "Ignore them — they no longer do anything.";
+
+/**
+ * Plain-text restatement of the step the wizard is now waiting on, for when the
+ * in-place edit failed and the on-screen buttons are dead.
+ *
+ * Deliberately not formatQuestionWizardStep's text: that copy invites a
+ * swipe-reply for a "custom answer" without saying the buttons stopped working,
+ * which is the entire point here. Two details that are load-bearing:
+ *
+ * - It points at the ORIGINAL question message. This reply is sent straight to
+ *   the Telegram API, so it has no `messages` row and a swipe-reply to it
+ *   resolves no session.
+ * - It asks for the option TEXT, not its number. A typed answer is stored
+ *   verbatim, so "2" would be recorded as the literal string "2".
+ */
+function staleKeyboardStepMessage(
+  questions: Array<{ question: string; options: Array<{ label: string; description?: string }> }>,
+  currentStep: number,
+): string {
+  const question = questions[currentStep];
+  const lines = [
+    "⚠️ I couldn't update the question message — its buttons no longer work.",
+    "",
+    `Question ${currentStep + 1} of ${questions.length}: ${question?.question ?? ""}`,
+  ];
+
+  const options = question?.options ?? [];
+  if (options.length > 0) {
+    lines.push("", "Options:");
+    options.forEach((opt, i) => {
+      lines.push(`${i + 1}. ${opt.label}${opt.description ? ` — ${opt.description}` : ""}`);
+    });
+  }
+
+  lines.push(
+    "",
+    "To answer: swipe-reply to the original question message above and type your answer as text" +
+      (options.length > 0 ? ` (e.g. "${options[0]!.label}")` : "") +
+      ". Don't tap the old buttons, and don't reply with just a number.",
+  );
+
+  return lines.join("\n");
+}
+
 async function dropCommand(
   storage: StorageDb,
   commandId: string,
