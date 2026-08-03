@@ -460,9 +460,22 @@ asserting empty-answer acceptance, and its media tests are all captioned.
 contract reads as transient. A 404 — the *normal* outcome once R2's 24h TTL sweeps the object —
 therefore retries forever and is never acked. Pre-existing; unchanged by this PR.
 
-### A note on `pigeon-m68`
+### A note on `pigeon-m68`, and a wrong call I made about it
 
-The flaky-test bead is no longer flaky. `lease-cas-concurrency.test.ts` now fails
-**deterministically**, verified 1/1 in a throwaway worktree at clean `origin/main`. Prior
-guidance to "re-run it in isolation" is stale and actively misleading: re-running no longer
-clears it, so anyone treating a red there as noise will be wrong.
+Mid-cycle I recorded that `lease-cas-concurrency.test.ts` had stopped being flaky and now
+failed **deterministically**, on the strength of 3 consecutive failures — one full-suite, one in
+isolation, one in a throwaway worktree at clean `origin/main`. I wrote that into both the bead
+and this file.
+
+**It was wrong.** The same test later passed 1/1 in a full-suite run and 8/8 in isolation. All
+three failures happened while the machine was loaded (npm installs and other suites running);
+all nine passes happened while it was idle. It is a load-sensitive flake in a concurrency
+proof — exactly the original characterisation, not a regression from it.
+
+Three consecutive failures felt like proof and were not. The retraction is recorded here rather
+than quietly edited away, because this cycle's whole theme is beads and notes asserting more
+than their evidence supports — and I did it too, in the middle of writing that up.
+
+Practical guidance: a red there is not necessarily real, but re-run it on an **idle** machine.
+Re-running while the rest of the suite is still going will often reproduce the failure and
+convince you it is genuine.
