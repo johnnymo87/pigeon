@@ -464,14 +464,24 @@ an active route when a valid lease exists. Drain still sheds sessions; both epoc
    The fix ships two `[router]` logs — lease-honored, and a live-lease-displacement
    tripwire — which are the first instruments that would show this class of event.
 
-2. **The fix is partial, deliberately.** Nothing renews leases in production: `renewCAS`'s
-   only caller is `touch()`, which has no callers, and there is no renewal route. Leases
-   lapse after `leaseTtlMs` (30s) and are re-acquired by the next `placeSession`. So the
-   protection lasts only until the current lease's natural expiry; a stall that outlives it
-   still ends in a clobber. Tracked as **pigeon-u1a**, which likely wants the serviceability
-   signal this document designs rather than a naive renewer — note the `touch()` docstring
-   warning first: a periodic renewer would extend a dead serve's lease forever, because the
-   full-token fence still matches a corpse that has not re-registered.
+2. **The fix is partial, deliberately.** The lease is renewed by the **serve itself, out of
+   process** — the patched opencode serve holds the pigeon SQLite file open and refreshes its
+   own `session_lease` row on a ~`leaseTtlMs/3` fiber. Nothing in the *daemon* renews
+   (`renewCAS`'s only TS caller is `touch()`, which has no callers), and I initially inferred
+   from that that nothing renews at all, which was wrong — see the note below. Because the
+   renewal fiber runs inside the serve's own single-threaded event loop, a CPU stall halts
+   renewal too, so the lease lapses ~`leaseTtlMs` after the last successful renew and a longer
+   stall still ends in a clobber. Tracked as **pigeon-u1a**, which likely wants the
+   serviceability signal this document designs rather than a naive renewer — note the
+   `touch()` docstring warning first: a daemon-side periodic renewer would extend a dead
+   serve's lease forever, because the full-token fence still matches a corpse that has not
+   re-registered.
+
+   **Corollary for this arc, learned the hard way:** "no TS caller" does not mean "does not
+   happen." The serve is a second writer to this database. Any dead-code or liveness argument
+   in this arc has to account for out-of-process writers, and the discriminating evidence is
+   cheap — sample `session_lease` twice more than a TTL apart and check whether expiry
+   advances, and check `/proc/<pid>/fd` for who holds the `.db` open.
 
 **Constraint this adds to §5.1 A.** The amendment says the verdict must not be ANDed into
 `isServeHealthy`. There is now a second reason: `resolveRoute` no longer consults

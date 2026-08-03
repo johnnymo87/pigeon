@@ -91,13 +91,22 @@ export class IngressRouter {
     // resolveRoute was the sole holdout contradicting it.
     //
     // SCOPE, stated plainly so the next incident does not "disprove" this fix.
-    // Nothing renews leases in production: renewCAS's only caller is touch(),
-    // which has no callers, so a lease simply lapses after leaseTtlMs (30s) and
-    // the next placeSession re-acquires it. This fix therefore protects a stall
-    // only until the CURRENT lease's natural expiry -- at most leaseTtlMs from the
-    // last acquire, and typically less, since the stall may begin mid-lease. A
-    // stall that outlives the remaining lease still ends in a re-place and still
-    // kills the turn. It narrows the window; it does not close it (bead pigeon-u1a).
+    // The lease is renewed by the SERVE ITSELF, out of process: the patched
+    // opencode serve holds this SQLite file open and refreshes its own
+    // session_lease row on a ~leaseTtlMs/3 fiber. Nothing in the DAEMON renews --
+    // renewCAS's only TS caller is touch(), which has no callers -- so do not
+    // conclude from "no TS caller" that renewal does not happen. (It was concluded
+    // here once, and it was wrong: verified by sampling session_lease 40s apart,
+    // longer than the 30s TTL, and seeing every row's expiry advance by exactly
+    // the elapsed time with zero generation changes, plus the serve PIDs holding
+    // this .db open in /proc/<pid>/fd.)
+    //
+    // That renewal fiber lives inside the serve's own single-threaded event loop
+    // -- the same loop a CPU-heavy turn blocks. So a stall stops renewal too, and
+    // the lease lapses ~leaseTtlMs after the last successful renew. This fix
+    // therefore protects a stall only up to roughly leaseTtlMs; a longer stall
+    // lapses the lease, resolveRoute goes null again, and placeSession clobbers as
+    // before. It narrows the window; it does not close it (bead pigeon-u1a).
     //
     // It also slows failover for a GENUINELY dead serve: commands now fail with
     // connection errors until the lease lapses instead of migrating on the next
@@ -384,11 +393,12 @@ export class IngressRouter {
   /**
    * Renew the lease of a session that is still validly routed.
    *
-   * NOTE (bead pigeon-pov): this method currently has NO production callers —
-   * nothing in the daemon renews leases, they lapse after leaseTtlMs and are
-   * re-acquired by the next placeSession (acquireCAS take-over ladder branch C,
-   * same-owner idempotent re-acquire). It is kept because a periodic renewer is
-   * the obvious future use.
+   * NOTE (bead pigeon-pov): this method has NO production callers, and it is the
+   * only TS caller of renewCAS. That does NOT mean leases go unrenewed — the
+   * patched opencode serve renews its own lease out of process by writing this
+   * SQLite file directly. Do not follow the dead-code thread from here into
+   * deleting renewCAS or the session_lease renewal SQL: that would silently break
+   * out-of-process renewal, and no test in this repo would catch it.
    *
    * If you wire one up, mind the liveness gate below. resolveRoute now honors a
    * valid lease over a stale heartbeat, which is right for ROUTING (the owner is
