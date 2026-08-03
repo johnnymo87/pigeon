@@ -139,7 +139,7 @@ export async function ingestWorkerCommand(
   let pendingQuestion = storage.pendingQuestions.getBySessionId(msg.sessionId);
 
   // The row above is hidden once it passes its 4h TTL, but it is not deleted —
-  // nothing calls cleanupExpired — so a late answer can still be matched to it.
+  // age-based cleanup deliberately does not exist — so a late answer can still be matched to it.
   // Resurrect it when the worker tells us which question this answer is for and
   // that id matches. Because the table is keyed on session_id with INSERT OR
   // REPLACE, a newer question would have destroyed this row; an expired row
