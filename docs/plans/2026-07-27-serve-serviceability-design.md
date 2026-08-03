@@ -430,3 +430,61 @@ expensive one and we should not pay for it before knowing if we need it.
    dead-man's switch would cut that to ~30s for real. Is that latency improvement worth
    more than I have credited, given class B has not been observed since the hijack was
    fenced?
+
+## 9. Landed: the live-lease clobber (pigeon-pov, 2026-08-03)
+
+Question 3 above — "should suspicion only stop *new* placements and leave in-flight
+sessions alone until their lease lapses naturally?" — turned out to describe a defect
+that already existed, independent of the verdict work. It is now fixed, and the answer
+to the question is **yes, and that rule is now enforced in `resolveRoute`**.
+
+**What was wrong.** `reassignFromDeadServe` was carefully guarded (skip any session whose
+lease on the dead serve is still valid, because only the owning serve can renew and
+`renewCAS` is full-token fenced, so an unexpired lease proves the serve is alive-but-busy).
+`resolveRoute` was the sole holdout: it gated on serve health *before* reading the lease, so
+a stale heartbeat made it return null even with a valid lease, and `ensureRouted`
+(`resolveRoute() ?? placeSession()`) then re-placed the session — bumping `owner_generation`
+and stealing the lease via the `acquireCAS` take-over ladder. That is the June
+"session lease lost mid-run" mode. Reached mid-turn in production by `/interrupt`,
+`/compact`, follow-up prompts and swarm arbiter delivery.
+
+**Fix.** `resolveRoute` now checks lease-token validity first, then gates the serve on
+exists + `!draining` + current epoch. `healthState` and heartbeat freshness no longer block
+an active route when a valid lease exists. Drain still sheds sessions; both epoch fences stay.
+
+**Two findings worth carrying into the verdict work:**
+
+1. **The bug was structurally unobservable, and the "evidence of absence" was a null
+   instrument.** The original bead cited a journald grep for "lease lost" returning zero
+   hits. That grep could never have matched: the string exists only in *code comments*, the
+   units are system-scope (a `--user` query returns "No entries" regardless), and journald
+   retention does not even reach June. There is no health-state-change log (`pigeon-f02`),
+   and five days of daemon journal contained zero `[router]` lines. Before trusting any
+   "we checked and saw nothing" claim in this arc, confirm the instrument could have fired.
+   The fix ships two `[router]` logs — lease-honored, and a live-lease-displacement
+   tripwire — which are the first instruments that would show this class of event.
+
+2. **The fix is partial, deliberately.** The lease is renewed by the **serve itself, out of
+   process** — the patched opencode serve holds the pigeon SQLite file open and refreshes its
+   own `session_lease` row on a ~`leaseTtlMs/3` fiber. Nothing in the *daemon* renews
+   (`renewCAS`'s only TS caller is `touch()`, which has no callers), and I initially inferred
+   from that that nothing renews at all, which was wrong — see the note below. Because the
+   renewal fiber runs inside the serve's own single-threaded event loop, a CPU stall halts
+   renewal too, so the lease lapses ~`leaseTtlMs` after the last successful renew and a longer
+   stall still ends in a clobber. Tracked as **pigeon-u1a**, which likely wants the
+   serviceability signal this document designs rather than a naive renewer — note the
+   `touch()` docstring warning first: a daemon-side periodic renewer would extend a dead
+   serve's lease forever, because the full-token fence still matches a corpse that has not
+   re-registered.
+
+   **Corollary for this arc, learned the hard way:** "no TS caller" does not mean "does not
+   happen." The serve is a second writer to this database. Any dead-code or liveness argument
+   in this arc has to account for out-of-process writers, and the discriminating evidence is
+   cheap — sample `session_lease` twice more than a TTL apart and check whether expiry
+   advances, and check `/proc/<pid>/fd` for who holds the `.db` open.
+
+**Constraint this adds to §5.1 A.** The amendment says the verdict must not be ANDed into
+`isServeHealthy`. There is now a second reason: `resolveRoute` no longer consults
+`isServeHealthy` for sessions holding a valid lease, so a verdict wired in there would not
+reach the live-session path at all — it would silently apply only to placement. That is
+probably the desired scope, but it should be a decision rather than an accident.

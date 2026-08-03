@@ -141,9 +141,19 @@ describe("IngressRouter Service Logic", () => {
     // Mark that serve unhealthy
     s.serves.setHealth(firstServe, "unhealthy", now);
 
-    // Resolve should be null because serve is unhealthy
-    const r = router.resolveRoute("session-1", now);
-    expect(r).toBeNull();
+    // While the lease is still VALID, an unhealthy flag is NOT sufficient to
+    // migrate (bead pigeon-pov): only the owning serve can renew, so an unexpired
+    // lease proves it is alive-but-busy, and migrating would kill the in-flight
+    // turn. This assertion used to read `toBeNull()`, which encoded the bug.
+    expect(router.resolveRoute("session-1", now)?.serveId).toBe(firstServe);
+    expect(router.ensureRouted("session-1", now).serveId).toBe(firstServe);
+
+    // A genuinely crashed serve stops renewing, so its lease lapses within
+    // leaseTtlMs -- and THEN the crash migration happens. Keep the surviving
+    // serve's heartbeat fresh so it is still an eligible target at `now`.
+    now += 5001;
+    const survivor = firstServe === "serve-1" ? s2 : s1;
+    s.serves.upsert({ ...survivor, heartbeatAt: now });
 
     // Now call ensureRouted again. It should migrate to the other serve.
     const res2 = router.ensureRouted("session-1", now);
@@ -1110,7 +1120,11 @@ describe("resolveProspectiveRoute (idle prospective routing)", () => {
     seedServe(s, "serve-1", "http://localhost:8001");
     seedAssignment(s, "ses_b", "serve-0", "assigned");
     s.leases.acquireCAS({ sessionId: "ses_b", serveId: "serve-0", instanceUuid: "uuid-serve-0", ownerGeneration: 1, binaryEpoch: 0 }, now, OPTS.leaseTtlMs);
-    expect(router.resolveRoute("ses_b", now)).toBeNull();
+    // Since pigeon-pov, resolveRoute ALSO honors the valid lease over the stale
+    // heartbeat (it previously returned null here, which was the bug: ensureRouted
+    // then re-placed the session and killed the in-flight turn). Prospective and
+    // active routing now agree, which is the point.
+    expect(router.resolveRoute("ses_b", now)?.serveId).toBe("serve-0");
     const r = router.resolveProspectiveRoute("ses_b", now)!;
     expect(r.serveId).toBe("serve-0");
   });
@@ -1163,5 +1177,244 @@ describe("resolveProspectiveRoute (idle prospective routing)", () => {
     seedServe(s, "serve-1", "http://localhost:8001");
     seedAssignment(s, "ses_f", "serve-1", "assigned");
     expect(router.resolveProspectiveRoute("ses_f", now)!.serveId).toBe("serve-1");
+  });
+});
+
+/**
+ * pigeon-pov: the ensureRouted -> placeSession path must honor a still-valid lease.
+ *
+ * reassignFromDeadServe already refuses to evict a session whose lease is still
+ * valid (Test 7b): only the owning serve can renew, and renewCAS is full-token
+ * fenced, so an unexpired lease PROVES the serve is alive-but-busy. A
+ * single-threaded opencode serve blocked by a CPU-heavy turn misses heartbeats
+ * for >staleServeMs while the run is perfectly healthy.
+ *
+ * resolveRoute was the sole holdout: it gated on serve health BEFORE reading the
+ * lease, so a stale heartbeat made it return null even with a valid lease, and
+ * ensureRouted then called placeSession -- which bumps owner_generation and
+ * steals the lease via acquireCAS take-over ladder branch B, killing the
+ * in-flight turn ("session lease lost mid-run", the June failure).
+ *
+ * This path is reached mid-turn in production: clientForSession -> forSession ->
+ * ensureRouted serves /interrupt, /compact, follow-up prompts and swarm delivery.
+ * /interrupt is the sharpest -- it is BY DEFINITION sent while a turn is running,
+ * and a CPU-heavy turn is simultaneously what stalls the heartbeat and what makes
+ * a user reach for interrupt.
+ */
+describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
+  const TTL = 5000;
+  const STALE = 2000;
+
+  function setup() {
+    const s = openStorageDb(":memory:");
+    const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
+    const router = new IngressRouter(s, {
+      leaseTtlMs: TTL,
+      staleServeMs: STALE,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+      log: (msg, fields) => logs.push({ msg, fields }),
+    });
+    const now = 10_000;
+    for (const [id, uuid, port] of [
+      ["serve-1", "uuid-1", 8001],
+      ["serve-2", "uuid-2", 8002],
+    ] as const) {
+      s.serves.upsert({
+        serveId: id,
+        instanceUuid: uuid,
+        endpoint: `http://localhost:${port}`,
+        binaryEpoch: 0,
+        healthState: "healthy",
+        heartbeatAt: now,
+        draining: false,
+      });
+    }
+    // Force session-1 onto serve-1 by making serve-2 temporarily ineligible.
+    s.serves.setHealth("serve-2", "unhealthy", now);
+    const placed = router.ensureRouted("session-1", now);
+    expect(placed.serveId).toBe("serve-1");
+    expect(placed.ownerGeneration).toBe(1);
+    s.serves.setHealth("serve-2", "healthy", now);
+    logs.length = 0; // ignore setup-time placement logs
+    return { s, router, now, logs };
+  }
+
+  /** Keep serve-2 a live steal target, or the red state degenerates to NoHealthyServeError. */
+  function freshenServe2(s: ReturnType<typeof openStorageDb>, at: number) {
+    s.serves.upsert({
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: at,
+      draining: false,
+    });
+  }
+
+  // THE core test. Staleness is driven by real heartbeat AGE, not setHealth:
+  // a fix that relaxes only the healthState clause while keeping the heartbeat
+  // clause would leave the production bug intact and must not pass.
+  it("stale HEARTBEAT + valid lease -> keeps the session on its owner, no generation bump", () => {
+    const { s, router, now, logs } = setup();
+    const later = now + STALE + 1; // serve-1 heartbeat now stale; lease (TTL 5000) still valid
+    freshenServe2(s, later);
+    const assignmentBefore = s.assignments.get("session-1");
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-1");
+    expect(r.ownerGeneration).toBe(1);
+    // The RETURNED expiry must be the real lease expiry, not a fabricated one.
+    expect(r.expiresAt).toBe(now + TTL);
+    const lease = s.leases.get("session-1");
+    expect(lease?.serveId).toBe("serve-1");
+    expect(lease?.ownerGeneration).toBe(1);
+    // Untouched: neither stolen nor silently re-acquired on a read path.
+    expect(lease?.leaseExpiresAt).toBe(now + TTL);
+    // resolveRoute is a READ. A mutant that touches the assignment here (e.g.
+    // touchActive) would silently defeat idle-migration accounting.
+    expect(s.assignments.get("session-1")).toEqual(assignmentBefore);
+    // The instrument itself is pinned: this bug was invisible in production for
+    // months precisely because nothing logged, so an untested log is a mutant
+    // waiting to happen.
+    expect(logs.filter((l) => l.msg.includes("honoring a valid lease"))).toHaveLength(1);
+  });
+
+  // Companion: pins the OTHER clause. A poller-probe failure marks the serve
+  // unhealthy while its heartbeat is fresh; the valid lease still proves life.
+  it("unhealthy healthState + fresh heartbeat + valid lease -> still keeps the owner", () => {
+    const { s, router, now } = setup();
+    s.serves.setHealth("serve-1", "unhealthy", now);
+    const later = now + 1; // heartbeat still fresh
+    freshenServe2(s, later);
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-1");
+    expect(r.ownerGeneration).toBe(1);
+    expect(s.leases.get("session-1")?.ownerGeneration).toBe(1);
+  });
+
+  // Kills the overcorrection mutant that would pin sessions to a stale serve forever.
+  it("EXPIRED lease on a stale serve -> does migrate, bumping the generation", () => {
+    const { s, router, now } = setup();
+    const later = now + TTL + 1; // lease expired AND heartbeat stale
+    freshenServe2(s, later);
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-2");
+    expect(r.ownerGeneration).toBe(2);
+  });
+
+  // Kills the mutant that drops the !draining fence: a draining serve must still shed.
+  it("draining owner + valid lease -> session is moved off the draining serve", () => {
+    const { s, router, now, logs } = setup();
+    const later = now + 1;
+    freshenServe2(s, later);
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: later,
+      draining: true,
+    });
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-2");
+    expect(r.ownerGeneration).toBe(2);
+    // ...and the live-lease tripwire must STAY QUIET here. Evicting a busy session
+    // off a draining serve is the point of drain, not a regression; if this fired
+    // it would go off for every session on every pool bounce and train whoever
+    // reads the logs to ignore the one signal that means a real clobber.
+    expect(logs.filter((l) => l.msg.includes("displacing a LIVE lease"))).toHaveLength(0);
+  });
+
+  // The healthy path must stay silent, or the honor-log becomes noise.
+  it("healthy owner + valid lease -> routes normally and logs nothing", () => {
+    const { s, router, now, logs } = setup();
+    const later = now + 1;
+    freshenServe2(s, later);
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: later,
+      draining: false,
+    });
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-1");
+    expect(logs).toHaveLength(0);
+  });
+
+  // Kills the mutant that drops the epoch fence.
+  it("stale-epoch lease -> not honored even though it is unexpired", () => {
+    const { s, router, now } = setup();
+    const later = now + 1;
+    s.meta.bumpEpoch(later);
+    s.serves.upsert({
+      serveId: "serve-2",
+      instanceUuid: "uuid-2",
+      endpoint: "http://localhost:8002",
+      binaryEpoch: 1,
+      healthState: "healthy",
+      heartbeatAt: later,
+      draining: false,
+    });
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-2");
+    expect(r.ownerGeneration).toBe(2);
+  });
+
+  // Kills the mutant that drops the SERVE-record epoch fence. The lease-epoch
+  // check alone does not cover this: a lease can sit at the current epoch while
+  // the serve record is still at the OLD one (it has not re-registered after a
+  // cutover yet), and routing to it would hand the turn to a process running the
+  // previous binary. Found by mutation-testing the fix -- without this test,
+  // deleting `serve.binaryEpoch !== epoch` passed the entire suite.
+  it("lease at current epoch but serve record still at the OLD epoch -> not honored", () => {
+    const { s, router, now } = setup();
+    const later = now + 1;
+    s.meta.bumpEpoch(later); // meta -> epoch 1; serve-1 record stays at epoch 0
+    const took = s.leases.acquireCAS(
+      { sessionId: "session-1", serveId: "serve-1", instanceUuid: "uuid-1", ownerGeneration: 1, binaryEpoch: 1 },
+      later,
+      TTL,
+    );
+    expect(took).toBe(true);
+    const lease = s.leases.get("session-1");
+    expect(lease?.binaryEpoch).toBe(1); // lease is CURRENT-epoch...
+    expect(s.serves.get("serve-1")?.binaryEpoch).toBe(0); // ...but the serve is not
+
+    expect(router.resolveRoute("session-1", later)).toBeNull();
+  });
+
+  // Kills the mutant that honors ANY unexpired lease regardless of token match.
+  it("lease whose serve disagrees with the assignment -> not honored", () => {
+    const { s, router, now } = setup();
+    const later = now + STALE + 1;
+    freshenServe2(s, later);
+    // Corrupt the token by writing it directly: acquireCAS deliberately REFUSES to
+    // create this state (it re-validates against the assignment), so going through
+    // the repo would leave the lease on serve-1 and the test would assert nothing.
+    s.db
+      .prepare("UPDATE session_lease SET serve_id = 'serve-2' WHERE session_id = 'session-1'")
+      .run();
+    expect(s.leases.get("session-1")?.serveId).toBe("serve-2");
+    expect(s.assignments.get("session-1")?.desiredServeId).toBe("serve-1");
+
+    expect(router.resolveRoute("session-1", later)).toBeNull();
   });
 });
