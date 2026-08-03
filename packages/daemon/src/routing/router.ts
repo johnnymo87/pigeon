@@ -26,8 +26,12 @@ export class LeaseContendedError extends Error {
   }
 }
 
+/** Structured logger, matching the shape used by the flap detector and outcome sensor. */
+export type RouterLogger = (msg: string, fields?: Record<string, unknown>) => void;
+
 export class IngressRouter {
   private sticky: StickyRouter<string, string>;
+  private readonly log: RouterLogger;
 
   constructor(
     private repos: {
@@ -48,9 +52,13 @@ export class IngressRouter {
       idleMigrateMs: number;
       dormantTtlMs: number;
       activeTurnCap: number;
+      log?: RouterLogger;
     },
   ) {
     this.sticky = new StickyRouter<string, string>(opts.idleMigrateMs);
+    this.log = opts.log ?? ((msg, fields) => {
+      console.log(`[router] ${msg}`, fields ? JSON.stringify(fields) : "");
+    });
   }
 
   private isServeHealthy(s: ServeInstanceRecord | null, now: number, epoch: number): boolean {
@@ -177,10 +185,19 @@ export class IngressRouter {
       throw new NoHealthyServeError();
     }
 
-    // Bounded-load skip
-    let eligible = candidates.filter(
-      (id) => this.repos.assignments.countActiveForServe(id) < this.opts.activeTurnCap,
+    // Bounded-load skip. Load is LIVE LEASES, never `session_assignment` rows — see
+    // SessionLeaseRepo.countLiveForServe and bead pigeon-76k for why the old counter
+    // turned this filter into a magnet. The session being placed is excluded from its
+    // own serve's load, so re-placing an idle session is a fixed point rather than a
+    // self-eviction.
+    const load = new Map(
+      candidates.map((id) => [
+        id,
+        this.repos.leases.countLiveForServe(id, now, epoch, sessionId),
+      ]),
     );
+    let eligible = candidates.filter((id) => load.get(id)! < this.opts.activeTurnCap);
+    const narrowed = eligible.length > 0 && eligible.length < candidates.length;
     if (eligible.length === 0) {
       eligible = candidates;
     }
@@ -192,6 +209,24 @@ export class IngressRouter {
     // override the output to a healthy serve. The stale pin self-heals on idle/sweep.
     if (!candidates.includes(chosen)) {
       chosen = desired;
+    }
+
+    // Narrowing the pool is allowed — with a truthful counter, steering placements
+    // toward the serves that still have capacity is the point — but it is an overload
+    // decision and must never be silent. Nobody could see the narrowing that drove the
+    // 2026-08-02 flap for thirty hours, which is most of why it took DB archaeology to
+    // find. Logged AFTER the sticky pin resolves, because a pinned session can still
+    // land on an over-cap serve and a log line that reported only the filter's input
+    // would describe a placement that did not happen.
+    if (narrowed) {
+      this.log("bounded-load skip narrowed the eligible pool", {
+        sessionId,
+        candidates,
+        eligible,
+        chosen,
+        activeTurnCap: this.opts.activeTurnCap,
+        liveLeases: Object.fromEntries(load),
+      });
     }
 
     const existing = this.repos.assignments.get(sessionId);

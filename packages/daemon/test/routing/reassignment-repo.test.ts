@@ -21,7 +21,7 @@
  * So we log the transitions themselves, timestamped. That makes the alert a
  * question about RATE — which is the only formulation that is not hopelessly
  * confounded, because generation also bumps for entirely legitimate reasons: the
- * bounded-load skip (router.ts:172-178, activeTurnCap=25) and a pool restart,
+ * bounded-load skip (`placeSession`, activeTurnCap=25 live leases) and a pool restart,
  * which moves every session on a serve at once and is a normal deploy.
  *
  * SCHEMA SAFETY: this table is defined in its own DDL string, NOT in ROUTING_DDL.
