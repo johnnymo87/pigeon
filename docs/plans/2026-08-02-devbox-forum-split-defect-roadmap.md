@@ -93,13 +93,30 @@ Normal text delivery on `-1004232934695` is therefore **proven working**, not me
 un-disproven. The forum split introduced no delivery regression, the 6 failures really are
 confined to W1's empty commands, and this roadmap's premise holds. W1–W4 are unblocked.
 
-### Suggested order after W0
+### Order, and how it has changed (updated 2026-08-02)
 
-W2 first (it is the design flaw, and it makes the others observable), then W1 (closes the only
-known live producer, and also closes W4), then W3 and W4 as verification.
+The original plan was: W2 first (the design flaw, which makes the rest observable), then W1
+(the only known live producer), then W3 and W4 as verification. W2 and W1 shipped together in
+PR #39 for the reason recorded in §6.
 
-W1 and W4 likely land together: a worker-side guard fixes both, and W4 is the strongest
-argument for fixing at the worker rather than the daemon.
+**Two corrections to that plan, both learned by doing:**
+
+1. **"W1 also closes W4" was wrong.** W1's guard removed W4's easy repro without fixing the
+   bug. The live path is now a caption-less media reply to a question, which submits an empty
+   answer *and* discards the file. W4 is therefore not verification work — it is real, and it
+   now overlaps W3's media handling.
+2. **Fixing the execute path exposed a sibling path.** W2's audit only covered execute;
+   the question-reply path had the same defect class (W2b, PR #42), and fixing *that* exposed
+   two more (W2c, W2d). Each fix in this epic has surfaced its own neighbours, so treat the
+   list as open rather than closed.
+
+**Remaining order:**
+
+| Next | Why |
+|------|-----|
+| `pigeon-k4c.2` (W2c) | Highest severity left. A real soft-lock with *no* recovery path, and it can silently attach an answer to the wrong question. Same subsystem as W2b, so the context is already warm. |
+| `pigeon-tyk` + `pigeon-bru` (W3 + W4) | Now genuinely coupled by the caption-less-media case; W3 has an open design fork (placeholder caption vs. contract relaxation) worth an oracle consult. |
+| `pigeon-k4c.3` (W2d) | Lowest urgency: noisy rather than silent, and strictly better than what it replaced. Do it after W2c, whose fix may inform the row-lifecycle question. |
 
 ---
 
