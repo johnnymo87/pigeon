@@ -1654,7 +1654,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       // Advance to step 1 manually (simulates answering Q1 with "A")
-      storage.pendingQuestions.advanceStep("sess-wiz-2", ["A"]);
+      const wiz2Record = storage.pendingQuestions.getBySessionId("sess-wiz-2")!;
+      storage.pendingQuestions.advanceStep(wiz2Record, ["A"]);
 
       const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
       let capturedReply: QuestionReplyInput | null = null;
@@ -1707,7 +1708,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       // Advance to step 1 (version=1)
-      storage.pendingQuestions.advanceStep("sess-wiz-3", ["A"]);
+      const wiz3Record = storage.pendingQuestions.getBySessionId("sess-wiz-3")!;
+      storage.pendingQuestions.advanceStep(wiz3Record, ["A"]);
 
       let adapterCalled = false;
 
@@ -2038,7 +2040,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-wizfail", requestId: "req-1", questions: twoQuestions, token: "tok-1",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-wizfail", ["A"]);
+    const wizFailRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wizfail")!;
+    storage.pendingQuestions.advanceStep(wizFailRecord, ["A"]);
 
     const tgCalls: Array<{ chatId: string; text: string }> = [];
     const editCalls: unknown[] = [];
@@ -2080,7 +2083,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-retry", requestId: "req-2", questions: twoQuestions, token: "tok-2",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-retry", ["A"]);
+    const wizRetryRecord = storage.pendingQuestions.getBySessionId("sess-w2b-retry")!;
+    storage.pendingQuestions.advanceStep(wizRetryRecord, ["A"]);
 
     const delivered: string[][][] = [];
     let failFirst = true;
@@ -2148,7 +2152,8 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-wiznoadapter", requestId: "req-4", questions: twoQuestions, token: "tok-4",
     }, now);
-    storage.pendingQuestions.advanceStep("sess-w2b-wiznoadapter", ["A"]);
+    const wizNoAdapterRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wiznoadapter")!;
+    storage.pendingQuestions.advanceStep(wizNoAdapterRecord, ["A"]);
 
     const tgCalls: Array<{ chatId: string; text: string }> = [];
 
@@ -2484,7 +2489,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
 
   it("stays silent on completion when no editNotification is wired", async () => {
     const storage = makeWizardStorage("sess-w2c-9");
-    storage.pendingQuestions.advanceStep("sess-w2c-9", ["Postgres"]);
+    const rec9 = storage.pendingQuestions.getBySessionId("sess-w2c-9")!;
+    storage.pendingQuestions.advanceStep(rec9, ["Postgres"]);
     const replies: string[] = [];
 
     await ingestWorkerCommand(
@@ -2553,7 +2559,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
     // execute path and reaches opencode as a stray prompt.
     const storage = makeWizardStorage("sess-w2c-10");
     // The adapter-lacks branch is only reached on the final step.
-    storage.pendingQuestions.advanceStep("sess-w2c-10", ["Postgres"]);
+    const rec10 = storage.pendingQuestions.getBySessionId("sess-w2c-10")!;
+    storage.pendingQuestions.advanceStep(rec10, ["Postgres"]);
     const replies: string[] = [];
 
     await expect(ingestWorkerCommand(
@@ -2633,7 +2640,8 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
   it("warns the buttons are stale when the completion edit fails on the final step", async () => {
     const storage = makeWizardStorage("sess-w2c-7");
     // Move to the final step so the next press completes the wizard.
-    storage.pendingQuestions.advanceStep("sess-w2c-7", ["Postgres"]);
+    const rec7 = storage.pendingQuestions.getBySessionId("sess-w2c-7")!;
+    storage.pendingQuestions.advanceStep(rec7, ["Postgres"]);
     const replies: string[] = [];
 
     await ingestWorkerCommand(

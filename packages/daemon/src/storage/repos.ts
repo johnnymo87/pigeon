@@ -401,6 +401,13 @@ export class PendingQuestionRepository {
     return row ? asPendingQuestion(row) : null;
   }
 
+  getBySessionIdIncludingExpired(sessionId: string): PendingQuestionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM pending_questions WHERE session_id = ?")
+      .get(sessionId) as SqlRow | null;
+    return row ? asPendingQuestion(row) : null;
+  }
+
   delete(sessionId: string): boolean {
     const result = this.db
       .prepare("DELETE FROM pending_questions WHERE session_id = ?")
@@ -408,15 +415,14 @@ export class PendingQuestionRepository {
     return result.changes > 0;
   }
 
-  advanceStep(sessionId: string, answer: string[], now = Date.now()): PendingQuestionRecord | null {
-    const current = this.getBySessionId(sessionId, now);
-    if (!current) return null;
+  advanceStep(current: PendingQuestionRecord, answer: string[]): PendingQuestionRecord | null {
     const newAnswers = [...current.answers, answer];
     const newStep = current.currentStep + 1;
     const newVersion = current.version + 1;
-    this.db.prepare(
+    const result = this.db.prepare(
       `UPDATE pending_questions SET current_step = ?, answers_json_v2 = ?, version = ? WHERE session_id = ?`,
-    ).run(newStep, JSON.stringify(newAnswers), newVersion, sessionId);
+    ).run(newStep, JSON.stringify(newAnswers), newVersion, current.sessionId);
+    if (result.changes === 0) return null;
     return { ...current, currentStep: newStep, answers: newAnswers, version: newVersion };
   }
 

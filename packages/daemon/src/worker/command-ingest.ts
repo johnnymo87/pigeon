@@ -182,7 +182,7 @@ export async function ingestWorkerCommand(
 
       if (!isLastStep) {
         // Advance wizard to next step
-        const updated = storage.pendingQuestions.advanceStep(msg.sessionId, [stepAnswer]);
+        const updated = storage.pendingQuestions.advanceStep(pendingQuestion, [stepAnswer]);
         if (!updated) {
           console.warn(`[command-ingest] wizard advance failed commandId=${commandId}`);
           storage.inbox.markDone(commandId);
