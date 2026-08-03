@@ -1528,6 +1528,27 @@ whole backlog:
   with nothing behind it is the bug* — is this roadmap's thesis, applied to the swarm subsystem. That
   is convergent evidence the shape is real, not an artefact of this file. Do not adopt those beads; do
   read that doc before arguing about delivery semantics.
+- **Forum-split defect cleanup** — epic **`pigeon-k4c`** (P1), spine doc
+  `docs/plans/2026-08-02-devbox-forum-split-defect-roadmap.md`. This is the track CORRECTION #5 above
+  already names by SHA as a source of baseline drift; it was never enumerated here, so until now its
+  ids failed the F1/F2 literal-id grep and looked orphaned. Open: **`pigeon-k4c.3`** (P2, a
+  genuinely-gone question keeps its row and hijacks every plain message for 4h), **`pigeon-k4c.4`**
+  (P2, the wizard version guard only runs when the *current* question is a wizard) and
+  **`pigeon-k4c.5`** (P2, the R2 media fetch throws on any non-`ok`, so a 404 after the 24h TTL is
+  read as transient and retries forever). Closed by that track: `pigeon-az8`, `pigeon-2k1`,
+  `pigeon-mmu`, `pigeon-k4c.1`, `pigeon-k4c.2`, `pigeon-tyk`, `pigeon-bru`.
+
+  **This track and Cycle 6 share `command-ingest.ts`, and that has already nearly cost us.** PR #45
+  and PR #46 independently rewrote the same question-reply path in parallel; they merged clean only
+  because the second was test-merged before landing. Anyone opening a cycle that touches the question
+  path should `git log origin/main -- packages/daemon/src/worker/command-ingest.ts` first.
+
+  **#46 also silently closed most of `pigeon-k4c.4`** — supplying `questionRequestId` on the button
+  path means a stale press is caught by the new supersede check instead of misrouting by option index.
+  Verified by probe, both ways: with metadata the misroute is unreachable; **without** metadata it
+  still fires *silently*, answering a question the user never read. Recorded on that bead. This is the
+  same lesson as CORRECTION #9 — a fix in one track can move another track's ground without either
+  bead noticing.
 
 > **Audit method note (2026-08-03).** The literal-grep audit produced one **false positive**:
 > `pigeon-5d0` came back unplaced, but it is **CLOSED** — it surfaced only because it appears inside

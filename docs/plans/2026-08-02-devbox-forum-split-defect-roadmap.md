@@ -8,6 +8,35 @@ If you are reading this after a compaction and have no other context, read
 [§1 Where things stand](#1-where-things-stand) then run `bd show pigeon-k4c` and
 `bd ready`. That pair is authoritative; this file is the narrative.
 
+> **Read priorities and status from `bd`, never from this file.** The `P` and `State` columns in §3
+> are snapshots taken when each row was written. Borrowed from the sibling roadmap below, which
+> logged this as its ninth correction after its own inline labels drifted from the tracker and sent a
+> reader at the wrong item.
+
+### Sibling tracks — read before touching shared code
+
+This is **not** the whole backlog, and it is not the only spine touching this subsystem.
+
+| Track | Spine | Overlap with this file |
+|---|---|---|
+| Delivery hardening (post-forum-topics) | `docs/plans/2026-07-31-delivery-hardening-roadmap.md`, Cycles 0–7 | **High.** Its Cycle 6 and this track both edit `packages/daemon/src/worker/command-ingest.ts`. |
+| Swarm delivery semantics | epic `pigeon-fnx` | Low — same thesis, different subsystem. |
+| Serve routing | epic `pigeon-u1u` | None. |
+
+**The overlap is not theoretical.** PR #45 (this track) and PR #46 (delivery hardening) independently
+rewrote the same question-reply path in parallel. They merged clean only because #45 was test-merged
+against #46 before landing, and the `sendBestEffort` collision surfaced as a compile error rather than
+two diverging copies — that was deliberate, not luck. Before opening any cycle here, run:
+
+```
+git log origin/main -- packages/daemon/src/worker/command-ingest.ts
+```
+
+**A sibling's fix can close or re-scope an item here without either bead noticing.** #46 closed most of
+`pigeon-k4c.4` as a side effect. Re-verify a bead against current `main` before working it — this epic
+has now overturned a bead's own stated conclusion four times (§7, §9, and both re-verifications in
+§10).
+
 ---
 
 ## 1. Where things stand
@@ -479,3 +508,50 @@ than their evidence supports — and I did it too, in the middle of writing that
 Practical guidance: a red there is not necessarily real, but re-run it on an **idle** machine.
 Re-running while the rest of the suite is still going will often reproduce the failure and
 convince you it is genuine.
+
+---
+
+## 10. Re-verification against post-#46 `main` (2026-08-03)
+
+PR #46, from the delivery-hardening track, rewrote the question-reply path this epic has been working
+all week. Both remaining question-path beads were re-verified against `c0358e6` **by probe test, not
+by reading**, because this epic has repeatedly punished reasoning.
+
+### `pigeon-k4c.4` (W2e) — mostly closed by someone else's PR, and the residue is the interesting part
+
+#46 made `resolveCallbackSession` return `questionRequestId` (webhook.ts:611-618), so **button presses
+now carry question identity**, and added a supersede check that rejects an answer whose requestId does
+not match the pending row. The probe, run both ways against `origin/main`:
+
+| Stale `v3:q0` press against a NEW single question | Answers delivered | User told |
+|---|---|---|
+| **With** metadata (what the post-#46 worker sends) | none | "That question was replaced by a newer one…" |
+| **Without** metadata | `[["Yes, deploy"]]` | **nothing** |
+
+So the bead's mechanism is untouched — the version guard at `:193` still only runs when the *current*
+question is a wizard — and #46 masked it upstream rather than fixing it. Where metadata is absent
+(commands queued by the pre-#46 worker and still in D1, a `notification_id` that does not parse, any
+future caller that omits it) it still fires, and fires **silently**, answering a question the user
+never read with an option chosen by position.
+
+The originally-proposed fix is still the right one *because* it does not depend on metadata: apply the
+version guard whenever the payload is wizard-**shaped**. That is defense-in-depth behind #46's identity
+check, not a duplicate of it.
+
+### `pigeon-k4c.3` (W2d) — still live, and now independently corroborated
+
+#46 deliberately did not extend `expires_at`, and its own comment states this bead's premise in this
+bead's terms: *"a live row hijacks EVERY plain message to the session into the question-reply path
+below."* Independent confirmation from another track.
+
+It also **changed the fix space**: `getBySessionIdIncludingExpired` makes an expired row deliberately
+reachable, so any fix here must not delete rows on TTL — that would destroy the late-answer rescue #46
+just built. The superseded case is now handled; a genuinely-gone question still hijacks for 4h.
+
+### The pattern, restated
+
+Three cycles ago the lesson was "each fix surfaces its neighbour". This cycle it is broader: **another
+session's merged PR moved this epic's ground, in one case closing an item and in the other narrowing
+it, and neither bead knew.** Beads and roadmaps record what was believed when written. The sibling-track
+table at the top of this file exists so the next reader checks before working, rather than discovering
+it at rebase time.
