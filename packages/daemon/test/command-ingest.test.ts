@@ -2199,6 +2199,42 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.db.close();
   });
 
+  it("clears the keyboard when it deletes an un-answerable question", async () => {
+    // Deleting the row without editing the message leaves live-looking buttons
+    // that now resolve to nothing: the next tap finds no row, matches the
+    // question-option shape, and is silently acked by the stale-option branch.
+    // Note this is the opposite call from the terminal-failure sites above,
+    // where the keyboard is still valid and must be left alone.
+    const { storage, now } = questionSession("sess-w2b-keyboard");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2b-keyboard", requestId: "req-kb", questions: [twoQuestions[0]!], token: "tok-kb",
+    }, now);
+
+    const editCalls: Array<{ notificationId: string; text: string; replyMarkup: unknown }> = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2b-kb", sessionId: "sess-w2b-keyboard", command: "typed", chatId: "77" }),
+      {
+        createAdapter: () => ({
+          name: "mock-no-qr",
+          async deliverCommand() { return { ok: true as const }; },
+        }),
+        editNotification: async (notificationId, text, replyMarkup) => {
+          editCalls.push({ notificationId, text, replyMarkup });
+          return { ok: true };
+        },
+        sendTelegramReply: async () => {},
+      },
+    );
+
+    expect(editCalls).toHaveLength(1);
+    expect(editCalls[0]!.notificationId).toBe("q:sess-w2b-keyboard:req-kb");
+    expect(editCalls[0]!.replyMarkup).toEqual({ inline_keyboard: [] });
+
+    storage.db.close();
+  });
+
   it("stops hijacking plain text once the un-answerable row is deleted", async () => {
     // The point of deleting: the next message reaches the session as a normal
     // prompt instead of looping the same undeliverable question reply.

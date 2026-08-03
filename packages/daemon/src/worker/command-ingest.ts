@@ -219,7 +219,7 @@ export async function ingestWorkerCommand(
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-        await dropUnanswerableQuestion(storage, commandId, msg, options.sendTelegramReply);
+        await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendTelegramReply, options.editNotification);
         return;
       }
 
@@ -265,7 +265,7 @@ export async function ingestWorkerCommand(
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-      await dropUnanswerableQuestion(storage, commandId, msg, options.sendTelegramReply);
+      await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendTelegramReply, options.editNotification);
       return;
     }
 
@@ -505,14 +505,27 @@ function questionReplyFailedMessage(error: string | undefined): string {
  * loop this same failure until the TTL expires and block normal command flow
  * entirely. Dropping it lets the user's next message through as a regular
  * prompt.
+ *
+ * The keyboard is cleared for the same reason the row is deleted, and in
+ * deliberate contrast to the delivery-failure sites: once the row is gone those
+ * buttons resolve to nothing, and a tap would be swallowed by the stale-option
+ * branch. Leaving a live-looking keyboard that silently does nothing would
+ * reintroduce the exact defect this change exists to remove.
  */
 async function dropUnanswerableQuestion(
   storage: StorageDb,
   commandId: string,
   msg: ExecuteMessage,
+  requestId: string,
   sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  editNotification: WorkerCommandIngestOptions["editNotification"],
 ): Promise<void> {
   storage.pendingQuestions.delete(msg.sessionId);
+  await editNotification?.(
+    `q:${msg.sessionId}:${requestId}`,
+    "This session can't receive question answers from Telegram.",
+    { inline_keyboard: [] },
+  );
   await dropCommand(
     storage,
     commandId,
