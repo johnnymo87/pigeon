@@ -66,8 +66,9 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ **PR #39** |
 | `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ **PR #39** |
 | `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | ✅ **PR #42** |
-| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | new, ready |
-| `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | new, ready |
+| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | ✅ **PR #43** |
+| `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | ready |
+| `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | new, ready |
 | `pigeon-tyk` | W3 — caption-less media silently dropped | P2 | ready |
 | `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ready |
 
@@ -114,9 +115,11 @@ PR #39 for the reason recorded in §6.
 
 | Next | Why |
 |------|-----|
-| `pigeon-k4c.2` (W2c) | Highest severity left. A real soft-lock with *no* recovery path, and it can silently attach an answer to the wrong question. Same subsystem as W2b, so the context is already warm. |
-| `pigeon-tyk` + `pigeon-bru` (W3 + W4) | Now genuinely coupled by the caption-less-media case; W3 has an open design fork (placeholder caption vs. contract relaxation) worth an oracle consult. |
-| `pigeon-k4c.3` (W2d) | Lowest urgency: noisy rather than silent, and strictly better than what it replaced. Do it after W2c, whose fix may inform the row-lifecycle question. |
+| `pigeon-tyk` + `pigeon-bru` (W3 + W4) | Now genuinely coupled by the caption-less-media case; W3 has an open design fork (placeholder caption vs. contract relaxation) worth an oracle consult. Only remaining items that are not question-path work. |
+| `pigeon-k4c.4` (W2e) | Small and well-scoped: apply the version guard whenever the payload is wizard-shaped, not only when the *current* question is a wizard. Pairs naturally with W2d since both concern stale question state. |
+| `pigeon-k4c.3` (W2d) | Lowest urgency: noisy rather than silent, and strictly better than what it replaced. |
+
+All three P1s are now done or in review. What remains is P2.
 
 ---
 
@@ -313,3 +316,60 @@ stayed silent.
   is genuinely gone keeps its row, hijacks every message for up to 4h, and
   answers each one with a retry hint that can never succeed. Noisy rather than
   silent, so still better than the behaviour it replaced.
+
+---
+
+## 8. W2c outcome (PR #43, `pigeon-k4c.2`)
+
+The wizard's non-final step mutated storage (`advanceStep` bumps `currentStep` **and** `version`)
+and then awaited `editNotification` while discarding the result. On edit failure, storage sat at
+step N+1/version V+1 while the screen still showed step N with version-V buttons, so every later
+press died on the stale-version guard. Typed text bypasses that guard and is stored against the
+*current* step, so a typed answer was silently recorded against a question the user never saw.
+
+**The fix keeps storage authoritative and apologises in prose.** It checks the result and, on
+failure, sends a plain-text restatement of the step the wizard actually wants. Rolling the advance
+back was rejected because `{ok:false}` is ambiguous — the daemon's fetch can die *after* Telegram
+applied the edit — so a rollback creates the same skew in the opposite direction.
+
+### What the oracle changed
+
+Consulted on scope, retry, and wording. It earned the slot by **correcting me on scope**: I had
+read a failed *completion* edit as garbage-injection, believing the stale button payload `v3:q1`
+would reach opencode as a literal prompt. Wrong — the stale-option guard at `:318-321` catches it
+and drops it. I verified the correction myself before building on it. The completion site was still
+worth fixing, just for a smaller reason: the keyboard outlives a wizard that no longer exists.
+
+It also **declined the retry** the bead had left open (`editNotification` collapses every failure
+class into a bare `{ok:false}`, so you cannot retry only-transient without changing its signature),
+and caught two things that would have made the fallback text actively misleading: it must point at
+the *original* question message (the fallback has no `messages` row, so swipe-replying to it
+resolves nothing) and must ask for the option *text*, not its number (typed answers are stored
+verbatim, so `2` records the literal `"2"`).
+
+### What the review changed
+
+Six mutations, two suite holes. The serious one is worth remembering as a testing lesson:
+
+> Every test returned a literal `{ok:false}` — but that shape never occurs in production.
+> `poller.editNotification` returns the worker's JSON verbatim regardless of HTTP status, and every
+> worker failure path answers `{error:...}` with **no `ok` field**. So relaxing `ok === true` to
+> `ok !== false` reads `undefined` as success and **restores the soft-lock** for the most
+> persistent failure there is — a 404 for a swept `messages` row — with the entire suite green.
+
+The tests mocked a shape the system does not produce. Both mutations were re-run locally after
+adding the pinning tests, and both now fail.
+
+### Process notes
+
+- **Zero pre-existing assertions changed**, as in W2b (#39 needed ten). Four of the nine new tests
+  pass against unfixed code by design, pinning behaviour that must *not* change — chiefly that no
+  rollback occurs.
+- Mutation testing has now earned its place three cycles running. Treat "the suite is green" as
+  unproven until a mutation has failed it.
+
+### Discovered, not fixed
+
+`pigeon-k4c.4` (W2e): a stale wizard button can answer a **new single question**, because the
+version guard at `:148` only runs when the *current* question is a wizard. A wizard-shaped payload
+arriving for a single question is stale by definition, but its version is never examined.
