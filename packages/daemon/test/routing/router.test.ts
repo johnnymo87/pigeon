@@ -1207,12 +1207,14 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
 
   function setup() {
     const s = openStorageDb(":memory:");
+    const logs: { msg: string; fields?: Record<string, unknown> }[] = [];
     const router = new IngressRouter(s, {
       leaseTtlMs: TTL,
       staleServeMs: STALE,
       idleMigrateMs: 3000,
       dormantTtlMs: 10000,
       activeTurnCap: 10,
+      log: (msg, fields) => logs.push({ msg, fields }),
     });
     const now = 10_000;
     for (const [id, uuid, port] of [
@@ -1235,7 +1237,8 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
     expect(placed.serveId).toBe("serve-1");
     expect(placed.ownerGeneration).toBe(1);
     s.serves.setHealth("serve-2", "healthy", now);
-    return { s, router, now };
+    logs.length = 0; // ignore setup-time placement logs
+    return { s, router, now, logs };
   }
 
   /** Keep serve-2 a live steal target, or the red state degenerates to NoHealthyServeError. */
@@ -1255,20 +1258,29 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
   // a fix that relaxes only the healthState clause while keeping the heartbeat
   // clause would leave the production bug intact and must not pass.
   it("stale HEARTBEAT + valid lease -> keeps the session on its owner, no generation bump", () => {
-    const { s, router, now } = setup();
+    const { s, router, now, logs } = setup();
     const later = now + STALE + 1; // serve-1 heartbeat now stale; lease (TTL 5000) still valid
     freshenServe2(s, later);
+    const assignmentBefore = s.assignments.get("session-1");
 
     const r = router.ensureRouted("session-1", later);
 
     expect(r.serveId).toBe("serve-1");
     expect(r.ownerGeneration).toBe(1);
+    // The RETURNED expiry must be the real lease expiry, not a fabricated one.
+    expect(r.expiresAt).toBe(now + TTL);
     const lease = s.leases.get("session-1");
     expect(lease?.serveId).toBe("serve-1");
     expect(lease?.ownerGeneration).toBe(1);
     // Untouched: neither stolen nor silently re-acquired on a read path.
     expect(lease?.leaseExpiresAt).toBe(now + TTL);
-    expect(s.assignments.get("session-1")?.desiredServeId).toBe("serve-1");
+    // resolveRoute is a READ. A mutant that touches the assignment here (e.g.
+    // touchActive) would silently defeat idle-migration accounting.
+    expect(s.assignments.get("session-1")).toEqual(assignmentBefore);
+    // The instrument itself is pinned: this bug was invisible in production for
+    // months precisely because nothing logged, so an untested log is a mutant
+    // waiting to happen.
+    expect(logs.filter((l) => l.msg.includes("honoring a valid lease"))).toHaveLength(1);
   });
 
   // Companion: pins the OTHER clause. A poller-probe failure marks the serve
@@ -1300,7 +1312,7 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
 
   // Kills the mutant that drops the !draining fence: a draining serve must still shed.
   it("draining owner + valid lease -> session is moved off the draining serve", () => {
-    const { s, router, now } = setup();
+    const { s, router, now, logs } = setup();
     const later = now + 1;
     freshenServe2(s, later);
     s.serves.upsert({
@@ -1317,6 +1329,32 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
 
     expect(r.serveId).toBe("serve-2");
     expect(r.ownerGeneration).toBe(2);
+    // ...and the live-lease tripwire must STAY QUIET here. Evicting a busy session
+    // off a draining serve is the point of drain, not a regression; if this fired
+    // it would go off for every session on every pool bounce and train whoever
+    // reads the logs to ignore the one signal that means a real clobber.
+    expect(logs.filter((l) => l.msg.includes("displacing a LIVE lease"))).toHaveLength(0);
+  });
+
+  // The healthy path must stay silent, or the honor-log becomes noise.
+  it("healthy owner + valid lease -> routes normally and logs nothing", () => {
+    const { s, router, now, logs } = setup();
+    const later = now + 1;
+    freshenServe2(s, later);
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: later,
+      draining: false,
+    });
+
+    const r = router.ensureRouted("session-1", later);
+
+    expect(r.serveId).toBe("serve-1");
+    expect(logs).toHaveLength(0);
   });
 
   // Kills the mutant that drops the epoch fence.

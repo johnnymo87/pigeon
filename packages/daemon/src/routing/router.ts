@@ -89,6 +89,20 @@ export class IngressRouter {
     // ladder, killing the in-flight turn ("session lease lost mid-run", June).
     // reassignFromDeadServe and resolveProspectiveRoute already encode this rule;
     // resolveRoute was the sole holdout contradicting it.
+    //
+    // SCOPE, stated plainly so the next incident does not "disprove" this fix.
+    // Nothing renews leases in production: renewCAS's only caller is touch(),
+    // which has no callers, so a lease simply lapses after leaseTtlMs (30s) and
+    // the next placeSession re-acquires it. This fix therefore protects a stall
+    // only until the CURRENT lease's natural expiry -- at most leaseTtlMs from the
+    // last acquire, and typically less, since the stall may begin mid-lease. A
+    // stall that outlives the remaining lease still ends in a re-place and still
+    // kills the turn. It narrows the window; it does not close it (bead pigeon-u1a).
+    //
+    // It also slows failover for a GENUINELY dead serve: commands now fail with
+    // connection errors until the lease lapses instead of migrating on the next
+    // health probe. That is the identical trade reassignFromDeadServe already
+    // makes deliberately, and lease expiry bounds it.
     const lease = this.repos.leases.get(sessionId);
     if (
       !lease ||
@@ -259,19 +273,28 @@ export class IngressRouter {
       });
     }
 
-    // Tripwire (bead pigeon-pov). Both callers of placeSession now refuse to
-    // displace a still-valid lease -- reassignFromDeadServe skips them outright,
-    // and ensureRouted no longer reaches here because resolveRoute honors the
-    // lease. So a hit on this line means that guarantee has regressed and an
-    // in-flight turn is about to be killed. It reads zero in a healthy system;
-    // its absence is the signal. Logged BEFORE the assignment upsert, while the
-    // prior lease is still observable.
+    // Tripwire (bead pigeon-pov): placeSession is about to kill an in-flight turn.
+    // After the resolveRoute fix, ensureRouted no longer reaches here with a valid
+    // lease and reassignFromDeadServe skips such sessions outright, so a hit is
+    // normally a regression.
+    //
+    // DRAIN IS EXCLUDED, and deliberately so: evicting a busy session off a
+    // draining serve is the POINT of drain (resolveRoute rejects draining, which
+    // routes us straight here), so a drain of a busy serve would otherwise fire
+    // this on every session and train the reader to ignore it. This log is only
+    // worth having if it stays rare, so it must not cry wolf during a routine
+    // pool bounce or an operator eviction.
+    //
+    // Logged BEFORE the assignment upsert, while the prior lease is still
+    // observable.
     const priorLease = this.repos.leases.get(sessionId);
+    const priorServe = priorLease ? this.repos.serves.get(priorLease.serveId) : undefined;
     if (
       priorLease &&
       priorLease.leaseExpiresAt > now &&
       priorLease.binaryEpoch === epoch &&
-      priorLease.serveId !== chosen
+      priorLease.serveId !== chosen &&
+      !priorServe?.draining
     ) {
       this.log("placeSession is displacing a LIVE lease (in-flight turn will be killed)", {
         sessionId,
@@ -358,10 +381,34 @@ export class IngressRouter {
     return this.resolveRoute(sessionId, now) ?? this.placeSession(sessionId, now);
   }
 
+  /**
+   * Renew the lease of a session that is still validly routed.
+   *
+   * NOTE (bead pigeon-pov): this method currently has NO production callers —
+   * nothing in the daemon renews leases, they lapse after leaseTtlMs and are
+   * re-acquired by the next placeSession (acquireCAS take-over ladder branch C,
+   * same-owner idempotent re-acquire). It is kept because a periodic renewer is
+   * the obvious future use.
+   *
+   * If you wire one up, mind the liveness gate below. resolveRoute now honors a
+   * valid lease over a stale heartbeat, which is right for ROUTING (the owner is
+   * probably just CPU-stalled) but would be catastrophic for RENEWAL: renewCAS is
+   * full-token fenced, so for a serve that is genuinely dead and has not
+   * re-registered, the token still matches and a periodic touch() would extend
+   * the corpse's lease forever. The lease would never expire, placeSession would
+   * never run, and the session would be pinned to a dead serve permanently.
+   * Renewal therefore fails closed on liveness, which routing does not.
+   */
   touch(sessionId: string, now: number): RouteResult | null {
     const epoch = this.repos.meta.get().binaryEpoch;
     const r = this.resolveRoute(sessionId, now);
     if (!r) {
+      return null;
+    }
+
+    // See the docstring: renewal, unlike routing, must not trust a lease alone.
+    const serve = this.repos.serves.get(r.serveId);
+    if (!this.isServeHealthy(serve ?? null, now, epoch)) {
       return null;
     }
 
