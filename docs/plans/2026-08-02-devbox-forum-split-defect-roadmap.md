@@ -368,6 +368,20 @@ adding the pinning tests, and both now fail.
 - Mutation testing has now earned its place three cycles running. Treat "the suite is green" as
   unproven until a mutation has failed it.
 
+### The rebase found one more
+
+PR #42 merged while this was in review, so #43 was rebased onto it. The rebase surfaced a defect
+**in #42's own new helper**: `dropUnanswerableQuestion` deletes the pending row and then clears the
+keyboard with an unguarded `editNotification` call. A throw there escapes before `dropCommand`
+runs — row already deleted, command never acked, user never told — and the retry then finds no
+pending question, so a typed answer falls through to the execute path and reaches opencode as a
+**stray prompt**. Fixed in #43 rather than filed, since it is the same class, in the same file, and
+the containment helper already existed.
+
+That is the third consecutive cycle in which fixing one path exposed a neighbour — and the first in
+which the *fix itself* introduced the next instance. §3's "treat the list as open rather than
+closed" is holding up.
+
 ### Discovered, not fixed
 
 `pigeon-k4c.4` (W2e): a stale wizard button can answer a **new single question**, because the
