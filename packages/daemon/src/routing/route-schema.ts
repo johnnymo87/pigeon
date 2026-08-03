@@ -3,6 +3,30 @@ import { createHash } from "node:crypto";
 
 export const ROUTING_SCHEMA_VERSION = 1;
 
+/**
+ * ── `session_assignment.last_active_at` IS MISNAMED, AND CANNOT BE RENAMED ────
+ *
+ * The column records when a session was last PLACED onto a serve. It is written
+ * only by `RouteRepo.upsert` (sole caller: `Router.placeSession`), and because
+ * placement happens only when `resolveRoute` finds no live lease, its recency is
+ * anti-correlated with activity: a busy session holds a serve-renewed lease, never
+ * re-places, and keeps a stale timestamp forever. Deriving "active" from it reads 0
+ * for the busiest serve in the pool — which is exactly what happened, and cost an
+ * entire memory investigation that was filed against an "idle" serve serving 602
+ * requests from 5 sessions.
+ *
+ * The TypeScript field is therefore `AssignmentRecord.lastPlacedAt`. The COLUMN
+ * keeps the wrong name on purpose: this string is sha256'd into
+ * `routing_meta.ddl_checksum` (below), and every serve validates that digest against
+ * a constant compiled into opencode-patched. Renaming the column — or editing any
+ * byte of this string, including adding a SQL comment inside it — forks the checksum
+ * and crash-loops the entire serve pool until a lockstep opencode-patched release
+ * ships. See the schema-safety note in `reassignment-repo.ts`.
+ *
+ * For a real activity signal read `session_lease` (rows with `lease_expires_at >
+ * now`), which the serve renews for the duration of every turn and releases when the
+ * turn ends.
+ */
 export const ROUTING_DDL = `
   CREATE TABLE IF NOT EXISTS serve_instance (
     serve_id       TEXT PRIMARY KEY,

@@ -96,7 +96,7 @@ describe("Hardened Lease CAS Concurrency Proof", () => {
           desiredServeId: "serve-A",
           ownerGeneration: 1,
           state: "assigned",
-          lastActiveAt: Date.now(),
+          lastPlacedAt: Date.now(),
           updatedAt: Date.now(),
         });
       }
@@ -326,7 +326,7 @@ describe("Hardened Lease CAS Concurrency Proof", () => {
           desiredServeId: "serve-A",
           ownerGeneration: 1,
           state: "assigned",
-          lastActiveAt: Date.now(),
+          lastPlacedAt: Date.now(),
           updatedAt: Date.now(),
         });
       }

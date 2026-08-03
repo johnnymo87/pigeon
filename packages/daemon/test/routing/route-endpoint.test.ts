@@ -97,7 +97,7 @@ describe("GET /route endpoint", () => {
     const t0 = 1000;
     const { app, storage: db } = setupRouterAndApp(t0);
     db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "unhealthy", heartbeatAt: t0, draining: false });
-    db.assignments.upsert({ sessionId: "ses_abc", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    db.assignments.upsert({ sessionId: "ses_abc", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: t0, updatedAt: t0 });
     const res = await app(new Request("http://localhost/route?session_id=ses_abc", { method: "GET" }));
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "session not routed" });
@@ -162,7 +162,7 @@ describe("GET /route endpoint", () => {
     const t0 = 1000;
     const { app, storage: db } = setupRouterAndApp(t0);
     db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
-    db.assignments.upsert({ sessionId: "ses_idle1", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    db.assignments.upsert({ sessionId: "ses_idle1", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: t0, updatedAt: t0 });
     const res = await app(new Request("http://localhost/route?session_id=ses_idle1", { method: "GET" }));
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -176,7 +176,7 @@ describe("GET /route endpoint", () => {
     const { app, storage: db } = setupRouterAndApp(t0);
     db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "unhealthy", heartbeatAt: t0, draining: false });
     db.serves.upsert({ serveId: "serve-1", instanceUuid: "u1", endpoint: "http://127.0.0.1:4097", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
-    db.assignments.upsert({ sessionId: "ses_idle2", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    db.assignments.upsert({ sessionId: "ses_idle2", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: t0, updatedAt: t0 });
     const res = await app(new Request("http://localhost/route?session_id=ses_idle2", { method: "GET" }));
     expect(res.status).toBe(200);
     expect((await res.json()).serveId).toBe("serve-1");
@@ -186,7 +186,7 @@ describe("GET /route endpoint", () => {
     const t0 = 1000;
     const { app, storage: db } = setupRouterAndApp(t0);
     db.serves.upsert({ serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096", binaryEpoch: 0, healthState: "healthy", heartbeatAt: t0, draining: false });
-    db.assignments.upsert({ sessionId: "ses_del", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: t0, updatedAt: t0 });
+    db.assignments.upsert({ sessionId: "ses_del", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: t0, updatedAt: t0 });
     db.assignments.delete("ses_del");
     const res = await app(new Request("http://localhost/route?session_id=ses_del", { method: "GET" }));
     expect(res.status).toBe(404);

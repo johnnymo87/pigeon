@@ -27,7 +27,7 @@ function asAssignment(row: Row): AssignmentRecord {
     desiredServeId: String(row.desired_serve_id),
     ownerGeneration: Number(row.owner_generation),
     state: String(row.state) as AssignmentRecord["state"],
-    lastActiveAt: Number(row.last_active_at),
+    lastPlacedAt: Number(row.last_active_at),
     updatedAt: Number(row.updated_at),
   };
 }
@@ -224,11 +224,17 @@ export class SessionAssignmentRepo {
         rec.desiredServeId,
         rec.ownerGeneration,
         rec.state,
-        rec.lastActiveAt,
+        rec.lastPlacedAt,
         rec.updatedAt,
       );
   }
 
+  /**
+   * Currently UNCALLED by pigeon src (tests only). Left in place as repo API, but do
+   * not cite either this or `setState` when reasoning about what churns `updated_at`
+   * on a live database — in production that is `upsert` (every placement) and
+   * `setDormantFenced` (sweep), and nothing else.
+   */
   bumpGeneration(sessionId: string, now: number): number {
     this.db
       .prepare(
@@ -243,16 +249,6 @@ export class SessionAssignmentRepo {
       throw new Error(`Assignment not found to bump generation: ${sessionId}`);
     }
     return rec.ownerGeneration;
-  }
-
-  touchActive(sessionId: string, now: number): void {
-    this.db
-      .prepare(
-        `UPDATE session_assignment
-         SET last_active_at = ?, updated_at = ?
-         WHERE session_id = ?`,
-      )
-      .run(now, now, sessionId);
   }
 
   setState(sessionId: string, state: AssignmentRecord["state"], now: number): void {
@@ -372,6 +368,26 @@ export class SessionLeaseRepo {
     return res.changes > 0;
   }
 
+  /**
+   * Intentionally not called by pigeon. Lease renewal is the SERVE's job: it holds the
+   * lease for the duration of a turn and renews it on a 10s fiber (opencode-patched's
+   * `serve-lease.patch`), releasing it in a finalizer when the turn ends. pigeon's own
+   * caller (`Router.touch`) was dead from the day it was written and has been removed.
+   *
+   * Kept because pigeon and the serve share one DB and this is pigeon's copy of the
+   * fencing rule that governs it; `router.test.ts` test 15 holds it to that rule. If you
+   * are about to call this from pigeon, you are probably re-introducing the bug the
+   * deletion fixed — check whether you actually want `ensureRouted`.
+   *
+   * AND IF YOU DO WIRE UP A RENEWER, mind the asymmetry established by pigeon-pov:
+   * `resolveRoute` deliberately honors a valid lease over a STALE HEARTBEAT, because a
+   * stalled-but-live owner should keep its session. That rule is right for routing and
+   * catastrophic for renewal. `renewCAS` is full-token fenced, so for a serve that is
+   * genuinely dead and has not re-registered, the token still matches — a periodic
+   * renewer would extend the corpse's lease forever, the lease would never expire,
+   * `placeSession` would never run, and the session would be pinned to a dead serve
+   * permanently. Renewal must fail closed on liveness; routing must not.
+   */
   renewCAS(
     sessionId: string,
     serveId: string,
@@ -430,9 +446,9 @@ export class SessionLeaseRepo {
    * current epoch. This is the pool's load measure (bead pigeon-76k).
    *
    * What it actually means, precisely — NOT "turns in flight". A lease is taken by
-   * `placeSession` at placement and renewed on `touch`, and `withSessionLease` holds
-   * one for the duration of a turn. So a live lease means "placed, renewed, or
-   * running a turn within the last TTL". That is a bounded, self-correcting proxy:
+   * `placeSession` at placement, and the SERVE renews it on a 10s fiber while
+   * `withSessionLease` holds one for the duration of a turn. So a live lease means
+   * "placed, or running a turn, within the last TTL". That is a bounded, self-correcting proxy:
    * unlike the assignment rows it replaces, it decays on its own and a finished turn
    * gives capacity back. It also does not see turns where the serve-side lease
    * wrapper fails open (unregistered identity, flag off) — those are load the pool

@@ -140,7 +140,7 @@ describe("reapStaleSessions", () => {
       desiredServeId: "serve-0",
       ownerGeneration: 1,
       state: "dormant",
-      lastActiveAt: 0,
+      lastPlacedAt: 0,
       updatedAt: 0,
     });
 

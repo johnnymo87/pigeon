@@ -94,7 +94,8 @@ export class IngressRouter {
     // The lease is renewed by the SERVE ITSELF, out of process: the patched
     // opencode serve holds this SQLite file open and refreshes its own
     // session_lease row on a ~leaseTtlMs/3 fiber. Nothing in the DAEMON renews --
-    // renewCAS's only TS caller is touch(), which has no callers -- so do not
+    // renewCAS has no TS caller at all, now that the never-wired touch() that used
+    // to call it has been deleted -- so do not
     // conclude from "no TS caller" that renewal does not happen. (It was concluded
     // here once, and it was wrong: verified by sampling session_lease 40s apart,
     // longer than the 30s TTL, and seeing every row's expiry advance by exactly
@@ -327,7 +328,7 @@ export class IngressRouter {
       desiredServeId: chosen,
       ownerGeneration,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
 
@@ -386,59 +387,23 @@ export class IngressRouter {
     };
   }
 
+  /**
+   * The only path that writes `session_assignment` (via `placeSession` -> upsert),
+   * and therefore the only path that advances `lastPlacedAt`.
+   *
+   * Note the consequence, which is not obvious and has already misled one
+   * investigation: `placeSession` runs ONLY when `resolveRoute` returns null, and
+   * `resolveRoute` succeeds exactly while a live lease is held — which the serve
+   * renews for the whole duration of a turn. So sustained work SUPPRESSES the
+   * placement it would be tempting to read as evidence of that work.
+   *
+   * And this is only the half of it that pigeon can see: a TUI or front-door request
+   * never reaches `ensureRouted` at all, because `GET /route` is deliberately
+   * read-only. Do not derive an "is this session active" signal from placement
+   * recency; read `session_lease` instead. See `AssignmentRecord.lastPlacedAt`.
+   */
   ensureRouted(sessionId: string, now: number): RouteResult {
     return this.resolveRoute(sessionId, now) ?? this.placeSession(sessionId, now);
-  }
-
-  /**
-   * Renew the lease of a session that is still validly routed.
-   *
-   * NOTE (bead pigeon-pov): this method has NO production callers, and it is the
-   * only TS caller of renewCAS. That does NOT mean leases go unrenewed — the
-   * patched opencode serve renews its own lease out of process by writing this
-   * SQLite file directly. Do not follow the dead-code thread from here into
-   * deleting renewCAS or the session_lease renewal SQL: that would silently break
-   * out-of-process renewal, and no test in this repo would catch it.
-   *
-   * If you wire one up, mind the liveness gate below. resolveRoute now honors a
-   * valid lease over a stale heartbeat, which is right for ROUTING (the owner is
-   * probably just CPU-stalled) but would be catastrophic for RENEWAL: renewCAS is
-   * full-token fenced, so for a serve that is genuinely dead and has not
-   * re-registered, the token still matches and a periodic touch() would extend
-   * the corpse's lease forever. The lease would never expire, placeSession would
-   * never run, and the session would be pinned to a dead serve permanently.
-   * Renewal therefore fails closed on liveness, which routing does not.
-   */
-  touch(sessionId: string, now: number): RouteResult | null {
-    const epoch = this.repos.meta.get().binaryEpoch;
-    const r = this.resolveRoute(sessionId, now);
-    if (!r) {
-      return null;
-    }
-
-    // See the docstring: renewal, unlike routing, must not trust a lease alone.
-    const serve = this.repos.serves.get(r.serveId);
-    if (!this.isServeHealthy(serve ?? null, now, epoch)) {
-      return null;
-    }
-
-    // Fail closed: if the lease can no longer be renewed (generation or epoch bumped
-    // underneath us), we have lost ownership — do NOT report the session as still routed.
-    const renewed = this.repos.leases.renewCAS(
-      sessionId,
-      r.serveId,
-      r.instanceUuid,
-      r.ownerGeneration,
-      epoch,
-      now,
-      this.opts.leaseTtlMs,
-    );
-    if (!renewed) {
-      return null;
-    }
-    this.repos.assignments.touchActive(sessionId, now);
-    this.sticky.route(sessionId, now, r.serveId);
-    return r;
   }
 
   sweep(now: number): void {
@@ -461,10 +426,22 @@ export class IngressRouter {
     }
   }
 
+  /**
+   * Behavior deliberately unchanged. `StickyRouter` ages pins by `idleMigrateMs`, so
+   * it reads as if it wants a last-ACTIVE time, and it is seeded here with a
+   * last-PLACED one. That is exact rather than approximate: with `touch()` deleted,
+   * `sticky.route` is called only from `placeSession` and from here, so a live
+   * daemon's pin timestamp IS the placement timestamp. A rebuild reconstructs the
+   * pins the process had, not an aged version of them.
+   *
+   * It is also inert in the direction that would matter: a pin can only influence
+   * `placeSession`, which runs only when `resolveRoute` returns null, so a wrongly
+   * aged pin cannot move a session that holds a live lease.
+   */
   rebuildFromDb(): void {
     const allAssignments = this.repos.assignments.all();
     for (const a of allAssignments) {
-      this.sticky.route(a.sessionId, a.lastActiveAt, a.desiredServeId);
+      this.sticky.route(a.sessionId, a.lastPlacedAt, a.desiredServeId);
     }
   }
 
