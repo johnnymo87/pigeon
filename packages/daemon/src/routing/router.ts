@@ -78,11 +78,17 @@ export class IngressRouter {
       return null;
     }
 
-    const serve = this.repos.serves.get(a.desiredServeId);
-    if (!serve || !this.isServeHealthy(serve, now, epoch)) {
-      return null;
-    }
-
+    // Lease FIRST, liveness second (bead pigeon-pov). An unexpired, full-token
+    // lease PROVES the owning serve is alive: only that serve can renew it, and
+    // renewCAS is fenced on (serve, instance_uuid, generation, epoch) plus the
+    // assignment. A single-threaded opencode serve whose event loop is blocked by
+    // a CPU-heavy turn misses heartbeats for >staleServeMs while the run is
+    // perfectly healthy, so gating on heartbeat freshness here used to declare a
+    // live session unroutable -- and ensureRouted then called placeSession, which
+    // bumps owner_generation and steals the lease via the acquireCAS take-over
+    // ladder, killing the in-flight turn ("session lease lost mid-run", June).
+    // reassignFromDeadServe and resolveProspectiveRoute already encode this rule;
+    // resolveRoute was the sole holdout contradicting it.
     const lease = this.repos.leases.get(sessionId);
     if (
       !lease ||
@@ -94,6 +100,30 @@ export class IngressRouter {
       lease.binaryEpoch !== epoch
     ) {
       return null;
+    }
+
+    // The serve record must still exist and be at the current epoch, and a
+    // DRAINING serve must still shed its sessions even while its lease is valid
+    // (that is the whole point of drain). Deliberately NOT isServeHealthy: the
+    // healthState and heartbeat clauses are exactly what the lease supersedes.
+    const serve = this.repos.serves.get(a.desiredServeId);
+    if (!serve || serve.draining || serve.binaryEpoch !== epoch) {
+      return null;
+    }
+
+    // Positive signal that this fix fired. Production has no other way to observe
+    // it: there is no health-state-change log (bead pigeon-f02) and five days of
+    // daemon journal contain zero [router] lines. Bounded by command rate and
+    // gated on a rare condition (a stall in progress), so it cannot become chatty.
+    if (!this.isServeHealthy(serve, now, epoch)) {
+      this.log("honoring a valid lease on a serve that looks unhealthy (CPU-stalled owner)", {
+        sessionId,
+        serveId: a.desiredServeId,
+        healthState: serve.healthState,
+        heartbeatAgeMs: now - serve.heartbeatAt,
+        staleServeMs: this.opts.staleServeMs,
+        leaseExpiresAt: lease.leaseExpiresAt,
+      });
     }
 
     return {
@@ -226,6 +256,29 @@ export class IngressRouter {
         chosen,
         activeTurnCap: this.opts.activeTurnCap,
         liveLeases: Object.fromEntries(load),
+      });
+    }
+
+    // Tripwire (bead pigeon-pov). Both callers of placeSession now refuse to
+    // displace a still-valid lease -- reassignFromDeadServe skips them outright,
+    // and ensureRouted no longer reaches here because resolveRoute honors the
+    // lease. So a hit on this line means that guarantee has regressed and an
+    // in-flight turn is about to be killed. It reads zero in a healthy system;
+    // its absence is the signal. Logged BEFORE the assignment upsert, while the
+    // prior lease is still observable.
+    const priorLease = this.repos.leases.get(sessionId);
+    if (
+      priorLease &&
+      priorLease.leaseExpiresAt > now &&
+      priorLease.binaryEpoch === epoch &&
+      priorLease.serveId !== chosen
+    ) {
+      this.log("placeSession is displacing a LIVE lease (in-flight turn will be killed)", {
+        sessionId,
+        leaseServeId: priorLease.serveId,
+        chosen,
+        leaseOwnerGeneration: priorLease.ownerGeneration,
+        leaseExpiresAt: priorLease.leaseExpiresAt,
       });
     }
 

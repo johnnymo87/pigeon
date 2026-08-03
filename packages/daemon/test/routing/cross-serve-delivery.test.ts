@@ -69,7 +69,7 @@ describe("cross-serve-delivery integration", () => {
   });
 
   it("proves end-to-end swarm routing across fake serves including failover", async () => {
-    const now = Date.now();
+    let now = Date.now();
     const storage = openStorageDb(":memory:");
 
     // 1. Seed two healthy serves
@@ -202,8 +202,16 @@ describe("cross-serve-delivery integration", () => {
     expect(fakeA.received).toContain("ses_A");
     expect(storage.swarm.getByMsgId("msg_2")?.state).toBe("handed_off");
 
-    // 8. Failover: mark serve-1 unhealthy
+    // 8. Failover: serve-1 dies. Marking it unhealthy is NOT enough on its own --
+    // since bead pigeon-pov an unexpired lease proves the owner is alive-but-busy
+    // (a CPU-stalled serve looks identical to a dead one from outside), so routing
+    // deliberately keeps delivering to it until the lease lapses rather than
+    // yanking the lease out from under an in-flight turn. A genuinely dead serve
+    // stops renewing, so advance past leaseTtlMs (10_000) to reach the real
+    // failover, keeping serve-0's heartbeat fresh so it stays an eligible target.
     storage.serves.setHealth("serve-1", "unhealthy", now);
+    now += 10_001;
+    storage.serves.upsert({ ...serve0, heartbeatAt: now });
 
     storage.swarm.insert(
       {
