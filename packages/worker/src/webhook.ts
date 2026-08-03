@@ -498,6 +498,20 @@ function isTopicServiceReply(
 }
 
 /**
+ * Extract questionRequestId from notification_id format q:{sessionId}:{requestId}.
+ * Strips any trailing #cN split-chunk suffix.
+ */
+function parseQuestionRequestId(notificationId: string | null | undefined): string | undefined {
+  if (notificationId && notificationId.startsWith("q:")) {
+    const parts = notificationId.split(":");
+    if (parts.length >= 3) {
+      return parts.slice(2).join(":").replace(/#c\d+$/, "");
+    }
+  }
+  return undefined;
+}
+
+/**
  * Resolve a session from an inbound Telegram message.
  * Returns { sessionId, command, questionRequestId? } or null if no session found.
  *
@@ -517,20 +531,6 @@ function isTopicServiceReply(
  * of half-wired-but-green failure this plan flags for T2.14. There is no caller that
  * legitimately has no env.
  */
-/**
- * Extract questionRequestId from notification_id format q:{sessionId}:{requestId}.
- * Strips any trailing #cN split-chunk suffix.
- */
-function parseQuestionRequestId(notificationId: string | null | undefined): string | undefined {
-  if (notificationId && notificationId.startsWith("q:")) {
-    const parts = notificationId.split(":");
-    if (parts.length >= 3) {
-      return parts.slice(2).join(":").replace(/#c\d+$/, "");
-    }
-  }
-  return undefined;
-}
-
 async function resolveMessageSession(
   db: D1Database,
   message: TelegramMessage,
