@@ -444,6 +444,37 @@ describe("storage schema and repositories", () => {
       storage.db.close();
     });
 
+    it("advanceStep refuses to write through a record that went stale, leaving the replacing row intact", () => {
+      const storage = createStorage();
+      const questions = [
+        { question: "Q1", header: "H1", options: [{ label: "Opt1", description: "" }] },
+        { question: "Q2", header: "H2", options: [{ label: "Opt2", description: "" }] },
+      ];
+      storage.pendingQuestions.store({
+        sessionId: "sess-stale",
+        requestId: "req-old",
+        questions,
+      }, 1_000);
+
+      const stale = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+
+      // Something advances the row, so the record the caller is holding is now
+      // a version behind what is stored.
+      storage.pendingQuestions.advanceStep(stale, ["Opt1"]);
+      const afterFirst = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+      expect(afterFirst.version).toBe(1);
+
+      // Replaying the same stale record must not advance a second time.
+      expect(storage.pendingQuestions.advanceStep(stale, ["Opt1"])).toBeNull();
+
+      const reloaded = storage.pendingQuestions.getBySessionId("sess-stale", 1_000)!;
+      expect(reloaded.version).toBe(1);
+      expect(reloaded.currentStep).toBe(1);
+      expect(reloaded.answers).toEqual([["Opt1"]]);
+
+      storage.db.close();
+    });
+
     it("advanceStep preserves existing behavior for live rows (bumps current_step, appends answers, increments version)", () => {
       const storage = createStorage();
       const createdAt = 1_000;
