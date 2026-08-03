@@ -73,7 +73,7 @@ export async function resolveTopic(
         }
         if (reopenRes.kind === "thread_not_found") {
           // Closed topic was deleted out-of-band in Telegram -> delete stale D1 row and fall through to recreate
-          await deleteTopicBySession(db, opts.sessionId);
+          await deleteTopicBySession(db, opts.sessionId, existing.message_thread_id);
         } else if (reopenRes.kind === "topic_not_modified") {
           // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
           await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
