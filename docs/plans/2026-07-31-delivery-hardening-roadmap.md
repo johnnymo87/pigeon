@@ -1097,6 +1097,27 @@ with `INSERT OR REPLACE`, which constrains the options.
 > the `messages` row backing its callback token (14-day retention). Past that, the press cannot
 > resolve a session in the worker at all and never reaches the daemon.
 
+> **Further amended 2026-08-03 by `pigeon-uyv` (PR #47).** One clause above needs qualifying:
+> "nothing deleted it (`cleanupExpired` had no caller)" was true when written, and `cleanupExpired`
+> has since been **deleted outright** rather than wired up — precisely because wiring it in would
+> have destroyed the rows resurrection depends on. Expired rows are still never deleted *by age*.
+>
+> They are now swept by **orphanhood**: `reapStaleSessions` runs
+> `DELETE FROM pending_questions WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = ...)`.
+> That is behaviour-neutral for everything above, because `ingestWorkerCommand` checks
+> `sessions.get` at `command-ingest.ts:123` and drops before it ever reads `pending_questions` — a
+> row whose session is gone was already unreachable. It cleared 52 of 54 production rows, the oldest
+> from 2026-03-18; the 2 survivors were exactly the expired-but-live rows resurrection needs.
+>
+> The one behavioural narrowing, accepted deliberately: a session reaped after 7d idle and then
+> re-registered under the same `ses_*` id loses its row, so a **button press** on that old question
+> can no longer resurrect. A **text** answer still works via the metadata fallback
+> (`command-ingest.ts:423-454`), which needs no row. Note this sits strictly inside the 14-day
+> `messages` coupling noted just above, and its failure mode is a visible error, not silent loss.
+>
+> Anyone touching `pigeon-bvh` should know this sweep exists: it spares live sessions' rows, so it
+> does not undercut outbox resurrection except in that same reaped-then-re-registered sliver.
+
 ### Cycle 5 — the server side (the track this roadmap was missing) — DONE (PR #36)
 
 Cycles 0–3 are **entirely client-side mitigations**. `pigeon-dul` makes the argument this roadmap
