@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { startSessionReaper, reapStaleSessions } from "../src/session-reaper";
 import { SESSION_TTL_MS } from "../src/storage/schema";
+import { ingestWorkerCommand } from "../src/worker/command-ingest";
+import type { QuestionReplyInput } from "../src/adapters/types";
 
 describe("reapStaleSessions", () => {
   let storage: StorageDb | null = null;
@@ -154,6 +156,158 @@ describe("reapStaleSessions", () => {
 
     expect(storage.sessions.get("ses_stale")).toBeNull();
     expect(storage.assignments.get("ses_stale")).toBeNull();
+  });
+
+  it("prevents regression: expired pending questions with live sessions survive session-reaping and remain resurrectable via ingestWorkerCommand", async () => {
+    storage = openStorageDb(":memory:");
+    const now = Date.now();
+
+    storage.sessions.upsert({
+      sessionId: "sess-live-guard",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+
+    // Question expired 5 hours ago (TTL is 4h)
+    storage.pendingQuestions.store({
+      sessionId: "sess-live-guard",
+      requestId: "req-exp-guard",
+      questions: [{
+        question: "Pick database",
+        header: "DB",
+        options: [
+          { label: "PostgreSQL", description: "" },
+          { label: "SQLite", description: "" },
+        ],
+      }],
+    }, now - 5 * 3600 * 1000);
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const reapResult = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(reapResult.orphanedQuestions).toBe(0);
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-live-guard")).not.toBeNull();
+
+    // Verify resurrection still works through ingestWorkerCommand
+    let capturedReply: QuestionReplyInput | null = null;
+    await ingestWorkerCommand(
+      storage,
+      {
+        commandId: "cmd-guard-1",
+        commandType: "execute",
+        sessionId: "sess-live-guard",
+        command: "q1",
+        chatId: "1",
+        metadata: { questionRequestId: "req-exp-guard" },
+      },
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
+            capturedReply = reply;
+            return { ok: true as const };
+          },
+        }),
+      },
+    );
+
+    expect(capturedReply).toEqual({
+      questionRequestId: "req-exp-guard",
+      answers: [["SQLite"]],
+    });
+  });
+
+  it("sweeps orphaned pending question records when a session is reaped as stale", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+
+    storage.sessions.upsert({ sessionId: "stale-q-1", notify: true }, 1_000);
+    storage.pendingQuestions.store({
+      sessionId: "stale-q-1",
+      requestId: "req-stale-1",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, 1_000);
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const result = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(result.reaped).toBe(1);
+    expect(result.orphanedQuestions).toBe(1);
+    expect(storage.sessions.get("stale-q-1")).toBeNull();
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("stale-q-1")).toBeNull();
+  });
+
+  it("sweeps orphaned pending question records when a session is deleted via sessions.cleanupExpired", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+
+    storage.sessions.upsert({ sessionId: "expired-sess-q", notify: true }, now - 1_000);
+    storage.sessions.touch("expired-sess-q", now - 1_000, -500); // expires_at = now - 1500 (in past), last_seen = now - 1000 (recent)
+
+    storage.pendingQuestions.store({
+      sessionId: "expired-sess-q",
+      requestId: "req-exp-sess-1",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, now - 1_000);
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const result = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(result.reaped).toBe(0);
+    expect(result.expired).toBe(1);
+    expect(result.orphanedQuestions).toBe(1);
+    expect(storage.sessions.get("expired-sess-q")).toBeNull();
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("expired-sess-q")).toBeNull();
+  });
+
+  it("orphaned pending question sweep is a no-op when all pending questions belong to live sessions", async () => {
+    storage = openStorageDb(":memory:");
+    const now = Date.now();
+
+    storage.sessions.upsert({ sessionId: "live-q-1", notify: true }, now - 1_000);
+    storage.pendingQuestions.store({
+      sessionId: "live-q-1",
+      requestId: "req-live-1",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, now - 1_000);
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const result = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(result.orphanedQuestions).toBe(0);
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("live-q-1")).not.toBeNull();
   });
 });
 

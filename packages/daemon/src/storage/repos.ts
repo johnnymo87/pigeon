@@ -403,7 +403,8 @@ export class PendingQuestionRepository {
 
   /**
    * Read the row ignoring `expires_at`. Expired rows are hidden, not deleted —
-   * `cleanupExpired` has no caller — so the row survives its TTL and can still
+   * age-based cleanup deliberately does not exist (the reaper's sweep is
+   * session-scoped, never age-scoped) — so the row survives its TTL and can still
    * be identified.
    *
    * Use ONLY where the caller has independent proof of *which* question it is
@@ -456,10 +457,21 @@ export class PendingQuestionRepository {
     return { ...current, currentStep: newStep, answers: newAnswers, version: newVersion };
   }
 
-  cleanupExpired(now = Date.now()): number {
+  /**
+   * Delete pending questions whose session no longer exists in `sessions`.
+   *
+   * Orphan rows are unreachable because `command-ingest` checks `sessions.get`
+   * before any `pending_questions` read; do NOT add an age/expiry-based sweep
+   * here — expired-but-live rows are load-bearing for question resurrection
+   * (`command-ingest.ts:157`).
+   */
+  deleteOrphaned(): number {
     const result = this.db
-      .prepare("DELETE FROM pending_questions WHERE expires_at < ?")
-      .run(now);
+      .prepare(
+        `DELETE FROM pending_questions
+         WHERE session_id NOT IN (SELECT session_id FROM sessions)`,
+      )
+      .run();
     return result.changes;
   }
 }

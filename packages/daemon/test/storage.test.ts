@@ -177,13 +177,21 @@ describe("storage schema and repositories", () => {
     expect(storage.pendingQuestions.delete("sess-pq")).toBe(true);
     expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_001)).toBeNull();
 
-    // Cleanup expired
+    // Delete orphaned
+    storage.sessions.upsert({ sessionId: "sess-live", notify: true }, 1_000);
     storage.pendingQuestions.store({
-      sessionId: "sess-pq2",
+      sessionId: "sess-live",
       requestId: "q2",
       questions: [{ question: "?", header: "H", options: [] }],
     }, 1_000);
-    expect(storage.pendingQuestions.cleanupExpired(1_000 + 5 * 60 * 60 * 1000)).toBe(1);
+    storage.pendingQuestions.store({
+      sessionId: "sess-orphan",
+      requestId: "q3",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, 1_000);
+    expect(storage.pendingQuestions.deleteOrphaned()).toBe(1);
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-live")).not.toBeNull();
+    expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-orphan")).toBeNull();
 
     storage.db.close();
   });

@@ -16,6 +16,7 @@ interface ReapDeps {
 interface ReapResult {
   reaped: number;
   expired: number;
+  orphanedQuestions: number;
 }
 
 export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
@@ -48,7 +49,16 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     log(`cleaned ${expired} expired session records`);
   }
 
-  return { reaped, expired };
+  // Sweep pending questions for deleted/orphaned sessions.
+  // Orphan rows are unreachable because command-ingest checks sessions.get before any
+  // pending_questions read; do NOT add an age/expiry-based sweep here — expired-but-live
+  // rows are load-bearing for question resurrection (command-ingest.ts:157).
+  const orphanedQuestions = deps.storage.pendingQuestions.deleteOrphaned();
+  if (orphanedQuestions > 0) {
+    log(`cleaned ${orphanedQuestions} orphaned pending question records`);
+  }
+
+  return { reaped, expired, orphanedQuestions };
 }
 
 interface StartReaperDeps extends ReapDeps {
