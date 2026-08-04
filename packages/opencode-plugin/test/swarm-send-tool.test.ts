@@ -326,6 +326,77 @@ describe("swarmSend (pure helper)", () => {
     }
   })
 
+  /**
+   * The one-shot re-auth budget must be spent on a token the daemon actually
+   * JUDGED, not on one that never reached it.
+   *
+   * `authRetried` means "the daemon rejected a refreshed token, so refreshing
+   * again is pointless". When the re-auth fetch REJECTS, the refreshed token
+   * was never adjudicated -- and this matters most in the ordering the retry
+   * loop exists for: the daemon can begin refusing the old token slightly
+   * before the new one lands on disk, so the mid-window re-read legitimately
+   * picks up a value that is still stale. Burning the one-shot there stranded
+   * the send on the NEXT 401 with most of the attempt budget unspent, even
+   * though one more re-resolve would have succeeded.
+   */
+  test("a re-auth whose fetch rejects does not consume the one-shot; a later 401 can still re-resolve", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-swarmsend-readj-"))
+    const secretPath = path.join(tmpDir, "token")
+    fs.writeFileSync(secretPath, "old-token", "utf8")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const seenAuth: Array<string | undefined> = []
+    let callCount = 0
+    const fetchFn = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++
+      seenAuth.push((init?.headers as Record<string, string>)?.["Authorization"])
+      // 1: daemon is already refusing the old token, but the new one has not
+      //    been written yet -- so the re-auth re-read below still sees "old".
+      if (callCount === 1) return status(401, "Unauthorized")
+      // 2: the re-auth retry lands in the restart window and rejects.
+      if (callCount === 2) econnRefused()
+      // 3: next outer attempt, still the old token -- but NOW the rotation
+      //    has landed, so a second re-auth would fix it.
+      if (callCount === 3) {
+        fs.writeFileSync(secretPath, "new-token", "utf8")
+        return status(401, "Unauthorized")
+      }
+      return ok202("msg_readj_ok")
+    }) as typeof fetch
+
+    const { sleepFn, delays } = recordingSleep()
+
+    try {
+      const result = await swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn,
+          sleepFn,
+        },
+        { to: "ses_target", message: "hi" },
+      )
+
+      expect(result.msg_id).toBe("msg_readj_ok")
+      expect(callCount).toBe(4)
+      expect(delays).toHaveLength(1)
+      expect(seenAuth).toEqual([
+        "Bearer old-token",
+        "Bearer old-token",
+        "Bearer old-token",
+        "Bearer new-token",
+      ])
+    } finally {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   test("throws with status + body when the daemon rejects the payload (400 close tag)", async () => {
     const fetchFn = (async () =>
       new Response(

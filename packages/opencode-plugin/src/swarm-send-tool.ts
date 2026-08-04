@@ -218,6 +218,14 @@ export async function swarmSend(
         // restart are often the same event, and riding out that window is
         // exactly what the backoff budget is for.
         lastError = err instanceof Error ? err : new Error(String(err))
+        // Give the one-shot back. `authRetried` is meant to record "the daemon
+        // REJECTED a refreshed token, so refreshing again is pointless" -- but
+        // this token never reached the daemon to be judged. The daemon can
+        // start refusing the old token just before the new one lands on disk,
+        // so the re-read above may legitimately still be stale; keeping the
+        // budget spent would strand the send on the next 401. Bounded by
+        // SWARM_SEND_MAX_ATTEMPTS regardless.
+        authRetried = false
         if (isLast) {
           throw new Error(
             `swarm_send failed after ${attempt} attempts (daemon unreachable): ${lastError.message}`,
