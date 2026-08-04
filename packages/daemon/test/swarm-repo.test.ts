@@ -72,6 +72,56 @@ describe("SwarmRepository", () => {
     s.db.close();
   });
 
+  it("getInbox includes handed-off rows that later failed, excludes pre-handoff failed rows", () => {
+    const s = createStorage();
+    // m1: handed off, then failed (e.g. nudge exhaustion)
+    s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
+    s.swarm.markHandedOff("m1", 1_500);
+    s.swarm.markFailed("m1", 2_000);
+
+    // m2: failed BEFORE handoff (e.g. max attempts exhausted)
+    s.swarm.insert({ ...BASE, msgId: "m2" }, 2_000);
+    s.swarm.markFailed("m2", 2_500);
+
+    // m3: handed off, active
+    s.swarm.insert({ ...BASE, msgId: "m3" }, 3_000);
+    s.swarm.markHandedOff("m3", 3_500);
+
+    const inbox = s.swarm.getInbox("ses_b", {});
+    expect(inbox.messages.map((m) => m.msgId)).toEqual(["m1", "m3"]);
+    s.db.close();
+  });
+
+  it("hasQueuedNudge identifies queued nudges for a message", () => {
+    const s = createStorage();
+    s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
+    s.swarm.markHandedOff("m1", 1_500);
+
+    expect(s.swarm.hasQueuedNudge("m1")).toBe(false);
+
+    // Insert a queued nudge
+    s.swarm.insert(
+      {
+        msgId: "nudge_1",
+        fromSession: "pigeon",
+        toSession: "ses_b",
+        channel: null,
+        kind: NUDGE_KIND,
+        priority: "normal",
+        replyTo: "m1",
+        payload: "nudge payload",
+      },
+      2_000,
+    );
+
+    expect(s.swarm.hasQueuedNudge("m1")).toBe(true);
+
+    // Once nudge is handed off, hasQueuedNudge returns false
+    s.swarm.markHandedOff("nudge_1", 2_500);
+    expect(s.swarm.hasQueuedNudge("m1")).toBe(false);
+    s.db.close();
+  });
+
   it("getInbox returns delivered messages for a session, ordered ascending", () => {
     const s = createStorage();
     s.swarm.insert({ ...BASE, msgId: "m1" }, 1_000);
