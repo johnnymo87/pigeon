@@ -1023,9 +1023,9 @@ describe("DeliveryWatchdog", () => {
     expect(sendPlainAlert.mock.calls[1]![1]).toBe("error");
   });
 
-  it("26. pigeon-3m5 regression test: wake message to idle target is NEVER requeued, row stays handed_off, no false failure report", async () => {
+  it("26. pigeon-3m5 regression test: wake message to idle target is NEVER requeued, row stays handed_off during nudges, gets nudged, then terminal without false failure report notice", async () => {
     fixture = makeFixture();
-    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
 
     const client = makeClient();
     const anchorText = `<swarm_message v="1" msg_id="wake1">`;
@@ -1039,17 +1039,36 @@ describe("DeliveryWatchdog", () => {
       toSession: "ses_b",
       handedOffAt: 0,
       kind: "wake",
+      payload: "WAKE_PAYLOAD_TEST_26",
     });
 
-    // Run multiple watchdog cycles across advancing time.
-    for (const now of [400_000, 900_000, 1_400_000, 1_900_000, 2_400_000]) {
+    // Run 3 watchdog cycles: gets nudged each time, never requeued, stays handed_off
+    for (const [now, expectedNudges] of [
+      [400_000, 1],
+      [900_000, 2],
+      [1_400_000, 3],
+    ] as const) {
       fixture.setNow(now);
       await watchdog.processOnce();
+      const r = storage.swarm.getByMsgId("wake1")!;
+      expect(r.state).toBe("handed_off");
+      expect(r.requeueCount).toBe(0);
+      expect(r.nudgeCount).toBe(expectedNudges);
     }
 
+    // Cycle 4: nudge budget exhausted -> marks failed
+    fixture.setNow(1_900_000);
+    await watchdog.processOnce();
+
     const row = storage.swarm.getByMsgId("wake1")!;
-    expect(row.state).toBe("handed_off");
+    expect(row.state).toBe("failed");
     expect(row.requeueCount).toBe(0);
+
+    // Alert fired containing payload text
+    expect(sendPlainAlert).toHaveBeenCalledWith(
+      expect.stringContaining("WAKE_PAYLOAD_TEST_26"),
+      "error",
+    );
 
     // notifySenderOfFailure was never called -> no delivery.failed notice in storage.
     const notices = storage.db
@@ -1199,7 +1218,7 @@ describe("DeliveryWatchdog", () => {
     expect(client2.abortSession).not.toHaveBeenCalled();
   });
 
-  it("31. Major 1: scheduled message with kind='checkpoint' and deliverAt set is suppressed from recovery", async () => {
+  it("31. Major 1: scheduled message with kind='checkpoint' and deliverAt set now gets nudged on idle target, not requeued", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
@@ -1238,16 +1257,13 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(400_000);
     await watchdog.processOnce();
 
-    // Scheduled checkpoint is NOT recovered at all — not requeued, not
-    // nudged, not aborted.
+    // Scheduled checkpoint IS recovered by nudge (not requeued, not aborted).
     const rowSched = storage.swarm.getByMsgId("sched1")!;
     expect(rowSched.state).toBe("handed_off");
     expect(rowSched.requeueCount).toBe(0);
-    expect(rowSched.nudgeCount).toBe(0);
+    expect(rowSched.nudgeCount).toBe(1);
 
-    // Unscheduled chat IS recovered — by nudge, the positive control that
-    // proves the suppression above is doing the work and the row was
-    // otherwise eligible.
+    // Unscheduled chat IS ALSO recovered by nudge.
     const rowChat = storage.swarm.getByMsgId("chat_unsched")!;
     expect(rowChat.state).toBe("handed_off");
     expect(rowChat.nudgeCount).toBe(1);
@@ -2139,6 +2155,294 @@ describe("DeliveryWatchdog", () => {
       expect(text).not.toContain("was NOT received");
       expect(text).toContain("DELIVERY UNCONFIRMED");
       expect(text).toContain("Do NOT resend");
+    });
+  });
+
+  describe("r4-nudge-wakes: suppressed row recovery and nudge exhaustion", () => {
+    it("1. SUPPRESSED row (wake and scheduled non-wake) with anchor present and idle session gets NUDGED without payload re-sent", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      // Case A: wake kind (label)
+      const client1 = makeClient();
+      client1.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_idle">`),
+      ]);
+      clientMap.set("ses_wake", { preferred: client1, all: [client1] });
+      insertHandedOff({
+        msgId: "wake_idle",
+        fromSession: "ses_a",
+        toSession: "ses_wake",
+        handedOffAt: 0,
+        kind: "wake.self",
+        payload: "ORIGINAL_WAKE_PAYLOAD",
+      });
+
+      // Case B: deliverAt set, non-wake kind (mechanism)
+      const client2 = makeClient();
+      client2.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="sched_idle">`),
+      ]);
+      clientMap.set("ses_sched", { preferred: client2, all: [client2] });
+      insertHandedOff({
+        msgId: "sched_idle",
+        fromSession: "ses_a",
+        toSession: "ses_sched",
+        handedOffAt: 0,
+        kind: "task.assign",
+        deliverAt: 100_000,
+        payload: "ORIGINAL_SCHED_PAYLOAD",
+      });
+
+      fixture.setNow(400_000);
+      await watchdog.processOnce();
+
+      // Case A asserts
+      const rowWake = storage.swarm.getByMsgId("wake_idle")!;
+      expect(rowWake.state).toBe("handed_off");
+      expect(rowWake.nudgeCount).toBe(1);
+      expect(rowWake.requeueCount).toBe(0);
+
+      // Case B asserts
+      const rowSched = storage.swarm.getByMsgId("sched_idle")!;
+      expect(rowSched.state).toBe("handed_off");
+      expect(rowSched.nudgeCount).toBe(1);
+      expect(rowSched.requeueCount).toBe(0);
+
+      // Nudge rows inserted in DB
+      const nudges = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'swarm.nudge' ORDER BY created_at")
+        .all() as Array<Record<string, unknown>>;
+      expect(nudges).toHaveLength(2);
+
+      expect(nudges[0]!.to_session).toBe("ses_wake");
+      expect(nudges[0]!.reply_to).toBe("wake_idle");
+      expect(String(nudges[0]!.payload)).not.toContain("ORIGINAL_WAKE_PAYLOAD");
+
+      expect(nudges[1]!.to_session).toBe("ses_sched");
+      expect(nudges[1]!.reply_to).toBe("sched_idle");
+      expect(String(nudges[1]!.payload)).not.toContain("ORIGINAL_SCHED_PAYLOAD");
+
+      // Verify original envelope was NOT re-sent
+      const wakeRowsInDb = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE msg_id = 'wake_idle'")
+        .all();
+      expect(wakeRowsInDb).toHaveLength(1);
+    });
+
+    it("2. Nudge exhaustion for a SUPPRESSED row: marked failed, alert contains payload text, no sender notice written", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_exhaust">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_exhaust",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake.checkpoint",
+        payload: "CRITICAL_CHECKPOINT_DATA_TO_VERIFY",
+      });
+
+      // Exhaust 3 nudges
+      for (const t of [400_000, 800_000, 1_200_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      const rowBefore = storage.swarm.getByMsgId("wake_exhaust")!;
+      expect(rowBefore.nudgeCount).toBe(3);
+      expect(rowBefore.state).toBe("handed_off");
+
+      // Next cycle triggers exhaustion
+      fixture.setNow(1_600_000);
+      await watchdog.processOnce();
+
+      const rowAfter = storage.swarm.getByMsgId("wake_exhaust")!;
+      expect(rowAfter.state).toBe("failed");
+
+      // Assert alert text contains payload content and prefix
+      expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+      const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
+      expect(severity).toBe("error");
+      expect(alertText).toContain("delivery watchdog: wake unverified after nudges exhausted");
+      expect(alertText).toContain("wake_exhaust");
+      expect(alertText).toContain("CRITICAL_CHECKPOINT_DATA_TO_VERIFY");
+      expect(alertText).toContain("payload IS in the transcript but was never read");
+
+      // Assert NO notifySenderOfFailure notice was written
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      expect(notices).toHaveLength(0);
+    });
+
+    it("3. Nudge exhaustion for an ORDINARY row: marked failed, alert fired, sender notice IS written with evidence 'present'", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="chat_exhaust">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "chat_exhaust",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "chat",
+        payload: "ORDINARY_CHAT_PAYLOAD",
+      });
+
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      const row = storage.swarm.getByMsgId("chat_exhaust")!;
+      expect(row.state).toBe("failed");
+
+      expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+      const [alertText] = sendPlainAlert.mock.calls[0]!;
+      expect(alertText).toContain("chat_exhaust");
+      expect(alertText).toContain("payload IS in the transcript but was never read");
+
+      // Sender notice IS written
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all() as Array<Record<string, unknown>>;
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.to_session).toBe("ses_a");
+      const noticePayload = String(notices[0]!.payload);
+      expect(noticePayload).toContain("DELIVERY UNCONFIRMED");
+      expect(noticePayload).toContain("Do NOT resend");
+      expect(noticePayload).not.toContain("was NOT received");
+    });
+
+    it("4. A swarm.nudge row that is itself unread does NOT cascade another nudge", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="nudge_unread">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "nudge_unread",
+        fromSession: "pigeon",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "swarm.nudge",
+      });
+
+      fixture.setNow(400_000);
+      await watchdog.processOnce();
+
+      const row = storage.swarm.getByMsgId("nudge_unread")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.nudgeCount).toBe(0);
+
+      const nudges = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'swarm.nudge'")
+        .all();
+      expect(nudges).toHaveLength(1); // Only the initial row, no second nudge created
+    });
+
+    it("5. anchor === null branch for suppressed row: unchanged (suppressed from requeue, no nudge, no state change)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([]); // No anchor in transcript
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_no_anchor",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake",
+        payload: "MISSING_ANCHOR_PAYLOAD",
+      });
+
+      fixture.setNow(1_000_000); // blockedAge > stuckAlertMs (900_000)
+      await watchdog.processOnce();
+
+      const row = storage.swarm.getByMsgId("wake_no_anchor")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.requeueCount).toBe(0);
+      expect(row.nudgeCount).toBe(0);
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
+      expect(severity).toBe("error");
+      expect(alertText).toContain("delivery watchdog: prompt lost and unverified");
+      expect(alertText).toContain("MISSING_ANCHOR_PAYLOAD");
+      expect(alertText).toContain("prompt for msg wake_no_anchor to ses_b not found in target transcript");
+    });
+
+    it("6. silent-in-flight branch for suppressed row: unchanged (no nudge, no terminal, state remains handed_off)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_silent">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }), // silent post-anchor turn
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_silent",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake",
+      });
+
+      fixture.setNow(400_000);
+      await watchdog.processOnce();
+
+      const row = storage.swarm.getByMsgId("wake_silent")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.nudgeCount).toBe(0);
+      expect(row.requeueCount).toBe(0);
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("7. no alert text produced anywhere in idle path contains string 'expected for idle target'", async () => {
+      fixture = makeFixture();
+      const { watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_check_string">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_check_string",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake",
+        payload: "SOME_WAKE_PAYLOAD",
+      });
+
+      // Run through nudges until exhaustion
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      // Collect all alerts sent
+      for (const call of sendPlainAlert.mock.calls) {
+        const text = call[0];
+        expect(text).not.toContain("expected for idle target");
+      }
     });
   });
 });

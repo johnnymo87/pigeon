@@ -904,18 +904,14 @@ export class DeliveryWatchdog {
     if (!blocking) {
       // Session is idle — our prompt is sitting there but nothing ever ran
       // it. Nothing to abort.
-      if (isSuppressedFromRecovery(row)) {
-        const blockedAge = now - (row.handedOffAt ?? now);
-        return this.suppressWakeRecovery(
-          row,
-          sessionId,
-          now,
-          counts,
-          "warning",
-          "idle-wake-unverified",
-          `delivery watchdog: wake msg ${row.msgId} to ${sessionId} handed off ${blockedAge}ms (${humanDuration(blockedAge)}) ago and remains unverified (expected for idle target)`,
-        );
-      }
+      //
+      // Suppression exists because REDELIVERY duplicates a payload. A nudge
+      // does not duplicate the payload — it asks the session to read the copy
+      // it already has — so the rationale that justifies suppressing requeue
+      // does not extend to suppressing nudges. Wakes are, by construction, the
+      // population with NOBODY WATCHING IN-BAND (a session asked to be woken
+      // later), so they need the strongest in-band recovery and currently get
+      // the weakest.
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
@@ -1028,13 +1024,38 @@ export class DeliveryWatchdog {
       this.storage.swarm.markFailed(row.msgId, now);
       counts.terminal++;
       this.pruneDedupe(row.msgId);
-      await this.alert(
-        "error",
-        `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
-      );
-      // We only get here from the anchor-present branch, and we have re-read
-      // the transcript on every one of those cycles.
-      notifySenderOfFailure(this.storage, row, reason, now, "present");
+
+      // A provider rate-limit (429) can park a turn for a very long time, and
+      // such a turn leaves an assistant message with ZERO parts — which is
+      // byte-identical in the transcript to a genuinely wedged turn. That
+      // ambiguity is real, but it belongs to the SILENT-IN-FLIGHT branch, not
+      // this one. This branch is reached only when there is NO post-anchor turn
+      // record at all, re-established on every one of the nudge cycles that
+      // preceded exhaustion. So the two indistinguishable causes cannot reach
+      // here.
+      //
+      // Note the fragility explicitly: this rests on opencode creating the
+      // assistant-message shell BEFORE the provider call, which is an upstream
+      // implementation detail; if that changed, a parked retry could start
+      // appearing in this branch.
+
+      if (isSuppressedFromRecovery(row)) {
+        const alertText = formatWakePayloadAlert(
+          row,
+          `${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
+          "delivery watchdog: wake unverified after nudges exhausted",
+        );
+        await this.alert("error", alertText);
+      } else {
+        await this.alert(
+          "error",
+          `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
+        );
+        // We only get here from the anchor-present branch, and we have re-read
+        // the transcript on every one of those cycles.
+        notifySenderOfFailure(this.storage, row, reason, now, "present");
+      }
+
       this.log("terminal", {
         msgId: row.msgId,
         sessionId,
