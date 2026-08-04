@@ -189,6 +189,54 @@ export async function ingestWorkerCommand(
     const legacyMatch = !wizardMatch ? QUESTION_OPTION_RE.exec(command) : null;
     const isWizard = pendingQuestion.questions.length > 1;
 
+    // An option token whose SHAPE disagrees with the pending question's arity
+    // provably came from a different render than the row now pending, so it must
+    // not be resolved by positional index below. The two renderers are a
+    // bijection: `formatQuestionNotification` emits legacy `q{i}` and is guarded
+    // on `questions.length === 1` (notification-service.ts:178-187), and
+    // `formatQuestionWizardStep` is the only producer of `v{version}:q{i}`
+    // (:241-250). Arity is immutable for the life of a row — `store()` is the
+    // only writer of `questions_json` and `advanceStep` never touches it — so
+    // this cannot fire on a question legitimately changing shape underneath the
+    // user.
+    //
+    // The bijection proves staleness only for RENDERED payloads. Typed text can
+    // forge either shape, and there a mismatch proves only "inconsistent with
+    // the row that is open now" — which deserves refusing just the same, so the
+    // conclusion is unchanged. Note such text was never answerable as prose: it
+    // previously resolved as an option index.
+    //
+    // This is NOT the version guard below, and widening that guard to cover this
+    // case does not work: every row is stored with version 0 (repos.ts:385) and
+    // a wizard's first step renders v0 (app.ts:816), so a stale `v0:qN` landing
+    // on a fresh single question compares 0 !== 0 = false and slips through. The
+    // symmetric legacy-against-wizard case carries no version at all, so no
+    // version-based check could ever defend it.
+    //
+    // Defense-in-depth *behind* the requestId identity check above, which is the
+    // real fix and which runs first. This earns its keep only where identity is
+    // absent, which is never a genuine button press on current code: a typed
+    // `/cmd TOKEN v0:q0`, a topic-routed message matching the shape
+    // (`resolveMessageSession` Try 2 sets no questionRequestId), and a swipe-reply
+    // to a NON-question notification of the same session (Try 1 resolves the
+    // session but a non-`q:` notification_id yields no requestId).
+    //
+    // Deliberately NOT symmetric with the version guard below, which stays a
+    // silent markDone: its usual trigger is a benign double-tap during the
+    // in-place card edit, where a loud reply would be noise. That asymmetry is a
+    // considered UX call, not an oversight — see pigeon-k4c.6.
+    if ((wizardMatch && !isWizard) || (legacyMatch && isWizard)) {
+      console.warn(`[command-ingest] option token shape does not match pending question arity sessionId=${msg.sessionId} commandId=${commandId} command=${command} questions=${pendingQuestion.questions.length}`);
+      await dropCommand(
+        storage,
+        commandId,
+        msg.chatId,
+        mismatchedOptionTokenMessage(),
+        options.sendTelegramReply,
+      );
+      return;
+    }
+
     // Validate wizard version if wizard match found and this is a wizard question
     if (wizardMatch && isWizard) {
       const incomingVersion = Number(wizardMatch[1]);
@@ -864,6 +912,22 @@ function supersededQuestionMessage(command: string): string {
     ? ""
     : `\n\nYour reply wasn't applied: "${command}"`;
   return `That question was replaced by a newer one, so your answer wasn't recorded. Answer the latest question above.${tail}`;
+}
+
+/**
+ * Refusal for an option token whose shape contradicts the pending question's
+ * arity.
+ *
+ * Deliberately not `supersededQuestionMessage`'s wording. "Replaced by a newer
+ * one" is true for the requestId mismatch that helper serves, but not for every
+ * case that reaches here: text typed to match the token grammar can arrive for
+ * the question that is genuinely open, where nothing was replaced. This says
+ * only what is true in all of them — the option does not belong to the question
+ * currently open. The raw token is not echoed, for the same reason it is not
+ * echoed there: it is machine text the user never typed as prose.
+ */
+function mismatchedOptionTokenMessage(): string {
+  return "That option doesn't belong to the question that's open now, so it wasn't recorded. Use the buttons on the latest question above.";
 }
 
 function isOptionToken(command: string): boolean {
