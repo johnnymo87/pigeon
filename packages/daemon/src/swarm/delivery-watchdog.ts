@@ -6,7 +6,10 @@ import {
   isWakeKind,
   isSuppressedFromRecovery,
   formatWakePayloadAlert,
+  formatNudgePayload,
+  NUDGE_KIND,
 } from "./delivery-policy";
+import { makeMsgId } from "../ids";
 
 export { isWakeKind, isSuppressedFromRecovery };
 
@@ -53,6 +56,9 @@ export const DEFAULT_STUCK_ALERT_MS = 900_000;
 export const DEFAULT_STUCK_ABORT_SILENCE_MS = 3_600_000;
 /** MAX_REQUEUES */
 export const DEFAULT_MAX_REQUEUES = 3;
+/** MAX_NUDGES — how many times we may ask a target to read a payload it
+ *  already holds before giving up and reporting DELIVERED_UNCONFIRMED. */
+export const DEFAULT_MAX_NUDGES = 3;
 /** OVERDUE_ALERT_MS */
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
 
@@ -70,6 +76,7 @@ export interface DeliveryWatchdogOptions {
   stuckAlertMs?: number;
   stuckAbortSilenceMs?: number;
   maxRequeues?: number;
+  maxNudges?: number;
   /**
    * Threshold for the overdue-still-queued alarm. Constructor-only on purpose:
    * unlike its siblings there is no env knob yet, because nothing has needed to
@@ -81,6 +88,8 @@ export interface DeliveryWatchdogOptions {
 export interface CycleSummary {
   verified: number;
   requeued: number;
+  /** Nudges sent this cycle (recovery that did NOT re-inject a payload). */
+  nudged: number;
   alerted: number;
   aborted: number;
   terminal: number;
@@ -96,6 +105,7 @@ function emptySummary(coalesced = false): CycleSummary {
   return {
     verified: 0,
     requeued: 0,
+    nudged: 0,
     alerted: 0,
     aborted: 0,
     terminal: 0,
@@ -400,6 +410,7 @@ export class DeliveryWatchdog {
   private readonly stuckAlertMs: number;
   private readonly stuckAbortSilenceMs: number;
   private readonly maxRequeues: number;
+  private readonly maxNudges: number;
   private readonly overdueAlertMs: number;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
@@ -428,6 +439,7 @@ export class DeliveryWatchdog {
     this.stuckAbortSilenceMs =
       opts.stuckAbortSilenceMs ?? DEFAULT_STUCK_ABORT_SILENCE_MS;
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
+    this.maxNudges = opts.maxNudges ?? DEFAULT_MAX_NUDGES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
   }
 
@@ -894,49 +906,12 @@ export class DeliveryWatchdog {
       if (interventionAlreadyUsed) {
         return this.skipInterventionBudgetUsed(row, sessionId, counts);
       }
-      return this.requeueOrTerminal(
-        row,
-        sessionId,
-        now,
-        counts,
-        "session idle — our prompt never ran",
-      );
-    }
-
-    if (row.abortedAt !== null) {
-      if (isSuppressedFromRecovery(row)) {
-        counts.skipped++;
-        this.log("skipped", {
-          msgId: row.msgId,
-          sessionId,
-          reason: "wake-suppress-stuck-after-recovery",
-        });
-        return false;
-      }
-      // We already used our one recovery attempt (abort+redeliver) for this
-      // message, and after redelivery it's stuck again. Give up.
-      if (interventionAlreadyUsed) {
-        return this.skipInterventionBudgetUsed(row, sessionId, counts);
-      }
-      this.storage.swarm.markFailed(row.msgId, now);
-      counts.terminal++;
-      this.pruneDedupe(row.msgId);
-      await this.alert(
-        "error",
-        `delivery watchdog: msg ${row.msgId} to ${sessionId} stuck again after abort+redeliver recovery — giving up`,
-      );
-      notifySenderOfFailure(
-        this.storage,
-        row,
-        "stuck again after abort+redeliver recovery attempt",
-        now,
-      );
-      this.log("terminal", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "stuck-after-recovery",
-      });
-      return true;
+      // The payload is already in the transcript (we have an anchor) and no
+      // turn has run since. Do NOT requeue: that re-renders the whole envelope
+      // and injects a SECOND copy, which is exactly the duplicate-injection
+      // half of pigeon-3m5. Nudge instead — ask the target to read the copy it
+      // already holds.
+      return this.nudgeOrTerminal(row, sessionId, now, counts);
     }
 
     const lastActivity = lastActivityOf(blocking);
@@ -962,27 +937,131 @@ export class DeliveryWatchdog {
       });
     }
 
-    if (silence <= this.stuckAbortSilenceMs) {
-      counts.skipped++;
-      this.log("skipped", { msgId: row.msgId, sessionId, reason: "waiting" });
-      return false;
-    }
+    // Our prompt is queued behind somebody else's running turn. We WAIT, for
+    // as long as it takes, and we do not touch that turn (pigeon-0gxy).
+    //
+    // Until R3 this is where the watchdog aborted the blocking turn and
+    // redelivered. That was wrong twice over, and it produced 7 of the 9
+    // duplicate-injection specimens in the production DB:
+    //
+    //  - opencode's runLoop re-reads the WHOLE transcript on every step
+    //    (prompt.ts:1092 -> toModelMessagesEffect at :1261), so a turn that is
+    //    already running SEES a user message injected after it started and can
+    //    act on it mid-turn. The turn we were about to kill may be the very
+    //    turn that is processing our message.
+    //  - even when it is not, aborting destroys a peer session's in-flight
+    //    work — its tool calls, its reasoning, its partial answer — purely so
+    //    that mail arrives sooner. Late mail is cheaper than destroyed work.
+    //
+    // Waiting costs nothing: when the blocking turn ends, this row falls into
+    // the idle branch above on a later cycle and gets NUDGED, so delivery
+    // still completes. We give up nothing but the destruction.
+    counts.skipped++;
+    this.log("skipped", {
+      msgId: row.msgId,
+      sessionId,
+      reason:
+        silence <= this.stuckAbortSilenceMs
+          ? "waiting"
+          : "blocked-behind-silent-turn",
+      blockedForMs: blockedAge,
+      blockerSilentForMs: silence,
+    });
+    return false;
+  }
 
-    if (isSuppressedFromRecovery(row)) {
+  /**
+   * Recovery for a row whose payload IS already in the target transcript.
+   *
+   * Sends a NUDGE — a small separate message telling the target it has an
+   * unread swarm message and naming its msg_id — rather than re-injecting the
+   * payload. This is the structural half of the pigeon-3m5 fix: the invariant
+   * is ONE PAYLOAD INJECTION PER msg_id, FOREVER. Requeueing would render and
+   * inject the whole envelope a second time, which is what put two identical
+   * copies in a target's context while its sender was told nothing arrived.
+   *
+   * The nudge is enqueued as an ordinary swarm row so it inherits the
+   * arbiter's routing, directory resolution, retry and backoff. When it lands
+   * on an idle session it starts a turn; that turn's context contains the
+   * original envelope (opencode rebuilds model input from the full transcript
+   * every step), so the original message is read and the ORIGINAL row verifies
+   * on the next cycle via the ordinary post-anchor evidence path.
+   *
+   * When the nudge budget is exhausted we stop and report honestly:
+   * DELIVERED_UNCONFIRMED, never "was NOT received" (see formatFailureNotice).
+   */
+  private async nudgeOrTerminal(
+    row: SwarmMessageRecord,
+    sessionId: string,
+    now: number,
+    counts: CycleSummary,
+  ): Promise<boolean> {
+    const reason = "target session idle — our prompt was never read";
+
+    // Loop guard: a nudge that is itself unread must never spawn another
+    // nudge. Without this a permanently-idle session mints nudges forever,
+    // each of which is itself an unverified handed_off row.
+    if (row.kind === NUDGE_KIND) {
       counts.skipped++;
       this.log("skipped", {
         msgId: row.msgId,
         sessionId,
-        reason: "wake-suppress-abort",
+        reason: "nudge-unread-no-cascade",
       });
       return false;
     }
 
-    if (interventionAlreadyUsed) {
-      return this.skipInterventionBudgetUsed(row, sessionId, counts);
+    if (row.nudgeCount >= this.maxNudges) {
+      this.storage.swarm.markFailed(row.msgId, now);
+      counts.terminal++;
+      this.pruneDedupe(row.msgId);
+      await this.alert(
+        "error",
+        `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
+      );
+      notifySenderOfFailure(this.storage, row, reason, now);
+      this.log("terminal", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "nudges-exhausted",
+      });
+      return true;
     }
 
-    return this.attemptAbort(row, sessionId, anchor, readClient, clients, now, counts);
+    const recorded = this.storage.swarm.recordNudge(row.msgId);
+    if (!recorded) {
+      // The row left handed_off underneath us (verified/cancelled/failed on
+      // another path). Do not send a nudge for a row that is no longer ours.
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "nudge-row-no-longer-handed-off",
+      });
+      return false;
+    }
+
+    this.storage.swarm.insert(
+      {
+        msgId: makeMsgId(),
+        fromSession: "pigeon",
+        toSession: sessionId,
+        channel: null,
+        kind: NUDGE_KIND,
+        priority: row.priority,
+        replyTo: row.msgId,
+        payload: formatNudgePayload(row),
+      },
+      now,
+    );
+    counts.nudged++;
+    this.log("nudged", {
+      msgId: row.msgId,
+      sessionId,
+      reason,
+      nudgeCount: row.nudgeCount + 1,
+    });
+    return true;
   }
 
   private async requeueOrTerminal(
@@ -1024,94 +1103,4 @@ export class DeliveryWatchdog {
     return true;
   }
 
-  private async attemptAbort(
-    row: SwarmMessageRecord,
-    sessionId: string,
-    anchor: number,
-    readClient: WatchdogClient,
-    clients: ClientSet,
-    now: number,
-    counts: CycleSummary,
-  ): Promise<boolean> {
-    // TOCTOU: re-fetch immediately before acting. A fresh turn may have
-    // started (or ours may have finally run) since the transcript we based
-    // this decision on was read at the top of the cycle.
-    const refetch = await fetchTranscript(readClient, sessionId);
-    if (!refetch.ok) {
-      counts.skipped++;
-      this.log("skipped", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "toctou-refetch-failed",
-      });
-      return false;
-    }
-
-    if (findVerificationEvidence(refetch.messages, anchor)) {
-      this.storage.swarm.markVerified(row.msgId, now);
-      this.pruneDedupe(row.msgId);
-      counts.verified++;
-      this.log("verified", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "toctou-refetch",
-      });
-      return false;
-    }
-
-    const stillBlocking = findBlockingInFlight(refetch.messages, anchor);
-    if (!stillBlocking) {
-      counts.skipped++;
-      this.log("skipped", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "toctou-no-longer-blocked",
-      });
-      return false;
-    }
-
-    const freshLastActivity = lastActivityOf(stillBlocking);
-    if (now - freshLastActivity <= this.stuckAbortSilenceMs) {
-      // A fresh turn/activity appeared — don't abort.
-      counts.skipped++;
-      this.log("skipped", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "toctou-fresh-activity",
-      });
-      return false;
-    }
-
-    // Still stuck — broadcast the abort to every healthy serve. Best-effort
-    // per serve: a 4xx from a non-owning serve is a benign no-op, so we only
-    // need one 2xx to consider the abort delivered.
-    const results = await Promise.allSettled(
-      clients.all.map((c) => c.abortSession(sessionId)),
-    );
-    const anySuccess = results.some((r) => r.status === "fulfilled");
-
-    if (!anySuccess) {
-      counts.skipped++;
-      await this.alert(
-        "error",
-        `delivery watchdog: abort broadcast failed on all healthy serves for session ${sessionId}, msg ${row.msgId}`,
-      );
-      this.log("skipped", {
-        msgId: row.msgId,
-        sessionId,
-        reason: "abort-broadcast-all-failed",
-      });
-      return false;
-    }
-
-    this.storage.swarm.markAborted(row.msgId, now);
-    this.storage.swarm.requeueForRecovery(
-      row.msgId,
-      now,
-      RECOVERY_REQUEUE_DELAY_MS,
-    );
-    counts.aborted++;
-    this.log("aborted+requeued", { msgId: row.msgId, sessionId });
-    return true;
-  }
 }

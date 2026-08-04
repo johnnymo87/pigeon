@@ -85,3 +85,45 @@ export function formatWakePayloadAlert(
     `payload:\n${payloadText}`
   );
 }
+
+/**
+ * Kind used for a NUDGE: a small message telling a target session that it has
+ * an earlier swarm message sitting unread in its own transcript.
+ *
+ * A nudge exists because of an opencode behaviour (pigeon-usbg): prompting a
+ * BUSY session writes the user message into the transcript and then silently
+ * discards the run, so the payload is present but no turn is ever started for
+ * it. The payload does not need re-sending — it needs a turn. A nudge is the
+ * cheapest thing that starts one.
+ *
+ * It is also the loop guard: the watchdog must never nudge a nudge, or a
+ * permanently idle session mints them forever.
+ */
+export const NUDGE_KIND = "swarm.nudge";
+
+/**
+ * Body of a nudge. It must be intelligible to the RECEIVING AGENT, which is a
+ * language model reading its own context, so it says plainly what happened,
+ * names the message, and — importantly — tells the agent what to do if it has
+ * already handled it.
+ *
+ * That last clause is load-bearing. A turn that was already running when the
+ * original arrived can have absorbed it mid-turn (opencode re-reads the whole
+ * transcript on every step), in which case the message HAS been handled and
+ * the watchdog cannot tell. Rather than risk silent double-execution we make
+ * the ambiguity explicit and let the agent, which can see its own history,
+ * resolve it.
+ */
+export function formatNudgePayload(
+  original: Pick<SwarmMessageRecord, "msgId" | "fromSession">,
+): string {
+  return (
+    `You have an UNREAD swarm message earlier in this conversation: ` +
+    `msg_id="${original.msgId}" from ${original.fromSession}. ` +
+    `It was delivered into your transcript but no turn was ever started for ` +
+    `it, so you may never have acted on it. Scroll back, find that envelope, ` +
+    `and handle it now. ` +
+    `If you have ALREADY handled it, do nothing further — this nudge is ` +
+    `automatic and does not mean your earlier work was lost.`
+  );
+}

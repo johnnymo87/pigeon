@@ -21,6 +21,8 @@ export interface SwarmMessageRecord {
   handedOffAt: number | null;
   verifiedAt: number | null;
   requeueCount: number;
+  /** How many nudges have been sent for this row. See {@link SwarmRepository.recordNudge}. */
+  nudgeCount: number;
   abortedAt: number | null;
   deliverAt: number | null;
   expiresAt: number | null;
@@ -76,6 +78,7 @@ function asRecord(row: Row): SwarmMessageRecord {
     handedOffAt: (row.handed_off_at as number | null) ?? null,
     verifiedAt: (row.verified_at as number | null) ?? null,
     requeueCount: Number(row.requeue_count ?? 0),
+    nudgeCount: Number(row.nudge_count ?? 0),
     abortedAt: (row.aborted_at as number | null) ?? null,
     deliverAt: (row.deliver_at as number | null) ?? null,
     expiresAt: (row.expires_at as number | null) ?? null,
@@ -308,6 +311,32 @@ export class SwarmRepository {
          WHERE msg_id = ? AND state = 'handed_off'`,
       )
       .run(now + delayMs, now, msgId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Records that a nudge has been sent for this message.
+   *
+   * Unlike {@link requeueForRecovery} this does NOT change `state`: the row
+   * stays `handed_off`, because its payload is still sitting in the target's
+   * transcript exactly once and must not be re-sent. The nudge is a separate,
+   * much smaller message that asks the target to read what it already has.
+   *
+   * Guarded on `state = 'handed_off'` so a row that raced to verified,
+   * cancelled or failed cannot have its counter bumped after the fact.
+   *
+   * Deliberately does NOT bump `updated_at`, for the same reason as
+   * {@link markVerified} and {@link markAborted}: `cleanupOlderThan` anchors
+   * retention on it, and nudging a row should not extend its retained life.
+   */
+  recordNudge(msgId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET nudge_count = nudge_count + 1
+         WHERE msg_id = ? AND state = 'handed_off'`,
+      )
+      .run(msgId);
     return result.changes > 0;
   }
 
