@@ -255,6 +255,77 @@ describe("swarmSend (pure helper)", () => {
     }
   })
 
+  /**
+   * pigeon-iy4 follow-through. A fetch REJECTION on the re-auth retry must
+   * re-enter the outer retry loop, not abort the send.
+   *
+   * A token rotation and a daemon restart are frequently the same event, so
+   * "401 with the stale token -> re-resolve -> retry lands in the restart
+   * window -> ECONNREFUSED" is an ordinary sequence here, not an exotic one.
+   * The catch used to only record lastError and fall through to the
+   * isTransientStatus check -- which still saw the ORIGINAL 401 response, a
+   * permanent status -- so the send threw immediately, with a refreshed token
+   * in hand and most of the ~15.5s backoff budget unspent, blaming a 401 that
+   * had already been cured.
+   *
+   * swarm-schedule-tool.ts:246-258 already does this correctly; W4 found it
+   * there ("Fix 3") and this is the same defect in the sibling tool.
+   */
+  test("re-auth retry that rejects (ECONNREFUSED) resumes the outer retry loop instead of throwing the cured 401", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pigeon-swarmsend-fix3-"))
+    const secretPath = path.join(tmpDir, "token")
+    fs.writeFileSync(secretPath, "old-token", "utf8")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const seenAuth: Array<string | undefined> = []
+    let callCount = 0
+    const fetchFn = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++
+      seenAuth.push((init?.headers as Record<string, string>)?.["Authorization"])
+      if (callCount === 1) {
+        fs.writeFileSync(secretPath, "new-token", "utf8")
+        return status(401, "Unauthorized")
+      }
+      // The daemon is mid-restart when the re-auth retry arrives.
+      if (callCount === 2) econnRefused()
+      return ok202("msg_fix3_ok")
+    }) as typeof fetch
+
+    const { sleepFn, delays } = recordingSleep()
+
+    try {
+      const result = await swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn,
+          sleepFn,
+        },
+        { to: "ses_target", message: "hi" },
+      )
+
+      expect(result.msg_id).toBe("msg_fix3_ok")
+      expect(callCount).toBe(3)
+      // The blip cost one backoff sleep rather than the whole send.
+      expect(delays).toHaveLength(1)
+      // And the refreshed token survived the rejection -- it is not re-resolved
+      // back to the stale value, and the retry is not attempted a second time.
+      expect(seenAuth).toEqual([
+        "Bearer old-token",
+        "Bearer new-token",
+        "Bearer new-token",
+      ])
+    } finally {
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   test("throws with status + body when the daemon rejects the payload (400 close tag)", async () => {
     const fetchFn = (async () =>
       new Response(
