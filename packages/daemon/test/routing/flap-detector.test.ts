@@ -582,6 +582,135 @@ describe("FlapDetector", () => {
 
     expect(r.countSince(0)).toBe(1);
   });
+
+  describe("Fix 1: watermark reset on log truncation", () => {
+    it("resets high watermark and alerts when latestEventId < lastAlertedEventId", async () => {
+      const r = repo();
+      // Seed alert state with a high watermark from a lost log
+      r.setAlertState({ lastAlertedEventId: 500, lastAlertAt: T0 - 60 * 60 * 1000 });
+
+      // Add 6 moves in rebuilt log (max event ID will be 6, which is < 500)
+      thrash(r, 6);
+      const latestId = r.latestEventId();
+      expect(latestId).toBe(6);
+
+      const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+      const log = vi.fn();
+      const d = new FlapDetector({
+        reassignments: r,
+        notifier: { sendPlainAlert },
+        log,
+        nowFn: () => T0,
+        windowMs: WINDOW,
+        perSessionMoves: 5,
+        alertCooldownMs: 10 * 60 * 1000,
+      });
+
+      await d.tick();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      expect(r.getAlertState().lastAlertedEventId).toBe(latestId);
+    });
+
+    it("emits loud log message when watermark is reset", async () => {
+      const r = repo();
+      r.setAlertState({ lastAlertedEventId: 500, lastAlertAt: null });
+      thrash(r, 6);
+
+      const log = vi.fn();
+      const d = new FlapDetector({
+        reassignments: r,
+        notifier: { sendPlainAlert: vi.fn().mockResolvedValue(undefined) },
+        log,
+        nowFn: () => T0,
+        windowMs: WINDOW,
+        perSessionMoves: 5,
+      });
+
+      await d.tick();
+
+      const resetLogs = log.mock.calls.filter((call) =>
+        String(call[0]).includes("watermark") || String(call[0]).includes("reset") || String(call[0]).includes("truncated"),
+      );
+      expect(resetLogs.length).toBeGreaterThan(0);
+      expect(JSON.stringify(resetLogs[0])).toContain("500");
+    });
+
+    it("does not reset watermark or alert when latestEventId === lastAlertedEventId", async () => {
+      const r = repo();
+      thrash(r, 6);
+      const latestId = r.latestEventId();
+      expect(latestId).toBe(6);
+
+      // Set alert state to current latest id and ancient alert time (cooldown expired)
+      r.setAlertState({ lastAlertedEventId: latestId, lastAlertAt: T0 - 60 * 60 * 1000 });
+
+      const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+      const log = vi.fn();
+      const d = new FlapDetector({
+        reassignments: r,
+        notifier: { sendPlainAlert },
+        log,
+        nowFn: () => T0,
+        windowMs: WINDOW,
+        perSessionMoves: 5,
+        alertCooldownMs: 10 * 60 * 1000,
+      });
+
+      await d.tick();
+
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const resetLogs = log.mock.calls.filter((call) =>
+        String(call[0]).includes("watermark") || String(call[0]).includes("reset") || String(call[0]).includes("truncated"),
+      );
+      expect(resetLogs.length).toBe(0);
+      expect(r.getAlertState().lastAlertedEventId).toBe(latestId);
+    });
+  });
+
+  describe("Fix 4: snapshot-before-send ordering test", () => {
+    it("snapshots event ID before alert send so events arriving mid-send are not lost and trigger future alert", async () => {
+      const r = repo();
+      thrash(r, 6); // Initial latest ID = 6
+      const initialLatestId = r.latestEventId();
+      expect(initialLatestId).toBe(6);
+
+      let now = T0;
+      // Mock sendPlainAlert to simulate a move arriving mid-send
+      const sendPlainAlert = vi.fn().mockImplementation(async () => {
+        // Record new event mid-send -> event ID 7
+        move(r, "ses_midsend", now, 10);
+      });
+
+      const d = new FlapDetector({
+        reassignments: r,
+        notifier: { sendPlainAlert },
+        log: vi.fn(),
+        nowFn: () => now,
+        windowMs: WINDOW,
+        perSessionMoves: 5,
+        alertCooldownMs: 10 * 60 * 1000,
+      });
+
+      await d.tick();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+      // The persisted watermark MUST be the ID snapshot before send (6), not the mid-send ID (7)
+      const midSendLatestId = r.latestEventId();
+      expect(midSendLatestId).toBe(7);
+      const stateAfterTick1 = r.getAlertState();
+      expect(stateAfterTick1.lastAlertedEventId).toBe(initialLatestId);
+      expect(stateAfterTick1.lastAlertedEventId!).toBeLessThan(midSendLatestId!);
+
+      // On a later tick after cooldown expires, the mid-send event MUST be treated as new evidence and trigger alert
+      now = T0 + 11 * 60 * 1000;
+      await d.tick();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(2);
+      expect(r.getAlertState().lastAlertedEventId).toBe(7);
+    });
+  });
 });
 
 describe("formatRecency", () => {
@@ -752,5 +881,63 @@ describe("renderFlapAlert", () => {
     const text = renderFlapAlert(v, defaultOpts);
     expect(text).toContain("BUG: the slow-burn arm fired with an empty session list");
     expect(text).not.toContain("()");
+  });
+
+  describe("Fix 2: moves > 1 filtering in renderFlapAlert", () => {
+    it("filters out single-move sessions from detail list when multi-move sessions are present", () => {
+      const v: FlapVerdict = {
+        flapping: true,
+        reasons: ["burst"],
+        windowMs: WINDOW,
+        totalMoves: 8,
+        distinctSessions: 3,
+        breadthSessions: 0,
+        slowBurnWorst: [],
+        worst: [
+          { sessionId: "ses_offender", moves: 6, lastMoveAt: T0 },
+          { sessionId: "ses_innocent1", moves: 1, lastMoveAt: T0 - 100 },
+          { sessionId: "ses_innocent2", moves: 1, lastMoveAt: T0 - 200 },
+        ],
+      };
+      const text = renderFlapAlert(v, defaultOpts);
+      expect(text).toContain("ses_offender moved 6x");
+      expect(text).not.toContain("ses_innocent1");
+      expect(text).not.toContain("ses_innocent2");
+    });
+
+    it("renders tripwire bug text when session list contains only 1-move sessions", () => {
+      const v: FlapVerdict = {
+        flapping: true,
+        reasons: ["burst"],
+        windowMs: WINDOW,
+        totalMoves: 1,
+        distinctSessions: 1,
+        breadthSessions: 0,
+        slowBurnWorst: [],
+        worst: [{ sessionId: "ses_innocent", moves: 1, lastMoveAt: T0 }],
+      };
+      const text = renderFlapAlert(v, defaultOpts);
+      expect(text).toContain("BUG: the burst arm fired with an empty session list");
+      expect(text).not.toContain("ses_innocent");
+      expect(text).not.toContain("()");
+    });
+  });
+
+  describe("Fix 3: slow-burn past tense rendering", () => {
+    it("uses past tense 'bounced between serves within the last 24h' and does not contain 'is bouncing' in slow-burn section", () => {
+      const v: FlapVerdict = {
+        flapping: true,
+        reasons: ["slow-burn"],
+        windowMs: WINDOW,
+        totalMoves: 0,
+        distinctSessions: 0,
+        breadthSessions: 0,
+        slowBurnWorst: [{ sessionId: "ses_slow", moves: 8, lastMoveAt: T0 - 17 * 3600 * 1000 }],
+        worst: [],
+      };
+      const text = renderFlapAlert(v, defaultOpts);
+      expect(text).toContain("[slow-burn] at least one session bounced between serves within the last 24h");
+      expect(text).not.toContain("[slow-burn] at least one session is bouncing");
+    });
   });
 });

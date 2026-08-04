@@ -260,12 +260,13 @@ export function renderFlapAlert(
   for (const reason of v.reasons) {
     if (reason === "burst") {
       thresholdsQuoted.push(`${opts.perSessionMoves} moves/session/${shortWinStr}`);
-      if (v.worst.length === 0) {
+      const filteredWorst = v.worst.filter((w) => w.moves > 1);
+      if (filteredWorst.length === 0) {
         sections.push(
           `BUG: the burst arm fired with an empty session list; this is a detector bug, please report it.`,
         );
       } else {
-        const detail = v.worst
+        const detail = filteredWorst
           .map((w) => `${w.sessionId} moved ${w.moves}x`)
           .join("; ");
         sections.push(
@@ -276,12 +277,13 @@ export function renderFlapAlert(
       thresholdsQuoted.push(
         `${opts.breadthSessions}x${opts.breadthMovesEach} moves/${shortWinStr}`,
       );
-      if (v.worst.length === 0) {
+      const filteredWorst = v.worst.filter((w) => w.moves > 1);
+      if (filteredWorst.length === 0) {
         sections.push(
           `BUG: the breadth arm fired with an empty session list; this is a detector bug, please report it.`,
         );
       } else {
-        const detail = v.worst
+        const detail = filteredWorst
           .map((w) => `${w.sessionId} moved ${w.moves}x`)
           .join("; ");
         sections.push(
@@ -292,18 +294,19 @@ export function renderFlapAlert(
       thresholdsQuoted.push(
         `${opts.slowBurnMoves} moves/session/${slowBurnWinStr}`,
       );
-      if (v.slowBurnWorst.length === 0) {
+      const filteredSlowBurn = v.slowBurnWorst.filter((w) => w.moves > 1);
+      if (filteredSlowBurn.length === 0) {
         sections.push(
           `BUG: the slow-burn arm fired with an empty session list; this is a detector bug, please report it.`,
         );
       } else {
-        const worst = v.slowBurnWorst[0]!;
+        const worst = filteredSlowBurn[0]!;
         const recency = formatRecency(Math.max(0, opts.now - worst.lastMoveAt));
-        const detail = v.slowBurnWorst
+        const detail = filteredSlowBurn
           .map((w) => `${w.sessionId} moved ${w.moves}x`)
           .join("; ");
         sections.push(
-          `[slow-burn] at least one session is bouncing between serves in the last ${slowBurnWinStr} (${detail}, last move ${recency}).`,
+          `[slow-burn] at least one session bounced between serves within the last ${slowBurnWinStr} (${detail}, last move ${recency}).`,
         );
       }
     }
@@ -425,6 +428,27 @@ export class FlapDetector {
       const cooling =
         this.lastAlertAt !== null && now - this.lastAlertAt < this.alertCooldownMs;
       const latestEventId = this.reassignments.latestEventId();
+
+      // Check for watermark ahead of log reality (e.g. log truncation or recreation).
+      // WHY THIS CANNOT BE SILENT: a watermark ahead of the log disables alerting
+      // with no outward symptom, so it must announce itself loudly and self-heal by
+      // resetting the persisted watermark to null so new evidence can alert again.
+      if (
+        latestEventId !== null &&
+        this.lastAlertedEventId !== null &&
+        latestEventId < this.lastAlertedEventId
+      ) {
+        this.log(
+          "reassignment alert watermark reset: event log appears to have been truncated or recreated",
+          {
+            latestEventId,
+            lastAlertedEventId: this.lastAlertedEventId,
+          },
+        );
+        this.lastAlertedEventId = null;
+        this.persistAlertState();
+      }
+
       const hasNewEvidence =
         latestEventId !== null &&
         (this.lastAlertedEventId === null || latestEventId > this.lastAlertedEventId);
