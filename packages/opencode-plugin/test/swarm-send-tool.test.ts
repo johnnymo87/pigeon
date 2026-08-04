@@ -530,6 +530,79 @@ describe("createSwarmSendTool", () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  /**
+   * pigeon-iy4. The one-shot 401 re-auth must survive the REAL tool entry
+   * point, not just a direct swarmSend() call.
+   *
+   * This has to go through execute() rather than swarmSend(): the bug lived
+   * entirely in what execute() passed down. execute() resolved the token once
+   * and handed it over as opts.authToken, so the retry's
+   * `opts.authToken ?? resolveDaemonToken()` kept preferring that snapshot and
+   * re-sent the identical dead token. The pre-existing 401 test
+   * ("invalidates token and retries on 401 response") calls swarmSend()
+   * without opts.authToken -- a configuration production never used -- which
+   * is exactly why it stayed green while the production path was broken.
+   *
+   * Asserting the full header sequence, not just "the second call happened":
+   * the broken code also makes two calls and also succeeds here. Only the
+   * header CONTENT separates the fixed path from the broken one.
+   */
+  test("execute() re-auth retry sends the refreshed token, not a stale snapshot (pigeon-iy4)", async () => {
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "pigeon-swarmsend-iy4-"),
+    )
+    const secretPath = path.join(tmpDir, "token")
+    fs.writeFileSync(secretPath, "old-token", "utf8")
+    process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE = secretPath
+
+    const authHeadersSeen: string[] = []
+    let callCount = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++
+      const headers = (init?.headers as Record<string, string>) ?? {}
+      if (headers["Authorization"]) {
+        authHeadersSeen.push(headers["Authorization"])
+      }
+      if (callCount === 1) {
+        // Token rotates on disk while the daemon is rejecting the old one.
+        fs.writeFileSync(secretPath, "new-token", "utf8")
+        return status(401, "Unauthorized")
+      }
+      return ok202("msg_iy4_ok")
+    }) as typeof fetch
+
+    try {
+      const def = createSwarmSendTool("http://daemon.test")
+      const result = await def.execute(
+        { to: "ses_target", message: "ping" },
+        {
+          sessionID: "ses_caller",
+          messageID: "msg_x",
+          agent: "build",
+          directory: "/tmp",
+          worktree: "/tmp",
+          abort: new AbortController().signal,
+          metadata: () => {},
+          ask: async () => {},
+        },
+      )
+
+      expect(callCount).toBe(2)
+      expect(authHeadersSeen).toEqual(["Bearer old-token", "Bearer new-token"])
+      expect(result).toContain("msg_iy4_ok")
+    } finally {
+      globalThis.fetch = originalFetch
+      delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+      invalidateDaemonToken()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("SWARM_SEND_TOOL_NAME (Anthropic compatibility)", () => {
