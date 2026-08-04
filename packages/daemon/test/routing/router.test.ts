@@ -220,13 +220,15 @@ describe("IngressRouter Service Logic", () => {
     };
     s.serves.upsert(s1);
 
-    // Call touch or keep-alive within idleMigrateMs. It should remain on S0 due to stickiness.
-    now += 1000; // 1s idle (less than idleMigrateMs=3s)
-    const res2 = router.touch(sessionId, now);
-    expect(res2?.serveId).toBe("serve-0");
+    // Resolve within the lease TTL. This is the production keep-alive path: the lease
+    // is still live, so ensureRouted takes the resolveRoute branch and never re-places.
+    // Note it therefore does NOT refresh stickiness — only placement does.
+    now += 1000; // 1s
+    const res2 = router.ensureRouted(sessionId, now);
+    expect(res2.serveId).toBe("serve-0");
 
-    // Even if we placeSession, because of stickiness activity being warm, it should keep S0
-    now += 1500; // another 1.5s (cumulative idle is 1.5s since the last touch)
+    // Re-placing while the pin is still warm keeps S0 (2.5s idle since placement < 3s).
+    now += 1500;
     const res3 = router.placeSession(sessionId, now);
     expect(res3.serveId).toBe("serve-0");
 
@@ -274,7 +276,7 @@ describe("IngressRouter Service Logic", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
 
@@ -523,7 +525,7 @@ describe("IngressRouter Service Logic", () => {
         desiredServeId: "serve-1",
         ownerGeneration: 1,
         state: "assigned",
-        lastActiveAt: now,
+        lastPlacedAt: now,
         updatedAt: now,
       });
     }
@@ -826,7 +828,7 @@ describe("IngressRouter Service Logic", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 2,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
 
@@ -845,8 +847,8 @@ describe("IngressRouter Service Logic", () => {
     expect(() => router.placeSession("session-contended", now)).toThrow(LeaseContendedError);
   });
 
-  // Test 11: touch on unrouted session -> null
-  it("touch on unrouted session: returns null", () => {
+  // Test 11: resolveRoute on unrouted session -> null
+  it("resolveRoute on unrouted session: returns null", () => {
     const s = openStorageDb(":memory:");
     const router = new IngressRouter(s, {
       leaseTtlMs: 5000,
@@ -856,7 +858,7 @@ describe("IngressRouter Service Logic", () => {
       activeTurnCap: 10,
     });
 
-    const res = router.touch("session-unrouted", 10_000);
+    const res = router.resolveRoute("session-unrouted", 10_000);
     expect(res).toBeNull();
   });
 
@@ -974,8 +976,15 @@ describe("IngressRouter Service Logic", () => {
     expect(router.resolveRoute("session-1", now)).toBeNull();
   });
 
-  // Test 15: touch fails closed when the lease can no longer be renewed
-  it("touch: returns null (fail closed) when renew is rejected after a generation bump", () => {
+  // Test 15: renewCAS fails closed once the assignment generation moves underneath it.
+  //
+  // This is the serve's invariant, not pigeon's: the serve renews the lease for the
+  // duration of a turn (see the renewal fiber in opencode-patched's serve-lease.patch).
+  // pigeon owns the identical CAS statement, so exercising it here keeps the fencing
+  // rule under test on this side of the shared DB. It used to be reached through
+  // `Router.touch()`, which was deleted as dead code -- the assertion is now made
+  // against the repo primitive directly, which is what the deleted method wrapped.
+  it("renewCAS: rejects renewal (fail closed) after a generation bump", () => {
     const s = openStorageDb(":memory:");
     const router = new IngressRouter(s, {
       leaseTtlMs: 5000,
@@ -996,15 +1005,50 @@ describe("IngressRouter Service Logic", () => {
       draining: false,
     });
 
-    router.ensureRouted("session-1", now);
-    // Happy path: touch renews and returns the route.
-    expect(router.touch("session-1", now + 1000)).not.toBeNull();
+    const r = router.ensureRouted("session-1", now);
+    const epoch = s.meta.get().binaryEpoch;
 
-    // Pigeon bumps the assignment generation -> the held lease (gen 1) can no longer be renewed.
+    // Happy path: the lease renews while it still matches the assignment.
+    expect(
+      s.leases.renewCAS("session-1", r.serveId, r.instanceUuid, r.ownerGeneration, epoch, now + 1000, 5000),
+    ).toBe(true);
+
+    // Pigeon bumps the assignment generation -> the held lease (gen 1) is now orphaned.
     s.assignments.bumpGeneration("session-1", now + 1500);
 
-    // touch must fail closed: renew is rejected, so do not report the session as still routed.
-    expect(router.touch("session-1", now + 2000)).toBeNull();
+    // Fail closed: the CAS is fenced on the assignment's generation, so renewal is rejected
+    // rather than silently extending a lease whose ownership has moved.
+    expect(
+      s.leases.renewCAS("session-1", r.serveId, r.instanceUuid, r.ownerGeneration, epoch, now + 2000, 5000),
+    ).toBe(false);
+
+    // And the orphaned lease must not route either. This covers the generation-mismatch
+    // arm of resolveRoute's lease check, which is what stops pigeon handing out a route
+    // to a serve that has lost ownership. It was only ever reached incidentally, via
+    // `Router.touch()` calling resolveRoute before renewing; with `touch` deleted it
+    // needs asserting deliberately or the arm goes untested.
+    //
+    // The heartbeat refresh keeps this assertion pinned to the generation arm and
+    // nothing else. It was strictly load-bearing when first written: staleServeMs is
+    // 2000, so at now+2000 the serve was already stale and resolveRoute returned null
+    // for THAT reason, passing while proving nothing. #54 (pigeon-pov) then made
+    // resolveRoute honor a valid lease over a stale heartbeat, which removes that
+    // confound — the assertion is now non-vacuous with or without the refresh. Keeping
+    // it anyway, because it costs one fixture and it re-pins the test to the arm it
+    // names if that ordering is ever revisited.
+    //
+    // Non-vacuity is verified by mutation, not assumed: neutering the generation check
+    // in router.ts fails this line.
+    s.serves.upsert({
+      serveId: "serve-1",
+      instanceUuid: "uuid-1",
+      endpoint: "http://localhost:8001",
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: now + 2000,
+      draining: false,
+    });
+    expect(router.resolveRoute("session-1", now + 2000)).toBeNull();
   });
 
   // Test 16: sweep does not clobber a newer assignment created by a concurrent re-route
@@ -1036,7 +1080,7 @@ describe("IngressRouter Service Logic", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
     // Expired lease row (gen 1) via raw insert so it's listed by listExpired.
@@ -1054,7 +1098,7 @@ describe("IngressRouter Service Logic", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 2,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
 
@@ -1080,7 +1124,7 @@ describe("resolveProspectiveRoute (idle prospective routing)", () => {
       heartbeatAt: opts.heartbeatAt ?? now, draining: opts.draining ?? false,
     });
   const seedAssignment = (s: S, sid: string, serveId: string, state: "assigned" | "dormant" = "dormant") =>
-    s.assignments.upsert({ sessionId: sid, directoryKey: null, desiredServeId: serveId, ownerGeneration: 1, state, lastActiveAt: now, updatedAt: now });
+    s.assignments.upsert({ sessionId: sid, directoryKey: null, desiredServeId: serveId, ownerGeneration: 1, state, lastPlacedAt: now, updatedAt: now });
 
   it("REAL dormant path: placeSession -> expire -> sweep -> prospective 200", () => {
     const s = openStorageDb(":memory:");
@@ -1274,8 +1318,10 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
     expect(lease?.ownerGeneration).toBe(1);
     // Untouched: neither stolen nor silently re-acquired on a read path.
     expect(lease?.leaseExpiresAt).toBe(now + TTL);
-    // resolveRoute is a READ. A mutant that touches the assignment here (e.g.
-    // touchActive) would silently defeat idle-migration accounting.
+    // resolveRoute is a READ. A mutant that advanced lastPlacedAt here would silently
+    // defeat idle-migration accounting -- and would also relaunder the placement
+    // timestamp into looking like an activity timestamp, which is the confusion the
+    // lastPlacedAt rename exists to kill.
     expect(s.assignments.get("session-1")).toEqual(assignmentBefore);
     // The instrument itself is pinned: this bug was invisible in production for
     // months precisely because nothing logged, so an untested log is a mutant

@@ -726,7 +726,7 @@ describe("ingestWorkerCommand", () => {
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-gone", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-gone", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       const tgCalls: Array<{ chatId: string; text: string }> = [];
 
@@ -916,7 +916,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-no-client", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-no-client", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       await ingestWorkerCommand(
         storage,
@@ -948,7 +948,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-gone-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-gone-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       const unregistered: string[] = [];
 
@@ -994,7 +994,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-gone-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-gone-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       await ingestWorkerCommand(
         storage,
@@ -1036,7 +1036,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-no-client-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-no-client-unreg", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       const unregistered: string[] = [];
 
@@ -1075,7 +1075,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
         backendAuthToken: "tok",
       }, 1_000);
-      storage.assignments.upsert({ sessionId: "sess-no-client-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastActiveAt: 1_000, updatedAt: 1_000 });
+      storage.assignments.upsert({ sessionId: "sess-no-client-reject", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
       await ingestWorkerCommand(
         storage,

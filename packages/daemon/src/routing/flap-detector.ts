@@ -32,7 +32,8 @@
  *
  * (Generation counters cannot substitute for this table: `owner_generation` is
  * monotonic but undateable, because `session_assignment.updated_at` is churned by
- * `touchActive` and `setDormantFenced` for unrelated reasons. "Moved 12 times"
+ * `upsert` (every placement, via `placeSession`) and by `setDormantFenced` (via
+ * `sweep`) for unrelated reasons. "Moved 12 times"
  * over three months and over ten minutes are indistinguishable from the counter.)
  *
  * ── THRESHOLDS ARE PROVISIONAL ───────────────────────────────────────────────

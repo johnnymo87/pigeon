@@ -138,7 +138,7 @@ describe("Routing Repositories", () => {
     s.db.close();
   });
 
-  it("SessionAssignmentRepo: upsert, get, bumpGeneration, touchActive, setState, listForServe", () => {
+  it("SessionAssignmentRepo: upsert, get, bumpGeneration, setState, listForServe", () => {
     const s = openStorageDb(":memory:");
 
     const a1: AssignmentRecord = {
@@ -147,7 +147,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     };
 
@@ -157,7 +157,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 3,
       state: "dormant",
-      lastActiveAt: 9_000,
+      lastPlacedAt: 9_000,
       updatedAt: 9_500,
     };
 
@@ -175,11 +175,9 @@ describe("Routing Repositories", () => {
     expect(updatedA1?.ownerGeneration).toBe(2);
     expect(updatedA1?.updatedAt).toBe(12_000);
 
-    // 3. touchActive
-    s.assignments.touchActive("session-1", 13_000);
-    const touchedA1 = s.assignments.get("session-1");
-    expect(touchedA1?.lastActiveAt).toBe(13_000);
-    expect(touchedA1?.updatedAt).toBe(13_000);
+    // 3. bumpGeneration churns updated_at ONLY -- lastPlacedAt is untouched, because
+    //    nothing but a placement may advance it.
+    expect(updatedA1?.lastPlacedAt).toBe(10_000);
 
     // 4. setState
     s.assignments.setState("session-1", "migrating", 14_000);
@@ -208,7 +206,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     };
     s.assignments.upsert(a3);
@@ -237,7 +235,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 2,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     });
 
@@ -265,7 +263,7 @@ describe("Routing Repositories", () => {
     const now = 1000;
     s.assignments.upsert({
       sessionId: "ses_del", directoryKey: null, desiredServeId: "serve-0",
-      ownerGeneration: 1, state: "dormant", lastActiveAt: now, updatedAt: now,
+      ownerGeneration: 1, state: "dormant", lastPlacedAt: now, updatedAt: now,
     });
     expect(s.assignments.get("ses_del")).not.toBeNull();
     s.assignments.delete("ses_del");
@@ -295,7 +293,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     });
 
@@ -355,7 +353,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-2",
       ownerGeneration: 2,
       state: "assigned",
-      lastActiveAt: 16_000,
+      lastPlacedAt: 16_000,
       updatedAt: 16_000,
     });
     acquired = s.leases.acquireCAS(inputHigher, 16_000, 5_000); // expires 21_000
@@ -382,7 +380,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-3",
       ownerGeneration: 2,
       state: "assigned",
-      lastActiveAt: 22_000,
+      lastPlacedAt: 22_000,
       updatedAt: 22_000,
     });
     acquired = s.leases.acquireCAS(inputDiffAfterExpiry, 22_000, 5_000); // now is 22_000, past 21_000
@@ -410,7 +408,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-4",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: 28_000,
+      lastPlacedAt: 28_000,
       updatedAt: 28_000,
     });
     const staleAcquired = s.leases.acquireCAS(inputStaleLower, 28_000, 5_000); // lease has expired (27_000), but generation is stale (1 < 2)
@@ -438,7 +436,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-A",
       ownerGeneration: 5,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     });
 
@@ -490,7 +488,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-A",
       ownerGeneration: 5,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     });
 
@@ -530,7 +528,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-B",
       ownerGeneration: 5,
       state: "assigned",
-      lastActiveAt: 17_000,
+      lastPlacedAt: 17_000,
       updatedAt: 17_000,
     });
 
@@ -565,7 +563,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-A",
       ownerGeneration: 5,
       state: "assigned",
-      lastActiveAt: 10_000,
+      lastPlacedAt: 10_000,
       updatedAt: 10_000,
     });
 
@@ -588,7 +586,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-A",
       ownerGeneration: 5,
       state: "assigned",
-      lastActiveAt: 12_000,
+      lastPlacedAt: 12_000,
       updatedAt: 12_000,
     });
 
@@ -605,7 +603,7 @@ describe("Routing Repositories", () => {
       desiredServeId: "serve-A",
       ownerGeneration: 6,
       state: "assigned",
-      lastActiveAt: 13_000,
+      lastPlacedAt: 13_000,
       updatedAt: 13_000,
     });
     // First let the current owner acquire at generation 6, epoch 2

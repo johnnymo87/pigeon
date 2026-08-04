@@ -116,7 +116,7 @@ describe("cross-serve-delivery integration", () => {
       desiredServeId: "serve-0",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
     storage.leases.acquireCAS(
@@ -137,7 +137,7 @@ describe("cross-serve-delivery integration", () => {
       desiredServeId: "serve-1",
       ownerGeneration: 1,
       state: "assigned",
-      lastActiveAt: now,
+      lastPlacedAt: now,
       updatedAt: now,
     });
     storage.leases.acquireCAS(

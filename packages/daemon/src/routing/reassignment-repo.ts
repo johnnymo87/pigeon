@@ -12,8 +12,9 @@
  * mechanism exists is the whole point: it means increment 2 lands instrumented.
  *
  * WHY NOT REUSE `session_assignment.owner_generation`: it is monotonic but
- * undateable. `updated_at` on that row is churned by `touchActive` and
- * `setDormantFenced` for reasons unrelated to reassignment, so the counter can
+ * undateable. `updated_at` on that row is churned by `upsert` (every placement,
+ * via `placeSession`) and by `setDormantFenced` (via `sweep`) for reasons unrelated
+ * to reassignment, so the counter can
  * tell you a session moved twelve times but never whether that was over three
  * months (fine) or ten minutes (the incident).
  *

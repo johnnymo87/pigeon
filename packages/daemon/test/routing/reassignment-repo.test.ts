@@ -12,7 +12,7 @@
  * The counter alone cannot support an alert, for two reasons:
  *
  *  1. IT CANNOT BE DATED. `session_assignment.updated_at` is churned by
- *     `touchActive` (route-repo.ts:248) and `setDormantFenced` (:273) on totally
+ *     `upsert` (every placement) and `setDormantFenced` (sweep) on totally
  *     unrelated events, so "generation is 12" carries no information about
  *     WHEN those 12 moves happened. Twelve moves over three months is healthy;
  *     twelve in ten minutes is the incident. The counter cannot tell them apart.
