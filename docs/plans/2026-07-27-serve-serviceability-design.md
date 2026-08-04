@@ -488,3 +488,72 @@ an active route when a valid lease exists. Drain still sheds sessions; both epoc
 `isServeHealthy` for sessions holding a valid lease, so a verdict wired in there would not
 reach the live-session path at all — it would silently apply only to placement. That is
 probably the desired scope, but it should be a decision rather than an accident.
+
+## 10. Landed: the flap alert stopped lying (pigeon-8cz, 2026-08-04)
+
+The alert this arc's increment 1 shipped to make flapping LOUD spent 2026-08-02 11:51 →
+2026-08-03 09:10 EDT (21 hours) sending this at ERROR severity every 30 minutes:
+
+> at least one session is bouncing between serves () in the last 15m. Fleet context: 0 moves
+> across 0 sessions
+
+Empty parens, zero counts. An observability feature emitting an alert whose every rendered
+number was wrong. Two independent causes, both now fixed.
+
+1. **Window mismatch.** `alert()` rendered the 15-minute fields (`worst`, `totalMoves`,
+   `distinctSessions`) unconditionally, but the arm that actually fired was **slow-burn**,
+   which evaluates over 24 hours from a separate query. Nothing had happened in the last 15
+   minutes, so the detail list was empty and the counts were zero. The body also quoted the
+   **burst** threshold (5/15m) while the firing rule was 8/24h, and never named the firing arm
+   at all — despite `FlapReason`'s own docstring promising the alert "can say WHAT shape was
+   seen."
+
+   Fixed by extracting a pure, exported `renderFlapAlert` that emits **one section per fired
+   arm**, each carrying its own window, its own session list, and its own threshold, plus a
+   last-move recency string ("last move 17h ago") so a stale condition reads as stale. Fleet
+   totals survive as context but are now explicitly labelled `(last 15m)`, so they can never
+   again be misread as describing a 24h incident. An empty detail is now impossible: if an arm
+   fires with an empty list the text says so and names the arm, because that is a detector bug
+   and should look like one.
+
+2. **Latching, with an in-memory-only throttle.** Slow-burn stays true for a full 24h after
+   the last qualifying move, and the 30-minute cooldown lived only in RAM — three daemon
+   restarts in that window each re-armed it instantly.
+
+   Fixed by gating delivery on **new evidence**: after the cooldown, an alert is re-sent only
+   if the event log has a row newer than a **persisted** watermark. Cooldown and gate are
+   AND-ed and each covers the other's blind spot — the gate alone would alert every 60s tick
+   during live flapping, and the cooldown alone produced this incident.
+
+**Three design points worth keeping.**
+
+- **The watermark is keyed on `id`, not `at`.** The bead said `at`; that is wrong. `id` is
+  `INTEGER PRIMARY KEY AUTOINCREMENT` and monotonic regardless of the clock, whereas an NTP
+  step-back could hand a genuinely new event an `at` below the stored watermark and silently
+  suppress a real alert. AUTOINCREMENT also means `pruneBefore` cannot cause id reuse, because
+  `sqlite_sequence` survives `DELETE`.
+- **The watermark advances only after a send SUCCEEDS**, while the cooldown is stamped before
+  the send. Send failures are swallowed and merely logged, so advancing on failure would drop
+  that evidence until something unrelated moved. Ordering is now pinned by a test that inserts
+  an event from inside the in-flight send.
+- **A watermark ahead of the log self-heals loudly.** Truncate or recreate
+  `reassignment_event` — the surgery an operator considers safe — and ids restart at 1 while
+  the watermark stays high, disabling alerting indefinitely with no symptom. The detector now
+  detects that inversion, logs it, and resets. Silent-miss paths are the thing this arc exists
+  to eliminate; a fix that introduced a new one would be a bad trade.
+
+**Deliberately not done here.** Thresholds are untouched — calibration is **pigeon-u1u.3**,
+gated on the **pigeon-u1u.5** soak. That bead now also carries a new soak metric: "new
+evidence" is any fleet move, not a move by the firing arm, so a latched slow-burn can be
+re-armed by unrelated churn (bounded-load-skip moves being the realistic source). If the
+delivered-alert count per latch is noisy, the pre-agreed fallback is to scope evidence to the
+firing arm's own sessions — a detection-semantics change, which is that bead's to make.
+`safeTick`'s all-zero fallback verdict, which is indistinguishable from a quiet pool, is
+**pigeon-2v62** (P4, latent — its only caller discards the return).
+
+**Method note.** Every fence added here was mutation-tested: delete the new-evidence gate and
+3 tests fail; neuter the empty-detail tripwire, 1; feed the slow-burn section the short
+window, 3. That last one only became true after strengthening a test which — despite being
+named for the production bug shape — originally survived the exact mutation it existed to
+catch, because the wrong-window substitution tripped the empty-list tripwire and still
+satisfied its assertions. A test named after a bug is not evidence that it catches it.
