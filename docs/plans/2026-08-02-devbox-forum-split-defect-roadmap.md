@@ -101,12 +101,14 @@ Full detail lives in the beads. Read those before implementing — they carry th
 | `pigeon-2k1` | W2 — terminal rejection silently acked, no feedback, leaks inbox row | P1 | ✅ merged (#39, `3fa7a7c`) |
 | `pigeon-mmu` | W1 — `forum_topic_created` service message queued as empty command | P2 | ✅ merged (#39, `3fa7a7c`) |
 | `pigeon-k4c.1` | W2b — question-reply path silent drops + unguarded revive sends | P1 | ✅ merged (#42, `03b5c14`) |
-| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | 🔵 in review (#43) |
+| `pigeon-k4c.2` | W2c — wizard soft-locks when `editNotification` fails (ignored `ok`) | P1 | ✅ merged (#43, `da7e35f`) |
 | `pigeon-k4c.3` | W2d — genuinely-gone question hijacks messages for up to 4h | P2 | ready |
-| `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | ready |
-| `pigeon-tyk` | W3 — caption-less media dropped (not silently — see §9) | P2 | 🔵 in review (#45) |
-| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | 🔵 in review (#45) |
+| `pigeon-k4c.4` | W2e — stale wizard button answers a NEW single question (guard skipped when `!isWizard`) | P2 | 🔵 in review (#58) — see §11 |
+| `pigeon-tyk` | W3 — caption-less media dropped (not silently — see §9) | P2 | ✅ merged (#45, `0a03adc`) |
+| `pigeon-bru` | W4 — text-less message submits an EMPTY ANSWER to a pending question | P2 | ✅ merged (#45, `0a03adc`) |
 | `pigeon-k4c.5` | R2 media fetch treats a 404 as transient and retries forever | P2 | ready |
+| `pigeon-k4c.6` | W2f — two silent drops remain (stale wizard version, invalid option index) | P2 | ready — filed by §11 |
+| `pigeon-k4c.7` | W2g — single→single replacement still misdelivered on metadata-less routes | P3 | ready — filed by §11, not fixable by W2e's mechanism |
 
 ### Why W0 gated everything — and how it resolved
 
@@ -571,3 +573,88 @@ session's merged PR moved this epic's ground, in one case closing an item and in
 it, and neither bead knew.** Beads and roadmaps record what was believed when written. The sibling-track
 table at the top of this file exists so the next reader checks before working, rather than discovering
 it at rebase time.
+
+---
+
+## 11. W2e outcome (2026-08-04) — the proposed fix was wrong, and the way it was wrong is the lesson
+
+`pigeon-k4c.4`, PR #58. Branch `fix/wizard-version-guard` off `b0b74f7`.
+
+### The plan of record was holed, and it would have tested green
+
+Both the bead's `LIKELY FIX` and §10's "the originally-proposed fix is still the right one" said:
+apply the version guard whenever the payload is wizard-**shaped**, not only when the pending
+question is a wizard. Two facts, each one line of source, kill it:
+
+- `repos.ts:385` — `store()` inserts **every** row with `version` 0, single and wizard alike.
+- `app.ts:816` — a wizard's **first step** renders with a hardcoded `version: 0`.
+
+So a stale `v0:qN` press landing on a fresh single question computes `incomingVersion !==
+pendingQuestion.version` as `0 !== 0` = **false**. The widened guard does not fire, and the
+misroute proceeds unchanged — for the most common wizard button that exists, step one.
+
+**The dangerous part is that it would have looked fixed.** A test written with a plausible-looking
+stale version (`v3:q0`, which is what a human reaches for when writing a "stale version" test)
+passes under the broken fix. The bug survives only for `v0` — the single most likely real value.
+This is the fourth time this epic has overturned a bead's own stated conclusion, but the first time
+the proposed remedy would have shipped, passed CI, and left the defect live.
+
+### What shipped instead
+
+A **shape/arity consistency** check: the payload's shape must agree with the pending question's
+arity. Grounded in a bijection between the only two renderers — `formatQuestionNotification` emits
+legacy `q{i}` only when `questions.length === 1`, `formatQuestionWizardStep` is the only producer of
+`v{version}:q{i}` — plus the fact that arity is immutable per row, since `store()` is the only writer
+of `questions_json`. A shape that disagrees with arity therefore *proves* the press came from a
+different render, with no reference to version at all.
+
+This also closed a **symmetric bug the bead never reported**: a stale legacy `qN` press landing on a
+pending wizard, resolved by index against whatever step is current. Legacy tokens carry no version,
+so no version-based guard could ever have defended it — only shape can.
+
+Refusal is **visible**, with purpose-built wording rather than `supersededQuestionMessage`, because
+"replaced by a newer one" is a lie for text typed to match the token grammar while the question it
+names is genuinely open.
+
+### The justification was wrong too, in the opposite direction from last cycle
+
+§10 and the bead both leaned on **stale daemons on devbox/macbook** as the route that "actually
+justifies the fix." That is void, and the reasoning error is worth naming: a daemon predating #46's
+identity check also predates *this* guard — same file, same deploy unit. There is no deployable
+state in which one runs and the other does not. A "stale deploy" argument only works for a fix that
+ships **separately** from the thing it backstops.
+
+What does justify it are the metadata-less routes, where identity is absent by construction: a typed
+`/cmd TOKEN v0:q0`, topic-routed text matching the shape, and — found by review, missed by me — a
+swipe-reply to a **non-question** notification of the same session, where Try 1 resolves the session
+but a non-`q:` `notification_id` yields no requestId.
+
+Note the direction of the correction. Last cycle I *over*claimed reachability and was corrected
+down. This cycle I claimed the *wrong* reachability, then found the fix was still justified on
+different grounds. "The conclusion survived" is not evidence the argument was sound.
+
+### Review and verification
+
+Adversarial review confirmed the v0 hole independently, attacked the bijection hard and failed to
+break it, and endorsed the scope call — but found **a surviving seventh mutant**: passing `""` to
+the message formatter appended a bogus echo tail that my substring assertions could not see.
+Assertions tightened to exact message equality. Final: **7 mutants, 0 survivors**, no pre-existing
+assertions flipped, daemon 1172 / plugin 345 / worker 361 green.
+
+### Filed, not fixed
+
+- **`pigeon-k4c.6`** (P2) — two adjacent *pre-existing* silent drops in the same function: the
+  stale-version guard and the invalid-option-index branch. Deliberately out of scope: a version
+  mismatch's common trigger is a benign double-tap during the in-place card edit, where a loud reply
+  is noise, so it needs a debounce decision the shape case does not. The code comment points at this
+  bead so the asymmetry is not read as an oversight.
+- **`pigeon-k4c.7`** (P3) — the residue this mechanism *cannot* reach: a single question replaced by
+  another single question. Shape matches and legacy tokens carry no version, so neither signal
+  exists. Only identity covers it.
+
+### Status of this spine
+
+With #58, seven of ten items are merged or in review and **only `pigeon-k4c.3` remains as original
+scope** (`k4c.5` is an unrelated R2 defect; `k4c.6`/`k4c.7` were born here). Treat this file as a
+**record with live pointers, not an active spine.** When `k4c.5` lands, folding `k4c.3` into the
+delivery-hardening track is better than keeping a spine alive for one item.
