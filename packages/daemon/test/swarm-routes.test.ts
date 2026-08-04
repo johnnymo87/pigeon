@@ -47,6 +47,42 @@ describe("POST /swarm/send", () => {
     expect(stored!.priority).toBe("normal");
   });
 
+  it("rejects caller-supplied kind in reserved 'swarm.' namespace on /swarm/send", async () => {
+    const { app } = newApp();
+
+    const res1 = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          kind: "swarm.nudge",
+          payload: "fake nudge",
+        }),
+      }),
+    );
+    expect(res1.status).toBe(400);
+    const body1 = (await res1.json()) as { error: string };
+    expect(body1.error).toContain("reserved for pigeon-generated messages");
+
+    const res2 = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          kind: "swarm.custom",
+          payload: "fake custom swarm message",
+        }),
+      }),
+    );
+    expect(res2.status).toBe(400);
+    const body2 = (await res2.json()) as { error: string };
+    expect(body2.error).toContain("reserved for pigeon-generated messages");
+  });
+
   it("respects caller-supplied msg_id (idempotency)", async () => {
     const { app, storage: s } = newApp();
     for (let i = 0; i < 2; i++) {
@@ -395,6 +431,44 @@ describe("POST /swarm/schedule", () => {
     expect(body.error).toBe(
       "scheduled delivery requires a session target (to), not a channel",
     );
+  });
+
+  it("rejects caller-supplied kind in reserved 'swarm.' namespace on /swarm/schedule", async () => {
+    const { app } = newApp();
+
+    const res1 = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          kind: "swarm.nudge",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+    expect(res1.status).toBe(400);
+    const body1 = (await res1.json()) as { error: string };
+    expect(body1.error).toContain("reserved for pigeon-generated messages");
+
+    const res2 = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          kind: "swarm.custom",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+    expect(res2.status).toBe(400);
+    const body2 = (await res2.json()) as { error: string };
+    expect(body2.error).toContain("reserved for pigeon-generated messages");
   });
 
   it("schedules with `after: '13h'` -> 202, not ready initially, ready once now advances past deliver_at", async () => {

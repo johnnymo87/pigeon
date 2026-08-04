@@ -529,13 +529,13 @@ export class DeliveryWatchdog {
    * Note that a NUDGE does not take path (c): the row stays `handed_off`
    * throughout, so it keeps its dedupe entry and its alert budget.
    *
-    * The remaining case — and the bug this exists to fix — is the row being
-    * deleted out from under us without ever resolving through (a) or (b).
-    * Note: swarm retention (`swarm.cleanupOlderThan`) is NOT currently
-    * wired, so permanently-unverified rows persist indefinitely in storage.
-    * Reconciling against "not in this cycle's eligible set" catches entries
-    * whose row was deleted or moved.
-   * "not in this cycle's eligible set" catches it the same way.
+   * The remaining case — and the bug this exists to fix — is the row being
+   * deleted out from under us without ever resolving through (a) or (b).
+   * Note: swarm retention (`swarm.cleanupOlderThan`) IS wired, but unverified
+   * rows are exempt from age cleanup (never deleted by retention while
+   * unverified), so they persist until verified or moved to a terminal state.
+   * Reconciling against "not in this cycle's eligible set" catches entries
+   * whose row was deleted or moved.
    *
    * Rows that are alive but simply too young (handed_off more recently than
    * `verifyAfterMs`) were never alerted in the first place — they can't be

@@ -899,8 +899,8 @@ describe("DeliveryWatchdog", () => {
     expect(sendPlainAlert).toHaveBeenCalledTimes(1);
     expect((watchdog as any).stuckAlerted.has("m1")).toBe(true);
 
-    // Simulate the 7-day retention sweep (cleanupOlderThan) deleting the row
-    // out-of-band, without ever routing it through markVerified/markFailed.
+    // Simulate out-of-band deletion (e.g. manual DB cleanup or nudge deletion)
+    // removing the row without ever routing it through markVerified/markFailed.
     storage.db.prepare("DELETE FROM swarm_messages WHERE msg_id = ?").run("m1");
 
     fixture.setNow(1_050_000);

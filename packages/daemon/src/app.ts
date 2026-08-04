@@ -142,6 +142,16 @@ export function parseSwarmSendBody(
   const payload = typeof body.payload === "string" ? body.payload : "";
   const callerMsgId = typeof body.msg_id === "string" ? body.msg_id : null;
 
+  if (typeof body.kind === "string" && body.kind.startsWith("swarm.")) {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: "kind cannot start with 'swarm.' (reserved for pigeon-generated messages)" },
+        { status: 400 },
+      ),
+    };
+  }
+
   if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
   if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
   if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };

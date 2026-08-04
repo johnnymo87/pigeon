@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { SwarmRepository } from "../src/storage/swarm-repo";
 import { initSwarmSchema } from "../src/storage/swarm-schema";
+import { NUDGE_KIND } from "../src/swarm/delivery-policy";
 import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
 
 function createStorage(): StorageDb {
@@ -656,10 +657,11 @@ describe("SwarmRepository", () => {
       s.db.close();
     });
 
-    it("cleanupOlderThan deletes expired and cancelled rows as well as handed_off and failed", () => {
+    it("cleanupOlderThan deletes expired and cancelled rows as well as verified handed_off and failed", () => {
       const s = createStorage();
       s.swarm.insert({ ...BASE, msgId: "m_handed" }, 1_000);
       s.swarm.markHandedOff("m_handed", 1_000); // updated_at = 1_000
+      s.swarm.markVerified("m_handed", 1_000);
 
       s.swarm.insert({ ...BASE, msgId: "m_failed" }, 1_000);
       s.swarm.markFailed("m_failed", 1_000); // updated_at = 1_000
@@ -680,6 +682,114 @@ describe("SwarmRepository", () => {
       expect(s.swarm.getByMsgId("m_canc")).toBeNull();
       expect(s.swarm.getByMsgId("m_exp")).toBeNull();
       expect(s.swarm.getByMsgId("m_queued")).not.toBeNull();
+
+      s.db.close();
+    });
+
+    it("never deletes an unverified handed_off row — recovery and swarm_read may still need it", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m_unverified" }, 1_000);
+      s.swarm.markHandedOff("m_unverified", 1_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(365 * 24 * 60 * 60 * 1000);
+      expect(cleaned).toBe(0);
+      expect(s.swarm.getByMsgId("m_unverified")).not.toBeNull();
+
+      s.db.close();
+    });
+
+    it("deletes a verified handed_off row older than cutoff only when verified_at is also older than cutoff", () => {
+      const s = createStorage();
+      const cutoff = 100_000;
+
+      // Handed off long ago (1_000), verified long ago (2_000 < cutoff)
+      s.swarm.insert({ ...BASE, msgId: "m_old_verify" }, 1_000);
+      s.swarm.markHandedOff("m_old_verify", 1_000);
+      s.swarm.markVerified("m_old_verify", 2_000);
+
+      // Handed off long ago (1_000), verified recently (120_000 >= cutoff)
+      s.swarm.insert({ ...BASE, msgId: "m_late_verify" }, 1_000);
+      s.swarm.markHandedOff("m_late_verify", 1_000);
+      s.swarm.markVerified("m_late_verify", 120_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(cutoff);
+      expect(cleaned).toBe(1);
+      expect(s.swarm.getByMsgId("m_old_verify")).toBeNull();
+      expect(s.swarm.getByMsgId("m_late_verify")).not.toBeNull();
+
+      s.db.close();
+    });
+
+    it("deletes failed, expired, and cancelled rows older than cutoff regardless of verified_at", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m_failed" }, 1_000);
+      s.swarm.markFailed("m_failed", 1_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_exp" }, 1_000);
+      s.swarm.markExpired("m_exp", 1_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_canc" }, 1_000);
+      s.swarm.markCancelled("m_canc", 1_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(5_000);
+      expect(cleaned).toBe(3);
+      expect(s.swarm.getByMsgId("m_failed")).toBeNull();
+      expect(s.swarm.getByMsgId("m_exp")).toBeNull();
+      expect(s.swarm.getByMsgId("m_canc")).toBeNull();
+
+      s.db.close();
+    });
+
+    it("never deletes a queued row even when very old", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m_queued" }, 1_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(365 * 24 * 60 * 60 * 1000);
+      expect(cleaned).toBe(0);
+      expect(s.swarm.getByMsgId("m_queued")).not.toBeNull();
+
+      s.db.close();
+    });
+
+    it("deletes an unverified handed_off nudge message older than cutoff", () => {
+      const s = createStorage();
+      s.swarm.insert({ ...BASE, msgId: "m_nudge", kind: NUDGE_KIND }, 1_000);
+      s.swarm.markHandedOff("m_nudge", 1_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(5_000);
+      expect(cleaned).toBe(1);
+      expect(s.swarm.getByMsgId("m_nudge")).toBeNull();
+
+      s.db.close();
+    });
+
+    it("never deletes rows newer than cutoff regardless of state", () => {
+      const s = createStorage();
+      const cutoff = 5_000;
+
+      s.swarm.insert({ ...BASE, msgId: "m_verified_new" }, 8_000);
+      s.swarm.markHandedOff("m_verified_new", 8_000);
+      s.swarm.markVerified("m_verified_new", 8_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_failed_new" }, 8_000);
+      s.swarm.markFailed("m_failed_new", 8_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_nudge_new", kind: NUDGE_KIND }, 8_000);
+      s.swarm.markHandedOff("m_nudge_new", 8_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_canc_new" }, 8_000);
+      s.swarm.markCancelled("m_canc_new", 8_000);
+
+      s.swarm.insert({ ...BASE, msgId: "m_exp_new" }, 8_000);
+      s.swarm.markExpired("m_exp_new", 8_000);
+
+      const cleaned = s.swarm.cleanupOlderThan(cutoff);
+      expect(cleaned).toBe(0);
+      expect(s.swarm.getByMsgId("m_verified_new")).not.toBeNull();
+      expect(s.swarm.getByMsgId("m_failed_new")).not.toBeNull();
+      expect(s.swarm.getByMsgId("m_nudge_new")).not.toBeNull();
+      expect(s.swarm.getByMsgId("m_canc_new")).not.toBeNull();
+      expect(s.swarm.getByMsgId("m_exp_new")).not.toBeNull();
 
       s.db.close();
     });

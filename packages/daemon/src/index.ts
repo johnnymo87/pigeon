@@ -9,6 +9,7 @@ import { OpencodeClient } from "./opencode-client";
 import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
 import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
+import { SWARM_RETENTION_MS } from "./storage/swarm-schema";
 import { Poller } from "./worker/poller";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
@@ -439,6 +440,9 @@ setInterval(() => {
 
   const alertsCleaned = storage.alerts.cleanupOlderThan(alertSentCutoff, alertAbandonedCutoff);
   if (alertsCleaned > 0) console.log(`[alerts] cleaned ${alertsCleaned} old entries`);
+
+  const swarmCleaned = storage.swarm.cleanupOlderThan(now - SWARM_RETENTION_MS);
+  if (swarmCleaned > 0) console.log(`[swarm] cleaned ${swarmCleaned} old messages`);
 }, 60 * 60 * 1000);
 
 // Reap stale Pigeon registry entries every hour. This must not delete opencode

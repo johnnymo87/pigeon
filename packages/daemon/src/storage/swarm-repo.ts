@@ -1,4 +1,5 @@
 import type BetterSqlite3 from "better-sqlite3";
+import { NUDGE_KIND } from "../swarm/delivery-policy";
 
 type Row = Record<string, unknown>;
 
@@ -473,13 +474,40 @@ export class SwarmRepository {
     return { messages: records, hasMore };
   }
 
+  /**
+   * Deletes terminal and verified records older than `cutoff` (anchored on `updated_at`).
+   *
+   * Deletable cases (when `updated_at < cutoff`):
+   * 1. Terminal records (`state IN ('failed', 'expired', 'cancelled')`).
+   * 2. Handed-off records that were verified before `cutoff` (`state = 'handed_off'`,
+   *    `verified_at IS NOT NULL AND verified_at < cutoff`). Requiring `verified_at < cutoff`
+   *    prevents deleting records that were handed off long ago but verified recently.
+   * 3. Handed-off nudge records (`state = 'handed_off'`, `kind = 'swarm.nudge'`),
+   *    even if unverified.
+   *
+   * Protected case:
+   * Unverified handed-off records (or records verified recently) with non-nudge kinds.
+   *
+   * Carve-out rationale for `swarm.nudge` ({@link NUDGE_KIND}):
+   * A nudge is a small message pigeon itself mints to tell a session it has an
+   * unread message. A nudge sent to a permanently-dead session stays `handed_off`/unverified
+   * forever and is deliberately never nudged again (loop guard). Without this carve-out,
+   * the verified requirement would turn pigeon's own nudges into an unbounded leak.
+   * This carve-out is keyed on `kind = 'swarm.nudge'`, which is trustworthy because
+   * the `swarm.` namespace is rejected at the ingress route (`parseSwarmSendBody` in `app.ts`),
+   * so the only way a row can carry `swarm.nudge` is if pigeon minted it internally.
+   */
   cleanupOlderThan(cutoff: number): number {
     const result = this.db
       .prepare(
         `DELETE FROM swarm_messages
-         WHERE state IN ('handed_off', 'failed', 'expired', 'cancelled') AND updated_at < ?`,
+         WHERE updated_at < ?
+           AND (
+             state IN ('failed', 'expired', 'cancelled')
+             OR (state = 'handed_off' AND ((verified_at IS NOT NULL AND verified_at < ?) OR kind = ?))
+           )`,
       )
-      .run(cutoff);
+      .run(cutoff, cutoff, NUDGE_KIND);
     return result.changes;
   }
 }
