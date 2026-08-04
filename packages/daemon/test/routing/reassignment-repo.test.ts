@@ -98,8 +98,36 @@ describe("ReassignmentEventRepo.topSessionsSince", () => {
     repo.record({ sessionId: "ses_cold", fromServeId: "serve-0", toServeId: "serve-1", ownerGeneration: 2, at: T0 - 4_000 });
 
     const top = repo.topSessionsSince(T0 - 30_000, 10);
-    expect(top[0]).toEqual({ sessionId: "ses_hot", moves: 5 });
-    expect(top[1]).toEqual({ sessionId: "ses_cold", moves: 1 });
+    expect(top[0]).toEqual({ sessionId: "ses_hot", moves: 5, lastMoveAt: T0 - 5_000 + 4 });
+    expect(top[1]).toEqual({ sessionId: "ses_cold", moves: 1, lastMoveAt: T0 - 4_000 });
+  });
+
+  it("returns lastMoveAt equal to MAX(at) of that session's events", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: T0 - 100_000 });
+    repo.record({ sessionId: "ses_a", fromServeId: "serve-1", toServeId: "serve-2", ownerGeneration: 2, at: T0 - 10_000 });
+    repo.record({ sessionId: "ses_a", fromServeId: "serve-2", toServeId: "serve-1", ownerGeneration: 3, at: T0 - 50_000 });
+
+    const top = repo.topSessionsSince(0, 10);
+    expect(top[0]?.lastMoveAt).toBe(T0 - 10_000);
+  });
+
+  it("calculates lastMoveAt per-session, not globally across interleaved timestamps", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: 100 });
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: 200 });
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 2, at: 300 });
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 2, at: 400 });
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 3, at: 500 });
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 3, at: 600 });
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 4, at: 700 });
+
+    const top = repo.topSessionsSince(0, 10);
+    const sesB = top.find((s) => s.sessionId === "ses_b");
+    const sesA = top.find((s) => s.sessionId === "ses_a");
+
+    expect(sesB?.lastMoveAt).toBe(700);
+    expect(sesA?.lastMoveAt).toBe(500);
   });
 
   it("distinguishes one session thrashing from a pool restart moving many sessions once", () => {
@@ -189,5 +217,60 @@ describe("ReassignmentEventRepo.record", () => {
     expect(() =>
       repo.record({ sessionId: "ses_new", fromServeId: null, toServeId: "serve-0", ownerGeneration: 1, at: T0 }),
     ).not.toThrow();
+  });
+});
+
+describe("ReassignmentEventRepo.latestEventId", () => {
+  it("returns null on an empty table", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    expect(repo.latestEventId()).toBeNull();
+  });
+
+  it("returns the highest id and is monotonic across inserts", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: T0 });
+    const id1 = repo.latestEventId();
+    expect(id1).not.toBeNull();
+
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: T0 + 1000 });
+    const id2 = repo.latestEventId();
+    expect(id2).not.toBeNull();
+    expect(id2!).toBeGreaterThan(id1!);
+  });
+
+  it("is NOT confused by out-of-order at values (clock skew property)", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    repo.record({ sessionId: "ses_a", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: T0 + 1000 });
+    const id1 = repo.latestEventId();
+
+    // Insert an event with an `at` timestamp far in the past
+    repo.record({ sessionId: "ses_b", fromServeId: null, toServeId: "serve-1", ownerGeneration: 1, at: T0 - 1_000_000 });
+    const id2 = repo.latestEventId();
+
+    expect(id2!).toBeGreaterThan(id1!);
+  });
+});
+
+describe("ReassignmentEventRepo alert state", () => {
+  it("returns {lastAlertedEventId: null, lastAlertAt: null} before anything is written", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    expect(repo.getAlertState()).toEqual({ lastAlertedEventId: null, lastAlertAt: null });
+  });
+
+  it("round-trips both fields when setAlertState is called", () => {
+    const repo = new ReassignmentEventRepo(freshDb());
+    repo.setAlertState({ lastAlertedEventId: 42, lastAlertAt: T0 });
+    expect(repo.getAlertState()).toEqual({ lastAlertedEventId: 42, lastAlertAt: T0 });
+  });
+
+  it("updates the single row when called twice, keeping row count at 1", () => {
+    const db = freshDb();
+    const repo = new ReassignmentEventRepo(db);
+    repo.setAlertState({ lastAlertedEventId: 10, lastAlertAt: T0 - 1000 });
+    repo.setAlertState({ lastAlertedEventId: 20, lastAlertAt: T0 });
+
+    expect(repo.getAlertState()).toEqual({ lastAlertedEventId: 20, lastAlertAt: T0 });
+    const countRow = db.prepare("SELECT COUNT(*) AS c FROM flap_alert_state").get() as { c: number };
+    expect(countRow.c).toBe(1);
   });
 });

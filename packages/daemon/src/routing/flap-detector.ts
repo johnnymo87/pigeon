@@ -144,8 +144,8 @@ export interface FlapVerdict {
   distinctSessions: number;
   /** Sessions clearing the breadth floor. Drives the breadth arm. */
   breadthSessions: number;
-  /** Worst offender over the 24h slow-burn window. */
-  slowBurnWorstMoves: number;
+  /** Worst offenders over the 24h slow-burn window, descending. Empty when quiet. */
+  slowBurnWorst: SessionMoveCount[];
   /** Worst offenders in the short window, descending. Empty when the log is quiet. */
   worst: SessionMoveCount[];
 }
@@ -182,7 +182,7 @@ export function evaluateFlapping(
   );
   const slowBurnWorst = reassignments.topSessionsSince(
     now - thresholds.slowBurnWindowMs,
-    1,
+    ALERT_SESSION_LIMIT,
   );
   const slowBurnWorstMoves = slowBurnWorst[0]?.moves ?? 0;
 
@@ -209,9 +209,127 @@ export function evaluateFlapping(
     totalMoves,
     distinctSessions,
     breadthSessions,
-    slowBurnWorstMoves,
+    slowBurnWorst,
     worst,
   };
+}
+
+export function formatRecency(deltaMs: number): string {
+  if (deltaMs < 60_000) {
+    return "<1m ago";
+  }
+  if (deltaMs < 3_600_000) {
+    const m = Math.floor(deltaMs / 60_000);
+    return `${m}m ago`;
+  }
+  if (deltaMs < 86_400_000) {
+    const h = Math.floor(deltaMs / 3_600_000);
+    return `${h}h ago`;
+  }
+  const d = Math.floor(deltaMs / 86_400_000);
+  return `${d}d ago`;
+}
+
+export interface RenderFlapAlertOptions {
+  now: number;
+  machineId?: string;
+  perSessionMoves: number;
+  breadthSessions: number;
+  breadthMovesEach: number;
+  slowBurnMoves: number;
+  slowBurnWindowMs: number;
+}
+
+export function renderFlapAlert(
+  v: FlapVerdict,
+  opts: RenderFlapAlertOptions,
+): string {
+  const where = opts.machineId ? ` on ${opts.machineId}` : "";
+  const shortMins = Math.round(v.windowMs / 60_000);
+  const shortWinStr = `${shortMins}m`;
+
+  const slowBurnHrs = Math.round(opts.slowBurnWindowMs / 3_600_000);
+  const slowBurnWinStr =
+    opts.slowBurnWindowMs >= 3_600_000
+      ? `${slowBurnHrs}h`
+      : `${Math.round(opts.slowBurnWindowMs / 60_000)}m`;
+
+  const sections: string[] = [];
+  const thresholdsQuoted: string[] = [];
+
+  for (const reason of v.reasons) {
+    if (reason === "burst") {
+      thresholdsQuoted.push(`${opts.perSessionMoves} moves/session/${shortWinStr}`);
+      const filteredWorst = v.worst.filter((w) => w.moves > 1);
+      if (filteredWorst.length === 0) {
+        sections.push(
+          `BUG: the burst arm fired with an empty session list; this is a detector bug, please report it.`,
+        );
+      } else {
+        const detail = filteredWorst
+          .map((w) => `${w.sessionId} moved ${w.moves}x`)
+          .join("; ");
+        sections.push(
+          `[burst] at least one session is bouncing between serves (${detail}) in the last ${shortWinStr}.`,
+        );
+      }
+    } else if (reason === "breadth") {
+      thresholdsQuoted.push(
+        `${opts.breadthSessions}x${opts.breadthMovesEach} moves/${shortWinStr}`,
+      );
+      const filteredWorst = v.worst.filter((w) => w.moves > 1);
+      if (filteredWorst.length === 0) {
+        sections.push(
+          `BUG: the breadth arm fired with an empty session list; this is a detector bug, please report it.`,
+        );
+      } else {
+        const detail = filteredWorst
+          .map((w) => `${w.sessionId} moved ${w.moves}x`)
+          .join("; ");
+        sections.push(
+          `[breadth] ${v.breadthSessions} sessions moved >= ${opts.breadthMovesEach}x in the last ${shortWinStr} (${detail}).`,
+        );
+      }
+    } else if (reason === "slow-burn") {
+      thresholdsQuoted.push(
+        `${opts.slowBurnMoves} moves/session/${slowBurnWinStr}`,
+      );
+      const filteredSlowBurn = v.slowBurnWorst.filter((w) => w.moves > 1);
+      if (filteredSlowBurn.length === 0) {
+        sections.push(
+          `BUG: the slow-burn arm fired with an empty session list; this is a detector bug, please report it.`,
+        );
+      } else {
+        const worst = filteredSlowBurn[0]!;
+        const recency = formatRecency(Math.max(0, opts.now - worst.lastMoveAt));
+        const detail = filteredSlowBurn
+          .map((w) => `${w.sessionId} moved ${w.moves}x`)
+          .join("; ");
+        sections.push(
+          `[slow-burn] at least one session bounced between serves within the last ${slowBurnWinStr} (${detail}, last move ${recency}).`,
+        );
+      }
+    }
+  }
+
+  const sectionsText = sections.join(" ");
+
+  const fleetContext =
+    `Fleet context (last ${shortWinStr}): ${v.totalMoves} moves across ${v.distinctSessions} sessions ` +
+    `— a pool restart looks like ~1 move per session and does NOT trigger this.`;
+
+  const juneNote =
+    `Repeated moves of the SAME session are what killed four in-flight turns in June ` +
+    `("session lease lost mid-run"). Check for a serve whose heartbeat is stale while ` +
+    `it is alive, or endpoint/config skew.`;
+
+  const threshWord = thresholdsQuoted.length > 1 ? "thresholds" : "threshold";
+  const threshList = thresholdsQuoted.join(", ");
+  const provisionalNote =
+    `NOTE: ${threshWord} (${threshList}) ${thresholdsQuoted.length > 1 ? "are" : "is"} ` +
+    `PROVISIONAL — no base rate existed when set, so tune once there is data.`;
+
+  return `serve reassignment flapping${where}: ${sectionsText} ${fleetContext} ${juneNote} ${provisionalNote}`;
 }
 
 export interface FlapDetectorOptions {
@@ -248,6 +366,7 @@ export class FlapDetector {
   private readonly machineId: string | undefined;
 
   private lastAlertAt: number | null = null;
+  private lastAlertedEventId: number | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private summaryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -268,6 +387,18 @@ export class FlapDetector {
     this.alertCooldownMs = opts.alertCooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
     this.retentionMs = opts.retentionMs ?? DEFAULT_RETENTION_MS;
     this.machineId = opts.machineId;
+
+    try {
+      const state = this.reassignments.getAlertState();
+      this.lastAlertAt = state.lastAlertAt;
+      this.lastAlertedEventId = state.lastAlertedEventId;
+    } catch (err) {
+      this.log("failed to load flap alert state", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.lastAlertAt = null;
+      this.lastAlertedEventId = null;
+    }
   }
 
   async tick(): Promise<FlapVerdict> {
@@ -296,9 +427,40 @@ export class FlapDetector {
 
       const cooling =
         this.lastAlertAt !== null && now - this.lastAlertAt < this.alertCooldownMs;
-      if (!cooling) {
+      const latestEventId = this.reassignments.latestEventId();
+
+      // Check for watermark ahead of log reality (e.g. log truncation or recreation).
+      // WHY THIS CANNOT BE SILENT: a watermark ahead of the log disables alerting
+      // with no outward symptom, so it must announce itself loudly and self-heal by
+      // resetting the persisted watermark to null so new evidence can alert again.
+      if (
+        latestEventId !== null &&
+        this.lastAlertedEventId !== null &&
+        latestEventId < this.lastAlertedEventId
+      ) {
+        this.log(
+          "reassignment alert watermark reset: event log appears to have been truncated or recreated",
+          {
+            latestEventId,
+            lastAlertedEventId: this.lastAlertedEventId,
+          },
+        );
+        this.lastAlertedEventId = null;
+        this.persistAlertState();
+      }
+
+      const hasNewEvidence =
+        latestEventId !== null &&
+        (this.lastAlertedEventId === null || latestEventId > this.lastAlertedEventId);
+
+      if (!cooling && hasNewEvidence) {
         this.lastAlertAt = now;
-        await this.alert(verdict);
+        this.persistAlertState();
+        const sent = await this.alert(verdict);
+        if (sent) {
+          this.lastAlertedEventId = latestEventId;
+          this.persistAlertState();
+        }
       }
     }
 
@@ -339,7 +501,7 @@ export class FlapDetector {
           : 0,
       sessionsAtBreadthFloor: v.breadthSessions,
       worstSessionInWindow: v.worst[0]?.moves ?? 0,
-      worstSessionIn24h: v.slowBurnWorstMoves,
+      worstSessionIn24h: v.slowBurnWorst[0]?.moves ?? 0,
       flappingNow: v.flapping,
       reasons: v.reasons.join(",") || "none",
       thresholds:
@@ -347,6 +509,19 @@ export class FlapDetector {
         `breadth=${this.breadthSessions}x${this.breadthMovesEach} ` +
         `slowBurn=${this.slowBurnMoves}/24h (ALL PROVISIONAL)`,
     });
+  }
+
+  private persistAlertState(): void {
+    try {
+      this.reassignments.setAlertState({
+        lastAlertedEventId: this.lastAlertedEventId,
+        lastAlertAt: this.lastAlertAt,
+      });
+    } catch (err) {
+      this.log("failed to persist flap alert state", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private prune(now: number): void {
@@ -359,35 +534,28 @@ export class FlapDetector {
     }
   }
 
-  private async alert(v: FlapVerdict): Promise<void> {
+  private async alert(v: FlapVerdict): Promise<boolean> {
     if (!this.notifier?.sendPlainAlert) {
-      return;
+      return true;
     }
-    const where = this.machineId ? ` on ${this.machineId}` : "";
-    const minutes = Math.round(v.windowMs / 60_000);
-    const detail = v.worst
-      .filter((w) => w.moves > 1)
-      .map((w) => `${w.sessionId} moved ${w.moves}x`)
-      .join("; ");
-
-    const text =
-      `serve reassignment flapping${where}: at least one session is bouncing ` +
-      `between serves (${detail}) in the last ${minutes}m. ` +
-      `Fleet context: ${v.totalMoves} moves across ${v.distinctSessions} sessions ` +
-      `— a pool restart looks like ~1 move per session and does NOT trigger this. ` +
-      `Repeated moves of the SAME session are what killed four in-flight turns in ` +
-      `June ("session lease lost mid-run"). Check for a serve whose heartbeat is ` +
-      `stale while it is alive, or endpoint/config skew. ` +
-      `NOTE: this threshold (${this.perSessionMoves} moves/session/${minutes}m) is ` +
-      `PROVISIONAL — no base rate existed when it was set, so tune it once there ` +
-      `is a week of data.`;
+    const text = renderFlapAlert(v, {
+      now: this.nowFn(),
+      machineId: this.machineId,
+      perSessionMoves: this.perSessionMoves,
+      breadthSessions: this.breadthSessions,
+      breadthMovesEach: this.breadthMovesEach,
+      slowBurnMoves: this.slowBurnMoves,
+      slowBurnWindowMs: this.slowBurnWindowMs,
+    });
 
     try {
       await this.notifier.sendPlainAlert(text, "error");
+      return true;
     } catch (err) {
       this.log("flap alert send failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 
@@ -412,7 +580,7 @@ export class FlapDetector {
         totalMoves: 0,
         distinctSessions: 0,
         breadthSessions: 0,
-        slowBurnWorstMoves: 0,
+        slowBurnWorst: [],
         worst: [],
       };
     }

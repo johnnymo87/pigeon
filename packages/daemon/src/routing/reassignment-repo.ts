@@ -54,6 +54,11 @@ export const REASSIGNMENT_DDL = `
   );
   CREATE INDEX IF NOT EXISTS idx_reassign_at ON reassignment_event(at);
   CREATE INDEX IF NOT EXISTS idx_reassign_session_at ON reassignment_event(session_id, at);
+  CREATE TABLE IF NOT EXISTS flap_alert_state (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    last_alerted_event_id INTEGER,
+    last_alert_at         INTEGER
+  );
 `;
 
 export function initReassignmentSchema(db: BetterSqlite3.Database): void {
@@ -72,6 +77,7 @@ export interface ReassignmentEvent {
 export interface SessionMoveCount {
   sessionId: string;
   moves: number;
+  lastMoveAt: number;
 }
 
 export class ReassignmentEventRepo {
@@ -116,15 +122,70 @@ export class ReassignmentEventRepo {
   topSessionsSince(since: number, limit: number): SessionMoveCount[] {
     const rows = this.db
       .prepare(
-        `SELECT session_id, COUNT(*) AS moves
+        `SELECT session_id, COUNT(*) AS moves, MAX(at) AS last_move_at
            FROM reassignment_event
           WHERE at >= ?
           GROUP BY session_id
           ORDER BY moves DESC, session_id ASC
           LIMIT ?`,
       )
-      .all(since, limit) as Array<{ session_id: string; moves: number }>;
-    return rows.map((r) => ({ sessionId: r.session_id, moves: Number(r.moves) }));
+      .all(since, limit) as Array<{
+      session_id: string;
+      moves: number;
+      last_move_at: number;
+    }>;
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      moves: Number(r.moves),
+      lastMoveAt: Number(r.last_move_at),
+    }));
+  }
+
+  /**
+   * Highest event id recorded so far, or null if no events exist.
+   *
+   * Keyed on \`id\` and NOT on \`at\`: \`id\` is \`INTEGER PRIMARY KEY AUTOINCREMENT\`
+   * and therefore monotonic regardless of the clock. An NTP step-back
+   * could give a genuinely new event an \`at\` timestamp below a stored \`at\`-watermark,
+   * silently suppressing a real alert.
+   */
+  latestEventId(): number | null {
+    const row = this.db
+      .prepare(`SELECT MAX(id) AS max_id FROM reassignment_event`)
+      .get() as { max_id: number | null } | undefined;
+    return row?.max_id ?? null;
+  }
+
+  getAlertState(): { lastAlertedEventId: number | null; lastAlertAt: number | null } {
+    const row = this.db
+      .prepare(
+        `SELECT last_alerted_event_id, last_alert_at FROM flap_alert_state WHERE id = 1`,
+      )
+      .get() as
+      | { last_alerted_event_id: number | null; last_alert_at: number | null }
+      | undefined;
+    if (!row) {
+      return { lastAlertedEventId: null, lastAlertAt: null };
+    }
+    return {
+      lastAlertedEventId: row.last_alerted_event_id ?? null,
+      lastAlertAt: row.last_alert_at ?? null,
+    };
+  }
+
+  setAlertState(s: { lastAlertedEventId: number | null; lastAlertAt: number | null }): void {
+    this.db
+      .prepare(
+        `INSERT INTO flap_alert_state (id, last_alerted_event_id, last_alert_at)
+         VALUES (1, @lastAlertedEventId, @lastAlertAt)
+         ON CONFLICT(id) DO UPDATE SET
+           last_alerted_event_id = excluded.last_alerted_event_id,
+           last_alert_at = excluded.last_alert_at`,
+      )
+      .run({
+        lastAlertedEventId: s.lastAlertedEventId,
+        lastAlertAt: s.lastAlertAt,
+      });
   }
 
   /**

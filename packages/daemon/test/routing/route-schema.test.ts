@@ -76,5 +76,6 @@ describe("routing schema cross-repo contract", () => {
     // digest changes and the pool crash-loops — catch it here, at desk, rather
     // than at 3am via a restart loop.
     expect(ROUTING_DDL).not.toContain("reassignment_event");
+    expect(ROUTING_DDL).not.toContain("flap_alert_state");
   });
 });
