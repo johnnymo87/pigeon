@@ -711,6 +711,16 @@ describe("renderFlapAlert", () => {
     const text = renderFlapAlert(v, { ...defaultOpts, machineId: "cloudbox" });
     expect(text).not.toContain("()");
     expect(text).toContain("Fleet context (last 15m): 0 moves across 0 sessions");
+
+    // The incident MUST be described from the arm's own 24h data. Without these
+    // three, this test survives the exact regression it is named for: rendering
+    // the short window here (the production bug) leaves `worst` empty, which
+    // merely trips the empty-detail tripwire and still satisfies the two
+    // assertions above. Verified by mutation — `slowBurnWorst` -> `worst` used
+    // to leave this test green.
+    expect(text).toContain("ses_slow");
+    expect(text).toContain("8");
+    expect(text).not.toContain("empty session list");
   });
 
   it("burst-only body does not mention the 24h window", () => {
