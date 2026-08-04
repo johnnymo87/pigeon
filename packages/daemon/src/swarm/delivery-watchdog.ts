@@ -301,7 +301,7 @@ function findSilentInFlight(
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     if (m.completed !== null) continue;
-    if (m.created <= anchor) continue;
+    if (m.created < anchor) continue;
     if (hasProducedOutput(m)) continue;
     if (silent === null || m.created < silent.created) silent = m;
   }
@@ -699,9 +699,7 @@ export class DeliveryWatchdog {
         } else if (second.status === 404) {
           // Confirmed — the session is truly gone.
           for (const row of rows) {
-            this.storage.swarm.markFailed(row.msgId, now);
-            counts.terminal++;
-            this.pruneDedupe(row.msgId);
+            let marked = false;
             const alertText = isSuppressedFromRecovery(row)
               ? formatWakePayloadAlert(
                   row,
@@ -709,18 +707,40 @@ export class DeliveryWatchdog {
                   "delivery watchdog: session no longer exists",
                 )
               : `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`;
-            await this.alert("error", alertText);
-            // The session itself is gone, so whatever we wrote went with it.
-            // "absent" is the honest reading: there is no transcript left for
-            // the payload to be sitting in, and a resend to a live session is
-            // the sender's only route.
-            notifySenderOfFailure(
-              this.storage,
-              row,
-              `session ${sessionId} no longer exists`,
-              now,
-              "absent",
-            );
+
+            this.storage.db.transaction(() => {
+              if (!this.storage.swarm.markFailed(row.msgId, now)) return;
+              marked = true;
+
+              if (isSuppressedFromRecovery(row)) {
+                this.storage.alerts.enqueue({
+                  source: "wake-session-deleted",
+                  refMsgId: row.msgId,
+                  text: alertText,
+                  severity: "error",
+                  now,
+                });
+              }
+
+              if (row.fromSession !== row.toSession) {
+                notifySenderOfFailure(
+                  this.storage,
+                  row,
+                  `session ${sessionId} no longer exists`,
+                  now,
+                  "absent",
+                );
+              }
+            })();
+
+            if (!marked) continue;
+
+            if (!isSuppressedFromRecovery(row)) {
+              await this.alert("error", alertText);
+            }
+
+            counts.terminal++;
+            this.pruneDedupe(row.msgId);
             this.log("terminal", {
               msgId: row.msgId,
               sessionId,
@@ -1005,7 +1025,7 @@ export class DeliveryWatchdog {
     now: number,
     counts: CycleSummary,
   ): Promise<boolean> {
-    const reason = "target session idle — our prompt was never read";
+    const reason = "target session idle — no turn was confirmed to have read prompt";
 
     // Loop guard: a nudge that is itself unread must never spawn another
     // nudge. Without this a permanently-idle session mints nudges forever,
@@ -1020,42 +1040,60 @@ export class DeliveryWatchdog {
       return false;
     }
 
+    if (this.storage.swarm.hasQueuedNudge(row.msgId)) {
+      counts.skipped++;
+      this.log("skipped", {
+        msgId: row.msgId,
+        sessionId,
+        reason: "previous-nudge-still-queued",
+      });
+      return false;
+    }
+
     if (row.nudgeCount >= this.maxNudges) {
-      this.storage.swarm.markFailed(row.msgId, now);
-      counts.terminal++;
-      this.pruneDedupe(row.msgId);
+      let marked = false;
+      this.storage.db.transaction(() => {
+        if (!this.storage.swarm.markFailed(row.msgId, now)) return;
+        marked = true;
 
-      // A provider rate-limit (429) can park a turn for a very long time, and
-      // such a turn leaves an assistant message with ZERO parts — which is
-      // byte-identical in the transcript to a genuinely wedged turn. That
-      // ambiguity is real, but it belongs to the SILENT-IN-FLIGHT branch, not
-      // this one. This branch is reached only when there is NO post-anchor turn
-      // record at all, re-established on every one of the nudge cycles that
-      // preceded exhaustion. So the two indistinguishable causes cannot reach
-      // here.
-      //
-      // Note the fragility explicitly: this rests on opencode creating the
-      // assistant-message shell BEFORE the provider call, which is an upstream
-      // implementation detail; if that changed, a parked retry could start
-      // appearing in this branch.
+        if (isSuppressedFromRecovery(row)) {
+          this.storage.alerts.enqueue({
+            source: "wake-nudge-exhausted",
+            refMsgId: row.msgId,
+            text: formatWakePayloadAlert(
+              row,
+              `${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but no turn was confirmed to have read it`,
+              "delivery watchdog: wake unverified after nudges exhausted",
+            ),
+            severity: "error",
+            now,
+          });
+        }
 
-      if (isSuppressedFromRecovery(row)) {
-        const alertText = formatWakePayloadAlert(
-          row,
-          `${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
-          "delivery watchdog: wake unverified after nudges exhausted",
-        );
-        await this.alert("error", alertText);
-      } else {
-        await this.alert(
-          "error",
-          `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
-        );
-        // We only get here from the anchor-present branch, and we have re-read
-        // the transcript on every one of those cycles.
-        notifySenderOfFailure(this.storage, row, reason, now, "present");
+        if (row.fromSession !== row.toSession) {
+          notifySenderOfFailure(this.storage, row, reason, now, "present");
+        }
+      })();
+
+      if (!marked) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "nudge-row-no-longer-handed-off",
+        });
+        return false;
       }
 
+      if (!isSuppressedFromRecovery(row)) {
+        await this.alert(
+          "error",
+          `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but no turn was confirmed to have read it`,
+        );
+      }
+
+      counts.terminal++;
+      this.pruneDedupe(row.msgId);
       this.log("terminal", {
         msgId: row.msgId,
         sessionId,
@@ -1145,7 +1183,9 @@ export class DeliveryWatchdog {
     // transcript, do NOT resend" -- which keying this on handedOffAt would do
     // -- would strand the message permanently and talk the sender out of the
     // only action that could recover it.
-    notifySenderOfFailure(this.storage, row, reason, now, "absent");
+    if (row.fromSession !== row.toSession) {
+      notifySenderOfFailure(this.storage, row, reason, now, "absent");
+    }
     this.log("terminal", { msgId: row.msgId, sessionId, reason });
     return true;
   }

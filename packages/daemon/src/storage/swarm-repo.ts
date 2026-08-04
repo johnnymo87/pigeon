@@ -342,6 +342,22 @@ export class SwarmRepository {
   }
 
   /**
+   * Returns true if there is an undelivered (`state = 'queued'`) nudge message
+   * in response to `msgId`. Used by the watchdog to prevent minting new nudges
+   * before a previous nudge has actually been handed off.
+   */
+  hasQueuedNudge(msgId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM swarm_messages
+         WHERE reply_to = ? AND kind = ? AND state = 'queued'
+         LIMIT 1`,
+      )
+      .get(msgId, NUDGE_KIND);
+    return row !== undefined;
+  }
+
+  /**
    * Records that the watchdog has fired its one allowed abort for this
    * message. First-write-wins: a message can only be aborted once, so a
    * second call is a no-op that leaves the original timestamp untouched.
@@ -412,7 +428,14 @@ export class SwarmRepository {
   }
 
   /**
-   * Fetch delivered (handed-off) messages for a session.
+   * Fetch inbox messages for a session.
+   *
+   * Selects on the structural property "this payload provably reached your transcript":
+   * includes rows currently `state = 'handed_off'` OR rows previously handed off
+   * (`handed_off_at IS NOT NULL`), even if they later moved to `failed` (e.g. via nudge
+   * exhaustion). This ensures an agent reading a nudge instructing it to call `swarm_read`
+   * can fetch the payload even after nudge exhaustion marked the row failed. Rows that failed
+   * BEFORE handoff (`handed_off_at IS NULL`) never reached the target transcript and are excluded.
    *
    * Messages are ALWAYS returned in ascending msg_id order (chronological,
    * oldest-first) regardless of paging direction, because every consumer —
@@ -437,7 +460,7 @@ export class SwarmRepository {
     const { since = null, before = null, limit } = opts;
     const hasLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0;
 
-    const conds = ["to_session = ?", "state = 'handed_off'"];
+    const conds = ["to_session = ?", "(state = 'handed_off' OR handed_off_at IS NOT NULL)"];
     const params: Array<string | number> = [toSession];
     if (since !== null) {
       conds.push("msg_id > ?");

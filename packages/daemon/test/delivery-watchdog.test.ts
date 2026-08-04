@@ -8,6 +8,7 @@ import {
   type ClientSet,
   type WatchdogClient,
 } from "../src/swarm/delivery-watchdog";
+import { NUDGE_KIND } from "../src/swarm/delivery-policy";
 
 // ---------------------------------------------------------------------------
 // Transcript builders — mirror opencode's GET /session/:id/message shape.
@@ -404,6 +405,7 @@ describe("DeliveryWatchdog", () => {
       expect(row.nudgeCount).toBe(expected);
       expect(row.state).toBe("handed_off");
       expect(row.requeueCount).toBe(0);
+      storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(tick, NUDGE_KIND);
     }
 
     fixture.setNow(1_900_000);
@@ -1011,6 +1013,7 @@ describe("DeliveryWatchdog", () => {
     for (const t of [4_100_000, 4_500_000, 4_900_000]) {
       fixture.setNow(t);
       await watchdog.processOnce();
+      storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
     }
     expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(3);
     expect(sendPlainAlert).toHaveBeenCalledTimes(1); // nudging is not alert-worthy
@@ -1035,7 +1038,7 @@ describe("DeliveryWatchdog", () => {
 
     insertHandedOff({
       msgId: "wake1",
-      fromSession: "ses_a",
+      fromSession: "ses_b",
       toSession: "ses_b",
       handedOffAt: 0,
       kind: "wake",
@@ -1054,6 +1057,7 @@ describe("DeliveryWatchdog", () => {
       expect(r.state).toBe("handed_off");
       expect(r.requeueCount).toBe(0);
       expect(r.nudgeCount).toBe(expectedNudges);
+      storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(now, NUDGE_KIND);
     }
 
     // Cycle 4: nudge budget exhausted -> marks failed
@@ -1064,11 +1068,12 @@ describe("DeliveryWatchdog", () => {
     expect(row.state).toBe("failed");
     expect(row.requeueCount).toBe(0);
 
-    // Alert fired containing payload text
-    expect(sendPlainAlert).toHaveBeenCalledWith(
-      expect.stringContaining("WAKE_PAYLOAD_TEST_26"),
-      "error",
-    );
+    // Durable alert fired containing payload text
+    const alerts = storage.db
+      .prepare("SELECT * FROM operational_alerts")
+      .all() as Array<Record<string, unknown>>;
+    expect(alerts).toHaveLength(1);
+    expect(String(alerts[0]!.text)).toContain("WAKE_PAYLOAD_TEST_26");
 
     // notifySenderOfFailure was never called -> no delivery.failed notice in storage.
     const notices = storage.db
@@ -1645,8 +1650,11 @@ describe("DeliveryWatchdog", () => {
       await watchdog.processOnce();
 
       expect(storage.swarm.getByMsgId("m_path4_wake")!.state).toBe("failed");
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("m_path4_wake");
       expect(alertText).toContain("ses_b");
       expect(alertText).toContain("check production deployment");
@@ -1996,6 +2004,7 @@ describe("DeliveryWatchdog", () => {
       for (const t of [400_000, 800_000, 1_200_000, 1_600_000, 2_000_000]) {
         fixture.setNow(t);
         await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
       }
 
       // The row never re-entered the queue, so the arbiter never re-rendered
@@ -2144,6 +2153,7 @@ describe("DeliveryWatchdog", () => {
       for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
         fixture.setNow(t);
         await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
       }
 
       expect(storage.swarm.getByMsgId("m1")!.state).toBe("failed");
@@ -2230,18 +2240,21 @@ describe("DeliveryWatchdog", () => {
       expect(wakeRowsInDb).toHaveLength(1);
     });
 
-    it("2. Nudge exhaustion for a SUPPRESSED row: marked failed, alert contains payload text, no sender notice written", async () => {
+    it("2. Nudge exhaustion for a SUPPRESSED row: marked failed, durable alert enqueued, sender notice written ONLY for cross-session", async () => {
       fixture = makeFixture();
-      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
         userMessage(50, `<swarm_message v="1" msg_id="wake_exhaust">`),
+        userMessage(50, `<swarm_message v="1" msg_id="cross_wake_exhaust">`),
       ]);
       clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      // Self-wake: fromSession === toSession
       insertHandedOff({
         msgId: "wake_exhaust",
-        fromSession: "ses_a",
+        fromSession: "ses_b",
         toSession: "ses_b",
         handedOffAt: 0,
         kind: "wake.checkpoint",
@@ -2252,6 +2265,7 @@ describe("DeliveryWatchdog", () => {
       for (const t of [400_000, 800_000, 1_200_000]) {
         fixture.setNow(t);
         await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
       }
 
       const rowBefore = storage.swarm.getByMsgId("wake_exhaust")!;
@@ -2265,20 +2279,46 @@ describe("DeliveryWatchdog", () => {
       const rowAfter = storage.swarm.getByMsgId("wake_exhaust")!;
       expect(rowAfter.state).toBe("failed");
 
-      // Assert alert text contains payload content and prefix
-      expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
-      const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
-      expect(severity).toBe("error");
+      // Assert durable alert enqueued with payload text and softened wording
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      const alertText = String(alerts[0]!.text);
+      expect(String(alerts[0]!.severity)).toBe("error");
       expect(alertText).toContain("delivery watchdog: wake unverified after nudges exhausted");
       expect(alertText).toContain("wake_exhaust");
       expect(alertText).toContain("CRITICAL_CHECKPOINT_DATA_TO_VERIFY");
-      expect(alertText).toContain("payload IS in the transcript but was never read");
+      expect(alertText).toContain("payload IS in the transcript but no turn was confirmed to have read it");
 
-      // Assert NO notifySenderOfFailure notice was written
-      const notices = storage.db
+      // Assert NO notifySenderOfFailure notice was written for self-wake
+      const noticesSelf = storage.db
         .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
         .all();
-      expect(notices).toHaveLength(0);
+      expect(noticesSelf).toHaveLength(0);
+
+      // Now test cross-session wake: fromSession !== toSession
+      insertHandedOff({
+        msgId: "cross_wake_exhaust",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake.checkpoint",
+        payload: "CROSS_SESSION_WAKE_PAYLOAD",
+      });
+
+      for (const t of [2_000_000, 2_400_000, 2_800_000, 3_200_000, 3_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
+      }
+
+      expect(storage.swarm.getByMsgId("cross_wake_exhaust")!.state).toBe("failed");
+      const noticesCross = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed' AND reply_to = 'cross_wake_exhaust'")
+        .all() as Array<Record<string, unknown>>;
+      expect(noticesCross).toHaveLength(1);
+      expect(noticesCross[0]!.to_session).toBe("ses_a");
     });
 
     it("3. Nudge exhaustion for an ORDINARY row: marked failed, alert fired, sender notice IS written with evidence 'present'", async () => {
@@ -2302,6 +2342,7 @@ describe("DeliveryWatchdog", () => {
       for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
         fixture.setNow(t);
         await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
       }
 
       const row = storage.swarm.getByMsgId("chat_exhaust")!;
@@ -2310,7 +2351,7 @@ describe("DeliveryWatchdog", () => {
       expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
       const [alertText] = sendPlainAlert.mock.calls[0]!;
       expect(alertText).toContain("chat_exhaust");
-      expect(alertText).toContain("payload IS in the transcript but was never read");
+      expect(alertText).toContain("payload IS in the transcript but no turn was confirmed to have read it");
 
       // Sender notice IS written
       const notices = storage.db
@@ -2414,9 +2455,40 @@ describe("DeliveryWatchdog", () => {
       expect(sendPlainAlert).not.toHaveBeenCalled();
     });
 
+    it("6b. same-millisecond in-flight zero-part assistant shell is treated as silent-in-flight (not nudged, not failed)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_same_ms">`),
+        assistantMessage({ created: 50, completed: null, parts: [] }), // in-flight turn created at EXACT SAME ms as anchor
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_same_ms",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake",
+      });
+
+      // Run multiple cycles up to maxNudges threshold
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      const row = storage.swarm.getByMsgId("wake_same_ms")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.nudgeCount).toBe(0);
+      expect(row.requeueCount).toBe(0);
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
     it("7. no alert text produced anywhere in idle path contains string 'expected for idle target'", async () => {
       fixture = makeFixture();
-      const { watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+      const { watchdog, clientMap, insertHandedOff, sendPlainAlert, storage } = fixture;
 
       const client = makeClient();
       client.getSessionMessages.mockResolvedValue([
@@ -2436,13 +2508,69 @@ describe("DeliveryWatchdog", () => {
       for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
         fixture.setNow(t);
         await watchdog.processOnce();
+        storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
       }
 
-      // Collect all alerts sent
+      // Collect all alerts sent or enqueued (Fix 7: assert alerts were actually produced)
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      const totalAlerts = alerts.length + sendPlainAlert.mock.calls.length;
+      expect(totalAlerts).toBeGreaterThanOrEqual(1);
+
+      for (const alert of alerts) {
+        expect(String(alert.text)).not.toContain("expected for idle target");
+      }
       for (const call of sendPlainAlert.mock.calls) {
         const text = call[0];
         expect(text).not.toContain("expected for idle target");
       }
+    });
+
+    it("8. Fix 5: nudge budget does not advance if previous nudge is still queued", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="wake_queued_nudge">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "wake_queued_nudge",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "wake",
+      });
+
+      // Cycle 1: mints first nudge (nudgeCount -> 1)
+      fixture.setNow(400_000);
+      await watchdog.processOnce();
+      let row = storage.swarm.getByMsgId("wake_queued_nudge")!;
+      expect(row.nudgeCount).toBe(1);
+
+      // Do NOT deliver the nudge (it remains queued in DB).
+      // Cycle 2: watchdog should skip because previous nudge is still queued.
+      fixture.setNow(800_000);
+      const summary2 = await watchdog.processOnce();
+      expect(summary2.skipped).toBe(1);
+      row = storage.swarm.getByMsgId("wake_queued_nudge")!;
+      expect(row.nudgeCount).toBe(1); // unchanged!
+      expect(row.state).toBe("handed_off"); // not marked failed!
+
+      // Now simulate arbiter delivering the nudge (state -> handed_off).
+      const queuedNudges = storage.db
+        .prepare("SELECT msg_id FROM swarm_messages WHERE reply_to = ? AND kind = ? AND state = 'queued'")
+        .all("wake_queued_nudge", NUDGE_KIND) as Array<{ msg_id: string }>;
+      expect(queuedNudges).toHaveLength(1);
+      storage.swarm.markHandedOff(queuedNudges[0]!.msg_id, 850_000);
+
+      // Cycle 3: now that previous nudge is handed off, watchdog mints nudge 2 (nudgeCount -> 2).
+      fixture.setNow(1_200_000);
+      await watchdog.processOnce();
+      row = storage.swarm.getByMsgId("wake_queued_nudge")!;
+      expect(row.nudgeCount).toBe(2);
     });
   });
 });
