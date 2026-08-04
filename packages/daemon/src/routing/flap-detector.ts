@@ -363,6 +363,7 @@ export class FlapDetector {
   private readonly machineId: string | undefined;
 
   private lastAlertAt: number | null = null;
+  private lastAlertedEventId: number | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private summaryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -383,6 +384,18 @@ export class FlapDetector {
     this.alertCooldownMs = opts.alertCooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
     this.retentionMs = opts.retentionMs ?? DEFAULT_RETENTION_MS;
     this.machineId = opts.machineId;
+
+    try {
+      const state = this.reassignments.getAlertState();
+      this.lastAlertAt = state.lastAlertAt;
+      this.lastAlertedEventId = state.lastAlertedEventId;
+    } catch (err) {
+      this.log("failed to load flap alert state", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.lastAlertAt = null;
+      this.lastAlertedEventId = null;
+    }
   }
 
   async tick(): Promise<FlapVerdict> {
@@ -411,9 +424,19 @@ export class FlapDetector {
 
       const cooling =
         this.lastAlertAt !== null && now - this.lastAlertAt < this.alertCooldownMs;
-      if (!cooling) {
+      const latestEventId = this.reassignments.latestEventId();
+      const hasNewEvidence =
+        latestEventId !== null &&
+        (this.lastAlertedEventId === null || latestEventId > this.lastAlertedEventId);
+
+      if (!cooling && hasNewEvidence) {
         this.lastAlertAt = now;
-        await this.alert(verdict);
+        this.persistAlertState();
+        const sent = await this.alert(verdict);
+        if (sent) {
+          this.lastAlertedEventId = latestEventId;
+          this.persistAlertState();
+        }
       }
     }
 
@@ -464,6 +487,19 @@ export class FlapDetector {
     });
   }
 
+  private persistAlertState(): void {
+    try {
+      this.reassignments.setAlertState({
+        lastAlertedEventId: this.lastAlertedEventId,
+        lastAlertAt: this.lastAlertAt,
+      });
+    } catch (err) {
+      this.log("failed to persist flap alert state", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private prune(now: number): void {
     try {
       this.reassignments.pruneBefore(now - this.retentionMs);
@@ -474,9 +510,9 @@ export class FlapDetector {
     }
   }
 
-  private async alert(v: FlapVerdict): Promise<void> {
+  private async alert(v: FlapVerdict): Promise<boolean> {
     if (!this.notifier?.sendPlainAlert) {
-      return;
+      return true;
     }
     const text = renderFlapAlert(v, {
       now: this.nowFn(),
@@ -490,10 +526,12 @@ export class FlapDetector {
 
     try {
       await this.notifier.sendPlainAlert(text, "error");
+      return true;
     } catch (err) {
       this.log("flap alert send failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 

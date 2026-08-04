@@ -273,7 +273,7 @@ describe("FlapDetector", () => {
     expect(sendPlainAlert).toHaveBeenCalledTimes(1);
   });
 
-  it("alerts again once the cooldown has elapsed", async () => {
+  it("suppresses a repeat alert inside cooldown even when new moves arrive", async () => {
     const r = repo();
     thrash(r);
     let now = T0;
@@ -289,10 +289,210 @@ describe("FlapDetector", () => {
     });
 
     await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    // New move arrives, but clock is inside cooldown (1 minute later)
+    now = T0 + 60_000;
+    move(r, "ses_stuck", now - 1, 10);
+    await d.tick();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-alert after the cooldown when no new move has occurred", async () => {
+    const r = repo();
+    thrash(r);
+    let now = T0;
+    const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
     now = T0 + 11 * 60 * 1000;
     await d.tick();
 
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it("alerts again after cooldown when new move HAS occurred", async () => {
+    const r = repo();
+    thrash(r);
+    let now = T0;
+    const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    now = T0 + 11 * 60 * 1000;
+    move(r, "ses_stuck", now - 1, 10);
+    await d.tick();
+
     expect(sendPlainAlert).toHaveBeenCalledTimes(2);
+  });
+
+  it("latched slow-burn with no new moves does not re-alert across 21 hours of ticks", async () => {
+    const r = repo();
+    // 8 moves spread over hours up to T0 (qualifying slow-burn)
+    for (let i = 0; i < 8; i++) {
+      move(r, "ses_slow", T0 - (20 - i) * 3600_000, i + 2);
+    }
+    let now = T0;
+    const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 30 * 60 * 1000,
+    });
+
+    await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    // Tick every 30 minutes for 21 hours (42 ticks) with NO new moves
+    for (let tick = 0; tick < 42; tick++) {
+      now += 30 * 60 * 1000;
+      await d.tick();
+    }
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists alert state across detector instances (restart survival)", async () => {
+    const r = repo();
+    thrash(r);
+    let now = T0;
+    const sendPlainAlert1 = vi.fn().mockResolvedValue(undefined);
+    const d1 = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert: sendPlainAlert1 },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d1.tick();
+    expect(sendPlainAlert1).toHaveBeenCalledTimes(1);
+
+    // Discard d1, simulate daemon restart by constructing new FlapDetector over same repo
+    now = T0 + 11 * 60 * 1000; // Cooldown expired, but NO new moves
+    const sendPlainAlert2 = vi.fn().mockResolvedValue(undefined);
+    const d2 = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert: sendPlainAlert2 },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d2.tick();
+    expect(sendPlainAlert2).not.toHaveBeenCalled();
+  });
+
+  it("does not advance event watermark if alert delivery fails", async () => {
+    const r = repo();
+    thrash(r);
+    let now = T0;
+    const sendPlainAlert = vi.fn().mockRejectedValueOnce(new Error("telegram down"));
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert },
+      log: vi.fn(),
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+
+    // Delivery failed: watermark must NOT have advanced, though lastAlertAt was updated
+    const stateAfterFail = r.getAlertState();
+    expect(stateAfterFail.lastAlertedEventId).toBeNull();
+    expect(stateAfterFail.lastAlertAt).toBe(T0);
+
+    // Cooldown expires, no new moves added. Next send succeeds.
+    now = T0 + 11 * 60 * 1000;
+    sendPlainAlert.mockResolvedValueOnce(undefined);
+    await d.tick();
+
+    expect(sendPlainAlert).toHaveBeenCalledTimes(2);
+    const stateAfterSuccess = r.getAlertState();
+    expect(stateAfterSuccess.lastAlertedEventId).toBe(r.latestEventId());
+    expect(stateAfterSuccess.lastAlertAt).toBe(now);
+  });
+
+  it("logs flapping detection even when delivery is suppressed by new-evidence gate", async () => {
+    const r = repo();
+    thrash(r);
+    let now = T0;
+    const log = vi.fn();
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert: vi.fn().mockResolvedValue(undefined) },
+      log,
+      nowFn: () => now,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+      alertCooldownMs: 10 * 60 * 1000,
+    });
+
+    await d.tick();
+    log.mockClear();
+
+    // Advance past cooldown with no new moves (suppressed by gate)
+    now = T0 + 11 * 60 * 1000;
+    await d.tick();
+
+    const flapLogs = log.mock.calls.filter((call) =>
+      String(call[0]).includes("serve reassignment flapping detected"),
+    );
+    expect(flapLogs.length).toBe(1);
+  });
+
+  it("alerts on first qualifying tick with null lastAlertedEventId in fresh DB", async () => {
+    const r = repo();
+    expect(r.getAlertState()).toEqual({ lastAlertedEventId: null, lastAlertAt: null });
+
+    thrash(r);
+    const sendPlainAlert = vi.fn().mockResolvedValue(undefined);
+    const d = new FlapDetector({
+      reassignments: r,
+      notifier: { sendPlainAlert },
+      log: vi.fn(),
+      nowFn: () => T0,
+      windowMs: WINDOW,
+      perSessionMoves: 5,
+    });
+
+    await d.tick();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect(r.getAlertState().lastAlertedEventId).toBe(r.latestEventId());
   });
 
   it("logs the detection even while the alert is cooling down", async () => {
