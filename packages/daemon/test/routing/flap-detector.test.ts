@@ -93,7 +93,7 @@ describe("evaluateFlapping", () => {
     const v = evaluateFlapping(r, T0, TH());
 
     expect(v.flapping).toBe(true);
-    expect(v.worst[0]).toEqual({ sessionId: "ses_stuck", moves: 5 });
+    expect(v.worst[0]).toEqual({ sessionId: "ses_stuck", moves: 5, lastMoveAt: T0 - 1_000 + 4 });
   });
 
   it("does not fire one move below the threshold", () => {

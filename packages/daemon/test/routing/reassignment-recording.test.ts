@@ -62,7 +62,7 @@ describe("reassignment recording", () => {
     expect(s.reassignments.countSince(0)).toBe(1);
 
     const top = s.reassignments.topSessionsSince(0, 5);
-    expect(top).toEqual([{ sessionId: "ses_x", moves: 1 }]);
+    expect(top).toEqual([{ sessionId: "ses_x", moves: 1, lastMoveAt: now + 1 }]);
 
     const row = s.db
       .prepare("SELECT session_id, from_serve_id, to_serve_id, owner_generation FROM reassignment_event")
