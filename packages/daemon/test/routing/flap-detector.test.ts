@@ -34,7 +34,10 @@ import {
 import {
   evaluateFlapping,
   FlapDetector,
+  formatRecency,
+  renderFlapAlert,
   type FlapThresholds,
+  type FlapVerdict,
 } from "../../src/routing/flap-detector";
 
 const T0 = 1_700_000_000_000;
@@ -130,7 +133,7 @@ describe("evaluateFlapping", () => {
 
     expect(v.flapping).toBe(true);
     expect(v.reasons).toEqual(["slow-burn"]);
-    expect(v.slowBurnWorstMoves).toBe(20);
+    expect(v.slowBurnWorst[0]?.moves).toBe(20);
   });
 
   it("keeps the slow-burn arm restart-invariant", () => {
@@ -378,5 +381,166 @@ describe("FlapDetector", () => {
     await d.tick();
 
     expect(r.countSince(0)).toBe(1);
+  });
+});
+
+describe("formatRecency", () => {
+  it("formats minutes, hours, and days correctly at boundaries", () => {
+    expect(formatRecency(0)).toBe("<1m ago");
+    expect(formatRecency(59_999)).toBe("<1m ago");
+    expect(formatRecency(60_000)).toBe("1m ago");
+    expect(formatRecency(43 * 60_000)).toBe("43m ago");
+    expect(formatRecency(59 * 60_000 + 59_000)).toBe("59m ago");
+    expect(formatRecency(60 * 60_000)).toBe("1h ago");
+    expect(formatRecency(17 * 3_600_000)).toBe("17h ago");
+    expect(formatRecency(23 * 3_600_000 + 59 * 60_000)).toBe("23h ago");
+    expect(formatRecency(24 * 3_600_000)).toBe("1d ago");
+    expect(formatRecency(2 * 86_400_000)).toBe("2d ago");
+  });
+});
+
+describe("renderFlapAlert", () => {
+  const defaultOpts = {
+    now: T0,
+    machineId: "devbox",
+    perSessionMoves: 5,
+    breadthSessions: 10,
+    breadthMovesEach: 3,
+    slowBurnMoves: 8,
+    slowBurnWindowMs: DAY,
+  };
+
+  it("renders burst-only verdict with burst arm name, session id, move count, and 15m window", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["burst"],
+      windowMs: WINDOW,
+      totalMoves: 6,
+      distinctSessions: 1,
+      breadthSessions: 0,
+      slowBurnWorst: [],
+      worst: [{ sessionId: "ses_burst", moves: 6, lastMoveAt: T0 }],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).toContain("burst");
+    expect(text).toContain("ses_burst");
+    expect(text).toContain("6x");
+    expect(text).toContain("15m");
+  });
+
+  it("renders breadth-only verdict with breadth arm name and threshold shape (10x3)", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["breadth"],
+      windowMs: WINDOW,
+      totalMoves: 30,
+      distinctSessions: 10,
+      breadthSessions: 10,
+      slowBurnWorst: [],
+      worst: [{ sessionId: "ses_0", moves: 3, lastMoveAt: T0 }],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).toContain("breadth");
+    expect(text).toContain("10x3");
+  });
+
+  it("renders slow-burn-only verdict with slow-burn arm name, 24h session id, count, 24h window, and last move recency", () => {
+    const lastMoveAt = T0 - 17 * 60 * 60 * 1000; // 17 hours ago
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["slow-burn"],
+      windowMs: WINDOW,
+      totalMoves: 0,
+      distinctSessions: 0,
+      breadthSessions: 0,
+      slowBurnWorst: [{ sessionId: "ses_slow", moves: 8, lastMoveAt }],
+      worst: [],
+    };
+    const text = renderFlapAlert(v, { ...defaultOpts, machineId: "cloudbox" });
+    expect(text).toContain("slow-burn");
+    expect(text).toContain("ses_slow");
+    expect(text).toContain("8x");
+    expect(text).toContain("24h");
+    expect(text).toContain("17h ago");
+  });
+
+  it("renders both burst and slow-burn sections when both fire together", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["burst", "slow-burn"],
+      windowMs: WINDOW,
+      totalMoves: 10,
+      distinctSessions: 2,
+      breadthSessions: 0,
+      slowBurnWorst: [{ sessionId: "ses_slow", moves: 9, lastMoveAt: T0 - 2 * 3600 * 1000 }],
+      worst: [{ sessionId: "ses_fast", moves: 6, lastMoveAt: T0 - 1000 }],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).toContain("burst");
+    expect(text).toContain("slow-burn");
+    expect(text).toContain("ses_fast");
+    expect(text).toContain("ses_slow");
+  });
+
+  it("quotes the firing arm's threshold in provisional note", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["slow-burn"],
+      windowMs: WINDOW,
+      totalMoves: 0,
+      distinctSessions: 0,
+      breadthSessions: 0,
+      slowBurnWorst: [{ sessionId: "ses_slow", moves: 8, lastMoveAt: T0 - 1000 }],
+      worst: [],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).toContain("8 moves/session/24h");
+  });
+
+  it("does not contain '()' or present 0 moves as incident description for slow-burn verdict (production bug shape)", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["slow-burn"],
+      windowMs: WINDOW,
+      totalMoves: 0,
+      distinctSessions: 0,
+      breadthSessions: 0,
+      slowBurnWorst: [{ sessionId: "ses_slow", moves: 8, lastMoveAt: T0 - 17 * 3600 * 1000 }],
+      worst: [],
+    };
+    const text = renderFlapAlert(v, { ...defaultOpts, machineId: "cloudbox" });
+    expect(text).not.toContain("()");
+    expect(text).toContain("Fleet context (last 15m): 0 moves across 0 sessions");
+  });
+
+  it("burst-only body does not mention the 24h window", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["burst"],
+      windowMs: WINDOW,
+      totalMoves: 6,
+      distinctSessions: 1,
+      breadthSessions: 0,
+      slowBurnWorst: [],
+      worst: [{ sessionId: "ses_burst", moves: 6, lastMoveAt: T0 }],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).not.toContain("24h");
+  });
+
+  it("produces explicit bug marker naming the arm when slow-burn fires with empty slowBurnWorst", () => {
+    const v: FlapVerdict = {
+      flapping: true,
+      reasons: ["slow-burn"],
+      windowMs: WINDOW,
+      totalMoves: 0,
+      distinctSessions: 0,
+      breadthSessions: 0,
+      slowBurnWorst: [],
+      worst: [],
+    };
+    const text = renderFlapAlert(v, defaultOpts);
+    expect(text).toContain("BUG: the slow-burn arm fired with an empty session list");
+    expect(text).not.toContain("()");
   });
 });
