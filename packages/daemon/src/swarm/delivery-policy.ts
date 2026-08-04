@@ -117,12 +117,22 @@ export const NUDGE_KIND = "swarm.nudge";
 export function formatNudgePayload(
   original: Pick<SwarmMessageRecord, "msgId" | "fromSession">,
 ): string {
+  // NOTE the deliberately non-attribute rendering of the id below. Writing it
+  // as msg_id="..." would make this nudge byte-match findAnchor's needle, so
+  // the delivered nudge would register as an ANCHOR for the original message.
+  // That silently breaks findAnchor's premise (attribute-form matches appear
+  // only in a row's own envelope) and, if the original were ever removed from
+  // the transcript, would let a surviving nudge fabricate an anchor and keep
+  // the watchdog asserting that a vanished payload "is in the transcript".
   return (
     `You have an UNREAD swarm message earlier in this conversation: ` +
-    `msg_id="${original.msgId}" from ${original.fromSession}. ` +
+    `message id ${original.msgId}, from ${original.fromSession}. ` +
     `It was delivered into your transcript but no turn was ever started for ` +
     `it, so you may never have acted on it. Scroll back, find that envelope, ` +
     `and handle it now. ` +
+    `If you cannot find it — a compaction may have dropped it out of your ` +
+    `context — call swarm_read to fetch it, rather than assuming it was ` +
+    `nothing. ` +
     `If you have ALREADY handled it, do nothing further — this nudge is ` +
     `automatic and does not mean your earlier work was lost.`
   );

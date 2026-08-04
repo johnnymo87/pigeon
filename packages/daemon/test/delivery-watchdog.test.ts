@@ -364,6 +364,17 @@ describe("DeliveryWatchdog", () => {
       .all() as Array<Record<string, unknown>>;
     expect(notices).toHaveLength(1);
     expect(notices[0]!.to_session).toBe("ses_a");
+
+    // The payload was observed ABSENT on every cycle, so the notice must tell
+    // the sender to resend. Keying this on handedOffAt (which IS set here)
+    // would emit "the payload IS in the transcript, do NOT resend" and strand
+    // the message forever -- the same lie as pigeon-3m5, inverted. This
+    // assertion is the guard: the bug hid precisely because the old version of
+    // this test checked that a notice existed but never read its text.
+    const text = String(notices[0]!.payload);
+    expect(text).toContain("was never delivered and was NOT received");
+    expect(text).toContain("safe to resend");
+    expect(text).not.toContain("Do NOT resend");
   });
 
   it("8. idle-never-ran: NUDGES (never requeues, never aborts); bounded terminal on nudge exhaustion", async () => {
@@ -1276,16 +1287,19 @@ describe("DeliveryWatchdog", () => {
     expect(row.requeueCount).toBe(0);
   });
 
-  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
+  it("33. a historic wake row carrying aborted_at is left alone (no abort, no terminal)", async () => {
+    // Was two near-identical tests, both named "33", both pinned to a guard at
+    // a line number that no longer exists. The guard they described (skip
+    // recovery when abortedAt is set) is gone with the abort path; what still
+    // matters is that a row left over from that era is handled calmly.
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
     const client = makeClient();
-    const stuckTranscript = [
+    client.getSessionMessages.mockImplementation(async () => [
       assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
       userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
-    ];
-    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    ]);
     clientMap.set("ses_b", { preferred: client, all: [client] });
 
     insertHandedOff({
@@ -1295,49 +1309,17 @@ describe("DeliveryWatchdog", () => {
       handedOffAt: 0,
       kind: "wake",
     });
-
-    // Simulate: a prior cycle somehow marked aborted_at
     storage.swarm.markAborted("wake_aborted", 100_000);
 
-    fixture.setNow(600_000); // eligible again
-    await watchdog.processOnce();
+    for (const t of [600_000, 4_000_000]) {
+      fixture.setNow(t);
+      await watchdog.processOnce();
+    }
 
     expect(client.abortSession).not.toHaveBeenCalled();
     const row = storage.swarm.getByMsgId("wake_aborted")!;
     expect(row.state).toBe("handed_off");
-  });
-
-  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
-    fixture = makeFixture();
-    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
-
-    const client = makeClient();
-    const stuckTranscript = [
-      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
-      userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
-    ];
-    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
-    clientMap.set("ses_b", { preferred: client, all: [client] });
-
-    insertHandedOff({
-      msgId: "wake_aborted",
-      fromSession: "ses_a",
-      toSession: "ses_b",
-      handedOffAt: 0,
-      kind: "wake",
-    });
-
-    // Pre-set abortedAt to simulate previous abort attempt
-    storage.db
-      .prepare("UPDATE swarm_messages SET aborted_at = 500_000 WHERE msg_id = ?")
-      .run("wake_aborted");
-
-    fixture.setNow(4_000_000);
-    await watchdog.processOnce();
-
-    const row = storage.swarm.getByMsgId("wake_aborted")!;
-    expect(row.state).toBe("handed_off");
-    expect(client.abortSession).not.toHaveBeenCalled();
+    expect(row.nudgeCount).toBe(0); // wake + blocked: no recovery of any kind
   });
 
   it("34. Minor 1: requeueOrTerminal only counts requeued when requeueForRecovery succeeds", async () => {
@@ -2040,6 +2022,9 @@ describe("DeliveryWatchdog", () => {
       expect(nudge.state).toBe("queued"); // the arbiter will deliver it
       // It names the original so the agent can find it...
       expect(String(nudge.payload)).toContain("m1");
+      // ...but NOT in attribute form, which would make the nudge itself match
+      // findAnchor's needle and register as an anchor for the original.
+      expect(String(nudge.payload)).not.toContain('msg_id="m1"');
       // ...but must NOT restate the payload, or we are back to two copies.
       expect(String(nudge.payload)).not.toContain("SECRET-ORIGINAL-PAYLOAD");
     });
@@ -2096,22 +2081,37 @@ describe("DeliveryWatchdog", () => {
       expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(0);
     });
 
-    it("3m5-5: the two failure notices are cut on handedOffAt, and only the never-delivered one says NOT received", () => {
+    it("3m5-5: the failure notice is cut on OBSERVED evidence, not on handedOffAt", () => {
+      // A handed-off row whose payload we watched NOT arrive must still be
+      // reported as resendable. This is the case that handedOffAt gets wrong.
+      const absentButHandedOff = formatFailureNotice(
+        { msgId: "m1", handedOffAt: 123 },
+        "ses_b",
+        "delivery write repeatedly lost",
+        "absent",
+      );
+      expect(absentButHandedOff).toContain("was never delivered");
+      expect(absentButHandedOff).toContain("safe to resend");
+      expect(absentButHandedOff).not.toContain("Do NOT resend");
+
+      const present = formatFailureNotice(
+        { msgId: "m1", handedOffAt: 123 },
+        "ses_b",
+        "why",
+        "present",
+      );
+      expect(present).toContain("DELIVERY UNCONFIRMED");
+      expect(present).not.toContain("was NOT received");
+      expect(present).toContain("Do NOT resend");
+
+      // Unobserved falls back to handedOffAt, the best signal available when
+      // nobody ever managed to read the transcript.
       expect(
         formatFailureNotice({ msgId: "m1", handedOffAt: null }, "ses_b", "why"),
       ).toContain("was never delivered and was NOT received");
       expect(
-        formatFailureNotice({ msgId: "m1", handedOffAt: null }, "ses_b", "why"),
-      ).toContain("safe to resend");
-
-      const unconfirmed = formatFailureNotice(
-        { msgId: "m1", handedOffAt: 123 },
-        "ses_b",
-        "why",
-      );
-      expect(unconfirmed).toContain("DELIVERY UNCONFIRMED");
-      expect(unconfirmed).not.toContain("was NOT received");
-      expect(unconfirmed).toContain("Do NOT resend");
+        formatFailureNotice({ msgId: "m1", handedOffAt: 9 }, "ses_b", "why"),
+      ).toContain("DELIVERY UNCONFIRMED");
     });
 
     it("3m5-6: terminal report for a handed-off row says UNCONFIRMED and warns against resending", async () => {

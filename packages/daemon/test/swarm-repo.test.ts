@@ -181,13 +181,14 @@ describe("SwarmRepository", () => {
   });
 
   describe("delivery verification columns", () => {
-    it("fresh DB has verified_at, requeue_count, aborted_at columns", () => {
+    it("fresh DB has verified_at, requeue_count, aborted_at, nudge_count columns", () => {
       const s = createStorage();
       const cols = s.db.pragma("table_info(swarm_messages)") as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain("verified_at");
       expect(names).toContain("requeue_count");
       expect(names).toContain("aborted_at");
+      expect(names).toContain("nudge_count");
 
       s.swarm.insert(BASE, 1_000);
       const m = s.swarm.getByMsgId("msg_01h1");
@@ -840,6 +841,9 @@ describe("swarm_messages verification column migration", () => {
     expect(names).toContain("verified_at");
     expect(names).toContain("requeue_count");
     expect(names).toContain("aborted_at");
+    // Present because CREATE TABLE lists it -- which is what this test's name
+    // claims. It was briefly true only via the swallow-everything ALTER loop.
+    expect(names).toContain("nudge_count");
     db.close();
   });
 
@@ -857,6 +861,7 @@ describe("swarm_messages verification column migration", () => {
     const names = cols.map((c) => c.name);
     expect(names).toContain("requeue_count");
     expect(names).toContain("aborted_at");
+    expect(names).toContain("nudge_count");
     db.close();
   });
 

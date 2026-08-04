@@ -26,7 +26,8 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       deliver_at INTEGER,
       expires_at INTEGER,
       cancelled_at INTEGER,
-      ref TEXT
+      ref TEXT,
+      nudge_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state

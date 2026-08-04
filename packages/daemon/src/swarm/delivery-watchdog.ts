@@ -21,11 +21,13 @@ export interface WatchdogClient {
 
 /**
  * Result of resolving the healthy opencode-serve clients relevant to a
- * session. `preferred` is used for the primary transcript read (and the
- * TOCTOU re-read before acting); `all` is the full healthy set, used for
- * second-opinion reads (a different client than `preferred`) and for
- * broadcasting an abort. Either may be empty/undefined when no healthy serve
- * is currently known for the session.
+ * session. `preferred` is used for the primary transcript read; `all` is the
+ * full healthy set, used for second-opinion reads (a different client than
+ * `preferred`). Either may be empty/undefined when no healthy serve is
+ * currently known for the session.
+ *
+ * `all` used to exist to broadcast aborts as well. Nothing broadcasts aborts
+ * any more (pigeon-0gxy); it is now purely a read facility.
  */
 export interface ClientSet {
   preferred: WatchdogClient | undefined;
@@ -52,7 +54,11 @@ export const DEFAULT_WATCHDOG_INTERVAL_MS = 60_000;
 export const DEFAULT_VERIFY_AFTER_MS = 300_000;
 /** STUCK_ALERT_MS */
 export const DEFAULT_STUCK_ALERT_MS = 900_000;
-/** STUCK_ABORT_SILENCE_MS */
+/**
+ * STUCK_ABORT_SILENCE_MS. Historical name: nothing aborts any more
+ * (pigeon-0gxy). It now only sets how long a blocking turn must be silent
+ * before the stuck alert labels it SILENT rather than ACTIVE.
+ */
 export const DEFAULT_STUCK_ABORT_SILENCE_MS = 3_600_000;
 /** MAX_REQUEUES */
 export const DEFAULT_MAX_REQUEUES = 3;
@@ -91,6 +97,8 @@ export interface CycleSummary {
   /** Nudges sent this cycle (recovery that did NOT re-inject a payload). */
   nudged: number;
   alerted: number;
+  /** Always 0 since R3 removed the abort path; retained so existing log and
+   *  metrics consumers do not break on a missing field. */
   aborted: number;
   terminal: number;
   skipped: number;
@@ -511,13 +519,15 @@ export class DeliveryWatchdog {
    * (b) it goes terminal, or (c) its `state` moves away from `handed_off`
    * (redelivery via `requeueForRecovery`, which resets `handed_off_at` on
    * the next `markHandedOff`). Paths (a) and (b) already call
-   * `pruneDedupe` explicitly. Path (c) currently does NOT prune explicitly
-   * on a successful abort+requeue — but that's fine (arguably correct):
-   * the row is temporarily absent from the eligible set only for the brief
-   * window between the abort's requeue and the arbiter's redelivery, and
-   * per the class-level doc comment a fresh redelivery is meant to get its
-   * own alert budget anyway, so reconciling it away here just makes that
-   * intent actually happen.
+   * `pruneDedupe` explicitly. Path (c) does NOT prune explicitly — but
+   * that's fine (arguably correct): the row is temporarily absent from the
+   * eligible set only for the window between the requeue and the arbiter's
+   * redelivery, and per the class-level doc comment a fresh redelivery is
+   * meant to get its own alert budget anyway, so reconciling it away here
+   * just makes that intent actually happen.
+   *
+   * Note that a NUDGE does not take path (c): the row stays `handed_off`
+   * throughout, so it keeps its dedupe entry and its alert budget.
    *
     * The remaining case — and the bug this exists to fix — is the row being
     * deleted out from under us without ever resolving through (a) or (b).
@@ -682,10 +692,8 @@ export class DeliveryWatchdog {
         if (second.ok) {
           // Contradicted — the "gone" serve was wrong. Proceed with the
           // second opinion's transcript, and adopt `alt` as the read client
-          // for the rest of this session's processing (the TOCTOU refetch
-          // in attemptAbort included) — otherwise every subsequent refetch
-          // keeps hitting the 404-ing client and abort escalation stalls
-          // forever via "toctou-refetch-failed".
+          // for the rest of this session's processing — otherwise every
+          // subsequent read keeps hitting the 404-ing client.
           messages = second.messages;
           readClient = alt;
         } else if (second.status === 404) {
@@ -702,11 +710,16 @@ export class DeliveryWatchdog {
                 )
               : `delivery watchdog: session ${sessionId} no longer exists on opencode-serve; msg ${row.msgId} cannot be verified — marking failed`;
             await this.alert("error", alertText);
+            // The session itself is gone, so whatever we wrote went with it.
+            // "absent" is the honest reading: there is no transcript left for
+            // the payload to be sitting in, and a resend to a live session is
+            // the sender's only route.
             notifySenderOfFailure(
               this.storage,
               row,
               `session ${sessionId} no longer exists`,
               now,
+              "absent",
             );
             this.log("terminal", {
               msgId: row.msgId,
@@ -1019,7 +1032,9 @@ export class DeliveryWatchdog {
         "error",
         `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (${row.nudgeCount} nudges exhausted); payload IS in the transcript but was never read`,
       );
-      notifySenderOfFailure(this.storage, row, reason, now);
+      // We only get here from the anchor-present branch, and we have re-read
+      // the transcript on every one of those cycles.
+      notifySenderOfFailure(this.storage, row, reason, now, "present");
       this.log("terminal", {
         msgId: row.msgId,
         sessionId,
@@ -1064,6 +1079,12 @@ export class DeliveryWatchdog {
     return true;
   }
 
+  /**
+   * Recovery for a row whose payload is NOT in the target transcript: the 2xx
+   * lied (or the write was lost). This is the ONE case where re-sending the
+   * whole envelope is correct rather than duplicative, because there is no
+   * first copy to duplicate. Reached only from the `anchor === null` branch.
+   */
   private async requeueOrTerminal(
     row: SwarmMessageRecord,
     sessionId: string,
@@ -1098,7 +1119,12 @@ export class DeliveryWatchdog {
       "error",
       `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason} (max requeues exhausted)`,
     );
-    notifySenderOfFailure(this.storage, row, reason, now);
+    // We have now read the transcript on every cycle that got us here and our
+    // envelope was absent every time. Telling the sender "it IS in the
+    // transcript, do NOT resend" -- which keying this on handedOffAt would do
+    // -- would strand the message permanently and talk the sender out of the
+    // only action that could recover it.
+    notifySenderOfFailure(this.storage, row, reason, now, "absent");
     this.log("terminal", { msgId: row.msgId, sessionId, reason });
     return true;
   }

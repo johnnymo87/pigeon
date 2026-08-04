@@ -8,27 +8,40 @@ import { makeMsgId } from "../ids";
 export const DELIVERY_FAILED_KIND = "delivery.failed";
 
 /**
+ * What we actually OBSERVED about the payload in the target's transcript at
+ * the moment we gave up. This is the discriminator for the sender-facing
+ * notice, and it must be an observation rather than an inference.
+ *
+ *   "absent"      we read the transcript and our envelope is NOT in it
+ *   "present"     we read the transcript and our envelope IS in it
+ *   "unobserved"  we never got a usable look (delivery failed before handoff,
+ *                 or the transcript was unreadable)
+ */
+export type DeliveryEvidence = "absent" | "present" | "unobserved";
+
+/**
  * The sender-facing failure taxonomy. It is cut along what is actually
- * OBSERVABLE, not along what we suspect happened, because the sender acts on
- * this text and the wrong verb makes them do the wrong thing.
+ * OBSERVABLE, because the sender acts on this text and the wrong verb makes
+ * them do the wrong thing -- in either direction:
  *
- * `handed_off_at` is the discriminator, and it is a real structural fact: the
- * arbiter sets it only after `prompt_async` returned 2xx, and opencode writes
- * the user message into the target transcript before anything else can go
- * wrong (see pigeon-usbg). So:
+ *   NOT RECEIVED       tells them to resend. Wrong when the payload is
+ *                      sitting in the target's transcript: they duplicate it.
+ *                      This was the pigeon-3m5 complaint.
+ *   DO NOT RESEND      tells them to stop. Wrong when the payload never
+ *                      landed: the message is stranded forever and the sender
+ *                      has been talked out of the one action that would fix
+ *                      it. This is the strictly WORSE error of the two.
  *
- *   handedOffAt === null  NEVER_DELIVERED       nothing was ever written into
- *                                               the target. Safe to resend.
- *   handedOffAt !== null  DELIVERED_UNCONFIRMED the payload IS in the target's
- *                                               transcript and will be in the
- *                                               context of its next turn. We
- *                                               could not confirm it was READ.
- *                                               Resending duplicates it.
+ * So the cut is on observed `evidence`, NOT on `handedOffAt`. handedOffAt only
+ * records that `prompt_async` returned 2xx, and we know exactly what that is
+ * worth: "a fiber was forked", nothing more (pigeon-usbg). The watchdog has a
+ * whole branch for handed-off rows whose payload is provably NOT in the
+ * transcript -- its own comment there reads "the 2xx lied". Keying the notice
+ * on handedOffAt would make that branch tell the sender the opposite of what
+ * the watchdog just observed four times over.
  *
- * The old text said "could not be delivered and was NOT received" for BOTH,
- * which is a flat lie in the second case and the one that pigeon-3m5 was
- * filed for: it invites the sender to resend a message the target already
- * holds, compounding the duplication the watchdog just worked to avoid.
+ * `unobserved` falls back to handedOffAt, which is the best available signal
+ * when nobody ever managed to read the transcript.
  *
  * Note what is deliberately ABSENT: a "dropped because the target was busy"
  * category. That is an inference, not an observation -- the transcript cannot
@@ -40,8 +53,15 @@ export function formatFailureNotice(
   failed: Pick<SwarmMessageRecord, "msgId" | "handedOffAt">,
   target: string,
   reason: string,
+  evidence: DeliveryEvidence = "unobserved",
 ): string {
-  if (failed.handedOffAt === null) {
+  const landed =
+    evidence === "present"
+      ? true
+      : evidence === "absent"
+        ? false
+        : failed.handedOffAt !== null;
+  if (!landed) {
     return (
       `DELIVERY FAILED: your swarm message ${failed.msgId} to ${target} ` +
       `was never delivered and was NOT received. Reason: ${reason}. ` +
@@ -72,6 +92,7 @@ export function notifySenderOfFailure(
   failed: SwarmMessageRecord,
   reason: string,
   now: number,
+  evidence: DeliveryEvidence = "unobserved",
 ): void {
   // Loop guard: a failed delivery.failed notification must not spawn another.
   if (failed.kind === DELIVERY_FAILED_KIND) return;
@@ -81,7 +102,7 @@ export function notifySenderOfFailure(
   if (!/^ses_[A-Za-z0-9_-]+$/.test(failed.fromSession)) return;
 
   const target = failed.toSession ?? failed.channel ?? "(unknown target)";
-  const payload = formatFailureNotice(failed, target, reason);
+  const payload = formatFailureNotice(failed, target, reason, evidence);
   storage.swarm.insert(
     {
       msgId: makeMsgId(),
