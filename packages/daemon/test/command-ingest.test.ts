@@ -3540,3 +3540,293 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
     storage.db.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// W2e (pigeon-k4c.4): a callback payload whose SHAPE disagrees with the pending
+// question's arity is provably stale/foreign and must never be resolved by
+// positional index.
+//
+// The two renderers are a bijection:
+//   - notification-service.ts:178-187 emits legacy `q{i}`, guarded on
+//     `questions.length === 1`
+//   - notification-service.ts:241-250 emits `v{version}:q{i}` and is the ONLY
+//     producer of the v-form
+// so shape disagreeing with arity proves the press came from a DIFFERENT render
+// than the row now pending.
+// ---------------------------------------------------------------------------
+describe("W2e: option-token shape must match the pending question's arity", () => {
+  function makeStorage(sessionId: string) {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, now);
+    return { storage, now };
+  }
+
+  const singleQuestion = [{
+    question: "Deploy to production?",
+    header: "Deploy",
+    options: [
+      { label: "Yes, deploy", description: "" },
+      { label: "No, abort", description: "" },
+    ],
+  }];
+
+  const twoQuestions = [
+    { question: "Q1", header: "H1", options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+    { question: "Q2", header: "H2", options: [{ label: "X", description: "" }, { label: "Y", description: "" }] },
+  ];
+
+  // THE CRUX. This is the case the originally-proposed fix ("apply the version
+  // guard whenever wizardMatch is present") does NOT catch: every row is stored
+  // with version 0 (repos.ts:385) and a wizard's first step renders v0
+  // (app.ts:816), so `incomingVersion !== pendingQuestion.version` is 0 !== 0
+  // = false and the stale press slips straight through.
+  it("refuses a stale v0 wizard press against a fresh single question (the version guard cannot see this)", async () => {
+    const { storage, now } = makeStorage("sess-w2e-1");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2e-1",
+      requestId: "req-fresh-single",
+      questions: singleQuestion,
+      token: "tok-w2e-1",
+    }, now);
+
+    // sanity: the row really is at version 0, same as the incoming payload
+    expect(storage.pendingQuestions.getBySessionId("sess-w2e-1")!.version).toBe(0);
+
+    let capturedReply: QuestionReplyInput | null = null;
+    let sentTelegramText: string | null = null;
+
+    await ingestWorkerCommand(
+      storage,
+      // no metadata: the metadata-less routes (typed `/cmd TOKEN v0:q0`,
+      // topic-routed text, and any pre-#46 daemon) are exactly where the
+      // requestId identity check at :173 cannot help.
+      makeMsg({ commandId: "cmd-w2e-1", sessionId: "sess-w2e-1", command: "v0:q0", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply(_s: unknown, reply: QuestionReplyInput) {
+            capturedReply = reply;
+            return { ok: true as const };
+          },
+        }),
+        sendTelegramReply: async (_chatId, text) => { sentTelegramText = text; },
+      },
+    );
+
+    // MUST NOT answer "Yes, deploy" to a question the user never read
+    expect(capturedReply).toBeNull();
+    // and MUST NOT be silent about it
+    expect(sentTelegramText).not.toBeNull();
+    // Exact equality, not a substring: a substring assertion cannot see a bogus
+    // echo tail appended to the message (a mutant that passed `""` to the
+    // formatter survived a `toContain` check).
+    expect(sentTelegramText).toBe(
+      "That option doesn't belong to the question that's open now, so it wasn't recorded. Use the buttons on the latest question above.",
+    );
+    // the raw token is not echoed back as if it were the user's words
+    expect(sentTelegramText!).not.toContain("v0:q0");
+    // and it must NOT claim the question was replaced -- for a shape mismatch
+    // that is not necessarily true
+    expect(sentTelegramText!).not.toContain("replaced by a newer one");
+    // pending row survives, so the real keyboard still works
+    expect(storage.pendingQuestions.getBySessionId("sess-w2e-1")).not.toBeNull();
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  // The symmetric case, which the bead did not report. A legacy payload carries
+  // NO version at all, so no version-based guard could ever defend this one.
+  it("refuses a stale legacy press against a pending wizard (no version exists to check)", async () => {
+    const { storage, now } = makeStorage("sess-w2e-2");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2e-2",
+      requestId: "req-wizard",
+      questions: twoQuestions,
+      token: "tok-w2e-2",
+    }, now);
+
+    let capturedReply: QuestionReplyInput | null = null;
+    let sentTelegramText: string | null = null;
+    let editCalled = false;
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-w2e-2", sessionId: "sess-w2e-2", command: "q1", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply(_s: unknown, reply: QuestionReplyInput) {
+            capturedReply = reply;
+            return { ok: true as const };
+          },
+        }),
+        editNotification: async () => { editCalled = true; return { ok: true }; },
+        sendTelegramReply: async (_chatId, text) => { sentTelegramText = text; },
+      },
+    );
+
+    expect(capturedReply).toBeNull();
+    // must not have advanced the wizard either
+    expect(editCalled).toBe(false);
+    const row = storage.pendingQuestions.getBySessionId("sess-w2e-2")!;
+    expect(row.currentStep).toBe(0);
+    expect(row.answers).toEqual([]);
+    expect(row.version).toBe(0);
+    expect(sentTelegramText).not.toBeNull();
+    expect(sentTelegramText).toBe(
+      "That option doesn't belong to the question that's open now, so it wasn't recorded. Use the buttons on the latest question above.",
+    );
+    expect(sentTelegramText!).not.toContain("q1");
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  // Guard against over-triggering: free text must still reach the question, and
+  // it must not be mistaken for a shape mismatch just because a wizard is up.
+  it("still accepts a free-text answer for a single question", async () => {
+    const { storage, now } = makeStorage("sess-w2e-3a");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2e-3a", requestId: "r3a", questions: singleQuestion, token: "t3a",
+    }, now);
+
+    let reply: QuestionReplyInput | null = null;
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "c3a", sessionId: "sess-w2e-3a", command: "some custom answer", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "no" }; },
+          async deliverQuestionReply(_s: unknown, r: QuestionReplyInput) { reply = r; return { ok: true as const }; },
+        }),
+      },
+    );
+    expect(reply).not.toBeNull();
+    expect(reply!.answers).toEqual([["some custom answer"]]);
+    storage.db.close();
+  });
+
+  // Free text against a wizard advances a step rather than delivering, so the
+  // guard must not mistake "no option token" for a shape mismatch.
+  it("still accepts a free-text answer for a wizard step", async () => {
+    const { storage, now } = makeStorage("sess-w2e-3b");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2e-3b", requestId: "r3b", questions: twoQuestions, token: "t3b",
+    }, now);
+
+    let sentTelegramText: string | null = null;
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "c3b", sessionId: "sess-w2e-3b", command: "another custom answer", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "no" }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        editNotification: async () => ({ ok: true }),
+        sendTelegramReply: async (_c, text) => { sentTelegramText = text; },
+      },
+    );
+    const row = storage.pendingQuestions.getBySessionId("sess-w2e-3b")!;
+    expect(row.currentStep).toBe(1);
+    expect(row.answers).toEqual([["another custom answer"]]);
+    expect(sentTelegramText).toBeNull();
+    storage.db.close();
+  });
+
+  // Matching shapes must be untouched by this guard.
+  it("still accepts a legacy press for a single question and a v-press for a wizard", async () => {
+    const { storage: s1, now: n1 } = makeStorage("sess-w2e-4a");
+    s1.pendingQuestions.store({
+      sessionId: "sess-w2e-4a", requestId: "r4a", questions: singleQuestion, token: "t4a",
+    }, n1);
+    let reply1: QuestionReplyInput | null = null;
+    await ingestWorkerCommand(
+      s1,
+      makeMsg({ commandId: "c4a", sessionId: "sess-w2e-4a", command: "q0", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "no" }; },
+          async deliverQuestionReply(_s: unknown, r: QuestionReplyInput) { reply1 = r; return { ok: true as const }; },
+        }),
+      },
+    );
+    expect(reply1).not.toBeNull();
+    expect(reply1!.answers).toEqual([["Yes, deploy"]]);
+    s1.db.close();
+
+    const { storage: s2, now: n2 } = makeStorage("sess-w2e-4b");
+    s2.pendingQuestions.store({
+      sessionId: "sess-w2e-4b", requestId: "r4b", questions: twoQuestions, token: "t4b",
+    }, n2);
+    await ingestWorkerCommand(
+      s2,
+      makeMsg({ commandId: "c4b", sessionId: "sess-w2e-4b", command: "v0:q1", chatId: "1" }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "no" }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        editNotification: async () => ({ ok: true }),
+      },
+    );
+    const advanced = s2.pendingQuestions.getBySessionId("sess-w2e-4b")!;
+    expect(advanced.currentStep).toBe(1);
+    expect(advanced.answers).toEqual([["B"]]);
+    s2.db.close();
+  });
+
+  // Ordering pin: when the worker DOES supply identity, that check must win, so
+  // this guard is genuinely defense-in-depth rather than a competing path.
+  it("lets the requestId identity check win when metadata is present", async () => {
+    const { storage, now } = makeStorage("sess-w2e-5");
+    storage.pendingQuestions.store({
+      sessionId: "sess-w2e-5", requestId: "req-current", questions: singleQuestion, token: "t5",
+    }, now);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    let sentTelegramText: string | null = null;
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "c5", sessionId: "sess-w2e-5", command: "v0:q0", chatId: "1",
+        metadata: { questionRequestId: "req-stale" },
+      }),
+      {
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() { return { ok: false, error: "no" }; },
+          async deliverQuestionReply() { return { ok: true as const }; },
+        }),
+        sendTelegramReply: async (_c, text) => { sentTelegramText = text; },
+      },
+    );
+    spy.mockRestore();
+
+    expect(sentTelegramText).not.toBeNull();
+    // the identity check's message, NOT the shape guard's -- proves ordering
+    expect(sentTelegramText!).toContain("replaced by a newer one");
+    expect(sentTelegramText!).not.toContain("doesn't belong to the question");
+    // the identity check logs "metadata mismatched"; the shape guard does not
+    expect(warns.some(w => w.includes("metadata mismatched"))).toBe(true);
+    expect(warns.some(w => w.includes("shape does not match"))).toBe(false);
+    storage.db.close();
+  });
+});
