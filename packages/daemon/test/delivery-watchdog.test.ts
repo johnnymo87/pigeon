@@ -22,6 +22,7 @@ function userMessage(created: number, text: string): unknown {
 }
 
 function assistantMessage(opts: {
+  id?: string;
   created: number;
   completed?: number | null;
   error?: unknown;
@@ -30,7 +31,7 @@ function assistantMessage(opts: {
   const time: Record<string, number> = { created: opts.created };
   if (typeof opts.completed === "number") time.completed = opts.completed;
   return {
-    info: { role: "assistant", time, error: opts.error },
+    info: { id: opts.id, role: "assistant", time, error: opts.error },
     parts: opts.parts ?? [],
   };
 }
@@ -2493,6 +2494,7 @@ describe("DeliveryWatchdog", () => {
       // it is exactly what we want for a row we cannot resolve. What must
       // never happen is a state change, asserted above. Pin that the alert is
       // advisory (it reports a turn producing no output) and never terminal.
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
       const alertTexts = sendPlainAlert.mock.calls.map((c) => String(c[0]));
       for (const text of alertTexts) {
         expect(text).toContain("in-flight turn produces no output");
@@ -2791,8 +2793,8 @@ describe("DeliveryWatchdog", () => {
       expect(sendPlainAlert).toHaveBeenCalledTimes(1);
       const [text] = sendPlainAlert.mock.calls[0]!;
       expect(text).toContain(missingDir);
-      expect(text).toContain("no longer exists");
-      expect(text).toContain("cannot proceed");
+      expect(text).toContain("not found on daemon filesystem");
+      expect(text).toContain("turn cannot proceed");
 
       const row = storage.swarm.getByMsgId("m_missing_dir")!;
       expect(row.state).toBe("handed_off");
@@ -2874,6 +2876,98 @@ describe("DeliveryWatchdog", () => {
       expect(text).not.toContain("working directory exists");
 
       const row = storage.swarm.getByMsgId("m_no_dir_fn")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.nudgeCount).toBe(0);
+      expect(row.requeueCount).toBe(0);
+    });
+
+    it("5d. directoryForSession hang times out, degrades to unresolvable, and cycle completes without state change", async () => {
+      const neverResolvingDir = new Promise<string | undefined>(() => {});
+      const directoryForSession = vi.fn(async () => neverResolvingDir);
+
+      const f = makeFixture({ directoryForSession });
+      const storage = f.storage;
+      const sendPlainAlert = f.sendPlainAlert;
+      const watchdog = new DeliveryWatchdog({
+        storage,
+        resolveClients: f.resolveClients,
+        directoryForSession,
+        notifier: { sendPlainAlert },
+        nowFn: () => f.getNow(),
+        log: () => {},
+        directoryTimeoutMs: 10,
+      });
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_timeout_dir">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }),
+      ]);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      f.insertHandedOff({
+        msgId: "m_timeout_dir",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+
+      f.setNow(2_000_000);
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const [text] = sendPlainAlert.mock.calls[0]!;
+      expect(text).toContain("working directory unresolvable; cannot determine cause");
+
+      const row = storage.swarm.getByMsgId("m_timeout_dir")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.nudgeCount).toBe(0);
+      expect(row.requeueCount).toBe(0);
+
+      watchdog.stop();
+    });
+
+    it("6. turn id changes between cycles at constant part count resets clock and prevents alert", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = f;
+
+      const client = makeClient();
+      let turnId = "turn_1";
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="m_turn_id_change">`),
+        assistantMessage({ id: turnId, created: 100, completed: null, parts: [] }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      insertHandedOff({
+        msgId: "m_turn_id_change",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      // Cycle 1 at t = 1_000_000 (first observation for turn_1)
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+
+      // Cycle 2 at t = 1_500_000 (turn replaces with turn_2, constant part count = 0)
+      turnId = "turn_2";
+      f.setNow(1_500_000);
+      await watchdog.processOnce();
+
+      // Cycle 3 at t = 2_000_000 (silentMs since turn_2 is 500_000 < 900_000 stuckAlertMs)
+      f.setNow(2_000_000);
+      await watchdog.processOnce();
+
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+
+      const row = storage.swarm.getByMsgId("m_turn_id_change")!;
       expect(row.state).toBe("handed_off");
       expect(row.verifiedAt).toBeNull();
       expect(row.nudgeCount).toBe(0);

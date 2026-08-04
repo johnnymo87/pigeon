@@ -68,6 +68,8 @@ export const DEFAULT_MAX_REQUEUES = 3;
 export const DEFAULT_MAX_NUDGES = 3;
 /** OVERDUE_ALERT_MS */
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
+/** DIRECTORY_TIMEOUT_MS */
+export const DEFAULT_DIRECTORY_TIMEOUT_MS = 5_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -91,6 +93,7 @@ export interface DeliveryWatchdogOptions {
    * tune it. Tests use it to drive the clock.
    */
   overdueAlertMs?: number;
+  directoryTimeoutMs?: number;
 }
 
 export interface CycleSummary {
@@ -437,8 +440,10 @@ export class DeliveryWatchdog {
   // Dedupe: msg_id -> the overdue queued alarm has already fired.
   private readonly overdueAlerted = new Set<string>();
   // Dedupe: msg_id -> the silent-in-flight warn has already fired.
+  // Intentional per-episode alert semantics: silentInFlightAlerted is not cleared when
+  // signature changes (only observation clock is reset), matching stuckAlerted until verification/terminal.
   private readonly silentInFlightAlerted = new Set<string>();
-  // Observation clock: msg_id -> { firstSeen: number, signature: string }
+  // Observation clock: msg_id -> { firstSeen: number; signature: string }
   private readonly silentInFlightObserved = new Map<
     string,
     { firstSeen: number; signature: string }
@@ -447,6 +452,7 @@ export class DeliveryWatchdog {
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
   private readonly intervalMs: number;
+  private readonly directoryTimeoutMs: number;
 
   constructor(opts: DeliveryWatchdogOptions) {
     this.storage = opts.storage;
@@ -464,6 +470,8 @@ export class DeliveryWatchdog {
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
     this.maxNudges = opts.maxNudges ?? DEFAULT_MAX_NUDGES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
+    this.directoryTimeoutMs =
+      opts.directoryTimeoutMs ?? DEFAULT_DIRECTORY_TIMEOUT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -946,6 +954,8 @@ export class DeliveryWatchdog {
       if (!observed || observed.signature !== signature) {
         this.silentInFlightObserved.set(row.msgId, { firstSeen: now, signature });
       } else {
+        // Note: If serve was unreachable between observations, silentMs spans unobserved time.
+        // Acceptable for an advisory about the same turn state, but duration is not continuously observed.
         const silentMs = now - observed.firstSeen;
         if (
           silentMs > this.stuckAlertMs &&
@@ -963,17 +973,33 @@ export class DeliveryWatchdog {
           // the state machine.
           let dirText = "working directory unresolvable; cannot determine cause";
           if (this.directoryForSession) {
+            // Bound directory lookup so an unbounded network await does not wedge
+            // the entire watchdog cycle (which would silently kill future cycles
+            // since processing remains true).
+            let timer: ReturnType<typeof setTimeout> | undefined;
             try {
-              const dir = await this.directoryForSession(sessionId);
+              const dirPromise = this.directoryForSession(sessionId);
+              dirPromise.catch(() => {}); // catch late rejections after timeout
+              const timeoutPromise = new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("directoryForSession timeout")),
+                  this.directoryTimeoutMs,
+                );
+                timer.unref?.();
+              });
+
+              const dir = await Promise.race([dirPromise, timeoutPromise]);
               if (dir) {
                 if (existsSync(dir)) {
                   dirText = `working directory exists (${dir}); turn may be parked on a provider retry (cannot distinguish from wedged turn in transcript)`;
                 } else {
-                  dirText = `working directory (${dir}) no longer exists; turn cannot proceed`;
+                  dirText = `working directory (${dir}) not found on daemon filesystem; if daemon and serve share a filesystem, turn cannot proceed — otherwise check is not meaningful here`;
                 }
               }
             } catch {
               dirText = "working directory unresolvable; cannot determine cause";
+            } finally {
+              if (timer !== undefined) clearTimeout(timer);
             }
           }
 
