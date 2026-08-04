@@ -38,7 +38,18 @@ export const SWARM_SEND_MAX_BACKOFF_MS = 8000
 export interface SwarmSendOptions {
   daemonBaseUrl: string // e.g. http://127.0.0.1:4731
   sessionId: string // injected from ToolContext; becomes the message `from`
-  authToken?: string // when set, sent as `Authorization: Bearer <token>`
+  /**
+   * When set, sent as `Authorization: Bearer <token>` and PINNED for the whole
+   * call -- including the 401 re-auth retry, which will re-send this exact
+   * value even after invalidateDaemonToken() has cleared the cache.
+   *
+   * Leave it unset in production. createSwarmSendTool() deliberately does not
+   * pass it (pigeon-iy4: passing it made the one-shot re-auth unreachable, so
+   * every send hard-failed after a token rotation until the plugin reloaded).
+   * It exists for tests that need to force a specific header value; a test
+   * that sets it is NOT exercising the production auth path.
+   */
+  authToken?: string
   fetchFn?: typeof fetch
   /** Injectable sleep (tests pass a no-op recorder). Defaults to setTimeout. */
   sleepFn?: (ms: number) => Promise<void>
@@ -200,7 +211,28 @@ export async function swarmSend(
           return { msg_id: data.msg_id, to: args.to, kind, priority, attempts: attempt }
         }
       } catch (err) {
+        // A rejection here is the network layer, not auth -- and `res` still
+        // holds the original 401, which is NOT transient, so falling through
+        // would throw permanently and blame an auth failure we just cured.
+        // Re-enter the outer loop instead: a token rotation and a daemon
+        // restart are often the same event, and riding out that window is
+        // exactly what the backoff budget is for.
         lastError = err instanceof Error ? err : new Error(String(err))
+        // Give the one-shot back. `authRetried` is meant to record "the daemon
+        // REJECTED a refreshed token, so refreshing again is pointless" -- but
+        // this token never reached the daemon to be judged. The daemon can
+        // start refusing the old token just before the new one lands on disk,
+        // so the re-read above may legitimately still be stale; keeping the
+        // budget spent would strand the send on the next 401. Bounded by
+        // SWARM_SEND_MAX_ATTEMPTS regardless.
+        authRetried = false
+        if (isLast) {
+          throw new Error(
+            `swarm_send failed after ${attempt} attempts (daemon unreachable): ${lastError.message}`,
+          )
+        }
+        await sleepFn(backoffMs(attempt))
+        continue
       }
     }
 
@@ -290,10 +322,16 @@ export function createSwarmSendTool(daemonBaseUrl: string): ToolDefinition {
     },
     async execute(args, ctx) {
       const result = await swarmSend(
+        // Deliberately NOT passing authToken: swarmSend resolves the token
+        // itself, which is all a snapshot here ever did. Passing one pinned
+        // the value for the whole call, so the 401 re-auth retry's
+        // `opts.authToken ?? resolveDaemonToken()` re-sent the same dead token
+        // after invalidateDaemonToken() had already cleared the cache --
+        // making the one-shot re-auth unreachable from the real entry point
+        // (pigeon-iy4). swarm-tool.ts does the same thing for swarm_read.
         {
           daemonBaseUrl,
           sessionId: ctx.sessionID,
-          authToken: resolveDaemonToken(),
         },
         {
           to: args.to,
