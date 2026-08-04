@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
@@ -67,6 +68,8 @@ export const DEFAULT_MAX_REQUEUES = 3;
 export const DEFAULT_MAX_NUDGES = 3;
 /** OVERDUE_ALERT_MS */
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
+/** DIRECTORY_TIMEOUT_MS */
+export const DEFAULT_DIRECTORY_TIMEOUT_MS = 5_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -74,6 +77,7 @@ const RECOVERY_REQUEUE_DELAY_MS = 5_000;
 export interface DeliveryWatchdogOptions {
   storage: StorageDb;
   resolveClients: ResolveClientsFn;
+  directoryForSession?: (sessionId: string) => Promise<string | undefined>;
   notifier?: DeliveryWatchdogNotifier;
   nowFn?: () => number;
   log?: WatchdogLogger;
@@ -89,6 +93,7 @@ export interface DeliveryWatchdogOptions {
    * tune it. Tests use it to drive the clock.
    */
   overdueAlertMs?: number;
+  directoryTimeoutMs?: number;
 }
 
 export interface CycleSummary {
@@ -148,6 +153,7 @@ function isObject(v: unknown): v is Record<string, unknown> {
 }
 
 interface ParsedMessage {
+  id?: string;
   role: string;
   created: number;
   completed: number | null;
@@ -162,6 +168,7 @@ function parseMessage(raw: unknown): ParsedMessage | null {
   const role = info.role;
   if (typeof role !== "string") return null;
 
+  const id = typeof info.id === "string" ? info.id : undefined;
   const time = info.time;
   const created =
     isObject(time) && typeof time.created === "number" ? time.created : 0;
@@ -170,7 +177,7 @@ function parseMessage(raw: unknown): ParsedMessage | null {
   const hasError = info.error !== undefined && info.error !== null;
   const parts = Array.isArray(raw.parts) ? raw.parts : [];
 
-  return { role, created, completed, hasError, parts };
+  return { id, role, created, completed, hasError, parts };
 }
 
 function messageText(msg: ParsedMessage): string {
@@ -411,6 +418,9 @@ async function fetchTranscript(
 export class DeliveryWatchdog {
   private readonly storage: StorageDb;
   private readonly resolveClients: ResolveClientsFn;
+  private readonly directoryForSession:
+    | ((sessionId: string) => Promise<string | undefined>)
+    | undefined;
   private readonly notifier: DeliveryWatchdogNotifier | undefined;
   private readonly nowFn: () => number;
   private readonly log: WatchdogLogger;
@@ -429,14 +439,25 @@ export class DeliveryWatchdog {
   private readonly ageAlarmed = new Set<string>();
   // Dedupe: msg_id -> the overdue queued alarm has already fired.
   private readonly overdueAlerted = new Set<string>();
+  // Dedupe: msg_id -> the silent-in-flight warn has already fired.
+  // Intentional per-episode alert semantics: silentInFlightAlerted is not cleared when
+  // signature changes (only observation clock is reset), matching stuckAlerted until verification/terminal.
+  private readonly silentInFlightAlerted = new Set<string>();
+  // Observation clock: msg_id -> { firstSeen: number; signature: string }
+  private readonly silentInFlightObserved = new Map<
+    string,
+    { firstSeen: number; signature: string }
+  >();
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
   private readonly intervalMs: number;
+  private readonly directoryTimeoutMs: number;
 
   constructor(opts: DeliveryWatchdogOptions) {
     this.storage = opts.storage;
     this.resolveClients = opts.resolveClients;
+    this.directoryForSession = opts.directoryForSession;
     this.notifier = opts.notifier;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
@@ -449,6 +470,8 @@ export class DeliveryWatchdog {
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
     this.maxNudges = opts.maxNudges ?? DEFAULT_MAX_NUDGES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
+    this.directoryTimeoutMs =
+      opts.directoryTimeoutMs ?? DEFAULT_DIRECTORY_TIMEOUT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -498,6 +521,8 @@ export class DeliveryWatchdog {
     this.stuckAlerted.delete(msgId);
     this.ageAlarmed.delete(msgId);
     this.overdueAlerted.delete(msgId);
+    this.silentInFlightAlerted.delete(msgId);
+    this.silentInFlightObserved.delete(msgId);
   }
 
   private reconcileOverdueDedupe(overdueIds: ReadonlySet<string>): void {
@@ -547,6 +572,12 @@ export class DeliveryWatchdog {
     }
     for (const msgId of this.ageAlarmed) {
       if (!eligibleIds.has(msgId)) this.ageAlarmed.delete(msgId);
+    }
+    for (const msgId of this.silentInFlightAlerted) {
+      if (!eligibleIds.has(msgId)) this.silentInFlightAlerted.delete(msgId);
+    }
+    for (const msgId of Array.from(this.silentInFlightObserved.keys())) {
+      if (!eligibleIds.has(msgId)) this.silentInFlightObserved.delete(msgId);
     }
   }
 
@@ -910,6 +941,92 @@ export class DeliveryWatchdog {
     // prompt_async is not idempotent.
     const silent = findSilentInFlight(messages, anchor);
     if (silent) {
+      // Task 1: One-shot escalation alert for long-silent in-flight rows.
+      // Clock starts from OUR FIRST OBSERVATION (now), not from turn's created timestamp.
+      // Signature records the turn's observed state (turn ID/created timestamp + part count).
+      // Note: A parked retry (e.g. 429) is also unchanged across observations, so this signature
+      // check does NOT separate wedged turns from parked retries — it only avoids shouting
+      // about turns that are visibly progressing.
+      const turnId = silent.id ?? String(silent.created);
+      const signature = `${turnId}:${silent.parts.length}`;
+      const observed = this.silentInFlightObserved.get(row.msgId);
+
+      if (!observed || observed.signature !== signature) {
+        this.silentInFlightObserved.set(row.msgId, { firstSeen: now, signature });
+      } else {
+        // Note: If serve was unreachable between observations, silentMs spans unobserved time.
+        // Acceptable for an advisory about the same turn state, but duration is not continuously observed.
+        const silentMs = now - observed.firstSeen;
+        if (
+          silentMs > this.stuckAlertMs &&
+          !this.silentInFlightAlerted.has(row.msgId)
+        ) {
+          this.silentInFlightAlerted.add(row.msgId);
+          counts.alerted++;
+
+          // Task 2: Working-directory corroboration.
+          // CRITICAL: This directory check is for human alert text corroboration ONLY.
+          // Under no circumstances may a missing directory trigger a state change,
+          // a markFailed, or a requeue. It assumes the daemon and the serve share a
+          // filesystem (true on this host, not structural), and it assumes gone-now
+          // implies gone-when-the-turn-parked. It is evidence for a human, not for
+          // the state machine.
+          let dirText = "working directory unresolvable; cannot determine cause";
+          if (this.directoryForSession) {
+            // Bound directory lookup so an unbounded network await does not wedge
+            // the entire watchdog cycle (which would silently kill future cycles
+            // since processing remains true).
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const dirPromise = this.directoryForSession(sessionId);
+              dirPromise.catch(() => {}); // catch late rejections after timeout
+              const timeoutPromise = new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("directoryForSession timeout")),
+                  this.directoryTimeoutMs,
+                );
+                timer.unref?.();
+              });
+
+              const dir = await Promise.race([dirPromise, timeoutPromise]);
+              if (dir) {
+                if (existsSync(dir)) {
+                  dirText = `working directory exists (${dir}); turn may be parked on a provider retry (cannot distinguish from wedged turn in transcript)`;
+                } else {
+                  dirText = `working directory (${dir}) not found on daemon filesystem; if daemon and serve share a filesystem, turn cannot proceed — otherwise check is not meaningful here`;
+                }
+              }
+            } catch {
+              dirText = "working directory unresolvable; cannot determine cause";
+            } finally {
+              if (timer !== undefined) clearTimeout(timer);
+            }
+          }
+
+          // Task 1: Send via EPHEMERAL alert path (this.alert), NOT durable storage.alerts.enqueue.
+          // Reason: the durable substrate's dedupe index is UNIQUE on ref_msg_id alone,
+          // so an early ADVISORY alert would permanently block a later TERMINAL alert for the same row.
+          //
+          // Task 3: REFUSED DESIGN OPTION:
+          // opencode-serve's GET /session/status is INSTANCE-SCOPED by the x-opencode-directory header.
+          // Queried without the correct directory it returns {} for a provably busy session,
+          // and absent means idle by design — so a liveness check built on it FAILS OPEN and silently
+          // becomes a no-op. If it is ever adopted it must send the directory header AND confirm
+          // the serve owns the session, and even then it may only DELAY or SUPPRESS an alert
+          // (failing open into alerting is the safe direction), never justify a terminal.
+          await this.alert(
+            "warning",
+            `delivery watchdog: msg ${row.msgId} to ${sessionId} in-flight turn produces no output — silent for ${humanDuration(silentMs)} (${silentMs}ms); ${dirText}`,
+          );
+          this.log("alerted", {
+            msgId: row.msgId,
+            sessionId,
+            reason: "silent-in-flight",
+            silentForMs: silentMs,
+          });
+        }
+      }
+
       counts.skipped++;
       this.log("skipped", {
         msgId: row.msgId,
@@ -918,6 +1035,9 @@ export class DeliveryWatchdog {
         silentForMs: now - silent.created,
       });
       return false;
+    } else {
+      this.silentInFlightObserved.delete(row.msgId);
+      this.silentInFlightAlerted.delete(row.msgId);
     }
 
     const blocking = findBlockingInFlight(messages, anchor);

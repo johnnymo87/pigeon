@@ -578,6 +578,7 @@ const deliveryWatchdog = (config.opencodeUrl || ingressRouter)
   ? new DeliveryWatchdog({
       storage,
       resolveClients: watchdogResolveClients,
+      directoryForSession,
       notifier,
       intervalMs: config.watchdogIntervalMs,
       verifyAfterMs: config.verifyAfterMs,
