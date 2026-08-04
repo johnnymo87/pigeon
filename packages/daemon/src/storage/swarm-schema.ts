@@ -26,7 +26,8 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       deliver_at INTEGER,
       expires_at INTEGER,
       cancelled_at INTEGER,
-      ref TEXT
+      ref TEXT,
+      nudge_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -59,6 +60,15 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       "ALTER TABLE swarm_messages ADD COLUMN expires_at INTEGER",
       "ALTER TABLE swarm_messages ADD COLUMN cancelled_at INTEGER",
       "ALTER TABLE swarm_messages ADD COLUMN ref TEXT",
+      // Counts NUDGES sent for this row, deliberately separate from
+      // requeue_count. They are different acts with different blast radii: a
+      // requeue re-injects the whole payload (a second copy in the target's
+      // context), a nudge only asks the target to read the copy it already
+      // has. Folding them into one counter would make the audit trail lie
+      // about which of the two happened -- and pigeon-s9d already cost us
+      // 4763 rows that were retroactively unknowable for want of a recorded
+      // reason.
+      "ALTER TABLE swarm_messages ADD COLUMN nudge_count INTEGER NOT NULL DEFAULT 0",
     ];
 
     for (const statement of additiveColumns) {

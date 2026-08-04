@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { formatFailureNotice } from "../src/swarm/notify-sender";
 import {
   DeliveryWatchdog,
   isWakeKind,
@@ -96,6 +97,7 @@ function makeFixture() {
     handedOffAt: number;
     kind?: string;
     deliverAt?: number | null;
+    payload?: string;
   }): void {
     storage.swarm.insert(
       {
@@ -106,7 +108,7 @@ function makeFixture() {
         kind: opts.kind ?? "chat",
         priority: "normal",
         replyTo: null,
-        payload: "payload",
+        payload: opts.payload ?? "payload",
         deliverAt: opts.deliverAt,
       },
       opts.handedOffAt,
@@ -260,9 +262,11 @@ describe("DeliveryWatchdog", () => {
     const row = storage.swarm.getByMsgId("m1")!;
     expect(row.verifiedAt).toBeNull();
     // No in-flight turn at all (the errored assistant already completed) ->
-    // idle-never-ran -> requeue.
-    expect(row.state).toBe("queued");
-    expect(row.requeueCount).toBe(1);
+    // idle-never-ran -> NUDGE. The row stays handed_off and its payload is
+    // never re-injected (pigeon-3m5).
+    expect(row.state).toBe("handed_off");
+    expect(row.requeueCount).toBe(0);
+    expect(row.nudgeCount).toBe(1);
   });
 
   it("5. serving in-flight turn (created > anchor) that has PRODUCED OUTPUT verifies, no alert/abort", async () => {
@@ -360,9 +364,20 @@ describe("DeliveryWatchdog", () => {
       .all() as Array<Record<string, unknown>>;
     expect(notices).toHaveLength(1);
     expect(notices[0]!.to_session).toBe("ses_a");
+
+    // The payload was observed ABSENT on every cycle, so the notice must tell
+    // the sender to resend. Keying this on handedOffAt (which IS set here)
+    // would emit "the payload IS in the transcript, do NOT resend" and strand
+    // the message forever -- the same lie as pigeon-3m5, inverted. This
+    // assertion is the guard: the bug hid precisely because the old version of
+    // this test checked that a notice existed but never read its text.
+    const text = String(notices[0]!.payload);
+    expect(text).toContain("was never delivered and was NOT received");
+    expect(text).toContain("safe to resend");
+    expect(text).not.toContain("Do NOT resend");
   });
 
-  it("8. idle-never-ran: requeue (no abort); bounded terminal on exhaustion", async () => {
+  it("8. idle-never-ran: NUDGES (never requeues, never aborts); bounded terminal on nudge exhaustion", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
 
@@ -375,26 +390,27 @@ describe("DeliveryWatchdog", () => {
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
 
-    fixture.setNow(400_000);
-    await watchdog.processOnce();
-    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(1);
-    expect(client.abortSession).not.toHaveBeenCalled();
+    // Three nudges, then terminal. Crucially the row NEVER leaves handed_off
+    // on the way (a requeue would re-inject the payload) and requeueCount
+    // stays 0 forever.
+    for (const [tick, expected] of [
+      [400_000, 1],
+      [900_000, 2],
+      [1_400_000, 3],
+    ] as const) {
+      fixture.setNow(tick);
+      await watchdog.processOnce();
+      const row = storage.swarm.getByMsgId("m1")!;
+      expect(row.nudgeCount).toBe(expected);
+      expect(row.state).toBe("handed_off");
+      expect(row.requeueCount).toBe(0);
+    }
 
-    storage.swarm.markHandedOff("m1", 500_000);
-    fixture.setNow(900_000);
-    await watchdog.processOnce();
-    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(2);
-
-    storage.swarm.markHandedOff("m1", 1_000_000);
-    fixture.setNow(1_400_000);
-    await watchdog.processOnce();
-    expect(storage.swarm.getByMsgId("m1")!.requeueCount).toBe(3);
-
-    storage.swarm.markHandedOff("m1", 1_500_000);
     fixture.setNow(1_900_000);
     await watchdog.processOnce();
     const row = storage.swarm.getByMsgId("m1")!;
     expect(row.state).toBe("failed");
+    expect(row.requeueCount).toBe(0);
     expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
     expect(client.abortSession).not.toHaveBeenCalled();
   });
@@ -467,7 +483,7 @@ describe("DeliveryWatchdog", () => {
     expect((watchdog as any).stuckAlerted.has("m1")).toBe(false);
   });
 
-  it("11. blocking in-flight past stuckAbortSilenceMs, no aborted_at: TOCTOU refetch then abort+requeue", async () => {
+  it("11. blocking in-flight past stuckAbortSilenceMs: WAITS, never aborts the peer's turn", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
@@ -481,53 +497,61 @@ describe("DeliveryWatchdog", () => {
     clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-    // silence = now - 20, must exceed stuckAbortSilenceMs (3_600_000)
+    // silence = now - 20, far past the old abort threshold (3_600_000).
     fixture.setNow(4_000_000);
 
     await watchdog.processOnce();
 
-    // Initial fetch + TOCTOU refetch, both via the preferred (readClient).
-    expect(clientA.getSessionMessages).toHaveBeenCalledTimes(2);
-    expect(clientA.abortSession).toHaveBeenCalledWith("ses_b");
-    expect(clientB.abortSession).toHaveBeenCalledWith("ses_b");
+    // pigeon-0gxy: the blocking turn is somebody else's work, and opencode's
+    // run loop re-reads the transcript every step, so that turn may be the one
+    // processing our message. We never kill it. No abort, no TOCTOU refetch
+    // (nothing to re-check before acting, because we do not act), no requeue.
+    expect(clientA.getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(clientA.abortSession).not.toHaveBeenCalled();
+    expect(clientB.abortSession).not.toHaveBeenCalled();
 
     const row = storage.swarm.getByMsgId("m1")!;
-    expect(row.abortedAt).toBe(4_000_000);
-    expect(row.state).toBe("queued");
-    expect(row.requeueCount).toBe(1);
+    expect(row.abortedAt).toBeNull();
+    expect(row.state).toBe("handed_off");
+    expect(row.requeueCount).toBe(0);
+    expect(row.nudgeCount).toBe(0); // not nudged either — the target is busy
   });
 
-  it("12. TOCTOU: refetch shows fresh activity -> no abort", async () => {
+  it("12. blocked row is nudged once the blocking turn finishes (delivery still completes without aborting)", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
     const client = makeClient();
-    const staleTranscript = [
+    const blocked = [
       assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
       userMessage(50, `<swarm_message v="1" msg_id="m1">`),
     ];
-    const freshTranscript = [
-      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 3_999_000)] }),
+    const finished = [
+      assistantMessage({ created: 10, completed: 4_100_000, parts: [toolPart(10, 20)] }),
       userMessage(50, `<swarm_message v="1" msg_id="m1">`),
     ];
-    client.getSessionMessages
-      .mockResolvedValueOnce(staleTranscript)
-      .mockResolvedValueOnce(freshTranscript);
+    client.getSessionMessages.mockImplementation(async () => blocked);
     clientMap.set("ses_b", { preferred: client, all: [client] });
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-    fixture.setNow(4_000_000);
 
+    fixture.setNow(4_000_000);
+    await watchdog.processOnce();
+    expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(0); // still blocked
+
+    // The blocker completes (with a pre-anchor created time, so it is not
+    // verification evidence for us). Now the session is idle and we nudge.
+    client.getSessionMessages.mockImplementation(async () => finished);
+    fixture.setNow(4_200_000);
     await watchdog.processOnce();
 
-    expect(client.getSessionMessages).toHaveBeenCalledTimes(2);
-    expect(client.abortSession).not.toHaveBeenCalled();
     const row = storage.swarm.getByMsgId("m1")!;
-    expect(row.abortedAt).toBeNull();
+    expect(row.nudgeCount).toBe(1);
     expect(row.state).toBe("handed_off");
+    expect(client.abortSession).not.toHaveBeenCalled();
   });
 
-  it("13. aborted_at already set + stuck again post-redelivery: markFailed + error alert + sender delivery.failed", async () => {
+  it("13. a historic row with aborted_at set is NOT failed on sight; it waits like any other blocked row", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
 
@@ -539,27 +563,26 @@ describe("DeliveryWatchdog", () => {
     clientMap.set("ses_b", { preferred: client, all: [client] });
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-    // Simulate: a prior cycle already aborted once and requeued.
+    // A row from before R3, when the watchdog still aborted and redelivered.
     storage.swarm.markAborted("m1", 100_000);
-    storage.swarm.requeueForRecovery("m1", 100_000, 5_000);
-    storage.swarm.markHandedOff("m1", 200_000); // arbiter redelivered
+    storage.swarm.markHandedOff("m1", 200_000);
 
-    fixture.setNow(600_000); // eligible again (> verifyAfterMs past 200_000)
+    fixture.setNow(600_000);
 
     await watchdog.processOnce();
 
-    expect(client.getSessionMessages).toHaveBeenCalledTimes(1); // no TOCTOU refetch
     expect(client.abortSession).not.toHaveBeenCalled();
 
+    // The old code marked this failed and told the sender it was NOT received.
+    // Both were wrong: the payload is in the transcript, and a turn is running.
     const row = storage.swarm.getByMsgId("m1")!;
-    expect(row.state).toBe("failed");
-    expect(sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
+    expect(row.state).toBe("handed_off");
+    expect(sendPlainAlert).not.toHaveBeenCalledWith(expect.any(String), "error");
 
     const notices = storage.db
       .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
       .all() as Array<Record<string, unknown>>;
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.to_session).toBe("ses_a");
+    expect(notices).toHaveLength(0);
   });
 
   it("14. 404 handling: confirmed (terminal), contradicted (proceed), 5xx (skip no counter bump)", async () => {
@@ -636,99 +659,36 @@ describe("DeliveryWatchdog", () => {
     }
   });
 
-  it("15. broadcast partial failure sets aborted_at (no repeat abort); all-hard-fail leaves aborted_at unset + alert", async () => {
-    // Scenario A: one 2xx + one 4xx -> aborted_at set; a later stuck-again
-    // cycle goes straight to terminal (no second abort attempt).
-    {
-      const f = makeFixture();
-      const clientA = makeClient();
-      const clientB = makeClient();
-      const stuckTranscript = [
-        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
-        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
-      ];
-      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
-      clientA.abortSession.mockResolvedValue(undefined);
-      clientB.abortSession.mockRejectedValue(new Error("abortSession failed: 403 Forbidden"));
-      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
-      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-      f.setNow(4_000_000);
-
-      await f.watchdog.processOnce();
-
-      let row = f.storage.swarm.getByMsgId("m1")!;
-      expect(row.abortedAt).toBe(4_000_000);
-      expect(row.state).toBe("queued");
-      expect(clientA.abortSession).toHaveBeenCalledTimes(1);
-      expect(clientB.abortSession).toHaveBeenCalledTimes(1);
-
-      // Redeliver and get stuck again — must go straight to terminal, no
-      // second abort broadcast.
-      f.storage.swarm.markHandedOff("m1", 4_100_000);
-      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
-      f.setNow(4_500_000);
-      await f.watchdog.processOnce();
-
-      row = f.storage.swarm.getByMsgId("m1")!;
-      expect(row.state).toBe("failed");
-      expect(clientA.abortSession).toHaveBeenCalledTimes(1); // unchanged
-      expect(clientB.abortSession).toHaveBeenCalledTimes(1); // unchanged
-
-      f.watchdog.stop();
-      f.storage.db.close();
-    }
-
-    // Scenario B: all serves hard-fail -> aborted_at unset, skip + alert.
-    {
-      const f = makeFixture();
-      const clientA = makeClient();
-      const clientB = makeClient();
-      const stuckTranscript = [
-        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
-        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
-      ];
-      clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
-      clientA.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
-      clientB.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
-      f.clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
-      f.insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-      f.setNow(4_000_000);
-
-      await f.watchdog.processOnce();
-
-      const row = f.storage.swarm.getByMsgId("m1")!;
-      expect(row.abortedAt).toBeNull();
-      expect(row.state).toBe("handed_off");
-      expect(f.sendPlainAlert).toHaveBeenCalledWith(expect.any(String), "error");
-
-      f.watchdog.stop();
-      f.storage.db.close();
-    }
-  });
-
-  it("16. abortSession all-fail: no requeue count burn", async () => {
+  it("15. INVARIANT: abortSession is never called, for any row shape, ever (pigeon-0gxy)", async () => {
+    // The abort broadcast, its TOCTOU re-read, its partial-failure handling
+    // and the aborted_at bookkeeping were all deleted in R3. This test stands
+    // where those four tests used to, and asserts the property that replaced
+    // them: pigeon does not touch a peer's running turn to deliver mail.
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
     const clientA = makeClient();
-    const stuckTranscript = [
+    const clientB = makeClient();
+    clientA.getSessionMessages.mockImplementation(async () => [
+      // A turn that has been silent for over an hour — the shape that used to
+      // trigger the abort broadcast.
       assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
       userMessage(50, `<swarm_message v="1" msg_id="m1">`),
-    ];
-    clientA.getSessionMessages.mockImplementation(async () => stuckTranscript);
-    clientA.abortSession.mockRejectedValue(new Error("abortSession failed: 500 Internal"));
-    clientMap.set("ses_b", { preferred: clientA, all: [clientA] });
-
+    ]);
+    clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-    fixture.setNow(4_000_000);
 
-    const before = storage.swarm.getByMsgId("m1")!.requeueCount;
-    await watchdog.processOnce();
-    const after = storage.swarm.getByMsgId("m1")!.requeueCount;
+    for (const t of [4_000_000, 8_000_000, 12_000_000]) {
+      fixture.setNow(t);
+      await watchdog.processOnce();
+    }
 
-    expect(before).toBe(0);
-    expect(after).toBe(0);
-    expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
+    expect(clientA.abortSession).not.toHaveBeenCalled();
+    expect(clientB.abortSession).not.toHaveBeenCalled();
+    const row = storage.swarm.getByMsgId("m1")!;
+    expect(row.abortedAt).toBeNull();
+    expect(row.state).toBe("handed_off");
+    expect(row.requeueCount).toBe(0);
   });
 
   it("17. two stuck rows to one session in one cycle: ONE transcript fetch, ONE intervention", async () => {
@@ -751,12 +711,16 @@ describe("DeliveryWatchdog", () => {
 
     expect(client.getSessionMessages).toHaveBeenCalledTimes(1);
 
+    // Both rows stay handed_off now (a nudge never requeues), so the budget
+    // is visible in nudgeCount rather than in state.
     const m1 = storage.swarm.getByMsgId("m1")!;
     const m2 = storage.swarm.getByMsgId("m2")!;
-    const requeuedCount = [m1, m2].filter((r) => r.state === "queued").length;
-    const untouchedCount = [m1, m2].filter((r) => r.state === "handed_off").length;
-    expect(requeuedCount).toBe(1);
-    expect(untouchedCount).toBe(1);
+    expect(m1.state).toBe("handed_off");
+    expect(m2.state).toBe("handed_off");
+    const nudged = [m1, m2].filter((r) => r.nudgeCount === 1).length;
+    const untouched = [m1, m2].filter((r) => r.nudgeCount === 0).length;
+    expect(nudged).toBe(1);
+    expect(untouched).toBe(1);
   });
 
   it("18. no healthy serve: skipped; unverified > 1h -> age alarm once, pruned on verify", async () => {
@@ -834,7 +798,7 @@ describe("DeliveryWatchdog", () => {
     expect(listSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("20. contradicted 404 second opinion: TOCTOU refetch and abort broadcast use the winning (alt) client", async () => {
+  it("20. contradicted 404 second opinion: the winning (alt) client serves the read", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
@@ -843,32 +807,31 @@ describe("DeliveryWatchdog", () => {
     clientA.getSessionMessages.mockRejectedValue(
       new Error("getSessionMessages failed (404): not found"),
     );
-    const stuckTranscript = [
-      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }), // silent since t=20
+    const idleTranscript = [
       userMessage(50, `<swarm_message v="1" msg_id="m1">`),
     ];
-    clientB.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    clientB.getSessionMessages.mockImplementation(async () => idleTranscript);
     clientMap.set("ses_b", { preferred: clientA, all: [clientA, clientB] });
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
-    // silence = now - 20, must exceed stuckAbortSilenceMs (3_600_000)
     fixture.setNow(4_000_000);
 
     await watchdog.processOnce();
 
     // Preferred (404-ing) client is read exactly once — the initial fetch.
     expect(clientA.getSessionMessages).toHaveBeenCalledTimes(1);
-    // The alt client wins the second opinion AND serves the TOCTOU refetch
-    // that gates the abort — it must NOT go back to the 404-ing preferred.
-    expect(clientB.getSessionMessages).toHaveBeenCalledTimes(2);
+    // The alt client wins the second opinion and its transcript is the one we
+    // act on. With the abort path gone there is no TOCTOU refetch, so this is
+    // a single read rather than two.
+    expect(clientB.getSessionMessages).toHaveBeenCalledTimes(1);
 
-    expect(clientA.abortSession).toHaveBeenCalledWith("ses_b");
-    expect(clientB.abortSession).toHaveBeenCalledWith("ses_b");
+    expect(clientA.abortSession).not.toHaveBeenCalled();
+    expect(clientB.abortSession).not.toHaveBeenCalled();
 
     const row = storage.swarm.getByMsgId("m1")!;
-    expect(row.abortedAt).toBe(4_000_000);
-    expect(row.state).toBe("queued");
-    expect(row.requeueCount).toBe(1);
+    expect(row.abortedAt).toBeNull();
+    expect(row.state).toBe("handed_off");
+    expect(row.nudgeCount).toBe(1);
   });
 
   it("21. 404 with no second-opinion client available: skip, no counter bump", async () => {
@@ -1012,52 +975,50 @@ describe("DeliveryWatchdog", () => {
     storage.db.close();
   });
 
-  it("25. lifecycle alert budget: warn -> abort+redeliver -> stuck again -> terminal fires sendPlainAlert exactly twice (one warn, one error)", async () => {
+  it("25. lifecycle alert budget: warn once while blocked, then one error alert when nudges are exhausted", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
 
     const client = makeClient();
-    const stuckTranscript = [
+    const blockedTranscript = [
       assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }), // silent since t=20
       userMessage(50, `<swarm_message v="1" msg_id="m1">`),
     ];
-    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    const idleTranscript = [userMessage(50, `<swarm_message v="1" msg_id="m1">`)];
+    client.getSessionMessages.mockImplementation(async () => blockedTranscript);
     clientMap.set("ses_b", { preferred: client, all: [client] });
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
 
-    // Episode step 1: past stuckAlertMs but silence still within
-    // stuckAbortSilenceMs -> warn alert fires, no abort.
-    fixture.setNow(1_000_000); // age=1_000_000>900_000; silence=999_980<=3_600_000
+    // Step 1: past stuckAlertMs -> one warn alert, no intervention.
+    fixture.setNow(1_000_000);
     await watchdog.processOnce();
     expect(sendPlainAlert).toHaveBeenCalledTimes(1);
     expect(sendPlainAlert.mock.calls[0]![1]).toBe("warning");
     expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
 
-    // Episode step 2: silence now exceeds stuckAbortSilenceMs -> TOCTOU
-    // refetch confirms still-stuck -> abort broadcast + requeue. No new
-    // alert (the stuck-alert dedupe already fired, and abort success
-    // itself doesn't alert).
-    fixture.setNow(3_700_000); // silence=3_699_980>3_600_000
+    // Step 2: silence now far past the OLD abort threshold. We keep waiting,
+    // and the stuck-alert dedupe means no new alert.
+    fixture.setNow(3_700_000);
     await watchdog.processOnce();
-    let row = storage.swarm.getByMsgId("m1")!;
-    expect(row.abortedAt).toBe(3_700_000);
-    expect(row.state).toBe("queued");
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1); // still just the warn
+    expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
+    expect(storage.swarm.getByMsgId("m1")!.abortedAt).toBeNull();
+    expect(client.abortSession).not.toHaveBeenCalled();
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
 
-    // Simulate the arbiter redelivering the recovered message.
-    storage.swarm.markHandedOff("m1", 3_700_000);
+    // Step 3: the blocker goes away. Now we nudge, up to the budget.
+    client.getSessionMessages.mockImplementation(async () => idleTranscript);
+    for (const t of [4_100_000, 4_500_000, 4_900_000]) {
+      fixture.setNow(t);
+      await watchdog.processOnce();
+    }
+    expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(3);
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1); // nudging is not alert-worthy
 
-    // Episode step 3: eligible again (past verifyAfterMs) and still stuck on
-    // the SAME blocking turn. Because aborted_at is already (permanently)
-    // set, this must go straight to terminal — no second abort attempt —
-    // firing exactly one more (error) alert.
-    fixture.setNow(4_100_000); // age since redelivery = 400_000 > verifyAfterMs(300_000)
+    // Step 4: budget exhausted -> exactly one error alert, and terminal.
+    fixture.setNow(5_300_000);
     await watchdog.processOnce();
-    row = storage.swarm.getByMsgId("m1")!;
-    expect(row.state).toBe("failed");
-    expect(client.abortSession).toHaveBeenCalledTimes(1); // unchanged since step 2 — no second abort attempt
-
+    expect(storage.swarm.getByMsgId("m1")!.state).toBe("failed");
     expect(sendPlainAlert).toHaveBeenCalledTimes(2);
     expect(sendPlainAlert.mock.calls[1]![1]).toBe("error");
   });
@@ -1189,7 +1150,7 @@ describe("DeliveryWatchdog", () => {
     expect(row.state).toBe("handed_off");
   });
 
-  it("30. non-wake kinds (chat, task.assign) retain today's exact behavior (requeued when idle, aborted when stuck)", async () => {
+  it("30. non-wake kinds (chat, task.assign): nudged when idle, left alone when blocked — never requeued, never aborted", async () => {
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
@@ -1223,12 +1184,19 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(4_000_000);
     await watchdog.processOnce();
 
-    expect(storage.swarm.getByMsgId("chat1")!.state).toBe("queued");
-    expect(storage.swarm.getByMsgId("chat1")!.requeueCount).toBe(1);
+    // Idle target: nudged, payload NOT re-injected.
+    const chat = storage.swarm.getByMsgId("chat1")!;
+    expect(chat.state).toBe("handed_off");
+    expect(chat.requeueCount).toBe(0);
+    expect(chat.nudgeCount).toBe(1);
 
-    expect(storage.swarm.getByMsgId("task1")!.state).toBe("queued");
-    expect(storage.swarm.getByMsgId("task1")!.abortedAt).toBe(4_000_000);
-    expect(client2.abortSession).toHaveBeenCalledWith("ses_b2");
+    // Busy target: left strictly alone.
+    const task = storage.swarm.getByMsgId("task1")!;
+    expect(task.state).toBe("handed_off");
+    expect(task.requeueCount).toBe(0);
+    expect(task.nudgeCount).toBe(0);
+    expect(task.abortedAt).toBeNull();
+    expect(client2.abortSession).not.toHaveBeenCalled();
   });
 
   it("31. Major 1: scheduled message with kind='checkpoint' and deliverAt set is suppressed from recovery", async () => {
@@ -1270,15 +1238,20 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(400_000);
     await watchdog.processOnce();
 
-    // Scheduled checkpoint is NOT requeued and NOT aborted
+    // Scheduled checkpoint is NOT recovered at all — not requeued, not
+    // nudged, not aborted.
     const rowSched = storage.swarm.getByMsgId("sched1")!;
     expect(rowSched.state).toBe("handed_off");
     expect(rowSched.requeueCount).toBe(0);
+    expect(rowSched.nudgeCount).toBe(0);
 
-    // Unscheduled chat IS requeued (positive control)
+    // Unscheduled chat IS recovered — by nudge, the positive control that
+    // proves the suppression above is doing the work and the row was
+    // otherwise eligible.
     const rowChat = storage.swarm.getByMsgId("chat_unsched")!;
-    expect(rowChat.state).toBe("queued");
-    expect(rowChat.requeueCount).toBe(1);
+    expect(rowChat.state).toBe("handed_off");
+    expect(rowChat.nudgeCount).toBe(1);
+    expect(rowChat.requeueCount).toBe(0);
   });
 
   it("32. Major 2: anchor-null branch alerts with severity error and states prompt not found, wake lost, recovery suppressed", async () => {
@@ -1314,16 +1287,19 @@ describe("DeliveryWatchdog", () => {
     expect(row.requeueCount).toBe(0);
   });
 
-  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
+  it("33. a historic wake row carrying aborted_at is left alone (no abort, no terminal)", async () => {
+    // Was two near-identical tests, both named "33", both pinned to a guard at
+    // a line number that no longer exists. The guard they described (skip
+    // recovery when abortedAt is set) is gone with the abort path; what still
+    // matters is that a row left over from that era is handled calmly.
     fixture = makeFixture();
     const { storage, watchdog, clientMap, insertHandedOff } = fixture;
 
     const client = makeClient();
-    const stuckTranscript = [
+    client.getSessionMessages.mockImplementation(async () => [
       assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
       userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
-    ];
-    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
+    ]);
     clientMap.set("ses_b", { preferred: client, all: [client] });
 
     insertHandedOff({
@@ -1333,49 +1309,17 @@ describe("DeliveryWatchdog", () => {
       handedOffAt: 0,
       kind: "wake",
     });
-
-    // Simulate: a prior cycle somehow marked aborted_at
     storage.swarm.markAborted("wake_aborted", 100_000);
 
-    fixture.setNow(600_000); // eligible again
-    await watchdog.processOnce();
+    for (const t of [600_000, 4_000_000]) {
+      fixture.setNow(t);
+      await watchdog.processOnce();
+    }
 
     expect(client.abortSession).not.toHaveBeenCalled();
     const row = storage.swarm.getByMsgId("wake_aborted")!;
     expect(row.state).toBe("handed_off");
-  });
-
-  it("33. Major 2: guard at :716 suppresses recovery when row.abortedAt is set on wake", async () => {
-    fixture = makeFixture();
-    const { storage, watchdog, clientMap, insertHandedOff } = fixture;
-
-    const client = makeClient();
-    const stuckTranscript = [
-      assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
-      userMessage(50, `<swarm_message v="1" msg_id="wake_aborted">`),
-    ];
-    client.getSessionMessages.mockImplementation(async () => stuckTranscript);
-    clientMap.set("ses_b", { preferred: client, all: [client] });
-
-    insertHandedOff({
-      msgId: "wake_aborted",
-      fromSession: "ses_a",
-      toSession: "ses_b",
-      handedOffAt: 0,
-      kind: "wake",
-    });
-
-    // Pre-set abortedAt to simulate previous abort attempt
-    storage.db
-      .prepare("UPDATE swarm_messages SET aborted_at = 500_000 WHERE msg_id = ?")
-      .run("wake_aborted");
-
-    fixture.setNow(4_000_000);
-    await watchdog.processOnce();
-
-    const row = storage.swarm.getByMsgId("wake_aborted")!;
-    expect(row.state).toBe("handed_off");
-    expect(client.abortSession).not.toHaveBeenCalled();
+    expect(row.nudgeCount).toBe(0); // wake + blocked: no recovery of any kind
   });
 
   it("34. Minor 1: requeueOrTerminal only counts requeued when requeueForRecovery succeeds", async () => {
@@ -2005,6 +1949,196 @@ describe("DeliveryWatchdog", () => {
       expect(skip).toBeDefined();
       // Anchored on the OLDEST silent turn (created=100), not the newest.
       expect(skip!.silentForMs).toBe(399_900);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // pigeon-3m5 (R3): the payload is injected exactly ONCE per msg_id, and a
+  // failure report never claims non-receipt for a payload that is sitting in
+  // the target's transcript.
+  // -------------------------------------------------------------------------
+  describe("pigeon-3m5: nudge instead of re-injecting the payload", () => {
+    it("3m5-1: the reproduction shape — ordinary send to an unresponsive target never produces a second payload copy", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      // Exactly the 2026-07-25 transcript: our envelope is present, and the
+      // session never ran a turn for it.
+      const client = makeClient();
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "m1",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "result",
+      });
+
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000, 2_000_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      // The row never re-entered the queue, so the arbiter never re-rendered
+      // and re-sent the envelope. THIS is the duplicate-injection fix.
+      const row = storage.swarm.getByMsgId("m1")!;
+      expect(row.requeueCount).toBe(0);
+
+      // And every recovery attempt was a nudge, bounded by the budget.
+      const nudges = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'swarm.nudge'")
+        .all() as Array<Record<string, unknown>>;
+      expect(nudges).toHaveLength(3);
+    });
+
+    it("3m5-2: the nudge is addressed to the target, references the original, and does not carry the payload", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "m1",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        payload: "SECRET-ORIGINAL-PAYLOAD",
+      });
+
+      fixture.setNow(400_000);
+      await watchdog.processOnce();
+
+      const nudge = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'swarm.nudge'")
+        .get() as Record<string, unknown>;
+      expect(nudge.to_session).toBe("ses_b");
+      expect(nudge.reply_to).toBe("m1");
+      expect(nudge.state).toBe("queued"); // the arbiter will deliver it
+      // It names the original so the agent can find it...
+      expect(String(nudge.payload)).toContain("m1");
+      // ...but NOT in attribute form, which would make the nudge itself match
+      // findAnchor's needle and register as an anchor for the original.
+      expect(String(nudge.payload)).not.toContain('msg_id="m1"');
+      // ...but must NOT restate the payload, or we are back to two copies.
+      expect(String(nudge.payload)).not.toContain("SECRET-ORIGINAL-PAYLOAD");
+    });
+
+    it("3m5-3: an unread NUDGE never spawns another nudge (no cascade)", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="n1">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "n1",
+        fromSession: "pigeon",
+        toSession: "ses_b",
+        handedOffAt: 0,
+        kind: "swarm.nudge",
+      });
+
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      const row = storage.swarm.getByMsgId("n1")!;
+      expect(row.nudgeCount).toBe(0);
+      expect(row.state).toBe("handed_off"); // honest unknown, not terminal
+      const spawned = storage.db
+        .prepare("SELECT COUNT(*) c FROM swarm_messages WHERE kind = 'swarm.nudge'")
+        .get() as { c: number };
+      expect(spawned.c).toBe(1); // just the one we seeded
+    });
+
+    it("3m5-4: a row that left handed_off between read and act is not nudged", async () => {
+      fixture = makeFixture();
+      const { storage, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+      // Simulate the race directly at the repo guard: the row leaves
+      // handed_off before the nudge is recorded.
+      storage.db
+        .prepare("UPDATE swarm_messages SET state='cancelled' WHERE msg_id='m1'")
+        .run();
+
+      expect(storage.swarm.recordNudge("m1")).toBe(false);
+      expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(0);
+    });
+
+    it("3m5-5: the failure notice is cut on OBSERVED evidence, not on handedOffAt", () => {
+      // A handed-off row whose payload we watched NOT arrive must still be
+      // reported as resendable. This is the case that handedOffAt gets wrong.
+      const absentButHandedOff = formatFailureNotice(
+        { msgId: "m1", handedOffAt: 123 },
+        "ses_b",
+        "delivery write repeatedly lost",
+        "absent",
+      );
+      expect(absentButHandedOff).toContain("was never delivered");
+      expect(absentButHandedOff).toContain("safe to resend");
+      expect(absentButHandedOff).not.toContain("Do NOT resend");
+
+      const present = formatFailureNotice(
+        { msgId: "m1", handedOffAt: 123 },
+        "ses_b",
+        "why",
+        "present",
+      );
+      expect(present).toContain("DELIVERY UNCONFIRMED");
+      expect(present).not.toContain("was NOT received");
+      expect(present).toContain("Do NOT resend");
+
+      // Unobserved falls back to handedOffAt, the best signal available when
+      // nobody ever managed to read the transcript.
+      expect(
+        formatFailureNotice({ msgId: "m1", handedOffAt: null }, "ses_b", "why"),
+      ).toContain("was never delivered and was NOT received");
+      expect(
+        formatFailureNotice({ msgId: "m1", handedOffAt: 9 }, "ses_b", "why"),
+      ).toContain("DELIVERY UNCONFIRMED");
+    });
+
+    it("3m5-6: terminal report for a handed-off row says UNCONFIRMED and warns against resending", async () => {
+      fixture = makeFixture();
+      const { storage, watchdog, clientMap, insertHandedOff } = fixture;
+
+      const client = makeClient();
+      client.getSessionMessages.mockImplementation(async () => [
+        userMessage(50, `<swarm_message v="1" msg_id="m1">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
+
+      for (const t of [400_000, 800_000, 1_200_000, 1_600_000]) {
+        fixture.setNow(t);
+        await watchdog.processOnce();
+      }
+
+      expect(storage.swarm.getByMsgId("m1")!.state).toBe("failed");
+      const notice = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .get() as Record<string, unknown>;
+      const text = String(notice.payload);
+      // The lie pigeon-3m5 was filed for.
+      expect(text).not.toContain("was NOT received");
+      expect(text).toContain("DELIVERY UNCONFIRMED");
+      expect(text).toContain("Do NOT resend");
     });
   });
 });
