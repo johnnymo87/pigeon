@@ -256,6 +256,39 @@ describe("TelegramNotificationService.sendPlainAlert timeout", () => {
       vi.useRealTimers();
     }
   });
+
+  // pigeon-wfj1. The test above proves the bound only for a fetch that HONOURS
+  // the AbortSignal. A signal-ignoring fetch -- a stubbed transport, a patched
+  // global, a future dispatcher -- was still unbounded, and this await sits
+  // inside the DeliveryWatchdog cycle under the `processing` guard, so a hang
+  // here wedges the watchdog exactly like the body-read hang did.
+  it("rejects even when the fetch IGNORES the abort signal", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(
+        () => new Promise<Response>(() => {}),
+      ) as unknown as typeof fetch;
+
+      const service = new TelegramNotificationService(
+        {} as any,
+        "bot-token",
+        "8248645256",
+        () => 2_000,
+        fetchMock,
+      );
+
+      const settled = service.sendPlainAlert("hello", "error").then(
+        () => "resolved",
+        (err: unknown) => String(err),
+      );
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(await settled).toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("formatQuestionWizardStep", () => {

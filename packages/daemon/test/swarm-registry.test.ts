@@ -156,4 +156,82 @@ describe("SessionDirectoryRegistry", () => {
       expect((callInit as RequestInit).headers).toBeUndefined();
     });
   });
+
+  // pigeon-wfj1. resolve() had NO bound of any kind -- no signal, no timeout,
+  // on either phase. It is reached from the SwarmArbiter via
+  // makeDirectoryResolver (routing/directory-resolver.ts:32), whose try/catch
+  // cannot help: a hang is not a throw. An unbounded resolve there holds the
+  // arbiter's at-most-one-in-flight slot for the target session forever.
+  describe("request deadline", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("rejects when the serve accepts but never sends headers", async () => {
+      vi.useFakeTimers();
+      const hangingFetch = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          }),
+      );
+      const reg = new SessionDirectoryRegistry({
+        baseUrl: "http://x",
+        ttlMs: 60_000,
+        fetchFn: hangingFetch as unknown as typeof fetch,
+        nowFn: () => 1_000,
+        requestTimeoutMs: 10_000,
+      });
+
+      const pending = reg.resolve("ses_a");
+      const assertion = expect(pending).rejects.toThrow(/timed out after 10000ms/);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+    });
+
+    // Same body-phase hole as the client: headers arrive, body never does.
+    it("rejects when the body never arrives", async () => {
+      vi.useFakeTimers();
+      const stalled = {
+        ok: true,
+        status: 200,
+        json: () => new Promise<never>(() => {}),
+        text: () => new Promise<never>(() => {}),
+      } as unknown as Response;
+      const fetchFn = vi.fn(async () => stalled);
+      const reg = new SessionDirectoryRegistry({
+        baseUrl: "http://x",
+        ttlMs: 60_000,
+        fetchFn: fetchFn as unknown as typeof fetch,
+        nowFn: () => 1_000,
+        requestTimeoutMs: 10_000,
+      });
+
+      const pending = reg.resolve("ses_a");
+      const assertion = expect(pending).rejects.toThrow(/timed out after 10000ms/);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+    });
+
+    it("passes an AbortSignal to fetch", async () => {
+      const fetchFn = fakeFetch([
+        new Response(JSON.stringify({ id: "ses_a", directory: "/home/dev/dir" }), {
+          status: 200,
+        }),
+      ]);
+      const reg = new SessionDirectoryRegistry({
+        baseUrl: "http://x",
+        ttlMs: 60_000,
+        fetchFn: fetchFn as unknown as typeof fetch,
+        nowFn: () => 1_000,
+      });
+
+      await reg.resolve("ses_a");
+
+      const callInit = fetchFn.mock.calls[0]![1] as RequestInit;
+      expect(callInit.signal).toBeInstanceOf(AbortSignal);
+    });
+  });
 });

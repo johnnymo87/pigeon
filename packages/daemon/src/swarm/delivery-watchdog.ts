@@ -70,6 +70,8 @@ export const DEFAULT_MAX_NUDGES = 3;
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
 /** DIRECTORY_TIMEOUT_MS */
 export const DEFAULT_DIRECTORY_TIMEOUT_MS = 5_000;
+/** See `DeliveryWatchdogOptions.stallAlertMs`. */
+export const DEFAULT_STALL_ALERT_MS = 10 * 60_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -94,6 +96,14 @@ export interface DeliveryWatchdogOptions {
    */
   overdueAlertMs?: number;
   directoryTimeoutMs?: number;
+  /**
+   * How long an in-flight cycle may run before a coalesced call reports it as
+   * stalled. Generous on purpose: a cycle legitimately makes one bounded
+   * transcript fetch per eligible session, so a backlog of sessions each
+   * hitting the 30s client timeout can take minutes without anything being
+   * wrong. This alarm is for "wedged", not "slow".
+   */
+  stallAlertMs?: number;
 }
 
 export interface CycleSummary {
@@ -451,8 +461,13 @@ export class DeliveryWatchdog {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
+  /** Wall-clock start of the in-flight cycle; null when idle. See `reportStallIfOverdue`. */
+  private cycleStartedAt: number | null = null;
+  /** `cycleStartedAt` of the episode a stall alert was raised for, so it can be retracted. */
+  private stallReportedFor: number | null = null;
   private readonly intervalMs: number;
   private readonly directoryTimeoutMs: number;
+  private readonly stallAlertMs: number;
 
   constructor(opts: DeliveryWatchdogOptions) {
     this.storage = opts.storage;
@@ -472,6 +487,7 @@ export class DeliveryWatchdog {
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
     this.directoryTimeoutMs =
       opts.directoryTimeoutMs ?? DEFAULT_DIRECTORY_TIMEOUT_MS;
+    this.stallAlertMs = opts.stallAlertMs ?? DEFAULT_STALL_ALERT_MS;
   }
 
   start(intervalMs = this.intervalMs): void {
@@ -494,9 +510,11 @@ export class DeliveryWatchdog {
 
   async processOnce(): Promise<CycleSummary> {
     if (this.processing) {
+      this.reportStallIfOverdue();
       return emptySummary(true);
     }
     this.processing = true;
+    this.cycleStartedAt = this.nowFn();
     try {
       return await this.runCycle();
     } catch (err) {
@@ -504,8 +522,118 @@ export class DeliveryWatchdog {
       this.log("cycle error", { error: message });
       return { ...emptySummary(), error: message };
     } finally {
+      const startedAt = this.cycleStartedAt;
       this.processing = false;
+      this.cycleStartedAt = null;
+      if (startedAt !== null && this.stallReportedFor === startedAt) {
+        // Never let bookkeeping break the loop it is reporting on: a throw from
+        // a `finally` would replace the cycle's real outcome with this one's.
+        try {
+          this.reportStallRecovered(startedAt, this.nowFn());
+        } catch (err) {
+          this.log("stall-recovered alert failed", { error: String(err) });
+        }
+      }
     }
+  }
+
+  /**
+   * The single-flight `processing` flag above is only safe while every await in
+   * a cycle is bounded. A HANG (as opposed to a throw) leaves it set forever,
+   * every later cycle coalesces, and the watchdog is silently dead — taking the
+   * overdue-queued alarm with it, which is the one alarm placed here precisely
+   * so the monitor cannot die together with the thing it monitors. `try/catch`
+   * cannot help: a hang is not a throw.
+   *
+   * pigeon-wfj1 bounded the known awaits (the client and the registry now carry
+   * end-to-end deadlines covering the response BODY, not just the headers). This
+   * is the backstop for the ones nobody has thought of yet — INCLUDING any await
+   * a future change adds to the cycle.
+   *
+   * It deliberately does NOT force-clear `processing`. Doing so would let two
+   * `runCycle()` bodies overlap: the dedupe Sets are check-then-act across
+   * awaits, and the nudge budget is read from a row snapshot taken before an
+   * await, so overlapping cycles could double-nudge a live session — replacing a
+   * silent death with a possibly-corrupt life. A stalled watchdog that says so
+   * is the honest outcome; a human (or a daemon restart) is the recovery.
+   *
+   * The report itself must not be able to hang, or it inherits the failure it
+   * exists to report — so it is a SYNCHRONOUS better-sqlite3 enqueue, and the
+   * independent AlertDrainer performs the network send.
+   */
+  private reportStallIfOverdue(): void {
+    const startedAt = this.cycleStartedAt;
+    if (startedAt === null) return;
+
+    const now = this.nowFn();
+    const stalledFor = now - startedAt;
+    if (stalledFor < this.stallAlertMs) return;
+
+    // Synthetic, non-null ref keyed to THIS episode. Non-null matters: SQLite
+    // permits many NULLs in a UNIQUE index, so a null ref would re-alert every
+    // cycle. Keying on the stalled cycle's start collapses that episode to one
+    // alert while still letting a later, distinct stall raise its own. The
+    // `watchdog-stall:` prefix keeps it out of the msg_id namespace, so it can
+    // never occupy the dedupe slot belonging to a real message's alert.
+    //
+    // THE WORDING DOES NOT PICK A CAUSE, because this trigger cannot separate
+    // the two. Exceeding the threshold proves only that the cycle has run that
+    // long. A hung await produces it — but so does a legitimate backlog: the
+    // cycle makes up to two bounded 30s transcript fetches per eligible session,
+    // so ~10 sessions on unresponsive serves reach 10 minutes honestly. Naming
+    // "hung" and demanding a restart would be a decisive instruction derived
+    // from evidence that does not support it, and during a multi-serve outage it
+    // would repeat every cycle. The follow-up alert below is what disambiguates.
+    const enqueued = this.storage.alerts.enqueue({
+      source: "delivery-watchdog-stall",
+      refMsgId: `watchdog-stall:${startedAt}`,
+      text:
+        `delivery watchdog: cycle started ${new Date(startedAt).toISOString()} ` +
+        `has been running ${humanDuration(stalledFor)} without finishing. ` +
+        `Delivery recovery and the overdue-queued alarm are BOTH stopped while ` +
+        `it runs, for every session. Two causes look identical from here: an ` +
+        `await inside the cycle is hung, OR the cycle is grinding through a ` +
+        `backlog of per-session timeouts (a multi-serve outage can legitimately ` +
+        `take this long). DO NOT restart yet: if a "cycle recovered" alert ` +
+        `follows, it was slow, not stuck. If none arrives, it is wedged — ` +
+        `restart the pigeon daemon and check what it was fetching.`,
+      severity: "error",
+      now,
+    });
+
+    if (enqueued) {
+      this.stallReportedFor = startedAt;
+      this.log("cycle stalled", {
+        stalledForMs: stalledFor,
+        startedAt,
+      });
+    }
+  }
+
+  /**
+   * Retract the ambiguity of a stall report once the cycle actually finishes.
+   *
+   * Without this, a slow-but-healthy cycle leaves a bare "may be wedged, restart
+   * the daemon" alert standing forever, and the reader has no way to tell that
+   * it resolved itself — so the honest-unknown alert above would drive exactly
+   * the unnecessary restart it is trying to prevent. Only fires for an episode
+   * that was actually reported, so it cannot become chatter on its own.
+   */
+  private reportStallRecovered(startedAt: number, now: number): void {
+    if (this.stallReportedFor !== startedAt) return;
+    this.stallReportedFor = null;
+    this.storage.alerts.enqueue({
+      source: "delivery-watchdog-stall-recovered",
+      refMsgId: `watchdog-stall-recovered:${startedAt}`,
+      text:
+        `delivery watchdog: the cycle started ${new Date(startedAt).toISOString()} ` +
+        `COMPLETED after ${humanDuration(now - startedAt)}. It was slow, not ` +
+        `wedged — no restart is needed. Recovery and the overdue-queued alarm ` +
+        `are running again. Recurring reports of this mean the cycle is ` +
+        `routinely spending minutes on unresponsive serves.`,
+      severity: "warning",
+      now,
+    });
   }
 
   private async alert(severity: AlertSeverity, text: string): Promise<void> {

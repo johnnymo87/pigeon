@@ -294,6 +294,231 @@ describe("OpencodeClient", () => {
     });
   });
 
+  // pigeon-wfj1. The h21 timeout bounded only the HEADER phase: the abort was
+  // disarmed in a `finally` the instant the fetch promise resolved, and every
+  // caller then read the body unbounded. A serve that accepts the connection,
+  // returns 200 headers, and then stalls mid-body left `res.json()` pending
+  // with nothing to reject on -- the exact never-settling promise h21 exists to
+  // prevent, one phase later. Verified against real Node 22 fetch, not just
+  // these stubs: headers landed in 15ms and the body read was still pending
+  // minutes later (see the PR description for the undici bodyTimeout nuance).
+  describe("request deadline covers the response BODY, not just the headers", () => {
+    /** Headers resolve immediately; the body never settles. */
+    const stalledBody = (status: number): Response =>
+      ({
+        ok: status >= 200 && status < 300,
+        status,
+        statusText: "OK",
+        json: () => new Promise<never>(() => {}),
+        text: () => new Promise<never>(() => {}),
+      }) as unknown as Response;
+
+    it("rejects when the body never arrives on a 200", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValueOnce(stalledBody(200));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const pending = client.getSessionMessages("sess-abc");
+      const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    });
+
+    // The ERROR body is read too (`await res.text()` before throwing), and it is
+    // just as unbounded. Easy to miss precisely because it is on the sad path.
+    it("rejects when the error body never arrives on a non-ok response", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValueOnce(stalledBody(500));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const pending = client.getSessionMessages("sess-abc");
+      const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    });
+
+    // MISCLASSIFICATION GUARD. DeliveryWatchdog.extractStatus() recovers a status
+    // by matching /\((\d+)\)/ against the message, and a status of 404 drives a
+    // TERMINAL state. If a body-phase timeout ever produced a message containing
+    // a parenthesised number, a hung serve would be recorded as "session gone".
+    // Assert the shape directly rather than trusting that it happens to hold.
+    it("produces a timeout message with no parenthesised digits to misread as a status", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValueOnce(stalledBody(200));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const pending = client.getSessionMessages("sess-abc").catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(30_000);
+      const err = (await pending) as Error;
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err.name).toBe("RequestTimeoutError");
+      expect(err.message).not.toMatch(/\(\d+\)/);
+    });
+
+    // A body read that fails for a NON-timeout reason must pass through
+    // untouched. Wrapping it would rewrite `getSessionMessages failed (404)`
+    // and silently disable the 404-terminal path in the watchdog.
+    it("does not rewrite a genuine non-ok error into a timeout", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("gone", { status: 404 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      await expect(client.getSessionMessages("sess-abc")).rejects.toThrow(
+        "getSessionMessages failed (404): gone",
+      );
+    });
+
+    // REAL undici does not merely hang a body read when the signal aborts -- it
+    // REJECTS it with AbortError, which then races the deadline's own rejection.
+    //
+    // WHICH ONE WINS DEPENDS ON MICROTASK COUNT, so it must not be relied on.
+    // Every `consume` in this file is an `async` function, and that internal hop
+    // happens to let the deadline's rejection land first. A `consume` that
+    // returns the body promise DIRECTLY -- which the signature allows, and which
+    // is the obvious way to write a future one-liner -- has no hop, and then the
+    // AbortError wins. Without the abort->timeout conversion in `withDeadline`
+    // the caller then gets a bare "The operation was aborted."
+    //
+    // That is not cosmetic: RequestTimeoutError is what keeps a hung serve out
+    // of the health verdict and off the watchdog's 404-terminal path. This test
+    // drives the private `request` on purpose, because it is the only way to
+    // exercise the no-hop shape -- and without it the conversion is DEAD CODE
+    // that merely looks protective.
+    it("reports a timeout even when the abort rejection wins the race (no-hop consume)", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementationOnce((_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () =>
+            new Promise<never>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(new DOMException("The operation was aborted.", "AbortError"));
+              });
+            }),
+        } as unknown as Response),
+      );
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const request = (
+        client as unknown as {
+          request: (
+            url: string,
+            init: RequestInit,
+            consume: (res: Response) => unknown,
+          ) => Promise<unknown>;
+        }
+      ).request.bind(client);
+
+      // No `async`, no `await`: the body promise IS the consume result.
+      const pending = request("http://localhost:4320/x", { method: "GET" }, (res) =>
+        res.json(),
+      ).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(30_000);
+      const err = (await pending) as Error;
+
+      expect(err.name).toBe("RequestTimeoutError");
+      expect(err.message).toMatch(/timed out after 30000ms/);
+    });
+
+    // `onOutcome` is documented "fires once per request", and it feeds the
+    // shadow serve-health tally. A hung-body request could contribute BOTH a
+    // success (status observed when the headers landed) and a timeout (observed
+    // when the body aborted) -- one request, two observations. Neither counts
+    // toward the verdict, so nothing broke visibly; the tally was quietly wrong.
+    //
+    // Uses the no-hop consume for the same reason as the test above: with an
+    // `async` consume the deadline's rejection wins and the second observation
+    // never happens, so a test written that way passes no matter what the code
+    // does. It is the shape, not the assertion, that does the detecting here.
+    it("observes a hung-body request exactly once", async () => {
+      vi.useFakeTimers();
+      const onOutcome = vi.fn();
+      fetchMock.mockImplementationOnce((_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () =>
+            new Promise<never>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(new DOMException("The operation was aborted.", "AbortError"));
+              });
+            }),
+        } as unknown as Response),
+      );
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+        onOutcome,
+      });
+
+      const request = (
+        client as unknown as {
+          request: (
+            url: string,
+            init: RequestInit,
+            consume: (res: Response) => unknown,
+          ) => Promise<unknown>;
+        }
+      ).request.bind(client);
+
+      const pending = request("http://localhost:4320/x", { method: "GET" }, (res) =>
+        res.json(),
+      ).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pending;
+
+      expect(onOutcome).toHaveBeenCalledTimes(1);
+    });
+
+    // The deadline must cover the body for EVERY method, not just the one that
+    // motivated the bead -- otherwise the next caller re-opens the hole.
+    it("bounds the body read on getSession too", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValueOnce(stalledBody(200));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+      });
+
+      const pending = client.getSession("sess-abc");
+      const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    });
+  });
+
   describe("summarize", () => {
     it("calls POST /session/:id/summarize with correct body", async () => {
       fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));

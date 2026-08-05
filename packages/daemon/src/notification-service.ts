@@ -394,13 +394,25 @@ export class TelegramNotificationService implements StopNotifier {
     const prefix =
       severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
     const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(),
-      PLAIN_ALERT_TIMEOUT_MS,
-    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // The AbortSignal alone only bounds a fetch that HONOURS it. Racing an
+    // explicit deadline bounds it either way -- which is the difference between
+    // an alert that can hang the watchdog cycle and one that cannot (pigeon-wfj1).
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(
+          new Error(
+            `Telegram sendMessage timed out after ${PLAIN_ALERT_TIMEOUT_MS}ms`,
+          ),
+        );
+      }, PLAIN_ALERT_TIMEOUT_MS);
+    });
+    deadline.catch(() => {});
+
     let response: Response;
     try {
-      response = await this.fetchFn(`${this.apiBase}/sendMessage`, {
+      const inFlight = this.fetchFn(`${this.apiBase}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -409,6 +421,8 @@ export class TelegramNotificationService implements StopNotifier {
         }),
         signal: controller.signal,
       });
+      inFlight.catch(() => {});
+      response = await Promise.race([inFlight, deadline]);
     } catch (err) {
       if (controller.signal.aborted) {
         throw new Error(
