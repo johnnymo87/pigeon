@@ -844,7 +844,9 @@ describe("DeliveryWatchdog", () => {
     // Not yet overdue: a slow cycle is not a stalled one.
     fixture.setNow(400_000 + 599_999);
     expect((await watchdog.processOnce()).coalesced).toBe(true);
-    expect(storage.alerts.countDrainable(Date.now())).toBe(0);
+    // Fake clock, not Date.now(): the assertion must be about the watchdog's
+    // notion of time, which is the only one the code under test can see.
+    expect(storage.alerts.countDrainable(400_000 + 599_999)).toBe(0);
 
     // Past the deadline.
     fixture.setNow(400_000 + 600_001);
@@ -858,9 +860,57 @@ describe("DeliveryWatchdog", () => {
     // down and that recovery is not running, or a reader will not act on it.
     expect(alert!.text).toMatch(/delivery watchdog/i);
     expect(alert!.text).toMatch(/10m/);
+    // ...but it must NOT assert a cause it cannot know. Exceeding the threshold
+    // is equally consistent with a hung await and with a legitimate backlog of
+    // per-session timeouts, so the text must name both and must not issue a
+    // bare restart instruction off evidence that cannot separate them.
+    expect(alert!.text).toMatch(/hung/i);
+    expect(alert!.text).toMatch(/backlog|slow|grinding/i);
+    expect(alert!.text).toMatch(/do not restart yet/i);
 
     hung.release();
     await first;
+  });
+
+  it("40. a stalled cycle that later COMPLETES retracts the restart advice", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog } = fixture;
+    const hung = makeHungCycle(fixture);
+
+    fixture.setNow(400_000);
+    const first = watchdog.processOnce();
+    await Promise.resolve();
+
+    fixture.setNow(1_100_000);
+    await watchdog.processOnce();
+    expect(storage.alerts.countDrainable(1_100_000)).toBe(1);
+
+    // The cycle was slow, not wedged. Without a follow-up the standing alert
+    // says "may be wedged, restart the daemon" forever, and a reader acting on
+    // it would restart a perfectly healthy daemon.
+    fixture.setNow(1_200_000);
+    hung.release();
+    await first;
+
+    const alerts: string[] = [];
+    let a = storage.alerts.nextDrainable(1_200_000);
+    while (a) {
+      alerts.push(a.source);
+      storage.alerts.markSent(a.id, 1_200_000);
+      a = storage.alerts.nextDrainable(1_200_000);
+    }
+    expect(alerts).toContain("delivery-watchdog-stall-recovered");
+  });
+
+  it("41. a cycle that was never reported as stalled does not emit a recovery alert", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog } = fixture;
+
+    fixture.setNow(400_000);
+    await watchdog.processOnce();
+
+    // No stall, so nothing to retract -- otherwise every healthy cycle chatters.
+    expect(storage.alerts.countDrainable(400_000)).toBe(0);
   });
 
   it("37. one alert per stall EPISODE, not one per cycle", async () => {

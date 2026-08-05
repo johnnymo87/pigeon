@@ -25,7 +25,7 @@ export { TransportError };
 interface OpencodeClientOptions {
   baseUrl: string;
   fetchFn?: typeof fetch;
-  /** Per-request ceiling. See `fetchWithTimeout`. Defaults to 30s. */
+  /** Per-request ceiling, covering headers AND body. See `request`. Defaults to 30s. */
   requestTimeoutMs?: number;
   /**
    * Shadow-mode observability tap (bead pigeon-f2a). Fires once per request with
@@ -132,6 +132,14 @@ export class OpencodeClient {
      * it matters: `RequestTimeoutError` is what keeps a hung serve out of the
      * health verdict and away from the watchdog's 404-terminal path.
      */
+    let observed = false;
+    /** Enforces the once-per-request contract structurally, not by convention. */
+    const observeOnce = (obs: OutcomeObservation): void => {
+      if (observed) return;
+      observed = true;
+      this.observe(obs);
+    };
+
     const withDeadline = async <R>(p: Promise<R>): Promise<R> => {
       p.catch(() => {});
       try {
@@ -139,7 +147,12 @@ export class OpencodeClient {
       } catch (err) {
         if (controller.signal.aborted && !(err instanceof RequestTimeoutError)) {
           const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
-          this.observe({ error: timeout });
+          // A body-phase abort arrives AFTER the final status was observed, so
+          // this is normally a no-op; it matters only when the body read is what
+          // aborts before any status exists. Without the guard one hung-body
+          // request contributed both a success and a timeout to the shadow tally
+          // -- and which one depended on microtask race order.
+          observeOnce({ error: timeout });
           throw timeout;
         }
         throw err;
@@ -156,11 +169,11 @@ export class OpencodeClient {
       } catch (err) {
         if (controller.signal.aborted) {
           const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
-          this.observe({ error: timeout });
+          observeOnce({ error: timeout });
           throw timeout;
         }
         const transportErr = new TransportError(err as Error);
-        this.observe({ error: transportErr });
+        observeOnce({ error: transportErr });
         throw transportErr;
       }
     };
@@ -193,7 +206,7 @@ export class OpencodeClient {
       // verdict: classifyServeOutcome() already treats 4xx as client_error, and
       // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
       // rule B -- "4xx IS NOT ILL-HEALTH").
-      this.observe({ status: res.status });
+      observeOnce({ status: res.status });
 
       // The body is read HERE, still inside the deadline. Callers never receive
       // the Response, so there is no way to read a body outside the bound --

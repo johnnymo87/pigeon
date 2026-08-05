@@ -447,6 +447,59 @@ describe("OpencodeClient", () => {
       expect(err.message).toMatch(/timed out after 30000ms/);
     });
 
+    // `onOutcome` is documented "fires once per request", and it feeds the
+    // shadow serve-health tally. A hung-body request could contribute BOTH a
+    // success (status observed when the headers landed) and a timeout (observed
+    // when the body aborted) -- one request, two observations. Neither counts
+    // toward the verdict, so nothing broke visibly; the tally was quietly wrong.
+    //
+    // Uses the no-hop consume for the same reason as the test above: with an
+    // `async` consume the deadline's rejection wins and the second observation
+    // never happens, so a test written that way passes no matter what the code
+    // does. It is the shape, not the assertion, that does the detecting here.
+    it("observes a hung-body request exactly once", async () => {
+      vi.useFakeTimers();
+      const onOutcome = vi.fn();
+      fetchMock.mockImplementationOnce((_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () =>
+            new Promise<never>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(new DOMException("The operation was aborted.", "AbortError"));
+              });
+            }),
+        } as unknown as Response),
+      );
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        requestTimeoutMs: 30_000,
+        onOutcome,
+      });
+
+      const request = (
+        client as unknown as {
+          request: (
+            url: string,
+            init: RequestInit,
+            consume: (res: Response) => unknown,
+          ) => Promise<unknown>;
+        }
+      ).request.bind(client);
+
+      const pending = request("http://localhost:4320/x", { method: "GET" }, (res) =>
+        res.json(),
+      ).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pending;
+
+      expect(onOutcome).toHaveBeenCalledTimes(1);
+    });
+
     // The deadline must cover the body for EVERY method, not just the one that
     // motivated the bead -- otherwise the next caller re-opens the hole.
     it("bounds the body read on getSession too", async () => {

@@ -463,6 +463,8 @@ export class DeliveryWatchdog {
   private processing = false;
   /** Wall-clock start of the in-flight cycle; null when idle. See `reportStallIfOverdue`. */
   private cycleStartedAt: number | null = null;
+  /** `cycleStartedAt` of the episode a stall alert was raised for, so it can be retracted. */
+  private stallReportedFor: number | null = null;
   private readonly intervalMs: number;
   private readonly directoryTimeoutMs: number;
   private readonly stallAlertMs: number;
@@ -520,8 +522,18 @@ export class DeliveryWatchdog {
       this.log("cycle error", { error: message });
       return { ...emptySummary(), error: message };
     } finally {
+      const startedAt = this.cycleStartedAt;
       this.processing = false;
       this.cycleStartedAt = null;
+      if (startedAt !== null && this.stallReportedFor === startedAt) {
+        // Never let bookkeeping break the loop it is reporting on: a throw from
+        // a `finally` would replace the cycle's real outcome with this one's.
+        try {
+          this.reportStallRecovered(startedAt, this.nowFn());
+        } catch (err) {
+          this.log("stall-recovered alert failed", { error: String(err) });
+        }
+      }
     }
   }
 
@@ -563,26 +575,65 @@ export class DeliveryWatchdog {
     // alert while still letting a later, distinct stall raise its own. The
     // `watchdog-stall:` prefix keeps it out of the msg_id namespace, so it can
     // never occupy the dedupe slot belonging to a real message's alert.
+    //
+    // THE WORDING DOES NOT PICK A CAUSE, because this trigger cannot separate
+    // the two. Exceeding the threshold proves only that the cycle has run that
+    // long. A hung await produces it — but so does a legitimate backlog: the
+    // cycle makes up to two bounded 30s transcript fetches per eligible session,
+    // so ~10 sessions on unresponsive serves reach 10 minutes honestly. Naming
+    // "hung" and demanding a restart would be a decisive instruction derived
+    // from evidence that does not support it, and during a multi-serve outage it
+    // would repeat every cycle. The follow-up alert below is what disambiguates.
     const enqueued = this.storage.alerts.enqueue({
       source: "delivery-watchdog-stall",
       refMsgId: `watchdog-stall:${startedAt}`,
       text:
-        `delivery watchdog: cycle has been running for ${humanDuration(stalledFor)} ` +
-        `(started ${new Date(startedAt).toISOString()}) and has not finished. ` +
-        `An await inside the cycle is hung, so delivery recovery and the ` +
-        `overdue-queued alarm are BOTH stopped — swarm messages may be silently ` +
-        `stuck for every session, not just one. This does not clear itself: ` +
-        `restart the pigeon daemon, then check what it was fetching.`,
+        `delivery watchdog: cycle started ${new Date(startedAt).toISOString()} ` +
+        `has been running ${humanDuration(stalledFor)} without finishing. ` +
+        `Delivery recovery and the overdue-queued alarm are BOTH stopped while ` +
+        `it runs, for every session. Two causes look identical from here: an ` +
+        `await inside the cycle is hung, OR the cycle is grinding through a ` +
+        `backlog of per-session timeouts (a multi-serve outage can legitimately ` +
+        `take this long). DO NOT restart yet: if a "cycle recovered" alert ` +
+        `follows, it was slow, not stuck. If none arrives, it is wedged — ` +
+        `restart the pigeon daemon and check what it was fetching.`,
       severity: "error",
       now,
     });
 
     if (enqueued) {
+      this.stallReportedFor = startedAt;
       this.log("cycle stalled", {
         stalledForMs: stalledFor,
         startedAt,
       });
     }
+  }
+
+  /**
+   * Retract the ambiguity of a stall report once the cycle actually finishes.
+   *
+   * Without this, a slow-but-healthy cycle leaves a bare "may be wedged, restart
+   * the daemon" alert standing forever, and the reader has no way to tell that
+   * it resolved itself — so the honest-unknown alert above would drive exactly
+   * the unnecessary restart it is trying to prevent. Only fires for an episode
+   * that was actually reported, so it cannot become chatter on its own.
+   */
+  private reportStallRecovered(startedAt: number, now: number): void {
+    if (this.stallReportedFor !== startedAt) return;
+    this.stallReportedFor = null;
+    this.storage.alerts.enqueue({
+      source: "delivery-watchdog-stall-recovered",
+      refMsgId: `watchdog-stall-recovered:${startedAt}`,
+      text:
+        `delivery watchdog: the cycle started ${new Date(startedAt).toISOString()} ` +
+        `COMPLETED after ${humanDuration(now - startedAt)}. It was slow, not ` +
+        `wedged — no restart is needed. Recovery and the overdue-queued alarm ` +
+        `are running again. Recurring reports of this mean the cycle is ` +
+        `routinely spending minutes on unresponsive serves.`,
+      severity: "warning",
+      now,
+    });
   }
 
   private async alert(severity: AlertSeverity, text: string): Promise<void> {
