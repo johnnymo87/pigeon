@@ -13,7 +13,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main: two quick merges would otherwise leave the
+  # first commit permanently without a completed CI status, which is exactly
+  # the commit a bisect or a deploy gate later wants to consult.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Node is pinned rather than left to ubuntu-latest's default: this repo has
@@ -22,10 +25,18 @@ env:
   NODE_VERSION: "22"
 
 jobs:
-  # The required gate. Everything here must pass to merge.
+  # The intended required gate.
+  #
+  # NOTE: nothing in this file can make a check required. That is branch
+  # protection, a repository setting configured outside the repo, and as of
+  # this commit `main` is NOT protected -- so a red run does not currently
+  # block anything. Until it is configured (requiring "typecheck + tests", and
+  # deliberately NOT the advisory job below), this workflow reports but does
+  # not enforce.
   test:
     name: typecheck + tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +54,11 @@ jobs:
       - run: npm ci
 
       # There is no build script in any workspace, so typecheck is the compile
-      # gate. It covers all three packages via the root script.
+      # gate. It runs in all three packages via the root script -- but note it
+      # covers each package's tsconfig `include`, which today means SRC only
+      # for opencode-plugin and worker. Their test code is typechecked by
+      # nothing (pigeon-09vu). Do not read a green tick here as "the test code
+      # compiles".
       - name: Typecheck
         run: npm run typecheck
 
@@ -59,11 +74,26 @@ jobs:
       # test/setup.ts's isolation guard can actually fire here.
       #
       # The value is not a secret and is never used to authenticate anything.
+      #
+      # The path below is a SECOND COPY of the constant in
+      # opencode-plugin/src/auth-token.ts. That is the same duplicate-the-
+      # resolver's-fallback shape this branch removed from test/setup.ts, so it
+      # gets the same treatment: the step asserts the constant still says what
+      # this step assumes, and asserts the file actually landed. Without those
+      # two checks, a renamed path or a typo here would silently stop planting
+      # the decoy, and CI would go back to being unable to see the bug class
+      # while staying green.
       - name: Plant decoy production secret so the token-leak guard can fire
         run: |
-          sudo mkdir -p /run/secrets
-          echo "ci-decoy-not-a-real-token" | sudo tee /run/secrets/pigeon_daemon_auth_token >/dev/null
-          sudo chmod 444 /run/secrets/pigeon_daemon_auth_token
+          set -euo pipefail
+          DECOY_PATH=/run/secrets/pigeon_daemon_auth_token
+          # Fail loudly if the resolver's hardcoded fallback has moved.
+          grep -qF "\"$DECOY_PATH\"" packages/opencode-plugin/src/auth-token.ts \
+            || { echo "::error::auth-token.ts no longer falls back to $DECOY_PATH; update this step"; exit 1; }
+          sudo mkdir -p "$(dirname "$DECOY_PATH")"
+          echo "ci-decoy-not-a-real-token" | sudo tee "$DECOY_PATH" >/dev/null
+          sudo chmod 444 "$DECOY_PATH"
+          test -r "$DECOY_PATH" || { echo "::error::decoy was not planted"; exit 1; }
 
       # PIGEON_SKIP_LOAD_SENSITIVE excludes the lease-CAS concurrency proof,
       # which forks 6 processes and is sensitive to machine load rather than to
@@ -92,9 +122,18 @@ jobs:
       # worker suite still runs unshuffled in the step above, so the package is
       # covered; only its ORDER independence is currently unverified.
       # Closing pigeon-dpi6 means deleting the exclusion here.
+      # The package list is DERIVED from the workspaces on disk, minus an
+      # explicit denylist, so a fourth package is shuffled automatically rather
+      # than being silently omitted by a hardcoded list that nobody updates.
       - name: Test (shuffled order)
         run: |
-          for pkg in daemon opencode-plugin; do
+          set -euo pipefail
+          DENY="worker" # pigeon-dpi6; remove from this list when that is fixed
+          for dir in packages/*/; do
+            pkg="$(basename "$dir")"
+            case " $DENY " in
+              *" $pkg "*) echo "skipping shuffled run for $pkg (see pigeon-dpi6)"; continue ;;
+            esac
             echo "::group::shuffled: $pkg"
             npm run test --workspace "packages/$pkg" -- --sequence.shuffle
             echo "::endgroup::"
@@ -110,9 +149,14 @@ jobs:
   # This job existing is what makes the skip above honest: coverage moves off
   # the blocking path rather than disappearing. If it proves stable here,
   # promote it back into the required job and delete the flag.
+  #
+  # Runs the node-only proof. The file's second test, a cross-binding node+bun
+  # proof, is gated on OPENCODE_BUN_BIN/OPENCODE_LEASE_ADAPTER and so is always
+  # skipped here -- "the proof" in this job's name means one of the two.
   lease-cas-proof:
-    name: lease-CAS concurrency proof (advisory)
+    name: lease-CAS concurrency proof (advisory, not required)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
