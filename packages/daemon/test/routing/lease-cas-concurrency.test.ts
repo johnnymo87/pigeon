@@ -79,7 +79,12 @@ const ADAPTER = process.env.OPENCODE_LEASE_ADAPTER;
 // intent rather than on CI so the proof still runs by default EVERYWHERE else,
 // including locally. Coverage is moved off the blocking path, not removed.
 // On fixing pigeon-y8p, promote this back into the main job and delete the flag.
-const SKIP_LOAD_SENSITIVE = Boolean(process.env.PIGEON_SKIP_LOAD_SENSITIVE);
+// Strict parse, deliberately not Boolean(): Boolean("0") and Boolean("false")
+// are both true, and a YAML `PIGEON_SKIP_LOAD_SENSITIVE: false` stringifies to
+// "false" -- which would silently skip the proof while reading as "don't skip".
+const SKIP_LOAD_SENSITIVE = ["1", "true"].includes(
+  (process.env.PIGEON_SKIP_LOAD_SENSITIVE ?? "").toLowerCase(),
+);
 
 describe("Hardened Lease CAS Concurrency Proof", () => {
   it.skipIf(SKIP_LOAD_SENSITIVE)("never allows more than 1 live owner for the same (session, generation, epoch) under genuine concurrent contention", async () => {

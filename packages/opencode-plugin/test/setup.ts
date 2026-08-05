@@ -21,16 +21,16 @@ const TEST_NO_TOKEN_PATH = "/nonexistent/pigeon-test-no-token"
 /**
  * Restore the pin and drop any memoised token.
  *
- * Applied both BEFORE and AFTER every test. Pinning once at module load was not
- * enough: 10 call sites across the suite point this variable at a tmpdir token
- * file and then `delete` it in a finally block rather than restoring the pin,
- * which leaves resolveDaemonToken() falling back to its hardcoded
- * /run/secrets/pigeon_daemon_auth_token default. On cloudbox that file exists,
- * so whichever test ran next read the LIVE production token and handed it to a
- * mock fetch -- precisely the outcome the comment above says must never happen.
- * Observed as an order-dependent failure of "includes Authorization Bearer
- * header only when authToken is set", which asserts no header and instead saw a
- * real `Bearer <production token>`; reproduced on unmodified main under
+ * Applied at module load, and BEFORE and AFTER every test. Pinning only at
+ * module load was not enough: 10 call sites across the suite point this variable
+ * at a tmpdir token file and then `delete` it in a finally block rather than
+ * restoring the pin, which leaves resolveDaemonToken() falling back to its
+ * hardcoded /run/secrets/pigeon_daemon_auth_token default. On cloudbox that file
+ * exists, so whichever test ran next read the LIVE production token and handed it
+ * to a mock fetch -- precisely the outcome the comment above says must never
+ * happen. Observed as an order-dependent failure of "includes Authorization
+ * Bearer header only when authToken is set", which asserts no header and instead
+ * saw a real `Bearer <production token>`; reproduced on unmodified main under
  * `--sequence.shuffle --sequence.seed=2`.
  *
  * Repairing in a hook rather than at the call sites is deliberate: the invariant
@@ -45,6 +45,27 @@ function pinTokenFile(): void {
   invalidateDaemonToken()
 }
 
+// Capture the AMBIENT state before the module-load pin destroys the evidence.
+// The pin below is what makes the suite safe, but it also overwrites exactly the
+// condition the guards in beforeEach need to see, so the snapshot has to happen
+// first. (Getting this order wrong is what made an earlier version of these
+// guards structurally unable to fire.)
+const AMBIENT_TOKEN_FILE = process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+const AMBIENT_TOKEN_ENV = process.env.PIGEON_DAEMON_AUTH_TOKEN
+
+// Pin at module load too, not only in the hooks. This covers the window between
+// this file being loaded and the first beforeEach -- which is when test files are
+// imported, so any module-scope resolveDaemonToken() call would land here. There
+// is no such call today, and this line is defence in depth against one appearing.
+//
+// It is also load-bearing for a subtler reason: test/auth-token.test.ts captures
+// the AMBIENT value of PIGEON_DAEMON_AUTH_TOKEN_FILE at collection time and
+// restores it in its afterEach. Without a module-scope pin that capture is
+// `undefined`, so its restore turns into a `delete` -- reintroducing the exact
+// unpinned hand-off this file exists to prevent. (An earlier version of this
+// commit dropped this line and did precisely that.)
+pinTokenFile()
+
 // NOTE: this mechanism relies on hooks running in "stack" order, which vitest
 // resolves by default and which vitest.config.ts now pins explicitly. Under
 // "stack", this setup file's afterEach runs LAST (reverse registration order),
@@ -52,9 +73,21 @@ function pinTokenFile(): void {
 //
 // It also assumes tests do not run concurrently within a file: process.env is
 // process-global, so `test.concurrent` would interleave mid-body and no hook
-// discipline could save it. There are currently zero uses of `test.concurrent`
-// in this package, and they must not be introduced without revisiting this.
+// discipline could save it. That ban is enforced structurally by
+// test/setup-isolation.test.ts, not merely asserted here.
 beforeEach(() => {
+  // Snapshot BEFORE repairing. Repair-and-report: the pin below guarantees the
+  // test is safe regardless, but a dangerous INCOMING state is a real defect
+  // that must not be swallowed. Guarding after the pin -- as an earlier version
+  // of this file did -- makes the checks structurally unable to fire, because
+  // the pin has already destroyed the very condition they test for.
+  // Either the environment the whole run started in, or whatever the previous
+  // test left behind. Both are "a token this test did not create".
+  const incomingTokenFile =
+    AMBIENT_TOKEN_FILE ?? process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+  const incomingTokenEnv =
+    AMBIENT_TOKEN_ENV ?? process.env.PIGEON_DAEMON_AUTH_TOKEN
+
   pinTokenFile()
 
   if (!process.env.PIGEON_DAEMON_URL) {
@@ -68,25 +101,35 @@ beforeEach(() => {
       "Test isolation guard: PIGEON_DAEMON_URL or TELEGRAM_WEBHOOK_PORT targets live production daemon port 4731!"
     )
   }
-  // Cheap early tripwire for the most obvious way to get this wrong.
-  if (process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE === PRODUCTION_TOKEN_PATH) {
+
+  // Incoming state was pointed at the live secret. Never legitimate: no test
+  // exercises the production path, and the harness pins away from it.
+  if (incomingTokenFile === PRODUCTION_TOKEN_PATH) {
     throw new Error(
-      "Test isolation guard: PIGEON_DAEMON_AUTH_TOKEN_FILE targets the live production secret!"
+      "Test isolation guard: PIGEON_DAEMON_AUTH_TOKEN_FILE pointed at the live " +
+        `production secret (${PRODUCTION_TOKEN_PATH}) at test start. It has been ` +
+        "re-pinned so this test is safe, but something set it and that is a bug. " +
+        "If it came from your shell, unset it before running the suite."
+    )
+  }
+  // A token supplied by the ambient environment is a token the test did not
+  // create. Deleting it silently would hide a real misconfiguration.
+  if (incomingTokenEnv) {
+    throw new Error(
+      "Test isolation guard: PIGEON_DAEMON_AUTH_TOKEN was set at test start by " +
+        "something other than a test. It has been unset so this test is safe. " +
+        "If it came from your shell, unset it before running the suite."
     )
   }
 
-  // THE structural guard: assert no token is RESOLVABLE at test start, rather
-  // than that a particular variable holds a particular string.
+  // Finally, verify the repair ITSELF worked -- this is what catches someone
+  // deleting the pin above, or TEST_NO_TOKEN_PATH somehow coming into existence.
   //
   // It asks the REAL resolver rather than re-implementing its precedence here.
   // An earlier version duplicated the `env ?? hardcoded default` fallback, which
   // would have kept passing -- while guarding the wrong thing -- if auth-token.ts
   // ever changed its default path or precedence. Probing the resolver means this
   // tracks those semantics for free.
-  //
-  // The probe is why the pin must come first: post-pin the effective path is
-  // /nonexistent/..., so this costs one failed existsSync and reads the
-  // production file only in the case where the leak has ALREADY happened.
   const resolvable = resolveDaemonToken({ forceRefresh: true })
   invalidateDaemonToken() // never leave a probed token in the memo
   if (resolvable) {
@@ -94,8 +137,8 @@ beforeEach(() => {
     // test output ends up in CI logs.
     throw new Error(
       "Test isolation guard: a daemon auth token is resolvable at test start " +
-        `(PIGEON_DAEMON_AUTH_TOKEN ${process.env.PIGEON_DAEMON_AUTH_TOKEN ? "is set" : "unset"}, ` +
-        `effective token file ${process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE ?? PRODUCTION_TOKEN_PATH}). ` +
+        "even after re-pinning, which means the pin itself is broken " +
+        `(effective token file ${process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE ?? PRODUCTION_TOKEN_PATH}). ` +
         "Tests must only ever see a token they created themselves."
     )
   }
