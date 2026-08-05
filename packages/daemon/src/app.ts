@@ -152,6 +152,36 @@ export function parseSwarmSendBody(
     };
   }
 
+  // Reserve ':' in the msg_id namespace, for the same reason `kind` reserves
+  // the "swarm." prefix directly above.
+  //
+  // Durable operational_alerts are deduped by a UNIQUE index on ref_msg_id
+  // ALONE, and pigeon keys its OWN alerts on ':'-delimited synthetic refs
+  // ("wake-lost:<msgId>", "watchdog-stall:<ts>") precisely so they cannot
+  // occupy the dedupe slot belonging to a real message. That separation is
+  // only structural if a msg_id can never contain ':'. Without this guard it
+  // was merely conventional: msg_id is accepted verbatim from the request
+  // body, so a caller minting "wake-lost:msg_real" takes the slot belonging
+  // to real row msg_real's payload-carrying alert — and enqueue's ON CONFLICT
+  // DO NOTHING drops it SILENTLY, since callers discard the return value.
+  // That is the exact silent loss this alert exists to prevent.
+  //
+  // Costs nothing real: every msg_id pigeon has ever minted is
+  // `msg_<base36>_<uuid8>` (daemon ids.ts and the plugin agree), and all 745
+  // rows in the production DB match it with zero colons.
+  if (callerMsgId !== null && callerMsgId.includes(":")) {
+    return {
+      ok: false,
+      response: Response.json(
+        {
+          error:
+            "msg_id cannot contain ':' (reserved as pigeon's alert-reference delimiter)",
+        },
+        { status: 400 },
+      ),
+    };
+  }
+
   if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
   if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
   if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };

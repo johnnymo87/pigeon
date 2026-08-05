@@ -1474,9 +1474,16 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(1_000_000); // blockedAge = 1,000,000 > stuckAlertMs (900_000)
     await watchdog.processOnce();
 
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-    const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
-    expect(severity).toBe("error");
+    // pigeon-fww: this alert is now DURABLE, so it is asserted on the queued
+    // row rather than on the best-effort send. The content requirements are
+    // unchanged — only the channel moved.
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+    const queued = storage.db
+      .prepare("SELECT * FROM operational_alerts")
+      .all() as Array<Record<string, unknown>>;
+    expect(queued).toHaveLength(1);
+    const alertText = String(queued[0]!.text);
+    expect(queued[0]!.severity).toBe("error");
     expect(alertText).not.toContain("expected for idle target");
     expect(alertText).toContain("not found in target transcript");
     expect(alertText).toContain("may be lost");
@@ -1840,7 +1847,7 @@ describe("DeliveryWatchdog", () => {
       expect(alertText).toContain("no longer exists");
     });
 
-    it("Path 5: lost-wake-unverified (anchor === null) includes payload in sendPlainAlert", async () => {
+    it("Path 5: lost-wake-unverified (anchor === null) includes payload in the durable alert", async () => {
       fixture = makeFixture();
       const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
       const now = 1_000_000;
@@ -1865,12 +1872,247 @@ describe("DeliveryWatchdog", () => {
 
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertText = sendPlainAlert.mock.calls[0]![0];
+      // pigeon-fww: the payload now rides the durable channel, so a failed
+      // send retries instead of losing the only copy a human would ever see.
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      const alertText = String(alerts[0]!.text);
       expect(alertText).toContain("m_path5_wake");
       expect(alertText).toContain("ses_b");
       expect(alertText).toContain("run database migrations");
       expect(alertText).toContain("not found in target transcript");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // pigeon-fww: the lost-wake alert was the last inline best-effort alert in
+  // the WAKE population, and it is the one that carries the payload — for a
+  // self-wake it is the only way the content ever reaches a human. Sent
+  // inline it is lost permanently on a 429, a blip, or a crash.
+  //
+  // pigeon-uhh converted the two wake TERMINAL sites by enqueueing inside
+  // their markFailed transaction. This site deliberately has NO state change
+  // (the row stays handed_off — the evidence cannot condemn it), so there was
+  // no transaction to ride in and the conversion silently did not apply.
+  // -------------------------------------------------------------------------
+  describe("pigeon-fww: the lost-wake alert must be durable", () => {
+    function lostWakeFixture(msgId: string, payload: string) {
+      const f = makeFixture();
+      fixture = f;
+      const now = 1_000_000;
+      f.setNow(now);
+      const client = makeClient();
+      // Transcript does NOT contain msg_id -> anchor === null
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(now - 800_000, "unrelated message"),
+      ]);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({
+        msgId,
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: now - 950_000, // stuckAlertMs = 900_000
+        kind: "wake",
+        deliverAt: now - 1_000_000,
+        payload,
+      });
+      return { ...f, now, client };
+    }
+
+    function alertRows(storage: StorageDb) {
+      return storage.db
+        .prepare("SELECT * FROM operational_alerts ORDER BY created_at, ref_msg_id")
+        .all() as Array<Record<string, unknown>>;
+    }
+
+    it("enqueues the lost-wake alert durably instead of sending it inline", async () => {
+      const { storage, watchdog, sendPlainAlert } = lostWakeFixture(
+        "m_fww_durable",
+        "run database migrations",
+      );
+
+      await watchdog.processOnce();
+
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.source).toBe("wake-lost-unverified");
+      // The payload a human needs must survive in the durable row.
+      const text = String(rows[0]!.text);
+      expect(text).toContain("m_fww_durable");
+      expect(text).toContain("run database migrations");
+      expect(text).toContain("not found in target transcript");
+      // and must NOT have gone out on the best-effort path, or a failed send
+      // still loses it.
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+    });
+
+    it("does not consume the dedupe slot of a later terminal alert for the same row", async () => {
+      // THE TRAP. The dedupe index is UNIQUE on ref_msg_id ALONE, so keying
+      // this advisory on the bare msgId would make it swallow the row's later
+      // TERMINAL alert via ON CONFLICT DO NOTHING — leaving "may be lost" as
+      // the human's last word about a row that has since been marked failed.
+      const f = lostWakeFixture("m_fww_trap", "deploy the hotfix");
+      const { storage, watchdog, client } = f;
+
+      await watchdog.processOnce();
+      expect(alertRows(storage)).toHaveLength(1);
+
+      // Same row, later cycle: the session is now confirmed gone (both
+      // clients 404), which marks it failed and enqueues on ref = msgId.
+      const dead = makeClient();
+      dead.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (404): Not found"),
+      );
+      const dead2 = makeClient();
+      dead2.getSessionMessages.mockRejectedValue(
+        new Error("getSessionMessages failed (404): Not found"),
+      );
+      f.clientMap.set("ses_b", { preferred: dead, all: [dead, dead2] });
+      void client;
+      f.setNow(f.now + 60_000);
+
+      await watchdog.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_fww_trap")!.state).toBe("failed");
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(2);
+      const refs = rows.map((r) => String(r.ref_msg_id)).sort();
+      expect(refs).toEqual(["m_fww_trap", "wake-lost:m_fww_trap"]);
+      // The terminal alert must actually be present, not silently dropped.
+      const terminal = rows.find((r) => r.ref_msg_id === "m_fww_trap")!;
+      expect(String(terminal.text)).toContain("no longer exists");
+    });
+
+    it("enqueues at most one lost-wake alert across repeated cycles", async () => {
+      const f = lostWakeFixture("m_fww_dedupe", "payload");
+      const { storage, watchdog } = f;
+
+      await watchdog.processOnce();
+      f.setNow(f.now + 60_000);
+      await watchdog.processOnce();
+
+      expect(alertRows(storage)).toHaveLength(1);
+    });
+
+    it("after a restart, an already-recorded alert is not re-enqueued and is not counted as a fresh alert", async () => {
+      // The in-memory Set does not survive a daemon restart, so the durable
+      // row becomes the dedupe of record and enqueue returns false. That
+      // `false` must NOT be counted or logged as a new alert: `counts.alerted`
+      // feeds the cycle summary, and an "alerted" log line for an alert that
+      // was never enqueued is a human-facing claim that did not happen.
+      //
+      // This is the layer the in-memory Set cannot provide. Within one process
+      // the Set already caps this at one alert; across a restart only the
+      // durable row can. Note the durable half is not eternal — an alert
+      // deleted by retention (an hour after it is SENT) frees its ref — so the
+      // two layers together mean: one alert per process, and no duplicate from
+      // a restart that happens while the alert is still on the books.
+      const f = lostWakeFixture("m_fww_restart", "payload");
+      const { storage, watchdog, resolveClients } = f;
+
+      const first = await watchdog.processOnce();
+      expect(first.alerted).toBe(1);
+      expect(alertRows(storage)).toHaveLength(1);
+
+      // Restart: a brand-new watchdog over the SAME storage, so every
+      // in-memory dedupe Set starts empty.
+      const restarted = new DeliveryWatchdog({
+        storage,
+        resolveClients,
+        notifier: { sendPlainAlert: f.sendPlainAlert },
+        nowFn: () => f.now + 60_000,
+        log: () => {},
+      });
+
+      const second = await restarted.processOnce();
+
+      expect(alertRows(storage)).toHaveLength(1);
+      expect(second.alerted).toBe(0);
+    });
+
+    it("an earlier ephemeral advisory for the same row cannot suppress the durable payload alert", async () => {
+      // `stuckAlerted` is SHARED with the queued-behind-turn branch. While the
+      // lost-wake branch was gated on that Set, a row that first appeared
+      // blocked behind a live turn consumed the budget with a losable,
+      // payload-less warning — and the durable payload alert was then never
+      // even ATTEMPTED for the rest of the process lifetime, because the row
+      // never leaves the eligible set for reconcileDedupe to prune.
+      //
+      // The two alerts are not interchangeable: one is a warning, the other is
+      // the last-resort delivery of the message body. So the durable branch is
+      // no longer gated on any in-memory Set — the alert ROW is the dedupe of
+      // record, which is also why a transient enqueue failure simply retries.
+      const f = makeFixture();
+      fixture = f;
+      const now = 1_000_000;
+      f.setNow(now);
+
+      const client = makeClient();
+      // Cycle 1: anchor present, and a turn that STARTED BEFORE it is still
+      // running -> the queued-behind-turn advisory fires and takes the budget.
+      client.getSessionMessages.mockResolvedValue([
+        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+        userMessage(50, `<swarm_message v="1" msg_id="m_fww_shared">`),
+      ]);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({
+        msgId: "m_fww_shared",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0, // blockedAge = 1_000_000 > stuckAlertMs (900_000)
+        kind: "wake",
+        deliverAt: 1,
+        payload: "SHARED_BUDGET_PAYLOAD",
+      });
+
+      await f.watchdog.processOnce();
+      expect(f.sendPlainAlert).toHaveBeenCalledTimes(1); // the ephemeral one
+      expect(alertRows(f.storage)).toHaveLength(0);
+
+      // Cycle 2: the anchor is no longer visible in the transcript, so this is
+      // now the lost-wake case and the payload must reach the durable channel.
+      client.getSessionMessages.mockResolvedValue([]);
+      f.setNow(now + 60_000);
+
+      await f.watchdog.processOnce();
+
+      const rows = alertRows(f.storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("wake-lost:m_fww_shared");
+      expect(String(rows[0]!.text)).toContain("SHARED_BUDGET_PAYLOAD");
+    });
+
+    it("a throwing enqueue does not poison the dedupe — the next cycle retries", async () => {
+      // Ordering guard: the in-memory Set add must happen AFTER the enqueue.
+      // If it happens first (as it did when the send could not throw), a
+      // transient SQLITE_BUSY suppresses the alert for the whole process
+      // lifetime — the row never leaves the eligible set, so reconcileDedupe
+      // never prunes it, and the payload is lost exactly as before.
+      const f = lostWakeFixture("m_fww_throw", "payload");
+      const { storage, watchdog } = f;
+
+      const real = storage.alerts.enqueue.bind(storage.alerts);
+      let calls = 0;
+      const spy = vi
+        .spyOn(storage.alerts, "enqueue")
+        .mockImplementation((input: Parameters<typeof real>[0]) => {
+          calls++;
+          if (calls === 1) throw new Error("SQLITE_BUSY: database is locked");
+          return real(input);
+        });
+
+      await watchdog.processOnce();
+      expect(alertRows(storage)).toHaveLength(0);
+
+      f.setNow(f.now + 60_000);
+      await watchdog.processOnce();
+
+      expect(alertRows(storage)).toHaveLength(1);
+      expect(String(alertRows(storage)[0]!.ref_msg_id)).toBe("wake-lost:m_fww_throw");
+      spy.mockRestore();
     });
   });
 
@@ -2598,9 +2840,15 @@ describe("DeliveryWatchdog", () => {
       expect(row.requeueCount).toBe(0);
       expect(row.nudgeCount).toBe(0);
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [alertText, severity] = sendPlainAlert.mock.calls[0]!;
-      expect(severity).toBe("error");
+      // pigeon-fww: durable channel, same content. Asserted on the queued row.
+      expect(sendPlainAlert).not.toHaveBeenCalled();
+      const queued = storage.db
+        .prepare("SELECT * FROM operational_alerts")
+        .all() as Array<Record<string, unknown>>;
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.severity).toBe("error");
+      expect(queued[0]!.ref_msg_id).toBe("wake-lost:wake_no_anchor");
+      const alertText = String(queued[0]!.text);
       expect(alertText).toContain("delivery watchdog: prompt lost and unverified");
       expect(alertText).toContain("MISSING_ANCHOR_PAYLOAD");
       expect(alertText).toContain("prompt for msg wake_no_anchor to ses_b not found in target transcript");
