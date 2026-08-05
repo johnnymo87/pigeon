@@ -72,6 +72,15 @@ export class OpencodeClient {
    * Bounds every request so a serve that ACCEPTS the connection but never
    * responds cannot leave a promise pending forever (bead pigeon-h21).
    *
+   * The deadline covers the RESPONSE BODY as well as the headers (pigeon-wfj1).
+   * The original h21 fix disarmed the abort in a `finally` that ran the moment
+   * the fetch promise resolved -- i.e. when the headers arrived -- and each
+   * caller then read the body unbounded. A serve that returns 200 headers and
+   * then stalls mid-body reproduced the exact defect h21 was written to
+   * prevent, one phase later. That is why callers pass a `consume` callback
+   * instead of receiving the `Response`: the body cannot be read outside the
+   * bound, because the Response never leaves this method.
+   *
    * That state is worse than a fast failure. The SwarmArbiter is
    * at-most-one-in-flight per target and releases the slot in a `.finally()`
    * (`swarm/arbiter.ts:76-77`), so a promise that never settles wedges ALL swarm
@@ -83,7 +92,11 @@ export class OpencodeClient {
    * into any serve-health verdict -- see
    * docs/plans/2026-07-27-serve-serviceability-design.md 5.1 C.
    */
-  private async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  private async request<T>(
+    url: string,
+    init: RequestInit,
+    consume: (res: Response) => T | Promise<T>,
+  ): Promise<T> {
     const buildHeaders = (): Record<string, string> => {
       const authHeader = resolveServeAuthHeader();
       const authObj: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
@@ -94,16 +107,52 @@ export class OpencodeClient {
       };
     };
 
-    const execFetch = async (): Promise<Response> => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    // ONE deadline for the WHOLE call: connect, headers, retry, and body. The
+    // controller stays armed across all of them, so there is no window in which
+    // a stalled peer can leave us pending. See the doc comment above for why
+    // the body phase is the one that actually bit us (pigeon-wfj1).
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new RequestTimeoutError(this.requestTimeoutMs, url));
+      }, this.requestTimeoutMs);
+    });
+    // The loser of every race below is left rejecting into the void; without a
+    // handler that is an unhandled rejection (fatal under Node's default).
+    deadline.catch(() => {});
+
+    /**
+     * Race `p` against the shared deadline without leaking its rejection.
+     *
+     * Aborting makes an in-flight body read reject with AbortError, which RACES
+     * the deadline's own rejection. Converting here makes the caller's error
+     * deterministic instead of depending on which rejection lands first -- and
+     * it matters: `RequestTimeoutError` is what keeps a hung serve out of the
+     * health verdict and away from the watchdog's 404-terminal path.
+     */
+    const withDeadline = async <R>(p: Promise<R>): Promise<R> => {
+      p.catch(() => {});
       try {
-        const response = await this.fetchFn(url, {
+        return await Promise.race([p, deadline]);
+      } catch (err) {
+        if (controller.signal.aborted && !(err instanceof RequestTimeoutError)) {
+          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          this.observe({ error: timeout });
+          throw timeout;
+        }
+        throw err;
+      }
+    };
+
+    const execFetch = async (): Promise<Response> => {
+      try {
+        return await this.fetchFn(url, {
           ...init,
           headers: buildHeaders(),
           signal: controller.signal,
         });
-        return response;
       } catch (err) {
         if (controller.signal.aborted) {
           const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
@@ -113,12 +162,11 @@ export class OpencodeClient {
         const transportErr = new TransportError(err as Error);
         this.observe({ error: transportErr });
         throw transportErr;
-      } finally {
-        clearTimeout(timer);
       }
     };
 
-    let res = await execFetch();
+    try {
+      let res = await withDeadline(execFetch());
 
     // Credential rotation self-heal: a 401 may mean the cached header is stale
     // (the secret file was rewritten under a long-running daemon). Re-resolve and
@@ -128,49 +176,68 @@ export class OpencodeClient {
     // by the auth middleware before the body is parsed or any handler runs, so no
     // side effect can have occurred on the first attempt -- that is what makes this
     // safe for the non-idempotent methods (prompt_async, summarize, abort, delete).
-    if (res.status === 401) {
-      const staleHeader = resolveServeAuthHeader();
-      invalidateServeAuthHeader();
-      const freshHeader = resolveServeAuthHeader();
-      if (freshHeader !== undefined && freshHeader !== staleHeader) {
-        // Release the discarded response's socket back to the undici pool instead of
-        // waiting for GC; this client runs on every swarm delivery.
-        res.body?.cancel().catch(() => {});
-        res = await execFetch();
+      if (res.status === 401) {
+        const staleHeader = resolveServeAuthHeader();
+        invalidateServeAuthHeader();
+        const freshHeader = resolveServeAuthHeader();
+        if (freshHeader !== undefined && freshHeader !== staleHeader) {
+          // Release the discarded response's socket back to the undici pool instead of
+          // waiting for GC; this client runs on every swarm delivery.
+          res.body?.cancel().catch(() => {});
+          res = await withDeadline(execFetch());
+        }
       }
-    }
 
-    // Observe the FINAL status only. A transient 401 that succeeded on retry should
-    // not be reported as a failed request. This does not weaken the serve-health
-    // verdict: classifyServeOutcome() already treats 4xx as client_error, and
-    // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
-    // rule B -- "4xx IS NOT ILL-HEALTH").
-    this.observe({ status: res.status });
-    return res;
+      // Observe the FINAL status only. A transient 401 that succeeded on retry should
+      // not be reported as a failed request. This does not weaken the serve-health
+      // verdict: classifyServeOutcome() already treats 4xx as client_error, and
+      // countsTowardVerdict() admits only "refused" and "server_error" (serve-outcome.ts
+      // rule B -- "4xx IS NOT ILL-HEALTH").
+      this.observe({ status: res.status });
+
+      // The body is read HERE, still inside the deadline. Callers never receive
+      // the Response, so there is no way to read a body outside the bound --
+      // the guarantee is structural, not a convention someone must remember.
+      // `Promise.resolve` on a native promise returns THAT promise, adding no
+      // microtask hop. That is deliberate: with a hop, the deadline's rejection
+      // always beat the body's abort rejection to the race, so the
+      // abort->timeout conversion in `withDeadline` was unreachable — it only
+      // looked protective. A `consume` that returns the body promise directly
+      // (no `async` wrapper) has no hop, and then the abort rejection DOES win.
+      // Keeping the shapes indistinguishable means the conversion is exercised
+      // rather than dead.
+      return await withDeadline(Promise.resolve(consume(res)));
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      const response = await this.fetchWithTimeout(`${this.baseUrl}/global/health`, {
-        method: "GET",
-      });
-      return response.ok;
+      return await this.request(
+        `${this.baseUrl}/global/health`,
+        { method: "GET" },
+        (response) => response.ok,
+      );
     } catch {
       return false;
     }
   }
 
   async createSession(directory: string): Promise<{ id: string }> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session`, {
-      method: "POST",
-      headers: { "x-opencode-directory": directory },
-    });
-
-    if (!response.ok) {
-      throw new Error(`createSession failed: ${response.status} ${response.statusText}`);
-    }
-
-    return response.json() as Promise<{ id: string }>;
+    return this.request(
+      `${this.baseUrl}/session`,
+      {
+        method: "POST",
+        headers: { "x-opencode-directory": directory },
+      },
+      async (response) => {
+        if (!response.ok) {
+          throw new Error(`createSession failed: ${response.status} ${response.statusText}`);
+        }
+        return (await response.json()) as { id: string };
+      },
+    );
   }
 
   /**
@@ -180,21 +247,23 @@ export class OpencodeClient {
    * "opencode-serve is unreachable."
    */
   async getSession(sessionId: string): Promise<{ id: string; directory: string } | null> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
-      method: "GET",
-    });
+    return this.request(
+      `${this.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      { method: "GET" },
+      async (response) => {
+        if (response.status === 404) return null;
 
-    if (response.status === 404) return null;
+        if (!response.ok) {
+          throw new Error(`getSession failed: ${response.status} ${response.statusText}`);
+        }
 
-    if (!response.ok) {
-      throw new Error(`getSession failed: ${response.status} ${response.statusText}`);
-    }
-
-    const body = (await response.json()) as { id?: string; directory?: string };
-    if (!body || !body.id || !body.directory) {
-      throw new Error(`getSession response missing id or directory: ${JSON.stringify(body)}`);
-    }
-    return { id: body.id, directory: body.directory };
+        const body = (await response.json()) as { id?: string; directory?: string };
+        if (!body || !body.id || !body.directory) {
+          throw new Error(`getSession response missing id or directory: ${JSON.stringify(body)}`);
+        }
+        return { id: body.id, directory: body.directory };
+      },
+    );
   }
 
   async getSessionInfo(sessionId: string): Promise<{
@@ -203,132 +272,161 @@ export class OpencodeClient {
     directory: string;
     time: { created: number; updated: number };
   } | null> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${encodeURIComponent(sessionId)}`, {
-      method: "GET",
-    });
+    return this.request(
+      `${this.baseUrl}/session/${encodeURIComponent(sessionId)}`,
+      { method: "GET" },
+      async (response) => {
+        if (response.status === 404) return null;
 
-    if (response.status === 404) return null;
+        if (!response.ok) {
+          throw new Error(`getSessionInfo failed: ${response.status} ${response.statusText}`);
+        }
 
-    if (!response.ok) {
-      throw new Error(`getSessionInfo failed: ${response.status} ${response.statusText}`);
-    }
+        const body = (await response.json()) as {
+          id?: string;
+          title?: string;
+          directory?: string;
+          time?: { created?: number; updated?: number };
+        };
 
-    const body = (await response.json()) as {
-      id?: string;
-      title?: string;
-      directory?: string;
-      time?: { created?: number; updated?: number };
-    };
+        if (!body || !body.id || !body.directory) {
+          throw new Error(`getSessionInfo response missing id or directory: ${JSON.stringify(body)}`);
+        }
 
-    if (!body || !body.id || !body.directory) {
-      throw new Error(`getSessionInfo response missing id or directory: ${JSON.stringify(body)}`);
-    }
-
-    return {
-      id: body.id,
-      title: body.title ?? "",
-      directory: body.directory,
-      time: {
-        created: body.time?.created ?? 0,
-        updated: body.time?.updated ?? 0,
+        return {
+          id: body.id,
+          title: body.title ?? "",
+          directory: body.directory,
+          time: {
+            created: body.time?.created ?? 0,
+            updated: body.time?.updated ?? 0,
+          },
+        };
       },
-    };
+    );
   }
 
   async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
-      method: "POST",
-      headers: {
-        "x-opencode-directory": directory,
-        "Content-Type": "application/json",
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}/prompt_async`,
+      {
+        method: "POST",
+        headers: {
+          "x-opencode-directory": directory,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ parts: [{ type: "text", text: prompt }] }),
       },
-      body: JSON.stringify({ parts: [{ type: "text", text: prompt }] }),
-    });
-
-    if (!response.ok) {
-      throw new OpencodeHttpError(
-        response.status,
-        response.statusText,
-        `sendPrompt failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      (response) => {
+        if (!response.ok) {
+          throw new OpencodeHttpError(
+            response.status,
+            response.statusText,
+            `sendPrompt failed: ${response.status} ${response.statusText}`,
+          );
+        }
+      },
+    );
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}`, {
-      method: "DELETE",
-    });
-
-    if (!response.ok) {
-      throw new Error(`deleteSession failed: ${response.status} ${response.statusText}`);
-    }
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}`,
+      { method: "DELETE" },
+      (response) => {
+        if (!response.ok) {
+          throw new Error(`deleteSession failed: ${response.status} ${response.statusText}`);
+        }
+      },
+    );
   }
 
   async abortSession(sessionId: string): Promise<void> {
-    const response = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/abort`, {
-      method: "POST",
-    });
-
-    if (!response.ok) {
-      throw new Error(`abortSession failed: ${response.status} ${response.statusText}`);
-    }
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}/abort`,
+      { method: "POST" },
+      (response) => {
+        if (!response.ok) {
+          throw new Error(`abortSession failed: ${response.status} ${response.statusText}`);
+        }
+      },
+    );
   }
 
   async getSessionMessages(sessionId: string): Promise<unknown[]> {
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/message`, {
-      method: "GET",
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`getSessionMessages failed (${res.status}): ${body}`);
-    }
-    return res.json();
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}/message`,
+      { method: "GET" },
+      async (res) => {
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`getSessionMessages failed (${res.status}): ${body}`);
+        }
+        return (await res.json()) as unknown[];
+      },
+    );
   }
 
   async summarize(sessionId: string, providerID: string, modelID: string): Promise<void> {
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/session/${sessionId}/summarize`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ providerID, modelID, auto: false }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`summarize failed (${res.status}): ${body}`);
-    }
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}/summarize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerID, modelID, auto: false }),
+      },
+      async (res) => {
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`summarize failed (${res.status}): ${body}`);
+        }
+      },
+    );
   }
 
   async mcpStatus(directory?: string): Promise<Record<string, { status: string; error?: string }>> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp`, {
-      method: "GET",
-      ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`mcpStatus failed (${res.status}): ${body}`);
-    }
-    return res.json() as Promise<Record<string, { status: string; error?: string }>>;
+    return this.request(
+      `${this.baseUrl}/mcp`,
+      {
+        method: "GET",
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      },
+      async (res) => {
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`mcpStatus failed (${res.status}): ${body}`);
+        }
+        return (await res.json()) as Record<string, { status: string; error?: string }>;
+      },
+    );
   }
 
   async mcpConnect(name: string, directory?: string): Promise<boolean> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`, {
-      method: "POST",
-      ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    });
-    return res.ok;
+    return this.request(
+      `${this.baseUrl}/mcp/${encodeURIComponent(name)}/connect`,
+      {
+        method: "POST",
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      },
+      (res) => res.ok,
+    );
   }
 
   async mcpDisconnect(name: string, directory?: string): Promise<boolean> {
     const headers: Record<string, string> = {};
     if (directory) headers["x-opencode-directory"] = directory;
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`, {
-      method: "POST",
-      ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    });
-    return res.ok;
+    return this.request(
+      `${this.baseUrl}/mcp/${encodeURIComponent(name)}/disconnect`,
+      {
+        method: "POST",
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      },
+      (res) => res.ok,
+    );
   }
 
   async listProviders(): Promise<{
@@ -336,17 +434,20 @@ export class OpencodeClient {
     default: Record<string, string>;
     connected: string[];
   }> {
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/provider`, {
-      method: "GET",
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`listProviders failed (${res.status}): ${body}`);
-    }
-    return res.json() as Promise<{
-      all: Array<{ id: string; models: Record<string, unknown> }>;
-      default: Record<string, string>;
-      connected: string[];
-    }>;
+    return this.request(
+      `${this.baseUrl}/provider`,
+      { method: "GET" },
+      async (res) => {
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`listProviders failed (${res.status}): ${body}`);
+        }
+        return (await res.json()) as {
+          all: Array<{ id: string; models: Record<string, unknown> }>;
+          default: Record<string, string>;
+          connected: string[];
+        };
+      },
+    );
   }
 }

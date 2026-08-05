@@ -76,6 +76,7 @@ function makeClient(): WatchdogClient & {
 
 function makeFixture(opts?: {
   directoryForSession?: (sessionId: string) => Promise<string | undefined>;
+  stallAlertMs?: number;
 }) {
   const storage: StorageDb = openStorageDb(":memory:");
   let now = 1_000_000;
@@ -93,6 +94,7 @@ function makeFixture(opts?: {
     notifier: { sendPlainAlert },
     nowFn: () => now,
     log: () => {},
+    ...(opts?.stallAlertMs !== undefined ? { stallAlertMs: opts.stallAlertMs } : {}),
   });
 
   function insertHandedOff(opts: {
@@ -802,6 +804,129 @@ describe("DeliveryWatchdog", () => {
     const firstResult = await first;
     expect(firstResult.coalesced).toBe(false);
     expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // pigeon-wfj1: stall TELEMETRY.
+  //
+  // The point of these is what they do NOT do. Nothing here force-clears the
+  // `processing` flag. A stalled cycle stays stalled -- it just stops being
+  // SILENT. Force-clearing would let two runCycle() bodies overlap, and the
+  // dedupe Sets are check-then-act across awaits while the nudge budget is read
+  // off a row snapshot taken before an await, so overlapping cycles could
+  // double-nudge a live session. That trades a silent death for a possibly
+  // corrupt life; the roadmap's rule is that an honest unknown is shippable.
+  // -------------------------------------------------------------------------
+
+  /** Start a cycle that hangs inside fetchTranscript until the returned fn is called. */
+  function makeHungCycle(fixture: ReturnType<typeof makeFixture>) {
+    const client = makeClient();
+    let release!: (v: unknown[]) => void;
+    client.getSessionMessages.mockImplementation(
+      () => new Promise((resolve) => { release = resolve; }),
+    );
+    fixture.clientMap.set("ses_b", { preferred: client, all: [client] });
+    fixture.insertHandedOff({
+      msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0,
+    });
+    return { release: () => release([]) };
+  }
+
+  it("36. a cycle stalled past the deadline enqueues a durable alert", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog } = fixture;
+    const hung = makeHungCycle(fixture);
+
+    fixture.setNow(400_000);
+    const first = watchdog.processOnce();
+    await Promise.resolve();
+
+    // Not yet overdue: a slow cycle is not a stalled one.
+    fixture.setNow(400_000 + 599_999);
+    expect((await watchdog.processOnce()).coalesced).toBe(true);
+    expect(storage.alerts.countDrainable(Date.now())).toBe(0);
+
+    // Past the deadline.
+    fixture.setNow(400_000 + 600_001);
+    expect((await watchdog.processOnce()).coalesced).toBe(true);
+
+    const alert = storage.alerts.nextDrainable(400_000 + 600_001);
+    expect(alert).toBeDefined();
+    expect(alert!.source).toBe("delivery-watchdog-stall");
+    expect(alert!.severity).toBe("error");
+    // Prose is part of the state machine: it must say the monitor itself is
+    // down and that recovery is not running, or a reader will not act on it.
+    expect(alert!.text).toMatch(/delivery watchdog/i);
+    expect(alert!.text).toMatch(/10m/);
+
+    hung.release();
+    await first;
+  });
+
+  it("37. one alert per stall EPISODE, not one per cycle", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog } = fixture;
+    const hung = makeHungCycle(fixture);
+
+    fixture.setNow(400_000);
+    const first = watchdog.processOnce();
+    await Promise.resolve();
+
+    for (const t of [1_100_000, 1_200_000, 1_300_000]) {
+      fixture.setNow(t);
+      await watchdog.processOnce();
+    }
+
+    // The unique index is on ref_msg_id, and the synthetic ref is keyed on the
+    // stalled cycle's start -- so repeat cycles of the SAME episode collapse.
+    expect(storage.alerts.countDrainable(1_300_000)).toBe(1);
+
+    hung.release();
+    await first;
+  });
+
+  // The stall path must not itself be able to hang, or the alarm inherits the
+  // failure it exists to report. Enqueue is better-sqlite3 and synchronous; the
+  // independent AlertDrainer does the network send.
+  it("38. the stall alert is recorded WITHOUT touching the network", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog, sendPlainAlert } = fixture;
+    const hung = makeHungCycle(fixture);
+
+    fixture.setNow(400_000);
+    const first = watchdog.processOnce();
+    await Promise.resolve();
+
+    fixture.setNow(1_100_000);
+    await watchdog.processOnce();
+
+    expect(storage.alerts.countDrainable(1_100_000)).toBe(1);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
+
+    hung.release();
+    await first;
+  });
+
+  it("39. reporting a stall does NOT restart the loop or overlap cycles", async () => {
+    fixture = makeFixture({ stallAlertMs: 600_000 });
+    const { storage, watchdog } = fixture;
+    const hung = makeHungCycle(fixture);
+    const listSpy = vi.spyOn(storage.swarm, "listUnverifiedHandedOff");
+
+    fixture.setNow(400_000);
+    const first = watchdog.processOnce();
+    await Promise.resolve();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
+    fixture.setNow(1_100_000);
+    const second = await watchdog.processOnce();
+
+    // Still coalesced, still single-flight: the alert is telemetry, not a reset.
+    expect(second.coalesced).toBe(true);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
+    hung.release();
+    await first;
   });
 
   it("20. contradicted 404 second opinion: the winning (alt) client serves the read", async () => {
