@@ -973,7 +973,7 @@ export class DeliveryWatchdog {
    * Helper for suppressing recovery (requeue/abort) on wake / scheduled messages.
    * Handles alerting if blocked past threshold and logs skip. Always returns `false`.
    */
-  private async suppressWakeRecovery(
+  private suppressWakeRecovery(
     row: SwarmMessageRecord,
     sessionId: string,
     now: number,
@@ -981,13 +981,49 @@ export class DeliveryWatchdog {
     severity: AlertSeverity,
     reason: string,
     alertText: string,
-  ): Promise<boolean> {
+  ): boolean {
     const blockedAge = now - (row.handedOffAt ?? now);
     if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
+      // DURABLE, not best-effort (pigeon-fww). `alertText` is built by
+      // formatWakePayloadAlert and CARRIES THE PAYLOAD: for a self-wake there
+      // is no sender watching in-band, so this alert is the only path by which
+      // the message's content ever reaches a human. Sent inline it dies on a
+      // 429, a transport blip, or a daemon crash, and nothing ever re-derives
+      // it — the in-memory Set below suppresses the retry and the row never
+      // leaves the eligible set for reconcileDedupe to prune.
+      //
+      // WHY THE REF IS NAMESPACED. The dedupe index is UNIQUE on ref_msg_id
+      // ALONE, so keying this on the bare msgId would make this ADVISORY
+      // occupy the slot belonging to the row's later TERMINAL alert
+      // (session-deleted / nudges-exhausted, both `refMsgId: row.msgId`), and
+      // ON CONFLICT DO NOTHING would drop the terminal SILENTLY — its return
+      // value is discarded inside those transactions. The human's last word
+      // would stay "may be lost" for a row since marked failed. The
+      // `wake-lost:` prefix keeps this out of the msg_id namespace entirely,
+      // the same device the stall alerts above use. The row can therefore
+      // produce at most two durable alerts: this advisory, and one terminal.
+      //
+      // ENQUEUE BEFORE THE SET ADD, and this order is load-bearing. Unlike
+      // `this.alert` (which swallows everything), enqueue CAN throw —
+      // SQLITE_BUSY, SQLITE_IOERR. Adding to `stuckAlerted` first would
+      // suppress this row's alert for the entire process lifetime on a
+      // transient failure, reproducing the exact silent loss being fixed.
+      const enqueued = this.storage.alerts.enqueue({
+        source: "wake-lost-unverified",
+        refMsgId: `wake-lost:${row.msgId}`,
+        text: alertText,
+        severity,
+        now,
+      });
+      // Added on `false` too: false means the alert is ALREADY durably
+      // recorded, which is equally "this row has been alerted". Note this Set
+      // is SHARED with the queued-behind-turn site, which caps the pair at one
+      // alert per row across both branches; that coupling is deliberate.
       this.stuckAlerted.add(row.msgId);
-      counts.alerted++;
-      await this.alert(severity, alertText);
-      this.log("alerted", { msgId: row.msgId, sessionId, reason });
+      if (enqueued) {
+        counts.alerted++;
+        this.log("alerted", { msgId: row.msgId, sessionId, reason });
+      }
     }
     counts.skipped++;
     this.log("skipped", {
@@ -1131,9 +1167,26 @@ export class DeliveryWatchdog {
             }
           }
 
-          // Task 1: Send via EPHEMERAL alert path (this.alert), NOT durable storage.alerts.enqueue.
-          // Reason: the durable substrate's dedupe index is UNIQUE on ref_msg_id alone,
-          // so an early ADVISORY alert would permanently block a later TERMINAL alert for the same row.
+          // Sent via the EPHEMERAL alert path (this.alert), NOT durable
+          // storage.alerts.enqueue — and after pigeon-fww that is a positive
+          // choice, not the absence of one.
+          //
+          // The reason recorded here originally was "a durable advisory would
+          // permanently block a later TERMINAL alert for this row, because the
+          // dedupe index is UNIQUE on ref_msg_id alone". That hazard is real
+          // but it is no longer a reason to stay ephemeral: pigeon-fww showed
+          // a namespaced ref (`wake-lost:<msgId>`) sidesteps it entirely, so
+          // any site that needs durability can have it.
+          //
+          // This site stays ephemeral because it does not need durability. The
+          // rule: an alert must be DURABLE when losing it can be the final
+          // silent loss of the event — no later durable signal is guaranteed
+          // to fire for the same underlying fact. That is true of the
+          // lost-wake alert (it carries the payload, and the row can sit
+          // handed_off indefinitely). It is NOT true here: this row remains in
+          // a live state machine whose terminal exits — session-deleted and
+          // nudges-exhausted — are both durable. Losing this advisory costs a
+          // human some latency, never the payload.
           //
           // Task 3: REFUSED DESIGN OPTION:
           // opencode-serve's GET /session/status is INSTANCE-SCOPED by the x-opencode-directory header.

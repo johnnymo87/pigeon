@@ -99,6 +99,58 @@ describe("AlertRepository", () => {
     storage.db.close();
   });
 
+  it("dedupe is bounded by row lifetime: cleaning a sent alert frees its refMsgId slot", () => {
+    // The schema comment used to claim this index enforces "one alert per
+    // swarm row, EVER". It does not, and nothing in the code ever did: the
+    // hourly maintenance sweep DELETES sent alerts older than
+    // ALERT_SENT_RETENTION_MS (1h), and deleting the row frees the unique
+    // slot. Dedupe therefore lasts as long as the ALERT ROW exists, not
+    // forever. Pinned here because a comment asserting a property the code
+    // does not enforce is precisely the defect class this project keeps
+    // finding, and because pigeon-fww's namespacing decision was reasoned
+    // about partly in terms of how long a slot stays occupied.
+    const storage = createStorage();
+    const now = 10_000;
+
+    expect(
+      storage.alerts.enqueue({ id: "a1", source: "s", refMsgId: "msg-1", text: "first", severity: "error", now }),
+    ).toBe(true);
+    expect(
+      storage.alerts.enqueue({ id: "a2", source: "s", refMsgId: "msg-1", text: "second", severity: "error", now }),
+    ).toBe(false);
+
+    // Send it, then let the retention sweep collect it.
+    storage.alerts.markSent("a1", now);
+    const cleaned = storage.alerts.cleanupOlderThan(now + 1, now + 1);
+    expect(cleaned).toBe(1);
+
+    // Same refMsgId is now insertable again.
+    expect(
+      storage.alerts.enqueue({ id: "a3", source: "s", refMsgId: "msg-1", text: "third", severity: "error", now: now + 2 }),
+    ).toBe(true);
+
+    storage.db.close();
+  });
+
+  it("a QUEUED alert still holds its slot against the retention sweep", () => {
+    // The complement of the test above, and the property that actually makes
+    // the durable channel safe: an alert that has NOT been sent yet is never
+    // deleted by cleanup (only abandonOlderThan may retire it, as a recorded
+    // state change), so its dedupe slot cannot be freed out from under a
+    // pending send.
+    const storage = createStorage();
+    const now = 10_000;
+
+    storage.alerts.enqueue({ id: "q1", source: "s", refMsgId: "msg-q", text: "queued", severity: "error", now });
+    expect(storage.alerts.cleanupOlderThan(now + 1_000_000, now + 1_000_000)).toBe(0);
+    expect(storage.alerts.getById("q1")).toBeDefined();
+    expect(
+      storage.alerts.enqueue({ id: "q2", source: "s", refMsgId: "msg-q", text: "dup", severity: "error", now }),
+    ).toBe(false);
+
+    storage.db.close();
+  });
+
   it("does NOT dedupe when refMsgId is null", () => {
     const storage = createStorage();
     const now = 10_000;

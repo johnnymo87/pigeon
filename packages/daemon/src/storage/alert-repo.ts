@@ -55,12 +55,31 @@ export function initAlertSchema(db: BetterSqlite3.Database): void {
      * Rows with ref_msg_id IS NULL do NOT collide with each other on ref_msg_id.
      * That is intended (alerts with no message back-pointer are not deduped).
      *
-     * Structural deduplication: unique index on ref_msg_id alone enforces "one alert
-     * per swarm row, ever." That matches the real invariant (a row dies once) and is
-     * deliberately stronger than per-source deduplication. If a future alert class
-     * ever legitimately needs a second alert for the same row, that must be a
-     * deliberate revisit, not something that works by accident because source strings
-     * happened to differ.
+     * Structural deduplication: the unique index is on ref_msg_id ALONE, deliberately
+     * stronger than per-source dedupe, so that a second alert for the same ref can
+     * never appear by accident merely because two source strings differ.
+     *
+     * SCOPE OF THAT GUARANTEE — this comment used to claim "one alert per swarm row,
+     * EVER", and that was never true. Dedupe lasts exactly as long as the ALERT ROW
+     * exists: the hourly maintenance sweep DELETES sent alerts older than
+     * ALERT_SENT_RETENTION_MS (1h) and abandoned ones after 7 days, and deleting a
+     * row frees its slot. A queued alert is never deleted (only abandonOlderThan may
+     * retire it, as a recorded state change), so a pending send cannot lose its slot.
+     * Both halves are pinned by tests in test/alert-repo.test.ts. The practical
+     * effect is that a chronic condition re-alerts at most about once an hour rather
+     * than falling permanently silent — which is the desirable direction, but it is a
+     * time bound, not "ever", and anything reasoning about collisions must use the
+     * real one.
+     *
+     * THE DELIBERATE REVISIT HAPPENED (pigeon-fww). One swarm row may now legitimately
+     * produce TWO durable alerts: an ADVISORY while it is still unresolved, and a
+     * TERMINAL when it dies. They are kept apart not by source label but STRUCTURALLY,
+     * by namespacing the advisory's ref into a separate key space ('wake-lost:<msgId>',
+     * as the watchdog's 'watchdog-stall:<ts>' alerts already do). Terminal alerts keep
+     * the bare msgId. Any future alert class that needs to coexist with a row's
+     * terminal alert MUST take a namespaced ref for the same reason: keying it on the
+     * bare msgId would let the advisory silently swallow the terminal, since enqueue's
+     * 'false' return is discarded at most call sites.
      */
     DROP INDEX IF EXISTS idx_op_alerts_dedupe;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_op_alerts_dedupe ON operational_alerts(ref_msg_id);
