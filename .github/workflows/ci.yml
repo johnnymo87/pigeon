@@ -23,6 +23,10 @@ env:
   # no "engines" field and no .nvmrc, so nothing else states the version.
   # Matches the development box (v22).
   NODE_VERSION: "22"
+  # Single source of truth for the decoy: the value planted at the production
+  # secret path AND the value the canary test asserts the resolver reaches.
+  # Public and non-authenticating by construction.
+  DECOY_TOKEN: "ci-decoy-not-a-real-token"
 
 jobs:
   # The intended required gate.
@@ -91,7 +95,7 @@ jobs:
           grep -qF "\"$DECOY_PATH\"" packages/opencode-plugin/src/auth-token.ts \
             || { echo "::error::auth-token.ts no longer falls back to $DECOY_PATH; update this step"; exit 1; }
           sudo mkdir -p "$(dirname "$DECOY_PATH")"
-          echo "ci-decoy-not-a-real-token" | sudo tee "$DECOY_PATH" >/dev/null
+          echo "$DECOY_TOKEN" | sudo tee "$DECOY_PATH" >/dev/null
           sudo chmod 444 "$DECOY_PATH"
           test -r "$DECOY_PATH" || { echo "::error::decoy was not planted"; exit 1; }
 
@@ -102,6 +106,9 @@ jobs:
         run: npm test
         env:
           PIGEON_SKIP_LOAD_SENSITIVE: "1"
+          # Lets test/setup-isolation.test.ts verify the decoy is actually
+          # reachable, rather than CI merely failing to disprove it.
+          PIGEON_CI_DECOY_TOKEN: ${{ env.DECOY_TOKEN }}
 
       # One shuffled run, random seed. No fixed seed matrix: the seeds we
       # already know pass will keep passing and go stale, whereas a fresh
@@ -140,6 +147,7 @@ jobs:
           done
         env:
           PIGEON_SKIP_LOAD_SENSITIVE: "1"
+          PIGEON_CI_DECOY_TOKEN: ${{ env.DECOY_TOKEN }}
 
   # Not required, and allowed to fail. The proof it runs is real, but its
   # detector infers mutual exclusion from wall-clock timestamps sampled before

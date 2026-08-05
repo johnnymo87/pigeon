@@ -57,6 +57,45 @@ describe("test/setup.ts token-pin harness", { shuffle: false }, () => {
 })
 
 /**
+ * Proves that CI can actually SEE the bug class this harness exists for.
+ *
+ * On cloudbox, /run/secrets/pigeon_daemon_auth_token holds the live bearer, so
+ * an unpinned resolve reaches a real secret. On a bare runner that file is
+ * absent, every such leak resolves to undefined, and CI would stay green while
+ * the bug was live on the dev box. The workflow therefore plants a decoy there.
+ *
+ * Planting it is not the same as it working. This test closes that gap: it
+ * removes the pin exactly as a leaking call site would and asserts the resolver
+ * reaches the planted file. If the decoy step is ever renamed, mis-pathed, or
+ * dropped, this goes red instead of CI quietly losing the ability to detect
+ * leaks.
+ *
+ * It runs whenever CI is set, and FAILS (rather than skipping) if the workflow
+ * did not export the decoy value -- a test that silently stops running is the
+ * failure mode being guarded against, so it must not be able to opt itself out.
+ */
+const onCI = ["1", "true"].includes((process.env.CI ?? "").toLowerCase())
+describe("CI decoy secret", () => {
+  test.skipIf(!onCI)("an unpinned resolve reaches the planted decoy", () => {
+    const expected = process.env.PIGEON_CI_DECOY_TOKEN
+    expect(
+      expected,
+      "CI is set but PIGEON_CI_DECOY_TOKEN is not: the workflow must export the " +
+        "decoy value alongside planting the file, or this check is vacuous"
+    ).toBeTruthy()
+
+    // Exactly what the 10 cleanup call sites do.
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN_FILE
+    invalidateDaemonToken()
+    const leaked = resolveDaemonToken({ forceRefresh: true })
+    invalidateDaemonToken()
+
+    // Safe to compare directly: the decoy is a public, non-authenticating value.
+    expect(leaked).toBe(expected)
+  })
+})
+
+/**
  * The harness's correctness depends on tests not running concurrently within a
  * file: process.env is process-global, so `test.concurrent` bodies would
  * interleave and no beforeEach/afterEach discipline could keep the pin stable
