@@ -83,6 +83,67 @@ describe("POST /swarm/send", () => {
     expect(body2.error).toContain("reserved for pigeon-generated messages");
   });
 
+  it("rejects a caller-supplied msg_id containing ':' on both /swarm/send and /swarm/schedule", async () => {
+    // pigeon-fww: durable operational_alerts are deduped by a UNIQUE index on
+    // ref_msg_id ALONE, and pigeon uses ':'-delimited SYNTHETIC refs
+    // ("wake-lost:<msgId>", "watchdog-stall:<ts>") to keep its own alerts out
+    // of the msg_id namespace. That separation is only structural if a msg_id
+    // can never contain ':' — otherwise a caller minting the msg_id
+    // "wake-lost:msg_real" occupies the slot belonging to real row msg_real's
+    // payload-carrying alert, and ON CONFLICT DO NOTHING drops it silently.
+    // Verified reachable: msg_id is accepted verbatim from the request body.
+    const { app } = newApp();
+
+    const send = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          payload: "hi",
+          msg_id: "wake-lost:msg_real",
+        }),
+      }),
+    );
+    expect(send.status).toBe(400);
+    expect((await send.json() as { error: string }).error).toContain("msg_id");
+
+    const schedule = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          payload: "hi",
+          after: "1h",
+          msg_id: "watchdog-stall:1000",
+        }),
+      }),
+    );
+    expect(schedule.status).toBe(400);
+    expect((await schedule.json() as { error: string }).error).toContain("msg_id");
+  });
+
+  it("still accepts an ordinary caller-supplied msg_id", async () => {
+    const { app, storage: s } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          payload: "hi",
+          msg_id: "msg_ordinary_id-123.ok",
+        }),
+      }),
+    );
+    expect(res.status).toBe(202);
+    expect(s.swarm.getByMsgId("msg_ordinary_id-123.ok")).toBeDefined();
+  });
+
   it("respects caller-supplied msg_id (idempotency)", async () => {
     const { app, storage: s } = newApp();
     for (let i = 0; i < 2; i++) {

@@ -2004,10 +2004,12 @@ describe("DeliveryWatchdog", () => {
       // feeds the cycle summary, and an "alerted" log line for an alert that
       // was never enqueued is a human-facing claim that did not happen.
       //
-      // (This is a bounded dedupe, not a permanent one — once the sent row is
-      // cleaned an hour after sending, a still-stuck row alerts again. That is
-      // deliberate: a chronic condition should keep reminding a human rather
-      // than fall silent forever. See test/alert-repo.test.ts.)
+      // This is the layer the in-memory Set cannot provide. Within one process
+      // the Set already caps this at one alert; across a restart only the
+      // durable row can. Note the durable half is not eternal — an alert
+      // deleted by retention (an hour after it is SENT) frees its ref — so the
+      // two layers together mean: one alert per process, and no duplicate from
+      // a restart that happens while the alert is still on the books.
       const f = lostWakeFixture("m_fww_restart", "payload");
       const { storage, watchdog, resolveClients } = f;
 
@@ -2031,7 +2033,59 @@ describe("DeliveryWatchdog", () => {
       expect(second.alerted).toBe(0);
     });
 
-    it("a throwing enqueue does not poison the in-memory dedupe — the next cycle retries", async () => {
+    it("an earlier ephemeral advisory for the same row cannot suppress the durable payload alert", async () => {
+      // `stuckAlerted` is SHARED with the queued-behind-turn branch. While the
+      // lost-wake branch was gated on that Set, a row that first appeared
+      // blocked behind a live turn consumed the budget with a losable,
+      // payload-less warning — and the durable payload alert was then never
+      // even ATTEMPTED for the rest of the process lifetime, because the row
+      // never leaves the eligible set for reconcileDedupe to prune.
+      //
+      // The two alerts are not interchangeable: one is a warning, the other is
+      // the last-resort delivery of the message body. So the durable branch is
+      // no longer gated on any in-memory Set — the alert ROW is the dedupe of
+      // record, which is also why a transient enqueue failure simply retries.
+      const f = makeFixture();
+      fixture = f;
+      const now = 1_000_000;
+      f.setNow(now);
+
+      const client = makeClient();
+      // Cycle 1: anchor present, and a turn that STARTED BEFORE it is still
+      // running -> the queued-behind-turn advisory fires and takes the budget.
+      client.getSessionMessages.mockResolvedValue([
+        assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
+        userMessage(50, `<swarm_message v="1" msg_id="m_fww_shared">`),
+      ]);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({
+        msgId: "m_fww_shared",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 0, // blockedAge = 1_000_000 > stuckAlertMs (900_000)
+        kind: "wake",
+        deliverAt: 1,
+        payload: "SHARED_BUDGET_PAYLOAD",
+      });
+
+      await f.watchdog.processOnce();
+      expect(f.sendPlainAlert).toHaveBeenCalledTimes(1); // the ephemeral one
+      expect(alertRows(f.storage)).toHaveLength(0);
+
+      // Cycle 2: the anchor is no longer visible in the transcript, so this is
+      // now the lost-wake case and the payload must reach the durable channel.
+      client.getSessionMessages.mockResolvedValue([]);
+      f.setNow(now + 60_000);
+
+      await f.watchdog.processOnce();
+
+      const rows = alertRows(f.storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("wake-lost:m_fww_shared");
+      expect(String(rows[0]!.text)).toContain("SHARED_BUDGET_PAYLOAD");
+    });
+
+    it("a throwing enqueue does not poison the dedupe — the next cycle retries", async () => {
       // Ordering guard: the in-memory Set add must happen AFTER the enqueue.
       // If it happens first (as it did when the send could not throw), a
       // transient SQLITE_BUSY suppresses the alert for the whole process

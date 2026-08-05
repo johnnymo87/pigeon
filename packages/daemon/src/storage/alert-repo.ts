@@ -65,18 +65,24 @@ export function initAlertSchema(db: BetterSqlite3.Database): void {
      * ALERT_SENT_RETENTION_MS (1h) and abandoned ones after 7 days, and deleting a
      * row frees its slot. A queued alert is never deleted (only abandonOlderThan may
      * retire it, as a recorded state change), so a pending send cannot lose its slot.
-     * Both halves are pinned by tests in test/alert-repo.test.ts. The practical
-     * effect is that a chronic condition re-alerts at most about once an hour rather
-     * than falling permanently silent — which is the desirable direction, but it is a
-     * time bound, not "ever", and anything reasoning about collisions must use the
-     * real one.
+     * Both halves are pinned by tests in test/alert-repo.test.ts. So the guarantee
+     * this index gives is "at most one live alert per ref at a time", NOT "one ever",
+     * and anything reasoning about collisions must use the real bound. How often a
+     * given class may therefore re-alert is decided by ITS CALLER, not here: the
+     * watchdog's lost-wake alert, for instance, also holds an in-memory Set that caps
+     * it at one per process lifetime, so this row's expiry does not by itself produce
+     * a repeat.
      *
      * THE DELIBERATE REVISIT HAPPENED (pigeon-fww). One swarm row may now legitimately
      * produce TWO durable alerts: an ADVISORY while it is still unresolved, and a
-     * TERMINAL when it dies. They are kept apart not by source label but STRUCTURALLY,
-     * by namespacing the advisory's ref into a separate key space ('wake-lost:<msgId>',
-     * as the watchdog's 'watchdog-stall:<ts>' alerts already do). Terminal alerts keep
-     * the bare msgId. Any future alert class that needs to coexist with a row's
+     * TERMINAL when it dies. They are kept apart not by source label but by NAMESPACING
+     * the advisory's ref into a separate key space ('wake-lost:<msgId>', as the
+     * watchdog's 'watchdog-stall:<ts>' alerts already do). Terminal alerts keep the
+     * bare msgId. That separation is structural only because ':' is REJECTED in
+     * caller-supplied msg_ids at the API boundary (see parseSwarmSendBody in app.ts) —
+     * without that guard it would be a convention, and a caller minting the msg_id
+     * 'wake-lost:msg_real' could take the slot belonging to real row msg_real's
+     * payload-carrying alert. Any future alert class that needs to coexist with a row's
      * terminal alert MUST take a namespaced ref for the same reason: keying it on the
      * bare msgId would let the advisory silently swallow the terminal, since enqueue's
      * 'false' return is discarded at most call sites.

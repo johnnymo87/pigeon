@@ -445,6 +445,16 @@ export class DeliveryWatchdog {
   // for this handoff episode. Pruned when the message verifies or goes
   // terminal (a fresh redelivery gets its own alert budget).
   private readonly stuckAlerted = new Set<string>();
+  // Dedupe: msg_id -> the lost-wake alert has already been enqueued.
+  //
+  // DELIBERATELY SEPARATE from `stuckAlerted`, which this branch used to share
+  // with the queued-behind-turn advisory. Sharing meant a row that first
+  // appeared blocked behind a live turn spent the budget on a losable,
+  // payload-less warning, and the durable payload alert was then never even
+  // attempted for the rest of the process lifetime. A warning and a
+  // last-resort delivery of the message body are not interchangeable, so they
+  // do not share a budget.
+  private readonly lostWakeAlerted = new Set<string>();
   // Dedupe: msg_id -> the no-healthy-serve age alarm has already fired.
   private readonly ageAlarmed = new Set<string>();
   // Dedupe: msg_id -> the overdue queued alarm has already fired.
@@ -647,6 +657,7 @@ export class DeliveryWatchdog {
 
   private pruneDedupe(msgId: string): void {
     this.stuckAlerted.delete(msgId);
+    this.lostWakeAlerted.delete(msgId);
     this.ageAlarmed.delete(msgId);
     this.overdueAlerted.delete(msgId);
     this.silentInFlightAlerted.delete(msgId);
@@ -697,6 +708,9 @@ export class DeliveryWatchdog {
   private reconcileDedupe(eligibleIds: ReadonlySet<string>): void {
     for (const msgId of this.stuckAlerted) {
       if (!eligibleIds.has(msgId)) this.stuckAlerted.delete(msgId);
+    }
+    for (const msgId of this.lostWakeAlerted) {
+      if (!eligibleIds.has(msgId)) this.lostWakeAlerted.delete(msgId);
     }
     for (const msgId of this.ageAlarmed) {
       if (!eligibleIds.has(msgId)) this.ageAlarmed.delete(msgId);
@@ -983,14 +997,26 @@ export class DeliveryWatchdog {
     alertText: string,
   ): boolean {
     const blockedAge = now - (row.handedOffAt ?? now);
-    if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
+    if (blockedAge > this.stuckAlertMs && !this.lostWakeAlerted.has(row.msgId)) {
       // DURABLE, not best-effort (pigeon-fww). `alertText` is built by
       // formatWakePayloadAlert and CARRIES THE PAYLOAD: for a self-wake there
       // is no sender watching in-band, so this alert is the only path by which
-      // the message's content ever reaches a human. Sent inline it dies on a
-      // 429, a transport blip, or a daemon crash, and nothing ever re-derives
-      // it — the in-memory Set below suppresses the retry and the row never
-      // leaves the eligible set for reconcileDedupe to prune.
+      // the message's content ever reaches a human. Sent inline it died on a
+      // 429, a transport blip, or a daemon crash, and nothing re-derived it.
+      //
+      // TWO LAYERS OF DEDUPE, and each covers the other's gap. The in-memory
+      // `lostWakeAlerted` (dedicated to this branch — see its declaration)
+      // bounds this to ONE alert per process lifetime, so a wake that sits
+      // unresolved for weeks cannot turn into a recurring page. The durable
+      // unique ref covers what the Set cannot: a restart empties the Set, and
+      // the alert row then refuses the duplicate on its own.
+      //
+      // ENQUEUE BEFORE THE SET ADD, and the order is load-bearing. Unlike
+      // `this.alert` (which swallowed everything), enqueue CAN throw —
+      // SQLITE_BUSY, SQLITE_IOERR. Marking the Set first would suppress this
+      // row for the entire process lifetime on a transient failure, which is
+      // the exact silent loss being fixed here; the row never leaves the
+      // eligible set, so reconcileDedupe would never restore it either.
       //
       // WHY THE REF IS NAMESPACED. The dedupe index is UNIQUE on ref_msg_id
       // ALONE, so keying this on the bare msgId would make this ADVISORY
@@ -999,15 +1025,11 @@ export class DeliveryWatchdog {
       // ON CONFLICT DO NOTHING would drop the terminal SILENTLY — its return
       // value is discarded inside those transactions. The human's last word
       // would stay "may be lost" for a row since marked failed. The
-      // `wake-lost:` prefix keeps this out of the msg_id namespace entirely,
-      // the same device the stall alerts above use. The row can therefore
-      // produce at most two durable alerts: this advisory, and one terminal.
-      //
-      // ENQUEUE BEFORE THE SET ADD, and this order is load-bearing. Unlike
-      // `this.alert` (which swallows everything), enqueue CAN throw —
-      // SQLITE_BUSY, SQLITE_IOERR. Adding to `stuckAlerted` first would
-      // suppress this row's alert for the entire process lifetime on a
-      // transient failure, reproducing the exact silent loss being fixed.
+      // `wake-lost:` prefix keeps this out of the msg_id namespace, which is
+      // enforced (not merely assumed) by rejecting ':' in caller-supplied
+      // msg_ids at the API boundary — see parseSwarmSendBody. The row can
+      // therefore produce at most two durable alerts: this advisory, and one
+      // terminal.
       const enqueued = this.storage.alerts.enqueue({
         source: "wake-lost-unverified",
         refMsgId: `wake-lost:${row.msgId}`,
@@ -1015,11 +1037,7 @@ export class DeliveryWatchdog {
         severity,
         now,
       });
-      // Added on `false` too: false means the alert is ALREADY durably
-      // recorded, which is equally "this row has been alerted". Note this Set
-      // is SHARED with the queued-behind-turn site, which caps the pair at one
-      // alert per row across both branches; that coupling is deliberate.
-      this.stuckAlerted.add(row.msgId);
+      this.lostWakeAlerted.add(row.msgId);
       if (enqueued) {
         counts.alerted++;
         this.log("alerted", { msgId: row.msgId, sessionId, reason });
@@ -1051,7 +1069,13 @@ export class DeliveryWatchdog {
       // into the transcript at all.
       if (isSuppressedFromRecovery(row)) {
         const blockedAge = now - (row.handedOffAt ?? now);
-        const reason = `prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed`;
+        // The `as of` stamp is not decoration. Every duration in this text is
+        // measured at OBSERVATION time, but the alert now rides the durable
+        // queue: the drainer retries with backoff and, through a long Telegram
+        // outage, this can reach a human hours after the fact. Without the
+        // stamp "unverified for 17 minutes" silently becomes a claim about the
+        // present, and a reader would size the problem wrongly.
+        const reason = `prompt for msg ${row.msgId} to ${sessionId} not found in target transcript after ${blockedAge}ms (${humanDuration(blockedAge)}) — wake may be lost, redelivery suppressed (observed ${new Date(now).toISOString()})`;
         const alertText = formatWakePayloadAlert(
           row,
           reason,
