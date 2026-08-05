@@ -1,0 +1,178 @@
+name: CI
+
+# Runs on PRs and on pushes to main. Deliberately NOT pull_request_target:
+# this repo is public, and that trigger would expose repository secrets to
+# code from forks.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run on main: two quick merges would otherwise leave the
+  # first commit permanently without a completed CI status, which is exactly
+  # the commit a bisect or a deploy gate later wants to consult.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # Node is pinned rather than left to ubuntu-latest's default: this repo has
+  # no "engines" field and no .nvmrc, so nothing else states the version.
+  # Matches the development box (v22).
+  NODE_VERSION: "22"
+  # Single source of truth for the decoy: the value planted at the production
+  # secret path AND the value the canary test asserts the resolver reaches.
+  # Public and non-authenticating by construction.
+  DECOY_TOKEN: "ci-decoy-not-a-real-token"
+
+jobs:
+  # The intended required gate.
+  #
+  # NOTE: nothing in this file can make a check required. That is branch
+  # protection, a repository setting configured outside the repo, and as of
+  # this commit `main` is NOT protected -- so a red run does not currently
+  # block anything. Until it is configured (requiring "typecheck + tests", and
+  # deliberately NOT the advisory job below), this workflow reports but does
+  # not enforce.
+  test:
+    name: typecheck + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # packages/daemon depends on johnnymo87/sticky-router as a git
+      # dependency. It is a PUBLIC repo, so this needs no credentials: npm
+      # falls back to https for hosted GitHub specs when ssh is unavailable
+      # (verified by running `npm ci` with GIT_SSH_COMMAND=/bin/false). If this
+      # step ever starts failing to fetch sticky-router, check that the repo is
+      # still public before reaching for a deploy key or PAT.
+      - run: npm ci
+
+      # There is no build script in any workspace, so typecheck is the compile
+      # gate. It runs in all three packages via the root script -- but note it
+      # covers each package's tsconfig `include`, which today means SRC only
+      # for opencode-plugin and worker. Their test code is typechecked by
+      # nothing (pigeon-09vu). Do not read a green tick here as "the test code
+      # compiles".
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Plant a decoy at the hardcoded production secret path that
+      # opencode-plugin/src/auth-token.ts falls back to.
+      #
+      # Without this, CI cannot detect the entire class of bug that motivated
+      # this workflow. On cloudbox that file EXISTS and holds the live daemon
+      # bearer, so a test that leaves PIGEON_DAEMON_AUTH_TOKEN_FILE unset reads
+      # a real secret. On a bare runner the file is absent, every such leak
+      # resolves to undefined, and CI would stay green while the bug was live
+      # on the dev box. The decoy makes the runner reproduce the hazard, so
+      # test/setup.ts's isolation guard can actually fire here.
+      #
+      # The value is not a secret and is never used to authenticate anything.
+      #
+      # The path below is a SECOND COPY of the constant in
+      # opencode-plugin/src/auth-token.ts. That is the same duplicate-the-
+      # resolver's-fallback shape this branch removed from test/setup.ts, so it
+      # gets the same treatment: the step asserts the constant still says what
+      # this step assumes, and asserts the file actually landed. Without those
+      # two checks, a renamed path or a typo here would silently stop planting
+      # the decoy, and CI would go back to being unable to see the bug class
+      # while staying green.
+      - name: Plant decoy production secret so the token-leak guard can fire
+        run: |
+          set -euo pipefail
+          DECOY_PATH=/run/secrets/pigeon_daemon_auth_token
+          # Fail loudly if the resolver's hardcoded fallback has moved.
+          grep -qF "\"$DECOY_PATH\"" packages/opencode-plugin/src/auth-token.ts \
+            || { echo "::error::auth-token.ts no longer falls back to $DECOY_PATH; update this step"; exit 1; }
+          sudo mkdir -p "$(dirname "$DECOY_PATH")"
+          echo "$DECOY_TOKEN" | sudo tee "$DECOY_PATH" >/dev/null
+          sudo chmod 444 "$DECOY_PATH"
+          test -r "$DECOY_PATH" || { echo "::error::decoy was not planted"; exit 1; }
+
+      # PIGEON_SKIP_LOAD_SENSITIVE excludes the lease-CAS concurrency proof,
+      # which forks 6 processes and is sensitive to machine load rather than to
+      # correctness (pigeon-y8p). It runs unopposed in the job below instead.
+      - name: Test
+        run: npm test
+        env:
+          PIGEON_SKIP_LOAD_SENSITIVE: "1"
+          # Lets test/setup-isolation.test.ts verify the decoy is actually
+          # reachable, rather than CI merely failing to disprove it.
+          PIGEON_CI_DECOY_TOKEN: ${{ env.DECOY_TOKEN }}
+
+      # One shuffled run, random seed. No fixed seed matrix: the seeds we
+      # already know pass will keep passing and go stale, whereas a fresh
+      # permutation each run is what actually catches NEW order dependence.
+      # Vitest prints "Running tests with seed <n>", so a failure here is
+      # reproducible with --sequence.seed=<printed seed>.
+      #
+      # Invoked per workspace on purpose. `npm test -- --sequence.shuffle`
+      # does NOT forward the flag through the root's `npm run --workspaces
+      # test` indirection -- it silently runs a plain `vitest run`, which
+      # would make this step a check that checks nothing.
+      #
+      # packages/worker is EXCLUDED from this step. Its suite is genuinely
+      # order-dependent -- 26 of 361 tests fail under shuffle because undici
+      # fetchMock interceptors leak between tests (pigeon-dpi6). That is a real
+      # bug, found by this very step, but it is not S1's to fix, and a
+      # permanently red required check is one everyone learns to ignore. The
+      # worker suite still runs unshuffled in the step above, so the package is
+      # covered; only its ORDER independence is currently unverified.
+      # Closing pigeon-dpi6 means deleting the exclusion here.
+      # The package list is DERIVED from the workspaces on disk, minus an
+      # explicit denylist, so a fourth package is shuffled automatically rather
+      # than being silently omitted by a hardcoded list that nobody updates.
+      - name: Test (shuffled order)
+        run: |
+          set -euo pipefail
+          DENY="worker" # pigeon-dpi6; remove from this list when that is fixed
+          for dir in packages/*/; do
+            pkg="$(basename "$dir")"
+            case " $DENY " in
+              *" $pkg "*) echo "skipping shuffled run for $pkg (see pigeon-dpi6)"; continue ;;
+            esac
+            echo "::group::shuffled: $pkg"
+            npm run test --workspace "packages/$pkg" -- --sequence.shuffle
+            echo "::endgroup::"
+          done
+        env:
+          PIGEON_SKIP_LOAD_SENSITIVE: "1"
+          PIGEON_CI_DECOY_TOKEN: ${{ env.DECOY_TOKEN }}
+
+  # Not required, and allowed to fail. The proof it runs is real, but its
+  # detector infers mutual exclusion from wall-clock timestamps sampled before
+  # commit, so CPU contention manufactures false positives (pigeon-y8p).
+  # Running it alone on an otherwise idle runner attacks that directly.
+  #
+  # This job existing is what makes the skip above honest: coverage moves off
+  # the blocking path rather than disappearing. If it proves stable here,
+  # promote it back into the required job and delete the flag.
+  #
+  # Runs the node-only proof. The file's second test, a cross-binding node+bun
+  # proof, is gated on OPENCODE_BUN_BIN/OPENCODE_LEASE_ADAPTER and so is always
+  # skipped here -- "the proof" in this job's name means one of the two.
+  lease-cas-proof:
+    name: lease-CAS concurrency proof (advisory, not required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Run the proof unopposed
+        working-directory: packages/daemon
+        run: npx vitest run test/routing/lease-cas-concurrency.test.ts
