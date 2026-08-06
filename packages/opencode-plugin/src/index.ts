@@ -309,6 +309,36 @@ const plugin: Plugin = async (ctx) => {
       }
     }
 
+    /**
+     * Settle discovery and registration for a session, retrying a registration
+     * that previously failed.
+     *
+     * A failed registration (daemon timeout, transient 5xx) used to leave a
+     * session known-but-unregistered forever: `lateDiscoverSession` returns
+     * early on `isKnown`, so nothing retried. Every notification path below is
+     * gated on `isRegistered`, so the session then went permanently silent --
+     * and invisibly so, because the daemon may well have recorded the session
+     * before the client's 1s timeout fired.
+     *
+     * Retrying here, at the notification sites, is self-limiting: these events
+     * are human-paced, and the daemon client's circuit breaker bounds the cost
+     * when the daemon is genuinely down.
+     */
+    const ensureRegistered = async (sessionID: string): Promise<void> => {
+      await lateDiscoverSession(sessionID)
+      await sessionManager.awaitRegistration(sessionID)
+
+      if (
+        sessionManager.isMainSession(sessionID) &&
+        !sessionManager.isRegistered(sessionID)
+      ) {
+        log("retrying failed session registration", { sessionID })
+        const envInfo = await envInfoP
+        doRegisterSession(sessionID, envInfo, sessionManager.getTitle(sessionID))
+        await sessionManager.awaitRegistration(sessionID)
+      }
+    }
+
     return {
       tool: {
         // Anthropic rejects tool names with characters outside
@@ -386,11 +416,8 @@ const plugin: Plugin = async (ctx) => {
 
            log("DEBUG session.idle received", { sessionID })
 
-           // Ensure discovery completes before checking registration
-           await lateDiscoverSession(sessionID)
-
-           // Await pending registration before checking isRegistered
-           await sessionManager.awaitRegistration(sessionID)
+           // Ensure discovery + registration have settled before checking isRegistered
+           await ensureRegistered(sessionID)
 
            log("DEBUG session.idle after awaitRegistration", {
              sessionID,
@@ -491,8 +518,7 @@ const plugin: Plugin = async (ctx) => {
           const error = props?.error
 
           if (sessionID) {
-            await lateDiscoverSession(sessionID)
-            await sessionManager.awaitRegistration(sessionID)
+            await ensureRegistered(sessionID)
 
             if (
               sessionManager.isMainSession(sessionID) &&
@@ -553,8 +579,7 @@ const plugin: Plugin = async (ctx) => {
           if (!sessionID || !requestId || !questions || questions.length === 0) return
 
           // Only notify for main sessions that are registered
-          await lateDiscoverSession(sessionID)
-          await sessionManager.awaitRegistration(sessionID)
+          await ensureRegistered(sessionID)
 
           if (
             !sessionManager.isMainSession(sessionID) ||
@@ -612,8 +637,7 @@ const plugin: Plugin = async (ctx) => {
           if (!sessionID || !status || status.type !== "retry") return
 
           // Only notify for main sessions that are registered
-          await lateDiscoverSession(sessionID)
-          await sessionManager.awaitRegistration(sessionID)
+          await ensureRegistered(sessionID)
           if (
             !sessionManager.isMainSession(sessionID) ||
             !sessionManager.isRegistered(sessionID)
