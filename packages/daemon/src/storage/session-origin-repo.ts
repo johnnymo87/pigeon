@@ -49,11 +49,14 @@ export class SessionOriginRepository {
   constructor(private readonly db: BetterSqlite3.Database) {}
 
   /**
-   * Insert-or-keep. A write from a weaker source never overwrites a stronger one, so a
+   * Insert-or-upgrade. A write from a weaker source never overwrites a stronger one, so a
    * later inferred guess can never downgrade what the launcher declared. Equal-or-stronger
    * writes refresh the payload and updated_at but preserve created_at.
    */
   record(input: RecordSessionOriginInput, now = Date.now()): void {
+    // tx.immediate() acquires write lock up front. Because record() reads before writing,
+    // a deferred lock allows concurrent external writers to commit between SELECT and UPDATE/INSERT,
+    // causing a lock-upgrade SQLITE_BUSY.
     const tx = this.db.transaction(() => {
       const existing = this.get(input.sessionId);
       if (existing && rank(input.source) < rank(existing.source)) return;
@@ -74,13 +77,13 @@ export class SessionOriginRepository {
         )
         .run(input.sessionId, input.origin, input.notifyPolicy, input.source, now, now);
     });
-    tx();
+    tx.immediate();
   }
 
   get(sessionId: string): SessionOriginRecord | null {
     const row = this.db
       .prepare("SELECT * FROM session_origin WHERE session_id = ?")
-      .get(sessionId) as SqlRow | null;
+      .get(sessionId) as SqlRow | undefined;
 
     if (!row) return null;
 

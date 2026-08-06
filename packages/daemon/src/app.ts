@@ -649,13 +649,22 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       if (request.method === "POST" && url.pathname === "/session-origin") {
         const body = await readJsonBody(request);
         const sessionId = typeof body.session_id === "string" ? body.session_id : "";
-        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId)) {
-          return Response.json({ error: "session_id must match ^ses_[A-Za-z0-9_-]+$" }, { status: 400 });
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
+          return Response.json(
+            { error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer" },
+            { status: 400 },
+          );
         }
 
         const origin = typeof body.origin === "string" ? body.origin.trim() : "";
         if (!origin) {
           return Response.json({ error: "origin is required" }, { status: 400 });
+        }
+        if (origin.length > 200) {
+          return Response.json({ error: "origin must be 200 characters or fewer" }, { status: 400 });
+        }
+        if (/[\x00-\x1F\x7F]/.test(origin)) {
+          return Response.json({ error: "origin must not contain control characters" }, { status: 400 });
         }
 
         // Reject rather than default. On the READ path an unknown policy degrades to "all"

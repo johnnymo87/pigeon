@@ -1806,5 +1806,32 @@ describe("createApp", () => {
       expect(res.status).toBe(400);
       expect((await res.json()).error).toMatch(/origin/);
     });
+
+    it("rejects session_id longer than 128 characters", async () => {
+      const app = newApp();
+      const longSid = "ses_" + "a".repeat(130);
+      const res = await post(app, { session_id: longSid, origin: "lgtm", notify_policy: "none" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/session_id/);
+    });
+
+    it("rejects origin longer than 200 characters", async () => {
+      const app = newApp();
+      const longOrigin = "a".repeat(201);
+      const res = await post(app, { session_id: "ses_a", origin: longOrigin, notify_policy: "none" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/origin/);
+    });
+
+    it("rejects origin containing control characters or interior newlines", async () => {
+      const app = newApp();
+      const res1 = await post(app, { session_id: "ses_a", origin: "lgtm\nscript", notify_policy: "none" });
+      expect(res1.status).toBe(400);
+      expect((await res1.json()).error).toMatch(/origin/);
+
+      const res2 = await post(app, { session_id: "ses_a", origin: "lgtm\x07foo", notify_policy: "none" });
+      expect(res2.status).toBe(400);
+      expect((await res2.json()).error).toMatch(/origin/);
+    });
   });
 });

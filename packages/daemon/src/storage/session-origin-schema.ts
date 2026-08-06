@@ -28,6 +28,7 @@ export function initSessionOriginSchema(db: BetterSqlite3.Database): void {
       updated_at INTEGER NOT NULL
     );
 
+    -- Serves ad-hoc ops/debugging queries (e.g. SELECT count(*) FROM session_origin GROUP BY origin)
     CREATE INDEX IF NOT EXISTS idx_session_origin_origin ON session_origin(origin);
   `);
 }
