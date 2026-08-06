@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { NvimRpcAdapter } from "../src/adapters/nvim-rpc";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { NvimRpcAdapter, resolveNvimBin } from "../src/adapters/nvim-rpc";
 import type { SessionRecord } from "../src/storage/types";
 
 /** Encode a JSON object as base64, matching pigeon.lua's dispatch response format */
@@ -286,5 +286,46 @@ describe("NvimRpcAdapter", () => {
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain("exit code 127");
+  });
+});
+
+describe("resolveNvimBin", () => {
+  // Why this exists: nvim used to be the ONE external binary the daemon
+  // resolved from PATH (TMUX_BIN, PGREP_BIN and OC_AUTO_ATTACH_BIN were all
+  // already pinnable). That forced the NixOS unit to carry a bare neovim on
+  // its PATH, which tmux then stamped into every pane oc-auto-attach created,
+  // shadowing the user's plugin-wrapped nvim. See pigeon-d45j / workstation-v8t5.
+  const original = process.env.NVIM_BIN;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.NVIM_BIN;
+    } else {
+      process.env.NVIM_BIN = original;
+    }
+  });
+
+  it("defaults to resolving nvim from PATH", () => {
+    delete process.env.NVIM_BIN;
+    expect(resolveNvimBin()).toBe("nvim");
+  });
+
+  it("honors NVIM_BIN so a deployment can pin an absolute path", () => {
+    process.env.NVIM_BIN = "/nix/store/abc-neovim/bin/nvim";
+    expect(resolveNvimBin()).toBe("/nix/store/abc-neovim/bin/nvim");
+  });
+
+  it("ignores an empty NVIM_BIN rather than trying to exec the empty string", () => {
+    process.env.NVIM_BIN = "";
+    expect(resolveNvimBin()).toBe("nvim");
+  });
+
+  it("reads the env at call time, not at import time", () => {
+    // The unit sets NVIM_BIN before exec, but a test (or a future caller that
+    // mutates env after import) must not be answered from a frozen snapshot.
+    process.env.NVIM_BIN = "/first/nvim";
+    expect(resolveNvimBin()).toBe("/first/nvim");
+    process.env.NVIM_BIN = "/second/nvim";
+    expect(resolveNvimBin()).toBe("/second/nvim");
   });
 });

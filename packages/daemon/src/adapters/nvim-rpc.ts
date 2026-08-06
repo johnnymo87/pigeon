@@ -4,6 +4,32 @@ import type { CommandDeliveryAdapter, CommandDeliveryResult } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+/**
+ * Resolve the nvim binary to exec.
+ *
+ * Mirrors TMUX_BIN / PGREP_BIN (main-session-allowlist.ts) and
+ * OC_AUTO_ATTACH_BIN (launch-ingest.ts): a systemd-managed deployment pins an
+ * absolute store path so the unit does not need the binary on its PATH.
+ *
+ * That indirection is not cosmetic. While nvim was resolved from PATH, the
+ * NixOS unit had to carry a bare neovim, and tmux stamps the spawning
+ * process's PATH into every pane it creates -- so that bare neovim became the
+ * `nvim` running in the user's editor pane, shadowing the plugin-wrapped build
+ * and failing at startup on a missing nvim-treesitter. See pigeon-d45j
+ * (workstation-v8t5 for the other half).
+ *
+ * The RPC client deliberately does not need the plugin set: `nvim --headless
+ * --server X --remote-expr` does not source init.lua, so pinning a bare build
+ * is both correct and cheaper than pinning the wrapper.
+ *
+ * Read at call time, not module load, so the value cannot be frozen by import
+ * order. An empty NVIM_BIN falls back rather than exec'ing "".
+ */
+export function resolveNvimBin(): string {
+  const pinned = process.env.NVIM_BIN;
+  return pinned !== undefined && pinned !== "" ? pinned : "nvim";
+}
+
 export interface NvimRpcAdapterDeps {
   /** Override for testing — runs the nvim subprocess and returns { stdout, stderr, exitCode } */
   exec?: (
@@ -18,7 +44,7 @@ function defaultExec(
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolve) => {
-    const child = execFile("nvim", args, { timeout: timeoutMs }, (error, stdout, stderr) => {
+    const child = execFile(resolveNvimBin(), args, { timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error && "killed" in error && error.killed) {
         resolve({ stdout: "", stderr: "", exitCode: null });
         return;
