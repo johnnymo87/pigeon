@@ -1,4 +1,5 @@
 import type { StorageDb } from "./storage/database";
+import { isNotifyPolicy, NOTIFY_POLICIES } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -643,6 +644,48 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const session = storage.sessions.get(sessionId);
         return Response.json({ ok: true, session: session ? toLegacySession(session) : null });
+      }
+
+      if (request.method === "POST" && url.pathname === "/session-origin") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId)) {
+          return Response.json({ error: "session_id must match ^ses_[A-Za-z0-9_-]+$" }, { status: 400 });
+        }
+
+        const origin = typeof body.origin === "string" ? body.origin.trim() : "";
+        if (!origin) {
+          return Response.json({ error: "origin is required" }, { status: 400 });
+        }
+
+        // Reject rather than default. On the READ path an unknown policy degrades to "all"
+        // (deliver), because a corrupt row must never silence real work. On the WRITE path
+        // the opposite is right: a typo'd policy that silently became "all" is
+        // indistinguishable from the feature not being deployed.
+        const notifyPolicy = body.notify_policy;
+        if (!isNotifyPolicy(notifyPolicy)) {
+          return Response.json(
+            { error: `notify_policy must be one of: ${NOTIFY_POLICIES.join(", ")}` },
+            { status: 400 },
+          );
+        }
+
+        // Deliberately NOT gated on the session existing. The launcher writes between
+        // session creation and the first prompt, which is BEFORE the plugin registers the
+        // session with the daemon — that ordering is the whole point of the launcher writer.
+        storage.sessionOrigins.record(
+          { sessionId, origin, notifyPolicy, source: "declared" },
+          nowFn(),
+        );
+
+        console.log(`[session-origin] declared sessionId=${sessionId} origin=${origin} policy=${notifyPolicy}`);
+        return Response.json({
+          ok: true,
+          session_id: sessionId,
+          origin,
+          notify_policy: notifyPolicy,
+          source: "declared",
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {

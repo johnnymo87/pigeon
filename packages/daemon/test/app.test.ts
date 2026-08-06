@@ -1727,4 +1727,77 @@ describe("createApp", () => {
       errorSpy.mockRestore();
     });
   });
+
+  describe("POST /session-origin", () => {
+    async function post(app: ReturnType<typeof createApp>, body: unknown) {
+      return app(new Request("http://localhost/session-origin", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+    }
+
+    it("records a declared origin and is idempotent", async () => {
+      const app = newApp(5_000);
+      const res = await post(app, {
+        session_id: "ses_a",
+        origin: "lgtm",
+        notify_policy: "errors-only",
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_a",
+        origin: "lgtm",
+        notify_policy: "errors-only",
+        source: "declared",
+      });
+
+      const again = await post(app, {
+        session_id: "ses_a",
+        origin: "lgtm",
+        notify_policy: "errors-only",
+      });
+      expect(again.status).toBe(200);
+      expect(storage!.sessionOrigins.get("ses_a")?.createdAt).toBe(5_000);
+    });
+
+    it("does NOT require the session to exist yet", async () => {
+      // The launcher writes between session creation and the first prompt; the plugin
+      // has not registered the session with the daemon at that point.
+      const app = newApp();
+      const res = await post(app, { session_id: "ses_ghost", origin: "lgtm", notify_policy: "none" });
+      expect(res.status).toBe(200);
+      expect(storage!.sessionOrigins.get("ses_ghost")?.origin).toBe("lgtm");
+    });
+
+    it("rejects a missing session_id", async () => {
+      const app = newApp();
+      const res = await post(app, { origin: "lgtm", notify_policy: "none" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/session_id/);
+    });
+
+    it("rejects a malformed session_id", async () => {
+      const app = newApp();
+      const res = await post(app, { session_id: "nope", origin: "lgtm", notify_policy: "none" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects an unknown notify_policy rather than defaulting it", async () => {
+      // Fail LOUD on the write path: a typo'd policy that silently became "all" would
+      // look like the feature simply not working, with nothing to grep for.
+      const app = newApp();
+      const res = await post(app, { session_id: "ses_a", origin: "lgtm", notify_policy: "quiet" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/notify_policy/);
+      expect(storage!.sessionOrigins.get("ses_a")).toBeNull();
+    });
+
+    it("rejects an empty origin", async () => {
+      const app = newApp();
+      const res = await post(app, { session_id: "ses_a", origin: "", notify_policy: "none" });
+      expect(res.status).toBe(400);
+    });
+  });
 });
