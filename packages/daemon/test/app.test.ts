@@ -1799,5 +1799,12 @@ describe("createApp", () => {
       const res = await post(app, { session_id: "ses_a", origin: "", notify_policy: "none" });
       expect(res.status).toBe(400);
     });
+
+    it("rejects a whitespace-only origin", async () => {
+      const app = newApp();
+      const res = await post(app, { session_id: "ses_a", origin: "   ", notify_policy: "none" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/origin/);
+    });
   });
 });

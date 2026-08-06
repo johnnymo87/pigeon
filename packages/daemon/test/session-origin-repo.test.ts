@@ -52,6 +52,52 @@ describe("SessionOriginRepository", () => {
     expect(row?.updatedAt).toBe(2_000);
   });
 
+  it("refreshes payload when re-recorded with an equal-or-stronger source (declared errors-only then declared none)", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm-v2", notifyPolicy: "none", source: "declared" },
+      2_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("lgtm-v2");
+    expect(row?.notifyPolicy).toBe("none");
+    expect(row?.source).toBe("declared");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(2_000);
+  });
+
+  it("degrades unrecognized notify_policy to 'all'", () => {
+    const s = newStorage();
+    // LOAD-BEARING: Fail-open house rule at app.ts:113 — a corrupt row must never silence real work.
+    s.db
+      .prepare(
+        `INSERT INTO session_origin (session_id, origin, notify_policy, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("ses_corrupt_policy", "lgtm", "banana", "declared", 1_000, 1_000);
+
+    const row = s.sessionOrigins.get("ses_corrupt_policy");
+    expect(row?.notifyPolicy).toBe("all");
+  });
+
+  it("degrades unrecognized source to 'inferred'", () => {
+    const s = newStorage();
+    // LOAD-BEARING: Fail-open house rule at app.ts:113 — a corrupt row must never silence real work.
+    s.db
+      .prepare(
+        `INSERT INTO session_origin (session_id, origin, notify_policy, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("ses_corrupt_source", "lgtm", "errors-only", "wat", 1_000, 1_000);
+
+    const row = s.sessionOrigins.get("ses_corrupt_source");
+    expect(row?.source).toBe("inferred");
+  });
+
   it("a declared row is never downgraded by an inferred write", () => {
     const s = newStorage();
     s.sessionOrigins.record(
