@@ -158,6 +158,33 @@ describe("reapStaleSessions", () => {
     expect(storage.assignments.get("ses_stale")).toBeNull();
   });
 
+  it("reaping a stale session preserves its session_origin row (no cleanup)", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+
+    storage.sessions.upsert({ sessionId: "stale-origin-1", notify: true }, 1_000);
+    storage.sessionOrigins.record(
+      { sessionId: "stale-origin-1", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(storage.sessions.get("stale-origin-1")).toBeNull();
+    // LOAD-BEARING: session_origin MUST outlive session reaper cleanup. lgtm re-awakens
+    // the SAME session id through /swarm/send after reaping; deleting session_origin here
+    // would silently reintroduce notification noise.
+    expect(storage.sessionOrigins.get("stale-origin-1")?.notifyPolicy).toBe("errors-only");
+  });
+
   it("prevents regression: expired pending questions with live sessions survive session-reaping and remain resurrectable via ingestWorkerCommand", async () => {
     storage = openStorageDb(":memory:");
     const now = Date.now();

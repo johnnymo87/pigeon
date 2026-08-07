@@ -13,6 +13,8 @@ import { OutboxRepository } from "./outbox-repo";
 import { initAlertSchema, AlertRepository } from "./alert-repo";
 import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
+import { initSessionOriginSchema } from "./session-origin-schema";
+import { SessionOriginRepository } from "./session-origin-repo";
 import { initRouteSchema } from "../routing/route-schema";
 import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMetaRepo } from "../routing/route-repo";
 import { initReassignmentSchema, ReassignmentEventRepo } from "../routing/reassignment-repo";
@@ -27,6 +29,7 @@ export interface StorageDb {
   outbox: OutboxRepository;
   alerts: AlertRepository;
   swarm: SwarmRepository;
+  sessionOrigins: SessionOriginRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
@@ -44,6 +47,7 @@ export function openStorageDb(path: string): StorageDb {
   db.exec("PRAGMA foreign_keys = ON;");
   initSchema(db);
   initSwarmSchema(db);
+  initSessionOriginSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
@@ -60,6 +64,7 @@ export function openStorageDb(path: string): StorageDb {
     outbox: new OutboxRepository(db),
     alerts: new AlertRepository(db),
     swarm: new SwarmRepository(db),
+    sessionOrigins: new SessionOriginRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),
