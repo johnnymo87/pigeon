@@ -1794,6 +1794,92 @@ describe("createApp", () => {
     });
   });
 
+  describe("GET /session-origin", () => {
+    async function get(app: ReturnType<typeof createApp>, query: string) {
+      return app(new Request(`http://localhost/session-origin${query}`, { method: "GET" }));
+    }
+
+    it("400 on missing session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on empty session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on malformed session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=invalid_sid");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("404 on unknown session", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=ses_unknown");
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Session not found" });
+    });
+
+    it("200 with full row after seeding via storage.sessionOrigins.record", async () => {
+      const app = newApp(10_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_seeded", origin: "unit-test", notifyPolicy: "errors-only", source: "declared" },
+        10_000,
+      );
+
+      const res = await get(app, "?session_id=ses_seeded");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        sessionId: "ses_seeded",
+        origin: "unit-test",
+        notifyPolicy: "errors-only",
+        source: "declared",
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      });
+    });
+
+    it("round-trip: POST /session-origin row is readable via GET /session-origin", async () => {
+      const app = newApp(12_345);
+      const postRes = await app(
+        new Request("http://localhost/session-origin", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "ses_rt",
+            origin: "launcher-script",
+            notify_policy: "none",
+          }),
+        }),
+      );
+      expect(postRes.status).toBe(200);
+
+      const getRes = await get(app, "?session_id=ses_rt");
+      expect(getRes.status).toBe(200);
+      expect(await getRes.json()).toEqual({
+        sessionId: "ses_rt",
+        origin: "launcher-script",
+        notifyPolicy: "none",
+        source: "declared",
+        createdAt: 12_345,
+        updatedAt: 12_345,
+      });
+    });
+  });
+
   describe("POST /stop honours session_origin policy", () => {
     async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review") {
       return app(

@@ -648,6 +648,23 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         });
       }
 
+      if (request.method === "GET" && url.pathname === "/session-origin") {
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
+          return Response.json(
+            { error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer" },
+            { status: 400 },
+          );
+        }
+
+        const record = storage.sessionOrigins.get(sessionId);
+        if (!record) {
+          return Response.json({ error: "Session not found" }, { status: 404 });
+        }
+
+        return Response.json(record);
+      }
+
       if (request.method === "GET" && url.pathname === "/sessions") {
         const active = url.searchParams.get("active") === "true";
         const notify = url.searchParams.get("notify") === "true";
