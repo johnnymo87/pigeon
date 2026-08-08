@@ -712,10 +712,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         return Response.json(record);
       }
 
-      // DELETE /session-origin
-      // Ops-facing hard reset / downgrade path out of a sticky override:
-      // - POST /sessions/enable-notify (override write) = user-facing "never silence this session again", sticky against automated writers.
-      // - DELETE /session-origin = ops-facing "forget everything; return to the normal pipeline" — after it, automated declared writers may re-quiet the session and the legacy title regex applies again. Weakest state.
+      // The ops-facing hard reset, and the only way back down out of a sticky override.
+      // The two levers are inverses, not duplicates:
+      //   POST /sessions/enable-notify — user-facing "never silence this session again".
+      //     Writes an override row that later declared writers cannot undo.
+      //   DELETE /session-origin      — ops-facing "forget everything, return to the normal
+      //     pipeline". Afterwards declared writers may re-quiet the session and the legacy
+      //     title regex applies again. This is the weakest state, not a quieter one.
+      // Idempotent by design: a hard reset that errors when already reset is a worse ops tool.
       if (request.method === "DELETE" && url.pathname === "/session-origin") {
         const sessionId = url.searchParams.get("session_id") ?? "";
         if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
