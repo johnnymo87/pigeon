@@ -642,6 +642,137 @@ describe("current-state formatting helpers", () => {
       const codeEntities = card.entities.filter(e => e.type === "code");
       expect(card.text.slice(codeEntities[0]!.offset, codeEntities[0]!.offset + codeEntities[0]!.length)).toBe("unknown");
     });
+
+    it("renders quiet indicator before swipe-reply when quiet is present", () => {
+      // quiet omitted or null produces identical output
+      const cardNoQuiet = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: null,
+      }, now);
+      expect(cardNoQuiet.text).toContain("🆔 sess-1\n↩️ Swipe-reply to respond");
+      expect(cardNoQuiet.text).not.toContain("🔇");
+
+      // origin with errors-only policy
+      const card1 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: "lgtm", policy: "errors-only" },
+      }, now);
+      expect(card1.text).toContain("🆔 sess-1\n🔇 Muted by lgtm · errors still notify\n↩️ Swipe-reply to respond");
+
+      // origin with none policy
+      const card2 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: "lgtm", policy: "none" },
+      }, now);
+      expect(card2.text).toContain("🆔 sess-1\n🔇 Muted by lgtm · all events\n↩️ Swipe-reply to respond");
+
+      // origin with other policy
+      const card3 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: "lgtm", policy: "all" },
+      }, now);
+      expect(card3.text).toContain("🆔 sess-1\n🔇 Muted by lgtm\n↩️ Swipe-reply to respond");
+
+      // origin with null origin (substitutes "declared policy")
+      const card4 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: null, policy: "errors-only" },
+      }, now);
+      expect(card4.text).toContain("🆔 sess-1\n🔇 Muted by declared policy · errors still notify\n↩️ Swipe-reply to respond");
+
+      const card5 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: null, policy: "none" },
+      }, now);
+      expect(card5.text).toContain("🆔 sess-1\n🔇 Muted by declared policy · all events\n↩️ Swipe-reply to respond");
+
+      const card6 = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "origin", origin: null, policy: null },
+      }, now);
+      expect(card6.text).toContain("🆔 sess-1\n🔇 Muted by declared policy\n↩️ Swipe-reply to respond");
+
+      // title pattern
+      const cardTitle = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "title", origin: null, policy: null },
+      }, now);
+      expect(cardTitle.text).toContain("🆔 sess-1\n🔇 Muted by title pattern\n↩️ Swipe-reply to respond");
+
+      // notify-flag
+      const cardFlag = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "notify-flag", origin: null, policy: null },
+      }, now);
+      expect(cardFlag.text).toContain("🆔 sess-1\n🔇 Muted · notifications turned off\n↩️ Swipe-reply to respond");
+
+      // unregistered
+      const cardUnreg = formatStateCard({
+        title: "Test Session",
+        status: "idle",
+        dir: "/home/dev/pigeon",
+        sid: "sess-1",
+        snippet: "",
+        lastActivity: null,
+        machineId: "devbox",
+        quiet: { reason: "unregistered", origin: null, policy: null },
+      }, now);
+      expect(cardUnreg.text).toContain("🆔 sess-1\n🔇 Muted · not registered with pigeon\n↩️ Swipe-reply to respond");
+    });
   });
 
   describe("formatCurrentStateIndex", () => {

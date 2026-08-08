@@ -25,6 +25,7 @@ import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
+import { explainQuiet } from "./notify-policy";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
@@ -312,6 +313,22 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
               () => storage.sessions.list({ active: true }).map(s => ({ sessionId: s.sessionId, pid: s.pid, lastSeen: s.lastSeen })),
             ),
             registerSession: (sid, label) => poller!.registerSession(sid, label),
+            describeQuiet: (sid, title) => {
+              try {
+                const session = storage.sessions.get(sid);
+                const originRow = storage.sessionOrigins.get(sid);
+                return explainQuiet({
+                  registered: !!session,
+                  notify: session?.notify ?? false,
+                  policy: originRow?.notifyPolicy ?? null,
+                  origin: originRow?.origin ?? null,
+                  title,
+                });
+              } catch (e) {
+                console.warn(`[current-state] quiet lookup failed for ${sid}:`, e);
+                return null;
+              }
+            },
             enqueueCard: (opts) => {
               // NOTE: OutboxSender delivers to its configured chatId and ignores this
               // command's msg.chatId, because the outbox payload carries no chatId. That is

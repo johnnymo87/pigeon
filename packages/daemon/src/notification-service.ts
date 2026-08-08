@@ -4,6 +4,7 @@ import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
 import type { Activity } from "./current-state-enrich";
+import type { QuietExplanation } from "./notify-policy";
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
 /**
@@ -270,6 +271,27 @@ export function relativeTime(ms: number, now: number): string {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+function formatQuietLine(quiet: QuietExplanation): string {
+  switch (quiet.reason) {
+    case "origin": {
+      const displayOrigin = quiet.origin ?? "declared policy";
+      if (quiet.policy === "errors-only") {
+        return `🔇 Muted by ${displayOrigin} · errors still notify`;
+      }
+      if (quiet.policy === "none") {
+        return `🔇 Muted by ${displayOrigin} · all events`;
+      }
+      return `🔇 Muted by ${displayOrigin}`;
+    }
+    case "title":
+      return "🔇 Muted by title pattern";
+    case "notify-flag":
+      return "🔇 Muted · notifications turned off";
+    case "unregistered":
+      return "🔇 Muted · not registered with pigeon";
+  }
+}
+
 export function formatStateCard(
   input: {
     title: string;
@@ -279,6 +301,7 @@ export function formatStateCard(
     snippet: string;
     lastActivity: number | null;
     machineId: string;
+    quiet?: QuietExplanation | null;
   },
   now?: number,
 ): TgMessage {
@@ -301,7 +324,13 @@ export function formatStateCard(
     .append(` · 🖥 ${input.machineId}`)
     .newline()
     .append("🆔 ")
-    .appendCode(input.sid)
+    .appendCode(input.sid);
+
+  if (input.quiet) {
+    builder.newline().append(formatQuietLine(input.quiet));
+  }
+
+  builder
     .newline()
     .append("↩️ ")
     .appendItalic("Swipe-reply to respond");
