@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, type SessionOriginRecord } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -11,7 +11,7 @@ import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
-import { isQuietTitle } from "./quiet-title";
+import { decideNotify } from "./notify-policy";
 
 interface LegacySession {
   session_id: string;
@@ -700,9 +700,27 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         const effectiveTitle = requestTitle ?? session.title;
 
-        if (event === "Stop" && isQuietTitle(effectiveTitle)) {
-          console.log(`[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}"`);
-          return Response.json({ ok: true, notified: false, reason: "quiet_title" });
+        let originRow: SessionOriginRecord | null = null;
+        try {
+          originRow = storage.sessionOrigins.get(sessionId);
+        } catch (err) {
+          // Fail open: a provenance read that throws must not cost the user a
+          // notification. Deliver and leave a trace.
+          console.error(`[stop] session_origin read failed sessionId=${sessionId}, delivering:`, err);
+        }
+
+        const decision = decideNotify({
+          event,
+          policy: originRow?.notifyPolicy ?? null,
+          title: effectiveTitle,
+        });
+
+        if (!decision.deliver) {
+          console.log(
+            `[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}" ` +
+            `layer=${decision.layer} origin=${originRow?.origin ?? "-"}`,
+          );
+          return Response.json({ ok: true, notified: false, reason: `quiet_${decision.layer}` });
         }
 
         const now = nowFn();

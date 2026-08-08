@@ -1793,4 +1793,82 @@ describe("createApp", () => {
       expect((await res2.json()).error).toMatch(/origin/);
     });
   });
+
+  describe("POST /stop honours session_origin policy", () => {
+    async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review") {
+      return app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event, summary: "done", title }),
+        }),
+      );
+    }
+
+    function seed(app: ReturnType<typeof createApp>, policy: string, notify = true) {
+      storage!.sessions.upsert({ sessionId: "ses_a", notify }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: policy as never, source: "declared" },
+        1_000,
+      );
+    }
+
+    it("errors-only + Stop -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+    });
+
+    it("errors-only + Error -> delivered (202 queued)", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Error");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
+    it("errors-only + Retry -> delivered (202 queued)", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Retry");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
+    it("notify=false on session short-circuits ahead of policy layer even with notifyPolicy=all", async () => {
+      const app = newApp();
+      seed(app, "all", false);
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "notify=false" });
+    });
+
+    it("none + Stop -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "none");
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+    });
+
+    it("session with NO origin row falls through to title layer (quiet-matching title -> quiet_title)", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+    });
+
+    it("notifyPolicy=all + quiet-matching title -> delivered (provenance overrides title regex)", async () => {
+      const app = newApp();
+      seed(app, "all");
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+  });
 });

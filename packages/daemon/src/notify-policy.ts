@@ -26,7 +26,7 @@ const ERROR_EVENTS = new Set(["Error", "Retry"]);
  *      PIGEON_QUIET_TITLE_LAYER=off, delete under pigeon-qdcb.5)
  *   3. deliver
  *
- * The caller checks `sessions.notify` BEFORE calling this (app.ts:684); that short-circuit
+ * The caller checks `sessions.notify` BEFORE calling this (the `!session.notify` short-circuit in the POST /stop handler); that short-circuit
  * is upstream of the whole matrix.
  *
  * Every unnamed case delivers. `Error` and `Retry` arrive on the same POST /stop as `Stop`
