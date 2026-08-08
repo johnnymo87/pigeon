@@ -48,6 +48,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -123,6 +124,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -166,6 +168,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
     };
 
     await ingestCurrentStateCommand(input);
@@ -198,6 +201,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
     };
 
     await ingestCurrentStateCommand(input);
@@ -250,6 +254,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -281,6 +286,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
     };
 
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
@@ -330,6 +336,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -392,6 +399,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -440,6 +448,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
     };
 
     await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
@@ -480,6 +489,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
       now: 2500,
     };
 
@@ -514,6 +524,7 @@ describe("current-state-ingest TDD tests", () => {
       registerSession,
       enqueueCard,
       sendPlainText,
+      describeQuiet: vi.fn().mockReturnValue(null),
     };
 
     await ingestCurrentStateCommand(input);
@@ -527,6 +538,118 @@ describe("current-state-ingest TDD tests", () => {
 
     expect(registerSession).not.toHaveBeenCalled();
     expect(enqueueCard).not.toHaveBeenCalled();
+  });
+
+  it("12. describeQuiet is called per session with sid and title, and quiet reaches card", async () => {
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
+    const sendPlainText = vi.fn().mockResolvedValue(undefined);
+
+    const describeQuiet = vi.fn().mockImplementation((sid: string, title: string) => {
+      if (sid === "ses_A") {
+        return { reason: "origin", origin: "lgtm", policy: "errors-only" };
+      }
+      return null;
+    });
+
+    const opencodeClient = {
+      healthCheck: vi.fn().mockResolvedValue(true),
+      getSessionInfo: vi.fn().mockImplementation(async (sid: string) => {
+        if (sid === "ses_A") {
+          return { id: "ses_A", title: "Session A", directory: "/home/dev/a", time: { created: 500, updated: 1000 } };
+        }
+        if (sid === "ses_B") {
+          return { id: "ses_B", title: "Session B", directory: "/home/dev/b", time: { created: 1000, updated: 2000 } };
+        }
+        return null;
+      }),
+      getSessionMessages: vi.fn().mockImplementation(async (sid: string) => {
+        if (sid === "ses_A") return [{ info: { role: "user", time: { completed: 1000 } } }];
+        if (sid === "ses_B") return [{ info: { role: "user", time: { completed: 2000 } } }];
+        return [];
+      }),
+    };
+
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A", "ses_B"], homeScreenCount: 0 });
+
+    const input: CurrentStateIngestInput = {
+      commandId: "cmd-123",
+      chatId: "chat-456",
+      machineId: "devbox",
+      opencodeClient,
+      enumerate,
+      registerSession,
+      enqueueCard,
+      sendPlainText,
+      describeQuiet,
+      now: 2500,
+    };
+
+    await ingestCurrentStateCommand(input);
+
+    expect(describeQuiet).toHaveBeenCalledTimes(2);
+    expect(describeQuiet).toHaveBeenCalledWith("ses_B", "Session B");
+    expect(describeQuiet).toHaveBeenCalledWith("ses_A", "Session A");
+
+    expect(enqueueCard).toHaveBeenCalledTimes(2);
+    const sesACardCall = enqueueCard.mock.calls.find((c) => c[0].sid === "ses_A");
+    expect(sesACardCall![0].text).toContain("🔇 Muted by lgtm · errors still notify");
+
+    const sesBCardCall = enqueueCard.mock.calls.find((c) => c[0].sid === "ses_B");
+    expect(sesBCardCall![0].text).not.toContain("🔇");
+  });
+
+  it("13. describeQuiet throwing does not break card enqueueing", async () => {
+    const registerSession = vi.fn().mockResolvedValue({ ok: true, kind: "success", status: 200, body: { ok: true } });
+    const enqueueCard = vi.fn();
+    const sendPlainText = vi.fn().mockResolvedValue(undefined);
+
+    const describeQuiet = vi.fn().mockImplementation(() => {
+      throw new Error("DB error in describeQuiet");
+    });
+
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const opencodeClient = {
+      healthCheck: vi.fn().mockResolvedValue(true),
+      getSessionInfo: vi.fn().mockImplementation(async (sid: string) => {
+        return { id: sid, title: "Session A", directory: "/home/dev/a", time: { created: 500, updated: 1000 } };
+      }),
+      getSessionMessages: vi.fn().mockResolvedValue([{ info: { role: "user", time: { completed: 1000 } } }]),
+    };
+
+    const enumerate = vi.fn().mockResolvedValue({ sids: ["ses_A"], homeScreenCount: 0 });
+
+    const input: CurrentStateIngestInput = {
+      commandId: "cmd-123",
+      chatId: "chat-456",
+      machineId: "devbox",
+      opencodeClient,
+      enumerate,
+      registerSession,
+      enqueueCard,
+      sendPlainText,
+      describeQuiet,
+      now: 2500,
+    };
+
+    await expect(ingestCurrentStateCommand(input)).resolves.not.toThrow();
+
+    expect(enqueueCard).toHaveBeenCalledTimes(1);
+    expect(enqueueCard).toHaveBeenCalledWith({
+      sid: "ses_A",
+      text: expect.any(String),
+      entities: expect.any(Array),
+      notificationId: "cs:cmd-123:ses_A",
+    });
+    const cardCall = enqueueCard.mock.calls[0];
+    expect(cardCall![0].text).not.toContain("🔇");
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[current-state-ingest] describeQuiet failed for ses_A:"),
+      expect.any(Error),
+    );
+
+    consoleWarnSpy.mockRestore();
   });
 
 });

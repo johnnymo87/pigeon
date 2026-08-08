@@ -1,5 +1,6 @@
 import type { TgEntity } from "../telegram-message";
 import type { SendNotificationInput, WorkerResult } from "./poller";
+import type { QuietExplanation } from "../notify-policy";
 import {
   classifyActivity,
   snippetFromMessages,
@@ -22,6 +23,7 @@ export interface CurrentStateIngestInput {
   };
   enumerate: () => Promise<{ sids: string[]; homeScreenCount: number }>;
   registerSession: (sid: string, label: string) => Promise<WorkerResult>;
+  describeQuiet: (sid: string, title: string) => QuietExplanation | null;
   enqueueCard: (opts: {
     sid: string;
     text: string;
@@ -105,6 +107,12 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
         console.warn(`[current-state-ingest] registerSession failed for ${r.sid}:`, regResult);
         continue;
       }
+      let quiet: QuietExplanation | null = null;
+      try {
+        quiet = input.describeQuiet(r.sid, r.title);
+      } catch (e) {
+        console.warn(`[current-state-ingest] describeQuiet failed for ${r.sid}:`, e);
+      }
       const card = formatStateCard(
         {
           title: r.title,
@@ -114,6 +122,7 @@ export async function ingestCurrentStateCommand(input: CurrentStateIngestInput):
           snippet: r.snippet,
           lastActivity: r.lastActivity,
           machineId: input.machineId,
+          quiet,
         },
         input.now,
       );

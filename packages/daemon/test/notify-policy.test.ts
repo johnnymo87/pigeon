@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { decideNotify } from "../src/notify-policy";
+import { decideNotify, explainQuiet } from "../src/notify-policy";
 
 describe("decideNotify", () => {
   it("delivers everything when there is no origin row and the title does not match", () => {
@@ -136,5 +136,133 @@ describe("decideNotify", () => {
     }
 
     warnSpy.mockRestore();
+  });
+});
+
+describe("explainQuiet", () => {
+  it("returns unregistered when registered is false, even if notify is true and policy/origin set", () => {
+    expect(
+      explainQuiet(
+        { registered: false, notify: true, policy: null, origin: null, title: "Fix bug" },
+        {},
+      ),
+    ).toEqual({
+      reason: "unregistered",
+      origin: null,
+      policy: null,
+    });
+
+    expect(
+      explainQuiet(
+        { registered: false, notify: false, policy: "errors-only", origin: "lgtm", title: "Task .lgtm-review-prompt.md" },
+        {},
+      ),
+    ).toEqual({
+      reason: "unregistered",
+      origin: "lgtm",
+      policy: "errors-only",
+    });
+  });
+
+  it("returns notify-flag when registered is true and notify is false, taking precedence over title match", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: false, policy: null, origin: null, title: "Task .lgtm-review-prompt.md" },
+        {},
+      ),
+    ).toEqual({
+      reason: "notify-flag",
+      origin: null,
+      policy: null,
+    });
+  });
+
+  it("returns origin when policy is errors-only, echoing back origin and policy", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: "errors-only", origin: "lgtm", title: "Fix auth bug" },
+        {},
+      ),
+    ).toEqual({
+      reason: "origin",
+      origin: "lgtm",
+      policy: "errors-only",
+    });
+  });
+
+  it("returns origin when policy is none", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: "none", origin: "custom", title: "Fix auth bug" },
+        {},
+      ),
+    ).toEqual({
+      reason: "origin",
+      origin: "custom",
+      policy: "none",
+    });
+  });
+
+  it("returns null when policy is all even if title matches quiet regex", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: "all", origin: "lgtm", title: "Task .lgtm-review-prompt.md" },
+        {},
+      ),
+    ).toBeNull();
+  });
+
+  it("returns title when no row (policy null) and title matches quiet pattern", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: "Task .lgtm-review-prompt.md" },
+        {},
+      ),
+    ).toEqual({
+      reason: "title",
+      origin: null,
+      policy: null,
+    });
+  });
+
+  it("returns null when no row and title is ordinary", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: "Fix auth bug" },
+        {},
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null when title matches but PIGEON_QUIET_TITLE_LAYER=off in env", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: "Task .lgtm-review-prompt.md" },
+        { PIGEON_QUIET_TITLE_LAYER: "off" },
+      ),
+    ).toBeNull();
+  });
+
+  it("handles null/undefined/empty title without throwing and returns null for ordinary session", () => {
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: null },
+        {},
+      ),
+    ).toBeNull();
+
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: undefined },
+        {},
+      ),
+    ).toBeNull();
+
+    expect(
+      explainQuiet(
+        { registered: true, notify: true, policy: null, origin: null, title: "" },
+        {},
+      ),
+    ).toBeNull();
   });
 });
