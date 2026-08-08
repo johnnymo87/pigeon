@@ -11,7 +11,7 @@ import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
-import { decideNotify } from "./notify-policy";
+import { decideNotify, type NotifyDecision } from "./notify-policy";
 
 interface LegacySession {
   session_id: string;
@@ -659,7 +659,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const record = storage.sessionOrigins.get(sessionId);
         if (!record) {
-          return Response.json({ error: "Session not found" }, { status: 404 });
+          return Response.json({ error: "No origin recorded for session" }, { status: 404 });
         }
 
         return Response.json(record);
@@ -726,11 +726,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           console.error(`[stop] session_origin read failed sessionId=${sessionId}, delivering:`, err);
         }
 
-        const decision = decideNotify({
-          event,
-          policy: originRow?.notifyPolicy ?? null,
-          title: effectiveTitle,
-        });
+        let decision: NotifyDecision;
+        try {
+          decision = decideNotify({
+            event,
+            policy: originRow?.notifyPolicy ?? null,
+            title: effectiveTitle,
+          });
+        } catch (err) {
+          console.error(`[stop] notify decision failed sessionId=${sessionId}, delivering:`, err);
+          decision = { deliver: true, layer: "default" };
+        }
 
         if (!decision.deliver) {
           console.log(

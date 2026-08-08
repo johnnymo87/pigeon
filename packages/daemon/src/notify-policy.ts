@@ -1,6 +1,14 @@
 import { isQuietTitle } from "./quiet-title";
 import type { NotifyPolicy } from "./storage/session-origin-repo";
 
+/**
+ * Which notification layer made the suppression decision.
+ *
+ * NOTE: Values here ("origin", "title", "default") are templated directly into
+ * the POST /stop response as `quiet_${layer}` (e.g. `quiet_origin`, `quiet_title`).
+ * They are part of the wire contract consumed by callers and tests; adding or
+ * changing a variant requires a deliberate decision about its wire string.
+ */
 export type NotifyLayer = "origin" | "title" | "default";
 
 export interface NotifyDecisionInput {
@@ -17,6 +25,25 @@ export interface NotifyDecision {
 /** Events that `errors-only` still delivers. */
 const ERROR_EVENTS = new Set(["Error", "Retry"]);
 
+/** Recognised spellings for switching the transitional title layer off. */
+const LAYER_OFF_VALUES = new Set(["off", "false", "0", "no"]);
+/** Recognised spellings for leaving it on. */
+const LAYER_ON_VALUES = new Set(["on", "true", "1", "yes"]);
+
+function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
+  const raw = env.PIGEON_QUIET_TITLE_LAYER?.trim();
+  if (!raw) return true;
+
+  const val = raw.toLowerCase();
+  if (LAYER_OFF_VALUES.has(val)) return false;
+  if (LAYER_ON_VALUES.has(val)) return true;
+
+  console.warn(
+    `[notify-policy] unrecognised PIGEON_QUIET_TITLE_LAYER="${raw}", leaving title layer enabled`,
+  );
+  return true;
+}
+
 /**
  * Which notification layer decided, and what it decided.
  *
@@ -30,7 +57,7 @@ const ERROR_EVENTS = new Set(["Error", "Retry"]);
  * is upstream of the whole matrix.
  *
  * Every unnamed case delivers. `Error` and `Retry` arrive on the same POST /stop as `Stop`
- * (opencode-plugin/src/index.ts:543,652), and have always been delivered for lgtm sessions
+ * (see the `Error` and `Retry` calls into `notifyStop` in opencode-plugin/src/index.ts), and have always been delivered for lgtm sessions
  * because the old gate tested `event === "Stop"`. Silencing them here would be a
  * regression that no counter would surface.
  */
@@ -52,7 +79,7 @@ export function decideNotify(
 
   if (policy === "all") return { deliver: true, layer: "origin" };
 
-  const titleLayerOn = (env.PIGEON_QUIET_TITLE_LAYER ?? "on").trim() !== "off";
+  const titleLayerOn = isTitleLayerOn(env);
   if (titleLayerOn && event === "Stop" && isQuietTitle(title, env)) {
     return { deliver: false, layer: "title" };
   }

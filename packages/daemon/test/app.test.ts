@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { StopNotifier } from "../src/notification-service";
@@ -1830,7 +1830,7 @@ describe("createApp", () => {
       const app = newApp();
       const res = await get(app, "?session_id=ses_unknown");
       expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: "Session not found" });
+      expect(await res.json()).toEqual({ error: "No origin recorded for session" });
     });
 
     it("200 with full row after seeding via storage.sessionOrigins.record", async () => {
@@ -1881,6 +1881,27 @@ describe("createApp", () => {
   });
 
   describe("POST /stop honours session_origin policy", () => {
+    const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      delete process.env.PIGEON_QUIET_TITLE_LAYER;
+    });
+
+    afterEach(() => {
+      if (originalQuietPattern !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_PATTERN = originalQuietPattern;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      }
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
+      }
+    });
+
     async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review") {
       return app(
         new Request("http://localhost/stop", {
@@ -1955,6 +1976,41 @@ describe("createApp", () => {
       const json = await res.json();
       expect(json.ok).toBe(true);
       expect(json.deliveryState).toBe("queued");
+    });
+
+    it("fails open and delivers if storage.sessionOrigins.get throws", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      vi.spyOn(storage!.sessionOrigins, "get").mockImplementationOnce(() => {
+        throw new Error("DB lock failure");
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop");
+      expect(res.status).toBe(202);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[stop] session_origin read failed sessionId=ses_a, delivering:"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("fails open and delivers if decideNotify throws", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const notifyPolicyModule = await import("../src/notify-policy");
+      vi.spyOn(notifyPolicyModule, "decideNotify").mockImplementationOnce(() => {
+        throw new Error("Unexpected policy failure");
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop");
+      expect(res.status).toBe(202);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[stop] notify decision failed sessionId=ses_a, delivering:"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
     });
   });
 });

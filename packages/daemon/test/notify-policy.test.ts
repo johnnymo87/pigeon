@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { decideNotify } from "../src/notify-policy";
 
 describe("decideNotify", () => {
@@ -88,12 +88,53 @@ describe("decideNotify", () => {
     });
   });
 
-  it("the title layer can be disabled by env", () => {
+  it("the title layer can be disabled by env recognised off values", () => {
+    const offValues = ["off", "OFF", "Off", " off ", "false", "0", "no"];
+    for (const val of offValues) {
+      expect(
+        decideNotify(
+          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
+          { PIGEON_QUIET_TITLE_LAYER: val },
+        ),
+      ).toEqual({ deliver: true, layer: "default" });
+    }
+  });
+
+  it("the title layer remains enabled for recognised on values and empty/unset", () => {
+    const onValues = ["on", "ON", "On", "1", "true", "yes", ""];
+    for (const val of onValues) {
+      expect(
+        decideNotify(
+          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
+          { PIGEON_QUIET_TITLE_LAYER: val },
+        ),
+      ).toEqual({ deliver: false, layer: "title" });
+    }
     expect(
       decideNotify(
         { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "off" },
+        {},
       ),
-    ).toEqual({ deliver: true, layer: "default" });
+    ).toEqual({ deliver: false, layer: "title" });
+  });
+
+  it("unrecognised PIGEON_QUIET_TITLE_LAYER value stays enabled and logs console.warn", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unrecognisedValues = ["disabled", "nope"];
+
+    for (const val of unrecognisedValues) {
+      expect(
+        decideNotify(
+          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
+          { PIGEON_QUIET_TITLE_LAYER: val },
+        ),
+      ).toEqual({ deliver: false, layer: "title" });
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(val),
+      );
+    }
+
+    warnSpy.mockRestore();
   });
 });
