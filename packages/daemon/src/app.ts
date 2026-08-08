@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES, type SessionOriginRecord } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, ORIGIN_UNKNOWN, type SessionOriginRecord } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -607,12 +607,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // what suppressed this session. Answering {ok:true} would tell the user their only
         // escape hatch worked while the session goes on hiding real work, which is precisely the
         // outcome app.ts:113 forbids. A loud 500 they can retry is the honest answer.
+        //
+        // The request is then partially applied on two axes: sessions.notify is already
+        // committed, and returning here skips onSessionStart's worker re-registration below.
+        // Both are benign and a retry heals them; the response reports notify:true honestly.
         try {
           const existingOrigin = storage.sessionOrigins.get(sessionId);
           storage.sessionOrigins.record(
             {
               sessionId,
-              origin: existingOrigin?.origin ?? "unknown",
+              origin: existingOrigin?.origin ?? ORIGIN_UNKNOWN,
               notifyPolicy: "all",
               source: "override",
             },
@@ -622,7 +626,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           console.error(`[enable-notify] session_origin record failed sessionId=${sessionId}:`, err);
           return Response.json(
             {
-              error: "Failed to clear notification policy; session may still be suppressed",
+              error: "Failed to override notification policy; session may still be suppressed",
               session_id: sessionId,
               notify: true,
             },

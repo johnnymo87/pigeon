@@ -2165,6 +2165,10 @@ describe("createApp", () => {
       // that is still suppressed had been un-quieted (app.ts:113).
       expect(res.status).toBe(500);
       expect((await res.json()).error).toMatch(/still be suppressed/);
+
+      // The request is deliberately partially applied: sessions.notify is already committed
+      // and a retry heals the rest. Pin that so the partial state is a decision, not a drift.
+      expect(storage!.sessions.get("ses_a")?.notify).toBe(true);
     });
 
     it("creates an override row with origin 'unknown' when no origin row exists", async () => {
@@ -2189,6 +2193,77 @@ describe("createApp", () => {
         createdAt: 1_000,
         updatedAt: 1_000,
       });
+    });
+
+    it("end-to-end: un-quiets a declared-quieted session over HTTP", async () => {
+      // The most representative production sequence: lgtm declares the session quiet first,
+      // the user escapes second, and the next Stop must reach them.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true, title: "some work" }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      const stopRes1 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes1.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+
+      const enableRes = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(enableRes.status).toBe(200);
+
+      const stopRes2 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes2.status).toBe(202);
+      expect((await stopRes2.json()).deliveryState).toBe("queued");
+    });
+
+    it("end-to-end: DELETE returns a session to title-regex suppression", async () => {
+      const app = newApp();
+      storage!.sessions.upsert(
+        { sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" },
+        1_000,
+      );
+
+      await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      const delRes = await app(
+        new Request("http://localhost/session-origin?session_id=ses_a", { method: "DELETE" }),
+      );
+      expect(delRes.status).toBe(200);
+      expect((await delRes.json()).cleared).toBe(true);
+
+      // Back to the weakest state: the legacy title layer applies again.
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
     });
 
     it("end-to-end: un-quiets a title-quieted session", async () => {
