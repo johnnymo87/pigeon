@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
+import { DEFAULT_DECLARED_QUIET_TTL_MS } from "../src/notify-policy";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { StopNotifier } from "../src/notification-service";
 
@@ -2074,6 +2075,33 @@ describe("createApp", () => {
       const json = await res.json();
       expect(json.ok).toBe(true);
       expect(json.deliveryState).toBe("queued");
+    });
+
+    it("delivers Stop and logs observable line when declared quiet policy is expired", async () => {
+      const createdAt = 1_000;
+      const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+      const now = createdAt + ttl + 500;
+      const app = newApp(now);
+
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, createdAt);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        createdAt,
+      );
+
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop", "PR review .lgtm-review-prompt.md");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[stop] declared quiet expired sessionId=ses_a origin=lgtm policy=errors-only ageMs=14400500 — delivering",
+      );
+
+      logSpy.mockRestore();
     });
 
     it("fails open and delivers if storage.sessionOrigins.get throws", async () => {

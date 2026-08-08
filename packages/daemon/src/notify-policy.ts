@@ -1,5 +1,82 @@
 import { isQuietTitle } from "./quiet-title";
-import type { NotifyPolicy } from "./storage/session-origin-repo";
+import type { NotifyPolicy, OriginSource } from "./storage/session-origin-repo";
+
+export const DEFAULT_DECLARED_QUIET_TTL_MS = 4 * 60 * 60 * 1000; // 4h
+
+export interface EffectivePolicyInput {
+  policy: NotifyPolicy | null;
+  source: OriginSource | null;
+  createdAt: number | null;
+  now: number;
+}
+
+export interface EffectivePolicyResult {
+  policy: NotifyPolicy | null;
+  expired: boolean; // true ONLY when expiry actually changed the outcome
+}
+
+function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): number {
+  const raw = env.PIGEON_DECLARED_QUIET_TTL_MS?.trim();
+  if (!raw) return DEFAULT_DECLARED_QUIET_TTL_MS;
+
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return parsed;
+  }
+
+  console.warn(
+    `[notify-policy] unrecognised PIGEON_DECLARED_QUIET_TTL_MS="${raw}", using default ${DEFAULT_DECLARED_QUIET_TTL_MS}ms`,
+  );
+  return DEFAULT_DECLARED_QUIET_TTL_MS;
+}
+
+/**
+ * Computes the effective notification policy for a session origin record,
+ * applying time-to-live (TTL) expiry to quiet declared/inferred rows.
+ *
+ * WHY expiry returns 'all' and not null:
+ * Expiry MUST NOT resolve to policy = null. When policy is null, decideNotify
+ * falls through to the legacy title layer (notify-policy.ts:82-85), where the
+ * quiet-title regex still matches 14 of 16 production lgtm titles (e.g.,
+ * "PR review .lgtm-review-prompt.md"). Resolving to null would leave the session
+ * muted by title regex for ~88% of cases, making expiry a no-op. Expiring to 'all'
+ * explicitly delivers at the origin layer and bypasses the title layer.
+ *
+ * WHY 'override' is exempt:
+ * User-issued un-quiet actions write source = 'override'. A user's explicit decision
+ * to un-quiet or change policy is permanent. Expiring an override would fail toward
+ * silence, defeating the user's explicit choice.
+ *
+ * WHY the clock uses created_at instead of updated_at:
+ * The suppression clock starts when provenance was first declared. Using updated_at
+ * would allow repeated identical declared writes from the reconciliation writer
+ * to refresh updated_at indefinitely, extending quiet status forever.
+ */
+export function effectiveNotifyPolicy(
+  input: EffectivePolicyInput,
+  env: Record<string, string | undefined> = process.env,
+): EffectivePolicyResult {
+  const { policy, source, createdAt, now } = input;
+
+  if (policy === null) {
+    return { policy: null, expired: false };
+  }
+
+  if (source === "override" || policy === "all") {
+    return { policy, expired: false };
+  }
+
+  if ((policy === "errors-only" || policy === "none") && (source === "declared" || source === "inferred")) {
+    if (createdAt !== null && Number.isFinite(createdAt)) {
+      const ttl = parseDeclaredQuietTtlMs(env);
+      if (now - createdAt > ttl) {
+        return { policy: "all", expired: true };
+      }
+    }
+  }
+
+  return { policy, expired: false };
+}
 
 /**
  * Which notification layer made the suppression decision.
