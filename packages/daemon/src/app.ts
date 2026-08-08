@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES, type SessionOriginRecord } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, ORIGIN_UNKNOWN, type SessionOriginRecord } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -589,6 +589,51 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
+        // Write an override row to session_origin so quiet-title and session_origin policy layers
+        // stop suppressing notifications for this session.
+        // We WRITE an explicit 'all' override row rather than deleting for two reasons:
+        // 1. Deleting is not durable: an automated declared writer ships next and would re-insert
+        //    the quiet row, silently re-quieting the session.
+        // 2. Deleting does not work for title-quieted sessions: deleting leaves policy === null,
+        //    which falls through to the title regex and keeps suppressing. Only an explicit 'all'
+        //    row short-circuits above the title regex.
+        //
+        // On failure we REPORT it rather than swallowing it. Note this is not the same shape of
+        // fail-open as POST /stop, and the difference is deliberate. There, ambiguity resolves
+        // toward delivering because the handler still controls the delivery. Here it does not:
+        // if this write is lost, the pre-existing errors-only row (or, with no row, the title
+        // regex) keeps suppressing, so the session stays SILENT. Setting sessions.notify = true
+        // does not save it — that short-circuit sits UPSTREAM of the policy matrix and was never
+        // what suppressed this session. Answering {ok:true} would tell the user their only
+        // escape hatch worked while the session goes on hiding real work, which is precisely the
+        // outcome app.ts:113 forbids. A loud 500 they can retry is the honest answer.
+        //
+        // The request is then partially applied on two axes: sessions.notify is already
+        // committed, and returning here skips onSessionStart's worker re-registration below.
+        // Both are benign and a retry heals them; the response reports notify:true honestly.
+        try {
+          const existingOrigin = storage.sessionOrigins.get(sessionId);
+          storage.sessionOrigins.record(
+            {
+              sessionId,
+              origin: existingOrigin?.origin ?? ORIGIN_UNKNOWN,
+              notifyPolicy: "all",
+              source: "override",
+            },
+            nowFn(),
+          );
+        } catch (err) {
+          console.error(`[enable-notify] session_origin record failed sessionId=${sessionId}:`, err);
+          return Response.json(
+            {
+              error: "Failed to override notification policy; session may still be suppressed",
+              session_id: sessionId,
+              notify: true,
+            },
+            { status: 500 },
+          );
+        }
+
         if (onSessionStart) {
           await onSessionStart(sessionId, true, label ?? existing.label);
         }
@@ -659,10 +704,37 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const record = storage.sessionOrigins.get(sessionId);
         if (!record) {
-          return Response.json({ error: "No origin recorded for session" }, { status: 404 });
+          return Response.json(
+            {
+              error: "No origin recorded for session",
+              hint: "No origin recorded means no override or declared origin exists. The legacy title regex and default delivery policy apply.",
+            },
+            { status: 404 },
+          );
         }
 
         return Response.json(record);
+      }
+
+      // The ops-facing hard reset, and the only way back down out of a sticky override.
+      // The two levers are inverses, not duplicates:
+      //   POST /sessions/enable-notify — user-facing "never silence this session again".
+      //     Writes an override row that later declared writers cannot undo.
+      //   DELETE /session-origin      — ops-facing "forget everything, return to the normal
+      //     pipeline". Afterwards declared writers may re-quiet the session and the legacy
+      //     title regex applies again. This is the weakest state, not a quieter one.
+      // Idempotent by design: a hard reset that errors when already reset is a worse ops tool.
+      if (request.method === "DELETE" && url.pathname === "/session-origin") {
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
+          return Response.json(
+            { error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer" },
+            { status: 400 },
+          );
+        }
+
+        const cleared = storage.sessionOrigins.clear(sessionId);
+        return Response.json({ ok: true, session_id: sessionId, cleared });
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {

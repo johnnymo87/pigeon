@@ -21,7 +21,10 @@ Use this skill before changing daemon routes, storage schema, worker integration
 
 - `GET /health`
 - `POST /session-start`
-- `POST /sessions/enable-notify`
+- `POST /sessions/enable-notify` -- **not merely "set `notify=true`" any more.** It is now the user-facing un-quiet lever, and also writes a `session_origin` row with `source='override'`, `notify_policy='all'`, which automated `declared` writers cannot undo. Calling it routinely (e.g. as a convenience step in some other flow) would permanently exempt that session from lgtm quieting, one session at a time, with nothing counting it. Returns 500 if the override write fails, because a session that is still silent must not be reported as un-quieted.
+- `POST /session-origin` -- declared provenance write (insert-or-upgrade, `source` hardcoded `declared`; precedence `inferred < declared < override`).
+- `GET /session-origin?session_id=` -- ops read: "why is this session silent?". A 404 means no row, which is not "nothing suppresses it" -- the legacy title regex and the deliver-default still apply.
+- `DELETE /session-origin?session_id=` -- ops hard reset, idempotent. The only way back down out of an override. Afterwards declared writers may re-quiet the session and the title regex applies again, so it makes a session *louder now, possibly quieter later* -- it is not a mute button.
 - `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`
 - `POST /stop`
 - `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons

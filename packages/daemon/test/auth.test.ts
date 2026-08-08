@@ -55,6 +55,7 @@ describe("Daemon Auth", () => {
       new Request("http://localhost/route?session_id=ses_x"),
       new Request("http://localhost/place", { method: "POST" }),
       new Request("http://localhost/cleanup", { method: "POST" }),
+      new Request("http://localhost/session-origin?session_id=ses_123", { method: "DELETE" }),
     ];
 
     for (const req of targets) {

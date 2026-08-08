@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { isOriginSource } from "../src/storage/session-origin-repo";
 
 describe("SessionOriginRepository", () => {
   let storage: StorageDb | null = null;
@@ -156,5 +157,136 @@ describe("SessionOriginRepository", () => {
     // still be quiet. A future "hygiene" FK cascade here silently reintroduces the
     // notification noise this whole epic exists to remove.
     expect(s.sessionOrigins.get("ses_a")?.notifyPolicy).toBe("errors-only");
+  });
+
+  it("recognizes 'override' as a valid origin source", () => {
+    expect(isOriginSource("override")).toBe(true);
+  });
+
+  it("an override write over an existing declared row wins", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "user", notifyPolicy: "all", source: "override" },
+      2_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.notifyPolicy).toBe("all");
+    expect(row?.source).toBe("override");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(2_000);
+  });
+
+  it("a subsequent declared write against an override row is a complete no-op", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "user", notifyPolicy: "all", source: "override" },
+      2_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      3_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.notifyPolicy).toBe("all");
+    expect(row?.source).toBe("override");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(2_000);
+  });
+
+  it("a subsequent inferred write against an override row is a complete no-op", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "user", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "guess", notifyPolicy: "errors-only", source: "inferred" },
+      2_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.notifyPolicy).toBe("all");
+    expect(row?.source).toBe("override");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(1_000);
+  });
+
+  it("lets a weaker write name the spawner of an override row still marked unknown", () => {
+    const s = newStorage();
+    // What the un-quiet lever writes when it fires before any provenance writer has run.
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "unknown", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    // The reconciliation writer later learns who actually spawned it.
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      2_000,
+    );
+
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("lgtm");
+    // ...but it must NOT resurrect suppression on a session the user un-quieted.
+    expect(row?.notifyPolicy).toBe("all");
+    expect(row?.source).toBe("override");
+    expect(row?.updatedAt).toBe(2_000);
+  });
+
+  it("does not let a weaker write overwrite an origin that is already named", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "something-else", notifyPolicy: "none", source: "declared" },
+      2_000,
+    );
+
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("lgtm");
+    expect(row?.notifyPolicy).toBe("all");
+    expect(row?.updatedAt).toBe(1_000);
+  });
+
+  it("does not overwrite a named origin with the unknown sentinel", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "unknown", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "unknown", notifyPolicy: "errors-only", source: "declared" },
+      2_000,
+    );
+
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("unknown");
+    expect(row?.updatedAt).toBe(1_000);
+  });
+
+  it("an override write over an existing override row overwrites and refreshes updatedAt", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "user1", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "user2", notifyPolicy: "errors-only", source: "override" },
+      2_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("user2");
+    expect(row?.notifyPolicy).toBe("errors-only");
+    expect(row?.source).toBe("override");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(2_000);
   });
 });

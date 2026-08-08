@@ -1830,7 +1830,10 @@ describe("createApp", () => {
       const app = newApp();
       const res = await get(app, "?session_id=ses_unknown");
       expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: "No origin recorded for session" });
+      expect(await res.json()).toEqual({
+        error: "No origin recorded for session",
+        hint: "No origin recorded means no override or declared origin exists. The legacy title regex and default delivery policy apply.",
+      });
     });
 
     it("200 with full row after seeding via storage.sessionOrigins.record", async () => {
@@ -1877,6 +1880,101 @@ describe("createApp", () => {
         createdAt: 12_345,
         updatedAt: 12_345,
       });
+    });
+  });
+
+  describe("DELETE /session-origin", () => {
+    async function del(app: ReturnType<typeof createApp>, query: string) {
+      return app(new Request(`http://localhost/session-origin${query}`, { method: "DELETE" }));
+    }
+
+    it("deletes an existing row and returns cleared: true", async () => {
+      const app = newApp(5_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_del", origin: "unit-test", notifyPolicy: "errors-only", source: "declared" },
+        5_000,
+      );
+      expect(storage!.sessionOrigins.get("ses_del")).not.toBeNull();
+
+      const res = await del(app, "?session_id=ses_del");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_del",
+        cleared: true,
+      });
+      expect(storage!.sessionOrigins.get("ses_del")).toBeNull();
+    });
+
+    it("is idempotent on unknown session id and returns cleared: false", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=ses_unknown");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_unknown",
+        cleared: false,
+      });
+    });
+
+    it("400 on missing session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on empty session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on malformed session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=invalid_sid");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("round-trip downgrade path: override -> declared record ignored -> DELETE -> declared record succeeds", async () => {
+      const app = newApp(10_000);
+      // 1. Seed override row (e.g. user ran enable-notify)
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "user:enable-notify", notifyPolicy: "all", source: "override" },
+        10_000,
+      );
+
+      // 2. Automated declared record attempt is a no-op against override
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "launcher", notifyPolicy: "errors-only", source: "declared" },
+        11_000,
+      );
+      let record = storage!.sessionOrigins.get("ses_override");
+      expect(record?.source).toBe("override");
+      expect(record?.notifyPolicy).toBe("all");
+
+      // 3. DELETE /session-origin clears the override
+      const delRes = await del(app, "?session_id=ses_override");
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true, session_id: "ses_override", cleared: true });
+      expect(storage!.sessionOrigins.get("ses_override")).toBeNull();
+
+      // 4. Automated declared record attempt now succeeds
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "launcher", notifyPolicy: "errors-only", source: "declared" },
+        12_000,
+      );
+      record = storage!.sessionOrigins.get("ses_override");
+      expect(record?.source).toBe("declared");
+      expect(record?.notifyPolicy).toBe("errors-only");
     });
   });
 
@@ -2011,6 +2109,266 @@ describe("createApp", () => {
         expect.any(Error),
       );
       errorSpy.mockRestore();
+    });
+  });
+
+  describe("POST /sessions/enable-notify un-quiet override", () => {
+    it("overrides pre-existing quiet origin row while preserving origin provenance", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow).toEqual({
+        sessionId: "ses_a",
+        origin: "lgtm",
+        notifyPolicy: "all",
+        source: "override",
+        createdAt: 1_000,
+        updatedAt: 1_000,
+      });
+    });
+
+    it("reports 500 rather than a false success when the override write fails", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      storage!.sessionOrigins.record = () => {
+        throw new Error("disk on fire");
+      };
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      // The user's only escape hatch failed. Answering ok:true would tell them a session
+      // that is still suppressed had been un-quieted (app.ts:113).
+      expect(res.status).toBe(500);
+      expect((await res.json()).error).toMatch(/still be suppressed/);
+
+      // The request is deliberately partially applied: sessions.notify is already committed
+      // and a retry heals the rest. Pin that so the partial state is a decision, not a drift.
+      expect(storage!.sessions.get("ses_a")?.notify).toBe(true);
+    });
+
+    it("creates an override row with origin 'unknown' when no origin row exists", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow).toEqual({
+        sessionId: "ses_a",
+        origin: "unknown",
+        notifyPolicy: "all",
+        source: "override",
+        createdAt: 1_000,
+        updatedAt: 1_000,
+      });
+    });
+
+    it("end-to-end: un-quiets a declared-quieted session over HTTP", async () => {
+      // The most representative production sequence: lgtm declares the session quiet first,
+      // the user escapes second, and the next Stop must reach them.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true, title: "some work" }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      const stopRes1 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes1.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+
+      const enableRes = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(enableRes.status).toBe(200);
+
+      const stopRes2 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes2.status).toBe(202);
+      expect((await stopRes2.json()).deliveryState).toBe("queued");
+    });
+
+    it("end-to-end: DELETE returns a session to title-regex suppression", async () => {
+      const app = newApp();
+      storage!.sessions.upsert(
+        { sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" },
+        1_000,
+      );
+
+      await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      const delRes = await app(
+        new Request("http://localhost/session-origin?session_id=ses_a", { method: "DELETE" }),
+      );
+      expect(delRes.status).toBe(200);
+      expect((await delRes.json()).cleared).toBe(true);
+
+      // Back to the weakest state: the legacy title layer applies again.
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+    });
+
+    it("end-to-end: un-quiets a title-quieted session", async () => {
+      const app = newApp();
+      storage!.sessions.upsert(
+        { sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" },
+        1_000,
+      );
+
+      // Initially suppressed by title regex
+      const stopRes1 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes1.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+
+      // Enable notify
+      const enableRes = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(enableRes.status).toBe(200);
+
+      // Now delivered despite quiet title
+      const stopRes2 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes2.status).toBe(202);
+      const json2 = await stopRes2.json();
+      expect(json2.ok).toBe(true);
+      expect(json2.deliveryState).toBe("queued");
+    });
+
+    it("override sticks against later automated writer", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" }, 1_000);
+
+      await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      // Automated writer attempts to set quiet policy
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        2_000,
+      );
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow?.notifyPolicy).toBe("all");
+      expect(originRow?.source).toBe("override");
+
+      // Stop is still delivered
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes.status).toBe(202);
+      expect((await stopRes.json()).deliveryState).toBe("queued");
+    });
+
+    it("retains existing behaviour of setting sessions.notify to true", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(storage!.sessions.get("ses_a")?.notify).toBe(true);
+    });
+
+    it("returns 404 for unknown session and writes no origin row", async () => {
+      const app = newApp();
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_unknown" }),
+        }),
+      );
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Session not found" });
+      expect(storage!.sessionOrigins.get("ses_unknown")).toBeNull();
     });
   });
 });
