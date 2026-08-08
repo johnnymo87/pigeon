@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createApp, isQuietTitle } from "../src/app";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { StopNotifier } from "../src/notification-service";
 
@@ -1252,47 +1252,6 @@ describe("createApp", () => {
     expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
   });
 
-  describe("isQuietTitle unit tests", () => {
-    it("returns false for null, undefined, or empty string", () => {
-      expect(isQuietTitle(null)).toBe(false);
-      expect(isQuietTitle(undefined)).toBe(false);
-      expect(isQuietTitle("")).toBe(false);
-    });
-
-    it("defaults to a production-tuned automation-title match", () => {
-      // Caught: with and without the leading dot, and the prose variants.
-      expect(isQuietTitle("Task .lgtm-prompt.md", {})).toBe(true);
-      expect(isQuietTitle("Task .LGTM-prompt.md", {})).toBe(true);
-      expect(isQuietTitle("Review PR with lgtm-review-prompt", {})).toBe(true);
-      expect(isQuietTitle("Enrich context per .lgtm-gather-prompt.md", {})).toBe(true);
-      expect(isQuietTitle("Review PR using LGTM prompt", {})).toBe(true);
-      // NOT caught: real work ON the lgtm tool must still be delivered, because a
-      // false positive silently hides real work.
-      expect(isQuietTitle("Fix lgtm dispatcher timeout", {})).toBe(false);
-      expect(isQuietTitle("Fix lgtm-run timer flake", {})).toBe(false);
-      expect(isQuietTitle("LGTM auto-reviews on reviewer add", {})).toBe(false);
-      expect(isQuietTitle("Feature work", {})).toBe(false);
-    });
-
-    it("uses custom regex pattern when PIGEON_QUIET_TITLE_PATTERN is set", () => {
-      const env = { PIGEON_QUIET_TITLE_PATTERN: "quiet|silent" };
-      expect(isQuietTitle("This is quiet", env)).toBe(true);
-      expect(isQuietTitle("Silent runner", env)).toBe(true);
-      expect(isQuietTitle("LGTM runner", env)).toBe(false);
-    });
-
-    it("falls back to the default pattern when PIGEON_QUIET_TITLE_PATTERN is invalid regex", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const env = { PIGEON_QUIET_TITLE_PATTERN: "(unclosed" };
-
-      expect(isQuietTitle("Task .lgtm-review-prompt.md", env)).toBe(true);
-      expect(isQuietTitle("Normal runner", env)).toBe(false);
-      expect(errorSpy).toHaveBeenCalled();
-
-      errorSpy.mockRestore();
-    });
-  });
-
   describe("PIGEON_QUIET_TITLE_PATTERN stop notification suppression", () => {
     const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
 
@@ -1832,6 +1791,226 @@ describe("createApp", () => {
       const res2 = await post(app, { session_id: "ses_a", origin: "lgtm\x07foo", notify_policy: "none" });
       expect(res2.status).toBe(400);
       expect((await res2.json()).error).toMatch(/origin/);
+    });
+  });
+
+  describe("GET /session-origin", () => {
+    async function get(app: ReturnType<typeof createApp>, query: string) {
+      return app(new Request(`http://localhost/session-origin${query}`, { method: "GET" }));
+    }
+
+    it("400 on missing session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on empty session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on malformed session_id", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=invalid_sid");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("404 on unknown session", async () => {
+      const app = newApp();
+      const res = await get(app, "?session_id=ses_unknown");
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "No origin recorded for session" });
+    });
+
+    it("200 with full row after seeding via storage.sessionOrigins.record", async () => {
+      const app = newApp(10_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_seeded", origin: "unit-test", notifyPolicy: "errors-only", source: "declared" },
+        10_000,
+      );
+
+      const res = await get(app, "?session_id=ses_seeded");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        sessionId: "ses_seeded",
+        origin: "unit-test",
+        notifyPolicy: "errors-only",
+        source: "declared",
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      });
+    });
+
+    it("round-trip: POST /session-origin row is readable via GET /session-origin", async () => {
+      const app = newApp(12_345);
+      const postRes = await app(
+        new Request("http://localhost/session-origin", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "ses_rt",
+            origin: "launcher-script",
+            notify_policy: "none",
+          }),
+        }),
+      );
+      expect(postRes.status).toBe(200);
+
+      const getRes = await get(app, "?session_id=ses_rt");
+      expect(getRes.status).toBe(200);
+      expect(await getRes.json()).toEqual({
+        sessionId: "ses_rt",
+        origin: "launcher-script",
+        notifyPolicy: "none",
+        source: "declared",
+        createdAt: 12_345,
+        updatedAt: 12_345,
+      });
+    });
+  });
+
+  describe("POST /stop honours session_origin policy", () => {
+    const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      delete process.env.PIGEON_QUIET_TITLE_LAYER;
+    });
+
+    afterEach(() => {
+      if (originalQuietPattern !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_PATTERN = originalQuietPattern;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      }
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
+      }
+    });
+
+    async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review") {
+      return app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event, summary: "done", title }),
+        }),
+      );
+    }
+
+    function seed(app: ReturnType<typeof createApp>, policy: string, notify = true) {
+      storage!.sessions.upsert({ sessionId: "ses_a", notify }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: policy as never, source: "declared" },
+        1_000,
+      );
+    }
+
+    it("errors-only + Stop -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+    });
+
+    it("errors-only + Error -> delivered (202 queued)", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Error");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
+    it("errors-only + Retry -> delivered (202 queued)", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Retry");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
+    it("notify=false on session short-circuits ahead of policy layer even with notifyPolicy=all", async () => {
+      const app = newApp();
+      seed(app, "all", false);
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "notify=false" });
+    });
+
+    it("none + Stop -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "none");
+      const res = await stop(app, "Stop");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+    });
+
+    it("session with NO origin row falls through to title layer (quiet-matching title -> quiet_title)", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+    });
+
+    it("notifyPolicy=all + quiet-matching title -> delivered (provenance overrides title regex)", async () => {
+      const app = newApp();
+      seed(app, "all");
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
+    it("fails open and delivers if storage.sessionOrigins.get throws", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      vi.spyOn(storage!.sessionOrigins, "get").mockImplementationOnce(() => {
+        throw new Error("DB lock failure");
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop");
+      expect(res.status).toBe(202);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[stop] session_origin read failed sessionId=ses_a, delivering:"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("fails open and delivers if decideNotify throws", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const notifyPolicyModule = await import("../src/notify-policy");
+      vi.spyOn(notifyPolicyModule, "decideNotify").mockImplementationOnce(() => {
+        throw new Error("Unexpected policy failure");
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop");
+      expect(res.status).toBe(202);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[stop] notify decision failed sessionId=ses_a, delivering:"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
     });
   });
 });

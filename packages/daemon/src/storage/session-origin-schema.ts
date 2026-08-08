@@ -9,11 +9,11 @@ import type BetterSqlite3 from "better-sqlite3";
  * Two independent reasons, both load-bearing:
  *
  *  1. The `sessions` row is rewritten wholesale on every plugin registration, and the
- *     plugin hardcodes notify: true (opencode-plugin/src/daemon-client.ts:136). A verdict
+ *     plugin hardcodes notify: true (see `registerSession` in opencode-plugin/src/daemon-client.ts). A verdict
  *     stored there is clobbered on the next outbox recovery.
  *
- *  2. The row must OUTLIVE the session. The session reaper (session-reaper.ts:31-35) and
- *     dead-session cleanup (worker/command-ingest.ts:1085,1150) both delete the sessions
+ *  2. The row must OUTLIVE the session. The session reaper (session-reaper.ts) and
+ *     dead-session cleanup (in worker/command-ingest.ts) both delete the sessions
  *     row, and lgtm then re-awakens the same session id through /swarm/send. If the
  *     provenance went with it, every re-review would go loud again.
  */

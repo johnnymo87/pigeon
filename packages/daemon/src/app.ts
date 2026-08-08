@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, type SessionOriginRecord } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -11,6 +11,7 @@ import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
+import { decideNotify, type NotifyDecision } from "./notify-policy";
 
 interface LegacySession {
   session_id: string;
@@ -90,30 +91,6 @@ function maybeNumber(value: unknown): number | undefined {
  * and to accommodate Phase 2 forum topic names (capped at 128 chars).
  */
 const MAX_TITLE_LENGTH = 200;
-
-/**
- * Titles of automation sessions whose routine Stop notifications are suppressed.
- *
- * Tuned against production, NOT guessed. Measured over 181 distinct live session
- * titles (59 mentioning lgtm) plus real-work-on-lgtm probes:
- *
- *   \.lgtm-                              74.6% caught, 0 false positives  (first attempt)
- *   lgtm-(review|gather)-prompt          81.4% caught, 0 false positives
- *   this pattern                         96.6% caught, 0 false positives
- *   bare "lgtm"                         100.0% caught, 4 false positives
- *
- * The leading-dot form was too strict: the model-generated title often drops the
- * dot ("Review PR with lgtm-review-prompt"), and prose variants ("PR review with
- * LGTM prompt") name the tool without the filename at all. Requiring a hyphen or
- * space before "prompt" is what keeps real work ON lgtm deliverable -- "Fix lgtm
- * dispatcher timeout" and "Fix lgtm-run timer flake" both correctly miss.
- *
- * Deliberately still missed: "LGTM for PR #3944" and "LGTM auto-reviews on
- * reviewer add". Both are ambiguous, and the second is probably genuine work on
- * the lgtm tool -- which must be delivered. A false positive silently hides real
- * work, so ambiguity resolves toward delivering.
- */
-const DEFAULT_QUIET_TITLE_PATTERN = "lgtm-(review|gather)-prompt|lgtm[ -]prompt";
 
 export interface SwarmSendFields {
   from: string;
@@ -222,32 +199,6 @@ export function parseSwarmSendBody(
       callerMsgId,
     },
   };
-}
-
-export function isQuietTitle(
-  title: string | null | undefined,
-  env: Record<string, string | undefined> = process.env,
-): boolean {
-  if (!title) return false;
-
-  const rawPattern = env.PIGEON_QUIET_TITLE_PATTERN?.trim();
-  let regex: RegExp;
-
-  if (rawPattern) {
-    try {
-      regex = new RegExp(rawPattern, "i");
-    } catch (err) {
-      console.error(
-        `[stop] invalid PIGEON_QUIET_TITLE_PATTERN regex "${rawPattern}", falling back to default automation-title pattern:`,
-        err,
-      );
-      regex = new RegExp(DEFAULT_QUIET_TITLE_PATTERN, "i");
-    }
-  } else {
-    regex = new RegExp(DEFAULT_QUIET_TITLE_PATTERN, "i");
-  }
-
-  return regex.test(title);
 }
 
 function parseTitle(val: unknown): string | undefined {
@@ -697,6 +648,23 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         });
       }
 
+      if (request.method === "GET" && url.pathname === "/session-origin") {
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
+          return Response.json(
+            { error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer" },
+            { status: 400 },
+          );
+        }
+
+        const record = storage.sessionOrigins.get(sessionId);
+        if (!record) {
+          return Response.json({ error: "No origin recorded for session" }, { status: 404 });
+        }
+
+        return Response.json(record);
+      }
+
       if (request.method === "GET" && url.pathname === "/sessions") {
         const active = url.searchParams.get("active") === "true";
         const notify = url.searchParams.get("notify") === "true";
@@ -749,9 +717,33 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         const effectiveTitle = requestTitle ?? session.title;
 
-        if (event === "Stop" && isQuietTitle(effectiveTitle)) {
-          console.log(`[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}"`);
-          return Response.json({ ok: true, notified: false, reason: "quiet_title" });
+        let originRow: SessionOriginRecord | null = null;
+        try {
+          originRow = storage.sessionOrigins.get(sessionId);
+        } catch (err) {
+          // Fail open: a provenance read that throws must not cost the user a
+          // notification. Deliver and leave a trace.
+          console.error(`[stop] session_origin read failed sessionId=${sessionId}, delivering:`, err);
+        }
+
+        let decision: NotifyDecision;
+        try {
+          decision = decideNotify({
+            event,
+            policy: originRow?.notifyPolicy ?? null,
+            title: effectiveTitle,
+          });
+        } catch (err) {
+          console.error(`[stop] notify decision failed sessionId=${sessionId}, delivering:`, err);
+          decision = { deliver: true, layer: "default" };
+        }
+
+        if (!decision.deliver) {
+          console.log(
+            `[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}" ` +
+            `layer=${decision.layer} origin=${originRow?.origin ?? "-"}`,
+          );
+          return Response.json({ ok: true, notified: false, reason: `quiet_${decision.layer}` });
         }
 
         const now = nowFn();
