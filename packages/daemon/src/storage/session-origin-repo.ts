@@ -1,7 +1,17 @@
 import type BetterSqlite3 from "better-sqlite3";
 
-/** Ordered weakest-to-strongest. A write never lowers the stored source. */
-export const ORIGIN_SOURCES = ["inferred", "declared"] as const;
+/**
+ * Ordered weakest-to-strongest. A write never lowers the stored source.
+ *
+ * WARNING: APPEND-ONLY! Rank derives from array index (`ORIGIN_SOURCES.indexOf`), so
+ * reordering silently inverts authority precedence.
+ *
+ * - `inferred`: automated guess based on TUI title or session heuristics.
+ * - `declared`: explicitly set during launch (e.g. via launcher/automation).
+ * - `override`: user-issued un-quiet / policy change that automated `declared`
+ *   writers must not undo.
+ */
+export const ORIGIN_SOURCES = ["inferred", "declared", "override"] as const;
 export type OriginSource = (typeof ORIGIN_SOURCES)[number];
 
 /**
@@ -50,8 +60,9 @@ export class SessionOriginRepository {
 
   /**
    * Insert-or-upgrade. A write from a weaker source never overwrites a stronger one, so a
-   * later inferred guess can never downgrade what the launcher declared. Equal-or-stronger
-   * writes refresh the payload and updated_at but preserve created_at.
+   * later inferred guess or automated declared write can never downgrade what a user
+   * override established. Equal-or-stronger writes refresh the payload and updated_at
+   * but preserve created_at.
    */
   record(input: RecordSessionOriginInput, now = Date.now()): void {
     // tx.immediate() acquires write lock up front. Because record() reads before writing,
