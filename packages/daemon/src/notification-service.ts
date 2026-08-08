@@ -279,7 +279,7 @@ function formatQuietLine(quiet: QuietExplanation): string {
         return `🔇 Muted by ${displayOrigin} · errors still notify`;
       }
       if (quiet.policy === "none") {
-        return `🔇 Muted by ${displayOrigin} · all events`;
+        return `🔇 Muted by ${displayOrigin} · nothing notifies`;
       }
       return `🔇 Muted by ${displayOrigin}`;
     }
@@ -288,7 +288,13 @@ function formatQuietLine(quiet: QuietExplanation): string {
     case "notify-flag":
       return "🔇 Muted · notifications turned off";
     case "unregistered":
-      return "🔇 Muted · not registered with pigeon";
+      // Deliberately NOT phrased as "Muted". The plugin re-registers a session
+      // before its next Stop (ensureRegistered precedes notifyStop), so a row
+      // reaped after a week of idleness usually self-heals and the next Stop
+      // DOES arrive. Asserting "Muted" here would cry wolf; the hedge keeps the
+      // genuinely-silent case (a long-lived plugin holding a stale registration)
+      // visible without lying about the common one.
+      return "🔇 Not registered with pigeon — notifications may not arrive";
   }
 }
 

@@ -140,12 +140,27 @@ export function explainQuiet(
   );
 
   if (!decision.deliver) {
-    if (decision.layer === "origin" || decision.layer === "title") {
-      return {
-        reason: decision.layer,
-        origin,
-        policy,
-      };
+    switch (decision.layer) {
+      case "origin":
+      case "title":
+        return { reason: decision.layer, origin, policy };
+      case "default":
+        // Unreachable today: decideNotify only ever returns layer "default"
+        // together with deliver:true. Handled explicitly so the exhaustiveness
+        // check below stays meaningful.
+        break;
+      default: {
+        // A NEW suppressing NotifyLayer was added without teaching explainQuiet
+        // about it. That is the FALSE-REASSURANCE direction -- the session would
+        // be silent while its card showed nothing -- so fail loudly at compile
+        // time rather than silently returning null.
+        const unhandled: never = decision.layer;
+        console.warn(
+          `[notify-policy] explainQuiet saw an unknown suppressing layer "${String(unhandled)}"; ` +
+          `card will not show a mute indicator for a session that is actually silent`,
+        );
+        break;
+      }
     }
   }
 

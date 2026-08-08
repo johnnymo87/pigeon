@@ -671,6 +671,20 @@ describe("current-state formatting helpers", () => {
       }, now);
       expect(card1.text).toContain("🆔 sess-1\n🔇 Muted by lgtm · errors still notify\n↩️ Swipe-reply to respond");
 
+      // The quiet line carries a surrogate-pair emoji and is inserted BETWEEN the
+      // sid code span and the trailing italic span. Telegram entity offsets are
+      // UTF-16 code units, so assert the italic still slices to exactly its own
+      // text -- this is what would break if offsets were ever precomputed rather
+      // than derived at append time.
+      const italic = card1.entities?.find(e => e.type === "italic");
+      expect(italic).toBeDefined();
+      expect(card1.text.slice(italic!.offset, italic!.offset + italic!.length)).toBe(
+        "Swipe-reply to respond",
+      );
+      const code = card1.entities?.find(e => e.type === "code" && e.length === "sess-1".length);
+      expect(code).toBeDefined();
+      expect(card1.text.slice(code!.offset, code!.offset + code!.length)).toBe("sess-1");
+
       // origin with none policy
       const card2 = formatStateCard({
         title: "Test Session",
@@ -682,7 +696,7 @@ describe("current-state formatting helpers", () => {
         machineId: "devbox",
         quiet: { reason: "origin", origin: "lgtm", policy: "none" },
       }, now);
-      expect(card2.text).toContain("🆔 sess-1\n🔇 Muted by lgtm · all events\n↩️ Swipe-reply to respond");
+      expect(card2.text).toContain("🆔 sess-1\n🔇 Muted by lgtm · nothing notifies\n↩️ Swipe-reply to respond");
 
       // origin with other policy
       const card3 = formatStateCard({
@@ -720,7 +734,7 @@ describe("current-state formatting helpers", () => {
         machineId: "devbox",
         quiet: { reason: "origin", origin: null, policy: "none" },
       }, now);
-      expect(card5.text).toContain("🆔 sess-1\n🔇 Muted by declared policy · all events\n↩️ Swipe-reply to respond");
+      expect(card5.text).toContain("🆔 sess-1\n🔇 Muted by declared policy · nothing notifies\n↩️ Swipe-reply to respond");
 
       const card6 = formatStateCard({
         title: "Test Session",
@@ -771,7 +785,7 @@ describe("current-state formatting helpers", () => {
         machineId: "devbox",
         quiet: { reason: "unregistered", origin: null, policy: null },
       }, now);
-      expect(cardUnreg.text).toContain("🆔 sess-1\n🔇 Muted · not registered with pigeon\n↩️ Swipe-reply to respond");
+      expect(cardUnreg.text).toContain("🆔 sess-1\n🔇 Not registered with pigeon — notifications may not arrive\n↩️ Swipe-reply to respond");
     });
   });
 
