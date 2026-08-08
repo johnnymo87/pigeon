@@ -593,10 +593,10 @@ describe("current-state-ingest TDD tests", () => {
 
     expect(enqueueCard).toHaveBeenCalledTimes(2);
     const sesACardCall = enqueueCard.mock.calls.find((c) => c[0].sid === "ses_A");
-    expect(sesACardCall[0].text).toContain("🔇 Muted by lgtm · errors still notify");
+    expect(sesACardCall![0].text).toContain("🔇 Muted by lgtm · errors still notify");
 
     const sesBCardCall = enqueueCard.mock.calls.find((c) => c[0].sid === "ses_B");
-    expect(sesBCardCall[0].text).not.toContain("🔇");
+    expect(sesBCardCall![0].text).not.toContain("🔇");
   });
 
   it("13. describeQuiet throwing does not break card enqueueing", async () => {
@@ -643,7 +643,7 @@ describe("current-state-ingest TDD tests", () => {
       notificationId: "cs:cmd-123:ses_A",
     });
     const cardCall = enqueueCard.mock.calls[0];
-    expect(cardCall[0].text).not.toContain("🔇");
+    expect(cardCall![0].text).not.toContain("🔇");
     expect(consoleWarnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[current-state-ingest] describeQuiet failed for ses_A:"),
       expect.any(Error),
