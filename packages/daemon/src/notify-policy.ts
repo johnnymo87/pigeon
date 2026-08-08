@@ -86,3 +86,68 @@ export function decideNotify(
 
   return { deliver: true, layer: "default" };
 }
+
+export type QuietReason = "unregistered" | "notify-flag" | "origin" | "title";
+
+export interface QuietExplanation {
+  reason: QuietReason;
+  /** The declared origin (e.g. "lgtm") when a session_origin row exists, else null. */
+  origin: string | null;
+  /** The row's notify policy when one exists, else null. */
+  policy: NotifyPolicy | null;
+}
+
+export interface ExplainQuietInput {
+  /** false when the daemon has no sessions row for this sid. */
+  registered: boolean;
+  /** sessions.notify. Ignored when registered === false. */
+  notify: boolean;
+  policy: NotifyPolicy | null;
+  origin: string | null;
+  title: string | null | undefined;
+}
+
+/** Returns null when a Stop WOULD be delivered; an explanation when it would not. */
+export function explainQuiet(
+  input: ExplainQuietInput,
+  env: Record<string, string | undefined> = process.env,
+): QuietExplanation | null {
+  const { registered, notify, policy, origin, title } = input;
+
+  if (!registered) {
+    return {
+      reason: "unregistered",
+      origin,
+      policy,
+    };
+  }
+
+  if (!notify) {
+    return {
+      reason: "notify-flag",
+      origin,
+      policy,
+    };
+  }
+
+  const decision = decideNotify(
+    {
+      event: "Stop",
+      policy,
+      title,
+    },
+    env,
+  );
+
+  if (!decision.deliver) {
+    if (decision.layer === "origin" || decision.layer === "title") {
+      return {
+        reason: decision.layer,
+        origin,
+        policy,
+      };
+    }
+  }
+
+  return null;
+}
