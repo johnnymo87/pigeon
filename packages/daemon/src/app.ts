@@ -700,10 +700,33 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const record = storage.sessionOrigins.get(sessionId);
         if (!record) {
-          return Response.json({ error: "No origin recorded for session" }, { status: 404 });
+          return Response.json(
+            {
+              error: "No origin recorded for session",
+              hint: "No origin recorded means no override or declared origin exists. The legacy title regex and default delivery policy apply.",
+            },
+            { status: 404 },
+          );
         }
 
         return Response.json(record);
+      }
+
+      // DELETE /session-origin
+      // Ops-facing hard reset / downgrade path out of a sticky override:
+      // - POST /sessions/enable-notify (override write) = user-facing "never silence this session again", sticky against automated writers.
+      // - DELETE /session-origin = ops-facing "forget everything; return to the normal pipeline" — after it, automated declared writers may re-quiet the session and the legacy title regex applies again. Weakest state.
+      if (request.method === "DELETE" && url.pathname === "/session-origin") {
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        if (!/^ses_[A-Za-z0-9_-]+$/.test(sessionId) || sessionId.length > 128) {
+          return Response.json(
+            { error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer" },
+            { status: 400 },
+          );
+        }
+
+        const cleared = storage.sessionOrigins.clear(sessionId);
+        return Response.json({ ok: true, session_id: sessionId, cleared });
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {

@@ -1830,7 +1830,10 @@ describe("createApp", () => {
       const app = newApp();
       const res = await get(app, "?session_id=ses_unknown");
       expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: "No origin recorded for session" });
+      expect(await res.json()).toEqual({
+        error: "No origin recorded for session",
+        hint: "No origin recorded means no override or declared origin exists. The legacy title regex and default delivery policy apply.",
+      });
     });
 
     it("200 with full row after seeding via storage.sessionOrigins.record", async () => {
@@ -1877,6 +1880,101 @@ describe("createApp", () => {
         createdAt: 12_345,
         updatedAt: 12_345,
       });
+    });
+  });
+
+  describe("DELETE /session-origin", () => {
+    async function del(app: ReturnType<typeof createApp>, query: string) {
+      return app(new Request(`http://localhost/session-origin${query}`, { method: "DELETE" }));
+    }
+
+    it("deletes an existing row and returns cleared: true", async () => {
+      const app = newApp(5_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_del", origin: "unit-test", notifyPolicy: "errors-only", source: "declared" },
+        5_000,
+      );
+      expect(storage!.sessionOrigins.get("ses_del")).not.toBeNull();
+
+      const res = await del(app, "?session_id=ses_del");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_del",
+        cleared: true,
+      });
+      expect(storage!.sessionOrigins.get("ses_del")).toBeNull();
+    });
+
+    it("is idempotent on unknown session id and returns cleared: false", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=ses_unknown");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_unknown",
+        cleared: false,
+      });
+    });
+
+    it("400 on missing session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on empty session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("400 on malformed session_id", async () => {
+      const app = newApp();
+      const res = await del(app, "?session_id=invalid_sid");
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "session_id must match ^ses_[A-Za-z0-9_-]+$ and be 128 characters or fewer",
+      });
+    });
+
+    it("round-trip downgrade path: override -> declared record ignored -> DELETE -> declared record succeeds", async () => {
+      const app = newApp(10_000);
+      // 1. Seed override row (e.g. user ran enable-notify)
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "user:enable-notify", notifyPolicy: "all", source: "override" },
+        10_000,
+      );
+
+      // 2. Automated declared record attempt is a no-op against override
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "launcher", notifyPolicy: "errors-only", source: "declared" },
+        11_000,
+      );
+      let record = storage!.sessionOrigins.get("ses_override");
+      expect(record?.source).toBe("override");
+      expect(record?.notifyPolicy).toBe("all");
+
+      // 3. DELETE /session-origin clears the override
+      const delRes = await del(app, "?session_id=ses_override");
+      expect(delRes.status).toBe(200);
+      expect(await delRes.json()).toEqual({ ok: true, session_id: "ses_override", cleared: true });
+      expect(storage!.sessionOrigins.get("ses_override")).toBeNull();
+
+      // 4. Automated declared record attempt now succeeds
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_override", origin: "launcher", notifyPolicy: "errors-only", source: "declared" },
+        12_000,
+      );
+      record = storage!.sessionOrigins.get("ses_override");
+      expect(record?.source).toBe("declared");
+      expect(record?.notifyPolicy).toBe("errors-only");
     });
   });
 
