@@ -589,6 +589,32 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
+        // Write an override row to session_origin so quiet-title and session_origin policy layers
+        // stop suppressing notifications for this session.
+        // We WRITE an explicit 'all' override row rather than deleting for two reasons:
+        // 1. Deleting is not durable: an automated declared writer ships next and would re-insert
+        //    the quiet row, silently re-quieting the session.
+        // 2. Deleting does not work for title-quieted sessions: deleting leaves policy === null,
+        //    which falls through to the title regex and keeps suppressing. Only an explicit 'all'
+        //    row short-circuits above the title regex.
+        //
+        // Fail-open: if session_origin.record throws, log error and continue. The session still gets
+        // sessions.notify = true rather than 500ing, maintaining delivery-oriented fault tolerance.
+        try {
+          const existingOrigin = storage.sessionOrigins.get(sessionId);
+          storage.sessionOrigins.record(
+            {
+              sessionId,
+              origin: existingOrigin?.origin ?? "unknown",
+              notifyPolicy: "all",
+              source: "override",
+            },
+            nowFn(),
+          );
+        } catch (err) {
+          console.error(`[enable-notify] session_origin record failed sessionId=${sessionId}:`, err);
+        }
+
         if (onSessionStart) {
           await onSessionStart(sessionId, true, label ?? existing.label);
         }

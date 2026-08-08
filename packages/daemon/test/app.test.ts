@@ -2013,4 +2013,163 @@ describe("createApp", () => {
       errorSpy.mockRestore();
     });
   });
+
+  describe("POST /sessions/enable-notify un-quiet override", () => {
+    it("overrides pre-existing quiet origin row while preserving origin provenance", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow).toEqual({
+        sessionId: "ses_a",
+        origin: "lgtm",
+        notifyPolicy: "all",
+        source: "override",
+        createdAt: 1_000,
+        updatedAt: 1_000,
+      });
+    });
+
+    it("creates an override row with origin 'unknown' when no origin row exists", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow).toEqual({
+        sessionId: "ses_a",
+        origin: "unknown",
+        notifyPolicy: "all",
+        source: "override",
+        createdAt: 1_000,
+        updatedAt: 1_000,
+      });
+    });
+
+    it("end-to-end: un-quiets a title-quieted session", async () => {
+      const app = newApp();
+      storage!.sessions.upsert(
+        { sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" },
+        1_000,
+      );
+
+      // Initially suppressed by title regex
+      const stopRes1 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(await stopRes1.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+
+      // Enable notify
+      const enableRes = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(enableRes.status).toBe(200);
+
+      // Now delivered despite quiet title
+      const stopRes2 = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes2.status).toBe(202);
+      const json2 = await stopRes2.json();
+      expect(json2.ok).toBe(true);
+      expect(json2.deliveryState).toBe("queued");
+    });
+
+    it("override sticks against later automated writer", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true, title: "Review PR with lgtm-review-prompt" }, 1_000);
+
+      await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      // Automated writer attempts to set quiet policy
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        2_000,
+      );
+
+      const originRow = storage!.sessionOrigins.get("ses_a");
+      expect(originRow?.notifyPolicy).toBe("all");
+      expect(originRow?.source).toBe("override");
+
+      // Stop is still delivered
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a", event: "Stop" }),
+        }),
+      );
+      expect(stopRes.status).toBe(202);
+      expect((await stopRes.json()).deliveryState).toBe("queued");
+    });
+
+    it("retains existing behaviour of setting sessions.notify to true", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(storage!.sessions.get("ses_a")?.notify).toBe(true);
+    });
+
+    it("returns 404 for unknown session and writes no origin row", async () => {
+      const app = newApp();
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_unknown" }),
+        }),
+      );
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Session not found" });
+      expect(storage!.sessionOrigins.get("ses_unknown")).toBeNull();
+    });
+  });
 });
