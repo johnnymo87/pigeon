@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { isOriginSource, type OriginSource } from "../src/storage/session-origin-repo";
+import { isOriginSource } from "../src/storage/session-origin-repo";
 
 describe("SessionOriginRepository", () => {
   let storage: StorageDb | null = null;
