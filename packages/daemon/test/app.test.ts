@@ -2043,6 +2043,32 @@ describe("createApp", () => {
       });
     });
 
+    it("reports 500 rather than a false success when the override write fails", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        1_000,
+      );
+
+      storage!.sessionOrigins.record = () => {
+        throw new Error("disk on fire");
+      };
+
+      const res = await app(
+        new Request("http://localhost/sessions/enable-notify", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: "ses_a" }),
+        }),
+      );
+
+      // The user's only escape hatch failed. Answering ok:true would tell them a session
+      // that is still suppressed had been un-quieted (app.ts:113).
+      expect(res.status).toBe(500);
+      expect((await res.json()).error).toMatch(/still be suppressed/);
+    });
+
     it("creates an override row with origin 'unknown' when no origin row exists", async () => {
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);

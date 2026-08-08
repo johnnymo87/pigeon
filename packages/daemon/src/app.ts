@@ -598,8 +598,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         //    which falls through to the title regex and keeps suppressing. Only an explicit 'all'
         //    row short-circuits above the title regex.
         //
-        // Fail-open: if session_origin.record throws, log error and continue. The session still gets
-        // sessions.notify = true rather than 500ing, maintaining delivery-oriented fault tolerance.
+        // On failure we REPORT it rather than swallowing it. Note this is not the same shape of
+        // fail-open as POST /stop, and the difference is deliberate. There, ambiguity resolves
+        // toward delivering because the handler still controls the delivery. Here it does not:
+        // if this write is lost, the pre-existing errors-only row (or, with no row, the title
+        // regex) keeps suppressing, so the session stays SILENT. Setting sessions.notify = true
+        // does not save it — that short-circuit sits UPSTREAM of the policy matrix and was never
+        // what suppressed this session. Answering {ok:true} would tell the user their only
+        // escape hatch worked while the session goes on hiding real work, which is precisely the
+        // outcome app.ts:113 forbids. A loud 500 they can retry is the honest answer.
         try {
           const existingOrigin = storage.sessionOrigins.get(sessionId);
           storage.sessionOrigins.record(
@@ -613,6 +620,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         } catch (err) {
           console.error(`[enable-notify] session_origin record failed sessionId=${sessionId}:`, err);
+          return Response.json(
+            {
+              error: "Failed to clear notification policy; session may still be suppressed",
+              session_id: sessionId,
+              notify: true,
+            },
+            { status: 500 },
+          );
         }
 
         if (onSessionStart) {
