@@ -2098,7 +2098,8 @@ describe("createApp", () => {
       expect(json.deliveryState).toBe("queued");
 
       expect(logSpy).toHaveBeenCalledWith(
-        "[stop] declared quiet expired sessionId=ses_a origin=lgtm policy=errors-only ageMs=14400500 — delivering",
+        `[stop] automated quiet expired sessionId=ses_a origin=lgtm source=declared ` +
+        `policy=errors-only ageMs=${ttl + 500} — delivering`,
       );
 
       logSpy.mockRestore();

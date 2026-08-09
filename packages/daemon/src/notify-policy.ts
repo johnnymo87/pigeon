@@ -1,7 +1,19 @@
 import { isQuietTitle } from "./quiet-title";
 import type { NotifyPolicy, OriginSource } from "./storage/session-origin-repo";
 
-export const DEFAULT_DECLARED_QUIET_TTL_MS = 4 * 60 * 60 * 1000; // 4h
+/**
+ * How long an AUTOMATED (declared/inferred) suppression stays in force.
+ *
+ * Sized against production: observed lgtm session lifetimes are 0-59 minutes, so 2h is
+ * ~2x headroom over the longest real run. Overshooting costs SILENCE on an adopted
+ * session for the whole window; undershooting costs NOISE on an unusually long review.
+ * Noise is the recoverable direction, so this is deliberately tight rather than generous.
+ *
+ * To disable expiry entirely (restoring the old sticky-forever behaviour) set
+ * PIGEON_DECLARED_QUIET_TTL_MS to a huge finite value such as 1e15. "Infinity" is NOT
+ * accepted -- it is non-finite, so it falls back to this default with a warning.
+ */
+export const DEFAULT_DECLARED_QUIET_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
 export interface EffectivePolicyInput {
   policy: NotifyPolicy | null;
@@ -35,12 +47,15 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * applying time-to-live (TTL) expiry to quiet declared/inferred rows.
  *
  * WHY expiry returns 'all' and not null:
- * Expiry MUST NOT resolve to policy = null. When policy is null, decideNotify
- * falls through to the legacy title layer (notify-policy.ts:82-85), where the
- * quiet-title regex still matches 14 of 16 production lgtm titles (e.g.,
- * "PR review .lgtm-review-prompt.md"). Resolving to null would leave the session
- * muted by title regex for ~88% of cases, making expiry a no-op. Expiring to 'all'
- * explicitly delivers at the origin layer and bypasses the title layer.
+ * Expiry MUST NOT resolve to policy = null. When policy is null, `decideNotify` falls
+ * through to the legacy title layer (the `isTitleLayerOn` / `isQuietTitle` block below),
+ * where the quiet-title regex still matches 14 of 16 production lgtm titles (measured
+ * against the live daemon DB: "PR review .lgtm-review-prompt.md", "Enriching review
+ * context from .lgtm-gather-prompt.md", ...). Resolving to null would therefore leave
+ * ~88% of the target population muted by the regex, making expiry a silent NO-OP.
+ * Expiring to 'all' decides explicitly at the origin layer and bypasses the title layer.
+ * (Deliberately no line numbers here: this is the load-bearing comment in the change and
+ * line citations rot on the first edit above them.)
  *
  * WHY 'override' is exempt:
  * User-issued un-quiet actions write source = 'override'. A user's explicit decision
@@ -48,9 +63,15 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * silence, defeating the user's explicit choice.
  *
  * WHY the clock uses created_at instead of updated_at:
- * The suppression clock starts when provenance was first declared. Using updated_at
- * would allow repeated identical declared writes from the reconciliation writer
- * to refresh updated_at indefinitely, extending quiet status forever.
+ * The suppression clock starts when provenance was FIRST declared. `record()` never
+ * touches created_at on the UPDATE path, so repeated identical declared writes from the
+ * reconciliation writer refresh only updated_at -- using that clock would extend quiet
+ * status forever, which is the exact bug this exists to kill.
+ * KNOWN CONSEQUENCE, and it fails toward NOISE: if a session id is ever REUSED across
+ * runs (e.g. a future lgtm "iterative mode"), the new run's declared row inherits the old
+ * created_at and is born already-expired, so every Stop delivers. That is loud, not
+ * silent, so it is the acceptable direction -- but it would look like a spam bug to
+ * whoever hits it, so change the clock deliberately rather than by surprise.
  */
 export function effectiveNotifyPolicy(
   input: EffectivePolicyInput,
@@ -67,11 +88,17 @@ export function effectiveNotifyPolicy(
   }
 
   if ((policy === "errors-only" || policy === "none") && (source === "declared" || source === "inferred")) {
-    if (createdAt !== null && Number.isFinite(createdAt)) {
-      const ttl = parseDeclaredQuietTtlMs(env);
-      if (now - createdAt > ttl) {
-        return { policy: "all", expired: true };
-      }
+    // An UNUSABLE clock (absent, NaN, Infinity -- e.g. a corrupt created_at read back
+    // through Number()) means we cannot prove the suppression is still young. Ambiguity
+    // resolves toward DELIVERING, so treat it as expired rather than silencing forever:
+    // a bad clock must not be a way to make a session permanently silent.
+    if (createdAt === null || !Number.isFinite(createdAt)) {
+      return { policy: "all", expired: true };
+    }
+
+    const ttl = parseDeclaredQuietTtlMs(env);
+    if (now - createdAt > ttl) {
+      return { policy: "all", expired: true };
     }
   }
 

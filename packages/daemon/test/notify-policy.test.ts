@@ -391,17 +391,24 @@ describe("effectiveNotifyPolicy", () => {
     ).toEqual({ policy: "errors-only", expired: false });
   });
 
-  it("keeps quiet rows unchanged when createdAt is null or not finite", () => {
+  it("treats an unusable clock as expired so a corrupt created_at cannot silence forever", () => {
+    // Fail open: with no usable clock we cannot prove the suppression is still young,
+    // and the dangerous direction is silence, not noise.
     expect(
       effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: null, now }, {}),
-    ).toEqual({ policy: "errors-only", expired: false });
+    ).toEqual({ policy: "all", expired: true });
 
     expect(
       effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: NaN, now }, {}),
-    ).toEqual({ policy: "errors-only", expired: false });
+    ).toEqual({ policy: "all", expired: true });
 
     expect(
       effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: Infinity, now }, {}),
+    ).toEqual({ policy: "all", expired: true });
+
+    // ...but an unusable clock must NOT override a user's permanent un-quiet exemption.
+    expect(
+      effectiveNotifyPolicy({ policy: "errors-only", source: "override", createdAt: NaN, now }, {}),
     ).toEqual({ policy: "errors-only", expired: false });
   });
 

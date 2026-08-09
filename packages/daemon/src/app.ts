@@ -814,13 +814,20 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           if (effective.expired && originRow) {
             const ageMs = now - originRow.createdAt;
             console.log(
-              `[stop] declared quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
-              `policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,
+              `[stop] automated quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
+              `source=${originRow.source} policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,
             );
           }
         } catch (err) {
-          console.error(`[stop] effective notify policy calculation failed sessionId=${sessionId}, falling back:`, err);
-          effectivePolicy = originRow?.notifyPolicy ?? null;
+          // Fail open. Falling back to the STORED policy would keep an expired row
+          // suppressing, i.e. an exception in this arithmetic could silence a session
+          // forever -- the one direction the house rule forbids. A spurious notification
+          // is recoverable; an invisible one is not.
+          console.error(
+            `[stop] effective notify policy calculation failed sessionId=${sessionId}, delivering:`,
+            err,
+          );
+          effectivePolicy = "all";
         }
 
         let decision: NotifyDecision;
