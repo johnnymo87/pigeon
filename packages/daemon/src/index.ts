@@ -24,10 +24,7 @@ import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
-import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
-import { effectiveNotifyPolicy, explainQuiet } from "./notify-policy";
 import { createTelegramReplySender } from "./worker/reply-factory";
-import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
@@ -299,70 +296,6 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             model: msg.model, machineId: config.machineId, opencodeClient: client,
             storage, sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
             allowedProviders: config.allowedProviders,
-          });
-        },
-        onCurrentState: async (msg) => {
-          if (!opencodeClient) { console.warn("[index] onCurrentState: no opencodeClient configured"); return; }
-          await ingestCurrentStateCommand({
-            commandId: msg.commandId,
-            chatId: msg.chatId,
-            machineId: config.machineId!,
-            opencodeClient,
-            enumerate: () => resolveMainSessionSids(
-              makeLiveDeps(),
-              () => storage.sessions.list({ active: true }).map(s => ({ sessionId: s.sessionId, pid: s.pid, lastSeen: s.lastSeen })),
-            ),
-            registerSession: (sid, label) => poller!.registerSession(sid, label),
-            describeQuiet: (sid, title) => {
-              try {
-                const session = storage.sessions.get(sid);
-                const originRow = storage.sessionOrigins.get(sid);
-                const effective = effectiveNotifyPolicy({
-                  policy: originRow?.notifyPolicy ?? null,
-                  source: originRow?.source ?? null,
-                  createdAt: originRow?.createdAt ?? null,
-                  now: Date.now(),
-                });
-                return explainQuiet({
-                  registered: !!session,
-                  notify: session?.notify ?? false,
-                  policy: effective.policy,
-                  origin: originRow?.origin ?? null,
-                  title,
-                });
-              } catch (e) {
-                console.warn(`[current-state] quiet lookup failed for ${sid}:`, e);
-                return null;
-              }
-            },
-            enqueueCard: (opts) => {
-              // NOTE: OutboxSender delivers to its configured chatId and ignores this
-              // command's msg.chatId, because the outbox payload carries no chatId. That is
-              // fine while Pigeon is single-tenant, but a /current-state arriving from a
-              // second chat would have its cards silently delivered to the configured one.
-              // threaded:false is load-bearing, not incidental. Cards are delivered via the
-              // same /notifications/send endpoint that lazily creates a forum topic on demand,
-              // once per surveyed session. Letting cards thread would fire a createForumTopic +
-              // sendMessage burst (~31 calls on a 15-session machine) against Telegram's ~20/min
-              // per-chat ceiling, and would spawn topics for idle sessions that never notified,
-              // defeating lazy creation. Cards belong in General.
-              const notificationPayload = {
-                message: { text: opts.text, entities: opts.entities },
-                replyMarkup: { inline_keyboard: [] },
-                notificationId: opts.notificationId,
-                threaded: false,
-              };
-              storage.outbox.upsert({
-                notificationId: opts.notificationId,
-                sessionId: opts.sid,
-                requestId: `cs-${opts.notificationId}`,
-                kind: "card",
-                payload: JSON.stringify(notificationPayload),
-                token: generateToken(),
-              });
-            },
-            // /current-state index is a machine-wide summary sent to General
-            sendPlainText: (text, entities) => sendTelegramMessage(msg.chatId, text, { entities, messageThreadId: undefined }),
           });
         },
       },

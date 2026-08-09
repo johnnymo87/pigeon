@@ -3,7 +3,6 @@ import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
-import type { Activity } from "./current-state-enrich";
 import type { QuietExplanation } from "./notify-policy";
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
@@ -269,129 +268,6 @@ export function relativeTime(ms: number, now: number): string {
     return `${Math.floor(diff / 3_600_000)}h ago`;
   }
   return `${Math.floor(diff / 86_400_000)}d ago`;
-}
-
-function formatQuietLine(quiet: QuietExplanation): string {
-  switch (quiet.reason) {
-    case "origin": {
-      const displayOrigin = quiet.origin ?? "declared policy";
-      if (quiet.policy === "errors-only") {
-        return `🔇 Muted by ${displayOrigin} · errors still notify`;
-      }
-      if (quiet.policy === "none") {
-        return `🔇 Muted by ${displayOrigin} · nothing notifies`;
-      }
-      return `🔇 Muted by ${displayOrigin}`;
-    }
-    case "title":
-      return "🔇 Muted by title pattern";
-    case "notify-flag":
-      return "🔇 Muted · notifications turned off";
-    case "unregistered":
-      // Deliberately NOT phrased as "Muted". The plugin re-registers a session
-      // before its next Stop (ensureRegistered precedes notifyStop), so a row
-      // reaped after a week of idleness usually self-heals and the next Stop
-      // DOES arrive. Asserting "Muted" here would cry wolf; the hedge keeps the
-      // genuinely-silent case (a long-lived plugin holding a stale registration)
-      // visible without lying about the common one.
-      return "🔇 Not registered with pigeon — notifications may not arrive";
-  }
-}
-
-export function formatStateCard(
-  input: {
-    title: string;
-    status: Activity;
-    dir: string | null;
-    sid: string;
-    snippet: string;
-    lastActivity: number | null;
-    machineId: string;
-    quiet?: QuietExplanation | null;
-  },
-  now?: number,
-): TgMessage {
-  const currentTime = now ?? Date.now();
-  const dirShort = input.dir ? input.dir.split("/").slice(-2).join("/") : "unknown";
-
-  const builder = new TgMessageBuilder()
-    .append(input.status === "active" ? "🟢" : "⚪")
-    .append(" ")
-    .appendBold(input.title);
-
-  if (input.snippet) {
-    builder.newline().append(input.snippet);
-  }
-
-  builder
-    .newline(2)
-    .append("📂 ")
-    .appendCode(dirShort)
-    .append(` · 🖥 ${input.machineId}`)
-    .newline()
-    .append("🆔 ")
-    .appendCode(input.sid);
-
-  if (input.quiet) {
-    builder.newline().append(formatQuietLine(input.quiet));
-  }
-
-  builder
-    .newline()
-    .append("↩️ ")
-    .appendItalic("Swipe-reply to respond");
-
-  if (input.lastActivity !== null) {
-    builder.append(` · ${relativeTime(input.lastActivity, currentTime)}`);
-  }
-
-  return builder.build();
-}
-
-export function formatCurrentStateIndex(
-  input: {
-    machineId: string;
-    sessions: Array<{ title: string; status: Activity }>;
-    unreadable?: number;
-    homeScreen?: number;
-  },
-): TgMessage {
-  const builder = new TgMessageBuilder()
-    .append("📋 ")
-    .appendBold("Current state")
-    .append(` — ${input.machineId}`)
-    .newline();
-
-  let active = 0;
-  let idle = 0;
-  for (const s of input.sessions) {
-    if (s.status === "active") {
-      active++;
-    } else if (s.status === "idle") {
-      idle++;
-    }
-  }
-
-  builder.append(`${input.sessions.length} main session(s) · ${active} 🟢 active · ${idle} ⚪ idle`);
-  if (input.unreadable && input.unreadable > 0) {
-    builder.append(` · ${input.unreadable} unreadable`);
-  }
-  if (input.homeScreen && input.homeScreen > 0) {
-    builder.append(` · ${input.homeScreen} on home screen`);
-  }
-
-  if (input.sessions.length > 0) {
-    builder.newline(2);
-    input.sessions.forEach((s, idx) => {
-      if (idx > 0) {
-        builder.newline();
-      }
-      const emoji = s.status === "active" ? "🟢" : "⚪";
-      builder.append(`${idx + 1}. ${s.title} ${emoji}`);
-    });
-  }
-
-  return builder.build();
 }
 
 export class TelegramNotificationService implements StopNotifier {
