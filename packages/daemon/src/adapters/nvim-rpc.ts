@@ -7,9 +7,8 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 /**
  * Resolve the nvim binary to exec.
  *
- * Mirrors TMUX_BIN / PGREP_BIN (main-session-allowlist.ts) and
- * OC_AUTO_ATTACH_BIN (launch-ingest.ts): a systemd-managed deployment pins an
- * absolute store path so the unit does not need the binary on its PATH.
+ * Mirrors OC_AUTO_ATTACH_BIN (launch-ingest.ts): a systemd-managed deployment
+ * pins an absolute store path so the unit does not need the binary on its PATH.
  *
  * That indirection is not cosmetic. While nvim was resolved from PATH, the
  * NixOS unit had to carry a bare neovim, and tmux stamps the spawning
