@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { decideNotify, explainQuiet } from "../src/notify-policy";
+import {
+  DEFAULT_DECLARED_QUIET_TTL_MS,
+  decideNotify,
+  effectiveNotifyPolicy,
+  explainQuiet,
+} from "../src/notify-policy";
 
 describe("decideNotify", () => {
   it("delivers everything when there is no origin row and the title does not match", () => {
@@ -243,6 +248,56 @@ describe("explainQuiet", () => {
     ).toBeNull();
   });
 
+  it("returns null when effective policy is applied to an expired declared quiet session", () => {
+    const now = 10_000_000;
+    const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+    const effective = effectiveNotifyPolicy(
+      { policy: "errors-only", source: "declared", createdAt: now - ttl - 1000, now },
+      {},
+    );
+    expect(effective).toEqual({ policy: "all", expired: true });
+
+    expect(
+      explainQuiet(
+        {
+          registered: true,
+          notify: true,
+          policy: effective.policy,
+          origin: "lgtm",
+          title: "PR review .lgtm-review-prompt.md",
+        },
+        {},
+      ),
+    ).toBeNull();
+  });
+
+  it("returns origin explanation when effective policy is applied to a non-expired declared quiet session", () => {
+    const now = 10_000_000;
+    const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+    const effective = effectiveNotifyPolicy(
+      { policy: "errors-only", source: "declared", createdAt: now - ttl + 1000, now },
+      {},
+    );
+    expect(effective).toEqual({ policy: "errors-only", expired: false });
+
+    expect(
+      explainQuiet(
+        {
+          registered: true,
+          notify: true,
+          policy: effective.policy,
+          origin: "lgtm",
+          title: "PR review .lgtm-review-prompt.md",
+        },
+        {},
+      ),
+    ).toEqual({
+      reason: "origin",
+      origin: "lgtm",
+      policy: "errors-only",
+    });
+  });
+
   it("handles null/undefined/empty title without throwing and returns null for ordinary session", () => {
     expect(
       explainQuiet(
@@ -264,5 +319,149 @@ describe("explainQuiet", () => {
         {},
       ),
     ).toBeNull();
+  });
+});
+
+describe("effectiveNotifyPolicy", () => {
+  const now = 10_000_000;
+  const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+
+  it("returns null policy unchanged and not expired when policy is null", () => {
+    expect(
+      effectiveNotifyPolicy({ policy: null, source: "declared", createdAt: now - ttl - 1000, now }, {}),
+    ).toEqual({ policy: null, expired: false });
+  });
+
+  it("returns override rows unchanged regardless of age", () => {
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "override", createdAt: now - ttl - 100_000, now },
+        {},
+      ),
+    ).toEqual({ policy: "errors-only", expired: false });
+
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "none", source: "override", createdAt: now - ttl - 100_000, now },
+        {},
+      ),
+    ).toEqual({ policy: "none", expired: false });
+  });
+
+  it("returns policy=all unchanged and not expired", () => {
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "all", source: "declared", createdAt: now - ttl - 100_000, now },
+        {},
+      ),
+    ).toEqual({ policy: "all", expired: false });
+  });
+
+  it("expires declared or inferred quiet rows (errors-only / none) when older than TTL", () => {
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - ttl - 1, now },
+        {},
+      ),
+    ).toEqual({ policy: "all", expired: true });
+
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "none", source: "inferred", createdAt: now - ttl - 1, now },
+        {},
+      ),
+    ).toEqual({ policy: "all", expired: true });
+  });
+
+  it("keeps quiet rows unchanged when within TTL", () => {
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - ttl + 1000, now },
+        {},
+      ),
+    ).toEqual({ policy: "errors-only", expired: false });
+  });
+
+  it("treats exact TTL boundary as NOT expired (strictly greater required)", () => {
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - ttl, now },
+        {},
+      ),
+    ).toEqual({ policy: "errors-only", expired: false });
+  });
+
+  it("treats an unusable clock as expired so a corrupt created_at cannot silence forever", () => {
+    // Fail open: with no usable clock we cannot prove the suppression is still young,
+    // and the dangerous direction is silence, not noise.
+    expect(
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: null, now }, {}),
+    ).toEqual({ policy: "all", expired: true });
+
+    expect(
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: NaN, now }, {}),
+    ).toEqual({ policy: "all", expired: true });
+
+    expect(
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: Infinity, now }, {}),
+    ).toEqual({ policy: "all", expired: true });
+
+    // ...but an unusable clock must NOT override a user's permanent un-quiet exemption.
+    expect(
+      effectiveNotifyPolicy({ policy: "errors-only", source: "override", createdAt: NaN, now }, {}),
+    ).toEqual({ policy: "errors-only", expired: false });
+  });
+
+  it("customizes TTL via PIGEON_DECLARED_QUIET_TTL_MS env var", () => {
+    const customTtlEnv = { PIGEON_DECLARED_QUIET_TTL_MS: "1000" }; // 1s
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - 500, now },
+        customTtlEnv,
+      ),
+    ).toEqual({ policy: "errors-only", expired: false });
+
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - 1001, now },
+        customTtlEnv,
+      ),
+    ).toEqual({ policy: "all", expired: true });
+  });
+
+  it("allows PIGEON_DECLARED_QUIET_TTL_MS=0 to expire immediately", () => {
+    const zeroTtlEnv = { PIGEON_DECLARED_QUIET_TTL_MS: "0" };
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - 1, now },
+        zeroTtlEnv,
+      ),
+    ).toEqual({ policy: "all", expired: true });
+  });
+
+  it("falls back to default TTL and logs console.warn when PIGEON_DECLARED_QUIET_TTL_MS is invalid or negative", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const badEnv1 = { PIGEON_DECLARED_QUIET_TTL_MS: "not-a-number" };
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - ttl - 1, now },
+        badEnv1,
+      ),
+    ).toEqual({ policy: "all", expired: true });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("not-a-number"));
+
+    warnSpy.mockClear();
+
+    const badEnv2 = { PIGEON_DECLARED_QUIET_TTL_MS: "-500" };
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "declared", createdAt: now - 100, now },
+        badEnv2,
+      ),
+    ).toEqual({ policy: "errors-only", expired: false }); // 100ms < 4h default
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("-500"));
+
+    warnSpy.mockRestore();
   });
 });

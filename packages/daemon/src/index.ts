@@ -25,7 +25,7 @@ import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { ingestCurrentStateCommand } from "./worker/current-state-ingest";
-import { explainQuiet } from "./notify-policy";
+import { effectiveNotifyPolicy, explainQuiet } from "./notify-policy";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { resolveMainSessionSids, makeLiveDeps } from "./main-session-allowlist";
 import { startSessionReaper } from "./session-reaper";
@@ -317,10 +317,16 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
               try {
                 const session = storage.sessions.get(sid);
                 const originRow = storage.sessionOrigins.get(sid);
+                const effective = effectiveNotifyPolicy({
+                  policy: originRow?.notifyPolicy ?? null,
+                  source: originRow?.source ?? null,
+                  createdAt: originRow?.createdAt ?? null,
+                  now: Date.now(),
+                });
                 return explainQuiet({
                   registered: !!session,
                   notify: session?.notify ?? false,
-                  policy: originRow?.notifyPolicy ?? null,
+                  policy: effective.policy,
                   origin: originRow?.origin ?? null,
                   title,
                 });

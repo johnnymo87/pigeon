@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES, ORIGIN_UNKNOWN, type SessionOriginRecord } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, ORIGIN_UNKNOWN, type NotifyPolicy, type SessionOriginRecord } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -11,7 +11,7 @@ import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
-import { decideNotify, type NotifyDecision } from "./notify-policy";
+import { decideNotify, effectiveNotifyPolicy, type NotifyDecision } from "./notify-policy";
 
 interface LegacySession {
   session_id: string;
@@ -798,11 +798,43 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           console.error(`[stop] session_origin read failed sessionId=${sessionId}, delivering:`, err);
         }
 
+        let effectivePolicy: NotifyPolicy | null = originRow?.notifyPolicy ?? null;
+        try {
+          const now = nowFn();
+          const effective = effectiveNotifyPolicy(
+            {
+              policy: originRow?.notifyPolicy ?? null,
+              source: originRow?.source ?? null,
+              createdAt: originRow?.createdAt ?? null,
+              now,
+            },
+            process.env,
+          );
+          effectivePolicy = effective.policy;
+          if (effective.expired && originRow) {
+            const ageMs = now - originRow.createdAt;
+            console.log(
+              `[stop] automated quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
+              `source=${originRow.source} policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,
+            );
+          }
+        } catch (err) {
+          // Fail open. Falling back to the STORED policy would keep an expired row
+          // suppressing, i.e. an exception in this arithmetic could silence a session
+          // forever -- the one direction the house rule forbids. A spurious notification
+          // is recoverable; an invisible one is not.
+          console.error(
+            `[stop] effective notify policy calculation failed sessionId=${sessionId}, delivering:`,
+            err,
+          );
+          effectivePolicy = "all";
+        }
+
         let decision: NotifyDecision;
         try {
           decision = decideNotify({
             event,
-            policy: originRow?.notifyPolicy ?? null,
+            policy: effectivePolicy,
             title: effectiveTitle,
           });
         } catch (err) {
