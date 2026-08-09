@@ -1346,14 +1346,16 @@ blast radius but **do not cure the outage**.
   itself is deliberately untouched.
   Reopen only if the §3 budget ever becomes the binding constraint — and if so, prefer the conditional
   form (reopen only when a human will actually read it) over an unconditional delete.
-- [ ] **6d. `pigeon-cx2`** — the `/current-state` **index** message bypasses the outbox *and the worker
-  entirely* (a raw Telegram call from the daemon). Cycle 0 made the cards durable and left the framing
-  message best-effort, so it is now the lossiest part of the command. Needs a different fix shape:
-  `/notifications/send` requires a registered `sessionId` and the index has none. Its deeper
-  significance: a daemon-direct-to-Telegram path makes any shared rate gate (6a) **structurally
-  blind**, so shrinking that path is a precondition for 6a, not a cleanup.
-- [ ] **6e. `pigeon-6hl`** (P3) — re-running `/current-state` also delivers the previous run's queued
-  cards, stale ones first.
+- [x] **6d. `pigeon-cx2`** — **the specific instance is GONE**: `/current-state` was deleted wholesale
+  (`pigeon-mlc0`), taking the index message and its raw daemon→Telegram call with it.
+  **THE DEEPER SIGNIFICANCE SURVIVES AND IS NOT CLOSED.** The claim was that a daemon-direct-to-Telegram
+  path makes any shared rate gate (6a) **structurally blind**. Deleting `/current-state` removed *one*
+  caller, not the path: `sendTelegramMessage` in daemon `index.ts` is still reached by
+  `createTelegramReplySender` for ~10 command acks (`/kill`, `/interrupt`, `/compact`, `/mcp *`,
+  `/model *`, launch errors). So 6a's precondition is **not** satisfied. Tracked by **`pigeon-bvps`**,
+  not by `pigeon-cx2` (which is closed as moot).
+- [x] **6e. `pigeon-6hl`** (P3) — moot. Re-run staleness was a property of the card fan-out, which no
+  longer exists.
 - [ ] **6f. `pigeon-1rb`** (P3) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
   it now fails **open** where the old code failed closed. Safe today, verified endpoint by endpoint.
 - [ ] **6g. `pigeon-66y`** — flip the worker test default to topics-on and delete the flag-off

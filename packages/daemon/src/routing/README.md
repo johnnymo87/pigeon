@@ -93,7 +93,7 @@ message lands on the target's serve and not the other, plus failover).
 Auth is **enforce-when-configured** (deny-by-default). When `PIGEON_DAEMON_AUTH_TOKEN` is set,
 EVERY daemon client must send the bearer token:
 - the opencode plugin (`daemon-client.ts` `daemonHeaders()`),
-- the `pigeon-send` CLI, workstation tooling, reset-workspace, and current-state tooling.
+- the `pigeon-send` CLI, workstation tooling, and reset-workspace.
 All daemon clients have been patched to transmit `PIGEON_DAEMON_AUTH_TOKEN`.
 Only `GET /health` remains in the anonymous allowlist for liveness probing.
 

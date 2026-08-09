@@ -4,7 +4,7 @@ import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } fr
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
 
-type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "current_state";
+type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -859,33 +859,6 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    // Handle /current-state command
-    const currentStateMatch = update.message.text.match(/^\/current-state(?:\s+(\S+))?$/);
-    if (currentStateMatch) {
-      const machineId = currentStateMatch[1] ?? "cloudbox";
-      const csChatId = update.message.chat.id;
-
-      const isRecent = await isMachineRecent(db, machineId);
-      if (!isRecent) {
-        await sendTelegramMessage(env, csChatId, `${machineId} is not recently seen.`, { messageThreadId: update.message.message_thread_id });
-        return OK();
-      }
-
-      const commandId = await queueCommand(db, env, {
-        machineId,
-        sessionId: null,
-        command: "",
-        chatId: String(csChatId),
-        label: null,
-        commandType: "current_state",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, csChatId, `Fetching current state on ${machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
     // Handle /kill command (reply-based)
     if (/^\/kill$/.test(update.message.text)) {
       const killChatId = update.message.chat.id;
@@ -1196,8 +1169,8 @@ export async function handleTelegramWebhook(
     // same semantics (contracts.ts isNonEmptyString) rather than a naive === "".
     //
     // Scoped to this plain-message execute path on purpose. A blanket guard inside
-    // queueCommand would break /kill, /interrupt, /compact, /mcp list, /model list
-    // and /current-state, all of which legitimately queue an empty command.
+    // queueCommand would break /kill, /interrupt, /compact, /mcp list, and /model list,
+    // all of which legitimately queue an empty command.
     //
     // Media with no caption is intentionally still routed: that is a separate defect
     // (W3 / pigeon-tyk) and dropping it here would silently discard the user's file.

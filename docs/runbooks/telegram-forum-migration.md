@@ -255,7 +255,7 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
    npx wrangler tail --cwd packages/worker
    ```
 2. Check for Telegram 429 rate limits or delivery errors in the logs.
-3. Send a test command in a topic in the supergroup (e.g., `/current-state`).
+3. Send a test command in a topic in the supergroup (e.g., `/model`).
 4. Follow the burn-in checklist in `.opencode/skills/daemon-cutover-burnin/SKILL.md`.
 
 ---

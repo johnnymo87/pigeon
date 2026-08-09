@@ -228,13 +228,6 @@ export interface ModelSetMessage {
   messageThreadId?: number;
 }
 
-export interface CurrentStateMessage {
-  commandId: string;
-  commandType: "current_state";
-  chatId: string;
-  messageThreadId?: number;
-}
-
 export type WorkerMessage =
   | ExecuteMessage
   | LaunchMessage
@@ -245,8 +238,7 @@ export type WorkerMessage =
   | McpEnableMessage
   | McpDisableMessage
   | ModelListMessage
-  | ModelSetMessage
-  | CurrentStateMessage;
+  | ModelSetMessage;
 
 export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
@@ -259,7 +251,6 @@ export interface PollerCallbacks {
   onMcpDisable: (msg: McpDisableMessage) => Promise<void>;
   onModelList: (msg: ModelListMessage) => Promise<void>;
   onModelSet: (msg: ModelSetMessage) => Promise<void>;
-  onCurrentState: (msg: CurrentStateMessage) => Promise<void>;
 }
 
 export interface PollerDeps {
@@ -370,8 +361,6 @@ export class Poller {
         await this.callbacks.onModelList(msg);
       } else if (msg.commandType === "model_set") {
         await this.callbacks.onModelSet(msg);
-      } else if (msg.commandType === "current_state") {
-        await this.callbacks.onCurrentState(msg);
       } else {
         console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
         return;

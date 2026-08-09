@@ -1622,7 +1622,7 @@ describe("classified delivery failure actions", () => {
   });
 
   // The legacy singular 'message' payload shape is still production-reachable (question
-  // notifications and /current-state cards write it), and the strip arm handles it. Adversarial
+  // notifications write it), and the strip arm handles it. Adversarial
   // review noted it was only ever verified by reading the code, never by a test.
   it("502 entity-400 strips the LEGACY singular message shape too, preserving replyMarkup", async () => {
     const legacyPayload = JSON.stringify({
