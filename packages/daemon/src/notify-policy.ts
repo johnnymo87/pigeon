@@ -211,7 +211,18 @@ export interface ExplainQuietInput {
   title: string | null | undefined;
 }
 
-/** Returns null when a Stop WOULD be delivered; an explanation when it would not. */
+/**
+ * Returns null when a Stop WOULD be delivered; an explanation when it would not.
+ *
+ * NO PRODUCTION CALLER as of pigeon-mlc0 (2026-08-09). Its only caller was the
+ * /current-state card renderer, which was deleted with the command. Kept
+ * deliberately, by explicit decision, as the reusable "is this session silent,
+ * and why?" primitive: it delegates to decideNotify, so it cannot drift from the
+ * real POST /stop decision, and the exhaustiveness guard below fails compilation
+ * if a new suppressing layer is added without teaching this function about it.
+ * Anything that needs to answer that question should route through here rather
+ * than re-deriving the answer. Do not delete it for being unreferenced.
+ */
 export function explainQuiet(
   input: ExplainQuietInput,
   env: Record<string, string | undefined> = process.env,
@@ -256,12 +267,12 @@ export function explainQuiet(
       default: {
         // A NEW suppressing NotifyLayer was added without teaching explainQuiet
         // about it. That is the FALSE-REASSURANCE direction -- the session would
-        // be silent while its card showed nothing -- so fail loudly at compile
-        // time rather than silently returning null.
+        // be silent while this function reported it as audible -- so fail loudly
+        // at compile time rather than silently returning null.
         const unhandled: never = decision.layer;
         console.warn(
           `[notify-policy] explainQuiet saw an unknown suppressing layer "${String(unhandled)}"; ` +
-          `card will not show a mute indicator for a session that is actually silent`,
+          `reporting a session as audible when it is actually silent`,
         );
         break;
       }

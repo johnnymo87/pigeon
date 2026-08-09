@@ -3,7 +3,6 @@ import type { StorageDb } from "./storage/database";
 import type { QuestionInfoData } from "./storage/types";
 import { splitTelegramMessage } from "./split-message";
 import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
-import type { QuietExplanation } from "./notify-policy";
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
 /**
@@ -254,20 +253,6 @@ export function formatQuestionWizardStep(input: {
 
 export function generateToken(): string {
   return randomBytes(16).toString("base64url");
-}
-
-export function relativeTime(ms: number, now: number): string {
-  const diff = now - ms;
-  if (diff < 0 || diff < 60_000) {
-    return "just now";
-  }
-  if (diff < 3_600_000) {
-    return `${Math.floor(diff / 60_000)}m ago`;
-  }
-  if (diff < 86_400_000) {
-    return `${Math.floor(diff / 3_600_000)}h ago`;
-  }
-  return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
 export class TelegramNotificationService implements StopNotifier {

@@ -5,7 +5,6 @@ import {
   formatQuestionWizardStep,
   TelegramNotificationService,
   RateLimitError,
-  relativeTime,
   displayName,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";
@@ -532,31 +531,3 @@ describe("formatQuestionNotification", () => {
 
 
 
-describe("relativeTime formatting helper", () => {
-  describe("relativeTime", () => {
-    it("handles boundary cases correctly", () => {
-      const now = 10000000;
-      // Future
-      expect(relativeTime(now + 1, now)).toBe("just now");
-      expect(relativeTime(now + 100000, now)).toBe("just now");
-      // Just now (< 60_000)
-      expect(relativeTime(now, now)).toBe("just now");
-      expect(relativeTime(now - 1, now)).toBe("just now");
-      expect(relativeTime(now - 59999, now)).toBe("just now");
-      // Minutes (< 3_600_000)
-      expect(relativeTime(now - 60000, now)).toBe("1m ago");
-      expect(relativeTime(now - 119000, now)).toBe("1m ago");
-      expect(relativeTime(now - 120000, now)).toBe("2m ago");
-      expect(relativeTime(now - 3599000, now)).toBe("59m ago");
-      // Hours (< 86_400_000)
-      expect(relativeTime(now - 3600000, now)).toBe("1h ago");
-      expect(relativeTime(now - 7199000, now)).toBe("1h ago");
-      expect(relativeTime(now - 7200000, now)).toBe("2h ago");
-      expect(relativeTime(now - 86399000, now)).toBe("23h ago");
-      // Days (>= 86_400_000)
-      expect(relativeTime(now - 86400000, now)).toBe("1d ago");
-      expect(relativeTime(now - 172799000, now)).toBe("1d ago");
-      expect(relativeTime(now - 172800000, now)).toBe("2d ago");
-    });
-  });
-});

@@ -1352,8 +1352,8 @@ blast radius but **do not cure the outage**.
   path makes any shared rate gate (6a) **structurally blind**. Deleting `/current-state` removed *one*
   caller, not the path: `sendTelegramMessage` in daemon `index.ts` is still reached by
   `createTelegramReplySender` for ~10 command acks (`/kill`, `/interrupt`, `/compact`, `/mcp *`,
-  `/model *`, launch errors). So 6a's precondition is **not** satisfied. Tracked by the narrowed
-  successor bead, not by `pigeon-cx2`.
+  `/model *`, launch errors). So 6a's precondition is **not** satisfied. Tracked by **`pigeon-bvps`**,
+  not by `pigeon-cx2` (which is closed as moot).
 - [x] **6e. `pigeon-6hl`** (P3) — moot. Re-run staleness was a property of the card fan-out, which no
   longer exists.
 - [ ] **6f. `pigeon-1rb`** (P3) — document the 2xx-without-`ok` contract in `safeExecuteWorkerFetch`;
