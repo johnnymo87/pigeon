@@ -903,7 +903,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           token,
         }, now);
 
-        console.log(`[stop] queued sessionId=${sessionId} notificationId=${notificationId} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
+        // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
+        // here, a DELIVERY from a session carrying a quiet policy is ambiguous in the logs
+        // between "Error/Retry, which errors-only delivers by design" and "a Stop leaked
+        // past the origin layer" -- the two cases a soak of the title layer has to tell
+        // apart. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
+        // policy=all here and is explained by the `automated quiet expired` line above.
+        // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
+        console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${originRow?.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
         return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
       }
 

@@ -2105,6 +2105,46 @@ describe("createApp", () => {
       logSpy.mockRestore();
     });
 
+    // pigeon-2z5w. The quieted line has always carried event/layer/origin; the queued
+    // line carried none of them, so a DELIVERY from an errors-only session was
+    // indistinguishable in the logs between "Error/Retry, delivered by design" and
+    // "a Stop leaked past the origin layer". Verifying pigeon-qdcb.8 needed an
+    // elimination argument over the source instead of one grep. These two tests pin
+    // the fields that make it directly observable.
+    it("logs event, origin and effective policy when DELIVERING from an errors-only session", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      // errors-only suppresses Stop but delivers Retry -- the by-design case that
+      // used to be unreadable in the logs.
+      const res = await stop(app, "Retry", "PR review .lgtm-review-prompt.md");
+      expect(res.status).toBe(202);
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\[stop\] queued sessionId=ses_a event=Retry .*origin=lgtm policy=errors-only/,
+        ),
+      );
+
+      logSpy.mockRestore();
+    });
+
+    it("logs placeholders for event/origin/policy when delivering with no origin row", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const res = await stop(app, "Stop", "ordinary human work");
+      expect(res.status).toBe(202);
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\[stop\] queued sessionId=ses_a event=Stop .*origin=- policy=-/),
+      );
+
+      logSpy.mockRestore();
+    });
+
     it("fails open and delivers if storage.sessionOrigins.get throws", async () => {
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
