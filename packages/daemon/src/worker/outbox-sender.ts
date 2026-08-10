@@ -321,8 +321,15 @@ export class OutboxSender {
         // Sub-budget check for low-priority kinds. Placed post-parse because it is
         // chunk-aware, and `continue` rather than `break` because higher-priority
         // entries later in the batch are still eligible.
+        // Checking `this.lowPrioritySendTimestamps.length > 0` allows an oversized entry
+        // (more chunks than SWARM_SUB_BUDGET) to send when the window is empty, preventing
+        // permanent starvation and silent drops. The global OUTBOX_RATE_LIMIT governor
+        // still bounds total chunks per window.
         if (LOW_PRIORITY_KINDS.has(entry.kind)) {
-          if (this.lowPrioritySendTimestamps.length + messages.length > SWARM_SUB_BUDGET) {
+          if (
+            this.lowPrioritySendTimestamps.length > 0 &&
+            this.lowPrioritySendTimestamps.length + messages.length > SWARM_SUB_BUDGET
+          ) {
             this.log("outbox sub-budget reached, deferring low-priority entry", {
               kind: entry.kind,
               notificationId: entry.notificationId,

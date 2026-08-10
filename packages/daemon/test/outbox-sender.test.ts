@@ -2089,6 +2089,36 @@ describe("OutboxSender rate governor", () => {
     expect(storage.outbox.getByNotificationId("swarm-5chunk-2")!.state).toBe("queued");
   });
 
+  it("allows a single 7-chunk low-priority entry to send when the window is empty", async () => {
+    const chunk7Msg = [
+      { text: "c1" }, { text: "c2" }, { text: "c3" },
+      { text: "c4" }, { text: "c5" }, { text: "c6" }, { text: "c7" },
+    ];
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "swarm-7chunk-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk7Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-7chunk-1",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(7);
+    expect(storage.outbox.getByNotificationId("swarm-7chunk-1")!.state).toBe("sent");
+  });
+
   it("allows non-low-priority traffic (questions/stops/cards) to take all OUTBOX_RATE_LIMIT slots when no swarm work is queued", async () => {
     for (let i = 0; i < 15; i++) {
       storage.outbox.upsert({
