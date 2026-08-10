@@ -93,6 +93,15 @@ export const MAX_PAUSE_MS = 5 * 60 * 1000;
  */
 export const OUTBOX_RATE_LIMIT = 12;
 export const OUTBOX_RATE_WINDOW_MS = 60_000;
+/**
+ * Of the OUTBOX_RATE_LIMIT sends per window, at most this many may be swarm/mirror
+ * traffic. Swarm volume is ~65x the stop/question volume and its observed peak minute
+ * already equals the full window, so without a carve-out a burst both delays questions
+ * and multiplies the chance of a topic-creation 429 -- which pauses the ENTIRE outbox
+ * for up to MAX_PAUSE_MS.
+ */
+export const SWARM_SUB_BUDGET = 6;
+const LOW_PRIORITY_KINDS = new Set(["swarm", "mirror"]);
 
 export function formatWorkerError(result: WorkerResult): string {
   if (result.kind === "transport_error") {
@@ -148,6 +157,12 @@ export class OutboxSender {
    * Timestamps (ms) of sendNotification calls within the rate governor sliding window.
    */
   private sendTimestamps: number[] = [];
+
+  /**
+   * Timestamps (ms) of sendNotification calls for low-priority entries (swarm/mirror)
+   * within the rate governor sliding window.
+   */
+  private lowPrioritySendTimestamps: number[] = [];
 
   /**
    * Set of notificationIds that have already attempted re-registration.
@@ -241,6 +256,7 @@ export class OutboxSender {
         // Prune send timestamps older than 60 seconds
         const windowStart = now - OUTBOX_RATE_WINDOW_MS;
         this.sendTimestamps = this.sendTimestamps.filter((t) => t > windowStart);
+        this.lowPrioritySendTimestamps = this.lowPrioritySendTimestamps.filter((t) => t > windowStart);
 
         // Proactive rate governor check before starting an entry.
         // Checking per-entry (rather than between chunks) prevents torn messages where chunk 1 is sent
@@ -302,6 +318,22 @@ export class OutboxSender {
           continue;
         }
 
+        // Sub-budget check for low-priority kinds. Placed post-parse because it is
+        // chunk-aware, and `continue` rather than `break` because higher-priority
+        // entries later in the batch are still eligible.
+        if (LOW_PRIORITY_KINDS.has(entry.kind)) {
+          if (this.lowPrioritySendTimestamps.length + messages.length > SWARM_SUB_BUDGET) {
+            this.log("outbox sub-budget reached, deferring low-priority entry", {
+              kind: entry.kind,
+              notificationId: entry.notificationId,
+              countInWindow: this.lowPrioritySendTimestamps.length,
+              chunks: messages.length,
+              budget: SWARM_SUB_BUDGET,
+            });
+            continue;
+          }
+        }
+
         // Attempt delivery — send each chunk
         try {
           let allOk = true;
@@ -309,6 +341,9 @@ export class OutboxSender {
             const isLast = i === messages.length - 1;
             const msg = messages[i]!;
             this.sendTimestamps.push(this.nowFn());
+            if (LOW_PRIORITY_KINDS.has(entry.kind)) {
+              this.lowPrioritySendTimestamps.push(this.nowFn());
+            }
             const result = await this.sendNotification({
               sessionId: entry.sessionId,
               chatId: this.chatId,
