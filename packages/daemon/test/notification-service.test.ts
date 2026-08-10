@@ -3,6 +3,8 @@ import {
   formatTelegramNotification,
   formatQuestionNotification,
   formatQuestionWizardStep,
+  formatSwarmNotification,
+  formatSwarmCancelNotification,
   TelegramNotificationService,
   RateLimitError,
   displayName,
@@ -526,6 +528,99 @@ describe("formatQuestionNotification", () => {
     });
 
     expect(result.message.text).not.toContain("Swipe-reply");
+  });
+});
+
+describe("formatSwarmNotification", () => {
+  const createdAt = Date.parse("2026-08-10T12:00:00.000Z");
+
+  it("header contains kind, priority, sender, and formatted event time", () => {
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "normal",
+      fromLabel: "worker-agent",
+      toSessionId: "ses_target123",
+      msgId: "msg_abc123",
+      payload: "Hello swarm",
+      createdAt,
+    });
+
+    expect(result.header.text).toContain("📨 swarm · chat · normal");
+    expect(result.header.text).toContain("from worker-agent");
+    expect(result.header.text).toContain("2026-08-10T12:00:00.000Z");
+    expect(result.header.text).not.toContain("⏰ scheduled");
+  });
+
+  it("marks scheduled variant when deliverAt is in the future", () => {
+    const deliverAt = createdAt + 3600_000; // 2026-08-10T13:00:00.000Z
+    const result = formatSwarmNotification({
+      kind: "task.assign",
+      priority: "urgent",
+      fromLabel: "coordinator",
+      toSessionId: "ses_target123",
+      msgId: "msg_sched123",
+      payload: "Scheduled task",
+      createdAt,
+      deliverAt,
+    });
+
+    expect(result.header.text).toContain("📨 swarm · task.assign · urgent");
+    expect(result.header.text).toContain("from coordinator");
+    expect(result.header.text).toContain("2026-08-10T12:00:00.000Z");
+    expect(result.header.text).toContain("⏰ scheduled 2026-08-10T13:00:00.000Z");
+  });
+
+  it("footer carries msg_id and toSessionId with code entities", () => {
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "low",
+      fromLabel: "sender-ses",
+      toSessionId: "ses_target999",
+      msgId: "msg_foot777",
+      payload: "Footer test",
+      createdAt,
+    });
+
+    expect(result.footer.text).toContain("ses_target999");
+    expect(result.footer.text).toContain("msg_foot777");
+    expect(result.footer.text).toContain("Swipe-reply to respond");
+
+    const codeEntities = result.footer.entities.filter((e: { type: string }) => e.type === "code");
+    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("passes payload through untouched including markup-ish characters", () => {
+    const rawPayload = "see `foo_bar` <ok> *bold* & _italic_";
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "normal",
+      fromLabel: "sender",
+      toSessionId: "ses_target",
+      msgId: "msg_markup",
+      payload: rawPayload,
+      createdAt,
+    });
+
+    expect(result.body.text).toBe(rawPayload);
+    expect(result.body.entities).toHaveLength(0);
+  });
+});
+
+describe("formatSwarmCancelNotification", () => {
+  it("renders cancel notice with msg_id and toSessionId", () => {
+    const result = formatSwarmCancelNotification({
+      msgId: "msg_cancel999",
+      toSessionId: "ses_target888",
+    });
+
+    expect(result.header.text).toContain("🚫 cancelled msg_cancel999");
+    expect(result.footer.text).toContain("ses_target888");
+
+    const headerCode = result.header.entities.find((e: { type: string }) => e.type === "code");
+    expect(headerCode).toBeDefined();
+
+    const footerCode = result.footer.entities.find((e: { type: string }) => e.type === "code");
+    expect(footerCode).toBeDefined();
   });
 });
 

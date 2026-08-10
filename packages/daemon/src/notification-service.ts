@@ -114,6 +114,81 @@ export function formatTelegramNotification(input: NotificationInput): {
   };
 }
 
+export interface FormatSwarmNotificationInput {
+  kind: string;
+  priority: string;
+  fromLabel: string;
+  toSessionId: string;
+  msgId: string;
+  payload: string;
+  createdAt: number;
+  deliverAt?: number | null;
+}
+
+export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
+  header: TgMessage;
+  body: TgMessage;
+  footer: TgMessage;
+} {
+  // The event time is required, not decoration. Task 1's arbitration allows a conversational row (question/stop)
+  // to preempt a backlogged swarm post within the same session, so a swarm post can arrive below the stop
+  // notification it caused. Always printing the event time makes that legible instead of misleading.
+  const createdAtTime = new Date(input.createdAt).toISOString();
+  const headerBuilder = new TgMessageBuilder()
+    .append(`📨 swarm · ${input.kind} · ${input.priority}`)
+    .newline()
+    .append(`from ${input.fromLabel} · ${createdAtTime}`);
+
+  if (input.deliverAt && input.deliverAt > input.createdAt) {
+    const deliverAtTime = new Date(input.deliverAt).toISOString();
+    headerBuilder.append(` · ⏰ scheduled ${deliverAtTime}`);
+  }
+
+  const bodyBuilder = new TgMessageBuilder().append(input.payload);
+
+  const footerBuilder = new TgMessageBuilder()
+    .append("🆔 ")
+    .appendCode(input.toSessionId)
+    .append(" · ")
+    .appendCode(input.msgId)
+    .newline(2)
+    .append("↩️ ")
+    .appendItalic("Swipe-reply to respond");
+
+  return {
+    header: headerBuilder.build(),
+    body: bodyBuilder.build(),
+    footer: footerBuilder.build(),
+  };
+}
+
+export interface FormatSwarmCancelNotificationInput {
+  msgId: string;
+  toSessionId: string;
+}
+
+export function formatSwarmCancelNotification(input: FormatSwarmCancelNotificationInput): {
+  header: TgMessage;
+  body: TgMessage;
+  footer: TgMessage;
+} {
+  const headerBuilder = new TgMessageBuilder()
+    .append("🚫 cancelled ")
+    .appendCode(input.msgId);
+
+  const bodyBuilder = new TgMessageBuilder();
+
+  const footerBuilder = new TgMessageBuilder()
+    .append("🆔 ")
+    .appendCode(input.toSessionId);
+
+  return {
+    header: headerBuilder.build(),
+    body: bodyBuilder.build(),
+    footer: footerBuilder.build(),
+  };
+}
+
 export function formatQuestionNotification(input: {
   label: string;
   questions: QuestionInfoData[];
