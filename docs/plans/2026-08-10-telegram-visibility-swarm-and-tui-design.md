@@ -375,3 +375,54 @@ Phase 2:
 - Mirroring assistant output beyond existing stop notifications.
 - A dedicated cross-session swarm topic.
 - Editing the Phase 1 post in place with later delivery state.
+
+## Task 10 spike result — question replies do NOT produce user messages
+
+**Answered 2026-08-10. Conclusion: (a) no user message, no action.** Telegram
+button presses will not echo into the topic. Tasks 11-15 are unblocked as
+designed.
+
+**Static evidence.** In the opencode binary (1.17.13.8), `Question.reply` does
+exactly four things: look up the pending request, delete it from the pending
+map, log `replied`, publish `Question.Event.Replied {sessionID, requestID,
+answers}`, and resolve the deferred that the `question` *tool* is awaiting.
+There is no message or part creation anywhere on that path. The answer surfaces
+as the **tool's output on the assistant message**, not as user input.
+
+**Empirical confirmation** (production transcript, not a synthetic harness):
+session `ses_013f897bbffebJcTlt4kkBPn7n` was asked a question at 11:35:50 and
+answered it from Telegram. The `question` tool part on assistant message
+`msg_fec50dd5a001d9NmDBBmPXqDgb` reads `state=completed`, with output beginning
+`"User has answered your questions: ..."`. Across the whole 11:30–12:00 window
+there are **zero** user-role messages.
+
+**Control** — a null result is worthless without one: the same query finds 11
+user-role messages elsewhere in that same session (Telegram-sent prompts, a
+swarm injection, a compaction marker). The instrument can see user messages; it
+saw none for the question reply.
+
+### Three findings that change Task 14
+
+1. **A compaction marker is a user-role message with no text part.** Message
+   `msg_fec987660001P322Aac94QlBIS` has `role: "user"` and exactly one part,
+   `{type: "compaction", auto: false, tail_start_id: ...}`. It is **not** marked
+   `synthetic`, so the planned synthetic-part exclusion does not catch it.
+   Task 14 must skip user messages that yield no text parts, or every compaction
+   posts an empty mirror.
+
+2. **The post-compaction resumption prompt does mirror, and should.** It arrives
+   as an ordinary user text message (`msg_fec98bb37001wVZ2YiwecbIb45`) and is not
+   daemon-injected, so nothing suppresses it. That is the correct outcome — it is
+   a genuine input that redirects the session, exactly what Phase 2 exists to
+   make visible — but it is multi-paragraph, so expect a chunked post.
+
+3. **Swarm injections are confirmed to arrive as user text messages** (e.g.
+   `msg_fec9440f1001p3Mzul3eudw81T`, whose text begins `<swarm_message v="1"`).
+   Echo suppression (Tasks 11–12) is therefore load-bearing, not defensive:
+   without it every swarm message would appear twice — once from the Phase 1
+   insert-time post, once from the Phase 2 mirror.
+
+**Method note for anyone re-running this:** opencode transcripts now live in
+`~/.local/share/opencode/opencode.db` (tables `message` and `part`, payloads in
+a JSON `data` column). Copy the `.db`, `-wal` and `-shm` together; a bare `.db`
+copy is a stale snapshot (see bead pigeon-uggt).
