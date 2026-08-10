@@ -532,6 +532,18 @@ number was wrong. Two independent causes, both now fixed.
   step-back could hand a genuinely new event an `at` below the stored watermark and silently
   suppress a real alert. AUTOINCREMENT also means `pruneBefore` cannot cause id reuse, because
   `sqlite_sequence` survives `DELETE`.
+
+  **This is settled, and it will attract a "simplification" back to `MAX(at)` from someone who
+  has not seen the evidence.** Two independent sessions built this bead separately and both
+  chose `id` on the a-priori clock argument above. The production measurement is the stronger
+  half and is the part worth keeping: on cloudbox, 2026-08-10, `reassignment_event` had
+  **`max(id)=500` but only 250 rows** — 7-day retention had already deleted half the table
+  while ids kept climbing, exactly because `sqlite_sequence` survives `DELETE`. An `at`-keyed
+  watermark would by then have been a pointer into rows that no longer exist. The corollary
+  for anyone touching retention: prune cannot produce id reuse at or below the watermark,
+  which is *why* the gate is safe to leave unguarded against that case. The one inversion that
+  is reachable — a truncated or recreated table restarting ids at 1 under a persisted high
+  watermark — is the self-heal in the next bullet, not an argument against `id`.
 - **The watermark advances only after a send SUCCEEDS**, while the cooldown is stamped before
   the send. Send failures are swallowed and merely logged, so advancing on failure would drop
   that evidence until something unrelated moved. Ordering is now pinned by a test that inserts
@@ -551,9 +563,94 @@ firing arm's own sessions — a detection-semantics change, which is that bead's
 `safeTick`'s all-zero fallback verdict, which is indistinguishable from a quiet pool, is
 **pigeon-2v62** (P4, latent — its only caller discards the return).
 
+**How to read "all arms silent" later.** Not as proof the detector was never load-bearing.
+Before pigeon-8cz, "no alerts" was equally compatible with a severed recorder. Silence became
+a *positive* statement only once four instruments agreed: no alerts, a base rate of 1.00–1.05
+moves/session/day, a worst session of 4 moves across the whole week against a 5-per-15m floor,
+and an empty `flap_alert_state`. One quiet instrument is not evidence; four that would each
+fail differently are.
+
 **Method note.** Every fence added here was mutation-tested: delete the new-evidence gate and
 3 tests fail; neuter the empty-detail tripwire, 1; feed the slow-burn section the short
 window, 3. That last one only became true after strengthening a test which — despite being
 named for the production bug shape — originally survived the exact mutation it existed to
 catch, because the wrong-window substitution tripped the empty-list tripwire and still
 satisfied its assertions. A test named after a bug is not evidence that it catches it.
+
+## 11. Landed: serve health transitions are visible (pigeon-f02, 2026-08-10)
+
+Root-causing the 2026-08-01 09:51:57 mass evacuation took hours of archaeology for one
+reason: `serve_instance` stores only the CURRENT `health_state`, so a serve that left and
+rejoined the healthy pool left no trace anywhere. The evacuation itself had to be *inferred*
+from 125 `reassignment_event` rows landing inside one minute — moves are recorded, the health
+change that caused them was not.
+
+**The bead's own prescription was wrong, and the reason is the interesting part.** It asked
+for logging on transition inside `setHealth` / `setHealthState`, attributed to the calling
+site (`sweepStale` vs `pollOnce` vs `selfHeal`). Three problems, all found by reading the
+writers before writing the code:
+
+1. **`pollOnce` never runs in production.** It is wired only in `http` liveness mode
+   (`index.ts`), and all three hosts run `self` (§1).
+2. **`selfHeal` is not a caller pigeon can attribute** — it is not in this process at all.
+   It is the serve-side drift repair in opencode-patched (`patches/registry-port-fence.patch`),
+   and it *does* write `health_state` — its UPDATE sets `'healthy'`, despite the comment
+   directly above it claiming it owns "instance_uuid / endpoint / draining and nothing else".
+   Trust that SQL, not that comment. Either way it is unreachable from a pigeon write site.
+3. **Fatally: nothing in pigeon writes `health_state='healthy'` in self mode.** The serve
+   writes it itself, unconditionally every 5s, from a worker thread, out of process, into the
+   same sqlite file (§1). So write-site logging captures the *unhealthy* edge only and is
+   **structurally blind to the rejoin** — precisely the transition the bead was filed to make
+   visible. It would have shipped, looked correct, passed its tests, and still left the next
+   evacuation half-invisible.
+
+**Shipped instead: an observer plus one write-site line.**
+
+- `HealthTransitionObserver` (`routing/health-transition-observer.ts`) keeps the last-observed
+  state per serve in memory and diffs `serve_instance` each tick, logging both edges
+  regardless of which *process* wrote the row. Strictly read-only: the moment an observer
+  "corrects" state it becomes a second writer, which is the rule-3 violation this whole arc
+  exists to avoid.
+- One line at the `sweepStale` write site carries what the observer structurally cannot know
+  — the exact caller and the `heartbeatAgeMs` that justified the verdict — and fires even if
+  the serve's heartbeat overwrites the row before the observer's next tick.
+- Attribution for the other direction is free and needs no plumbing: in self mode an observed
+  `to: "healthy"` **means the serve wrote it**, since nothing in pigeon can. Three serve-side
+  writers produce it — the 5s heartbeat, `registerSelf` at boot, and the `selfHeal` drift
+  repair — and the logged `instanceUuid` separates them: unchanged means the same process
+  resurrected itself, changed means it restarted and re-registered.
+- **To COUNT transitions from these lines, filter `writer: "observed"`.** The `sweepStale`
+  line and the observer both report the same healthy->unhealthy event about 5s apart, on
+  purpose; a naive grep for `"to":"unhealthy"` double-counts every one of them.
+- Wired OUTSIDE the `serveLiveness` branch, on the endpoint reconciler's precedent: a
+  monitoring signal that silently does not exist on `http` hosts is itself a failure mode.
+
+**A restart emits one baseline line, not N synthetic transitions.** A fresh observer has no
+last-observed state, and inventing transitions to fill that gap would put fiction in the
+record that a later archaeologist would read as real churn. Staying silent instead would
+violate the doctrine that absence of a line is not a positive statement. One line stating
+where the pool was found resolves both.
+
+**Known and accepted limits.** A transition that fully reverts inside one 5s tick is invisible
+to the observer; the `sweepStale` line covers that case on the unhealthy edge, and a rejoin
+shorter than 5s is inferable from an unhealthy line with no matching rejoin. A serve with zero
+assigned sessions can flap while producing neither moves nor much signal — low diagnostic
+value, deliberately not engineered for. Volume is bounded by construction at one line per
+serve per changed tick: ~0 in steady state, ~2N across a nightly pool restart.
+
+**Deliberately not done here: the `reason` column on `reassignment_event`.** The bead offered
+it as optional — tagging each move `restart` / `stale-evacuation` / `cap-narrowed` /
+`hrw-repick` so the flap detector could attribute moves instead of counting them blind. The
+value is real (pigeon-u1u.3 is concluding "no change warranted" from blind counts). The cost
+is not: `placeSession` does not know *why* it was called, so a reason has to be threaded
+through `placeSession` / `ensureRouted` / `reassignFromDeadServe` — live routing-path
+signatures with their own test matrix and their own review. That is not the "smaller half" of
+a P2. Split to **pigeon-f58w** (P3). Trap recorded there and here for whoever takes it:
+`REASSIGNMENT_DDL` uses `CREATE TABLE IF NOT
+EXISTS`, so adding the column inside that string is a silent no-op on every DB that already
+exists — it needs an explicit additive migration.
+
+**Trap noted while in the file.** `setHealth` bumps `heartbeat_at`; `setHealthState` does not.
+If anyone "simplifies" `sweepStale` to use `setHealth`, pigeon starts writing heartbeats and
+becomes a second writer fighting the serve's own — a rule-3 violation wearing the costume of a
+cleanup. The new log line sits directly beside that call; do not let a future diff drift it.

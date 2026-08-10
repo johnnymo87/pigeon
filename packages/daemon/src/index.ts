@@ -30,6 +30,7 @@ import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
 import { ServeEndpointReconciler } from "./routing/endpoint-reconciler";
+import { HealthTransitionObserver } from "./routing/health-transition-observer";
 import {
   FlapDetector,
   DEFAULT_WINDOW_MS,
@@ -66,15 +67,23 @@ let healthPoller: ServeHealthPoller | undefined;
 if (ingressRouter) {
   seedServes(storage.serves, config.serveEndpoints, Date.now());
   ingressRouter.rebuildFromDb();
+  const serveHealthLog = (msg: string, fields?: Record<string, unknown>) =>
+    console.warn(`[serve-health] ${msg}`, fields ? JSON.stringify(fields) : "");
   if (config.serveLiveness === "self") {
-    const poller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
+    const poller = new ServeHealthPoller(storage.serves, ingressRouter, {
+      healthPollMs: config.healthPollMs,
+      log: serveHealthLog,
+    });
     const selfLivenessTimer = setInterval(() => {
       poller.sweepStale(Date.now(), config.staleServeMs);
     }, config.healthPollMs);
     selfLivenessTimer.unref?.();
     console.log(`[pigeon-daemon] ingress router started with self-heartbeat liveness sweep (serves=${config.serveEndpoints.length})`);
   } else {
-    healthPoller = new ServeHealthPoller(storage.serves, ingressRouter, { healthPollMs: config.healthPollMs });
+    healthPoller = new ServeHealthPoller(storage.serves, ingressRouter, {
+      healthPollMs: config.healthPollMs,
+      log: serveHealthLog,
+    });
     healthPoller.start();
     console.log(`[pigeon-daemon] ingress router started with HTTP polling liveness (serves=${config.serveEndpoints.length})`);
   }
@@ -452,6 +461,29 @@ if (endpointReconciler) {
     intervalMs: config.healthPollMs,
     serves: config.serveEndpoints.length,
     alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
+  }));
+}
+
+// Serve health transition observer (bead pigeon-f02) — records baseline and
+// health state diffs across ticks.
+//
+// Wired OUTSIDE the `serveLiveness === "self"` branch above for the same reason
+// as the endpoint reconciler: a monitoring signal that silently doesn't exist
+// on `http` hosts is a trap during local testing or non-self deployments.
+const healthTransitionObserver = ingressRouter
+  ? new HealthTransitionObserver({
+      serves: storage.serves,
+      log: (msg, fields) =>
+        console.warn(`[serve-health] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+
+if (healthTransitionObserver) {
+  void healthTransitionObserver.safeTick();
+  healthTransitionObserver.start(config.healthPollMs);
+  console.log("[pigeon-daemon] serve health transition observer started", JSON.stringify({
+    intervalMs: config.healthPollMs,
+    serves: config.serveEndpoints.length,
   }));
 }
 

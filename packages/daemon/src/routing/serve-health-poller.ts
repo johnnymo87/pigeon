@@ -4,6 +4,7 @@ import { resolveServeAuthHeader, invalidateServeAuthHeader } from "../serve-auth
 
 export class ServeHealthPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private log: (msg: string, fields?: Record<string, unknown>) => void;
 
   constructor(
     private serves: ServeInstanceRepo,
@@ -13,8 +14,13 @@ export class ServeHealthPoller {
       fetchFn?: typeof fetch;
       nowFn?: () => number;
       timeoutMs?: number;
+      log?: (msg: string, fields?: Record<string, unknown>) => void;
     },
-  ) {}
+  ) {
+    this.log =
+      opts.log ??
+      ((msg, fields) => console.warn(`[serve-health] ${msg}`, fields ? JSON.stringify(fields) : ""));
+  }
 
   async pollOnce(now = (this.opts.nowFn ?? Date.now)()): Promise<void> {
     const allServes = this.serves.all();
@@ -89,6 +95,14 @@ export class ServeHealthPoller {
     for (const s of allServes) {
       if (s.healthState === "healthy" && s.heartbeatAt <= now - staleMs) {
         try {
+          this.log("serve health stale sweep", {
+            writer: "sweepStale",
+            serveId: s.serveId,
+            from: "healthy",
+            to: "unhealthy",
+            heartbeatAgeMs: now - s.heartbeatAt,
+            staleMs,
+          });
           this.serves.setHealthState(s.serveId, "unhealthy");
           try {
             this.router.reassignFromDeadServe(s.serveId, now);
