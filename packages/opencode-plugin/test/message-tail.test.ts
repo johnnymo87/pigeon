@@ -1440,5 +1440,164 @@ describe("MessageTail", () => {
       await new Promise((r) => setTimeout(r, 100))
       expect(mirrors).toHaveLength(0)
     })
+
+    test("unknown-at-flush session whose discovery resolves as a main session -> mirrors after discovery settles", async () => {
+      let discoveryResolve: (() => void) | undefined
+      const discoveryPromise = new Promise<void>((res) => {
+        discoveryResolve = res
+      })
+
+      let isMain = false
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => isMain,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "sess-late-main",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-late-main",
+          messageID: "msg-1",
+          type: "text",
+        },
+        "First prompt after restart"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+
+      isMain = true
+      discoveryResolve!()
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("First prompt after restart")
+    })
+
+    test("unknown-at-flush whose discovery resolves as a subagent -> no mirror", async () => {
+      let discoveryResolve: (() => void) | undefined
+      const discoveryPromise = new Promise<void>((res) => {
+        discoveryResolve = res
+      })
+
+      let isMain = false
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => isMain,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-sub",
+        sessionID: "sess-late-sub",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-late-sub",
+          messageID: "msg-sub",
+          type: "text",
+        },
+        "Subagent prompt"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+
+      discoveryResolve!()
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("discovery that never settles -> no mirror, no hung timer, no unhandled rejection", async () => {
+      const discoveryPromise = new Promise<void>(() => {})
+
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => false,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-hung",
+        sessionID: "sess-hung",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-hung",
+          messageID: "msg-hung",
+          type: "text",
+        },
+        "Prompt with hung discovery"
+      )
+
+      await new Promise((r) => setTimeout(r, 1150))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("already-known main session -> unchanged single mirror with no added delay", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => true,
+        getDiscoveryPromise: () => undefined,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      const start = Date.now()
+      tail.onMessageUpdated({
+        id: "msg-known",
+        sessionID: "sess-known",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-known",
+          messageID: "msg-known",
+          type: "text",
+        },
+        "Known main prompt"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      const elapsed = Date.now() - start
+
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("Known main prompt")
+      expect(elapsed).toBeLessThan(500)
+    })
   })
 })

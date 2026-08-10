@@ -25,6 +25,7 @@ export type FileInfo = {
 export type MessageTailOptions = {
   postMirror?: (opts: { sessionId: string; messageId: string; text: string }) => Promise<unknown>
   isMainSession?: (sessionId: string) => boolean
+  getDiscoveryPromise?: (sessionId: string) => Promise<void> | undefined
   log?: (message: string, data?: unknown) => void
   debounceMs?: number
 }
@@ -54,12 +55,31 @@ type UserMessageBuffer = {
   timer: ReturnType<typeof setTimeout>
 }
 
+async function waitForDiscovery(promise: Promise<void>, timeoutMs = 1000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs)
+    if (timer.unref) {
+      timer.unref()
+    }
+  })
+  try {
+    await Promise.race([
+      promise.catch(() => {}),
+      timeoutPromise,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export class MessageTail {
   private sessions = new Map<string, SessionTail>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
 
   private postMirror?: MessageTailOptions["postMirror"]
   private isMainSession?: MessageTailOptions["isMainSession"]
+  private getDiscoveryPromise?: MessageTailOptions["getDiscoveryPromise"]
   private log?: MessageTailOptions["log"]
   private debounceMs: number
 
@@ -69,6 +89,7 @@ export class MessageTail {
   constructor(options?: MessageTailOptions) {
     this.postMirror = options?.postMirror
     this.isMainSession = options?.isMainSession
+    this.getDiscoveryPromise = options?.getDiscoveryPromise
     this.log = options?.log
     this.debounceMs = options?.debounceMs ?? 500
   }
@@ -216,7 +237,7 @@ export class MessageTail {
     }
   }
 
-  private flushUserMessage(messageID: string): void {
+  private async flushUserMessage(messageID: string): Promise<void> {
     const buffer = this.userBuffers.get(messageID)
     if (!buffer) return
 
@@ -225,7 +246,13 @@ export class MessageTail {
 
     // Exclusion 1: Subagent sessions
     if (this.isMainSession && !this.isMainSession(buffer.sessionID)) {
-      return
+      const discoveryPromise = this.getDiscoveryPromise?.(buffer.sessionID)
+      if (discoveryPromise) {
+        await waitForDiscovery(discoveryPromise, 1000)
+      }
+      if (!this.isMainSession(buffer.sessionID)) {
+        return
+      }
     }
 
     // Exclusion 2 & 3: Filter synthetic parts and non-text parts (e.g. compaction)

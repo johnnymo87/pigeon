@@ -52,6 +52,7 @@ const plugin: Plugin = async (ctx) => {
     const messageTail = new MessageTail({
       postMirror: (opts) => postMirror({ ...opts, daemonUrl, log }),
       isMainSession: (sessionId) => sessionManager.isMainSession(sessionId),
+      getDiscoveryPromise: (sessionId) => sessionManager.getDiscoveryPromise(sessionId),
       log,
     })
 
@@ -499,6 +500,7 @@ const plugin: Plugin = async (ctx) => {
           const delta = props?.delta as string | undefined
 
           if (part?.id && part?.sessionID && part?.messageID && part?.type) {
+            lateDiscoverSession(part.sessionID).catch(() => {})
             messageTail.onPartUpdated(part, delta)
           }
 
