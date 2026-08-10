@@ -366,6 +366,31 @@ describe("reapStaleSessions", () => {
     expect(result.orphanedQuestions).toBe(1);
     expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-direct-del")).toBeNull();
   });
+
+  it("sweeps expired injected prompt records during session reaping", async () => {
+    storage = openStorageDb(":memory:");
+    const now = 2_000_000;
+    const ttlMs = 15 * 60 * 1000;
+
+    // Fresh record
+    storage.injectedPrompts.record("ses_live", "hash_1", now - 1000);
+    // Expired record
+    storage.injectedPrompts.record("ses_expired", "hash_2", now - ttlMs - 1000);
+
+    const deleteSession = vi.fn(async () => {});
+    const unregisterSession = vi.fn(async () => {});
+
+    const result = await reapStaleSessions({
+      storage,
+      deleteSession,
+      unregisterSession,
+      nowFn: () => now,
+    });
+
+    expect(result.expiredInjectedPrompts).toBe(1);
+    expect(storage.injectedPrompts.has("ses_live", "hash_1", now)).toBe(true);
+    expect(storage.injectedPrompts.has("ses_expired", "hash_2", now)).toBe(false);
+  });
 });
 
 describe("startSessionReaper", () => {
