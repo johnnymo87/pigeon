@@ -469,6 +469,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const cancelled = storage.swarm.markCancelled(msgId, nowFn());
         if (cancelled) {
+          enqueueSwarmCancelNotice(storage, record, nowFn());
           return Response.json({ cancelled: true, msg_id: msgId }, { status: 200 });
         }
 

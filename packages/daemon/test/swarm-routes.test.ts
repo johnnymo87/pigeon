@@ -1083,6 +1083,46 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
     expect(s.swarm.getReadyForTarget("ses_b", 5_000)).toHaveLength(0);
   });
 
+  it("enqueues a cancellation notice (wc:) in outbox when a scheduled message is cancelled", async () => {
+    const { app, storage: s } = newApp(1_000);
+
+    const schedRes = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_to_cancel_1",
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+    expect(schedRes.status).toBe(202);
+
+    expect(s.outbox.getByNotificationId("w:msg_to_cancel_1")).not.toBeNull();
+
+    const cancelRes = await app(
+      new Request("http://localhost/swarm/scheduled/msg_to_cancel_1/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "ses_a" }),
+      }),
+    );
+    expect(cancelRes.status).toBe(200);
+
+    const scheduleNotice = s.outbox.getByNotificationId("w:msg_to_cancel_1");
+    const cancelNotice = s.outbox.getByNotificationId("wc:msg_to_cancel_1");
+
+    expect(scheduleNotice).not.toBeNull();
+    expect(scheduleNotice!.sessionId).toBe("ses_b");
+
+    expect(cancelNotice).not.toBeNull();
+    expect(cancelNotice!.sessionId).toBe("ses_b");
+    expect(cancelNotice!.kind).toBe("swarm");
+  });
+
   it("requires `from` in body", async () => {
     const { app } = newApp();
 
