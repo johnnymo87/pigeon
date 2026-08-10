@@ -3,6 +3,9 @@ import {
   formatTelegramNotification,
   formatQuestionNotification,
   formatQuestionWizardStep,
+  formatSwarmNotification,
+  formatSwarmCancelNotification,
+  formatEventTime,
   TelegramNotificationService,
   RateLimitError,
   displayName,
@@ -526,6 +529,112 @@ describe("formatQuestionNotification", () => {
     });
 
     expect(result.message.text).not.toContain("Swipe-reply");
+  });
+});
+
+describe("formatSwarmNotification", () => {
+  const createdAt = 1000;
+
+  it("formatEventTime renders short time when same day, or month day time when different day", () => {
+    const today = new Date(2026, 7, 10, 14, 30).getTime();
+    const sameDay = new Date(2026, 7, 10, 12, 3).getTime();
+    const diffDay = new Date(2026, 7, 9, 9, 15).getTime();
+
+    expect(formatEventTime(sameDay, today)).toBe("12:03");
+    expect(formatEventTime(diffDay, today)).toBe("Aug 9 09:15");
+  });
+
+  it("header contains kind, priority, sender, and formatted event time", () => {
+    const createdAt = new Date(2026, 7, 10, 12, 0).getTime();
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "normal",
+      fromLabel: "worker-agent",
+      toSessionId: "ses_target123",
+      msgId: "msg_abc123",
+      payload: "Hello swarm",
+      createdAt,
+      now: createdAt,
+    });
+
+    expect(result.header.text).toContain("📨 swarm · chat · normal");
+    expect(result.header.text).toContain("from worker-agent");
+    expect(result.header.text).toContain("12:00");
+    expect(result.header.text).not.toContain("⏰ scheduled");
+  });
+
+  it("marks scheduled variant when deliverAt is in the future", () => {
+    const createdAt = new Date(2026, 7, 10, 12, 0).getTime();
+    const deliverAt = new Date(2026, 7, 10, 13, 0).getTime();
+    const result = formatSwarmNotification({
+      kind: "task.assign",
+      priority: "urgent",
+      fromLabel: "coordinator",
+      toSessionId: "ses_target123",
+      msgId: "msg_sched123",
+      payload: "Scheduled task",
+      createdAt,
+      deliverAt,
+      now: createdAt,
+    });
+
+    expect(result.header.text).toContain("📨 swarm · task.assign · urgent");
+    expect(result.header.text).toContain("from coordinator");
+    expect(result.header.text).toContain("12:00");
+    expect(result.header.text).toContain("⏰ scheduled 13:00");
+  });
+
+  it("footer carries msg_id and toSessionId with code entities", () => {
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "low",
+      fromLabel: "sender-ses",
+      toSessionId: "ses_target999",
+      msgId: "msg_foot777",
+      payload: "Footer test",
+      createdAt,
+    });
+
+    expect(result.footer.text).toContain("ses_target999");
+    expect(result.footer.text).toContain("msg_foot777");
+    expect(result.footer.text).toContain("Swipe-reply to respond");
+
+    const codeEntities = result.footer.entities.filter((e: { type: string }) => e.type === "code");
+    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("passes payload through untouched including markup-ish characters", () => {
+    const rawPayload = "see `foo_bar` <ok> *bold* & _italic_";
+    const result = formatSwarmNotification({
+      kind: "chat",
+      priority: "normal",
+      fromLabel: "sender",
+      toSessionId: "ses_target",
+      msgId: "msg_markup",
+      payload: rawPayload,
+      createdAt,
+    });
+
+    expect(result.body.text).toBe(rawPayload);
+    expect(result.body.entities).toHaveLength(0);
+  });
+});
+
+describe("formatSwarmCancelNotification", () => {
+  it("renders cancel notice with msg_id and toSessionId", () => {
+    const result = formatSwarmCancelNotification({
+      msgId: "msg_cancel999",
+      toSessionId: "ses_target888",
+    });
+
+    expect(result.header.text).toContain("🚫 cancelled msg_cancel999");
+    expect(result.footer.text).toContain("ses_target888");
+
+    const headerCode = result.header.entities.find((e: { type: string }) => e.type === "code");
+    expect(headerCode).toBeDefined();
+
+    const footerCode = result.footer.entities.find((e: { type: string }) => e.type === "code");
+    expect(footerCode).toBeDefined();
   });
 });
 

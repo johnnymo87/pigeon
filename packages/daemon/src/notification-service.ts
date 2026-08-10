@@ -114,6 +114,103 @@ export function formatTelegramNotification(input: NotificationInput): {
   };
 }
 
+export function formatEventTime(ts: number, now = Date.now()): string {
+  const d = new Date(ts);
+  const nowD = new Date(now);
+  const hours = d.getHours().toString().padStart(2, "0");
+  const mins = d.getMinutes().toString().padStart(2, "0");
+  const timeStr = `${hours}:${mins}`;
+
+  const isToday =
+    d.getFullYear() === nowD.getFullYear() &&
+    d.getMonth() === nowD.getMonth() &&
+    d.getDate() === nowD.getDate();
+
+  if (isToday) {
+    return timeStr;
+  }
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const monthStr = months[d.getMonth()]!;
+  return `${monthStr} ${d.getDate()} ${timeStr}`;
+}
+
+export interface FormatSwarmNotificationInput {
+  kind: string;
+  priority: string;
+  fromLabel: string;
+  toSessionId: string;
+  msgId: string;
+  payload: string;
+  createdAt: number;
+  deliverAt?: number | null;
+  now?: number;
+}
+
+export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
+  header: TgMessage;
+  body: TgMessage;
+  footer: TgMessage;
+} {
+  // The event time is required, not decoration. Task 1's arbitration allows a conversational row (question/stop)
+  // to preempt a backlogged swarm post within the same session, so a swarm post can arrive below the stop
+  // notification it caused. Always printing the event time makes that legible instead of misleading.
+  const now = input.now ?? Date.now();
+  const createdAtTime = formatEventTime(input.createdAt, now);
+  const headerBuilder = new TgMessageBuilder()
+    .append(`📨 swarm · ${input.kind} · ${input.priority}`)
+    .newline()
+    .append(`from ${input.fromLabel} · ${createdAtTime}`);
+
+  if (input.deliverAt && input.deliverAt > input.createdAt) {
+    const deliverAtTime = formatEventTime(input.deliverAt, now);
+    headerBuilder.append(` · ⏰ scheduled ${deliverAtTime}`);
+  }
+
+  const bodyBuilder = new TgMessageBuilder().append(input.payload);
+
+  const footerBuilder = new TgMessageBuilder()
+    .append("🆔 ")
+    .appendCode(input.toSessionId)
+    .append(" · ")
+    .appendCode(input.msgId)
+    .newline(2)
+    .append("↩️ ")
+    .appendItalic("Swipe-reply to respond");
+
+  return {
+    header: headerBuilder.build(),
+    body: bodyBuilder.build(),
+    footer: footerBuilder.build(),
+  };
+}
+
+export interface FormatSwarmCancelNotificationInput {
+  msgId: string;
+  toSessionId: string;
+}
+
+export function formatSwarmCancelNotification(input: FormatSwarmCancelNotificationInput): {
+  header: TgMessage;
+  body: TgMessage;
+  footer: TgMessage;
+} {
+  const headerBuilder = new TgMessageBuilder()
+    .append("🚫 cancelled ")
+    .appendCode(input.msgId);
+
+  const bodyBuilder = new TgMessageBuilder();
+
+  const footerBuilder = new TgMessageBuilder()
+    .append("🆔 ")
+    .appendCode(input.toSessionId);
+
+  return {
+    header: headerBuilder.build(),
+    body: bodyBuilder.build(),
+    footer: footerBuilder.build(),
+  };
+}
+
 export function formatQuestionNotification(input: {
   label: string;
   questions: QuestionInfoData[];

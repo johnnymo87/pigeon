@@ -26,6 +26,7 @@ It also gives us durable delivery, retry with backoff, replay via inbox, and an 
 | `packages/daemon/src/swarm/envelope.ts` | `renderEnvelope({fields}, payload)` — produces the `<swarm_message>` XML the LLM sees |
 | `packages/daemon/src/swarm/registry.ts` | `SessionDirectoryRegistry` — caches `sessionId → directory` (5min TTL) |
 | `packages/daemon/src/swarm/arbiter.ts` | `SwarmArbiter` — per-target queue with at-most-one in-flight delivery and retry/backoff |
+| `packages/daemon/src/swarm/telegram-notice.ts` | `enqueueSwarmTelegramNotice()` — helper enqueuing best-effort Telegram outbox notice |
 | `packages/daemon/src/app.ts` | `POST /swarm/send`, `GET /swarm/inbox` route blocks (flat `if`-style, mirrors existing routes) |
 | `packages/daemon/src/index.ts` | Boots arbiter conditionally on `opencodeClient && config.opencodeUrl` |
 | `packages/opencode-plugin/src/swarm-tool.ts` | `swarmRead()` helper + `createSwarmReadTool()` factory |
@@ -159,6 +160,26 @@ Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BA
 - `invalidate(sessionId)`: drops cache entry. Not currently called by the arbiter (a stale entry will be invalidated by the next 404 from `prompt_async` indirectly, since the next `getReadyForTarget` will likely re-resolve after retry backoff).
 
 The registry is what makes the daemon "the canonical source of `directory` for a session" — `pigeon-send` callers don't pass `--cwd`; the daemon looks it up. This is the core of the protocol simplification (no more "remember to pass `--cwd <target's-own-dir>`").
+
+## Telegram Topic Mirroring
+
+Every swarm IPC message is mirrored to the **receiver's** Telegram forum topic thread so operators can see why a session started working.
+
+### Hook Sites & Guarantees
+- **Hooked at insert, not delivery**: Swarm rows enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
+- **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a Telegram post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
+- **Fault isolation**: The `enqueueSwarmTelegramNotice` helper (`packages/daemon/src/swarm/telegram-notice.ts`) is wrapped in an internal `try/catch`. A Telegram/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
+- **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).
+
+### Notification Outbox & Rate Governance
+- **Outbox Kind & IDs**: Outbox `kind='swarm'` (24h expiry; `mirror` reserved for Phase 2). IDs are `w:<msg_id>` for posts and `wc:<msg_id>` for retractions. Multi-chunk posts suffix earlier chunks via `chunkNotificationId` (`w:<msg_id>:c0`, etc.).
+- **Sub-Budget Ceiling**: `SWARM_SUB_BUDGET = 6` of the governor's 12 sends/60s ceiling for `swarm`+`mirror` kinds. Prevents swarm bursts from starving questions/stops or provoking topic-creation 429 rate limits. An entry larger than the budget is allowed through an empty window. Deferring one entry also defers subsequent entries for that session to preserve per-session order.
+- **Outbox Ordering Invariant**: `getReady` sorts by session rank → per-row tier (conversational: question/stop/card vs record: everything else) → `created_at` within tier (pigeon-81p invariant). Because conversational rows preempt backlogged swarm posts within a session, a swarm post may land **below** the stop notification it caused. Every post carries its event time.
+
+### Production Baseline (7d Measured)
+- Volume: 2,609 messages (~373/day, peak hour 133).
+- Payload: mean 2,840 chars; 28% multi-chunk.
+- Cancellations: ~6% of production rows.
 
 ## Boot Conditional
 

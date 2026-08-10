@@ -166,6 +166,75 @@ describe("POST /swarm/send", () => {
     expect(stored!.payload).toBe("first");
   });
 
+  it("enqueues a Telegram notice to the receiver when a send is accepted", async () => {
+    const { app, storage: s } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          kind: "chat",
+          payload: "hello telegram",
+        }),
+      }),
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string };
+
+    const outboxRow = s.outbox.getByNotificationId(`w:${body.msg_id}`);
+    expect(outboxRow).not.toBeNull();
+    expect(outboxRow!.sessionId).toBe("ses_b");
+    expect(outboxRow!.kind).toBe("swarm");
+  });
+
+  it("enqueues exactly one notice when the same caller-supplied msg_id is sent twice", async () => {
+    const { app, storage: s } = newApp();
+    for (let i = 0; i < 2; i++) {
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_idempotent_1",
+            from: "ses_a",
+            to: "ses_b",
+            kind: "chat",
+            payload: i === 0 ? "first" : "second",
+          }),
+        }),
+      );
+      expect(res.status).toBe(202);
+    }
+
+    const row = s.outbox.getByNotificationId("w:msg_idempotent_1");
+    expect(row).not.toBeNull();
+    const count = (s.db.prepare("SELECT COUNT(*) as c FROM outbox WHERE notification_id = ?").get("w:msg_idempotent_1") as { c: number }).c;
+    expect(count).toBe(1);
+  });
+
+  it("returns 202 when notice enqueue fails on send", async () => {
+    const { app, storage: s } = newApp();
+    s.outbox.upsert = () => {
+      throw new Error("Outbox error");
+    };
+
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          kind: "chat",
+          payload: "failing outbox test",
+        }),
+      }),
+    );
+    expect(res.status).toBe(202);
+  });
+
   it("rejects without `from`", async () => {
     const { app } = newApp();
     const res = await app(
@@ -471,6 +540,30 @@ describe("POST /swarm/schedule", () => {
     storage = openStorageDb(":memory:");
     return { app: createApp(storage, { nowFn: () => now }), storage };
   }
+
+  it("enqueues a Telegram notice to the receiver when a schedule is accepted", async () => {
+    const { app, storage: s } = newApp();
+    const res = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string };
+
+    const outboxRow = s.outbox.getByNotificationId(`w:${body.msg_id}`);
+    expect(outboxRow).not.toBeNull();
+    expect(outboxRow!.sessionId).toBe("ses_b");
+    expect(outboxRow!.kind).toBe("swarm");
+  });
 
   it("M2: rejects scheduled messages targeting a channel with 400", async () => {
     const { app } = newApp();
@@ -988,6 +1081,46 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
 
     // Row is no longer ready at deliverAt
     expect(s.swarm.getReadyForTarget("ses_b", 5_000)).toHaveLength(0);
+  });
+
+  it("enqueues a cancellation notice (wc:) in outbox when a scheduled message is cancelled", async () => {
+    const { app, storage: s } = newApp(1_000);
+
+    const schedRes = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_to_cancel_1",
+          from: "ses_a",
+          to: "ses_b",
+          after: "1h",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+    expect(schedRes.status).toBe(202);
+
+    expect(s.outbox.getByNotificationId("w:msg_to_cancel_1")).not.toBeNull();
+
+    const cancelRes = await app(
+      new Request("http://localhost/swarm/scheduled/msg_to_cancel_1/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "ses_a" }),
+      }),
+    );
+    expect(cancelRes.status).toBe(200);
+
+    const scheduleNotice = s.outbox.getByNotificationId("w:msg_to_cancel_1");
+    const cancelNotice = s.outbox.getByNotificationId("wc:msg_to_cancel_1");
+
+    expect(scheduleNotice).not.toBeNull();
+    expect(scheduleNotice!.sessionId).toBe("ses_b");
+
+    expect(cancelNotice).not.toBeNull();
+    expect(cancelNotice!.sessionId).toBe("ses_b");
+    expect(cancelNotice!.kind).toBe("swarm");
   });
 
   it("requires `from` in body", async () => {

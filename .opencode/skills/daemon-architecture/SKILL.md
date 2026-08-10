@@ -40,7 +40,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
 - `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint. Wizard columns: `current_step`, `answers_json_v2`, `version` for multi-question flows.
-- `outbox`: durable notification delivery queue for both question and stop notifications. Keyed by `notification_id`, `kind` field (`"question"` or `"stop"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour.
+- `outbox`: durable notification delivery queue for stop, question, and swarm mirror notifications. Keyed by `notification_id`, `kind` field (`"question"`, `"stop"`, `"swarm"`, or reserved `"mirror"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour (24h TTL for `"swarm"` kind). Outbox `getReady` sorts by session rank → per-row tier (conversational vs record) → `created_at`, with `SWARM_SUB_BUDGET = 6`/60s rate governance.
 - `model_override`: nullable TEXT column on `sessions` table. Stores `provider/model` string (e.g. `anthropic/claude-sonnet-4-20250514`). Read by `command-ingest.ts` and passed through the adapter to the plugin.
 - `swarm_messages`: durable cross-session message queue. Keyed by `msg_id` (idempotency key), state machine `queued → handed_off | failed`. Per-target serialized delivery via `SwarmArbiter`. Schema and column-level details in the `swarm-architecture` skill.
 
@@ -179,7 +179,7 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
 
 1. Sender (some `bash` shell, often a sub-shell of an opencode session) runs `pigeon-send <to> <payload>` (or `opencode-send <ses_*> <payload>` which auto-routes).
 2. `pigeon-send` POSTs to daemon `/swarm/send` with `{from, to, kind, priority, payload, [reply_to], [msg_id]}`.
-3. Daemon validates, mints `msg_id` if not caller-supplied, calls `storage.swarm.insert(...)`, returns HTTP 202 `{accepted: true, msg_id}` immediately.
+3. Daemon validates, mints `msg_id` if not caller-supplied, calls `storage.swarm.insert(...)`, enqueues best-effort Telegram topic mirror notice (outbox `kind='swarm'`, `w:<msg_id>`), and returns HTTP 202 `{accepted: true, msg_id}` immediately.
 4. Background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
 5. For each ready target (in parallel), `drainTarget` collapses concurrent calls onto a single in-flight promise (the at-most-one-in-flight invariant per target).
 6. Inside the per-target drain: pop one ready msg → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.

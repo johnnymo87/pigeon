@@ -71,7 +71,9 @@ export function splitTelegramMessage(
 
   let result: TgMessage[];
 
-  if (maxBody > 0 && body.text.length <= maxBody) {
+  if (body.text.length === 0) {
+    result = [concatMessages([currentHeader, SEP, currentFooter])];
+  } else if (maxBody > 0 && body.text.length <= maxBody) {
     result = [concatMessages([currentHeader, SEP, body, SEP, currentFooter])];
   } else {
     const bodyChunks = splitBodyText(body.text, maxBody);

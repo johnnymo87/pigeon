@@ -101,8 +101,21 @@ export class OutboxRepository {
 
   /**
    * Returns entries ready to be delivered: state='queued' AND (next_retry_at IS NULL OR next_retry_at <= now).
-   * Ordered by per-session best message-class priority FIRST (sessions with questions before stops before cards),
-   * then created_at ASC and rowid ASC within each session.
+   *
+   * Session-level group ordering (subquery):
+   *   question=1, stop=2, card=3, swarm=4, mirror=5, else=6
+   *
+   * Per-row tier ordering (secondary CASE):
+   *   question/stop/card -> 1 (conversational tier)
+   *   everything else (swarm, mirror, unknown) -> 2 (record tier)
+   *
+   * Within a session, order is created_at per tier. The conversational tier preempts the
+   * record tier. Conversational rows never reorder among themselves (pigeon-81p).
+   * Record rows may be preempted by conversational rows (arbitration A').
+   *
+   * Note on group subquery behavior: the group subquery counts `queued` rows regardless of `next_retry_at`,
+   * so a question sitting in retry backoff still elevates its session's swarm rows into group 1 while itself
+   * being absent from the batch. Narrow, self-healing, bounded by the batch limit.
    */
   getReady(now = Date.now(), limit = 100): OutboxRecord[] {
     const rows = this.db
@@ -110,8 +123,9 @@ export class OutboxRepository {
         `SELECT * FROM outbox
          WHERE state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
-         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 ELSE 4 END)
+         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
+                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 1 WHEN 'card' THEN 1 ELSE 2 END) ASC,
                   created_at ASC,
                   rowid ASC
          LIMIT ?`,

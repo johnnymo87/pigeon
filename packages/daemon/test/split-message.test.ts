@@ -96,7 +96,7 @@ describe("splitTelegramMessage", () => {
   it("handles empty body", () => {
     const result = splitTelegramMessage(plainHeader, plainBody(""), plainFooter, 100);
     expect(result).toHaveLength(1);
-    expect(result[0]!.text).toBe("HEADER\n\n\n\nFOOTER");
+    expect(result[0]!.text).toBe("HEADER\n\nFOOTER");
   });
 
   it("preserves body entities within a single chunk", () => {
@@ -234,6 +234,15 @@ describe("splitTelegramMessage", () => {
         expect(chunk.text.length).toBeLessThanOrEqual(5);
         expect(hasLoneSurrogate(chunk.text)).toBe(false);
       }
+    });
+
+    it("formats empty body with a single separator between header and footer (no quadruple newlines)", () => {
+      const header = plainBody("Header");
+      const body = plainBody("");
+      const footer = plainBody("Footer");
+      const result = splitTelegramMessage(header, body, footer);
+      expect(result).toHaveLength(1);
+      expect(result[0]!.text).toBe("Header\n\nFooter");
     });
 
     it("property sweep: satisfies maxLen, chunk count bounds, entity bounds, and surrogate integrity for all size combinations", () => {

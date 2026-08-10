@@ -489,4 +489,59 @@ describe("OutboxRepository", () => {
 
     storage.db.close();
   });
+
+  it("ranks a question ahead of same-session swarm rows enqueued earlier", () => {
+    const storage = createStorage();
+    const s = "ses_same";
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:1", sessionId: s, requestId: "r1", kind: "swarm", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:2", sessionId: s, requestId: "r2", kind: "swarm", payload: "{}" }, 2_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q:1", sessionId: s, requestId: "r3", kind: "question", payload: "{}" }, 3_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready.map((r) => r.notificationId)).toEqual(["q:1", "w:1", "w:2"]);
+
+    storage.db.close();
+  });
+
+  it("sorts an unknown kind below mirror", () => {
+    const storage = createStorage();
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "x:1", sessionId: "ses_a", requestId: "r1", kind: "wat", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "m:1", sessionId: "ses_b", requestId: "r2", kind: "mirror", payload: "{}" }, 2_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready.map((r) => r.notificationId)).toEqual(["m:1", "x:1"]);
+
+    storage.db.close();
+  });
+
+  it("preserves created_at order between mirror and swarm rows in the same session", () => {
+    const storage = createStorage();
+    const s = "ses_same";
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "m:1", sessionId: s, requestId: "r1", kind: "mirror", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:1", sessionId: s, requestId: "r2", kind: "swarm", payload: "{}" }, 2_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready.map((r) => r.notificationId)).toEqual(["m:1", "w:1"]);
+
+    storage.db.close();
+  });
+
+  it("delivers a stop before same-session swarm rows enqueued earlier", () => {
+    const storage = createStorage();
+    const s = "ses_same";
+    // Note: this inversion is a deliberate, arbitrated allowance (conversational traffic
+    // preempts the record stream within a session).
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:1", sessionId: s, requestId: "r1", kind: "swarm", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:2", sessionId: s, requestId: "r2", kind: "swarm", payload: "{}" }, 2_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "s:1", sessionId: s, requestId: "r3", kind: "stop", payload: "{}" }, 3_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready.map((r) => r.notificationId)).toEqual(["s:1", "w:1", "w:2"]);
+
+    storage.db.close();
+  });
 });

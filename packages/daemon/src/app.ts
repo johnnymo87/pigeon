@@ -12,6 +12,7 @@ import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
 import { decideNotify, effectiveNotifyPolicy, type NotifyDecision } from "./notify-policy";
+import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 
 interface LegacySession {
   session_id: string;
@@ -274,7 +275,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const f = parsed.fields;
         const msgId = f.callerMsgId ?? makeMsgId();
-        storage.swarm.insert(
+        const inserted = storage.swarm.insert(
           {
             msgId,
             fromSession: f.from,
@@ -287,6 +288,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+        if (inserted) {
+          const record = storage.swarm.getByMsgId(msgId);
+          if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
+        }
 
         return Response.json({ accepted: true, msg_id: msgId }, { status: 202 });
       }
@@ -395,6 +400,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
 
+        const record = storage.swarm.getByMsgId(msgId);
+        if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
+
         return Response.json(
           {
             accepted: true,
@@ -461,6 +469,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const cancelled = storage.swarm.markCancelled(msgId, nowFn());
         if (cancelled) {
+          enqueueSwarmCancelNotice(storage, record, nowFn());
           return Response.json({ cancelled: true, msg_id: msgId }, { status: 200 });
         }
 

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
-import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
+import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
+import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -927,6 +928,11 @@ describe("chunkNotificationId unit tests", () => {
 });
 
 describe("expiryForKind unit tests", () => {
+  it("expires swarm after 24h and mirror after 6h", () => {
+    expect(expiryForKind("swarm")).toBe(REPLY_TOKEN_TTL_MS);
+    expect(expiryForKind("mirror")).toBe(6 * 60 * 60 * 1000);
+  });
+
   it("returns PENDING_QUESTION_TTL_MS (4h) for question", () => {
     expect(expiryForKind("question")).toBe(4 * 60 * 60 * 1000);
   });
@@ -1975,6 +1981,302 @@ describe("OutboxSender rate governor", () => {
     expect(sendNotification).toHaveBeenCalledTimes(2);
     expect(storage.outbox.getByNotificationId("notif-low-1")!.state).toBe("sent");
     expect(storage.outbox.getByNotificationId("notif-low-2")!.state).toBe("sent");
+  });
+
+  it("never lets swarm entries take more than the sub-budget in one window", async () => {
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-swarm-${i}`,
+        kind: "swarm",
+        payload: JSON.stringify({
+          messages: [{ text: `swarm-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-swarm-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(SWARM_SUB_BUDGET);
+
+    // m6: sub-budget-deferred entry is left completely untouched (still queued, no retry backoff)
+    const deferred = storage.outbox.getByNotificationId("notif-swarm-6")!;
+    expect(deferred.state).toBe("queued");
+    expect(deferred.attempts).toBe(0);
+    expect(deferred.nextRetryAt).toBeNull();
+    expect(deferred.retryCount).toBe(0);
+  });
+
+  it("still delivers a question while a swarm burst is saturating the sub-budget", async () => {
+    for (let i = 0; i < 8; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-swarm-${i}`,
+        kind: "swarm",
+        payload: JSON.stringify({
+          messages: [{ text: `swarm-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-swarm-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-question-urgent",
+      kind: "question",
+      payload: JSON.stringify({
+        messages: [{ text: "Urgent question?" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-question-urgent",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+
+    expect(storage.outbox.getByNotificationId("notif-question-urgent")!.state).toBe("sent");
+  });
+
+  it("counts chunks, not entries, against the sub-budget", async () => {
+    const chunk5Msg = [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }];
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "swarm-5chunk-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk5Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-5chunk-1",
+      }),
+    }, 1_000);
+
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "swarm-5chunk-2",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk5Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-5chunk-2",
+      }),
+    }, 1_001);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(5);
+    expect(storage.outbox.getByNotificationId("swarm-5chunk-1")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("swarm-5chunk-2")!.state).toBe("queued");
+  });
+
+  it("allows a single 7-chunk low-priority entry to send when the window is empty", async () => {
+    const chunk7Msg = [
+      { text: "c1" }, { text: "c2" }, { text: "c3" },
+      { text: "c4" }, { text: "c5" }, { text: "c6" }, { text: "c7" },
+    ];
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "swarm-7chunk-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk7Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-7chunk-1",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(7);
+    expect(storage.outbox.getByNotificationId("swarm-7chunk-1")!.state).toBe("sent");
+  });
+
+  it("maintains per-session order when deferring low-priority entries", async () => {
+    // 1. Seed sub-budget with 2 chunks from another session
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_other",
+      notificationId: "swarm-other-2chunk",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "other-1" }, { text: "other-2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-other-2chunk",
+      }),
+    }, 1_000);
+
+    // 2. Add multi-chunk w: entry for ses_1 that will exceed sub-budget (2 + 5 = 7 > 6)
+    const chunk5Msg = [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }];
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_1",
+      notificationId: "w:msg_X",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk5Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "w:msg_X",
+      }),
+    }, 1_001);
+
+    // 3. Add single-chunk wc: entry for ses_1 that would fit (2 + 1 = 3 <= 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_1",
+      notificationId: "wc:msg_X",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "cancel-1" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "wc:msg_X",
+      }),
+    }, 1_002);
+
+    let currentTime = 5_000;
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => currentTime,
+    });
+
+    // Tick 1: ses_other sends 2 chunks. w:msg_X is deferred. wc:msg_X MUST ALSO be deferred (same session).
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(storage.outbox.getByNotificationId("swarm-other-2chunk")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("w:msg_X")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("wc:msg_X")!.state).toBe("queued");
+
+    // Tick 2: Advance time past 60s window. Now window is empty, so w:msg_X sends, then wc:msg_X sends in order.
+    currentTime = 70_000;
+    await sender.processOnce();
+
+    expect(storage.outbox.getByNotificationId("w:msg_X")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("wc:msg_X")!.state).toBe("sent");
+  });
+
+  it("logs sub-budget deferral at most once per tick (m4)", async () => {
+    // Entry 0: 5 chunks -> sends (countInWindow = 5)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_0",
+      notificationId: "notif-swarm-m4-0",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-0",
+      }),
+    }, 1_000);
+
+    // Entry 1: 2 chunks -> deferred (5 + 2 = 7 > 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_1",
+      notificationId: "notif-swarm-m4-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-1",
+      }),
+    }, 1_001);
+
+    // Entry 2: 2 chunks -> deferred (5 + 2 = 7 > 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_2",
+      notificationId: "notif-swarm-m4-2",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-2",
+      }),
+    }, 1_002);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const logSpy = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logSpy,
+    });
+
+    await sender.processOnce();
+
+    const deferralLogs = logSpy.mock.calls.filter(
+      (call) => call[0] === "outbox sub-budget reached, deferring low-priority entry",
+    );
+    expect(deferralLogs).toHaveLength(1);
+  });
+
+  it("allows non-low-priority traffic (questions/stops/cards) to take all OUTBOX_RATE_LIMIT slots when no swarm work is queued", async () => {
+    for (let i = 0; i < 15; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-q-${i}`,
+        kind: "question",
+        payload: JSON.stringify({
+          messages: [{ text: `question-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-q-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+    await sender.processOnce();
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(OUTBOX_RATE_LIMIT);
   });
 
   it("escalates backoff under sustained transport failure while attempts stays 0", async () => {
