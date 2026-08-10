@@ -940,5 +940,87 @@ describe("daemon-client", () => {
       const res = await postMirror(opts)
       expect(res).toBeNull()
     })
+
+    test("does not trip circuit breaker on non-2xx error", async () => {
+      _resetBreakerForTesting()
+      server?.close()
+      server = await createTestServer(async (req) => {
+        const url = new URL(req.url)
+        const body = await req.json()
+        requestLog.push({ path: url.pathname, body })
+        if (url.pathname === "/mirror") {
+          return new Response("Internal Error", { status: 500 })
+        }
+        return Response.json({ ok: true, notified: true })
+      })
+      serverPort = server.port
+
+      const mirrorRes = await postMirror({
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+      expect(mirrorRes).toBeNull()
+
+      requestLog = []
+      const stopRes = await notifyStop({
+        sessionId: "ses_1",
+        message: "Stop msg",
+        label: "Test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+      expect(stopRes).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/stop")
+    })
+
+    test("does not trip circuit breaker on network error", async () => {
+      _resetBreakerForTesting()
+      const mirrorRes = await postMirror({
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello",
+        daemonUrl: "http://127.0.0.1:99999",
+        log: mockLog,
+      })
+      expect(mirrorRes).toBeNull()
+
+      requestLog = []
+      const stopRes = await notifyStop({
+        sessionId: "ses_1",
+        message: "Stop msg",
+        label: "Test",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+      expect(stopRes).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+    })
+
+    test("respects circuit breaker when breaker is already open", async () => {
+      _resetBreakerForTesting()
+      await notifyStop({
+        sessionId: "ses_1",
+        message: "Stop msg",
+        label: "Test",
+        daemonUrl: "http://127.0.0.1:99999",
+        log: mockLog,
+      })
+
+      requestLog = []
+      const mirrorRes = await postMirror({
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      })
+
+      expect(mirrorRes).toBeNull()
+      expect(requestLog).toHaveLength(0)
+    })
   })
 })

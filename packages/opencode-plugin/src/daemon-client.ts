@@ -321,7 +321,6 @@ export async function postMirror(opts: PostMirrorOpts): Promise<{ mirrored: bool
     if (!res.ok) {
       const text = await res.text().catch(() => "")
       opts.log?.("daemon returned error for mirror", { status: res.status, body: text })
-      onFailure()
       return null
     }
 
@@ -329,7 +328,6 @@ export async function postMirror(opts: PostMirrorOpts): Promise<{ mirrored: bool
     onSuccess()
     return data
   } catch (err) {
-    onFailure()
     opts.log?.("postMirror failed:", err instanceof Error ? { message: err.message } : String(err))
     return null
   }
