@@ -12,6 +12,8 @@ import {
   type ReplyQuestionEnvelope,
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "./contracts";
+import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
+import { hashPrompt } from "../hash-prompt";
 
 export interface OpencodeDirectExecuteInput {
   requestId: string;
@@ -49,6 +51,7 @@ export interface OpencodeDirectAdapterDeps {
   now?: () => number;
   logger?: (message: string, fields?: Record<string, unknown>) => void;
   sleep?: (ms: number) => Promise<void>;
+  injectedPrompts?: InjectedPromptsRepository;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -87,6 +90,10 @@ export async function executeViaOpencodeDirectChannel(
   const timeoutMs = input.timeoutMs ?? input.deadlineMs ?? DEFAULT_TIMEOUT_MS;
   const maxRetries = input.maxRetries ?? DEFAULT_MAX_RETRIES;
   const maxAttempts = Math.max(1, maxRetries + 1);
+
+  if (input.command) {
+    deps.injectedPrompts?.record(input.sessionId, hashPrompt(input.command));
+  }
 
   const envelope = buildExecuteEnvelope(input, now);
   log("opencode-direct.execute.start", {

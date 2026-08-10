@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { OpencodeClient } from "../src/opencode-client";
 import { invalidateServeAuthHeader } from "../src/serve-auth";
+import { openStorageDb } from "../src/storage/database";
+import { hashPrompt } from "../src/hash-prompt";
 
 describe("OpencodeClient", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
@@ -190,6 +194,26 @@ describe("OpencodeClient", () => {
       // A leaked timer would keep the daemon's event loop referenced per send.
       expect(clearSpy).toHaveBeenCalled();
 
+    });
+
+    it("records the prompt before the request is issued", async () => {
+      const db = openStorageDb(":memory:");
+      let recordedAtCallTime = false;
+      fetchMock.mockImplementationOnce(async () => {
+        recordedAtCallTime = db.injectedPrompts.has("sess-abc", hashPrompt("Hello, world!"));
+        throw new Error("timeout");
+      });
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+        injectedPrompts: db.injectedPrompts,
+      });
+
+      await client.sendPrompt("sess-abc", "/home/user/project", "Hello, world!").catch(() => {});
+
+      expect(recordedAtCallTime).toBe(true);
+      expect(db.injectedPrompts.has("sess-abc", hashPrompt("Hello, world!"))).toBe(true);
     });
   });
 
@@ -1123,6 +1147,41 @@ describe("OpencodeClient", () => {
 
       expect(ok).toBe(false);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("guard: prompt_async call site restriction", () => {
+    it("has no prompt_async call sites outside opencode-client", () => {
+      const srcDir = resolve(__dirname, "../src");
+      function findTsFiles(dir: string): string[] {
+        const entries = readdirSync(dir, { withFileTypes: true });
+        const files: string[] = [];
+        for (const entry of entries) {
+          const fullPath = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            files.push(...findTsFiles(fullPath));
+          } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+            files.push(fullPath);
+          }
+        }
+        return files;
+      }
+
+      const tsFiles = findTsFiles(srcDir);
+      const promptAsyncFiles = tsFiles.filter((file) => {
+        const content = readFileSync(file, "utf8");
+        // Remove single-line and multi-line comments
+        const codeNoComments = content
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/\/\/.*/g, "");
+        return codeNoComments.includes("prompt_async");
+      });
+
+      const relativeFiles = promptAsyncFiles.map((f) => relative(resolve(__dirname, ".."), f));
+      expect(
+        relativeFiles,
+        "sendPrompt in opencode-client.ts must be the ONLY daemon-side prompt_async call site so all daemon-injected prompts are recorded to suppress Telegram echo",
+      ).toEqual(["src/opencode-client.ts"]);
     });
   });
 });

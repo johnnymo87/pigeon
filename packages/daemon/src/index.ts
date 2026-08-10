@@ -85,7 +85,7 @@ if (ingressRouter) {
 }
 
 const opencodeClient = config.opencodeUrl
-  ? new OpencodeClient({ baseUrl: config.opencodeUrl })
+  ? new OpencodeClient({ baseUrl: config.opencodeUrl, injectedPrompts: storage.injectedPrompts })
   : undefined;
 
 // Shadow-mode serve outcome sensor (bead pigeon-f2a) — the sensor for the
@@ -120,6 +120,7 @@ const clientFactory = ingressRouter
       ingressRouter,
       Date.now,
       outcomeSensor ? (endpoint, obs) => outcomeSensor.record(endpoint, obs) : undefined,
+      storage.injectedPrompts,
     )
   : undefined;
 // Resolve the owning-serve client for a session; falls back to the legacy single client when routing is unconfigured.

@@ -5,6 +5,8 @@ import {
 } from "../src/opencode-direct/contracts";
 import { DirectChannelAdapter } from "../src/adapters/direct-channel";
 import type { SessionRecord } from "../src/storage/types";
+import { openStorageDb } from "../src/storage/database";
+import { hashPrompt } from "../src/hash-prompt";
 
 function makeSession(): SessionRecord {
   return {
@@ -85,5 +87,28 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
 
     expect(result.ok).toBe(true);
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("records the prompt in injectedPrompts repository before issuing execute request", async () => {
+    const db = openStorageDb(":memory:");
+    let recordedAtCallTime = false;
+    const fetchFn = vi.fn(async () => {
+      recordedAtCallTime = db.injectedPrompts.has("s1", hashPrompt("fix the bug"));
+      throw new Error("network error");
+    });
+
+    const adapter = new DirectChannelAdapter({
+      fetchFn: fetchFn as unknown as typeof fetch,
+      sleep: async () => {},
+      injectedPrompts: db.injectedPrompts,
+    });
+
+    await adapter.deliverCommand(makeSession(), "fix the bug", {
+      commandId: "c1",
+      chatId: "5",
+    });
+
+    expect(recordedAtCallTime).toBe(true);
+    expect(db.injectedPrompts.has("s1", hashPrompt("fix the bug"))).toBe(true);
   });
 });

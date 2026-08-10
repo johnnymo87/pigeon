@@ -1,6 +1,7 @@
 import { OpencodeClient } from "../opencode-client";
 import { type IngressRouter, NoHealthyServeError } from "./router";
 import type { OutcomeObservation } from "./serve-outcome";
+import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 
 /** Resolves an OpencodeClient bound to the serve that owns a given session. */
 export class OpencodeClientFactory {
@@ -13,6 +14,7 @@ export class OpencodeClientFactory {
      * Optional, and observability only — nothing here affects routing.
      */
     private onOutcome?: (endpoint: string, obs: OutcomeObservation) => void,
+    private injectedPrompts?: InjectedPromptsRepository,
   ) {}
 
   /** The owning serve's client, or undefined if the session can't currently be routed (no healthy serve). */
@@ -39,6 +41,7 @@ export class OpencodeClientFactory {
       c = new OpencodeClient({
         baseUrl: apiBase,
         onOutcome: onOutcome ? (obs) => onOutcome(apiBase, obs) : undefined,
+        injectedPrompts: this.injectedPrompts,
       });
       this.cache.set(apiBase, c);
     }
