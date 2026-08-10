@@ -4,7 +4,10 @@ import {
   enqueueSwarmCancelNotice,
 } from "../src/swarm/telegram-notice";
 import type { StorageDb } from "../src/storage/database";
+import { openStorageDb } from "../src/storage/database";
 import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
+import { notifySenderOfFailure } from "../src/swarm/notify-sender";
+import { DeliveryWatchdog, type WatchdogClient } from "../src/swarm/delivery-watchdog";
 
 function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRecord {
   return {
@@ -168,6 +171,82 @@ describe("enqueueSwarmCancelNotice", () => {
       expect(consoleSpy).toHaveBeenCalled();
     } finally {
       consoleSpy.mockRestore();
+    }
+  });
+});
+
+describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)", () => {
+  it("notifySenderOfFailure enqueues a Telegram notice to original sender in outbox", () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      const failedRecord = makeRecord({
+        msgId: "msg_original_1",
+        fromSession: "ses_sender_1",
+        toSession: "ses_receiver_1",
+        payload: "some payload",
+      });
+
+      notifySenderOfFailure(storage, failedRecord, "target unroutable", 1000);
+
+      const row = storage.db.prepare("SELECT msg_id, to_session FROM swarm_messages WHERE from_session = 'pigeon'").get() as { msg_id: string; to_session: string };
+      expect(row).toBeDefined();
+      expect(row.to_session).toBe("ses_sender_1");
+
+      const outboxRow = storage.outbox.getByNotificationId(`w:${row.msg_id}`);
+      expect(outboxRow).not.toBeNull();
+      expect(outboxRow!.sessionId).toBe("ses_sender_1");
+      expect(outboxRow!.kind).toBe("swarm");
+    } finally {
+      storage.db.close();
+    }
+  });
+
+  it("DeliveryWatchdog nudge enqueues a Telegram notice to target session in outbox", async () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      const now = 100_000;
+      storage.swarm.insert({
+        msgId: "m_handed_off",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "test message",
+      }, now - 60_000);
+
+      storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE msg_id = ?").run(now - 30_000, "m_handed_off");
+
+      const mockClient: WatchdogClient = {
+        getSessionMessages: async () => [
+          {
+            info: { role: "user", time: { created: now - 30_000 } },
+            parts: [{ type: "text", text: `<swarm_message v="1" msg_id="m_handed_off">test message</swarm_message>` }],
+          },
+        ],
+        abortSession: async () => {},
+      };
+
+      const watchdog = new DeliveryWatchdog({
+        storage,
+        resolveClients: (sessionId: string) => ({ preferred: mockClient, all: [mockClient] }),
+        nowFn: () => now,
+        verifyAfterMs: 5_000,
+      });
+
+      await watchdog.processOnce();
+
+      const nudgeRow = storage.db.prepare("SELECT msg_id, to_session FROM swarm_messages WHERE kind = 'swarm.nudge'").get() as { msg_id: string; to_session: string } | undefined;
+      expect(nudgeRow).toBeDefined();
+      expect(nudgeRow!.to_session).toBe("ses_b");
+
+      const outboxRow = storage.outbox.getByNotificationId(`w:${nudgeRow!.msg_id}`);
+      expect(outboxRow).not.toBeNull();
+      expect(outboxRow!.sessionId).toBe("ses_b");
+      expect(outboxRow!.kind).toBe("swarm");
+    } finally {
+      storage.db.close();
     }
   });
 });

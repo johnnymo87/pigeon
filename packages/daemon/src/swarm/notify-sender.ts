@@ -1,6 +1,7 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import { makeMsgId } from "../ids";
+import { enqueueSwarmTelegramNotice } from "./telegram-notice";
 
 /** Kind used for system notifications sent back to a sender whose message
  *  could not be delivered. Also used as the loop guard: a delivery.failed
@@ -103,9 +104,10 @@ export function notifySenderOfFailure(
 
   const target = failed.toSession ?? failed.channel ?? "(unknown target)";
   const payload = formatFailureNotice(failed, target, reason, evidence);
-  storage.swarm.insert(
+  const msgId = makeMsgId();
+  const inserted = storage.swarm.insert(
     {
-      msgId: makeMsgId(),
+      msgId,
       fromSession: "pigeon",
       toSession: failed.fromSession,
       channel: null,
@@ -116,4 +118,8 @@ export function notifySenderOfFailure(
     },
     now,
   );
+  if (inserted) {
+    const record = storage.swarm.getByMsgId(msgId);
+    if (record) enqueueSwarmTelegramNotice(storage, record, now);
+  }
 }
