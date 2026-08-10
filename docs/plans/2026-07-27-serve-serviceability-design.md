@@ -592,8 +592,11 @@ writers before writing the code:
 
 1. **`pollOnce` never runs in production.** It is wired only in `http` liveness mode
    (`index.ts`), and all three hosts run `self` (§1).
-2. **`selfHeal` is not a `health_state` writer at all.** It writes `draining`, serve-side.
-   The bead's caller list named a component that cannot appear.
+2. **`selfHeal` is not a caller pigeon can attribute** — it is not in this process at all.
+   It is the serve-side drift repair in opencode-patched (`patches/registry-port-fence.patch`),
+   and it *does* write `health_state` — its UPDATE sets `'healthy'`, despite the comment
+   directly above it claiming it owns "instance_uuid / endpoint / draining and nothing else".
+   Trust that SQL, not that comment. Either way it is unreachable from a pigeon write site.
 3. **Fatally: nothing in pigeon writes `health_state='healthy'` in self mode.** The serve
    writes it itself, unconditionally every 5s, from a worker thread, out of process, into the
    same sqlite file (§1). So write-site logging captures the *unhealthy* edge only and is
@@ -612,7 +615,13 @@ writers before writing the code:
   — the exact caller and the `heartbeatAgeMs` that justified the verdict — and fires even if
   the serve's heartbeat overwrites the row before the observer's next tick.
 - Attribution for the other direction is free and needs no plumbing: in self mode an observed
-  `to: "healthy"` **means** the serve's own heartbeat, definitionally.
+  `to: "healthy"` **means the serve wrote it**, since nothing in pigeon can. Three serve-side
+  writers produce it — the 5s heartbeat, `registerSelf` at boot, and the `selfHeal` drift
+  repair — and the logged `instanceUuid` separates them: unchanged means the same process
+  resurrected itself, changed means it restarted and re-registered.
+- **To COUNT transitions from these lines, filter `writer: "observed"`.** The `sweepStale`
+  line and the observer both report the same healthy->unhealthy event about 5s apart, on
+  purpose; a naive grep for `"to":"unhealthy"` double-counts every one of them.
 - Wired OUTSIDE the `serveLiveness` branch, on the endpoint reconciler's precedent: a
   monitoring signal that silently does not exist on `http` hosts is itself a failure mode.
 

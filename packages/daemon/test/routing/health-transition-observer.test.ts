@@ -39,6 +39,11 @@ describe("HealthTransitionObserver", () => {
     expect(msg).toContain("baseline");
     expect(fields).toHaveProperty("baseline");
     expect(fields.baseline).toBeTruthy();
+    // The baseline line's whole job is to state WHERE the pool was found, so an
+    // empty or truncated pool string is the failure mode that matters — asserting
+    // only the call count would let a baseline carrying nothing pass.
+    expect(fields.pool).toContain("serve-0:healthy");
+    expect(fields.pool).toContain("serve-1:unhealthy");
 
     s.db.close();
   });
@@ -80,6 +85,19 @@ describe("HealthTransitionObserver", () => {
       draining: false,
       writer: "observed",
     });
+
+    // Tick 3: the state is now STABLE at unhealthy. A transition is an edge, not a
+    // level, so it must be reported exactly once.
+    //
+    // This assertion is the fence on `lastObserved` being advanced inside the
+    // transition branch. Without it, deleting that one line leaves every test here
+    // green while the observer re-logs the same transition on every 5s tick
+    // forever — unbounded journald spam, and a transition count that is really a
+    // duration count. Found by mutation-testing this exact deletion.
+    log.mockClear();
+    now = 3000;
+    observer.tick();
+    expect(log).not.toHaveBeenCalled();
 
     s.db.close();
   });

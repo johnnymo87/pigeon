@@ -14,15 +14,23 @@
  *  - Pigeon's ONLY in-process production writer is `ServeHealthPoller.sweepStale` ->
  *    `setHealthState('unhealthy')`.
  *  - `pollOnce` writes both states but is wired ONLY in `http` mode (never in prod).
- *  - There is NO `selfHeal` health-state writer anywhere.
+ *
+ * There are in fact THREE serve-side writers of `health_state='healthy'`, all of
+ * them out-of-process: the 5s heartbeat and `registerSelf` at boot
+ * (opencode-patched `patches/serve-lease.patch`), and the drift repair `selfHeal`
+ * (`patches/registry-port-fence.patch`), whose UPDATE sets `health_state='healthy'`
+ * despite a comment above it claiming it owns "instance_uuid / endpoint / draining
+ * and nothing else".
  *
  * Consequence: logging inside write-site methods (`setHealth`/`setHealthState`)
  * would capture only the unhealthy edge in production and would be structurally
  * BLIND to a serve REJOINING the healthy pool — which is the exact transition this
  * bead exists to make visible.
  *
- * In self mode a `to: "healthy"` observed transition means the serve's own heartbeat
- * by definition, since nothing in pigeon writes healthy in that mode.
+ * In self mode a `to: "healthy"` observed transition therefore means "the serve
+ * wrote it", not "the heartbeat wrote it" — it could be any of those three. The
+ * logged `instanceUuid` is what separates them: unchanged means the same process
+ * resurrected itself, changed means it restarted and re-registered.
  *
  * Also note that the observer and the sweep run on separate intervals of the same
  * period, so a sweepStale-caused transition may produce its own line one tick AFTER
