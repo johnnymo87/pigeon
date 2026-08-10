@@ -3641,5 +3641,144 @@ describe("DeliveryWatchdog", () => {
       expect(alerts).toHaveLength(1);
       expect(alerts[0].refMsgId).toBe("stuck:m_throw");
     });
+
+    // Every duration in these texts is measured at OBSERVATION time, but the
+    // alert now rides the durable queue: the drainer retries with backoff and
+    // can reach a human hours later. Without the stamp, "blocked 17min" or
+    // "silent for 20min" silently becomes a claim about the present and the
+    // reader sizes the problem wrongly. The lost-wake advisory already carries
+    // this stamp for exactly this reason; moving these two onto the same queue
+    // brings the same obligation.
+    it("5. both durable advisories carry the observation stamp", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff } = f;
+
+      const blocked = makeClient();
+      blocked.getSessionMessages.mockResolvedValue([
+        assistantMessage({ created: 10, completed: null }),
+        userMessage(50, `<swarm_message v="1" msg_id="m_stamp_blocked">`),
+      ]);
+      clientMap.set("ses_b", { preferred: blocked, all: [blocked] });
+      insertHandedOff({
+        msgId: "m_stamp_blocked",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("stuck:m_stamp_blocked");
+      expect(String(rows[0]!.text)).toContain(
+        `(observed ${new Date(1_000_000).toISOString()})`,
+      );
+
+      // ...and the silent-in-flight advisory, which needs it even more: its
+      // `dirText` is a PRESENT-TENSE claim about the filesystem, checked at
+      // observation time and possibly read hours later.
+      const g = makeFixture();
+      fixture = g;
+      const silentClient = makeClient();
+      silentClient.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_stamp_silent">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }),
+      ]);
+      g.clientMap.set("ses_b", { preferred: silentClient, all: [silentClient] });
+      g.insertHandedOff({
+        msgId: "m_stamp_silent",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      g.setNow(1_000_000);
+      await g.watchdog.processOnce();
+      g.setNow(1_900_001);
+      await g.watchdog.processOnce();
+
+      const silentRows = alertRows(g.storage);
+      expect(silentRows).toHaveLength(1);
+      expect(silentRows[0]!.ref_msg_id).toBe("silent:m_stamp_silent");
+      expect(String(silentRows[0]!.text)).toContain(
+        `(observed ${new Date(1_900_001).toISOString()})`,
+      );
+    });
+
+    // CHARACTERISATION TEST — this pins a KNOWN LIMITATION, not a desirable
+    // behaviour, so that it cannot change silently in either direction.
+    //
+    // `silentInFlightAlerted` is keyed on the ROW and is cleared only by a
+    // cycle that observes no silent in-flight turn at all. If one silent turn
+    // ends in an error (which is NOT verification evidence, so the row
+    // survives) and another silent turn begins before any cycle sees the gap,
+    // the gate never re-arms and the second episode is never announced —
+    // even though it may be the materially different, actionable one.
+    //
+    // This predates the durability change and is not made worse by it: the
+    // inline path was gated by the very same Set. Keying the durable ref on the
+    // turn was tried and reverted, because the gate means the second enqueue is
+    // never attempted at all, so the ref alone buys nothing. Re-arming the gate
+    // per turn is a behaviour change tracked in pigeon-e9zl.
+    it("6. KNOWN LIMITATION: a second silent episode on a new turn is NOT re-announced", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff } = f;
+
+      const client = makeClient();
+      // Episode 1: turn 100 in flight, silent.
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_two_eps">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+      insertHandedOff({
+        msgId: "m_two_eps",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+      f.setNow(1_900_001);
+      await watchdog.processOnce();
+      expect(alertRows(storage).map((r) => r.ref_msg_id)).toEqual([
+        "silent:m_two_eps",
+      ]);
+
+      // Turn 100 ends in ERROR. An errored turn is not verification evidence,
+      // so the row stays unverified — but the silent-in-flight gate clears.
+      // Then turn 300 starts and is silent in its turn.
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_two_eps">`),
+        assistantMessage({
+          created: 100,
+          completed: 200,
+          error: { name: "ProviderError" },
+        }),
+        assistantMessage({ created: 300, completed: null, parts: [] }),
+      ]);
+
+      f.setNow(2_000_000);
+      await watchdog.processOnce();
+      f.setNow(2_900_002);
+      await watchdog.processOnce();
+
+      // Still exactly one advisory: the row-keyed gate never re-armed, so the
+      // second episode produced no enqueue at all. If this ever becomes two,
+      // pigeon-e9zl was implemented and this test should be inverted.
+      expect(alertRows(storage).map((r) => r.ref_msg_id)).toEqual([
+        "silent:m_two_eps",
+      ]);
+
+      const row = storage.swarm.getByMsgId("m_two_eps")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.requeueCount).toBe(0);
+    });
   });
 });

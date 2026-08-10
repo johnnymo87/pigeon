@@ -1058,6 +1058,15 @@ export class DeliveryWatchdog {
       if (enqueued) {
         counts.alerted++;
         this.log("alerted", { msgId: row.msgId, sessionId, reason });
+      } else {
+        // Suppressed by the durable ref rather than by choice. Counted nowhere
+        // and previously logged nowhere, so a dedupe drop was indistinguishable
+        // from "no alert was needed".
+        this.log("alert deduped", {
+          msgId: row.msgId,
+          sessionId,
+          refMsgId: `wake-lost:${row.msgId}`,
+        });
       }
     }
     counts.skipped++;
@@ -1245,10 +1254,34 @@ export class DeliveryWatchdog {
           // becomes a no-op. If it is ever adopted it must send the directory header AND confirm
           // the serve owns the session, and even then it may only DELAY or SUPPRESS an alert
           // (failing open into alerting is the safe direction), never justify a terminal.
+          // ONE ADVISORY PER ROW PER PROCESS, and that limitation is inherited
+          // rather than introduced here — but it is sharper than it looks, so
+          // it is written down. `silentInFlightAlerted` is keyed on the ROW and
+          // is cleared only by a cycle that observes NO silent in-flight turn
+          // at all. If one silent turn ends (in an error, say — an errored turn
+          // is not verification evidence, so the row survives) and another
+          // starts before any cycle sees the gap, the gate never re-arms and
+          // the second episode is never announced. That matters because
+          // episode 2 is often the MATERIALLY DIFFERENT one: episode 1 may read
+          // "directory exists, may be parked on a provider retry" (ignorable)
+          // while episode 2 reads "directory not found, turn cannot proceed"
+          // (actionable).
+          //
+          // Keying the durable ref on the turn was tried and REVERTED: it
+          // changes nothing on its own, because the gate above means the second
+          // enqueue is never even attempted. Making episode 2 reachable
+          // requires re-arming the GATE per turn, which is a behaviour change
+          // beyond making this alert durable — filed as pigeon-e9zl. Pinned by
+          // test 6 so it cannot change silently.
+          //
+          // The `observed` stamp carries the same obligation as the lost-wake
+          // advisory: these durations are measured now, but the drainer can
+          // deliver hours later, and `dirText` is a PRESENT-TENSE claim about
+          // the filesystem checked at observation time.
           const enqueued = this.storage.alerts.enqueue({
             source: "delivery-silent-in-flight",
             refMsgId: `silent:${row.msgId}`,
-            text: `delivery watchdog: msg ${row.msgId} to ${sessionId} in-flight turn produces no output — silent for ${humanDuration(silentMs)} (${silentMs}ms); ${dirText}`,
+            text: `delivery watchdog: msg ${row.msgId} to ${sessionId} in-flight turn produces no output — silent for ${humanDuration(silentMs)} (${silentMs}ms); ${dirText} (observed ${new Date(now).toISOString()})`,
             severity: "warning",
             now,
           });
@@ -1260,6 +1293,12 @@ export class DeliveryWatchdog {
               sessionId,
               reason: "silent-in-flight",
               silentForMs: silentMs,
+            });
+          } else {
+            this.log("alert deduped", {
+              msgId: row.msgId,
+              sessionId,
+              refMsgId: `silent:${row.msgId}`,
             });
           }
         }
@@ -1335,10 +1374,16 @@ export class DeliveryWatchdog {
       // terminal SILENTLY. The `stuck:` prefix stays out of the msg_id
       // namespace, which is enforced by rejecting ':' in caller-supplied
       // msg_ids at the API boundary — see parseSwarmSendBody.
+      // The `observed` stamp is not decoration, and it is required precisely
+      // BECAUSE this alert is now durable: every duration above is measured at
+      // observation time, but the drainer retries with backoff and can deliver
+      // this hours later. Without the stamp "blocked 17min" silently becomes a
+      // claim about the present and the reader sizes the problem wrongly. Same
+      // rule, same wording, as the lost-wake advisory.
       const enqueued = this.storage.alerts.enqueue({
         source: "delivery-blocked-behind-turn",
         refMsgId: `stuck:${row.msgId}`,
-        text: `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})${recoveryNote}`,
+        text: `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})${recoveryNote} (observed ${new Date(now).toISOString()})`,
         severity: "warning",
         now,
       });
@@ -1349,6 +1394,15 @@ export class DeliveryWatchdog {
           msgId: row.msgId,
           sessionId,
           reason: `queued-behind-${label.toLowerCase()}-turn`,
+        });
+      } else {
+        // Suppressed by the durable ref, not by choice. Without this line the
+        // drop is invisible in both `counts.alerted` and the log, which is the
+        // same silent-loss shape this change exists to remove.
+        this.log("alert deduped", {
+          msgId: row.msgId,
+          sessionId,
+          refMsgId: `stuck:${row.msgId}`,
         });
       }
     }
