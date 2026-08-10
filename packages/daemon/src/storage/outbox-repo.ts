@@ -101,8 +101,9 @@ export class OutboxRepository {
 
   /**
    * Returns entries ready to be delivered: state='queued' AND (next_retry_at IS NULL OR next_retry_at <= now).
-   * Ordered by per-session best message-class priority FIRST (sessions with questions before stops before cards),
-   * then created_at ASC and rowid ASC within each session.
+   * Ordered by per-session best message-class priority FIRST (question=1, stop=2, card=3, swarm=4, mirror=5, else=6),
+   * then per-row kind priority (question=1, stop=2, card=3, swarm=4, mirror=5, else=6),
+   * then created_at ASC and rowid ASC.
    */
   getReady(now = Date.now(), limit = 100): OutboxRecord[] {
     const rows = this.db
@@ -110,8 +111,9 @@ export class OutboxRepository {
         `SELECT * FROM outbox
          WHERE state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
-         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 ELSE 4 END)
+         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
+                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END) ASC,
                   created_at ASC,
                   rowid ASC
          LIMIT ?`,

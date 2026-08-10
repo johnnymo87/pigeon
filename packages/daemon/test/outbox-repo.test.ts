@@ -364,7 +364,7 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("getReady orders strictly by created_at within the same session (stop before question regression)", () => {
+  it("getReady orders by kind priority within the same session (question before stop even if stop enqueued earlier)", () => {
     const storage = createStorage();
 
     // Stop created at t=1000 for same session
@@ -373,7 +373,7 @@ describe("OutboxRepository", () => {
     storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-1", kind: "question", sessionId: "sess-1" }, 2_000);
 
     const ready = storage.outbox.getReady(5_000, 10);
-    expect(ready.map((r) => r.notificationId)).toEqual(["stop-1", "q-1"]);
+    expect(ready.map((r) => r.notificationId)).toEqual(["q-1", "stop-1"]);
 
     storage.db.close();
   });
@@ -392,7 +392,7 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
-  it("getReady orders multi-session outbox entries by session priority then created_at", () => {
+  it("getReady orders multi-session outbox entries by session priority then kind priority", () => {
     const storage = createStorage();
 
     // Session A: card created at t=1000
@@ -404,7 +404,7 @@ describe("OutboxRepository", () => {
     storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q-c", kind: "question", sessionId: "sess-c" }, 3_000);
 
     const ready = storage.outbox.getReady(5_000, 10);
-    expect(ready.map((r) => r.notificationId)).toEqual(["card-c", "q-c", "stop-b", "card-a"]);
+    expect(ready.map((r) => r.notificationId)).toEqual(["q-c", "card-c", "stop-b", "card-a"]);
 
     storage.db.close();
   });
@@ -486,6 +486,32 @@ describe("OutboxRepository", () => {
       },
       oldestQueuedAgeMs: 8_000,
     });
+
+    storage.db.close();
+  });
+
+  it("ranks a question ahead of same-session swarm rows enqueued earlier", () => {
+    const storage = createStorage();
+    const s = "ses_same";
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:1", sessionId: s, requestId: "r1", kind: "swarm", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:2", sessionId: s, requestId: "r2", kind: "swarm", payload: "{}" }, 2_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "q:1", sessionId: s, requestId: "r3", kind: "question", payload: "{}" }, 3_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready[0]!.notificationId).toBe("q:1");
+
+    storage.db.close();
+  });
+
+  it("sorts an unknown kind below mirror", () => {
+    const storage = createStorage();
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "x:1", sessionId: "ses_a", requestId: "r1", kind: "wat", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "m:1", sessionId: "ses_b", requestId: "r2", kind: "mirror", payload: "{}" }, 2_000);
+
+    const ready = storage.outbox.getReady(10_000, 10);
+
+    expect(ready.map((r) => r.notificationId)).toEqual(["m:1", "x:1"]);
 
     storage.db.close();
   });
