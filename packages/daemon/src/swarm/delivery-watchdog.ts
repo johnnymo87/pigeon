@@ -708,11 +708,15 @@ export class DeliveryWatchdog {
    *
    * The remaining case — and the bug this exists to fix — is the row being
    * deleted out from under us without ever resolving through (a) or (b).
-   * Note: swarm retention (`swarm.cleanupOlderThan`) IS wired, but unverified
-   * rows are exempt from age cleanup (never deleted by retention while
-   * unverified), so they persist until verified or moved to a terminal state.
-   * Reconciling against "not in this cycle's eligible set" catches entries
-   * whose row was deleted or moved.
+   * Swarm retention (`swarm.cleanupOlderThan`) IS wired, and it CAN delete a
+   * row we hold a dedupe entry for: unverified rows are exempt from age
+   * cleanup as a rule, but `swarm.nudge` rows are explicitly carved OUT of
+   * that exemption and are reaped at SWARM_RETENTION_MS even while unverified
+   * (see SwarmRepo.cleanupOlderThan) — otherwise pigeon's own nudges into a
+   * permanently dead session would be an unbounded leak. So a nudge row can
+   * vanish from under a live dedupe entry, which is exactly the case this
+   * reconciliation handles. Reconciling against "not in this cycle's eligible
+   * set" catches entries whose row was deleted or moved.
    *
    * Rows that are alive but simply too young (handed_off more recently than
    * `verifyAfterMs`) were never alerted in the first place — they can't be
@@ -1054,6 +1058,15 @@ export class DeliveryWatchdog {
       if (enqueued) {
         counts.alerted++;
         this.log("alerted", { msgId: row.msgId, sessionId, reason });
+      } else {
+        // Suppressed by the durable ref rather than by choice. Counted nowhere
+        // and previously logged nowhere, so a dedupe drop was indistinguishable
+        // from "no alert was needed".
+        this.log("alert deduped", {
+          msgId: row.msgId,
+          sessionId,
+          refMsgId: `wake-lost:${row.msgId}`,
+        });
       }
     }
     counts.skipped++;
@@ -1162,9 +1175,6 @@ export class DeliveryWatchdog {
           silentMs > this.stuckAlertMs &&
           !this.silentInFlightAlerted.has(row.msgId)
         ) {
-          this.silentInFlightAlerted.add(row.msgId);
-          counts.alerted++;
-
           // Task 2: Working-directory corroboration.
           // CRITICAL: This directory check is for human alert text corroboration ONLY.
           // Under no circumstances may a missing directory trigger a state change,
@@ -1204,26 +1214,38 @@ export class DeliveryWatchdog {
             }
           }
 
-          // Sent via the EPHEMERAL alert path (this.alert), NOT durable
-          // storage.alerts.enqueue — and after pigeon-fww that is a positive
-          // choice, not the absence of one.
+          // DURABLE, not best-effort (pigeon-xsu8). This site was previously
+          // ephemeral BY DECISION, on the reasoning that "this row remains in a
+          // live state machine whose terminal exits — session-deleted and
+          // nudges-exhausted — are both durable", so losing the advisory cost a
+          // human some latency but never the payload.
           //
-          // The reason recorded here originally was "a durable advisory would
-          // permanently block a later TERMINAL alert for this row, because the
-          // dedupe index is UNIQUE on ref_msg_id alone". That hazard is real
-          // but it is no longer a reason to stay ephemeral: pigeon-fww showed
-          // a namespaced ref (`wake-lost:<msgId>`) sidesteps it entirely, so
-          // any site that needs durability can have it.
+          // THAT PREMISE IS FALSE FOR THIS BRANCH, which is precisely the
+          // branch it was written on. Neither terminal is GUARANTEED here:
+          //   - nudges-exhausted is UNREACHABLE while the turn stays silent —
+          //     this branch returns below without ever reaching nudgeOrTerminal
+          //     (that lives in the idle branch, taken only once a turn is no
+          //     longer in flight);
+          //   - session-deleted fires only if the target session is actually
+          //     deleted, which for a wedged-but-live session never happens.
+          // A turn that is silent forever therefore produces NO terminal and NO
+          // second signal, so this advisory is the only word a human ever gets
+          // — the final-silent-loss condition from pigeon-fww, which is the
+          // rule that decides durability. Measured 2026-08-10: the one
+          // permanently-trapped row in production sits in exactly this branch.
           //
-          // This site stays ephemeral because it does not need durability. The
-          // rule: an alert must be DURABLE when losing it can be the final
-          // silent loss of the event — no later durable signal is guaranteed
-          // to fire for the same underlying fact. That is true of the
-          // lost-wake alert (it carries the payload, and the row can sit
-          // handed_off indefinitely). It is NOT true here: this row remains in
-          // a live state machine whose terminal exits — session-deleted and
-          // nudges-exhausted — are both durable. Losing this advisory costs a
-          // human some latency, never the payload.
+          // The dedupe hazard that originally argued for ephemerality is
+          // handled the same way pigeon-fww handled it: a namespaced ref keeps
+          // this advisory out of the slot belonging to the row's later terminal
+          // alert. Enqueue precedes the Set add so a throwing enqueue cannot
+          // burn the row's one advisory for the process lifetime.
+          //
+          // Re-alerting on a schedule was considered and REJECTED: the
+          // transcript looks identical every cycle, so time passing carries no
+          // new information, and re-asserting an unchanged fact on a timer is
+          // just alert fatigue. The in-memory Set is cleared when the turn
+          // resolves, so a genuinely NEW silent episode — an actual information
+          // delta — re-arms this advisory.
           //
           // Task 3: REFUSED DESIGN OPTION:
           // opencode-serve's GET /session/status is INSTANCE-SCOPED by the x-opencode-directory header.
@@ -1232,16 +1254,53 @@ export class DeliveryWatchdog {
           // becomes a no-op. If it is ever adopted it must send the directory header AND confirm
           // the serve owns the session, and even then it may only DELAY or SUPPRESS an alert
           // (failing open into alerting is the safe direction), never justify a terminal.
-          await this.alert(
-            "warning",
-            `delivery watchdog: msg ${row.msgId} to ${sessionId} in-flight turn produces no output — silent for ${humanDuration(silentMs)} (${silentMs}ms); ${dirText}`,
-          );
-          this.log("alerted", {
-            msgId: row.msgId,
-            sessionId,
-            reason: "silent-in-flight",
-            silentForMs: silentMs,
+          // ONE ADVISORY PER ROW PER PROCESS, and that limitation is inherited
+          // rather than introduced here — but it is sharper than it looks, so
+          // it is written down. `silentInFlightAlerted` is keyed on the ROW and
+          // is cleared only by a cycle that observes NO silent in-flight turn
+          // at all. If one silent turn ends (in an error, say — an errored turn
+          // is not verification evidence, so the row survives) and another
+          // starts before any cycle sees the gap, the gate never re-arms and
+          // the second episode is never announced. That matters because
+          // episode 2 is often the MATERIALLY DIFFERENT one: episode 1 may read
+          // "directory exists, may be parked on a provider retry" (ignorable)
+          // while episode 2 reads "directory not found, turn cannot proceed"
+          // (actionable).
+          //
+          // Keying the durable ref on the turn was tried and REVERTED: it
+          // changes nothing on its own, because the gate above means the second
+          // enqueue is never even attempted. Making episode 2 reachable
+          // requires re-arming the GATE per turn, which is a behaviour change
+          // beyond making this alert durable — filed as pigeon-e9zl. Pinned by
+          // test 6 so it cannot change silently.
+          //
+          // The `observed` stamp carries the same obligation as the lost-wake
+          // advisory: these durations are measured now, but the drainer can
+          // deliver hours later, and `dirText` is a PRESENT-TENSE claim about
+          // the filesystem checked at observation time.
+          const enqueued = this.storage.alerts.enqueue({
+            source: "delivery-silent-in-flight",
+            refMsgId: `silent:${row.msgId}`,
+            text: `delivery watchdog: msg ${row.msgId} to ${sessionId} in-flight turn produces no output — silent for ${humanDuration(silentMs)} (${silentMs}ms); ${dirText} (observed ${new Date(now).toISOString()})`,
+            severity: "warning",
+            now,
           });
+          this.silentInFlightAlerted.add(row.msgId);
+          if (enqueued) {
+            counts.alerted++;
+            this.log("alerted", {
+              msgId: row.msgId,
+              sessionId,
+              reason: "silent-in-flight",
+              silentForMs: silentMs,
+            });
+          } else {
+            this.log("alert deduped", {
+              msgId: row.msgId,
+              sessionId,
+              refMsgId: `silent:${row.msgId}`,
+            });
+          }
         }
       }
 
@@ -1286,22 +1345,66 @@ export class DeliveryWatchdog {
     const silence = now - lastActivity;
 
     if (blockedAge > this.stuckAlertMs && !this.stuckAlerted.has(row.msgId)) {
-      this.stuckAlerted.add(row.msgId);
-      counts.alerted++;
       const fresh = silence <= this.stuckAbortSilenceMs;
       const label = fresh ? "ACTIVE" : "SILENT";
       const recoveryNote = isSuppressedFromRecovery(row)
         ? " (recovery suppressed)"
         : "";
-      await this.alert(
-        "warning",
-        `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})${recoveryNote}`,
-      );
-      this.log("alerted", {
-        msgId: row.msgId,
-        sessionId,
-        reason: `queued-behind-${label.toLowerCase()}-turn`,
+      // DURABLE, not best-effort (pigeon-xsu8). NO TERMINAL IS REACHABLE FROM
+      // THIS BRANCH: we wait for the blocking turn for as long as it takes
+      // (pigeon-0gxy forbids preempting it), so `notifySenderOfFailure` never
+      // fires while the row is blocked. If the blocking turn never completes,
+      // this advisory is the ONLY signal about this row that any human will
+      // EVER receive. Sent inline it died on a transport blip, a 429, or a
+      // daemon crash, and — because `alert()` no-ops without a notifier — it
+      // could be dropped without even an error. That is the final-silent-loss
+      // condition from pigeon-fww, so it belongs in durable storage.
+      //
+      // ENQUEUE BEFORE THE SET ADD, and the order is load-bearing for the same
+      // reason as the lost-wake advisory: unlike `this.alert` (which swallowed
+      // everything), enqueue CAN throw (SQLITE_BUSY, SQLITE_IOERR). Marking the
+      // Set first would suppress this row for the whole process lifetime on a
+      // transient failure — the row never leaves the eligible set, so
+      // reconcileDedupe would never restore it either.
+      //
+      // WHY THE REF IS NAMESPACED. The dedupe index is UNIQUE on ref_msg_id
+      // ALONE, so keying this on the bare msgId would make this ADVISORY occupy
+      // the slot belonging to the row's later TERMINAL alert (both use
+      // `refMsgId: row.msgId`), and ON CONFLICT DO NOTHING would drop that
+      // terminal SILENTLY. The `stuck:` prefix stays out of the msg_id
+      // namespace, which is enforced by rejecting ':' in caller-supplied
+      // msg_ids at the API boundary — see parseSwarmSendBody.
+      // The `observed` stamp is not decoration, and it is required precisely
+      // BECAUSE this alert is now durable: every duration above is measured at
+      // observation time, but the drainer retries with backoff and can deliver
+      // this hours later. Without the stamp "blocked 17min" silently becomes a
+      // claim about the present and the reader sizes the problem wrongly. Same
+      // rule, same wording, as the lost-wake advisory.
+      const enqueued = this.storage.alerts.enqueue({
+        source: "delivery-blocked-behind-turn",
+        refMsgId: `stuck:${row.msgId}`,
+        text: `delivery watchdog: msg ${row.msgId} to ${sessionId} queued behind ${label} turn — blocked ${blockedAge}ms (${humanDuration(blockedAge)}), turn silent ${silence}ms (${humanDuration(silence)})${recoveryNote} (observed ${new Date(now).toISOString()})`,
+        severity: "warning",
+        now,
       });
+      this.stuckAlerted.add(row.msgId);
+      if (enqueued) {
+        counts.alerted++;
+        this.log("alerted", {
+          msgId: row.msgId,
+          sessionId,
+          reason: `queued-behind-${label.toLowerCase()}-turn`,
+        });
+      } else {
+        // Suppressed by the durable ref, not by choice. Without this line the
+        // drop is invisible in both `counts.alerted` and the log, which is the
+        // same silent-loss shape this change exists to remove.
+        this.log("alert deduped", {
+          msgId: row.msgId,
+          sessionId,
+          refMsgId: `stuck:${row.msgId}`,
+        });
+      }
     }
 
     // Our prompt is queued behind somebody else's running turn. We WAIT, for
