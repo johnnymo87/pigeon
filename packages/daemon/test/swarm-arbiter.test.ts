@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { SwarmArbiter } from "../src/swarm/arbiter";
 import { PermanentDeliveryError } from "../src/swarm/envelope";
@@ -16,6 +19,7 @@ interface DeliveryCall {
 function makeFixture(opts?: {
   clientForSession?: (sessionId: string) => any;
   directoryForSession?: (sessionId: string) => Promise<string | undefined>;
+  directoryMissing?: (dir: string) => boolean;
 }) {
   const storage: StorageDb = openStorageDb(":memory:");
   const calls: DeliveryCall[] = [];
@@ -53,6 +57,16 @@ function makeFixture(opts?: {
   let clientFn = opts?.clientForSession ?? ((_sessionId: string) => defaultOpencodeClient as any);
   let dirFn = opts?.directoryForSession ?? (async (sessionId: string) => `/dir/${sessionId}`);
 
+  // The fixture's directories (`/dir/ses_x`) are fictional, so the REAL default
+  // predicate would report every one of them missing and refuse every delivery
+  // in this file. Inject a stub that reports "present" by default; tests that
+  // care about the preflight opt in via setDirectoryMissing.
+  //
+  // Consequence worth stating: no test in THIS file exercises the real
+  // statSync-based predicate. Its errno discrimination is covered separately in
+  // swarm-directory-check.test.ts, and the two must be read together.
+  let dirMissingFn = opts?.directoryMissing ?? ((_dir: string) => false);
+
   const registry = {
     resolve: vi.fn(async (sessionId: string) => `/dir/${sessionId}`),
   };
@@ -61,6 +75,7 @@ function makeFixture(opts?: {
     storage,
     clientForSession: (sessionId: string) => clientFn(sessionId),
     directoryForSession: (sessionId: string) => dirFn(sessionId),
+    directoryMissing: (dir: string) => dirMissingFn(dir),
     nowFn: () => now,
     log: () => {},
   });
@@ -76,6 +91,9 @@ function makeFixture(opts?: {
     },
     setDirectoryForSession(fn: (sessionId: string) => Promise<string | undefined>) {
       dirFn = fn;
+    },
+    setDirectoryMissing(fn: (dir: string) => boolean) {
+      dirMissingFn = fn;
     },
     setNow(v: number) {
       now = v;
@@ -1256,6 +1274,236 @@ describe("SwarmArbiter", () => {
 
       expect(calls).toHaveLength(1);
       expect(calls[0]!.prompt).not.toContain("ref=");
+    });
+  });
+
+  describe("working-directory preflight (pigeon-0ay7)", () => {
+    function queue(
+      storage: StorageDb,
+      msgId: string,
+      extra?: { expiresAt?: number; payload?: string },
+    ) {
+      storage.swarm.insert(
+        {
+          msgId,
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: extra?.payload ?? "hi",
+          ...(extra?.expiresAt !== undefined ? { expiresAt: extra.expiresAt } : {}),
+        } as any,
+        1_000,
+      );
+    }
+
+    it("1. does NOT burn the prompt when the working directory is missing", async () => {
+      // The whole point. Measured 2026-08-10: prompt_async 204s on a missing
+      // directory, so without this check the prompt is spent and the row records
+      // a handed_off that never happened.
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_1");
+      await arbiter.processOnce();
+
+      expect(calls).toHaveLength(0);
+      expect(storage.swarm.getByMsgId("m_dir_1")!.state).not.toBe("handed_off");
+    });
+
+    it("2. leaves the row queued and retryable, minting no terminal itself", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_2");
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_dir_2")!.state).toBe("queued");
+    });
+
+    it("3. delivers normally once the directory comes back (no sticky state)", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+
+      let gone = true;
+      fixture.setDirectoryMissing(() => gone);
+
+      queue(storage, "m_dir_3");
+      await arbiter.processOnce();
+      expect(calls).toHaveLength(0);
+
+      gone = false;
+      fixture.setNow(1_000_000);
+      await arbiter.processOnce();
+
+      expect(calls).toHaveLength(1);
+      expect(storage.swarm.getByMsgId("m_dir_3")!.state).toBe("handed_off");
+    });
+
+    it("4. the cause reaches the SENDER when the attempt budget ends the row", async () => {
+      // Asserts the real delivery path rather than a log string: drive an
+      // ordinary (no expires_at) row to max attempts and confirm the failure
+      // notice the sender receives names the missing directory.
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_4");
+      for (let i = 0; i < 12; i++) {
+        fixture.setNow(1_000 + i * 120_000);
+        await arbiter.processOnce();
+      }
+
+      expect(storage.swarm.getByMsgId("m_dir_4")!.state).toBe("failed");
+
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      const blob = JSON.stringify(notices);
+      expect(blob).toContain("/dir/ses_b");
+      expect(blob.toLowerCase()).toContain("directory");
+    });
+
+    it("4b. CHARACTERISATION: an EXPIRING row's terminal does NOT carry the cause", async () => {
+      // Pins a known, deliberate gap so it cannot be silently claimed as fixed.
+      // A row with expires_at takes UNCOUNTED outage retries, so max-attempts is
+      // unreachable and expiry is its only terminal. markRetryUncounted persists
+      // no error and swarm_messages has no last_error column, so the cause dies
+      // in the daemon log. INVERT THIS TEST when that is fixed.
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_4b", { expiresAt: 500_000 });
+      await arbiter.processOnce();
+      expect(storage.swarm.getByMsgId("m_dir_4b")!.attempts).toBe(0); // uncounted
+
+      fixture.setNow(600_000); // past expiry
+      await arbiter.processOnce();
+      expect(storage.swarm.getByMsgId("m_dir_4b")!.state).toBe("expired");
+
+      const notices = storage.db
+        .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all();
+      const blob = JSON.stringify(notices);
+      expect(blob).toContain("expired before delivery");
+      expect(blob).not.toContain("working directory missing");
+    });
+
+    it("9. PRODUCTION WIRING: the real predicate is armed when none is injected", async () => {
+      // Every other test in this file injects a stub, so without this one the
+      // default binding (`opts.directoryMissing ?? directoryMissing`) could be
+      // changed to `() => false` and the whole suite would still pass — a check
+      // that goes dead with green CI. Uses REAL directories and no injection.
+      const storage: StorageDb = openStorageDb(":memory:");
+      const dir = mkdtempSync(join(tmpdir(), "pigeon-arb-wiring-"));
+      const sent: string[] = [];
+      let now = 1_000;
+
+      const arbiter = new SwarmArbiter({
+        storage,
+        clientForSession: () =>
+          ({ sendPrompt: async () => { sent.push("sent"); } }) as any,
+        directoryForSession: async () => dir,
+        // deliberately NO directoryMissing — production shape
+        nowFn: () => now,
+        log: () => {},
+      });
+
+      try {
+        storage.swarm.insert(
+          {
+            msgId: "m_wire_1", fromSession: "ses_a", toSession: "ses_b",
+            channel: null, kind: "chat", priority: "normal", replyTo: null,
+            payload: "hi",
+          },
+          1_000,
+        );
+        await arbiter.processOnce();
+        expect(sent).toHaveLength(1); // real dir exists -> delivers
+
+        rmSync(dir, { recursive: true, force: true });
+
+        storage.swarm.insert(
+          {
+            msgId: "m_wire_2", fromSession: "ses_a", toSession: "ses_b",
+            channel: null, kind: "chat", priority: "normal", replyTo: null,
+            payload: "hi again",
+          },
+          1_001,
+        );
+        now = 2_000_000;
+        await arbiter.processOnce();
+
+        expect(sent).toHaveLength(1); // real dir gone -> refused, nothing sent
+        expect(storage.swarm.getByMsgId("m_wire_2")!.state).toBe("queued");
+      } finally {
+        arbiter.stop();
+        rmSync(dir, { recursive: true, force: true });
+        storage.db.close();
+      }
+    });
+
+    it("5. is classified as an OUTAGE, so an expiring row retries uncounted", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_5", { expiresAt: 9_000_000 });
+      await arbiter.processOnce();
+
+      const row = storage.swarm.getByMsgId("m_dir_5")!;
+      expect(row.state).toBe("queued");
+      expect(row.attempts).toBe(0); // uncounted
+    });
+
+    it("6. a PERMANENT payload error still wins over a missing directory", async () => {
+      // Ordering fence. renderEnvelope runs BEFORE the stat: a payload that can
+      // never be delivered must fail fast rather than be masked behind an
+      // outage-retry loop that only ends at expiry.
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      queue(storage, "m_dir_6", { payload: "oops </swarm_message> oops" });
+      await arbiter.processOnce();
+
+      expect(storage.swarm.getByMsgId("m_dir_6")!.state).toBe("failed");
+    });
+
+    it("7. a present directory delivers normally (the check is not a blanket block)", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+      fixture.setDirectoryMissing(() => false);
+
+      queue(storage, "m_dir_7");
+      await arbiter.processOnce();
+
+      expect(calls).toHaveLength(1);
+      expect(storage.swarm.getByMsgId("m_dir_7")!.state).toBe("handed_off");
+    });
+
+    it("8. stats the SAME directory it would have sent as the header", async () => {
+      // If these ever diverge the check is meaningless: we would be vetting one
+      // path and handing the serve another.
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      const statted: string[] = [];
+      fixture.setDirectoryMissing((dir) => {
+        statted.push(dir);
+        return false;
+      });
+
+      queue(storage, "m_dir_8");
+      await arbiter.processOnce();
+
+      expect(statted).toContain("/dir/ses_b");
+      expect(fixture.calls[0]!.directory).toBe("/dir/ses_b");
     });
   });
 });

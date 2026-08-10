@@ -1425,6 +1425,8 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
             },
           }) as any,
         directoryForSession: async () => "/dir/ses_b",
+        // Fictional directory; see note in swarm-routes.integration.test.ts.
+        directoryMissing: () => false,
         nowFn: () => 1_000_000 + 3600 * 1000 + 1,
         log: () => {},
       });
@@ -1475,6 +1477,8 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
             },
           }) as any,
         directoryForSession: async () => "/dir/ses_b",
+        // Fictional directory; see note in swarm-routes.integration.test.ts.
+        directoryMissing: () => false,
         nowFn: () => 1_000_000 + 3600 * 1000 + 1,
         log: () => {},
       });

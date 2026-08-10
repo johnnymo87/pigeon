@@ -48,6 +48,10 @@ describe("swarm routes e2e", () => {
       storage,
       clientForSession: () => opencodeClient as any,
       directoryForSession: async (sessionId) => `/dir/${sessionId}`,
+      // These directories are fictional; the real preflight (pigeon-0ay7) would
+      // correctly refuse every delivery here. Ordering/serialization is what is
+      // under test, not the preflight, which has its own coverage.
+      directoryMissing: () => false,
       log: () => {},
     });
 
@@ -117,6 +121,10 @@ describe("swarm routes e2e", () => {
       storage,
       clientForSession: () => opencodeClient as any,
       directoryForSession: async (sessionId) => `/dir/${sessionId}`,
+      // These directories are fictional; the real preflight (pigeon-0ay7) would
+      // correctly refuse every delivery here. Ordering/serialization is what is
+      // under test, not the preflight, which has its own coverage.
+      directoryMissing: () => false,
       log: () => {},
     });
 
