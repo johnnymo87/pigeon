@@ -16,8 +16,9 @@ export interface WatchdogClientFactory {
 /**
  * Builds the delivery watchdog's `resolveClients`: given a target session,
  * returns the client to read its transcript from (`preferred`) plus every
- * currently-healthy serve client (`all`, used for a 404 second opinion and
- * for broadcasting an abort).
+ * currently-healthy serve client (`all`, used for a 404 second opinion).
+ * `all` is a READ facility only — nothing broadcasts aborts any more
+ * (pigeon-0gxy).
  *
  * Mirrors the ingress-router-or-fallback shape of
  * {@link makeDirectoryResolver} in `../routing/directory-resolver`:

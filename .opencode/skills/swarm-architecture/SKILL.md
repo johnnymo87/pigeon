@@ -151,6 +151,70 @@ Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BA
 
 **Why a single in-flight per target is enough**: opencode serve's race occurs when two `prompt_async` calls land on the same session id from different `x-opencode-directory` headers. Since the daemon is the single writer and uses the registry to canonicalize the directory, all daemon-routed traffic always uses the same directory header. The race is gone for daemon-routed traffic. (`opencode-send --direct` bypasses the daemon and re-introduces the race; that's why Task 13 exists as a defense-in-depth follow-up.)
 
+## Turn-Preemption Policy (pigeon-0gxy)
+
+**Delivery never preempts a running turn.** If a message is queued behind the
+target's in-flight turn, the `DeliveryWatchdog` **waits indefinitely**. It
+raises a one-shot advisory alert once `stuckAlertMs` passes (labelling the
+blocker `ACTIVE` or `SILENT` per `STUCK_ABORT_SILENCE_MS`), and when the turn
+ends the row is picked up on a later cycle and **nudged** — never re-injected,
+per the "one payload injection per `msg_id`, forever" invariant.
+
+**The rule, scoped.** Aborting a turn requires either (a) an explicit **human**
+command targeting one named session, or (b) **lifecycle** termination of the
+session itself (serve drain, `/kill`). *Delivery latency is never sufficient
+cause* — no priority, no `urgent` kind, no operator-configurable bypass. And a
+lifecycle cause must originate in the session's **own lifecycle state**, never
+in any message's delivery state: "this delivery is stuck, so presume the
+session wedged, so lifecycle-terminate it" is the banned move wearing a hat.
+
+(The session reaper is *not* an example of (b): `reapStaleSessions` deletes
+local routing rows and unregisters from the worker after a week idle. It never
+terminates a session or its turn — its optional `deleteSession` dep is never
+called and `index.ts` does not even pass it.)
+
+**Why no automated exception, including for urgent mail.** opencode's
+`runLoop()` re-reads the full transcript on every step, so a turn already
+running **sees** a message injected after it started and can act on it
+mid-turn. The turn blocking our message may be *the very turn processing it* —
+and from outside, that case is byte-identical to an unrelated turn. Urgency
+makes this worse, not better: the worst outcome for an urgent message is
+killing the turn already handling it. Priority cannot buy information the
+daemon does not have. Waiting costs latency; aborting destroys a peer's tool
+calls, reasoning and partial answer irreversibly.
+
+**The authorized override already exists**: the Telegram `/interrupt` command
+(`worker/interrupt-ingest.ts` → `OpencodeClient.abortSession`). A human with
+context decides, targets one session, and owns the consequence.
+
+**No deadlock risk from waiting.** An agent awaiting a reply does so by *ending
+its turn* (going idle), so "both busy" means both are working, not circularly
+waiting; work terminates and mail then delivers. A mid-turn poller is covered
+too, since `swarm_read` hits `GET /swarm/inbox` directly and bypasses the
+prompt queue entirely — though `getInbox` filters on `handed_off`, so a poller
+sees a row only once the arbiter has handed it off (~one 500ms tick). During a
+serve outage neither path delivers, which is an availability problem, not a
+deadlock.
+
+**Enforcement, and exactly what it covers.** There are two automated paths that
+could preempt, and each is guarded differently:
+
+- **The watchdog** — a mutation-tested assertion fence: test 15 in
+  `test/delivery-watchdog.test.ts` ("INVARIANT: abortSession is never called,
+  for any row shape, ever") plus ~24 sibling assertions. Reintroducing
+  `for (const c of clients.all) await c.abortSession(sessionId)` at the wait
+  site fails 11 tests. `WatchdogClient.abortSession` is retained *deliberately*
+  so that fence stays expressible — read its docblock before "cleaning up" the
+  unused member.
+- **The arbiter** — a structural fence: `ArbiterClient` (`arbiter.ts`) exposes
+  only `sendPrompt`, so an abort in the delivery loop is a **compile error**.
+  It has no "never called" assertions, which is precisely why the capability is
+  withheld here instead.
+
+Neither fence constrains code that builds its own HTTP call to
+`POST /session/:id/abort` rather than going through a client. That residue is
+covered by policy and review, not by a test.
+
 ## Session Directory Registry
 
 `SessionDirectoryRegistry` (`packages/daemon/src/swarm/registry.ts`):

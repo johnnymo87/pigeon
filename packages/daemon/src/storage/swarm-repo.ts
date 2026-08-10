@@ -358,9 +358,22 @@ export class SwarmRepository {
   }
 
   /**
-   * Records that the watchdog has fired its one allowed abort for this
-   * message. First-write-wins: a message can only be aborted once, so a
-   * second call is a no-op that leaves the original timestamp untouched.
+   * Stamps `aborted_at`. NO PRODUCTION CALLER since R3 removed the abort path
+   * (pigeon-0gxy) — the watchdog never preempts a running turn, so nothing
+   * new is ever marked aborted.
+   *
+   * Retained on purpose, for two reasons — note the SECOND is the durable one:
+   *  - it is the only writer for a column that carried PRE-R3 rows in the
+   *    production DB (as of the pigeon-3m5 analysis, 2026-08: 7 of 9 requeued
+   *    specimens had it set). Do not treat that as a present-tense fact —
+   *    {@link cleanupOlderThan} reaps terminal/verified rows on retention, so
+   *    those specimens age out and the claim goes false silently;
+   *  - tests use it to construct such a legacy row, which is how
+   *    "13. a historic row with aborted_at set is NOT failed on sight" and
+   *    "33. a historic wake row carrying aborted_at is left alone" pin the
+   *    behaviour that legacy data is not mistreated.
+   *
+   * First-write-wins: a second call is a no-op leaving the original stamp.
    *
    * Deliberately does NOT bump `updated_at`, for the same reason as
    * {@link markVerified}: {@link cleanupOlderThan} anchors retention on it.

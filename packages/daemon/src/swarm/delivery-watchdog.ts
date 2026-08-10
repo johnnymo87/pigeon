@@ -18,6 +18,22 @@ export { isWakeKind, isSuppressedFromRecovery };
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
   getSessionMessages(sessionId: string): Promise<unknown[]>;
+  /**
+   * DELIBERATELY RETAINED THOUGH THE WATCHDOG NEVER CALLS IT (pigeon-0gxy).
+   *
+   * This is not dead code to be tidied away. It is what makes the
+   * never-preempt invariant ASSERTABLE: ~25 tests, including
+   * "15. INVARIANT: abortSession is never called, for any row shape, ever",
+   * assert `expect(client.abortSession).not.toHaveBeenCalled()`. Delete this
+   * member and those assertions stop being expressible — the fence silently
+   * becomes prose.
+   *
+   * Removing it would also buy nothing structurally: the concrete
+   * `OpencodeClient` keeps the method regardless (the Telegram `/interrupt`
+   * command calls it via `worker/interrupt-ingest.ts`), so re-adding it here
+   * is one line. Capability-absence that is trivially recoverable is
+   * decoration; the mutation-tested assertion is the real guard.
+   */
   abortSession(sessionId: string): Promise<void>;
 }
 
@@ -113,9 +129,6 @@ export interface CycleSummary {
   /** Nudges sent this cycle (recovery that did NOT re-inject a payload). */
   nudged: number;
   alerted: number;
-  /** Always 0 since R3 removed the abort path; retained so existing log and
-   *  metrics consumers do not break on a missing field. */
-  aborted: number;
   terminal: number;
   skipped: number;
   /** True when this call coalesced into an already-running cycle and did no work. */
@@ -131,7 +144,6 @@ function emptySummary(coalesced = false): CycleSummary {
     requeued: 0,
     nudged: 0,
     alerted: 0,
-    aborted: 0,
     terminal: 0,
     skipped: 0,
     coalesced,
