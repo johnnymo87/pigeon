@@ -88,6 +88,41 @@ journalctl -u pigeon-daemon --no-pager --since '2 minutes ago' -o short-precise 
 
 If you ever see two `delivered` events for the same target with timestamps closer together than the actual `prompt_async` round-trip, the at-most-one-in-flight invariant is broken — file an issue and check `arbiter.ts:inflight`.
 
+## Tracing Telegram Swarm Posts
+
+Swarm IPC messages are mirrored to the **receiver's** Telegram topic at insert time. Post delivery is best-effort via the daemon's outbox and independent of swarm IPC arbiter delivery — a missing or backlogged Telegram post does **not** mean the swarm message itself failed to reach the target's transcript.
+
+### Outbox Querying
+
+Swarm Telegram notifications use `notification_id` prefixes:
+- `w:<msg_id>` — original swarm post notice
+- `wc:<msg_id>` — cancellation retraction notice (`🚫 cancelled <msg_id>`)
+- Multi-chunk posts suffix earlier chunks via `chunkNotificationId` (`w:<msg_id>:c0`, etc.)
+
+Query outbox state for a given `msg_id`:
+
+```bash
+nix-shell -p sqlite --run \
+  "sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+   \"SELECT notification_id, kind, state, attempts, datetime(created_at/1000,'unixepoch') \
+     FROM outbox WHERE notification_id LIKE 'w%:<msg_id>%' ORDER BY created_at DESC;\""
+```
+
+Outbox rows use `kind='swarm'` (24h TTL).
+
+### Sub-Budget Deferral Logs
+
+Swarm posts are rate-governed (`SWARM_SUB_BUDGET = 6` of the outbox governor's 12 sends/60s ceiling across `swarm`+`mirror` kinds) so swarm bursts cannot starve questions/stops or trigger Telegram topic rate limits (429s).
+
+When the sub-budget is exhausted, the outbox sender logs a once-per-tick debug/info line:
+
+```bash
+journalctl -u pigeon-daemon --no-pager --since '10 minutes ago' \
+  | grep 'outbox sub-budget reached'
+```
+
+Deferring one low-priority entry also defers that session's subsequent entries to preserve per-session delivery order.
+
 ## Common Failure Modes
 
 ### "swarm arbiter NOT started" at boot

@@ -56,6 +56,8 @@ Topic names are **write-once**: `topicName(dir, title)` renders `title · ~/path
 
 Cross-session messaging between opencode sessions on the same machine. Senders POST to daemon `/swarm/send` (typically via `~/.local/bin/pigeon-send` from workstation, or transparently via `opencode-send <ses_*>` which auto-routes). The daemon persists in `swarm_messages` and returns 202 immediately. A background `SwarmArbiter` (500ms tick, at-most-one-in-flight per target) delivers via opencode serve `prompt_async`, with the message wrapped in a `<swarm_message v="1" ...>` XML envelope so the receiving agent can structurally distinguish swarm traffic from user prompts. Receivers can also call the `swarm_read` opencode tool (registered by the plugin) to fetch their inbox via `GET /swarm/inbox`.
 
+Swarm messages are mirrored into the receiver's Telegram topic at insert time via outbox `kind='swarm'` (`w:<msg_id>` notice, `wc:<msg_id>` retraction). This feed is best-effort and indicates message dispatch rather than transcript delivery. Outbox rate limits (`SWARM_SUB_BUDGET = 6`/60s) prevent swarm bursts from starving conversational notifications or triggering Telegram topic rate limits.
+
 This fixes the prompt_async race architecturally — the daemon is the single writer to opencode serve for cross-session messages, so the "concurrent prompt_async from different `x-opencode-directory` headers bypasses the busy guard" race that bit COPS-6107 cannot occur for daemon-routed traffic. See the `swarm-architecture` skill for tables/routes/algorithm and `swarm-operations` for ops + debugging.
 
 ### Commands
@@ -96,7 +98,7 @@ The session ID is included in the Telegram confirmation message.
 
 Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name. Each notification includes the session ID on its own line for easy copy-paste.
 
-**Durable notification delivery:** Both stop and question notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
+**Durable notification delivery:** Stop, question, and swarm mirror notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
 
 **Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7%` footer showing the cumulative context-window usage reported by the latest assistant message and its percentage of the model's context window. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved.
 
