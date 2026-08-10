@@ -54,16 +54,22 @@ export interface OutboxSenderOptions {
  */
 const MAX_ATTEMPTS = 10;
 
+const MIRROR_TTL_MS = 6 * 60 * 60 * 1000;
+
 /**
  * Outbox expiry durations grounded in system affordance TTLs.
  * - question: PENDING_QUESTION_TTL_MS (4h) - pending question expires after 4h so reply can't route
  * - stop/card: REPLY_TOKEN_TTL_MS (24h) - reply token expires after 24h so reply can't route
+ * - swarm: REPLY_TOKEN_TTL_MS (24h) - a stale swarm post still explains history
+ * - mirror: MIRROR_TTL_MS (6h) - a stale prompt mirror has no value
  * - default: REPLY_TOKEN_TTL_MS (24h)
  */
 const EXPIRY_BY_KIND: Record<string, number> = {
   question: PENDING_QUESTION_TTL_MS,
   stop: REPLY_TOKEN_TTL_MS,
   card: REPLY_TOKEN_TTL_MS,
+  swarm: REPLY_TOKEN_TTL_MS,
+  mirror: MIRROR_TTL_MS,
 };
 
 export function expiryForKind(kind: string): number {

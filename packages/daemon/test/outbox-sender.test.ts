@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
+import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
 import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
@@ -927,6 +928,11 @@ describe("chunkNotificationId unit tests", () => {
 });
 
 describe("expiryForKind unit tests", () => {
+  it("expires swarm after 24h and mirror after 6h", () => {
+    expect(expiryForKind("swarm")).toBe(REPLY_TOKEN_TTL_MS);
+    expect(expiryForKind("mirror")).toBe(6 * 60 * 60 * 1000);
+  });
+
   it("returns PENDING_QUESTION_TTL_MS (4h) for question", () => {
     expect(expiryForKind("question")).toBe(4 * 60 * 60 * 1000);
   });
