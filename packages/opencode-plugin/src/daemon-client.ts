@@ -64,6 +64,14 @@ type NotifyQuestionAnsweredOpts = {
   log: LogFn
 }
 
+type PostMirrorOpts = {
+  sessionId: string
+  messageId: string
+  text: string
+  daemonUrl?: string
+  log?: LogFn
+}
+
 type DaemonResult = { ok: boolean; deliveryState?: string; notified?: boolean } | null
 
 const BreakerState = { Closed: 0, Open: 1, HalfOpen: 2 } as const
@@ -292,6 +300,39 @@ export async function sendQuestionAsked(opts: NotifyQuestionAskedOpts): Promise<
 
   const data = (await res.json()) as { ok: boolean; deliveryState?: string; notified?: boolean }
   return data
+}
+
+export async function postMirror(opts: PostMirrorOpts): Promise<{ mirrored: boolean } | null> {
+  if (!checkBreaker()) return null
+
+  const url = getDaemonUrl(opts.daemonUrl)
+
+  try {
+    const res = await fetchDaemon(`${url}/mirror`, {
+      method: "POST",
+      body: JSON.stringify({
+        sessionId: opts.sessionId,
+        messageId: opts.messageId,
+        text: opts.text,
+      }),
+      signal: AbortSignal.timeout(3000),
+    })
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      opts.log?.("daemon returned error for mirror", { status: res.status, body: text })
+      onFailure()
+      return null
+    }
+
+    const data = (await res.json()) as { mirrored: boolean }
+    onSuccess()
+    return data
+  } catch (err) {
+    onFailure()
+    opts.log?.("postMirror failed:", err instanceof Error ? { message: err.message } : String(err))
+    return null
+  }
 }
 
 export function _resetBreakerForTesting(): void {

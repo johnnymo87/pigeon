@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 import { invalidateDaemonToken } from "../src/auth-token"
-import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, _resetBreakerForTesting } from "../src/daemon-client"
+import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, postMirror, _resetBreakerForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
 
@@ -895,6 +895,50 @@ describe("daemon-client", () => {
         invalidateDaemonToken()
         fs.rmSync(tmpDir, { recursive: true, force: true })
       }
+    })
+  })
+
+  describe("postMirror", () => {
+    test("sends POST /mirror with sessionId, messageId, text and returns daemon response", async () => {
+      server?.close()
+      server = await createTestServer(async (req) => {
+        const url = new URL(req.url)
+        const body = await req.json()
+        requestLog.push({ path: url.pathname, body })
+        return Response.json({ mirrored: true })
+      })
+      serverPort = server.port
+
+      const opts = {
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello from TUI",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      const res = await postMirror(opts)
+      expect(res).toEqual({ mirrored: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].path).toBe("/mirror")
+      expect(requestLog[0].body).toEqual({
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello from TUI",
+      })
+    })
+
+    test("returns null and fails open on daemon error / unreachable", async () => {
+      const opts = {
+        sessionId: "ses_1",
+        messageId: "msg_1",
+        text: "Hello from TUI",
+        daemonUrl: "http://127.0.0.1:99999",
+        log: mockLog,
+      }
+
+      const res = await postMirror(opts)
+      expect(res).toBeNull()
     })
   })
 })
