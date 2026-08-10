@@ -4,6 +4,8 @@ import {
   type OutcomeObservation,
 } from "./routing/serve-outcome";
 import { resolveServeAuthHeader, invalidateServeAuthHeader } from "./serve-auth";
+import type { InjectedPromptsRepository } from "./storage/injected-prompts-repo";
+import { hashPrompt } from "./hash-prompt";
 
 export class OpencodeHttpError extends Error {
   readonly status: number;
@@ -35,6 +37,7 @@ interface OpencodeClientOptions {
    * nothing reads its output for routing. See routing/serve-outcome.ts.
    */
   onOutcome?: (obs: OutcomeObservation) => void;
+  injectedPrompts?: InjectedPromptsRepository;
 }
 
 /**
@@ -51,12 +54,14 @@ export class OpencodeClient {
   private readonly fetchFn: typeof fetch;
   private readonly requestTimeoutMs: number;
   private readonly onOutcome: ((obs: OutcomeObservation) => void) | undefined;
+  private readonly injectedPrompts: InjectedPromptsRepository | undefined;
 
   constructor(options: OpencodeClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.fetchFn = options.fetchFn ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.onOutcome = options.onOutcome;
+    this.injectedPrompts = options.injectedPrompts;
   }
 
   /** Never let the observability tap perturb the request it is observing. */
@@ -320,6 +325,7 @@ export class OpencodeClient {
   }
 
   async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
+    this.injectedPrompts?.record(sessionId, hashPrompt(prompt));
     return this.request(
       `${this.baseUrl}/session/${sessionId}/prompt_async`,
       {

@@ -13,6 +13,8 @@ import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
 import { decideNotify, effectiveNotifyPolicy, type NotifyDecision } from "./notify-policy";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
+import { hashPrompt } from "./hash-prompt";
+import { TgMessageBuilder } from "./telegram-message";
 
 interface LegacySession {
   session_id: string;
@@ -764,6 +766,81 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             tokens: cleanedTokens,
           },
         });
+      }
+
+      if (request.method === "POST" && url.pathname === "/mirror") {
+        const body = await readJsonBody(request);
+        const sessionId =
+          typeof body.sessionId === "string" && body.sessionId
+            ? body.sessionId
+            : typeof body.session_id === "string"
+              ? body.session_id
+              : "";
+        if (!sessionId) {
+          return Response.json({ error: "sessionId is required" }, { status: 400 });
+        }
+
+        const messageId =
+          typeof body.messageId === "string" && body.messageId
+            ? body.messageId
+            : typeof body.message_id === "string"
+              ? body.message_id
+              : "";
+        if (!messageId) {
+          return Response.json({ error: "messageId is required" }, { status: 400 });
+        }
+
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text.trim()) {
+          return Response.json({ mirrored: false });
+        }
+
+        const now = nowFn();
+        const hash = hashPrompt(text);
+
+        if (storage.injectedPrompts.consume(sessionId, hash, now)) {
+          return Response.json({ mirrored: false });
+        }
+
+        const session = storage.sessions.get(sessionId);
+        if (session) {
+          storage.sessions.touch(sessionId, now);
+        }
+
+        const label = displayName({
+          title: session?.title,
+          label: session?.label,
+          sessionId,
+        });
+
+        const header = new TgMessageBuilder().append(`🧑 ${label}`).build();
+        const bodyMsg = new TgMessageBuilder().append(text).build();
+        const footer = new TgMessageBuilder().build();
+
+        const chunks = splitTelegramMessage(header, bodyMsg, footer);
+        const notificationId = `m:${sessionId}:${messageId}`;
+        const notificationPayload = {
+          messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
+          replyMarkup: undefined,
+          notificationId,
+          title: session?.title ?? undefined,
+          dir: session?.cwd ?? undefined,
+          threaded: true,
+        };
+
+        storage.outbox.upsert(
+          {
+            notificationId,
+            sessionId,
+            requestId: `mirror-${sessionId}-${messageId}`,
+            kind: "mirror",
+            payload: JSON.stringify(notificationPayload),
+            token: "",
+          },
+          now,
+        );
+
+        return Response.json({ mirrored: true });
       }
 
       if (request.method === "POST" && url.pathname === "/stop") {

@@ -17,6 +17,7 @@ interface ReapResult {
   reaped: number;
   expired: number;
   orphanedQuestions: number;
+  expiredInjectedPrompts: number;
 }
 
 export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
@@ -58,7 +59,12 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     log(`cleaned ${orphanedQuestions} orphaned pending question records`);
   }
 
-  return { reaped, expired, orphanedQuestions };
+  const expiredInjectedPrompts = deps.storage.injectedPrompts.cleanupExpired(now);
+  if (expiredInjectedPrompts > 0) {
+    log(`cleaned ${expiredInjectedPrompts} expired injected prompt records`);
+  }
+
+  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts };
 }
 
 interface StartReaperDeps extends ReapDeps {

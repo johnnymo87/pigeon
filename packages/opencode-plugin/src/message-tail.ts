@@ -22,6 +22,14 @@ export type FileInfo = {
   url: string;
 }
 
+export type MessageTailOptions = {
+  postMirror?: (opts: { sessionId: string; messageId: string; text: string }) => Promise<unknown>
+  isMainSession?: (sessionId: string) => boolean
+  getDiscoveryPromise?: (sessionId: string) => Promise<void> | undefined
+  log?: (message: string, data?: unknown) => void
+  debounceMs?: number
+}
+
 type MessageInfo = Pick<Message, "id" | "sessionID" | "role">
 type PartInfo = Pick<Part, "id" | "sessionID" | "messageID" | "type">
 
@@ -33,9 +41,58 @@ type SessionTail = {
   lastSeenAt: number
 }
 
+type UserPartData = {
+  id: string
+  type: string
+  text: string
+  synthetic?: boolean
+}
+
+type UserMessageBuffer = {
+  messageID: string
+  sessionID: string
+  parts: Map<string, UserPartData>
+  timer: ReturnType<typeof setTimeout>
+}
+
+async function waitForDiscovery(promise: Promise<void>, timeoutMs = 1000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs)
+    if (timer.unref) {
+      timer.unref()
+    }
+  })
+  try {
+    await Promise.race([
+      promise.catch(() => {}),
+      timeoutPromise,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export class MessageTail {
   private sessions = new Map<string, SessionTail>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
+
+  private postMirror?: MessageTailOptions["postMirror"]
+  private isMainSession?: MessageTailOptions["isMainSession"]
+  private getDiscoveryPromise?: MessageTailOptions["getDiscoveryPromise"]
+  private log?: MessageTailOptions["log"]
+  private debounceMs: number
+
+  private messageRoles = new Map<string, { sessionID: string; role: string }>()
+  private userBuffers = new Map<string, UserMessageBuffer>()
+
+  constructor(options?: MessageTailOptions) {
+    this.postMirror = options?.postMirror
+    this.isMainSession = options?.isMainSession
+    this.getDiscoveryPromise = options?.getDiscoveryPromise
+    this.log = options?.log
+    this.debounceMs = options?.debounceMs ?? 500
+  }
 
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
@@ -49,19 +106,34 @@ export class MessageTail {
   }
 
   onMessageUpdated(info: MessageInfo): void {
+    this.messageRoles.set(info.id, { sessionID: info.sessionID, role: info.role })
+
     const tail = this.getOrCreate(info.sessionID)
     tail.seenAnyMessage = true
 
-    if (info.role !== "assistant") return
-
-    if (tail.currentMessageId !== info.id) {
-      tail.currentMessageId = info.id
-      tail.text = ""
-      tail.files = []
+    if (info.role === "assistant") {
+      if (tail.currentMessageId !== info.id) {
+        tail.currentMessageId = info.id
+        tail.text = ""
+        tail.files = []
+      }
+      const pendingBuffer = this.userBuffers.get(info.id)
+      if (pendingBuffer) {
+        clearTimeout(pendingBuffer.timer)
+        this.userBuffers.delete(info.id)
+      }
     }
   }
 
-  onPartUpdated(part: PartInfo & { mime?: string; filename?: string; url?: string; state?: { status?: string; attachments?: Array<{ mime?: string; filename?: string; url?: string }> } }, delta?: string): void {
+  onPartUpdated(part: PartInfo & { synthetic?: boolean; text?: string; mime?: string; filename?: string; url?: string; state?: { status?: string; attachments?: Array<{ mime?: string; filename?: string; url?: string }> } }, delta?: string): void {
+    const roleInfo = this.messageRoles.get(part.messageID)
+    const currentAssistantMsgId = this.sessions.get(part.sessionID)?.currentMessageId
+
+    if (roleInfo?.role === "user" || (roleInfo === undefined && part.messageID !== currentAssistantMsgId)) {
+      this.handleUserPartUpdated(part, delta)
+      if (roleInfo?.role === "user") return
+    }
+
     // Handle file parts
     if (part.type === "file" && part.mime && part.url) {
       const tail = this.getOrCreate(part.sessionID)
@@ -112,6 +184,104 @@ export class MessageTail {
     }
   }
 
+  private handleUserPartUpdated(
+    part: PartInfo & { synthetic?: boolean; text?: string },
+    delta?: string,
+  ): void {
+    let buffer = this.userBuffers.get(part.messageID)
+    if (!buffer) {
+      buffer = {
+        messageID: part.messageID,
+        sessionID: part.sessionID,
+        parts: new Map(),
+        timer: setTimeout(() => {}, 0),
+      }
+      clearTimeout(buffer.timer)
+      this.userBuffers.set(part.messageID, buffer)
+    } else {
+      clearTimeout(buffer.timer)
+    }
+
+    let partData = buffer.parts.get(part.id)
+    if (!partData) {
+      partData = {
+        id: part.id,
+        type: part.type,
+        text: "",
+        synthetic: part.synthetic === true,
+      }
+      buffer.parts.set(part.id, partData)
+    }
+
+    if (part.synthetic === true) {
+      partData.synthetic = true
+    }
+    if (part.type) {
+      partData.type = part.type
+    }
+
+    if (part.type === "text") {
+      if (delta !== undefined) {
+        partData.text += delta
+      } else if (part.text !== undefined) {
+        partData.text = part.text
+      }
+    }
+
+    buffer.timer = setTimeout(() => {
+      this.flushUserMessage(part.messageID)
+    }, this.debounceMs)
+
+    if (buffer.timer.unref) {
+      buffer.timer.unref()
+    }
+  }
+
+  private async flushUserMessage(messageID: string): Promise<void> {
+    const buffer = this.userBuffers.get(messageID)
+    if (!buffer) return
+
+    clearTimeout(buffer.timer)
+    this.userBuffers.delete(messageID)
+
+    // Exclusion 1: Subagent sessions
+    if (this.isMainSession && !this.isMainSession(buffer.sessionID)) {
+      const discoveryPromise = this.getDiscoveryPromise?.(buffer.sessionID)
+      if (discoveryPromise) {
+        await waitForDiscovery(discoveryPromise, 1000)
+      }
+      if (!this.isMainSession(buffer.sessionID)) {
+        return
+      }
+    }
+
+    // Exclusion 2 & 3: Filter synthetic parts and non-text parts (e.g. compaction)
+    const textParts: string[] = []
+    for (const partData of buffer.parts.values()) {
+      if (partData.synthetic) continue
+      if (partData.type === "text") {
+        textParts.push(partData.text)
+      }
+    }
+
+    if (textParts.length === 0) return
+
+    const text = textParts.join("")
+
+    // Exclusion 4: Empty or whitespace-only text
+    if (!text.trim()) return
+
+    if (this.postMirror) {
+      this.postMirror({
+        sessionId: buffer.sessionID,
+        messageId: buffer.messageID,
+        text,
+      }).catch((err) => {
+        this.log?.("postMirror error:", err)
+      })
+    }
+  }
+
   getSummary(sessionID: string): string {
     const tail = this.sessions.get(sessionID)
     if (!tail || !tail.text) return ""
@@ -140,6 +310,19 @@ export class MessageTail {
 
   clear(sessionID: string): void {
     this.sessions.delete(sessionID)
+
+    for (const [msgID, buffer] of this.userBuffers) {
+      if (buffer.sessionID === sessionID) {
+        clearTimeout(buffer.timer)
+        this.userBuffers.delete(msgID)
+      }
+    }
+
+    for (const [msgID, roleInfo] of this.messageRoles) {
+      if (roleInfo.sessionID === sessionID) {
+        this.messageRoles.delete(msgID)
+      }
+    }
   }
 
   startEviction(intervalMs = 3600_000): void {
@@ -167,7 +350,7 @@ export class MessageTail {
       }
 
       for (const id of idsToDelete) {
-        this.sessions.delete(id)
+        this.clear(id)
       }
     }, intervalMs)
 

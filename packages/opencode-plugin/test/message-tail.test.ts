@@ -1128,4 +1128,476 @@ describe("MessageTail", () => {
       expect(tail.getFiles("session-1")).toHaveLength(1)
     })
   })
+
+  describe("user prompt mirroring (Task 14)", () => {
+    test("a TUI-typed user message -> exactly one POST /mirror with the right fields", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-user-1",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-user-1",
+          type: "text",
+        },
+        "Fix the build error"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0]).toEqual({
+        sessionId: "session-1",
+        messageId: "msg-user-1",
+        text: "Fix the build error",
+      })
+    })
+
+    test("multiple parts arriving within the debounce window -> ONE POST containing the full text", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 100,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-user-2",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-user-2",
+          type: "text",
+        },
+        "First line\n"
+      )
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      tail.onPartUpdated(
+        {
+          id: "part-2",
+          sessionID: "session-1",
+          messageID: "msg-user-2",
+          type: "text",
+        },
+        "Second line"
+      )
+
+      await new Promise((r) => setTimeout(r, 150))
+
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0]).toEqual({
+        sessionId: "session-1",
+        messageId: "msg-user-2",
+        text: "First line\nSecond line",
+      })
+    })
+
+    test("a part arriving after a flush -> treated as a new flush, not merged", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-user-3",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-user-3",
+          type: "text",
+        },
+        "Initial text"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("Initial text")
+
+      // Part arrives after flush
+      tail.onPartUpdated(
+        {
+          id: "part-2",
+          sessionID: "session-1",
+          messageID: "msg-user-3",
+          type: "text",
+        },
+        " Appended text"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(2)
+      expect(mirrors[1].text).toBe(" Appended text")
+    })
+
+    test("subagent session (parentID present) -> no POST", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: (sessionId) => sessionId !== "subagent-session",
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-sub-1",
+        sessionID: "subagent-session",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "subagent-session",
+          messageID: "msg-sub-1",
+          type: "text",
+        },
+        "Subagent chatter"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("synthetic part -> excluded from the text (and if nothing remains, no POST)", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      // 1. Synthetic part only -> no POST
+      tail.onMessageUpdated({
+        id: "msg-synth-1",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-synth",
+          sessionID: "session-1",
+          messageID: "msg-synth-1",
+          type: "text",
+          synthetic: true,
+        } as any,
+        "Quiet swarm note"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+
+      // 2. Mixed real and synthetic parts -> only real part included
+      tail.onMessageUpdated({
+        id: "msg-synth-2",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-real",
+          sessionID: "session-1",
+          messageID: "msg-synth-2",
+          type: "text",
+        },
+        "User typed prompt"
+      )
+
+      tail.onPartUpdated(
+        {
+          id: "part-synth-2",
+          sessionID: "session-1",
+          messageID: "msg-synth-2",
+          type: "text",
+          synthetic: true,
+        } as any,
+        "\nSynthetic append"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("User typed prompt")
+    })
+
+    test("compaction-only message (no text parts) -> no POST", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-compact-1",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated({
+        id: "part-compact",
+        sessionID: "session-1",
+        messageID: "msg-compact-1",
+        type: "compaction",
+        auto: false,
+        tail_start_id: "msg-0",
+      } as any)
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("daemon unreachable / non-2xx -> no throw, silently dropped", async () => {
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async () => {
+          throw new Error("Connection refused")
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-fail-1",
+        sessionID: "session-1",
+        role: "user",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-fail-1",
+          type: "text",
+        },
+        "Text that fails to mirror"
+      )
+
+      await expect(new Promise((r) => setTimeout(r, 100))).resolves.not.toThrow()
+    })
+
+    test("assistant-role messages -> no POST", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+      const tail = new MessageTail({
+        debounceMs: 50,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-asst-1",
+        sessionID: "session-1",
+        role: "assistant",
+      })
+
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "session-1",
+          messageID: "msg-asst-1",
+          type: "text",
+        },
+        "Assistant output"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("unknown-at-flush session whose discovery resolves as a main session -> mirrors after discovery settles", async () => {
+      let discoveryResolve: (() => void) | undefined
+      const discoveryPromise = new Promise<void>((res) => {
+        discoveryResolve = res
+      })
+
+      let isMain = false
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => isMain,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-1",
+        sessionID: "sess-late-main",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-late-main",
+          messageID: "msg-1",
+          type: "text",
+        },
+        "First prompt after restart"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+
+      isMain = true
+      discoveryResolve!()
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("First prompt after restart")
+    })
+
+    test("unknown-at-flush whose discovery resolves as a subagent -> no mirror", async () => {
+      let discoveryResolve: (() => void) | undefined
+      const discoveryPromise = new Promise<void>((res) => {
+        discoveryResolve = res
+      })
+
+      let isMain = false
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => isMain,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-sub",
+        sessionID: "sess-late-sub",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-late-sub",
+          messageID: "msg-sub",
+          type: "text",
+        },
+        "Subagent prompt"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mirrors).toHaveLength(0)
+
+      discoveryResolve!()
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("discovery that never settles -> no mirror, no hung timer, no unhandled rejection", async () => {
+      const discoveryPromise = new Promise<void>(() => {})
+
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => false,
+        getDiscoveryPromise: () => discoveryPromise,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      tail.onMessageUpdated({
+        id: "msg-hung",
+        sessionID: "sess-hung",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-hung",
+          messageID: "msg-hung",
+          type: "text",
+        },
+        "Prompt with hung discovery"
+      )
+
+      await new Promise((r) => setTimeout(r, 1150))
+      expect(mirrors).toHaveLength(0)
+    })
+
+    test("already-known main session -> unchanged single mirror with no added delay", async () => {
+      const mirrors: Array<{ sessionId: string; messageId: string; text: string }> = []
+
+      const tail = new MessageTail({
+        debounceMs: 50,
+        isMainSession: () => true,
+        getDiscoveryPromise: () => undefined,
+        postMirror: async (opts) => {
+          mirrors.push(opts)
+          return { mirrored: true }
+        },
+      })
+
+      const start = Date.now()
+      tail.onMessageUpdated({
+        id: "msg-known",
+        sessionID: "sess-known",
+        role: "user",
+      })
+      tail.onPartUpdated(
+        {
+          id: "part-1",
+          sessionID: "sess-known",
+          messageID: "msg-known",
+          type: "text",
+        },
+        "Known main prompt"
+      )
+
+      await new Promise((r) => setTimeout(r, 100))
+      const elapsed = Date.now() - start
+
+      expect(mirrors).toHaveLength(1)
+      expect(mirrors[0].text).toBe("Known main prompt")
+      expect(elapsed).toBeLessThan(500)
+    })
+  })
 })

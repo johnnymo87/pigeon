@@ -18,6 +18,8 @@ import { SessionOriginRepository } from "./session-origin-repo";
 import { initRouteSchema } from "../routing/route-schema";
 import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMetaRepo } from "../routing/route-repo";
 import { initReassignmentSchema, ReassignmentEventRepo } from "../routing/reassignment-repo";
+import { initInjectedPromptsSchema } from "./injected-prompts-schema";
+import { InjectedPromptsRepository } from "./injected-prompts-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -30,6 +32,7 @@ export interface StorageDb {
   alerts: AlertRepository;
   swarm: SwarmRepository;
   sessionOrigins: SessionOriginRepository;
+  injectedPrompts: InjectedPromptsRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
@@ -48,6 +51,7 @@ export function openStorageDb(path: string): StorageDb {
   initSchema(db);
   initSwarmSchema(db);
   initSessionOriginSchema(db);
+  initInjectedPromptsSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
@@ -65,6 +69,7 @@ export function openStorageDb(path: string): StorageDb {
     alerts: new AlertRepository(db),
     swarm: new SwarmRepository(db),
     sessionOrigins: new SessionOriginRepository(db),
+    injectedPrompts: new InjectedPromptsRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),

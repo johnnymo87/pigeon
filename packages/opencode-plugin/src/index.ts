@@ -4,7 +4,7 @@ import {
   ResultErrorCode,
   type ExecuteCommandEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
-import { registerSession, notifyStop, notifyQuestionAnswered, sendQuestionAsked } from "./daemon-client"
+import { registerSession, notifyStop, notifyQuestionAnswered, sendQuestionAsked, postMirror } from "./daemon-client"
 import { QuestionDeliveryQueue } from "./question-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
@@ -28,13 +28,6 @@ const plugin: Plugin = async (ctx) => {
     const sdkClientConfig = (ctx.client as any)._client?.getConfig?.()
     const internalFetch: typeof fetch = sdkClientConfig?.fetch ?? globalThis.fetch
 
-    const messageTail = new MessageTail()
-    const sessionManager = new SessionManager()
-
-    // Start TTL eviction for stale sessions (24h staleness, 1h interval)
-    sessionManager.startEviction()
-    messageTail.startEviction()
-
     // SDK-native logging wrapper
     const log = (message: string, data?: unknown): void => {
       try {
@@ -50,12 +43,25 @@ const plugin: Plugin = async (ctx) => {
       } catch {}
     }
 
-    const tokenTracker = new TokenTracker()
-    const providerCache = new ProviderCache(log)
+    const sessionManager = new SessionManager()
 
     const daemonUrl =
       process.env.PIGEON_DAEMON_URL ??
       `http://127.0.0.1:${process.env.TELEGRAM_WEBHOOK_PORT ?? "4731"}`
+
+    const messageTail = new MessageTail({
+      postMirror: (opts) => postMirror({ ...opts, daemonUrl, log }),
+      isMainSession: (sessionId) => sessionManager.isMainSession(sessionId),
+      getDiscoveryPromise: (sessionId) => sessionManager.getDiscoveryPromise(sessionId),
+      log,
+    })
+
+    // Start TTL eviction for stale sessions (24h staleness, 1h interval)
+    sessionManager.startEviction()
+    messageTail.startEviction()
+
+    const tokenTracker = new TokenTracker()
+    const providerCache = new ProviderCache(log)
 
     const questionQueue = new QuestionDeliveryQueue({
       log,
@@ -494,6 +500,7 @@ const plugin: Plugin = async (ctx) => {
           const delta = props?.delta as string | undefined
 
           if (part?.id && part?.sessionID && part?.messageID && part?.type) {
+            lateDiscoverSession(part.sessionID).catch(() => {})
             messageTail.onPartUpdated(part, delta)
           }
 

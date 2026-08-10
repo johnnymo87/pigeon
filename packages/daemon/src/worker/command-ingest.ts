@@ -1,5 +1,6 @@
 import type { StorageDb } from "../storage/database";
 import type { SessionRecord } from "../storage/types";
+import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult } from "../adapters/types";
 import { DirectChannelAdapter } from "../adapters/direct-channel";
 import { NvimRpcAdapter } from "../adapters/nvim-rpc";
@@ -77,13 +78,13 @@ function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   return OpencodeDirectSource.TelegramReply;
 }
 
-function selectAdapter(session: SessionRecord): CommandDeliveryAdapter | null {
+function selectAdapter(session: SessionRecord, injectedPrompts?: InjectedPromptsRepository): CommandDeliveryAdapter | null {
   if (
     session.backendKind === "opencode-plugin-direct"
     && session.backendEndpoint
     && session.backendAuthToken
   ) {
-    return new DirectChannelAdapter();
+    return new DirectChannelAdapter({ injectedPrompts });
   }
 
   if (session.nvimSocket && session.ptyPath) {
@@ -333,7 +334,7 @@ export async function ingestWorkerCommand(
 
       const adapter = options.createAdapter
         ? options.createAdapter(session)
-        : selectAdapter(session);
+        : selectAdapter(session, storage.injectedPrompts);
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -404,7 +405,7 @@ export async function ingestWorkerCommand(
 
     const adapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session);
+      : selectAdapter(session, storage.injectedPrompts);
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -483,7 +484,7 @@ export async function ingestWorkerCommand(
 
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session);
+      : selectAdapter(session, storage.injectedPrompts);
 
     if (fallbackAdapter?.deliverQuestionReply) {
       const answers: string[][] = [[msg.command.trim()]];
@@ -541,7 +542,7 @@ export async function ingestWorkerCommand(
 
   const adapter = options.createAdapter
     ? options.createAdapter(session)
-    : selectAdapter(session);
+    : selectAdapter(session, storage.injectedPrompts);
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
