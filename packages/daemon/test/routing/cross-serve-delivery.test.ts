@@ -172,6 +172,10 @@ describe("cross-serve-delivery integration", () => {
       storage,
       clientForSession,
       directoryForSession,
+      // Fake serves resolve to fictional directories; the real preflight
+      // (pigeon-0ay7) would refuse them. Cross-serve routing is what is under
+      // test here, not the preflight.
+      directoryMissing: () => false,
       nowFn: () => now,
       log: () => {},
     });

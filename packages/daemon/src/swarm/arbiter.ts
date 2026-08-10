@@ -15,6 +15,7 @@ export interface ArbiterClient {
   sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void>;
 }
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
+import { directoryMissing } from "./directory-check";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
   isOutageFailure,
@@ -29,6 +30,12 @@ export interface ArbiterOptions {
   storage: StorageDb;
   clientForSession: (sessionId: string) => ArbiterClient | undefined;   // replaces opencodeClient
   directoryForSession: (sessionId: string) => Promise<string | undefined>; // replaces registry
+  /**
+   * Working-directory preflight (pigeon-0ay7). Injected for testability, and
+   * doubling as the escape hatch if serves ever stop sharing the daemon's
+   * filesystem: pass `() => false` and the preflight disappears.
+   */
+  directoryMissing?: (dir: string) => boolean;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -55,6 +62,7 @@ export class SwarmArbiter {
   private readonly storage: StorageDb;
   private readonly clientForSession: (sessionId: string) => ArbiterClient | undefined;
   private readonly directoryForSession: (sessionId: string) => Promise<string | undefined>;
+  private readonly directoryMissing: (dir: string) => boolean;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -71,6 +79,7 @@ export class SwarmArbiter {
     this.storage = opts.storage;
     this.clientForSession = opts.clientForSession;
     this.directoryForSession = opts.directoryForSession;
+    this.directoryMissing = opts.directoryMissing ?? directoryMissing;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
@@ -222,6 +231,56 @@ export class SwarmArbiter {
           },
           next.payload,
         );
+
+        // WORKING-DIRECTORY PREFLIGHT (pigeon-0ay7).
+        //
+        // MEASURED 2026-08-10 on cloudbox, and the measurement is the whole
+        // reason this blocks rather than merely annotating: prompt_async against
+        // a session whose directory has been deleted returns HTTP 204. The serve
+        // does NOT validate the directory. So without this check `markHandedOff`
+        // fires below and the row records a delivery that never happened — a
+        // FALSE SUCCESS of exactly the class pigeon-fnx removed everywhere else.
+        // The turn does fail (PlatformError: NotFound: FileSystem.realPath), but
+        // only on the plugin's event stream; the arbiter is told 204, and the
+        // SENDER is told nothing at all.
+        //
+        // WHY THIS IS ALLOWED TO DRIVE STATE, when the watchdog asks the same
+        // filesystem question and is explicitly forbidden from doing so (see
+        // "Task 2: Working-directory corroboration" in delivery-watchdog.ts;
+        // that one is an existsSync used for alert prose only).
+        // Two independent reasons, and BOTH are required:
+        //   1. SUBJECT. The watchdog's stat is evidence about a turn already
+        //      dispatched — a past remote event, where gone-now does not imply
+        //      gone-then. This stat is a precondition on an action NOT YET
+        //      TAKEN. The record it produces ("refused to send; directory
+        //      missing") is a true statement about our own behaviour even if
+        //      the stat is wrong. A wrong stat here makes the DECISION wrong;
+        //      it can never make the RECORD false. The axiom forbids false
+        //      records.
+        //   2. REVERSIBILITY. This throws TargetUnavailableError, which
+        //      isOutageFailure classifies as an outage, so the row stays
+        //      `queued` and retryable. No terminal is minted here. Terminals
+        //      still arrive only via the existing expiry sweep or attempt
+        //      budget, both already RECORDED transitions that alert.
+        // The rule, stated so it survives paraphrase: this stat may REFUSE A
+        // FUTURE SEND; it may never RE-INTERPRET A DISPATCHED TURN.
+        //
+        // Ordering is deliberate: renderEnvelope runs FIRST so a
+        // PermanentDeliveryError (a fact about the payload, true regardless of
+        // the filesystem) fails fast instead of being masked behind an
+        // outage-retry loop that only ends at expiry. Pinned by test 6.
+        //
+        // ASSUMPTION: daemon and serve share a filesystem. True on this host,
+        // not structural. If serves go remote this silently answers about the
+        // wrong machine — inject `directoryMissing: () => false` at the wiring
+        // in index.ts to switch the preflight off rather than editing here.
+        if (this.directoryMissing(directory)) {
+          throw new TargetUnavailableError(
+            `target ${target} working directory missing: ${directory} ` +
+              `(stat on daemon filesystem; assumes daemon and serve are co-located)`,
+          );
+        }
+
         await client.sendPrompt(target, directory, prompt);
         const handedOff = this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
         if (!handedOff) {

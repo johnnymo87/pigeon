@@ -225,6 +225,39 @@ covered by policy and review, not by a test.
 
 The registry is what makes the daemon "the canonical source of `directory` for a session" — `pigeon-send` callers don't pass `--cwd`; the daemon looks it up. This is the core of the protocol simplification (no more "remember to pass `--cwd <target's-own-dir>`").
 
+### Two hazards before you build any pre-flight gate
+
+Both measured live on cloudbox. Both fail in the direction that *looks* like success, which is why they are here and not only in a code comment.
+
+**1. `GET /session/status` is INSTANCE-SCOPED, and absent means idle (pigeon-unlw).**
+
+Measured 2026-08-03, same serve, same moment, same session:
+
+```
+curl :4096/session/status
+  -> {}
+curl :4096/session/status -H 'x-opencode-directory: /home/dev/projects/pigeon'
+  -> {"ses_035c43657ffexoUZgTYsjMgDES":{"type":"busy"}}
+```
+
+The status map lives in `InstanceState` and opencode partitions instances by working directory, so the header selects *which map you read*. Worse, `status.set()` **deletes** the key when a session goes idle — so an empty map is indistinguishable from "all sessions idle" **by design**. The failure mode is: correct endpoint, correct serve, wrong instance, answer looks healthy. Nothing in the response tells you that you asked the wrong map.
+
+A busy-gate built without the header is therefore **a silent no-op that reports "idle", passes, and drops the prompt exactly as before.** Rules for any consumer:
+
+- send the session's directory header, the *same* directory the delivery will use (`directoryForSession`);
+- assert the serve you asked actually **owns** the session — a non-owning serve also answers `{}` rather than erroring;
+- treat **absent as UNKNOWN, not IDLE**, unless both hold.
+
+There is currently **no consumer of this endpoint in the daemon** — the only mention is a REFUSED DESIGN OPTION comment in `delivery-watchdog.ts`. If you adopt it, note that an unknown may only *delay or suppress* an alert (failing open into alerting is the safe direction); it may never justify a terminal.
+
+**2. `prompt_async` does NOT validate the working directory (pigeon-0ay7).**
+
+Measured 2026-08-10: against a session whose directory had been deleted, `prompt_async` returned **HTTP 204**. The turn then failed internally with `PlatformError: NotFound: FileSystem.realPath(<dir>)`, visible only on the plugin's event stream — never as an HTTP error. So a naive delivery records `handed_off` for a message the agent never saw, and the sender is told nothing.
+
+The arbiter therefore stats the directory before sending (`swarm/directory-check.ts`) and throws `TargetUnavailableError` when it is provably absent, which the existing outage path turns into a retry rather than a terminal.
+
+**The rule that governs both, and the one to carry forward:** a filesystem check may **refuse a future send**; it may never **re-interpret a turn already dispatched**. The same `stat` is sanctioned in the arbiter preflight and forbidden in the watchdog's silent-in-flight branch for exactly that reason.
+
 ## Telegram Topic Mirroring
 
 Every swarm IPC message is mirrored to the **receiver's** Telegram forum topic thread so operators can see why a session started working.
