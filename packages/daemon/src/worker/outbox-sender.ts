@@ -250,6 +250,7 @@ export class OutboxSender {
 
       const entries = this.storage.outbox.getReady(now, 5);
       const deferredLowPrioritySessions = new Set<string>();
+      let loggedSubBudgetDeferral = false;
 
       batchLoop: for (const entry of entries) {
         const now = this.nowFn();
@@ -335,13 +336,16 @@ export class OutboxSender {
             this.lowPrioritySendTimestamps.length + messages.length > SWARM_SUB_BUDGET
           ) {
             deferredLowPrioritySessions.add(entry.sessionId);
-            this.log("outbox sub-budget reached, deferring low-priority entry", {
-              kind: entry.kind,
-              notificationId: entry.notificationId,
-              countInWindow: this.lowPrioritySendTimestamps.length,
-              chunks: messages.length,
-              budget: SWARM_SUB_BUDGET,
-            });
+            if (!loggedSubBudgetDeferral) {
+              this.log("outbox sub-budget reached, deferring low-priority entry", {
+                kind: entry.kind,
+                notificationId: entry.notificationId,
+                countInWindow: this.lowPrioritySendTimestamps.length,
+                chunks: messages.length,
+                budget: SWARM_SUB_BUDGET,
+              });
+              loggedSubBudgetDeferral = true;
+            }
             continue;
           }
         }

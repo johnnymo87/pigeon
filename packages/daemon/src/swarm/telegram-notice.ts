@@ -31,7 +31,7 @@ export function enqueueSwarmTelegramNotice(
       }),
       toSessionId: record.toSession,
       msgId: record.msgId,
-      payload: record.payload,
+      payload: record.payload.toWellFormed(),
       createdAt: record.createdAt,
       deliverAt: record.deliverAt,
     });

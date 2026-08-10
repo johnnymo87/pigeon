@@ -2009,6 +2009,13 @@ describe("OutboxSender rate governor", () => {
     await sender.processOnce();
 
     expect(sendNotification).toHaveBeenCalledTimes(SWARM_SUB_BUDGET);
+
+    // m6: sub-budget-deferred entry is left completely untouched (still queued, no retry backoff)
+    const deferred = storage.outbox.getByNotificationId("notif-swarm-6")!;
+    expect(deferred.state).toBe("queued");
+    expect(deferred.attempts).toBe(0);
+    expect(deferred.nextRetryAt).toBeNull();
+    expect(deferred.retryCount).toBe(0);
   });
 
   it("still delivers a question while a swarm burst is saturating the sub-budget", async () => {
@@ -2183,6 +2190,64 @@ describe("OutboxSender rate governor", () => {
 
     expect(storage.outbox.getByNotificationId("w:msg_X")!.state).toBe("sent");
     expect(storage.outbox.getByNotificationId("wc:msg_X")!.state).toBe("sent");
+  });
+
+  it("logs sub-budget deferral at most once per tick (m4)", async () => {
+    // Entry 0: 5 chunks -> sends (countInWindow = 5)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_0",
+      notificationId: "notif-swarm-m4-0",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-0",
+      }),
+    }, 1_000);
+
+    // Entry 1: 2 chunks -> deferred (5 + 2 = 7 > 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_1",
+      notificationId: "notif-swarm-m4-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-1",
+      }),
+    }, 1_001);
+
+    // Entry 2: 2 chunks -> deferred (5 + 2 = 7 > 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_m4_2",
+      notificationId: "notif-swarm-m4-2",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-m4-2",
+      }),
+    }, 1_002);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const logSpy = vi.fn();
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+      log: logSpy,
+    });
+
+    await sender.processOnce();
+
+    const deferralLogs = logSpy.mock.calls.filter(
+      (call) => call[0] === "outbox sub-budget reached, deferring low-priority entry",
+    );
+    expect(deferralLogs).toHaveLength(1);
   });
 
   it("allows non-low-priority traffic (questions/stops/cards) to take all OUTBOX_RATE_LIMIT slots when no swarm work is queued", async () => {

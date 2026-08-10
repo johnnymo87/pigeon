@@ -5,6 +5,7 @@ import {
   formatQuestionWizardStep,
   formatSwarmNotification,
   formatSwarmCancelNotification,
+  formatEventTime,
   TelegramNotificationService,
   RateLimitError,
   displayName,
@@ -532,9 +533,19 @@ describe("formatQuestionNotification", () => {
 });
 
 describe("formatSwarmNotification", () => {
-  const createdAt = Date.parse("2026-08-10T12:00:00.000Z");
+  const createdAt = 1000;
+
+  it("formatEventTime renders short time when same day, or month day time when different day", () => {
+    const today = new Date(2026, 7, 10, 14, 30).getTime();
+    const sameDay = new Date(2026, 7, 10, 12, 3).getTime();
+    const diffDay = new Date(2026, 7, 9, 9, 15).getTime();
+
+    expect(formatEventTime(sameDay, today)).toBe("12:03");
+    expect(formatEventTime(diffDay, today)).toBe("Aug 9 09:15");
+  });
 
   it("header contains kind, priority, sender, and formatted event time", () => {
+    const createdAt = new Date(2026, 7, 10, 12, 0).getTime();
     const result = formatSwarmNotification({
       kind: "chat",
       priority: "normal",
@@ -543,16 +554,18 @@ describe("formatSwarmNotification", () => {
       msgId: "msg_abc123",
       payload: "Hello swarm",
       createdAt,
+      now: createdAt,
     });
 
     expect(result.header.text).toContain("📨 swarm · chat · normal");
     expect(result.header.text).toContain("from worker-agent");
-    expect(result.header.text).toContain("2026-08-10T12:00:00.000Z");
+    expect(result.header.text).toContain("12:00");
     expect(result.header.text).not.toContain("⏰ scheduled");
   });
 
   it("marks scheduled variant when deliverAt is in the future", () => {
-    const deliverAt = createdAt + 3600_000; // 2026-08-10T13:00:00.000Z
+    const createdAt = new Date(2026, 7, 10, 12, 0).getTime();
+    const deliverAt = new Date(2026, 7, 10, 13, 0).getTime();
     const result = formatSwarmNotification({
       kind: "task.assign",
       priority: "urgent",
@@ -562,12 +575,13 @@ describe("formatSwarmNotification", () => {
       payload: "Scheduled task",
       createdAt,
       deliverAt,
+      now: createdAt,
     });
 
     expect(result.header.text).toContain("📨 swarm · task.assign · urgent");
     expect(result.header.text).toContain("from coordinator");
-    expect(result.header.text).toContain("2026-08-10T12:00:00.000Z");
-    expect(result.header.text).toContain("⏰ scheduled 2026-08-10T13:00:00.000Z");
+    expect(result.header.text).toContain("12:00");
+    expect(result.header.text).toContain("⏰ scheduled 13:00");
   });
 
   it("footer carries msg_id and toSessionId with code entities", () => {

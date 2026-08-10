@@ -123,6 +123,18 @@ describe("enqueueSwarmTelegramNotice", () => {
       consoleSpy.mockRestore();
     }
   });
+
+  it("sanitizes ill-formed UTF-16 lone surrogates using toWellFormed()", () => {
+    const { storage, upsertCalls } = mockStorage();
+    const record = makeRecord({ payload: "bad surrogate \uD83D here" });
+    const now = 1786363205000;
+
+    enqueueSwarmTelegramNotice(storage, record, now);
+
+    expect(upsertCalls).toHaveLength(1);
+    const payload = JSON.parse(upsertCalls[0]!.input.payload);
+    expect(payload.messages[0].text).toContain("bad surrogate \uFFFD here");
+  });
 });
 
 describe("enqueueSwarmCancelNotice", () => {

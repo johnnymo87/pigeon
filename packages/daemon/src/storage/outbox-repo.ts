@@ -112,6 +112,10 @@ export class OutboxRepository {
    * Within a session, order is created_at per tier. The conversational tier preempts the
    * record tier. Conversational rows never reorder among themselves (pigeon-81p).
    * Record rows may be preempted by conversational rows (arbitration A').
+   *
+   * Note on group subquery behavior: the group subquery counts `queued` rows regardless of `next_retry_at`,
+   * so a question sitting in retry backoff still elevates its session's swarm rows into group 1 while itself
+   * being absent from the batch. Narrow, self-healing, bounded by the batch limit.
    */
   getReady(now = Date.now(), limit = 100): OutboxRecord[] {
     const rows = this.db
