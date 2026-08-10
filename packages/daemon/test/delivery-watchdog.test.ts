@@ -60,6 +60,12 @@ function textPart(start: number, end?: number): unknown {
   };
 }
 
+function alertRows(storage: any) {
+  return storage.db
+    .prepare("SELECT * FROM operational_alerts ORDER BY created_at, ref_msg_id")
+    .all() as Array<Record<string, unknown>>;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -440,15 +446,19 @@ describe("DeliveryWatchdog", () => {
 
     await watchdog.processOnce();
 
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-    const [text, severity] = sendPlainAlert.mock.calls[0]!;
+    const rows = alertRows(storage);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ref_msg_id).toBe("stuck:m1");
+    expect(rows[0]!.source).toBe("delivery-blocked-behind-turn");
+    expect(rows[0]!.severity).toBe("warning");
+    const text = String(rows[0]!.text);
     expect(text).toContain("ACTIVE");
     expect(text).toContain("m1");
     expect(text).toContain("ses_b");
     // Human-readable durations render alongside the raw ms values.
     expect(text).toContain("1000000ms (17min)");
     expect(text).toContain("1000ms (1s)");
-    expect(severity).toBe("warning");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
     expect(client.abortSession).not.toHaveBeenCalled();
     expect(storage.swarm.getByMsgId("m1")!.verifiedAt).toBeNull();
   });
@@ -469,7 +479,10 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(1_000_000);
 
     await watchdog.processOnce();
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const rows1 = alertRows(storage);
+    expect(rows1).toHaveLength(1);
+    expect(rows1[0]!.ref_msg_id).toBe("stuck:m1");
+    expect(rows1[0]!.source).toBe("delivery-blocked-behind-turn");
     expect((watchdog as any).stuckAlerted.has("m1")).toBe(true);
 
     // Repeat cycles: alert must not fire again.
@@ -477,7 +490,8 @@ describe("DeliveryWatchdog", () => {
     await watchdog.processOnce();
     fixture.setNow(1_100_000);
     await watchdog.processOnce();
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect(alertRows(storage)).toHaveLength(1);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
 
     // Now let it verify — the dedupe entry should be pruned.
     client.getSessionMessages.mockImplementation(async () => [
@@ -1077,7 +1091,11 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(1_000_000);
 
     await watchdog.processOnce();
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    const rows = alertRows(storage);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ref_msg_id).toBe("stuck:m1");
+    expect(rows[0]!.source).toBe("delivery-blocked-behind-turn");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
     expect((watchdog as any).stuckAlerted.has("m1")).toBe(true);
 
     // Simulate out-of-band deletion (e.g. manual DB cleanup or nudge deletion)
@@ -1171,11 +1189,15 @@ describe("DeliveryWatchdog", () => {
 
     insertHandedOff({ msgId: "m1", fromSession: "ses_a", toSession: "ses_b", handedOffAt: 0 });
 
-    // Step 1: past stuckAlertMs -> one warn alert, no intervention.
+    // Step 1: past stuckAlertMs -> one warn alert (now durable), no intervention.
     fixture.setNow(1_000_000);
     await watchdog.processOnce();
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-    expect(sendPlainAlert.mock.calls[0]![1]).toBe("warning");
+    const rowsStep1 = alertRows(storage);
+    expect(rowsStep1).toHaveLength(1);
+    expect(rowsStep1[0]!.ref_msg_id).toBe("stuck:m1");
+    expect(rowsStep1[0]!.source).toBe("delivery-blocked-behind-turn");
+    expect(rowsStep1[0]!.severity).toBe("warning");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
     expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
 
     // Step 2: silence now far past the OLD abort threshold. We keep waiting,
@@ -1185,7 +1207,8 @@ describe("DeliveryWatchdog", () => {
     expect(storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
     expect(storage.swarm.getByMsgId("m1")!.abortedAt).toBeNull();
     expect(client.abortSession).not.toHaveBeenCalled();
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect(alertRows(storage)).toHaveLength(1);
+    expect(sendPlainAlert).not.toHaveBeenCalled();
 
     // Step 3: the blocker goes away. Now we nudge, up to the budget.
     client.getSessionMessages.mockImplementation(async () => idleTranscript);
@@ -1195,14 +1218,17 @@ describe("DeliveryWatchdog", () => {
       storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE kind = ? AND state = 'queued'").run(t, NUDGE_KIND);
     }
     expect(storage.swarm.getByMsgId("m1")!.nudgeCount).toBe(3);
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1); // nudging is not alert-worthy
+    expect(alertRows(storage)).toHaveLength(1);
+    expect(sendPlainAlert).not.toHaveBeenCalled(); // nudging is not alert-worthy
 
     // Step 4: budget exhausted -> exactly one error alert, and terminal.
     fixture.setNow(5_300_000);
     await watchdog.processOnce();
     expect(storage.swarm.getByMsgId("m1")!.state).toBe("failed");
-    expect(sendPlainAlert).toHaveBeenCalledTimes(2);
-    expect(sendPlainAlert.mock.calls[1]![1]).toBe("error");
+    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    expect(sendPlainAlert.mock.calls[0]![1]).toBe("error");
+    // The durable warning advisory from Step 1 and the terminal inline error alert coexisted without dedupe collision.
+    expect(alertRows(storage)).toHaveLength(1);
   });
 
   it("26. pigeon-3m5 regression test: wake message to idle target is NEVER requeued, row stays handed_off during nudges, gets nudged, then terminal without false failure report notice", async () => {
@@ -1560,7 +1586,7 @@ describe("DeliveryWatchdog", () => {
 
   it("35. Minor 4: wake behind live blocking turn appends recovery suppressed note in alert", async () => {
     fixture = makeFixture();
-    const { watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
+    const { storage, watchdog, clientMap, insertHandedOff, sendPlainAlert } = fixture;
 
     const client = makeClient();
     // Blocking turn that is silent (last activity t=100_000)
@@ -1582,9 +1608,13 @@ describe("DeliveryWatchdog", () => {
     fixture.setNow(1_200_000); // blockedAge = 1,200,000 > stuckAlertMs (900_000)
     await watchdog.processOnce();
 
-    expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-    const [alertText] = sendPlainAlert.mock.calls[0]!;
+    const rows = alertRows(storage);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ref_msg_id).toBe("stuck:wake_behind_turn");
+    expect(rows[0]!.source).toBe("delivery-blocked-behind-turn");
+    const alertText = String(rows[0]!.text);
     expect(alertText).toContain("recovery suppressed");
+    expect(sendPlainAlert).not.toHaveBeenCalled();
   });
 
   describe("E1: overdue queued alarm", () => {
@@ -2033,18 +2063,18 @@ describe("DeliveryWatchdog", () => {
       expect(second.alerted).toBe(0);
     });
 
-    it("an earlier ephemeral advisory for the same row cannot suppress the durable payload alert", async () => {
+    it("an earlier namespaced advisory for the same row cannot suppress the durable payload alert", async () => {
       // `stuckAlerted` is SHARED with the queued-behind-turn branch. While the
       // lost-wake branch was gated on that Set, a row that first appeared
-      // blocked behind a live turn consumed the budget with a losable,
-      // payload-less warning — and the durable payload alert was then never
-      // even ATTEMPTED for the rest of the process lifetime, because the row
-      // never leaves the eligible set for reconcileDedupe to prune.
+      // blocked behind a live turn consumed the budget with a warning advisory —
+      // and the durable payload alert was then never even ATTEMPTED for the
+      // rest of the process lifetime, because the row never leaves the eligible
+      // set for reconcileDedupe to prune.
       //
-      // The two alerts are not interchangeable: one is a warning, the other is
-      // the last-resort delivery of the message body. So the durable branch is
-      // no longer gated on any in-memory Set — the alert ROW is the dedupe of
-      // record, which is also why a transient enqueue failure simply retries.
+      // The two alerts are not interchangeable: one is a warning advisory (now
+      // durable under ref 'stuck:<msgId>'), the other is the last-resort
+      // delivery of the message body (durable under ref 'wake-lost:<msgId>').
+      // So the durable payload branch is gated on its own namespaced ref.
       const f = makeFixture();
       fixture = f;
       const now = 1_000_000;
@@ -2052,7 +2082,7 @@ describe("DeliveryWatchdog", () => {
 
       const client = makeClient();
       // Cycle 1: anchor present, and a turn that STARTED BEFORE it is still
-      // running -> the queued-behind-turn advisory fires and takes the budget.
+      // running -> the queued-behind-turn advisory fires and enqueues durably.
       client.getSessionMessages.mockResolvedValue([
         assistantMessage({ created: 10, completed: null, parts: [toolPart(10, 20)] }),
         userMessage(50, `<swarm_message v="1" msg_id="m_fww_shared">`),
@@ -2069,8 +2099,10 @@ describe("DeliveryWatchdog", () => {
       });
 
       await f.watchdog.processOnce();
-      expect(f.sendPlainAlert).toHaveBeenCalledTimes(1); // the ephemeral one
-      expect(alertRows(f.storage)).toHaveLength(0);
+      expect(f.sendPlainAlert).not.toHaveBeenCalled();
+      const cycle1Rows = alertRows(f.storage);
+      expect(cycle1Rows).toHaveLength(1);
+      expect(cycle1Rows[0]!.ref_msg_id).toBe("stuck:m_fww_shared");
 
       // Cycle 2: the anchor is no longer visible in the transcript, so this is
       // now the lost-wake case and the payload must reach the durable channel.
@@ -2080,9 +2112,10 @@ describe("DeliveryWatchdog", () => {
       await f.watchdog.processOnce();
 
       const rows = alertRows(f.storage);
-      expect(rows).toHaveLength(1);
-      expect(rows[0]!.ref_msg_id).toBe("wake-lost:m_fww_shared");
-      expect(String(rows[0]!.text)).toContain("SHARED_BUDGET_PAYLOAD");
+      expect(rows).toHaveLength(2);
+      expect(rows.map((r) => r.ref_msg_id)).toEqual(["stuck:m_fww_shared", "wake-lost:m_fww_shared"]);
+      const lostRow = rows.find((r) => r.ref_msg_id === "wake-lost:m_fww_shared")!;
+      expect(String(lostRow.text)).toContain("SHARED_BUDGET_PAYLOAD");
     });
 
     it("a throwing enqueue does not poison the dedupe — the next cycle retries", async () => {
@@ -2917,13 +2950,16 @@ describe("DeliveryWatchdog", () => {
       // it is exactly what we want for a row we cannot resolve. What must
       // never happen is a state change, asserted above. Pin that the alert is
       // advisory (it reports a turn producing no output) and never terminal.
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const alertTexts = sendPlainAlert.mock.calls.map((c) => String(c[0]));
-      for (const text of alertTexts) {
-        expect(text).toContain("in-flight turn produces no output");
-        expect(text).not.toContain("nudges exhausted");
-        expect(text).not.toContain("marking failed");
-      }
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:wake_same_ms");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
+      expect(text).toContain("in-flight turn produces no output");
+      expect(text).not.toContain("nudges exhausted");
+      expect(text).not.toContain("marking failed");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
     });
 
     it("7. no alert text produced anywhere in idle path contains string 'expected for idle target'", async () => {
@@ -3077,11 +3113,15 @@ describe("DeliveryWatchdog", () => {
       f.setNow(1_900_001);
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [text, severity] = sendPlainAlert.mock.calls[0]!;
-      expect(severity).toBe("warning");
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_silent_alert");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
       expect(text).toContain("m_silent_alert");
       expect(text).toContain("silent for");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       // Verify NO state transition occurred
       const row = storage.swarm.getByMsgId("m_silent_alert")!;
@@ -3117,7 +3157,7 @@ describe("DeliveryWatchdog", () => {
       // Cycle 2: alert fires
       f.setNow(2_000_000);
       await watchdog.processOnce();
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      expect(alertRows(storage)).toHaveLength(1);
 
       // Cycles 3, 4, 5
       f.setNow(3_000_000);
@@ -3128,7 +3168,11 @@ describe("DeliveryWatchdog", () => {
       await watchdog.processOnce();
 
       // Still only 1 alert
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_dedupe");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       const row = storage.swarm.getByMsgId("m_dedupe")!;
       expect(row.state).toBe("handed_off");
@@ -3213,11 +3257,16 @@ describe("DeliveryWatchdog", () => {
       f.setNow(2_000_000);
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [text] = sendPlainAlert.mock.calls[0]!;
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_missing_dir");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
       expect(text).toContain(missingDir);
       expect(text).toContain("not found on daemon filesystem");
       expect(text).toContain("turn cannot proceed");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       const row = storage.swarm.getByMsgId("m_missing_dir")!;
       expect(row.state).toBe("handed_off");
@@ -3254,11 +3303,16 @@ describe("DeliveryWatchdog", () => {
       f.setNow(2_000_000);
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [text] = sendPlainAlert.mock.calls[0]!;
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_existing_dir");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
       expect(text).toContain(existingDir);
       expect(text).toContain("working directory exists");
       expect(text).toContain("provider retry");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       const row = storage.swarm.getByMsgId("m_existing_dir")!;
       expect(row.state).toBe("handed_off");
@@ -3292,11 +3346,16 @@ describe("DeliveryWatchdog", () => {
       f.setNow(2_000_000);
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [text] = sendPlainAlert.mock.calls[0]!;
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_no_dir_fn");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
       expect(text).toContain("working directory unresolvable");
       expect(text).not.toContain("no longer exists");
       expect(text).not.toContain("working directory exists");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       const row = storage.swarm.getByMsgId("m_no_dir_fn")!;
       expect(row.state).toBe("handed_off");
@@ -3342,9 +3401,14 @@ describe("DeliveryWatchdog", () => {
       f.setNow(2_000_000);
       await watchdog.processOnce();
 
-      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
-      const [text] = sendPlainAlert.mock.calls[0]!;
+      const rows = alertRows(storage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.ref_msg_id).toBe("silent:m_timeout_dir");
+      expect(rows[0]!.source).toBe("delivery-silent-in-flight");
+      expect(rows[0]!.severity).toBe("warning");
+      const text = String(rows[0]!.text);
       expect(text).toContain("working directory unresolvable; cannot determine cause");
+      expect(sendPlainAlert).not.toHaveBeenCalled();
 
       const row = storage.swarm.getByMsgId("m_timeout_dir")!;
       expect(row.state).toBe("handed_off");
@@ -3395,6 +3459,187 @@ describe("DeliveryWatchdog", () => {
       expect(row.verifiedAt).toBeNull();
       expect(row.nudgeCount).toBe(0);
       expect(row.requeueCount).toBe(0);
+    });
+  });
+
+  // pigeon-xsu8. The two branches from which NO terminal is reachable — a row
+  // blocked behind a never-completing turn, and a row whose in-flight turn
+  // produces no output — each emit exactly one advisory and then go quiet
+  // forever. That advisory was therefore the ONLY signal a human would ever
+  // get for the row, and it was sent inline (best-effort): it died on a
+  // transport blip, a 429, or a daemon crash with nothing to re-derive it, and
+  // it no-op'd entirely when no notifier was configured. That is the
+  // final-silent-loss condition, so both must be DURABLE.
+  describe("durable advisories for rows with no reachable terminal (pigeon-xsu8)", () => {
+    /** Drains every queued alert, returning the records. */
+    const drain = (storage: any, now: number) => {
+      const out: any[] = [];
+      let a = storage.alerts.nextDrainable(now);
+      while (a) {
+        out.push(a);
+        storage.alerts.markSent(a.id, now);
+        a = storage.alerts.nextDrainable(now);
+      }
+      return out;
+    };
+
+    it("1. blocked-behind-turn advisory is enqueued durably under a namespaced ref", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff } = f;
+
+      // A turn that STARTED BEFORE our prompt (predates the anchor) and never
+      // completes -> the blocking branch, which never reaches a terminal.
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        assistantMessage({ created: 10, completed: null }),
+        userMessage(50, `<swarm_message v="1" msg_id="m_blocked">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      insertHandedOff({
+        msgId: "m_blocked",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+
+      const alerts = drain(storage, 2_000_000);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].refMsgId).toBe("stuck:m_blocked");
+      expect(alerts[0].text).toContain("m_blocked");
+      expect(alerts[0].severity).toBe("warning");
+
+      // Still an honest unknown: no state transition of any kind.
+      const row = storage.swarm.getByMsgId("m_blocked")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.requeueCount).toBe(0);
+    });
+
+    it("2. silent-in-flight advisory is enqueued durably under a namespaced ref", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff } = f;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        userMessage(50, `<swarm_message v="1" msg_id="m_silent_durable">`),
+        assistantMessage({ created: 100, completed: null, parts: [] }),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      insertHandedOff({
+        msgId: "m_silent_durable",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      // Cycle 1 establishes the observation clock; cycle 2 crosses the threshold.
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+      f.setNow(1_900_001);
+      await watchdog.processOnce();
+
+      const alerts = drain(storage, 2_000_000);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].refMsgId).toBe("silent:m_silent_durable");
+      expect(alerts[0].text).toContain("m_silent_durable");
+
+      const row = storage.swarm.getByMsgId("m_silent_durable")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.verifiedAt).toBeNull();
+      expect(row.nudgeCount).toBe(0);
+      expect(row.requeueCount).toBe(0);
+    });
+
+    // The namespace is the whole reason these advisories are safe to make
+    // durable: the dedupe index is UNIQUE ON ref_msg_id ALONE, so an advisory
+    // keyed on the bare msgId would occupy the slot belonging to the row's
+    // later TERMINAL alert and ON CONFLICT DO NOTHING would drop that terminal
+    // SILENTLY -- leaving the human's last word as "may be stuck" for a row
+    // since marked failed.
+    it("3. a namespaced advisory does NOT consume the slot of a later terminal alert", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage } = f;
+
+      expect(
+        storage.alerts.enqueue({
+          source: "delivery-blocked-behind-turn",
+          refMsgId: "stuck:m_x",
+          text: "advisory",
+          severity: "warning",
+          now: 1,
+        }),
+      ).toBe(true);
+
+      // The terminal alert keys on the BARE msgId and must still get in.
+      expect(
+        storage.alerts.enqueue({
+          source: "swarm-delivery-failed",
+          refMsgId: "m_x",
+          text: "terminal",
+          severity: "error",
+          now: 2,
+        }),
+      ).toBe(true);
+
+      const refs = drain(storage, 10).map((a) => a.refMsgId).sort();
+      expect(refs).toEqual(["m_x", "stuck:m_x"]);
+    });
+
+    // Ordering is load-bearing, and this is the regression that motivates it:
+    // enqueue CAN throw (SQLITE_BUSY/IOERR) where the old inline path swallowed
+    // everything. Marking the in-memory Set first would suppress the row for
+    // the whole process lifetime on a transient failure -- the row never leaves
+    // the eligible set, so reconcileDedupe would never restore it either. That
+    // is the exact silent loss being fixed, reintroduced.
+    it("4. a throwing enqueue does not burn the row's one advisory", async () => {
+      const f = makeFixture();
+      fixture = f;
+      const { storage, watchdog, clientMap, insertHandedOff } = f;
+
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue([
+        assistantMessage({ created: 10, completed: null }),
+        userMessage(50, `<swarm_message v="1" msg_id="m_throw">`),
+      ]);
+      clientMap.set("ses_b", { preferred: client, all: [client] });
+
+      insertHandedOff({
+        msgId: "m_throw",
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        handedOffAt: 60,
+      });
+
+      const real = storage.alerts.enqueue.bind(storage.alerts);
+      const spy = vi
+        .spyOn(storage.alerts, "enqueue")
+        .mockImplementationOnce(() => {
+          throw new Error("SQLITE_BUSY");
+        });
+
+      f.setNow(1_000_000);
+      await watchdog.processOnce();
+
+      // Nothing stored, and the row was NOT marked as already-advised.
+      expect(storage.alerts.countDrainable(2_000_000)).toBe(0);
+      expect((watchdog as any).stuckAlerted.has("m_throw")).toBe(false);
+
+      // Next cycle succeeds, so the advisory is not lost.
+      spy.mockImplementation(real as any);
+      f.setNow(1_100_000);
+      await watchdog.processOnce();
+
+      const alerts = drain(storage, 2_000_000);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0].refMsgId).toBe("stuck:m_throw");
     });
   });
 });
