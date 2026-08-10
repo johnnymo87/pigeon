@@ -51,7 +51,10 @@ describe("directoryMissing (pigeon-0ay7 preflight predicate)", () => {
     expect(directoryMissing(link)).toBe(false);
   });
 
-  it("FAILS OPEN (returns false) when stat fails for a reason other than ENOENT/ENOTDIR", () => {
+  // Skipped VISIBLY under root, where the mode bits cannot produce EACCES. A
+  // bare `return` here would report green whether or not it ever asserted,
+  // letting the test rot into permanent vacuity in a root container.
+  it.skipIf(process.getuid?.() === 0)("FAILS OPEN (returns false) when stat fails for a reason other than ENOENT/ENOTDIR", () => {
     // EACCES is the motivating case: a permissions problem is NOT evidence that
     // the directory is gone, and treating it as "missing" would block a delivery
     // that would have succeeded. Unknown must not collapse into missing.
@@ -67,14 +70,18 @@ describe("directoryMissing (pigeon-0ay7 preflight predicate)", () => {
     } catch (e: any) {
       sawEacces = e?.code === "EACCES";
     }
-    // Guard: if we are root (or the fs ignores the mode) the premise does not
-    // hold and this assertion would be vacuous. Skip rather than pass falsely.
-    if (!sawEacces) {
-      chmodSync(locked, 0o700);
-      return;
-    }
-
-    expect(directoryMissing(child)).toBe(false);
+    // Assert the PREMISE rather than silently returning on it. If the
+    // filesystem stops producing EACCES here (some overlay/CI filesystems
+    // ignore mode bits) this test must go RED and be re-examined, not quietly
+    // pass without ever testing fail-open.
     chmodSync(locked, 0o700);
+    expect(sawEacces).toBe(true);
+
+    chmodSync(locked, 0o000);
+    try {
+      expect(directoryMissing(child)).toBe(false);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
   });
 });

@@ -16,11 +16,19 @@ import { statSync } from "node:fs";
  *     deliverable message — precisely the fail-closed-on-ambiguity this
  *     roadmap exists to remove.
  *
- * ENOENT/ENOTDIR are the only codes treated as "missing". ENOTDIR is included
- * because it is what you get when a PARENT component is a file, which is the
- * same class of "this path cannot be a working directory" fact as ENOENT.
- * Anything else — EACCES, EIO, ELOOP, an NFS blip — returns false and the
- * delivery proceeds. An unknown must never be laundered into a missing.
+ * ENOENT/ENOTDIR are the only codes treated as "missing", and this set is
+ * DELIBERATELY UNDER-INCLUSIVE rather than an attempt at completeness. They are
+ * the two codes the measured failure (a deleted working directory / a file in a
+ * parent position) actually produces. Everything else returns false and the
+ * delivery proceeds.
+ *
+ * That under-inclusiveness is a choice, so do not "complete" it casually.
+ * ELOOP and ENAMETOOLONG are arguably as deterministic as ENOENT and could
+ * justifiably be added; EACCES, EIO and an NFS blip must NOT be, because they
+ * are not evidence of absence. The cost of omitting a code is only the status
+ * quo (we send, and the turn fails as it does today); the cost of wrongly
+ * ADDING one is blocking a message that would have delivered. When in doubt,
+ * leave it out. An unknown must never be laundered into a missing.
  *
  * ASSUMPTION, and it is load-bearing: the daemon and the serve share a
  * filesystem. True on this host (both are user systemd units on the same

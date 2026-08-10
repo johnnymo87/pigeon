@@ -252,9 +252,14 @@ There is currently **no consumer of this endpoint in the daemon** — the only m
 
 **2. `prompt_async` does NOT validate the working directory (pigeon-0ay7).**
 
-Measured 2026-08-10: against a session whose directory had been deleted, `prompt_async` returned **HTTP 204**. The turn then failed internally with `PlatformError: NotFound: FileSystem.realPath(<dir>)`, visible only on the plugin's event stream — never as an HTTP error. So a naive delivery records `handed_off` for a message the agent never saw, and the sender is told nothing.
+Measured 2026-08-10: against a session whose directory had been deleted, `prompt_async` returned **HTTP 204**. The turn then failed internally with `PlatformError: NotFound: FileSystem.realPath(<dir>)`, visible only on the plugin's event stream — never as an HTTP error.
 
-The arbiter therefore stats the directory before sending (`swarm/directory-check.ts`) and throws `TargetUnavailableError` when it is provably absent, which the existing outage path turns into a retry rather than a terminal.
+Be precise about the harm, because the obvious framing is wrong: this is **not** a false success. `handed_off` truthfully records a handoff, and `pigeon-s9d` already stopped such a row being stamped verified. The harm is that the row **can never reach an end** — the prompt is burned into a turn that can never run, the deleted-directory turn leaves an assistant row at `parts=0 / completed=null` forever (which is the silent-in-flight branch, the one branch that may never gain a terminal), and the sender is told nothing.
+
+The arbiter therefore stats the directory before sending (`swarm/directory-check.ts`) and throws `TargetUnavailableError` when it is provably absent, so the row stays `queued` — bounded and retryable — rather than parked in the branch with no exit. Two limits worth knowing:
+
+- A row with **no** `expires_at` still ends at the attempt budget, and that terminal *does* name the missing directory. A row **with** `expires_at` (every scheduled wake) takes uncounted outage retries, so expiry is its only terminal and it says just "expired before delivery" — the cause is currently lost to the daemon log.
+- The predicate is `statSync().isDirectory()` treating only `ENOENT`/`ENOTDIR` as missing, deliberately under-inclusive. Never `existsSync`: it accepts a plain file and collapses `EACCES`/`EIO` into "missing", which is fail-closed on ambiguity.
 
 **The rule that governs both, and the one to carry forward:** a filesystem check may **refuse a future send**; it may never **re-interpret a turn already dispatched**. The same `stat` is sanctioned in the arbiter preflight and forbidden in the watchdog's silent-in-flight branch for exactly that reason.
 

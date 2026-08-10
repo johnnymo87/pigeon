@@ -237,12 +237,25 @@ export class SwarmArbiter {
         // MEASURED 2026-08-10 on cloudbox, and the measurement is the whole
         // reason this blocks rather than merely annotating: prompt_async against
         // a session whose directory has been deleted returns HTTP 204. The serve
-        // does NOT validate the directory. So without this check `markHandedOff`
-        // fires below and the row records a delivery that never happened — a
-        // FALSE SUCCESS of exactly the class pigeon-fnx removed everywhere else.
-        // The turn does fail (PlatformError: NotFound: FileSystem.realPath), but
-        // only on the plugin's event stream; the arbiter is told 204, and the
-        // SENDER is told nothing at all.
+        // does NOT validate the directory. The turn then fails internally
+        // (PlatformError: NotFound: FileSystem.realPath) on the plugin's event
+        // stream only — never as an HTTP error.
+        //
+        // BE PRECISE ABOUT THE HARM PREVENTED. It is NOT a false success:
+        // `handed_off` truthfully records a handoff (the 204 did happen), and
+        // pigeon-s9d already stopped such a row being stamped verified. The harm
+        // is that the row can never reach an END, which is this roadmap's whole
+        // subject:
+        //   - the prompt is BURNED into a turn that can never run;
+        //   - the deleted-directory turn leaves an assistant row at
+        //     parts=0 / completed=null FOREVER (measured, pigeon-s9d), which is
+        //     the SILENT-IN-FLIGHT branch — the one branch that by axiom may
+        //     never gain a terminal, and where the one permanently-trapped
+        //     production row already sits. nudges-exhausted is unreachable
+        //     there, since it lives in the idle branch;
+        //   - the SENDER is told nothing, ever.
+        // Refusing to send keeps the row in `queued` instead: bounded, recorded,
+        // and with exits that alert.
         //
         // WHY THIS IS ALLOWED TO DRIVE STATE, when the watchdog asks the same
         // filesystem question and is explicitly forbidden from doing so (see
@@ -264,6 +277,20 @@ export class SwarmArbiter {
         //      budget, both already RECORDED transitions that alert.
         // The rule, stated so it survives paraphrase: this stat may REFUSE A
         // FUTURE SEND; it may never RE-INTERPRET A DISPATCHED TURN.
+        //
+        // WHERE THE CAUSE ACTUALLY REACHES A HUMAN, stated exactly because it is
+        // asymmetric and it is tempting to claim more:
+        //   - rows with NO expires_at (ordinary /swarm/send): the budget applies,
+        //     and this message text reaches the sender via notifySenderOfFailure
+        //     and the wake-max-attempts alert. The cause IS named.
+        //   - rows WITH expires_at (every scheduled wake — parseScheduleTime
+        //     always defaults it): isOutageFailure makes the retries UNCOUNTED,
+        //     so max-attempts is unreachable and expiry is the only terminal.
+        //     `markRetryUncounted` persists no error and swarm_messages has no
+        //     last_error column, so the wake-expired alert says only "expired
+        //     before delivery" and THIS CAUSE IS LOST to the daemon log.
+        // Carrying it into the expiry terminal needs somewhere to persist it —
+        // filed as a follow-up rather than smuggled in here.
         //
         // Ordering is deliberate: renderEnvelope runs FIRST so a
         // PermanentDeliveryError (a fact about the payload, true regardless of

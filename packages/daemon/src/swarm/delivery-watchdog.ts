@@ -1190,10 +1190,14 @@ export class DeliveryWatchdog {
           //     so its record ("refused to send") stays true even if the stat is
           //     wrong. This one is an inference about a turn ALREADY DISPATCHED,
           //     where a wrong stat would make the RECORD false.
-          //   - EXIT: that one throws into the outage path and the row stays
-          //     queued and retryable. This branch's only available exit would be
-          //     a terminal, and the two causes it would decide between (wedged
-          //     vs parked on a provider retry) are byte-identical here.
+          //   - EXIT: that one throws into the outage path, so the row stays
+          //     queued and retryable and the stat mints no terminal itself. (It
+          //     is not terminal-free forever: a row with no expires_at still
+          //     ends at the attempt budget, but that terminal records the
+          //     refusal truthfully.) This branch's only available exit would be
+          //     an immediate terminal, and the two causes it would decide
+          //     between (wedged vs parked on a provider retry) are
+          //     byte-identical here.
           // The rule both obey: a stat may refuse a future send; it may never
           // re-interpret a dispatched turn.
           let dirText = "working directory unresolvable; cannot determine cause";
