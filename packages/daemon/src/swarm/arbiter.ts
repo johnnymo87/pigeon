@@ -1,6 +1,19 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
-import type { OpencodeClient } from "../opencode-client";
+/**
+ * The ONLY capability the arbiter may exercise on a serve (pigeon-0gxy).
+ *
+ * Deliberately narrower than `OpencodeClient`, which also carries
+ * `abortSession`. The turn-preemption policy says delivery latency never
+ * justifies killing a peer's running turn, and the arbiter IS the delivery
+ * path — so it must not be able to abort at all. The watchdog's half of that
+ * invariant is guarded by ~25 "never called" assertions; the arbiter's half is
+ * guarded structurally here, because it has no such assertions. Widening this
+ * back to `OpencodeClient` re-arms the exact preemption the policy forbids.
+ */
+export interface ArbiterClient {
+  sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void>;
+}
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
@@ -14,7 +27,7 @@ export { DELIVERY_FAILED_KIND };
 
 export interface ArbiterOptions {
   storage: StorageDb;
-  clientForSession: (sessionId: string) => OpencodeClient | undefined;   // replaces opencodeClient
+  clientForSession: (sessionId: string) => ArbiterClient | undefined;   // replaces opencodeClient
   directoryForSession: (sessionId: string) => Promise<string | undefined>; // replaces registry
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
@@ -40,7 +53,7 @@ function backoffFor(attempts: number): number {
 
 export class SwarmArbiter {
   private readonly storage: StorageDb;
-  private readonly clientForSession: (sessionId: string) => OpencodeClient | undefined;
+  private readonly clientForSession: (sessionId: string) => ArbiterClient | undefined;
   private readonly directoryForSession: (sessionId: string) => Promise<string | undefined>;
   private readonly nowFn: () => number;
   private readonly log: (
