@@ -249,6 +249,7 @@ export class OutboxSender {
       }
 
       const entries = this.storage.outbox.getReady(now, 5);
+      const deferredLowPrioritySessions = new Set<string>();
 
       batchLoop: for (const entry of entries) {
         const now = this.nowFn();
@@ -326,10 +327,14 @@ export class OutboxSender {
         // permanent starvation and silent drops. The global OUTBOX_RATE_LIMIT governor
         // still bounds total chunks per window.
         if (LOW_PRIORITY_KINDS.has(entry.kind)) {
+          if (deferredLowPrioritySessions.has(entry.sessionId)) {
+            continue;
+          }
           if (
             this.lowPrioritySendTimestamps.length > 0 &&
             this.lowPrioritySendTimestamps.length + messages.length > SWARM_SUB_BUDGET
           ) {
+            deferredLowPrioritySessions.add(entry.sessionId);
             this.log("outbox sub-budget reached, deferring low-priority entry", {
               kind: entry.kind,
               notificationId: entry.notificationId,

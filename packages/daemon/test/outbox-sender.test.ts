@@ -2119,6 +2119,72 @@ describe("OutboxSender rate governor", () => {
     expect(storage.outbox.getByNotificationId("swarm-7chunk-1")!.state).toBe("sent");
   });
 
+  it("maintains per-session order when deferring low-priority entries", async () => {
+    // 1. Seed sub-budget with 2 chunks from another session
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_other",
+      notificationId: "swarm-other-2chunk",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "other-1" }, { text: "other-2" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "swarm-other-2chunk",
+      }),
+    }, 1_000);
+
+    // 2. Add multi-chunk w: entry for ses_1 that will exceed sub-budget (2 + 5 = 7 > 6)
+    const chunk5Msg = [{ text: "c1" }, { text: "c2" }, { text: "c3" }, { text: "c4" }, { text: "c5" }];
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_1",
+      notificationId: "w:msg_X",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: chunk5Msg,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "w:msg_X",
+      }),
+    }, 1_001);
+
+    // 3. Add single-chunk wc: entry for ses_1 that would fit (2 + 1 = 3 <= 6)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      sessionId: "ses_1",
+      notificationId: "wc:msg_X",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "cancel-1" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "wc:msg_X",
+      }),
+    }, 1_002);
+
+    let currentTime = 5_000;
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => currentTime,
+    });
+
+    // Tick 1: ses_other sends 2 chunks. w:msg_X is deferred. wc:msg_X MUST ALSO be deferred (same session).
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(storage.outbox.getByNotificationId("swarm-other-2chunk")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("w:msg_X")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("wc:msg_X")!.state).toBe("queued");
+
+    // Tick 2: Advance time past 60s window. Now window is empty, so w:msg_X sends, then wc:msg_X sends in order.
+    currentTime = 70_000;
+    await sender.processOnce();
+
+    expect(storage.outbox.getByNotificationId("w:msg_X")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("wc:msg_X")!.state).toBe("sent");
+  });
+
   it("allows non-low-priority traffic (questions/stops/cards) to take all OUTBOX_RATE_LIMIT slots when no swarm work is queued", async () => {
     for (let i = 0; i < 15; i++) {
       storage.outbox.upsert({
