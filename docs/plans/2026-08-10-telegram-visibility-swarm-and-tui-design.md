@@ -98,7 +98,12 @@ failed, the outbox's failed→queued reset (`outbox-repo.ts:81`) would re-post i
   row is `failed` (`outbox-repo.ts:72-81`) and the worker dedupes by
   `notification_id` (`notifications.ts:212-223`). Chunks derive ids via
   `chunkNotificationId` (`outbox-sender.ts:113`).
-- Header: `📨 swarm · <kind> · <priority>` then `from <sender display name>`.
+- Header: `📨 swarm · <kind> · <priority>` then `from <sender display name>`,
+  then the message's **event time** (`created_at`). The event time is not
+  decoration: within-session ordering lets a conversational row preempt a
+  backlogged swarm post (see "Scheduling fairness"), so a post can arrive below
+  the stop it caused. Always printing the event time makes that legible rather
+  than misleading — no overtake detection needed.
   Rows with a future `deliver_at` add `⏰ scheduled <time>`.
 - Body: full payload, unmodified.
 - Footer: `🆔 <to_session>`, `msg_id`, and the standard swipe-reply hint.
@@ -142,25 +147,46 @@ it. This is the common case: a worker sprayed with status updates (41 messages
 to one session in one hour, observed) then asks a question, and the question
 waits behind the backlog at 12 sends/min.
 
-Fix: add a per-row secondary sort.
+Fix: add a per-row secondary sort — but a **two-tier** one, not a full ladder.
 
 ```
-ORDER BY <existing per-session best-kind subquery> ASC,
-         <per-row kind CASE> ASC,
+ORDER BY <per-session best-kind subquery, full ladder> ASC,
+         <per-row tier: conversational 1, record 2> ASC,
          created_at ASC,
          rowid ASC
 ```
 
-Kind ladder: question 1, stop 2, card 3, swarm 4, mirror 5, `ELSE` strictly
-lowest (6) so a future kind cannot silently sort into swarm's slot — the current
-`ELSE 4` would tie. The **same** ladder must be applied inside the existing
-`MIN(CASE ...)` subquery as well as the new per-row CASE; updating only one
-leaves a mirror-only session tied with swarm-only sessions at group rank.
+The subquery keeps the full ladder — question 1, stop 2, card 3, swarm 4,
+mirror 5, `ELSE` strictly lowest (6), since the current `ELSE 4` would tie a
+future kind with swarm. Session ranking never affects within-session order, and
+it is what preserves cross-session question preemption.
 
-Accepted consequence: while session X has a queued question, X's swarm backlog
-rides at `(1,4)`, ahead of another session's stop at `(2,2)`. The window closes
-as soon as X's question sends — it sorts first, normally the same tick — and the
-stated requirement is about questions only.
+The **per-row** CASE has only two values: `question`/`stop`/`card` → 1,
+everything else → 2. This is load-bearing, and the reason is `pigeon-81p`
+(commit `816f0d7`, "preserve per-session causal ordering in outbox delivery"): a
+production defect where message-class priority sent a question ahead of the
+earlier stop that explained it, and a human answered a question whose context had
+not arrived. Within a session, order must stay `created_at` **per tier**:
+
+- Ordering conversational kinds among themselves by class re-commits `81p`
+  exactly.
+- Ordering *record* kinds among themselves by class commits the same sin with new
+  kinds: a `mirror` enqueued before a `swarm` row (user types "do X", coordinator
+  then messages the session) would deliver after it.
+
+Accepted consequence, arbitrated deliberately: during a burst, a swarm post can
+appear **below** the stop notification it caused — the sub-budget drains a
+41-message backlog over roughly ten minutes. This is in tension with the
+feature's own "cause above effect" purpose, and the trade is made knowingly: the
+notification rail's first duty is interactivity, and a delayed *question* is
+user-blocking in a way a late record entry is not. Option B (pure `created_at`
+within a session, causality always correct) was rejected because it leaves a
+live question waiting 7-10 minutes behind its own session's backlog — and the
+sprayed-at session is precisely the one likely to ask.
+
+To keep the permitted inversion honest, swarm posts carry their **event time**
+in the header (see below). An annotated late post is a readable record; a
+silently reordered one lies.
 
 **Burst budget.** Ordering alone is not enough: the governor is 12 sends / 60s
 (`outbox-sender.ts:88`) checked per *entry*, not per chunk

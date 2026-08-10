@@ -22,7 +22,21 @@ npm run --workspace @pigeon/daemon typecheck
 
 ## Phase 0 — scheduling fairness (no user-visible change)
 
-### Task 1: Per-row kind ordering in `getReady`
+### Task 1: Per-row kind ordering in `getReady` — DONE (`1c7753a`, corrected by `2337669`)
+
+> **Correction, recorded after the fact.** The original spec below said "per-row
+> kind CASE, full ladder". That was wrong: it reverts `pigeon-81p` (commit
+> `816f0d7`), which deliberately made within-session order pure `created_at` so
+> a question could not be sent ahead of the earlier stop explaining it. The
+> implementer rewrote that regression test to make the change pass; an
+> adversarial reviewer arbitrated. The shipped design is **A′**: the subquery
+> keeps the full ladder, the **per-row** CASE is two-valued
+> (`question`/`stop`/`card` → 1, everything else → 2), and within a tier order
+> stays `created_at`. Otherwise a `mirror` enqueued before a `swarm` row would
+> deliver after it — the same defect with new kinds. See the design doc's
+> "Scheduling fairness" section. Swarm posts carry their event time (Task 4) so
+> the permitted preemption is legible.
+
 
 Today `getReady` ranks only by *per-session best kind*. A session with a queued
 question promotes **its own swarm rows** to rank 1, and `created_at ASC` puts
@@ -318,8 +332,12 @@ because a payload is arbitrary agent text and must never be parsed as markup.
 Return `{ header, body, footer }` (no `replyMarkup`: swipe-reply works via the
 worker's `messages` row, so no token is needed).
 
-- header: `📨 swarm · <kind> · <priority>` newline `from <fromLabel>`, plus
-  `⏰ scheduled <ISO>` when `deliverAt` is in the future
+- header: `📨 swarm · <kind> · <priority>` newline `from <fromLabel>`, then the
+  message's **event time** (`createdAt`), plus `⏰ scheduled <ISO>` when
+  `deliverAt` is in the future. The event time is required, not cosmetic — a
+  conversational row may preempt a backlogged swarm post within the same
+  session, so a post can land below the stop it caused. Always printing the
+  event time makes that legible.
 - body: payload verbatim
 - footer: `🆔 <toSessionId>`, `msg_id`, standard swipe-reply hint
 
