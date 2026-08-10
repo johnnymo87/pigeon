@@ -101,9 +101,17 @@ export class OutboxRepository {
 
   /**
    * Returns entries ready to be delivered: state='queued' AND (next_retry_at IS NULL OR next_retry_at <= now).
-   * Ordered by per-session best message-class priority FIRST (question=1, stop=2, card=3, swarm=4, mirror=5, else=6),
-   * then per-row kind priority (question=1, stop=2, card=3, swarm=4, mirror=5, else=6),
-   * then created_at ASC and rowid ASC.
+   *
+   * Session-level group ordering (subquery):
+   *   question=1, stop=2, card=3, swarm=4, mirror=5, else=6
+   *
+   * Per-row tier ordering (secondary CASE):
+   *   question/stop/card -> 1 (conversational tier)
+   *   everything else (swarm, mirror, unknown) -> 2 (record tier)
+   *
+   * Within a session, order is created_at per tier. The conversational tier preempts the
+   * record tier. Conversational rows never reorder among themselves (pigeon-81p).
+   * Record rows may be preempted by conversational rows (arbitration A').
    */
   getReady(now = Date.now(), limit = 100): OutboxRecord[] {
     const rows = this.db
@@ -113,7 +121,7 @@ export class OutboxRepository {
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
          ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
-                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END) ASC,
+                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 1 WHEN 'card' THEN 1 ELSE 2 END) ASC,
                   created_at ASC,
                   rowid ASC
          LIMIT ?`,
