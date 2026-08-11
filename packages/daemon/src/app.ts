@@ -784,6 +784,27 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/injected-prompts") {
+        const body = await readJsonBody(request);
+        const sessionId =
+          typeof body.sessionId === "string" && body.sessionId
+            ? body.sessionId
+            : typeof body.session_id === "string"
+              ? body.session_id
+              : "";
+        if (!sessionId) {
+          return Response.json({ error: "sessionId is required" }, { status: 400 });
+        }
+
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text.trim()) {
+          return Response.json({ error: "text is required" }, { status: 400 });
+        }
+
+        storage.injectedPrompts.record(sessionId, hashPrompt(text), nowFn());
+        return Response.json({ recorded: true });
+      }
+
       if (request.method === "POST" && url.pathname === "/mirror") {
         const body = await readJsonBody(request);
         const sessionId =
