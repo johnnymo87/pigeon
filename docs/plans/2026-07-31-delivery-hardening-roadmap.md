@@ -1494,8 +1494,22 @@ whole backlog:
 > of its five members — they looked orphaned when they were in fact placed. A range is readable to a
 > human and invisible to the check that stops beads getting lost, so the ids below are now enumerated.
 
-- **Launch/TUI:** `pigeon-92q` (headless `/launch` completes with no notification when
-  `oc-auto-attach` fails). Delivery-adjacent in symptom, different subsystem in cause.
+- **Launch/TUI:** ~~`pigeon-92q`~~ **closed 2026-08-11 as misdiagnosed at filing, no code shipped.**
+  Its premise — that the plugin loads only in the TUI process, so a headless `/launch` never notifies
+  — was false when the bead was written: the direct-channel plugin architecture landed 2026-02-11
+  (`93bd766`/`7b7902d`), three months before the incident it was filed from, and the plugin runs
+  inside `opencode serve`. Measured 2026-08-11: 11 serve-hosted TUI-less sessions carry stop rows, and
+  both `/launch` sessions in the journal since 2026-07-01 notified end to end. The probable real cause
+  of the original silence was the late-discovery registration race fixed the next morning by
+  `10a6bdf`. See the bead's closure note; it also records why the outbox (24h retention) is the wrong
+  instrument for this question and the daemon journal is the right one.
+  - The surviving risk is now **`pigeon-up8q`** (P3, filed 2026-08-11): notification is single-path
+    through the plugin, so a plugin that is dead (serve OOM — `pigeon-8bif`, which closed as
+    *mitigated*, not fixed), never loaded, or never registered means the session completes in silence
+    and nothing notices. That one **is** delivery hardening in substance — it is the "did the
+    notification get created at all" half that this roadmap's outbox work assumes — but it is parked
+    here rather than adopted, because every cycle above concerns delivery of a notification that
+    exists. If a later cycle grows an end-to-end completion audit, adopt it there.
 - **Swarm:** `pigeon-3m5`, `pigeon-web`, `pigeon-0ky`, `pigeon-755` (retention sweep declared but
   never wired), and `pigeon-iy4` (P2 — the 401 re-auth path in the `swarm_send`/`swarm_read` tools is
   dead in production because the token snapshot is stale). **`pigeon-iy4` was genuinely orphaned until
