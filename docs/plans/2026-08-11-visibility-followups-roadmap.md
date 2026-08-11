@@ -244,6 +244,33 @@ prompt in `injected_prompts`, fixing the leak at source for automations that hav
 and neither subsumes the other: the gate suppresses everything for a quiet session; the source fix
 suppresses only the launch prompt, but for every session.
 
+> **`pigeon-w36w` is DONE** — pigeon PR #100 (`3c08192`, daemon deployed to cloudbox) added a
+> record-only `POST /injected-prompts`, and workstation PR #353 (`2e23aa6`) makes `opencode-launch`
+> call it between session create and `prompt_async`. Deployment of the launcher itself is
+> `pigeon-0e37` (it is a nix package; no machine runs it until a home-manager switch).
+>
+> **This is the first end-to-end proof that the leak was real and is now closed**, measured rather
+> than asserted — two throwaway sessions, both with **no** `session_origin` row so the gate above
+> could not have been what suppressed anything:
+>
+> | session | outbox kinds | mirror rows |
+> |---|---|---|
+> | control, unpatched path | `mirror`, `stop` | **1** |
+> | patched launcher | `stop` | **0** |
+>
+> The load-bearing detail is that `injected_prompts` for the launched session **consumed to 0**. A
+> leftover count would have meant the hash never matched and the absent mirror had some other
+> cause. When re-testing this, check the count — not just the absent row.
+>
+> **Rejected alternative, recorded because it looks obviously better than it is:** marking the
+> launch part `synthetic: true` (the plugin already drops synthetic parts, §"Exclusion 2") would
+> have been one line in the caller and no daemon change. Measured on cloudbox: it does suppress the
+> mirror and the model does still receive the text, **but the session then never gets a title** — a
+> control titled itself in 40 s while the synthetic session still read `New session - <ISO>` minutes
+> later. Every CLI-launched topic would be named after its bare path forever and `pigeon-353p`'s
+> provisional-name flag would never clear. Cheap seams that touch opencode's own message semantics
+> have side effects outside the one behaviour you are aiming at.
+
 <details>
 <summary>Original specification, kept for the record (its mirror-scope clause is refuted above)</summary>
 
