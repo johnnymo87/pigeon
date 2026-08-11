@@ -155,19 +155,30 @@ describe("swarmSend (pure helper)", () => {
     expect(body.reply_to).toBe("msg_prev")
   })
 
-  test("includes Authorization Bearer header only when authToken is set", async () => {
+  test("includes Authorization Bearer header only when a token resolves", async () => {
+    // Drives the header through the REAL resolver rather than a per-call
+    // override. swarmSend has no authToken option any more (pigeon-zox1): a
+    // pinned token survived invalidateDaemonToken() and broke the 401 re-auth
+    // retry, so the option was removed instead of documented.
+    process.env.PIGEON_DAEMON_AUTH_TOKEN = "secret-tok"
+    invalidateDaemonToken()
+
     const withTok = capturingFetch(() => ok202())
     await swarmSend(
       {
         daemonBaseUrl: "http://daemon.test",
         sessionId: "ses_sender",
-        authToken: "secret-tok",
         fetchFn: withTok.fetchFn,
       },
       { to: "ses_target", message: "hi" },
     )
     expect(headersOf(withTok.seen[0]!)["Authorization"]).toBe("Bearer secret-tok")
     expect(headersOf(withTok.seen[0]!)["Content-Type"]).toBe("application/json")
+
+    // No resolvable token: the harness pins PIGEON_DAEMON_AUTH_TOKEN_FILE at a
+    // path that does not exist, so dropping the env var leaves nothing to find.
+    delete process.env.PIGEON_DAEMON_AUTH_TOKEN
+    invalidateDaemonToken()
 
     const noTok = capturingFetch(() => ok202())
     await swarmSend(
@@ -179,6 +190,64 @@ describe("swarmSend (pure helper)", () => {
       { to: "ses_target", message: "hi" },
     )
     expect(headersOf(noTok.seen[0]!)["Authorization"]).toBeUndefined()
+  })
+
+  /**
+   * pigeon-zox1. The 401 re-auth branch REPLACES `res` but used to leave `text`
+   * bound to the first response's body, so the final error paired the retry's
+   * STATUS with the original 401's TEXT -- reporting `400 Unauthorized` for a
+   * response whose body said nothing of the kind, and sending a human hunting
+   * an auth fault that had already been cured.
+   *
+   * Asserting on both halves: the status must come from the retry AND the body
+   * must come from the same response. Checking only one of them passes on the
+   * broken code.
+   */
+  test("reports the retry's own body, not the original 401's, after re-auth (pigeon-zox1)", async () => {
+    const { fetchFn } = scriptFetch([
+      () => new Response("stale token", { status: 401 }),
+      () => new Response("malformed payload", { status: 400 }),
+    ])
+
+    // No "(re-auth attempted)" marker here on purpose: a 400 is not a verdict
+    // on the token, so tagging it would point a human at an auth fault that is
+    // not there. The marker is asserted by the 401-on-retry test below.
+    await expect(
+      swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn,
+          sleepFn: async () => {},
+        },
+        { to: "ses_target", message: "hi" },
+      ),
+    ).rejects.toThrow(/^swarm_send failed: 400 malformed payload$/)
+  })
+
+  /**
+   * The other half of the same diagnostic: when the refreshed token is ALSO
+   * rejected, the message must say a re-auth was attempted. Without it,
+   * "stale token, now fixed" and "the rotated token is also wrong" produce
+   * identical output, and only the second one needs a human.
+   */
+  test("marks the error when a refreshed token is also rejected (pigeon-zox1)", async () => {
+    const { fetchFn } = scriptFetch([
+      () => new Response("first", { status: 401 }),
+      () => new Response("still unauthorized", { status: 401 }),
+    ])
+
+    await expect(
+      swarmSend(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_sender",
+          fetchFn,
+          sleepFn: async () => {},
+        },
+        { to: "ses_target", message: "hi" },
+      ),
+    ).rejects.toThrow("401 still unauthorized (re-auth attempted)")
   })
 
   test("reads token from secret file when env is unset", async () => {
@@ -683,7 +752,9 @@ describe("createSwarmSendTool", () => {
    * `opts.authToken ?? resolveDaemonToken()` kept preferring that snapshot and
    * re-sent the identical dead token. The pre-existing 401 test
    * ("invalidates token and retries on 401 response") calls swarmSend()
-   * without opts.authToken -- a configuration production never used -- which
+   * without opts.authToken -- a configuration production did not use AT THE
+   * TIME (pigeon-zox1 has since deleted the option, so it is now the only
+   * configuration there is) -- which
    * is exactly why it stayed green while the production path was broken.
    *
    * Asserting the full header sequence, not just "the second call happened":

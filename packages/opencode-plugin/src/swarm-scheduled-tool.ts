@@ -27,7 +27,6 @@ export interface ScheduledMessage {
 export interface SwarmScheduledOptions {
   daemonBaseUrl: string // e.g. http://127.0.0.1:4731
   sessionId: string // ctx.sessionID
-  authToken?: string
   fetchFn?: typeof fetch
   now?: number // injectable current time for relative formatting in tests
 }
@@ -44,7 +43,7 @@ export async function swarmScheduledList(
   const url = new URL("/swarm/scheduled", opts.daemonBaseUrl)
   url.searchParams.set("session", opts.sessionId)
 
-  let token = opts.authToken ?? resolveDaemonToken()
+  let token = resolveDaemonToken()
   const headers: Record<string, string> = {}
   if (token) headers["Authorization"] = `Bearer ${token}`
 
@@ -52,7 +51,7 @@ export async function swarmScheduledList(
 
   if (res.status === 401) {
     invalidateDaemonToken()
-    const retryToken = opts.authToken ?? resolveDaemonToken()
+    const retryToken = resolveDaemonToken()
     if (retryToken) {
       headers["Authorization"] = `Bearer ${retryToken}`
     } else {
@@ -80,7 +79,7 @@ export async function swarmScheduledCancel(
     opts.daemonBaseUrl,
   )
 
-  let token = opts.authToken ?? resolveDaemonToken()
+  let token = resolveDaemonToken()
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
@@ -96,7 +95,7 @@ export async function swarmScheduledCancel(
 
   if (res.status === 401) {
     invalidateDaemonToken()
-    const retryToken = opts.authToken ?? resolveDaemonToken()
+    const retryToken = resolveDaemonToken()
     if (retryToken) {
       headers["Authorization"] = `Bearer ${retryToken}`
     } else {

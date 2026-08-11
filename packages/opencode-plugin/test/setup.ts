@@ -29,9 +29,13 @@ const TEST_NO_TOKEN_PATH = "/nonexistent/pigeon-test-no-token"
  * exists, so whichever test ran next read the LIVE production token and handed it
  * to a mock fetch -- precisely the outcome the comment above says must never
  * happen. Observed as an order-dependent failure of "includes Authorization
- * Bearer header only when authToken is set", which asserts no header and instead
+ * Bearer header only when a token resolves", which asserts no header and instead
  * saw a real `Bearer <production token>`; reproduced on unmodified main under
- * `--sequence.shuffle --sequence.seed=2`.
+ * `--sequence.shuffle --sequence.seed=2`. (That test was named "... only when
+ * authToken is set" until pigeon-zox1 deleted the per-call authToken option; it
+ * now drives the same assertion through the real resolver, which makes this
+ * harness pin MORE load-bearing, not less -- the test no longer supplies its own
+ * token for the positive half.)
  *
  * Repairing in a hook rather than at the call sites is deliberate: the invariant
  * then lives in ONE place and cannot be forgotten by a future test. The afterEach

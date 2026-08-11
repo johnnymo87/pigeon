@@ -391,6 +391,44 @@ describe("swarmSchedule (pure helper)", () => {
     expect(seen).toHaveLength(1)
   })
 
+  /**
+   * pigeon-zox1. Same defect class as swarm-send: the 401 re-auth branch
+   * REPLACES `res`, but `text` was read from the first response and never
+   * refreshed, so a retry that 400s was reported as `400 <the 401's body>` --
+   * an auth string attached to a status that had nothing to do with auth.
+   *
+   * Asserting the retry's body is present AND the 401's body is absent: a
+   * one-sided assertion passes on the broken code.
+   */
+  test("reports the retry's own body, not the original 401's, after re-auth (pigeon-zox1)", async () => {
+    const { fetchFn, seen } = scriptFetch([
+      () => status(401, "Unauthorized"),
+      () => status(400, JSON.stringify({ error: "payload under 40 chars" })),
+    ])
+
+    let message = ""
+    try {
+      await swarmSchedule(
+        {
+          daemonBaseUrl: "http://daemon.test",
+          sessionId: "ses_caller",
+          fetchFn,
+          sleepFn: noSleep,
+        },
+        { message: "short", after: "1h" },
+      )
+      throw new Error("expected swarmSchedule to reject")
+    } catch (err) {
+      message = (err as Error).message
+    }
+
+    expect(message).toContain("swarm_schedule failed: 400")
+    expect(message).toContain("payload under 40 chars")
+    // The 401's body must NOT survive into an error about the 400.
+    expect(message).not.toContain("Unauthorized")
+    expect(seen).toHaveLength(2)
+  })
+
   test("503 throws immediately, surfaces daemon's error text, and fetch is called EXACTLY ONCE", async () => {
     const { fetchFn, seen } = scriptFetch([
       () =>
