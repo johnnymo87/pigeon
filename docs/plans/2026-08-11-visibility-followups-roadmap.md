@@ -51,13 +51,14 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 |---|---|---|---|
 | **A** | `pigeon-ywlg` | Gate the swarm feed on notify policy | **Yes** — needs `shouldEmitAncillary` from `pigeon-qdcb.5` |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
-| **C** | `pigeon-rmr2` | `opencode.db` full scans of `part` throw `SQLITE_CORRUPT` | No |
+| ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | No |
 | **E** | `pigeon-pre9` | Deferred polish from adversarial review | No |
 
-**Start with C or D** — they are the only unblocked items, and D is the one with a correctness
-argument. A and B are both blocked on something outside this session's control; do not burn a cycle
-discovering that again.
+**Start with D, then E.** They are the only live unblocked items. **C is withdrawn** — the database
+it wanted repaired is healthy (see item C for the measurement). A and B are blocked on things
+outside this session's control, and **B must be sequenced last** regardless, because A/D/E each
+re-widen the fleet skew B exists to close. Do not burn a cycle rediscovering any of this.
 
 ---
 
@@ -116,6 +117,11 @@ items A–E resolves toward posting. Note this is the opposite of the leak direc
 Phase 2's echo suppression, where an unconsumed count suppresses for ≤15 min — that is deliberate,
 because there the alternative was noise in every topic on the machine. Know which side you are on.
 
+**The discriminator for a novel case:** if the risk is *duplicating something Telegram already
+showed*, err toward silence; if the risk is *losing a genuine event*, err toward posting. Item D is
+the live collision — failing closed there means a real session stops notifying — which is why it
+needs an explicit argument rather than a default.
+
 ### 1.7 The verification checklist misses what it cannot observe
 
 Phase 2's burn-in checklist was entirely behavioural, so the one task with no runtime symptom —
@@ -129,6 +135,12 @@ steps. Put them in the ritual (§2) rather than trusting them to a symptom.
 
 Every item in §3 runs this sequence. It is the user's standing instruction.
 
+0. **Reproduce the item's stated symptom before designing anything.** If it does not reproduce, the
+   item is the bug — amend or withdraw it and stop. This step exists because item **C** did not
+   reproduce: it sat in a bead for two days and this roadmap sent the first reader at it, until an
+   adversarial review measured instead of trusting. §1.7 warns that a checklist misses what it
+   cannot observe; this is the twin failure — **a roadmap preserves what is no longer true, or was
+   never true**, and it does so with authority.
 1. **Compact** if context is heavy. Persist first (`preparing-for-compaction`): beads updated, plan
    file current, resumption prompt pointing at *this file by path* and the item letter.
 2. **Optional `oracle-fable` consult** — for a design question where being wrong is expensive.
@@ -145,8 +157,8 @@ Every item in §3 runs this sequence. It is the user's standing instruction.
 it. Twice during `pigeon-d95y` a subagent reported "all green" having run only its own test files.
 
 ```bash
-npm run test        # expect: 66+ / 21+ / 2 files, exit 0
-npm run typecheck   # expect: exit 0
+npm run test        # expect exit 0; test-FILE counts per package: daemon 68+, plugin 21+, worker 2
+npm run typecheck   # expect exit 0 across all three workspaces
 ```
 
 ---
@@ -162,8 +174,10 @@ predicate is owned by the session holding `pigeon-qdcb` (see §4); as of 2026-08
 
 **The problem, and it is worse than a duplicate.** `pigeon-qdcb` suppresses the Stop notification
 for a declared-quiet session, and the Phase 1 swarm feed then reinstates the noise through a side
-door. lgtm's `reawaken()` re-prompts via `/swarm/send`, so every re-review posts into a topic that
-policy says should be silent. And because topics are created by the **first** notification, a swarm
+door. lgtm re-prompts a session via `/swarm/send` on re-review, so those posts land in a topic that
+policy says should be silent. (That mechanism is **reported, not verified** — it came from the
+`qdcb` owner, and a review could not find a `reawaken()` symbol in lgtm code. Treat it as motivation,
+not premise: the gate is correct regardless of which caller drives the re-prompt.) And because topics are created by the **first** notification, a swarm
 post can *create* a topic for a session that was meant to be invisible — the same mechanism that
 produced `pigeon-353p`.
 
@@ -212,6 +226,16 @@ no longer emits `current_state`, so the old daemons' dead handlers are unreachab
 exists only in the opposite order (new daemon + old worker), which is why the original deploy was
 sequenced worker-first.
 
+**SEQUENCE B LAST, AFTER A / D / E.** All three are daemon-or-plugin code changes, so each one
+merged *after* a fleet deploy re-widens the exact skew B exists to close — and D and E.4 are plugin
+changes, which need a serve restart on every host, not just a daemon restart (§1.2). Doing B first
+and then landing A silently recreates the debt.
+
+**How to start it, given there is no session on those hosts.** This is the part that otherwise
+stalls: send `/launch devbox pigeon "<deploy prompt>"` from Telegram. `/launch` still works on the
+stale daemons, so the old code can be told to update itself. Without this, a context-free reader
+concludes B waits indefinitely on nothing.
+
 **Per host** (`/home/dev/projects/pigeon` or host equivalent), as **separate** bash calls (§1.1):
 
 ```bash
@@ -228,22 +252,33 @@ not interrupt live work; on cloudbox this was left to the nightly reset.
 
 ---
 
-### [ ] C. `pigeon-rmr2` (P2) — `opencode.db` full scans of `part` throw `SQLITE_CORRUPT`
+### [x] C. `pigeon-rmr2` — WITHDRAWN 2026-08-11. The database is not corrupt.
 
-**Unblocked. Good first pickup.** Found incidentally during the Phase 2 adversarial review, unrelated
-to that branch.
+**The premise did not reproduce, and the bug report was almost certainly an instance of §1.3.**
+This item originally claimed that a full-table scan of `part` in
+`~/.local/share/opencode/opencode.db` throws `SQLITE_CORRUPT` while bounded scans succeed.
 
-A full-table scan of `part` in `~/.local/share/opencode/opencode.db` throws `SQLITE_CORRUPT`;
-bounded rowid-range scans succeed, so the damage is confined to part of the file. **Nothing
-user-visible is broken today** — only unbounded queries hit it — which is precisely why it will
-ambush the next person who writes an ad hoc transcript query, and why it silently constrains every
-such query written until then.
+Measured twice on 2026-08-11, independently — once by `adversarial-reviewer-fable` on a coherent
+copy (db + `-wal` + `-shm`), once directly against the **live** file opened read-only with its WAL
+intact:
 
-**Approach:** `PRAGMA integrity_check` to size the damage first, then decide between `VACUUM INTO` a
-fresh file and accepting it. **Do not run a destructive repair against the live DB while sessions
-are attached** — every running session on this host writes to it. Work on a copy (§1.3), and note
-that this file is opencode's, not pigeon's, so a fix here is operational, not a code change; there
-may be no PR (step 5 of §2 is conditional for exactly this reason).
+```
+full scan of part OK: 1712315 rows, 4.48 GB payload, 42.2s
+integrity_check: ok
+```
+
+"Damage confined to part of the file, bounded scans succeed, unbounded scans throw" is the exact
+signature of reading a `.db` **without its `-wal`** — the hazard recorded in §1.3, which had already
+produced one false "the feature is silently broken" conclusion during Phase 1 verification. The
+original report carried no repro command, so this cannot be proven, only strongly inferred.
+
+**Kept in this file rather than deleted, deliberately.** A withdrawn item that vanishes invites the
+next person to re-file it from the same bad measurement. `pigeon-rmr2` is closed with this evidence.
+
+**The lesson is the durable part, and it now sits in §2 as step 0:** this item survived in a bead
+for two days and was about to send the first post-compaction session to repair a healthy 7.2 GB
+database. Roadmaps preserve claims long after they stop being true — or, here, long after they were
+never true.
 
 ---
 
@@ -268,17 +303,25 @@ needs an explicit argument rather than a default — a good candidate for the §
 
 Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Do them together in one PR or not at all.
 
-1. `messageRoles` (`packages/opencode-plugin/src/message-tail.ts:66,88`) grows unbounded for a
-   long-lived session; pruned only on `clear()`. Small but indefinite.
-2. The empty footer leaves a trailing blank line on every mirror (`app.ts:124` +
-   `split-message.ts:77`). Telegram trims it; cosmetic.
-3. Whitespace-only text returns before `consume` (`app.ts:100-102` vs `:107`), so an injected
-   whitespace-only prompt leaks its count for 15 min. Near-unreachable.
-4. **Log when the assistant-message buffer-cancel fires** (`message-tail.ts:99-103`). This is the
+> **Line references corrected 2026-08-11.** The four below were transcribed from bead `pigeon-pre9`
+> and were **wrong against the tree this file sits on** — `app.ts:100-124` is `parseSwarmSendBody`,
+> so a reader would have landed in swarm-validation code and concluded the item was nonsense. All
+> four are substantively real; only the pointers lied. Verified line-exact on `origin/main` at
+> `4a454ff`. The bead carries the same correction.
+
+1. `messageRoles` (`packages/opencode-plugin/src/message-tail.ts` — declared `:86`, written `:109`,
+   pruned only at `:321-323` via `clear()`) grows unbounded for a long-lived active session. Small
+   but indefinite.
+2. The empty footer leaves a trailing blank line on every mirror (`packages/daemon/src/app.ts:833`,
+   `const footer = new TgMessageBuilder().build()`, plus `split-message.ts`). Telegram trims it;
+   cosmetic.
+3. Whitespace-only text returns at `app.ts:809` **before** `injectedPrompts.consume` at `:816`, so an
+   injected whitespace-only prompt leaks its count for 15 min. Near-unreachable.
+4. **Log when the assistant-message buffer-cancel fires** (`message-tail.ts:122-123`). This is the
    only guard on the assistant-leak vector — a part arriving >500ms before its `message.updated`
    would flush assistant deltas as a user mirror — and the guard is currently invisible in the logs.
-   This one is worth more than the other three: it is the difference between knowing that vector is
-   dormant and assuming it.
+   Worth more than the other three: it is the difference between knowing that vector is dormant and
+   assuming it.
 
 ---
 
