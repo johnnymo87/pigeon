@@ -51,7 +51,11 @@ const plugin: Plugin = async (ctx) => {
 
     const messageTail = new MessageTail({
       postMirror: (opts) => postMirror({ ...opts, daemonUrl, log }),
-      isMainSession: (sessionId) => sessionManager.isMainSession(sessionId),
+      // Deliberately the STRICT predicate, not `isMainSession`. A session whose
+      // parentage could not be established is treated as main everywhere else so it
+      // keeps notifying, but it must not mirror: if it turns out to be a subagent,
+      // the mirror posts a full task brief into a Telegram topic (`pigeon-kq6h`).
+      isMainSession: (sessionId) => sessionManager.isConfirmedMain(sessionId),
       getDiscoveryPromise: (sessionId) => sessionManager.getDiscoveryPromise(sessionId),
       log,
     })
@@ -300,9 +304,13 @@ const plugin: Plugin = async (ctx) => {
             doRegisterSession(sessionID, envInfo, title)
           }
         } catch (err) {
-          // Fallback: register without parentID
-          log("session.get failed, registering without parentID", serializeError(err))
-          sessionManager.onSessionCreated(sessionID, undefined)
+          // Fallback: parentage is UNKNOWN, not "no parent". The session is still
+          // treated as main so stops/errors/questions keep flowing (failing closed
+          // here is what makes a real session go silent, invisibly), but it is not
+          // *confirmed* main, so it will not mirror prompts. A later
+          // `session.updated` resolves it either way. See `pigeon-kq6h`.
+          log("session.get failed, registering with unknown parentage", serializeError(err))
+          sessionManager.onSessionCreated(sessionID, undefined, undefined, "unknown")
           doRegisterSession(sessionID, envInfo)
         }
       })()
@@ -398,6 +406,21 @@ const plugin: Plugin = async (ctx) => {
           const rawTitle = sessionInfo?.title
 
           if (!sessionID) return
+
+          // A `parentID` here is free, authoritative evidence, and it is the one
+          // repair available for a session whose `session.get` failed during late
+          // discovery: it demotes a subagent that was optimistically treated as main,
+          // stopping both its stop-notifications and its prompt mirror
+          // (`pigeon-kq6h`). Runs before the early returns below, which discard it.
+          //
+          // Only a PRESENT parentID is acted on, and only for a session whose
+          // parentage is still unknown -- see `resolveParentage`. An update that omits
+          // the field must never promote anything, which is what the guard on the next
+          // line has pinned since `2fd9a56`.
+          if (sessionManager.isKnown(sessionID)) {
+            sessionManager.resolveParentage(sessionID, parentID)
+          }
+
           if (parentID) return
           if (!sessionManager.isKnown(sessionID) || !sessionManager.isMainSession(sessionID)) return
 
