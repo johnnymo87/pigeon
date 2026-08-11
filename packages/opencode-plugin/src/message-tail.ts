@@ -73,6 +73,12 @@ async function waitForDiscovery(promise: Promise<void>, timeoutMs = 1000): Promi
   }
 }
 
+/**
+ * Cap on retained message-role entries. Sized well above any plausible number of messages that
+ * could still receive parts, so eviction only ever reaches entries that are long finished.
+ */
+const MAX_MESSAGE_ROLES = 2000
+
 export class MessageTail {
   private sessions = new Map<string, SessionTail>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
@@ -85,6 +91,7 @@ export class MessageTail {
 
   private messageRoles = new Map<string, { sessionID: string; role: string }>()
   private userBuffers = new Map<string, UserMessageBuffer>()
+  private evictionAnnounced = false
 
   constructor(options?: MessageTailOptions) {
     this.postMirror = options?.postMirror
@@ -106,7 +113,13 @@ export class MessageTail {
   }
 
   onMessageUpdated(info: MessageInfo): void {
+    // Delete before set so the entry moves to the END of the Map's insertion order. Map.set on
+    // an existing key keeps its original position, which would make eviction order track message
+    // CREATION rather than last activity -- and a long-streaming message re-fires message.updated
+    // throughout, so all those updates would be wasted. See pruneMessageRoles.
+    this.messageRoles.delete(info.id)
     this.messageRoles.set(info.id, { sessionID: info.sessionID, role: info.role })
+    this.pruneMessageRoles()
 
     const tail = this.getOrCreate(info.sessionID)
     tail.seenAnyMessage = true
@@ -121,7 +134,56 @@ export class MessageTail {
       if (pendingBuffer) {
         clearTimeout(pendingBuffer.timer)
         this.userBuffers.delete(info.id)
+        // This is the only guard on the assistant-leak vector: parts arrived for this message
+        // more than debounceMs before its message.updated told us it was an assistant message,
+        // so they were provisionally buffered as user text and would have flushed as a mirror.
+        // Log it — otherwise there is no way to tell a dormant vector from a firing one.
+        this.log?.(
+          `[mirror] cancelled buffered user parts for message ${info.id} in session ${info.sessionID}: message.updated reports role=assistant (${pendingBuffer.parts.size} part(s) discarded)`,
+        )
       }
+    }
+  }
+
+  /**
+   * Bound messageRoles. It is written on every message.updated and otherwise pruned only by
+   * clear(), which runs on session end or 24h staleness — so a single long-lived active session
+   * grows it for the life of the process.
+   *
+   * Eviction drops the least-recently-UPDATED entries (onMessageUpdated re-inserts to refresh
+   * position), and skips the in-flight assistant message of any session.
+   *
+   * Both of those matter, and the reason is the same hazard. If a role entry is evicted while a
+   * part for it can still arrive, onPartUpdated takes its `roleInfo === undefined` branch, treats
+   * the part as USER text, and flushes assistant output into Telegram as if the user typed it —
+   * the worst outcome in this codebase, and the exact leak the buffer-cancel above guards.
+   *
+   * An earlier version of this evicted in creation order and claimed that was safe because the
+   * oldest entries "can no longer receive parts". Adversarial review disproved it by probe: a
+   * message keeps its creation-order position through every update, so a just-finished assistant
+   * message became the oldest unprotected entry milliseconds after its last delta, and a late
+   * text part for it mirrored assistant output as user text. Recency refresh is what makes
+   * eviction age track time-since-activity, which is what this comment can now honestly claim.
+   *
+   * Residual, accepted: a part arriving after MAX_MESSAGE_ROLES further message updates across
+   * all sessions still leaks. Pinned by test rather than left implicit.
+   */
+  private pruneMessageRoles(): void {
+    if (this.messageRoles.size <= MAX_MESSAGE_ROLES) return
+
+    if (!this.evictionAnnounced) {
+      this.evictionAnnounced = true
+      // Item 4 of this same change exists because an invisible guard cannot be reasoned about.
+      // The same applies here: say so once when the cap first engages.
+      this.log?.(
+        `[mirror] messageRoles reached its ${MAX_MESSAGE_ROLES}-entry cap; evicting least-recently-updated entries from here on`,
+      )
+    }
+
+    for (const [msgID, roleInfo] of this.messageRoles) {
+      if (this.messageRoles.size <= MAX_MESSAGE_ROLES) break
+      if (this.sessions.get(roleInfo.sessionID)?.currentMessageId === msgID) continue
+      this.messageRoles.delete(msgID)
     }
   }
 

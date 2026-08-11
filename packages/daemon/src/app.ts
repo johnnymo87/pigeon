@@ -828,14 +828,22 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const text = typeof body.text === "string" ? body.text : "";
-        if (!text.trim()) {
-          return Response.json({ mirrored: false });
-        }
-
         const now = nowFn();
         const hash = hashPrompt(text);
 
-        if (storage.injectedPrompts.consume(sessionId, hash, now)) {
+        // Consume BEFORE the whitespace check, so that "an injected prompt is consumed exactly
+        // once" holds for every text shape rather than every text shape except whitespace.
+        //
+        // This is hygiene, not a bug fix, and the distinction was corrected after review. It is
+        // tempting to say the leaked count "suppresses a later identical prompt for 15 minutes",
+        // and pigeon-pre9 and the first version of this comment both said so — but hashPrompt is
+        // a raw sha256 with no normalisation, so a later prompt with the same hash is also
+        // whitespace-only and is dropped by the !text.trim() check regardless of any count. A
+        // whitespace-hash count can never change a mirroring decision. What the reorder actually
+        // buys is that the row is freed when its echo arrives instead of lingering to the TTL
+        // sweep, and that a future caller of consume() cannot inherit a shape-dependent rule.
+        const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
+        if (wasInjected || !text.trim()) {
           return Response.json({ mirrored: false });
         }
 

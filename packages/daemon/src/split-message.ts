@@ -1,7 +1,9 @@
 /**
  * Split a Telegram notification into multiple TgMessages that each fit within maxLen.
  *
- * Each chunk is formatted as: header + "\n\n" + bodyChunk + "\n\n" + footer
+ * Each chunk is formatted as: header + "\n\n" + bodyChunk + "\n\n" + footer, except that an empty
+ * header or footer contributes no separator — an empty footer (as the prompt mirror uses) would
+ * otherwise leave a trailing blank line on every message.
  *
  * Header and footer are truncated as needed if overhead crowds out the body budget below minBodyBudget.
  * Header is truncated first (least load-bearing); footer is truncated second (routing metadata at top preserved).
@@ -38,18 +40,26 @@ export function splitTelegramMessage(
   const minBodyBudget = Math.min(MIN_BODY_BUDGET, Math.floor(maxLen / 4));
   let currentHeader = header;
   let currentFooter = footer;
-  let overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
+  // An empty header or footer contributes no separator, so it must not be charged one either.
+  const overheadFor = (h: TgMessage, f: TgMessage): number =>
+    h.text.length +
+    f.text.length +
+    SEP.text.length * ((h.text.length > 0 ? 1 : 0) + (f.text.length > 0 ? 1 : 0));
+  let overhead = overheadFor(currentHeader, currentFooter);
   let maxBody = maxLen - overhead;
 
   // 1. Truncate header if overhead crowds out body budget below minBodyBudget
   if (maxBody < minBodyBudget && currentHeader.text.length > 0) {
     const allowedHeaderLen = Math.max(
       0,
-      maxLen - minBodyBudget - currentFooter.text.length - SEP.text.length * 2,
+      maxLen -
+        minBodyBudget -
+        currentFooter.text.length -
+        SEP.text.length * (1 + (currentFooter.text.length > 0 ? 1 : 0)),
     );
     if (currentHeader.text.length > allowedHeaderLen) {
       currentHeader = sliceBodyMessage(currentHeader, 0, allowedHeaderLen);
-      overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
+      overhead = overheadFor(currentHeader, currentFooter);
       maxBody = maxLen - overhead;
     }
   }
@@ -58,35 +68,53 @@ export function splitTelegramMessage(
   if (maxBody < minBodyBudget && currentFooter.text.length > 0) {
     const allowedFooterLen = Math.max(
       0,
-      maxLen - currentHeader.text.length - minBodyBudget - SEP.text.length * 2,
+      maxLen -
+        currentHeader.text.length -
+        minBodyBudget -
+        SEP.text.length * (1 + (currentHeader.text.length > 0 ? 1 : 0)),
     );
     if (currentFooter.text.length > allowedFooterLen) {
       // Note: session ID sits near the top of the footer (after cwd), so truncating from 0 to allowedFooterLen
       // preserves routing metadata at the start of the footer while dropping any pathological tail.
       currentFooter = sliceBodyMessage(currentFooter, 0, allowedFooterLen);
-      overhead = currentHeader.text.length + currentFooter.text.length + SEP.text.length * 2;
+      overhead = overheadFor(currentHeader, currentFooter);
       maxBody = maxLen - overhead;
     }
   }
 
+  // Join only the non-empty components, separating each pair with SEP. An empty footer (as the
+  // prompt mirror uses) would otherwise leave a trailing blank line on every message.
+  const joinParts = (...parts: TgMessage[]): TgMessage => {
+    const kept: TgMessage[] = [];
+    for (const part of parts) {
+      if (part.text.length === 0) continue;
+      if (kept.length > 0) kept.push(SEP);
+      kept.push(part);
+    }
+    return concatMessages(kept);
+  };
+
   let result: TgMessage[];
 
   if (body.text.length === 0) {
-    result = [concatMessages([currentHeader, SEP, currentFooter])];
+    result = [joinParts(currentHeader, currentFooter)];
   } else if (maxBody > 0 && body.text.length <= maxBody) {
-    result = [concatMessages([currentHeader, SEP, body, SEP, currentFooter])];
+    result = [joinParts(currentHeader, body, currentFooter)];
   } else {
     const bodyChunks = splitBodyText(body.text, maxBody);
     result = bodyChunks.map((chunk) => {
       const chunkMsg = sliceBodyMessage(body, chunk.start, chunk.end);
-      return concatMessages([currentHeader, SEP, chunkMsg, SEP, currentFooter]);
+      return joinParts(currentHeader, chunkMsg, currentFooter);
     });
   }
 
-  // Final safety clamp: ensure no chunk exceeds maxLen (belt and braces)
-  return result.map((msg) =>
-    msg.text.length > maxLen ? sliceBodyMessage(msg, 0, maxLen) : msg,
-  );
+  // Final safety pass: clamp to maxLen AND drop a trailing unpaired high surrogate.
+  // sliceBodyMessage does both (it walks `end` back off a high surrogate), so run every chunk
+  // through it rather than only the over-long ones. Until pigeon-pre9 the strip happened only
+  // by accident: an empty footer still contributed a "\n\n", which pushed short malformed input
+  // over maxLen and triggered the clamp. With that separator correctly gone, a one-chunk body
+  // ending in a lone high surrogate would otherwise reach Telegram unsanitised.
+  return result.map((msg) => sliceBodyMessage(msg, 0, Math.min(msg.text.length, maxLen)));
 }
 
 /**
