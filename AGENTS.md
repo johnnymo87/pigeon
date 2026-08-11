@@ -17,7 +17,32 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
 - Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
-- Deploy daemon/plugin: `git pull && npm install` then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
+- Deploy daemon/plugin: `git pull`, then **separately** `npm install`, then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md)). Two bash calls, not one — see below.
+
+### Heavy commands and your serve's memory cgroup
+
+On cloudbox an agent's bash command normally runs in its own systemd scope
+(`oc-agent.slice`, `MemoryMax=10G`), isolated from the `opencode serve` that spawned it.
+**A command whose text contains a bare `git` token is deliberately exempted** and runs
+inside the serve's own cgroup instead: `MemoryMax=14G`, `OOMPolicy=stop`, shared with the
+serve process and every peer session on that port. The exemption exists so opencode's
+`git ... : deny` permission rules still match — wrapping the command would blind them.
+
+The consequence is that `OOMPolicy=stop` makes **any** OOM in that cgroup stop the whole
+serve. That kills the plugin, so no `session.idle` fires and the session's Telegram
+notifications stop **silently** — it looks like a pigeon bug, not an OOM. It also takes out
+every other session on that port. This has happened (`pigeon-8bif`).
+
+So: **never chain `git` with an install or a test run in one bash call.** Split them.
+
+```bash
+git pull --ff-only          # call 1 — unscoped, but trivial
+npm install && npm run test # call 2 — scoped and capped
+```
+
+The suite itself is modest (~1.0 GiB peak, measured cold and warm), so this is about not
+adding load to a cgroup that may already be near its ceiling — not about the suite being
+large. On macOS/devbox there is no such scoping at all, and everything runs unscoped.
 
 ## Architecture
 

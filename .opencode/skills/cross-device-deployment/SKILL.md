@@ -27,11 +27,22 @@ On each machine, pull latest code and restart the daemon.
 
 ### 1. Pull and Install
 
+Run these as **two separate bash calls**, not one compound command:
+
 ```bash
-cd <project-path>/pigeon
-git pull
-npm install
+cd <project-path>/pigeon && git pull
 ```
+
+```bash
+cd <project-path>/pigeon && npm install
+```
+
+> **Why split?** On cloudbox, a bash command containing a bare `git` token is exempted from
+> the per-command systemd scope and runs inside the `opencode serve` cgroup
+> (`MemoryMax=14G`, `OOMPolicy=stop`, shared with peer sessions). `npm install` peaks around
+> 1.9 GiB; chaining it after `git pull` charges that to the serve, where an OOM stops the
+> serve, kills the plugin, and silently ends Telegram notifications for every session on
+> that port. See the Quickstart section of `AGENTS.md` (`pigeon-8bif`).
 
 ### 2. Restart Daemon
 
