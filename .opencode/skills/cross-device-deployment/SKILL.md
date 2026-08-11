@@ -147,6 +147,9 @@ journal with 90-day retention instead of the ~6 days the shared journal manages.
 Chromebook runs pigeon as a *user* service with no namespace, so the flag would
 find nothing there.
 
-Omitting the flag where it is needed does not error — it prints **zero entries**,
-which looks exactly like a daemon that logged nothing. If a devbox/cloudbox log
-query comes back suspiciously empty, check the flag before concluding anything.
+Omitting the flag where it is needed does not error — it prints systemd's own
+`Started`/`Stopped` lines (PID 1 is not namespaced) and **none of the daemon's
+output**. That looks exactly like a daemon that is running but logging nothing,
+which is more believable than an empty result and therefore more misleading. If a
+devbox/cloudbox log query shows lifecycle lines and nothing else, check the flag
+before concluding anything.
