@@ -236,6 +236,10 @@ export async function handleSendNotification(
     const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
     let messageThreadId: number | undefined;
+    // Telegram auto-pins the first message posted into a freshly created forum topic. Track
+    // whether THIS request created the topic so the pin can be cleared after the send that
+    // caused it (pigeon-ud6s).
+    let topicJustCreated = false;
 
     if (topicsEnabled(env) && threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
@@ -257,6 +261,7 @@ export async function handleSendNotification(
 
       if (topicRes.ok && topicRes.messageThreadId !== null) {
         messageThreadId = topicRes.messageThreadId;
+        topicJustCreated = topicRes.created === true;
       }
     }
 
@@ -304,6 +309,10 @@ export async function handleSendNotification(
         retryTopicRes.ok && retryTopicRes.messageThreadId !== null
           ? retryTopicRes.messageThreadId
           : undefined;
+      topicJustCreated =
+        retryTopicRes.ok &&
+        retryTopicRes.messageThreadId !== null &&
+        retryTopicRes.created === true;
 
       // Retry sendMessage exactly once
       telegramResult = await tg.sendMessage({
@@ -351,6 +360,34 @@ export async function handleSendNotification(
     }
 
     const messageId = telegramResult.result.message_id;
+
+    // Telegram auto-pins the first message posted into a newly created forum topic, so every
+    // new session topic would otherwise open with a pinned notification. Clear it here, on the
+    // one request that created the topic, so no user-made pin can ever be caught by this
+    // (the topic is seconds old and this is its first message). Best-effort: an unpin failure
+    // — missing can_pin_messages, a Telegram 5xx — must not fail an already-delivered
+    // notification, and must not be retried by the daemon (pigeon-ud6s).
+    if (topicJustCreated && messageThreadId !== undefined) {
+      try {
+        const unpinRes = await tg.unpinAllForumTopicMessages({
+          chatId,
+          messageThreadId,
+        });
+        if (!unpinRes.ok) {
+          console.warn("[worker] unpinAllForumTopicMessages failed", {
+            sessionId,
+            messageThreadId,
+            details: getTelegramErrorDetails(unpinRes),
+          });
+        }
+      } catch (err) {
+        console.warn("[worker] unpinAllForumTopicMessages threw", {
+          sessionId,
+          messageThreadId,
+          error: String(err),
+        });
+      }
+    }
 
     // Store message→session mapping for reply routing
     await withD1(

@@ -18,8 +18,11 @@ import {
 } from "./topics";
 
 export type ResolveTopicResult =
-  | { ok: true; messageThreadId: number }
-  | { ok: true; messageThreadId: null }
+  // `created` is true only on the path that both created the Telegram topic AND won the
+  // finalize CAS for it — i.e. exactly one caller per topic ever sees it. Callers use it to
+  // clear Telegram's auto-pin of the first message posted into a new topic (pigeon-ud6s).
+  | { ok: true; messageThreadId: number; created?: boolean }
+  | { ok: true; messageThreadId: null; created?: boolean }
   | { ok: false; kind: "rate_limited"; retryAfter: number };
 
 export interface ResolveTopicOptions {
@@ -233,7 +236,7 @@ export async function resolveTopic(
     });
 
     if (finalized) {
-      return { ok: true, messageThreadId: threadId };
+      return { ok: true, messageThreadId: threadId, created: true };
     }
 
     // Lost finalize CAS! Another caller finalized first.

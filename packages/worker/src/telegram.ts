@@ -83,6 +83,11 @@ export interface DeleteForumTopicOptions {
   messageThreadId: number;
 }
 
+export interface UnpinAllForumTopicMessagesOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
 
 /**
@@ -382,6 +387,33 @@ export async function deleteForumTopic(
   return parseTgResponse<boolean>(res);
 }
 
+/**
+ * Clears every pinned message in a forum topic.
+ *
+ * Telegram auto-pins the first message posted into a freshly created forum topic, which
+ * leaves every new Pigeon session topic with a pinned message nobody asked for. Pigeon
+ * calls this once, immediately after the first send into a topic it just created, so the
+ * only pin it can possibly clear is Telegram's own (bead pigeon-ud6s).
+ */
+export async function unpinAllForumTopicMessages(
+  botToken: string,
+  options: UnpinAllForumTopicMessagesOptions,
+): Promise<TgResult<boolean>> {
+  const res = await fetch(
+    `https://api.telegram.org/bot${botToken}/unpinAllForumTopicMessages`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: options.chatId,
+        message_thread_id: options.messageThreadId,
+      }),
+    },
+  );
+
+  return parseTgResponse<boolean>(res);
+}
+
 export function createTelegramClient(botToken: string) {
   return {
     sendMessage: (options: SendMessageOptions) => sendMessage(botToken, options),
@@ -395,6 +427,8 @@ export function createTelegramClient(botToken: string) {
     closeForumTopic: (options: CloseForumTopicOptions) => closeForumTopic(botToken, options),
     reopenForumTopic: (options: ReopenForumTopicOptions) => reopenForumTopic(botToken, options),
     deleteForumTopic: (options: DeleteForumTopicOptions) => deleteForumTopic(botToken, options),
+    unpinAllForumTopicMessages: (options: UnpinAllForumTopicMessagesOptions) =>
+      unpinAllForumTopicMessages(botToken, options),
   };
 }
 
