@@ -47,13 +47,13 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * applying time-to-live (TTL) expiry to quiet declared/inferred rows.
  *
  * WHY expiry returns 'all' and not null:
- * Expiry MUST NOT resolve to policy = null. When policy is null, `decideNotify` falls
- * through to the legacy title layer (the `isTitleLayerOn` / `isQuietTitle` block below),
- * where the quiet-title regex still matches 14 of 16 production lgtm titles (measured
- * against the live daemon DB: "PR review .lgtm-review-prompt.md", "Enriching review
- * context from .lgtm-gather-prompt.md", ...). Resolving to null would therefore leave
- * ~88% of the target population muted by the regex, making expiry a silent NO-OP.
- * Expiring to 'all' decides explicitly at the origin layer and bypasses the title layer.
+ * Expiry MUST NOT resolve to policy = null. Expiring to 'all' decides explicitly at
+ * the origin layer instead of falling through to whatever downstream default happens
+ * to be configured, ensuring the outcome does not silently depend on the title layer's
+ * configuration. With PIGEON_QUIET_TITLE_LAYER=on (the rollback configuration, and
+ * historical default), falling through to null WOULD be a silent NO-OP for ~88% of lgtm
+ * titles (where the regex matches production titles like "PR review .lgtm-review-prompt.md"),
+ * keeping expired sessions muted. Expiring to 'all' explicitly overrides downstream layers.
  * (Deliberately no line numbers here: this is the load-bearing comment in the change and
  * line citations rot on the first edit above them.)
  *
@@ -136,16 +136,19 @@ const LAYER_ON_VALUES = new Set(["on", "true", "1", "yes"]);
 
 function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
   const raw = env.PIGEON_QUIET_TITLE_LAYER?.trim();
-  if (!raw) return true;
+  if (!raw) return false;
 
   const val = raw.toLowerCase();
   if (LAYER_OFF_VALUES.has(val)) return false;
   if (LAYER_ON_VALUES.has(val)) return true;
 
+  // An unparseable value must resolve the same way as an absent one (default),
+  // and the repo's standing bias is that ambiguity resolves toward DELIVERING notifications.
+  // A typo'd re-enable (e.g. "=enabled") failing loud (noise) is strictly safer than failing silent.
   console.warn(
-    `[notify-policy] unrecognised PIGEON_QUIET_TITLE_LAYER="${raw}", leaving title layer enabled`,
+    `[notify-policy] unrecognised PIGEON_QUIET_TITLE_LAYER="${raw}", leaving title layer disabled`,
   );
-  return true;
+  return false;
 }
 
 /**
@@ -153,8 +156,9 @@ function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
  *
  * Precedence, strongest first:
  *   1. session_origin.notify_policy  (declared provenance)
- *   2. the legacy quiet-title regex  (transitional; disable with
- *      PIGEON_QUIET_TITLE_LAYER=off, delete under pigeon-qdcb.5)
+ *   2. the legacy quiet-title regex  (transitional; off by default, re-enable
+ *      with PIGEON_QUIET_TITLE_LAYER=on; retained for soak, deletion tracked
+ *      by follow-up bead)
  *   3. deliver
  *
  * The caller checks `sessions.notify` BEFORE calling this (the `!session.notify` short-circuit in the POST /stop handler); that short-circuit

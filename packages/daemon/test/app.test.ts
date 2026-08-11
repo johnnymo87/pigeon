@@ -1316,12 +1316,22 @@ describe("createApp", () => {
 
   describe("PIGEON_QUIET_TITLE_PATTERN stop notification suppression", () => {
     const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
+    });
 
     afterEach(() => {
       if (originalQuietPattern !== undefined) {
         process.env.PIGEON_QUIET_TITLE_PATTERN = originalQuietPattern;
       } else {
         delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      }
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
       }
     });
 
@@ -2122,6 +2132,7 @@ describe("createApp", () => {
     });
 
     it("session with NO origin row falls through to title layer (quiet-matching title -> quiet_title)", async () => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
       const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
@@ -2243,6 +2254,20 @@ describe("createApp", () => {
   });
 
   describe("POST /sessions/enable-notify un-quiet override", () => {
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
+    });
+
+    afterEach(() => {
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
+      }
+    });
+
     it("overrides pre-existing quiet origin row while preserving origin provenance", async () => {
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
