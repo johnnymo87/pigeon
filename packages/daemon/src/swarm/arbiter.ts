@@ -72,6 +72,13 @@ export class SwarmArbiter {
   // One in-flight promise per target session — collapses concurrent processOnce
   // calls into a single per-target queue.
   private readonly inflight = new Map<string, Promise<void>>();
+  /**
+   * Set by drain(). Draining a target is a LOOP, so without this the loop
+   * would keep pulling the next queued row and shutdown would take as long as
+   * the backlog. Checked at the top of each iteration so the delivery already
+   * in flight still completes its terminal write.
+   */
+  private draining = false;
 
   private timer: ReturnType<typeof setInterval> | null = null;
 
@@ -100,6 +107,57 @@ export class SwarmArbiter {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+  }
+
+  /**
+   * Stop taking new work and wait for in-flight deliveries to reach their
+   * terminal write. Call this from a SIGTERM handler before exiting.
+   *
+   * WHY (pigeon-8aob): `sendPrompt` is awaited and only THEN is `markHandedOff`
+   * committed. A process death in that window leaves the row `queued`, so the
+   * next daemon redelivers and the target is woken TWICE. The per-target
+   * in-flight guard is an in-memory Map, so it cannot outlive the process that
+   * owns it. Draining closes that window for every restart we initiate --
+   * which is the deploy case, and deploys are the restarts we actually cause.
+   *
+   * WHAT THIS IS NOT. It does not make delivery exactly-once and must not be
+   * described as if it did. A hard crash (OOM, SIGKILL, power loss) runs no
+   * handler and is unaffected. Duplicate-on-ambiguity also remains ACCEPTED
+   * POLICY elsewhere on this path: a timed-out send is a COUNTED attempt and
+   * is resent, precisely because a timeout may mean the request WAS processed
+   * (delivery-policy.ts, `isOutageFailure`). This method narrows one duplicate
+   * window; it does not remove the class.
+   *
+   * Bounded on purpose: a wedged `sendPrompt` must not hold the process open
+   * until systemd escalates to SIGKILL, because being killed mid-write is the
+   * very outcome this exists to avoid.
+   */
+  async drain(timeoutMs: number): Promise<{ drained: boolean; pending: number }> {
+    // LOAD-BEARING, and not merely for the sends. `draining` is checked inside
+    // drainTargetInner only; `processOnce` also runs `sweepExpired`, which is
+    // NOT gated by it and writes to the DB (expiring rows, notifying senders,
+    // enqueuing alerts). Without this call the 500ms tick keeps firing and
+    // keeps expiring rows after we have decided to exit. Pinned by the
+    // "does not keep expiring rows after drain" test.
+    this.stop();
+    this.draining = true;
+
+    const pending = Array.from(this.inflight.values());
+    if (pending.length === 0) return { drained: true, pending: 0 };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        Promise.allSettled(pending).then(() => "done" as const),
+        deadline,
+      ]);
+      return { drained: outcome === "done", pending: this.inflight.size };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -189,6 +247,12 @@ export class SwarmArbiter {
 
   private async drainTargetInner(target: string): Promise<void> {
     while (true) {
+      // Shutting down: leave the remaining backlog `queued` for the next
+      // process rather than starting a send we may not live to record. The
+      // delivery already in flight is NOT interrupted -- it is awaited by
+      // drain(), which is the entire point.
+      if (this.draining) return;
+
       const now = this.nowFn();
       const next = this.storage.swarm.getReadyForTarget(target, now, 1)[0];
       if (!next) return;
