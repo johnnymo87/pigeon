@@ -1316,12 +1316,22 @@ describe("createApp", () => {
 
   describe("PIGEON_QUIET_TITLE_PATTERN stop notification suppression", () => {
     const originalQuietPattern = process.env.PIGEON_QUIET_TITLE_PATTERN;
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
+    });
 
     afterEach(() => {
       if (originalQuietPattern !== undefined) {
         process.env.PIGEON_QUIET_TITLE_PATTERN = originalQuietPattern;
       } else {
         delete process.env.PIGEON_QUIET_TITLE_PATTERN;
+      }
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
       }
     });
 
@@ -2122,10 +2132,26 @@ describe("createApp", () => {
     });
 
     it("session with NO origin row falls through to title layer (quiet-matching title -> quiet_title)", async () => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
       const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
       expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
+    });
+
+    // THE PRODUCTION DEFAULT after pigeon-qdcb.5. The sibling test above pins the
+    // rollback configuration (PIGEON_QUIET_TITLE_LAYER=on, regex still suppressing);
+    // this one pins what actually ships. Note the enclosing beforeEach DELETES the var,
+    // so "unset" here is the real default path, not an inherited value. This assertion
+    // is what must survive the eventual deletion of the regex.
+    it("session with NO origin row and a quiet-matching title DELIVERS by default (title layer off)", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
     });
 
     it("notifyPolicy=all + quiet-matching title -> delivered (provenance overrides title regex)", async () => {
@@ -2243,6 +2269,20 @@ describe("createApp", () => {
   });
 
   describe("POST /sessions/enable-notify un-quiet override", () => {
+    const originalQuietLayer = process.env.PIGEON_QUIET_TITLE_LAYER;
+
+    beforeEach(() => {
+      process.env.PIGEON_QUIET_TITLE_LAYER = "on";
+    });
+
+    afterEach(() => {
+      if (originalQuietLayer !== undefined) {
+        process.env.PIGEON_QUIET_TITLE_LAYER = originalQuietLayer;
+      } else {
+        delete process.env.PIGEON_QUIET_TITLE_LAYER;
+      }
+    });
+
     it("overrides pre-existing quiet origin row while preserving origin provenance", async () => {
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_a", notify: false }, 1_000);
