@@ -616,3 +616,76 @@ const server = startServer(config, createApp(storage, {
 
 console.log(`[pigeon-daemon] listening on http://127.0.0.1:${server.port}`);
 console.log(`[pigeon-daemon] auth: ${config.authToken ? "enabled" : "disabled"}`);
+
+/**
+ * Graceful shutdown (pigeon-8aob).
+ *
+ * The arbiter awaits `sendPrompt` and only THEN commits `markHandedOff`. Dying
+ * in that window leaves the row `queued`, so the next daemon redelivers and the
+ * target session is woken TWICE. Until this handler existed there was no signal
+ * handling at all, which meant EVERY deploy was an abrupt kill and every deploy
+ * rolled that dice.
+ *
+ * Scope, stated so nobody reads more into it: this closes the restarts WE
+ * initiate. A hard crash (OOM, SIGKILL, power loss) runs no handler and is
+ * unaffected, and duplicate-on-ambiguity remains deliberate policy on the
+ * timeout path (see `isOutageFailure` in swarm/delivery-policy.ts). Delivery is
+ * still at-least-once, by design.
+ *
+ * BUDGET ARITHMETIC, and why it is not a round number. The budget must EXCEED
+ * the longest an in-flight iteration can legitimately take, or the drain gives
+ * up on a send that was about to succeed -- exiting with the row still
+ * `queued` and duplicating it anyway, which is the worst of both (we waited AND
+ * duplicated). One iteration is bounded by a directory lookup
+ * (DEFAULT_REGISTRY_TIMEOUT_MS, 10s) plus the prompt itself
+ * (DEFAULT_REQUEST_TIMEOUT_MS in opencode-client.ts, 30s) = 40s. 45s leaves
+ * margin. Targets drain concurrently, so this is wall-clock, not per-target.
+ *
+ * At 45s every in-flight promise settles by construction, so the deadline race
+ * is a backstop rather than the mechanism: a send that succeeds commits
+ * `markHandedOff`, and one that wedges resolves as RequestTimeoutError and
+ * commits a COUNTED `markRetry` -- a recorded state either way, never an
+ * ambiguous `queued`.
+ *
+ * Headroom: systemd TimeoutStopSec is 90s for this unit (verified on the live
+ * unit, but it is defined in the workstation repo -- if it is ever lowered
+ * below ~60s, lower this to match or we trade a clean drain for a SIGKILL
+ * mid-write, the exact failure this exists to avoid).
+ *
+ * Cost, stated plainly: for up to 45s after SIGTERM the daemon is still fully
+ * live -- it accepts new /swarm/send, and the poller still ingests. All of
+ * that is durable, but the window is real and grows with this number.
+ */
+const SHUTDOWN_DRAIN_MS = 45_000;
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  // A second Ctrl-C / SIGTERM must not start a second drain.
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[pigeon-daemon] ${signal} received, draining swarm arbiter...`);
+
+  if (swarmArbiter) {
+    try {
+      const { drained, pending } = await swarmArbiter.drain(SHUTDOWN_DRAIN_MS);
+      if (drained) {
+        console.log("[pigeon-daemon] swarm arbiter drained cleanly");
+      } else {
+        // Not fatal, but it means we are exiting in the very window this
+        // handler exists to avoid, so say so plainly rather than exiting 0 in
+        // silence: the next process may redeliver those rows.
+        console.warn(
+          `[pigeon-daemon] swarm arbiter drain TIMED OUT after ${SHUTDOWN_DRAIN_MS}ms ` +
+            `with ${pending} delivery(ies) still in flight; those rows may be redelivered`,
+        );
+      }
+    } catch (err) {
+      console.error("[pigeon-daemon] error while draining swarm arbiter", err);
+    }
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

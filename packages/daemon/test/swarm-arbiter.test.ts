@@ -110,6 +110,23 @@ function makeFixture(opts?: {
   };
 }
 
+/** Minimal queued row for tests that only care about delivery timing. */
+function insertQueued(storage: StorageDb, msgId: string, to: string): void {
+  storage.swarm.insert(
+    {
+      msgId,
+      fromSession: "ses_a",
+      toSession: to,
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hi",
+    },
+    1_000,
+  );
+}
+
 describe("SwarmArbiter", () => {
   let fixture: ReturnType<typeof makeFixture> | null = null;
 
@@ -1506,4 +1523,148 @@ describe("SwarmArbiter", () => {
       expect(fixture.calls[0]!.directory).toBe("/dir/ses_b");
     });
   });
+
+  /**
+   * pigeon-8aob. A daemon death between `sendPrompt` resolving and
+   * `markHandedOff` committing leaves the row `queued`, so the next process
+   * redelivers and the target is woken TWICE. The in-flight guard is an
+   * in-memory Map, so it cannot survive the process that owns it.
+   *
+   * These pin the graceful-drain mitigation: on SIGTERM the daemon stops
+   * accepting new work and waits for the in-flight delivery to reach its
+   * terminal write. That closes the DEPLOY case, which is the one restart
+   * class we actually control. It does NOT make delivery exactly-once, and
+   * deliberately so -- see the notes on pigeon-8aob.
+   */
+  describe("drain (pigeon-8aob)", () => {
+    it("waits for an in-flight delivery to commit markHandedOff", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      insertQueued(storage, "m_drain1", "ses_b");
+      fixture.setInFlightDelay(60);
+
+      // Start the delivery but do NOT await it: this is the crash window.
+      const inflight = arbiter.processOnce();
+
+      // Mid-flight the row must still be queued -- otherwise the test would
+      // pass even without a drain.
+      expect(storage.swarm.getByMsgId("m_drain1")!.state).toBe("queued");
+
+      const result = await arbiter.drain(5_000);
+      expect(result.drained).toBe(true);
+
+      // The whole point: after drain the terminal write HAS happened, so a
+      // restart here cannot redeliver.
+      expect(storage.swarm.getByMsgId("m_drain1")!.state).toBe("handed_off");
+      await inflight;
+    });
+
+    it("does not start a NEW delivery once draining", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+
+      insertQueued(storage, "m_drain2a", "ses_b");
+      insertQueued(storage, "m_drain2b", "ses_b");
+      fixture.setInFlightDelay(40);
+
+      const inflight = arbiter.processOnce();
+      await arbiter.drain(5_000);
+      await inflight;
+
+      // Same target, two queued rows: the loop would normally continue to the
+      // second. Draining must stop after the in-flight one commits, leaving
+      // the second for the next process rather than half-sending it.
+      expect(calls).toHaveLength(1);
+      expect(storage.swarm.getByMsgId("m_drain2a")!.state).toBe("handed_off");
+      expect(storage.swarm.getByMsgId("m_drain2b")!.state).toBe("queued");
+    });
+
+    /**
+     * Belt-and-braces, and honest about it: `draining` and `stop()` EACH block
+     * delivery on their own, so this passes with either one removed. It pins
+     * the disjunction, not either mechanism. The test below is the one that
+     * separates them.
+     */
+    it("delivers nothing after drain (flag and stop() each suffice)", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter, calls } = fixture;
+
+      arbiter.start(5);
+      await arbiter.drain(5_000);
+
+      insertQueued(storage, "m_drain3", "ses_b");
+      await new Promise((r) => setTimeout(r, 40));
+      expect(calls).toHaveLength(0);
+    });
+
+    it("gives up at the deadline instead of holding shutdown open", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      insertQueued(storage, "m_drain4", "ses_b");
+      fixture.setInFlightDelay(400);
+
+      const inflight = arbiter.processOnce();
+      const started = Date.now();
+      const result = await arbiter.drain(30);
+      const elapsed = Date.now() - started;
+
+      // Bounded: a wedged sendPrompt must not hold the process until systemd
+      // SIGKILLs it, which would be no better than no drain at all.
+      expect(result.drained).toBe(false);
+      expect(result.pending).toBe(1);
+      expect(elapsed).toBeLessThan(300);
+      await inflight;
+    });
+
+    /**
+     * This is what makes `stop()` inside drain() load-bearing, and it is here
+     * because a mutation that deleted that call SURVIVED the rest of this
+     * suite. `draining` is checked inside drainTargetInner only -- but
+     * `processOnce` also runs `sweepExpired`, which is NOT gated by it and
+     * WRITES (expires rows, notifies senders, enqueues alerts). Leave the
+     * timer running and the daemon keeps mutating state after it has decided
+     * to exit.
+     */
+    it("does not keep expiring rows after drain", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      storage.swarm.insert(
+        {
+          msgId: "m_sweep",
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "wake up",
+          deliverAt: 10_000,
+          expiresAt: 20_000,
+        },
+        1_000,
+      );
+
+      arbiter.start(5);
+      await arbiter.drain(5_000);
+
+      // Push time past expiry. A still-running tick would sweep the row.
+      fixture.setNow(30_000);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(storage.swarm.getByMsgId("m_sweep")!.state).toBe("queued");
+    });
+
+    it("drain on an idle arbiter is idempotent", async () => {
+      fixture = makeFixture();
+      const { arbiter } = fixture;
+      const a = await arbiter.drain(1_000);
+      const b = await arbiter.drain(1_000);
+      expect(a.drained).toBe(true);
+      expect(b.drained).toBe(true);
+    });
+  });
+
 });
