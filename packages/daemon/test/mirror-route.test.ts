@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { hashPrompt } from "../src/hash-prompt";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { DEFAULT_DECLARED_QUIET_TTL_MS } from "../src/notify-policy";
 
 describe("POST /mirror route", () => {
   let storage: StorageDb | null = null;
@@ -294,5 +295,95 @@ describe("POST /mirror route", () => {
 
     // Outbox should still have exactly one row due to notificationId deduplication
     expect(storage!.outbox.getReady().length).toBe(1);
+  });
+
+  describe("declared-quiet sessions do not mirror", () => {
+    // REGRESSION. Production, 2026-08-11: lgtm's automated reviews had their Stop
+    // correctly suppressed by session_origin, but still mirrored their own launch
+    // prompt -- 16 mirror rows against 1 stop row for the quiet population. Because a
+    // Telegram topic is created by a session's FIRST notification, each of those also
+    // created a topic, so the user saw a new forum topic per automated PR review.
+    //
+    // The mirror fires for a HEADLESS session because /mirror's real predicate is
+    // "user-role message not found in injected_prompts", not "a human typed this".
+    // lgtm launches via the opencode-launch CLI, so its launch prompt is a user
+    // message the daemon never injected and therefore never suppressed.
+    const LGTM_LAUNCH_PROMPT =
+      "Read the file .lgtm-review-prompt.md in this directory and follow its instructions to review the PR.";
+
+    function mirror(app: ReturnType<typeof createApp>, sessionId: string) {
+      return app(
+        new Request("http://localhost/mirror", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId, messageId: "msg_1", text: LGTM_LAUNCH_PROMPT }),
+        }),
+      );
+    }
+
+    it("suppresses the mirror and enqueues nothing for a declared quiet session", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_lgtm", notify: true }, 1_000);
+      storage!.sessionOrigins.record(
+        {
+          sessionId: "ses_lgtm",
+          origin: "lgtm",
+          notifyPolicy: "errors-only",
+          source: "declared",
+        },
+        1_000,
+      );
+
+      const res = await mirror(app, "ses_lgtm");
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ mirrored: false, reason: "quiet_origin" });
+      // The topic-creating side effect is the whole point: no row, no topic.
+      expect(storage!.outbox.getReady().length).toBe(0);
+    });
+
+    it("still mirrors an identical prompt for a session with no origin row", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_human", notify: true }, 1_000);
+
+      const res = await mirror(app, "ses_human");
+
+      expect(await res.json()).toEqual({ mirrored: true });
+      expect(storage!.outbox.getReady().length).toBe(1);
+    });
+
+    it("mirrors again once the declared quiet TTL has expired", async () => {
+      const app = newApp(1_000);
+      storage!.sessions.upsert({ sessionId: "ses_lgtm", notify: true }, 1_000);
+      storage!.sessionOrigins.record(
+        {
+          sessionId: "ses_lgtm",
+          origin: "lgtm",
+          notifyPolicy: "errors-only",
+          source: "declared",
+        },
+        1_000,
+      );
+      storage!.db.close();
+      storage = null;
+
+      // Same row, but read far enough in the future that the 2h TTL has lapsed.
+      const later = 1_000 + DEFAULT_DECLARED_QUIET_TTL_MS + 1;
+      storage = openStorageDb(":memory:");
+      const app2 = createApp(storage, { nowFn: () => later });
+      storage.sessions.upsert({ sessionId: "ses_lgtm", notify: true }, 1_000);
+      storage.sessionOrigins.record(
+        {
+          sessionId: "ses_lgtm",
+          origin: "lgtm",
+          notifyPolicy: "errors-only",
+          source: "declared",
+        },
+        1_000,
+      );
+
+      const res = await mirror(app2, "ses_lgtm");
+      expect(await res.json()).toEqual({ mirrored: true });
+    });
   });
 });

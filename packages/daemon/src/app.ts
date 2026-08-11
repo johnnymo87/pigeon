@@ -12,6 +12,7 @@ import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
 import { decideNotify, effectiveNotifyPolicy, type NotifyDecision } from "./notify-policy";
+import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
@@ -815,6 +816,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         if (storage.injectedPrompts.consume(sessionId, hash, now)) {
           return Response.json({ mirrored: false });
+        }
+
+        // A session declared quiet (lgtm's automated reviews) must not mirror its
+        // prompts. Without this, lgtm's own launch prompt -- a user-role message the
+        // daemon never injected and so never suppressed -- posts into Telegram AND
+        // creates the topic, defeating the Stop suppression it sits beside.
+        if (!shouldEmitAncillaryFor(storage, sessionId, now)) {
+          console.log(`[mirror] quieted sessionId=${sessionId} reason=origin`);
+          return Response.json({ mirrored: false, reason: "quiet_origin" });
         }
 
         const session = storage.sessions.get(sessionId);
