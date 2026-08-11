@@ -2139,6 +2139,21 @@ describe("createApp", () => {
       expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_title" });
     });
 
+    // THE PRODUCTION DEFAULT after pigeon-qdcb.5. The sibling test above pins the
+    // rollback configuration (PIGEON_QUIET_TITLE_LAYER=on, regex still suppressing);
+    // this one pins what actually ships. Note the enclosing beforeEach DELETES the var,
+    // so "unset" here is the real default path, not an inherited value. This assertion
+    // is what must survive the eventual deletion of the regex.
+    it("session with NO origin row and a quiet-matching title DELIVERS by default (title layer off)", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, 1_000);
+      const res = await stop(app, "Stop", "Review PR with lgtm-review-prompt");
+      expect(res.status).toBe(202);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("queued");
+    });
+
     it("notifyPolicy=all + quiet-matching title -> delivered (provenance overrides title regex)", async () => {
       const app = newApp();
       seed(app, "all");
