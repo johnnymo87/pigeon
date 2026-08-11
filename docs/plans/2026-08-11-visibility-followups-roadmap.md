@@ -53,7 +53,7 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
-| **E** | `pigeon-pre9` | Deferred polish from adversarial review | **MERGED** 2026-08-11, PR #NNN — awaiting the same serve restart as D |
+| **E** | `pigeon-pre9` | Deferred polish from adversarial review | **MERGED** 2026-08-11, PR #99 — awaiting the same serve restart as D |
 
 **Only B remains, and it is the deploy.** A, C, D and E are all resolved: **D and E are merged but
 NOT deployed**, and both are waiting on the *same* `opencode serve` restart (§1.2) — that restart is
@@ -439,7 +439,7 @@ from the outside.
 
 ### [ ] E. `pigeon-pre9` (P4) — deferred polish from the adversarial review
 
-**All four written, reviewed and merged in PR #NNN (`eb2212a`). NOT ticked: like D, the plugin half
+**All four written, reviewed and merged in PR #99 (`e5addda`). NOT ticked: like D, the plugin half
 is inert until an `opencode serve` restart (§1.2).** Tick when a restarted serve has run the plugin
 half — the same restart D is waiting for, which is why they were landed together.
 
@@ -447,7 +447,7 @@ Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Done together in one
 
 **Item 4 pairs naturally with D** — both are `message-tail.ts`/plugin changes needing the same serve
 restart, so landing them close together spends one restart instead of two. That is what happened:
-D merged as PR #94, E as PR #NNN, minutes apart.
+D merged as PR #94, E as PR #99, minutes apart.
 
 > **CORRECTION #E1 (2026-08-11, written while doing the work).** Item 3's stated failure mode below
 > — "leaks its count for 15 min" — is **impossible**, and the bead said the same thing. `hashPrompt`
