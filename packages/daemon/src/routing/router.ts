@@ -9,6 +9,7 @@ import type {
 import type {
   ServeInstanceRecord,
   RouteResult,
+  LeaseRecord,
 } from "./types";
 import type { ReassignmentEventRepo } from "./reassignment-repo";
 
@@ -69,6 +70,82 @@ export class IngressRouter {
       !s.draining &&
       s.binaryEpoch === epoch
     );
+  }
+
+  /**
+   * How long past its expiry an already-expired lease row is RETAINED as a
+   * PLACEMENT MARKER rather than swept away (bead pigeon-u1a). Derived from
+   * leaseTtlMs so the two can never drift apart in config.
+   */
+  private get markerGraceMs(): number {
+    return this.opts.leaseTtlMs * 5;
+  }
+
+  /**
+   * Is this EXPIRED lease row still worth keeping as a placement marker?
+   *
+   * WHAT THIS IS NOT: it is NOT a "turn is in flight" detector, and it must not
+   * be described as one. `placeSession` mints a lease at EVERY placement, so an
+   * expired row is equally the residue of a placement that never ran a turn at
+   * all. What the row actually attests is narrower and still useful: THIS SESSION
+   * WAS PLACED ON THIS SERVE VERY RECENTLY. That is recency stickiness, and it is
+   * the property pigeon-u1a needs.
+   *
+   * The gates, and why each one is load-bearing:
+   *
+   * - CURRENT EPOCH. A lease from a previous binary generation says nothing about
+   *   where this session should run now.
+   * - WITHIN GRACE. This bounds retention for a session that goes QUIET, and that
+   *   is ALL it bounds. Do not read it as a ceiling on how long a session can stay
+   *   put: every placement that honors a marker calls acquireCAS, whose take-over
+   *   ladder branch C re-mints a full-TTL lease over an expired one
+   *   (route-repo.ts, `session_lease.lease_expires_at <= @now`), so the grace
+   *   clock restarts from the NEW expiry. A session touched more often than
+   *   leaseTtlMs + grace can therefore sit on the same serve indefinitely. That is
+   *   deliberate rather than overlooked: the only alternative is moving a session
+   *   whose turn may be running, which is the kill this bead exists to prevent,
+   *   and the design doc (§5.1 A) already settled that a live serve is never
+   *   evacuated.
+   * - OWNING SERVE STILL HEALTHY. This is the liveness gate that keeps the whole
+   *   mechanism out of the `renewCAS` trap. We never renew or extend anything —
+   *   a genuinely dead serve stops beating (its heartbeat is on a worker thread
+   *   that dies with the process), leaves the healthy set, and its sessions
+   *   migrate on the very next sweep exactly as they do today.
+   *
+   *   SCOPE: this gate is only meaningful under `PIGEON_SERVE_LIVENESS=self`,
+   *   which every current host sets explicitly — but note `config.ts` DEFAULTS to
+   *   `http`. In http mode `ServeHealthPoller.pollOnce` probes `/global/health`
+   *   over the serve's blocked event loop, times out, and writes
+   *   health_state='unhealthy' — so a CPU-stalled serve fails this gate, the
+   *   marker is dropped, and the session migrates exactly as it did before this
+   *   fix. A future pool host that forgets that env var silently loses this
+   *   protection rather than breaking loudly.
+   * - SAME instance_uuid. A serve that crashed and restarted re-registers with a
+   *   fresh uuid while keeping its serve_id. The process that held this lease is
+   *   gone, so there is no in-flight work to protect and no reason to suppress a
+   *   rebalance; treat the marker as stale.
+   */
+  private isMarkerRetained(lease: LeaseRecord, now: number, epoch: number): boolean {
+    if (lease.binaryEpoch !== epoch) {
+      return false;
+    }
+    if (now - lease.leaseExpiresAt >= this.markerGraceMs) {
+      return false;
+    }
+    const serve = this.repos.serves.get(lease.serveId);
+    if (!this.isServeHealthy(serve, now, epoch)) {
+      return false;
+    }
+    return serve!.instanceUuid === lease.instanceUuid;
+  }
+
+  /** The retained marker for a session, or null. Live (unexpired) leases are not markers. */
+  private retainedMarker(sessionId: string, now: number, epoch: number): LeaseRecord | null {
+    const lease = this.repos.leases.get(sessionId);
+    if (!lease || lease.leaseExpiresAt > now) {
+      return null;
+    }
+    return this.isMarkerRetained(lease, now, epoch) ? lease : null;
   }
 
   resolveRoute(sessionId: string, now: number): RouteResult | null {
@@ -265,6 +342,59 @@ export class IngressRouter {
       chosen = desired;
     }
 
+    // Recency stickiness (bead pigeon-u1a). THE HAZARD THIS CLOSES, precisely:
+    //
+    // The serve renews its lease from a fiber on its OWN single-threaded event
+    // loop, so a CPU-heavy turn that blocks that loop for longer than leaseTtlMs
+    // lapses the lease WHILE THE TURN IS STILL RUNNING. resolveRoute then returns
+    // null (it requires an unexpired lease) and ensureRouted lands here. The
+    // serve's heartbeat, by contrast, runs on a WORKER THREAD ("Fix C") and stays
+    // fresh throughout, so the stalled serve is still in `candidates` and HRW is
+    // free to pick it again -- which is harmless, because an unchanged
+    // desiredServeId does not bump owner_generation and the serve's own renewal
+    // fiber re-acquires the rotated token and carries on.
+    //
+    // The kill is the OTHER branch: if HRW's winner differs from where the
+    // session actually is, we move it, bump owner_generation, and the serve's
+    // re-acquire fails closed -- "session lease lost mid-run", the June failure.
+    // Nothing stopped that, because the sticky pin's lastActivity only advances
+    // inside placeSession, which by design does not run during a turn; any turn
+    // longer than idleMigrateMs has an aged pin, and one longer than dormantTtlMs
+    // has no pin at all.
+    //
+    // So: if this session held a lease on one of the serves we are choosing
+    // between, and that serve is still alive, keep it there.
+    //
+    // The marker's own health gate (isMarkerRetained -> isServeHealthy) is the
+    // ONLY membership test needed here. Re-checking `candidates.includes(...)`
+    // adds nothing: listHealthy's SQL filters on exactly the same four columns as
+    // isServeHealthy, with the same `now`, `staleServeMs` and `epoch`. A mutation
+    // test confirmed it -- deleting that clause failed no test.
+    //
+    // The two reads are NOT atomic with each other (separate statements, no
+    // transaction, and the serves' heartbeat threads write serve_instance
+    // concurrently), so they can disagree. Both directions are benign: if the
+    // serve went unhealthy after listHealthy, the marker's own fresher read
+    // rejects it; if it became healthy after, we keep a session on a serve that
+    // is genuinely healthy right now, and `serves.get(chosen)!` below cannot be
+    // null because the marker just proved the row exists.
+    //
+    // Note this deliberately does NOT require the serve to be under
+    // `activeTurnCap`: keeping a session where it already is continues an
+    // existing placement rather than making a new load decision, and the
+    // alternative is killing a running turn to enforce a soft capacity limit.
+    const marker = this.retainedMarker(sessionId, now, epoch);
+    if (marker && marker.serveId !== chosen) {
+      this.log("keeping a session on the serve whose lease it just held (recency stickiness)", {
+        sessionId,
+        keptOn: marker.serveId,
+        insteadOf: chosen,
+        leaseExpiredAgoMs: now - marker.leaseExpiresAt,
+        markerGraceMs: this.markerGraceMs,
+      });
+      chosen = marker.serveId;
+    }
+
     // Narrowing the pool is allowed — with a truthful counter, steering placements
     // toward the serves that still have capacity is the point — but it is an overload
     // decision and must never be silent. Nobody could see the narrowing that drove the
@@ -408,8 +538,22 @@ export class IngressRouter {
 
   sweep(now: number): void {
     this.sticky.sweep(now, this.opts.dormantTtlMs);
+    const epoch = this.repos.meta.get().binaryEpoch;
     const expired = this.repos.leases.listExpired(now);
     for (const l of expired) {
+      // Keep a recently-expired lease on a still-healthy serve as a placement
+      // marker (bead pigeon-u1a); releasing it here is what used to destroy the
+      // only record that this session was just running somewhere, ~5s after the
+      // lease lapsed and typically before anything asked to route the session.
+      // RETAIN ONLY -- the row's lease_expires_at is never pushed forward, so
+      // this cannot become the daemon-side renewer that the touch() docstring
+      // forbids, and resolveRoute still refuses to route on an expired lease.
+      // Deferring the dormant mark is safe: nothing in the daemon reads
+      // `session_assignment.state`, and the fenced release below is unchanged
+      // when the grace window does elapse.
+      if (this.isMarkerRetained(l, now, epoch)) {
+        continue;
+      }
       // Release FIRST with the full token: if a newer owner has already replaced this
       // lease (concurrent re-route), release no-ops and we must NOT touch the assignment.
       const released = this.repos.leases.release(

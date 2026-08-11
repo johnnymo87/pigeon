@@ -1131,7 +1131,12 @@ describe("resolveProspectiveRoute (idle prospective routing)", () => {
     const router = new IngressRouter(s, OPTS);
     seedServe(s, "serve-1", "http://localhost:8001");
     router.placeSession("session-x", now);
-    const later = now + OPTS.leaseTtlMs + 1;
+    // Past the pigeon-u1a marker grace (5x leaseTtlMs). Sweep now RETAINS a
+    // freshly-expired lease while its owner is still healthy, so the dormant
+    // transition this test is named for happens only once that window closes.
+    // The serve is kept healthy on purpose: the assertion below is about
+    // prospective routing returning the ASSIGNED serve, not about failover.
+    const later = now + OPTS.leaseTtlMs * 6 + 1;
     s.serves.setHealth("serve-1", "healthy", later);
     router.sweep(later);
     expect(router.resolveRoute("session-x", later)).toBeNull();
@@ -1462,5 +1467,270 @@ describe("pigeon-pov: ensureRouted must not clobber a live lease", () => {
     expect(s.assignments.get("session-1")?.desiredServeId).toBe("serve-1");
 
     expect(router.resolveRoute("session-1", later)).toBeNull();
+  });
+});
+
+/**
+ * pigeon-u1a. A CPU stall that outlives the lease used to get the turn killed.
+ *
+ * The setup every test here shares, and why it is built this way:
+ *
+ * The serve renews its lease from a fiber on its own single-threaded event loop,
+ * so a stall lapses the lease mid-turn. Its heartbeat, however, runs on a WORKER
+ * THREAD and stays fresh -- so the stalled serve remains healthy and eligible.
+ * That means a re-placement only KILLS the turn when HRW's winner differs from
+ * where the session already is, which in turn requires the healthy pool to have
+ * CHANGED since the session was placed. So each test places the session while
+ * only serve-1 exists, then introduces serve-2 that HRW prefers, then stalls.
+ *
+ * Heartbeats are re-stamped at each `at()` step deliberately: a test that let
+ * them go stale would be exercising the dead-serve path instead of the stall.
+ */
+describe("pigeon-u1a: a stall that outlives its lease must not move the session", () => {
+  const LEASE_TTL = 30_000;
+  const GRACE = LEASE_TTL * 5; // 150_000, the marker retention window
+  const T0 = 1_000_000;
+
+  function setup() {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: LEASE_TTL,
+      staleServeMs: 20_000,
+      idleMigrateMs: 60_000,
+      dormantTtlMs: 300_000,
+      activeTurnCap: 25,
+    });
+    const serve = (serveId: string, at: number, uuid?: string): ServeInstanceRecord => ({
+      serveId,
+      instanceUuid: uuid ?? `uuid-${serveId}`,
+      endpoint: `http://localhost:80${serveId.slice(-1)}`,
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: at,
+      draining: false,
+    });
+    /** Re-stamp heartbeats so the serves are alive at `at` (the stall is in the LEASE, not the beat). */
+    const beat = (at: number, ...serveIds: string[]) => {
+      for (const id of serveIds) s.serves.upsert(serve(id, at));
+    };
+    return { s, router, serve, beat };
+  }
+
+  /**
+   * Place `sid` on serve-1 while it is the only serve, then add a serve-2 that
+   * HRW prefers. Returns a session whose assignment (serve-1) and HRW winner
+   * (serve-2) disagree -- the only configuration in which a re-placement moves.
+   */
+  function placedOnServe1ButHrwPrefersServe2() {
+    const { s, router, serve, beat } = setup();
+    s.serves.upsert(serve("serve-1", T0));
+    const sid = sessionPreferring("serve-2", ["serve-1", "serve-2"]);
+
+    const placed = router.ensureRouted(sid, T0);
+    expect(placed.serveId).toBe("serve-1");
+    expect(placed.ownerGeneration).toBe(1);
+
+    s.serves.upsert(serve("serve-2", T0));
+    expect(pickServe(sid, ["serve-1", "serve-2"])).toBe("serve-2");
+    return { s, router, serve, beat, sid };
+  }
+
+  it("stall past the lease: session stays on its healthy owner, generation unchanged", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    // 100s in: the lease lapsed 70s ago and the sticky pin (60s) has aged out,
+    // but both serves are alive. Pre-fix this moved the session and killed the turn.
+    const at = T0 + 100_000;
+    beat(at, "serve-1", "serve-2");
+    router.sweep(at);
+
+    const res = router.ensureRouted(sid, at);
+    expect(res.serveId).toBe("serve-1");
+    expect(res.ownerGeneration).toBe(1);
+    expect(s.assignments.get(sid)?.desiredServeId).toBe("serve-1");
+    expect(s.assignments.get(sid)?.ownerGeneration).toBe(1);
+  });
+
+  it("sweep RETAINS the expired lease as a marker while the owner is healthy, without extending it", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+    const expiresAt = s.leases.get(sid)!.leaseExpiresAt;
+
+    const at = T0 + 100_000;
+    beat(at, "serve-1", "serve-2");
+    router.sweep(at);
+
+    const kept = s.leases.get(sid);
+    expect(kept).not.toBeNull();
+    // Retained, NEVER renewed: pushing this forward would be the daemon-side
+    // renewer the touch() docstring forbids.
+    expect(kept!.leaseExpiresAt).toBe(expiresAt);
+    expect(kept!.leaseExpiresAt).toBeLessThan(at);
+    // The dormant mark is deferred, not skipped -- see the past-grace test.
+    expect(s.assignments.get(sid)?.state).toBe("assigned");
+    // And an expired marker must never be routable.
+    expect(router.resolveRoute(sid, at)).toBeNull();
+  });
+
+  it("past the grace window: the marker is released and the session rebalances", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + LEASE_TTL + GRACE + 1;
+    beat(at, "serve-1", "serve-2");
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).toBeNull();
+    expect(s.assignments.get(sid)?.state).toBe("dormant");
+
+    const res = router.ensureRouted(sid, at);
+    expect(res.serveId).toBe("serve-2");
+    expect(res.ownerGeneration).toBe(2);
+  });
+
+  it("owner stops beating (genuinely dead): failover still happens immediately", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    // Only serve-2 beats. serve-1's heartbeat is left at T0, so it is stale --
+    // this is the dead-serve path and it must NOT be suppressed by the marker.
+    const at = T0 + 100_000;
+    beat(at, "serve-2");
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).toBeNull();
+
+    const res = router.ensureRouted(sid, at);
+    expect(res.serveId).toBe("serve-2");
+    expect(res.ownerGeneration).toBe(2);
+  });
+
+  it("owner crashed and restarted (new instance_uuid): marker is stale, session rebalances", () => {
+    const { s, router, serve, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + 100_000;
+    beat(at, "serve-2");
+    // serve-1 is healthy again but it is a NEW PROCESS: whatever the lease was
+    // protecting died with the old one.
+    s.serves.upsert(serve("serve-1", at, "uuid-serve-1-RESTARTED"));
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).toBeNull();
+    expect(router.ensureRouted(sid, at).serveId).toBe("serve-2");
+  });
+
+  it("stale-epoch marker is never honored", () => {
+    const { s, router, serve, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + 100_000;
+    beat(at, "serve-1", "serve-2");
+    s.meta.bumpEpoch(at);
+    // Both serves re-register at the new epoch; only the LEASE is stale.
+    s.serves.upsert({ ...serve("serve-1", at), binaryEpoch: 1 });
+    s.serves.upsert({ ...serve("serve-2", at), binaryEpoch: 1 });
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).toBeNull();
+    expect(router.ensureRouted(sid, at).serveId).toBe("serve-2");
+  });
+
+  it("a retained marker does not consume capacity", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + 100_000;
+    beat(at, "serve-1", "serve-2");
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).not.toBeNull();
+    // Expired rows are not live load; a marker must not make its serve look busy.
+    expect(s.leases.countLiveForServe("serve-1", at, 0)).toBe(0);
+  });
+
+  it("a draining owner is still evacuated despite a marker", () => {
+    const { s, router, serve, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + 100_000;
+    beat(at, "serve-2");
+    s.serves.upsert({ ...serve("serve-1", at), draining: true });
+    router.sweep(at);
+
+    expect(router.ensureRouted(sid, at).serveId).toBe("serve-2");
+  });
+
+  it("grace boundary is exclusive: at exactly grace the marker is already gone", () => {
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+
+    const at = T0 + LEASE_TTL + GRACE; // exactly, not +1
+    beat(at, "serve-1", "serve-2");
+    router.sweep(at);
+
+    expect(s.leases.get(sid)).toBeNull();
+  });
+
+  it("honoring a marker RE-MINTS a live lease, restarting the grace clock (deliberate, not a bound)", () => {
+    // The grace window bounds a QUIET session only. acquireCAS's take-over ladder
+    // branch C re-mints a full-TTL lease over an expired one, so every touch
+    // restarts the clock and a regularly-touched session can stay on the same
+    // serve indefinitely. Pinned here because it is a real trade, not an
+    // oversight: the alternative is moving a session whose turn may be running.
+    const { s, router, beat, sid } = placedOnServe1ButHrwPrefersServe2();
+    const originalExpiry = s.leases.get(sid)!.leaseExpiresAt;
+    const originalGraceEnd = originalExpiry + GRACE;
+
+    const at1 = T0 + 100_000;
+    beat(at1, "serve-1", "serve-2");
+    router.sweep(at1);
+    expect(router.ensureRouted(sid, at1).serveId).toBe("serve-1");
+
+    // The expired marker is a LIVE lease again, expiring a full TTL from now.
+    const reminted = s.leases.get(sid)!;
+    expect(reminted.leaseExpiresAt).toBe(at1 + LEASE_TTL);
+
+    // ...so a moment that is past the ORIGINAL grace still keeps the session.
+    const at2 = at1 + 100_000;
+    expect(at2).toBeGreaterThan(originalGraceEnd);
+    beat(at2, "serve-1", "serve-2");
+    router.sweep(at2);
+    expect(router.ensureRouted(sid, at2).serveId).toBe("serve-1");
+    expect(s.assignments.get(sid)?.ownerGeneration).toBe(1);
+  });
+
+  it("an over-capacity owner still keeps the session: the cap must not evict a stalled turn", () => {
+    // activeTurnCap is a soft steering signal for NEW placements. Enforcing it
+    // against a session that is already running would mean killing a live turn to
+    // rebalance load, which is the trade this whole bead exists to refuse.
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: LEASE_TTL,
+      staleServeMs: 20_000,
+      idleMigrateMs: 60_000,
+      dormantTtlMs: 300_000,
+      activeTurnCap: 1,
+    });
+    const serve = (serveId: string, at: number): ServeInstanceRecord => ({
+      serveId,
+      instanceUuid: `uuid-${serveId}`,
+      endpoint: `http://localhost:80${serveId.slice(-1)}`,
+      binaryEpoch: 0,
+      healthState: "healthy",
+      heartbeatAt: at,
+      draining: false,
+    });
+
+    s.serves.upsert(serve("serve-1", T0));
+    const sid = sessionPreferring("serve-2", ["serve-1", "serve-2"]);
+    expect(router.ensureRouted(sid, T0).serveId).toBe("serve-1");
+    s.serves.upsert(serve("serve-2", T0));
+
+    const at = T0 + 100_000;
+    s.serves.upsert(serve("serve-1", at));
+    s.serves.upsert(serve("serve-2", at));
+    router.sweep(at);
+
+    // Fill serve-1 to capacity with a genuinely live lease from another session,
+    // so the bounded-load skip would divert our stalled session to serve-2.
+    const filler = sessionPreferring("serve-1", ["serve-1", "serve-2"], sid);
+    expect(router.placeSession(filler, at).serveId).toBe("serve-1");
+    expect(s.leases.countLiveForServe("serve-1", at, 0, sid)).toBe(1);
+
+    // Kept on its over-cap owner anyway.
+    expect(router.ensureRouted(sid, at).serveId).toBe("serve-1");
   });
 });
