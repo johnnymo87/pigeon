@@ -69,12 +69,24 @@ is not the spine; it is residuals, two real P2s, and the migration close-out:
 |---|---|
 | **Cycle 6 residuals** | 7 open. `6a` is **DONE**. The remaining P2s are **`6d`** and **`6g`** (read from `bd`, not from the inline labels — see CORRECTION #9 in Cycle 6). The rest, including `6i`, are P3. |
 | **Cycle 7 close-out** | `7a` (record the burn-in 429 rate), then `7b` (drop the old chat id — irreversible, do it last). |
-| **§4.2 feature track** | `F4`, `F5` open; independent of everything above, pick up in any gap. |
+| **§4.2 feature track** | `F4`, `F5`, `F6a` open; independent of everything above, pick up in any gap. `F6` (`pigeon-d95y`, Telegram visibility) is **DONE** 2026-08-11 but deployed to **cloudbox only** — that is `F6a`. |
 | **`4f`** | Evidence-gated. **Do not schedule it** — `4e` is supposed to produce the evidence first. |
 
 **Not tracked as a cycle but owed: `devbox` and `macbook` still run stale daemon code.** F1–F3 were
 worker-only so nothing is blocked today, but see §1.0 — merging is not deploying, and that gap once
 meant two whole cycles of daemon work had never actually run.
+
+> **CORRECTION #10 (2026-08-11, after F6). The "F1–F3 were worker-only so nothing is blocked" clause
+> above no longer covers the feature track.** `F6` (`pigeon-d95y`) is **daemon + plugin**, and it is
+> deployed to **cloudbox only**. On devbox, macbook and chromebook the swarm feed and the TUI mirror
+> simply do not exist — silently, since a missing post looks exactly like a quiet session. Tracked as
+> `F6a` / `pigeon-rqyz`.
+>
+> Note the extra step this class of change carries: a daemon restart is enough for the daemon half,
+> but the **plugin half only loads when `opencode serve` restarts**, which disrupts live sessions. On
+> cloudbox that was deliberately deferred to the nightly reset. Plan for it — "restarted the daemon"
+> is not "deployed the feature", and the daemon half alone is inert rather than broken, which is a
+> state that looks like success.
 
 ### Test baseline — regressions are measured against this
 
@@ -1807,6 +1819,58 @@ makes it delivery work that happens to also be a quality-of-life win.
   because F2 now writes a user-chosen title into that column, so an unrelated recovery path can wipe a
   manual rename. Likely `COALESCE(excluded.label, sessions.label)`, but decide whether clearing a label
   must stay expressible.
+
+- [x] **F6. `pigeon-d95y`** (P2, epic) — DONE 2026-08-11. **Telegram visibility: a topic now shows all
+  three inputs that drive a session, not just one.** Two of the three were invisible: swarm IPC injects
+  straight into a transcript, and TUI-typed prompts were dropped by the plugin — so a topic showed a
+  session working with no visible cause, and read one-sided. Phase 1 (swarm posts, insert-time) shipped
+  as PR #76 / `dcd4016`; Phase 2 (TUI mirror + echo suppression) as PR #78 / `02c997a`. Burn-in evidence
+  on `pigeon-d95y.15`; behaviour documented in `AGENTS.md`. Design and plan:
+  `docs/plans/2026-08-10-telegram-visibility-{swarm-and-tui-design,implementation}.md`.
+
+  **Hooked at swarm INSERT, not `handed_off`**, deliberately: under the on-hold quiet-swarm design
+  (`docs/plans/2026-08-09-swarm-quiet-messages-design.md`) agent-to-agent rows would never *reach*
+  `handed_off`, and an insert-time hook is invariant to that.
+
+  **Phase 0 was required first** and is the part worth remembering: measured swarm volume is ~373/day
+  with a peak *minute* of 12 chunks — 100% of the outbox governor window, roughly 65× existing outbox
+  volume. So the feature needed a scheduling answer before a formatting one: a two-tier `getReady`
+  sort, expiry for the new kinds, and `SWARM_SUB_BUDGET = 6` of 12 so a swarm burst cannot starve a
+  question notification.
+
+  **The blocking spike (`.10`) earned its place twice.** Its own question — do Telegram question
+  replies materialise as user messages, which would echo every button press — answered *no*
+  (`Question.reply` only resolves the deferred the `question` tool awaits). But it also caught that a
+  **compaction marker is a user-role message with no text part and is NOT flagged `synthetic`**, which
+  the planned exclusion would have missed: every compaction would have posted an empty message. Both
+  findings came from reading production transcripts with a control, not from reasoning about the code.
+
+  **Burn-in was measured, not staged:** 12 Telegram deliveries with zero echoes, 21 swarm handoffs with
+  zero mirrors, mirror-producing and swarm-receiving sessions disjoint. `/launch` was *not* exercised —
+  none occurred in the window — and is covered by mechanism (same `sendPrompt` record site) rather than
+  observation. Recorded as a gap rather than counted as a pass.
+
+  **Fallout, already fixed by a peer track — `pigeon-353p`, PR #86 (`5bb29d9`).** Phase 1 did not
+  introduce the bug but it *exposed* it, and that is the interesting part. Topic names are write-once
+  and are fixed by a session's **first** notification; before Phase 1 that was almost always a `stop`,
+  by which time opencode's summariser had produced a real title. Making swarm traffic visible meant a
+  swarm post became the first notification for any session messaged early — ~1s after creation, while
+  the title is still opencode core's `New session - <ISO>` placeholder — so those topics were named
+  after a timestamp permanently. Measured deltas: 976ms, 963ms, 1094ms, 32.9s, 110s, every one of them
+  a swarm post; every `stop`-first session was fine. The fix treats the placeholder as *absent* in both
+  daemon and worker (duplicated deliberately, since the worker deploys centrally while daemons lag) and
+  adds a one-shot provisional rename. **Generalisable lesson: a visibility feature changes which event
+  arrives FIRST, and any write-once decision keyed on "first" is therefore in its blast radius.**
+
+  **Open, non-blocking:** `pigeon-rqyz` (below), `pigeon-kq6h` (P3, subagent misclassified as main when
+  `session.get` fails — pre-existing, but the mirror makes it louder), `pigeon-pre9` (P4 polish).
+
+- [ ] **F6a. `pigeon-rqyz`** (P3) — **`pigeon-d95y` is deployed to cloudbox ONLY.** devbox, macbook and
+  chromebook still run daemon+plugin code without the mirror. Unlike F1–F3 this is *not* worker-only, so
+  §0's "nothing is blocked today" reasoning does not cover it — see the correction in §0. Each machine
+  needs `git pull`, then separately `npm install`, then a daemon restart; the plugin half additionally
+  needs an `opencode serve` restart before any mirror appears, which is why cloudbox waited for the
+  nightly reset rather than interrupting live sessions.
 
 **`pigeon-cn8` (4c) is still worth doing early:** it removes roughly half of all topics, which makes
 any naming or topic-list change much easier to evaluate against a list that is mostly real work.

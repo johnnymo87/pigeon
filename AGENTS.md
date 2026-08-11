@@ -131,6 +131,17 @@ Opencode events (stop, question, error) are sent back to Telegram as replies, ta
 
 **Durable notification delivery:** Stop, question, and swarm mirror notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
 
+**TUI-typed prompt mirror:** A prompt typed directly into the opencode TUI is posted into the session's topic as `🧑 <session>` (outbox `kind='mirror'`, `notificationId` `m:<sessionId>:<messageId>`), so a topic is no longer one-sided — it shows the prompts as well as the answers. The plugin accumulates user-role parts per message, flushes after 500ms of quiescence, and POSTs to daemon `/mirror`.
+
+Prompts the daemon *injected* must not be mirrored, because Telegram already showed them — and they arrive as ordinary user messages, indistinguishable from typing. So the daemon records `sha256(prompt)` in a counted `injected_prompts` table (15-min TTL, swept by the session reaper) immediately **before** each injection, and `/mirror` consumes one count and stays silent on a hit. Two details are load-bearing rather than defensive:
+
+- **Recorded before the HTTP call, never after the response.** `prompt_async` is non-idempotent and a 30s timeout may mean *processed* (`worker/delivery-policy.ts`). A response-time record loses the race to the events it exists to suppress.
+- **Counted, not single-use.** A plain row is consumed by the first of two identical prompts and the second echoes. Sending `continue` twice inside 15 minutes is routine, and arbiter retry-after-timeout produces byte-identical re-injections.
+
+Four things are deliberately never mirrored: subagent sessions, parts marked `synthetic`, messages yielding no text parts, and empty/whitespace text. The third is not hypothetical — a **compaction marker is a user-role message whose only part is `{type: "compaction"}` and it is not flagged synthetic**, so without that rule every compaction posts an empty message. A post-compaction *resumption* prompt, by contrast, does mirror and should: it is a genuine input that redirects the session.
+
+Both remaining leaks fail toward silence rather than duplicates (an unconsumed count suppresses an identical TUI prompt for ≤15 min; an undiscovered session drops its mirror). That direction is deliberate — a missing post is a gap, a duplicate post is noise in every topic on the machine.
+
 **Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7%` footer showing the cumulative context-window usage reported by the latest assistant message and its percentage of the model's context window. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved.
 
 **Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
