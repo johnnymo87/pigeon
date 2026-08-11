@@ -93,13 +93,22 @@ const MIN_SPAN_MS: Record<WorkerFailureClass, number> = {
  *    from a reaped session mask a live outage.
  *  - `app_rejection` (HTTP 2xx carrying `ok:false`) is ambiguous by construction and is
  *    not currently reachable on either route.
- *  - A 502 relaying a TELEGRAM 4xx is Telegram's verdict on our message, not the worker
- *    failing. This one is load-bearing rather than fastidious: a 5xx never charges an
- *    outbox entry an attempt (`isTransportFailure`), so a message Telegram keeps rejecting
- *    retries until the age cap. After `strip_entities` fires once the payload no longer
- *    has entities, so rule 6 stops matching and every subsequent rejection lands on the
- *    generic retry arm as a bare 502. Counting those would let ONE poisoned message raise
- *    an alert naming the wrong component while the worker is perfectly healthy.
+ *  - A 502 relaying a Telegram 400 — and ONLY 400 — is Telegram's verdict on our message,
+ *    not the worker failing. This one is load-bearing rather than fastidious: a 5xx never
+ *    charges an outbox entry an attempt (`isTransportFailure`), so a message Telegram
+ *    keeps rejecting retries until the age cap. After `strip_entities` fires once the
+ *    payload no longer has entities, so rule 6 stops matching and every subsequent
+ *    rejection lands on the generic retry arm as a bare 502. Counting those would let ONE
+ *    poisoned message raise an alert naming the wrong component while the worker is
+ *    perfectly healthy.
+ *
+ * The exclusion stops at 400 deliberately. The worker relays EVERY Telegram error as a 502
+ * carrying that code (`getTelegramErrorDetails` in worker/telegram.ts), so excluding the
+ * whole 4xx range would also swallow 401 (bot token revoked, or a botched rotation) and
+ * 403 (bot removed from the group). Those are verdicts on the DEPLOYMENT rather than on one
+ * message: they fail every send until a human intervenes, which is exactly the sustained
+ * total failure this alarm exists to record. The alert text will name the worker when the
+ * true culprit is the token, but a misattributed alert beats six hours of silence.
  *
  * A 502 relaying a Telegram 5xx, or carrying no Telegram error code at all, still counts:
  * those are the worker's own failures, or Telegram being down, and both are worth knowing.
@@ -112,8 +121,7 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     return "transport";
   }
   if (result.kind === "http_error" && result.status >= 500) {
-    const telegramCode = getTelegramErrorCode(result.body);
-    if (telegramCode !== undefined && telegramCode >= 400 && telegramCode < 500) {
+    if (getTelegramErrorCode(result.body) === 400) {
       return "neutral";
     }
     return "server_error";
@@ -200,6 +208,17 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
         return;
       }
       if (sample === "neutral") {
+        // A 5xx we decline to count is the one case where the alarm stays deliberately
+        // quiet, so it is also the one case that would otherwise leave no trace at all.
+        // Leave a journal line: "no durable record" is what made the outage that motivated
+        // this alarm undiagnosable. Plain 4xx are ordinary traffic and stay silent.
+        if (result.kind === "http_error" && result.status >= 500) {
+          this.log?.("worker 5xx not counted toward the alarm", {
+            endpoint,
+            status: result.status,
+            telegramErrorCode: getTelegramErrorCode(result.body),
+          });
+        }
         return;
       }
       this.extend(sample, endpoint, result, now);
@@ -241,12 +260,19 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
 
     const label = ENDPOINT_LABEL[endpoint];
     const span = formatEpisodeDuration(now - episode.startedAt);
+    // The consequence differs by route, and saying the wrong one sends an operator looking
+    // in the wrong place: a register-only episode leaves delivery working for existing
+    // sessions while new ones silently fail to route.
+    const consequence =
+      endpoint === "send"
+        ? "Telegram delivery through the worker is down; the daemon outbox is holding and retrying."
+        : "New sessions cannot register with the worker, so their notifications will 404 until this clears.";
     const text =
       cls === "server_error"
-        ? `Worker ${label} is failing: ${episode.count} consecutive 5xx over ${span} (latest ${episode.lastDetail}). ` +
-          `Telegram delivery through the worker is down; the daemon outbox is holding and retrying.`
+        ? `Worker ${label} is failing: ${episode.count} consecutive 5xx over ${span} ` +
+          `(latest ${episode.lastDetail}). ${consequence}`
         : `Worker ${label} is unreachable: ${episode.count} consecutive transport failures over ${span} ` +
-          `(latest ${episode.lastDetail}). The daemon outbox is holding and retrying.`;
+          `(latest ${episode.lastDetail}). ${consequence}`;
 
     // Logged unconditionally, and BEFORE the enqueue. On a host with no plain-alert
     // notifier the alert row is never delivered, and the journal is then the only record

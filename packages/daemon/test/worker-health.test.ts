@@ -49,10 +49,7 @@ function success(): WorkerResult {
   return { ok: true, kind: "success", status: 200, body: { ok: true } };
 }
 
-/**
- * Drives `count` server errors spaced `stepMs` apart, starting at `startAt`.
- * Returns the clock value AFTER the final sample.
- */
+/** Records `count` server errors, advancing the shared clock by `stepMs` after each. */
 function driveServerErrors(
   monitor: WorkerHealthMonitor,
   clock: { now: number },
@@ -115,13 +112,27 @@ describe("classifyWorkerHealthSample", () => {
    * poisoned message retries until the age cap. Counting it would produce a "worker is
    * down" alert naming the wrong component.
    */
-  it("treats a 502 relaying a Telegram 4xx as neutral, not a server error", () => {
+  it("treats a 502 relaying a Telegram 400 as neutral, not a server error", () => {
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 400 } })),
     ).toBe("neutral");
+  });
+
+  /**
+   * The exclusion is exactly 400 and nothing wider. The worker relays EVERY Telegram
+   * error as 502 carrying that code (worker/telegram.ts getTelegramErrorDetails), so a
+   * blanket 4xx exclusion would swallow 401 (bot token revoked or mis-rotated) and 403
+   * (bot removed from the group). Those are verdicts on the deployment, not on one
+   * message: they fail every send until a human intervenes, which is precisely the
+   * sustained-total-failure shape this alarm exists to record.
+   */
+  it("counts a 502 relaying a Telegram 401 or 403 — those are account-level, not per-message", () => {
+    expect(
+      classifyWorkerHealthSample(serverError(502, { details: { error_code: 401 } })),
+    ).toBe("server_error");
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 403 } })),
-    ).toBe("neutral");
+    ).toBe("server_error");
   });
 
   it("still counts a 502 relaying a Telegram 5xx, and a bare 502", () => {
@@ -389,6 +400,59 @@ describe("WorkerHealthMonitor — robustness", () => {
     });
 
     expect(() => driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD, 60_000)).not.toThrow();
+  });
+
+  /**
+   * A 5xx we deliberately decline to count still gets a journal line. Without this, the
+   * one case the alarm is designed to stay quiet about is also the one case that leaves no
+   * evidence at all — and "no durable record" is the whole reason the 2026-07-14 outage
+   * could not be diagnosed sixteen days later.
+   */
+  it("logs a 5xx that it declines to count, so silence still leaves evidence", () => {
+    const clock = { now: 1_000_000 };
+    const logged: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const monitor = new WorkerHealthMonitor({
+      alerts: createSink(),
+      nowFn: () => clock.now,
+      log: (msg, fields) => logged.push({ msg, ...(fields ? { fields } : {}) }),
+    });
+
+    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.msg).toContain("not counted");
+    expect(logged[0]!.fields?.telegramErrorCode).toBe(400);
+  });
+
+  it("does not log a plain 4xx — only a 5xx it chose not to count", () => {
+    const clock = { now: 1_000_000 };
+    const logged: string[] = [];
+    const monitor = new WorkerHealthMonitor({
+      alerts: createSink(),
+      nowFn: () => clock.now,
+      log: (msg) => logged.push(msg),
+    });
+
+    monitor.record("send", serverError(404));
+    monitor.record("send", success());
+
+    expect(logged).toEqual([]);
+  });
+
+  it("names the right consequence for each endpoint", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD, 30_000, "register");
+    clock.now += 30_000;
+    driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD, 30_000, "send");
+
+    const registerAlert = sink.alerts.find((a) => a.text.includes("/sessions/register"))!;
+    const sendAlert = sink.alerts.find((a) => a.text.includes("/notifications/send"))!;
+
+    expect(registerAlert.text).toContain("session");
+    expect(registerAlert.text).not.toContain("Telegram delivery through the worker is down");
+    expect(sendAlert.text).toContain("Telegram delivery through the worker is down");
   });
 
   it("logs the trip so there is durable journal evidence even with no alert egress", () => {
