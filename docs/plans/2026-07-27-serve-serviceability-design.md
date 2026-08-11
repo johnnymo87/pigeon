@@ -471,11 +471,15 @@ an active route when a valid lease exists. Drain still sheds sessions; both epoc
    from that that nothing renews at all, which was wrong — see the note below. Because the
    renewal fiber runs inside the serve's own single-threaded event loop, a CPU stall halts
    renewal too, so the lease lapses ~`leaseTtlMs` after the last successful renew and a longer
-   stall still ends in a clobber. Tracked as **pigeon-u1a**, which likely wants the
-   serviceability signal this document designs rather than a naive renewer — note the
-   `touch()` docstring warning first: a daemon-side periodic renewer would extend a dead
-   serve's lease forever, because the full-token fence still matches a corpse that has not
-   re-registered.
+   stall still ends in a clobber. Tracked as **pigeon-u1a** — **now closed, see §12**, which
+   did NOT need the serviceability signal this document designs, and did need one of this
+   paragraph's own premises corrected: the stalled serve's heartbeat does *not* go stale
+   (it beats from a worker thread), so the serve stays healthy and the kill turns on HRW
+   re-picking a *different* serve rather than on the owner being evicted. The `touch()`
+   docstring warning stands and shaped the fix: a daemon-side periodic renewer would extend
+   a dead serve's lease forever, because the full-token fence still matches a corpse that
+   has not re-registered. §12 retains an expired lease without ever extending it, which is
+   why it escapes that trap.
 
    **Corollary for this arc, learned the hard way:** "no TS caller" does not mean "does not
    happen." The serve is a second writer to this database. Any dead-code or liveness argument
@@ -654,3 +658,79 @@ exists — it needs an explicit additive migration.
 If anyone "simplifies" `sweepStale` to use `setHealth`, pigeon starts writing heartbeats and
 becomes a second writer fighting the serve's own — a rule-3 violation wearing the costume of a
 cleanup. The new log line sits directly beside that call; do not let a future diff drift it.
+
+## 12. Landed: the stalled-serve clobber is closed (pigeon-u1a, 2026-08-11)
+
+§9 shipped `resolveRoute`'s lease-first rule and recorded that it was **partial on purpose**: the
+serve renews its lease from a fiber on its own event loop, so a stall longer than `leaseTtlMs`
+lapses the lease mid-turn and `placeSession` clobbers as before. That residual is now closed, and
+closing it required correcting the bead's own account of the mechanism twice.
+
+**The bead was wrong about the heartbeat, and that error was load-bearing.** `pigeon-u1a` claimed
+the stalled serve's heartbeat goes stale at `staleServeMs`, so the serve leaves the healthy pool
+and its sessions get re-placed. False: the heartbeat runs on a **worker thread** (Fix C,
+`serve-lease.patch:1180-1191`) precisely so a blocked main loop cannot starve it, and all four
+production serves were confirmed `mode=worker` in journald. The stalled serve therefore stays
+`healthy` and *remains a placement candidate* — which is what makes the real chain possible.
+(This is the third factual correction in this bead's lineage; §9's note records the first two. The
+pattern is consistent: every one came from assuming a single writer or a single starvation domain.)
+
+**The real chain.** HRW is deterministic, so a re-placement that picks the *same* serve is
+harmless — `owner_generation` does not move, and the serve's renewal fiber re-acquires the rotated
+token and continues (`serve-lease.patch:1554-1571`). **A turn dies only if the session is moved to
+a different serve.** What used to prevent that was the in-memory sticky pin — but
+`StickyRouter.route()` is called only from `placeSession`, which by design does not run during a
+turn, so the pin's `lastActivity` never advances mid-turn. Any turn longer than `idleMigrateMs`
+(60s) has an aged pin; longer than `dormantTtlMs` (300s) has **no pin at all**. Meanwhile `sweep()`
+released the expired lease every 5s, destroying the one record that the session had just been
+running somewhere. Severity was therefore *understated* in the bead, and most so for exactly the
+long-lived swarm-coordinator sessions the arbiter touches every 500ms.
+
+**Shipped:** `sweep` now RETAINS a recently-expired lease as a **placement marker** while the owning
+serve is still healthy, at the current epoch, with an unchanged `instance_uuid`, and within
+`5 × leaseTtlMs`; `placeSession` keeps the session on that serve instead of the HRW winner. The row's
+`lease_expires_at` is **never pushed forward** and `resolveRoute` is untouched, so this is not the
+daemon-side renewer the `touch()` docstring forbids — a genuinely dead serve stops beating, fails
+the health gate, and its sessions migrate on the next sweep exactly as before. No schema change,
+no serve change, placement-only (§5.1 A ✓).
+
+**Three points worth keeping.**
+
+- **The marker is NOT a "turn in flight" detector**, and the code says so at the gate. It is
+  tempting to read it as one — the serve's finalizer deletes the lease when a turn ends, so a
+  surviving expired row *looks* like proof of an in-flight turn. But `placeSession` mints a lease at
+  **every** placement, so the same residue is left by a placement that never ran a turn at all. The
+  honest name is **recency stickiness**, and the fence is correct under that weaker reading. An
+  oracle consult caught this before it shipped: the fence was right and its stated justification
+  was false, which is the failure mode that survives review most easily.
+- **The grace window bounds a QUIET session only — it is not a ceiling.** Honoring a marker calls
+  `acquireCAS`, whose take-over ladder branch C re-mints a full-TTL lease over an expired one, so
+  the grace clock restarts on every touch and a regularly-touched session can stay on one serve
+  indefinitely. That is the deliberate trade — the alternative is moving a session whose turn may be
+  running — and §5.1 A already settled that a live serve is never evacuated. It is pinned by a test
+  rather than left as prose, because the first reader to see "5 × leaseTtlMs" will otherwise believe
+  a bound that does not exist.
+- **The protection is inert under `serveLiveness: "http"`, which is `config.ts`'s DEFAULT.** In http
+  mode `pollOnce` probes `/global/health` over the serve's blocked loop, times out, and writes
+  `health_state='unhealthy'`, so the marker's health gate rejects and the session migrates exactly as
+  before. Every current host sets `PIGEON_SERVE_LIVENESS=self` explicitly; a future pool host that
+  forgets it loses this protection **silently**. Documented at the gate.
+
+**Method note.** Nine mutants, nine kills — but two of them only after the code changed. A
+redundant `candidates.includes(...)` survived its mutant; inspection confirmed `listHealthy`'s SQL
+matches `isServeHealthy` clause for clause, so the clause was **deleted** rather than justified. A
+second mutant showed that the deliberate decision to ignore `activeTurnCap` was asserted only in a
+comment, so it gained the test that now pins it. Adversarial review then found no correctness hole
+but three comments claiming bounds the code does not guarantee — the grace "bound" above, an
+"atomic in the same tick" claim about two non-transactional reads (true conclusion, false reason:
+divergence is possible and merely benign in both directions), and the missing http-mode caveat.
+All three were rewritten. **The recurring defect in this arc is not wrong code; it is correct code
+with a comment that overstates what it guarantees.**
+
+**Deliberately not closed here: two serve-side paths to the same symptom** — the `checkLeaseDeadline`
+race at stall-end, and re-acquire's `.catch()` converting a transient `SQLITE_BUSY` into a
+fail-closed die. Both live in opencode-patched, both need the cross-repo lockstep, and both cluster
+at exactly the events that produce long stalls. Filed as **pigeon-tra1** so that the first
+post-deploy "lease lost mid-run" is not misread as disproving this fix. The discriminator is the
+message: `session lease lost mid-run` means the assignment genuinely moved (daemon-side);
+`session lease deadline exceeded` is serve-side and untouched by this change.
