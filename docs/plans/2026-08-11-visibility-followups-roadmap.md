@@ -53,9 +53,14 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
-| **E** | `pigeon-pre9` | Deferred polish from adversarial review | No |
+| **E** | `pigeon-pre9` | Deferred polish from adversarial review | **MERGED** 2026-08-11, PR #NNN — awaiting the same serve restart as D |
 
-**D and E are the live items; A is done and B is blocked.** A shipped on 08-11 as `pigeon-8zqt`
+**Only B remains, and it is the deploy.** A, C, D and E are all resolved: **D and E are merged but
+NOT deployed**, and both are waiting on the *same* `opencode serve` restart (§1.2) — that restart is
+now the single action that converts four merged PRs into working behaviour, and it is also the first
+half of B. Do not tick D or E until it has happened.
+
+Historical detail, still accurate: A shipped on 08-11 as `pigeon-8zqt`
 (PR #97) after being reassigned to the `qdcb` owner, who also corrected its scope — read
 CORRECTION #A1 in item A before treating anything written about A here as current. D is written,
 reviewed and green in PR #94, but it is **not ticked**, because a plugin change is not live until
@@ -72,13 +77,26 @@ fleet skew B exists to close. Do not burn a cycle rediscovering any of this.
 
 ## §1 — OPERATING HAZARDS
 
-### 1.1 Never chain `git` with a heavy command on cloudbox
+### 1.1 Splitting `git` from a heavy command on cloudbox — now hygiene, not a hazard
 
-A bash command whose text contains a bare `git` token is **exempted** from the `oc-agent.slice`
-scope and runs inside `opencode-serve@<port>.service` instead: `MemoryMax=14G`, `OOMPolicy=stop`,
-shared with the serve and every peer session on that port. Any OOM there stops the whole serve,
-which kills the plugin, so `session.idle` never fires and Telegram notifications stop **silently** —
-it reads as a pigeon bug. This cost a peer session a serve (`pigeon-8bif`).
+> **CORRECTED 2026-08-11 (item E).** This entry described the `git` exemption as current. It is
+> **gone** as of workstation PR #349, merged into pigeon's `AGENTS.md` by PR #96 the same day this
+> spine was written. Left in place rather than deleted, because the *practice* it recommends is
+> still right and because a reader who has seen the old rule elsewhere needs to know it changed.
+
+**What used to be true:** a bash command whose text contained a bare `git` token was exempted from
+the `oc-agent.slice` scope and ran inside `opencode-serve@<port>.service` — `MemoryMax=14G`,
+`OOMPolicy=stop`, shared with the serve and every peer session on that port. An OOM there stopped
+the whole serve, killing the plugin, so `session.idle` never fired and Telegram notifications
+stopped **silently**, reading as a pigeon bug. It cost a peer session a serve (`pigeon-8bif`).
+
+**What is true now:** the scope wrap happens at spawn time instead of by rewriting the command
+text, so the `git … : deny` permission globs still match *and* every command is scoped, `git`
+included. An OOM reports **exit 137** and kills only your command; retrying unchanged fails
+identically, so reduce parallelism instead. The old silent-serve-death mode only applies if you
+see the wrapper's `WARNING: … running UNSCOPED` line.
+
+Keep splitting them anyway — it costs nothing and the suite is only ~1.0 GiB peak:
 
 ```bash
 git pull --ff-only          # call 1
@@ -421,10 +439,35 @@ from the outside.
 
 ### [ ] E. `pigeon-pre9` (P4) — deferred polish from the adversarial review
 
-Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Do them together in one PR or not at all.
+**All four written, reviewed and merged in PR #NNN (`eb2212a`). NOT ticked: like D, the plugin half
+is inert until an `opencode serve` restart (§1.2).** Tick when a restarted serve has run the plugin
+half — the same restart D is waiting for, which is why they were landed together.
+
+Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Done together in one PR, as specified.
 
 **Item 4 pairs naturally with D** — both are `message-tail.ts`/plugin changes needing the same serve
-restart, so landing them close together spends one restart instead of two.
+restart, so landing them close together spends one restart instead of two. That is what happened:
+D merged as PR #94, E as PR #NNN, minutes apart.
+
+> **CORRECTION #E1 (2026-08-11, written while doing the work).** Item 3's stated failure mode below
+> — "leaks its count for 15 min" — is **impossible**, and the bead said the same thing. `hashPrompt`
+> is a raw sha256 with no normalisation, so any later prompt with a matching hash is also
+> whitespace-only and is dropped by the `!text.trim()` check *regardless of any count*. A
+> whitespace-hash count can never change a mirroring decision. The reorder still shipped, as
+> **hygiene**: the row is freed at echo time instead of at the TTL sweep, and "consumed exactly
+> once" stops being conditional on the shape of the text. Found by `adversarial-reviewer-fable`
+> checking whether the scenario was reachable rather than whether the code matched the item.
+
+> **CORRECTION #E2 (2026-08-11).** The first implementation of item 1 introduced a **new instance of
+> the assistant-leak** it was supposed to avoid, and the review caught it by probe rather than by
+> reading. `Map.set` on an existing key keeps the entry's ORIGINAL insertion position, so eviction
+> ordered by insertion tracked message *creation*, not activity. A long-streaming assistant message
+> therefore sat at its original position while peers filled the cap, lost its `currentMessageId`
+> protection the instant the next message began, and was evicted milliseconds after its last delta;
+> a late text part for it then took the `roleInfo === undefined` branch and mirrored assistant
+> output into Telegram as user text. Fixed by delete-then-set (recency refresh), pinned by a test
+> verified to fail without it. **The general lesson: an eviction policy's safety argument is a claim
+> about ordering, and Map insertion order is not the order you assume it is.**
 
 > **Line references corrected 2026-08-11.** The four below were transcribed from bead `pigeon-pre9`
 > and were **wrong against the tree this file sits on** — `app.ts:100-124` is `parseSwarmSendBody`,
@@ -445,6 +488,38 @@ restart, so landing them close together spends one restart instead of two.
    would flush assistant deltas as a user mirror — and the guard is currently invisible in the logs.
    Worth more than the other three: it is the difference between knowing that vector is dormant and
    assuming it.
+
+**What shipped, per item:** (1) `messageRoles` capped at 2000 with least-recently-*updated*
+eviction, skipping any session's in-flight assistant message, and announcing itself once when the
+cap first engages; (2) `splitTelegramMessage` joins only non-empty components, so an empty footer
+contributes no separator — which exposed and fixed a latent hole where a body ending in an unpaired
+high surrogate was sanitised only by accident; (3) `consume` before the whitespace return, as
+hygiene (see CORRECTION #E1); (4) the buffer-cancel logs session, message and discarded part count.
+
+**Evidence:** `npm run test` exit 0 (daemon 71, plugin 23, worker 2 files), `npm run typecheck`
+exit 0, both re-run on current `main` after PR #97's quiet-policy gate landed underneath this work.
+The resulting order in `/mirror` is consume THEN the quiet gate, which is the right way round — a
+quiet session still consumes its injected counts rather than accumulating them until the TTL sweep.
+
+**Two things worth carrying forward, both from how the review found its findings:**
+
+- It **probed the tests, not just the code**, and proved one of my "positive controls" was theatre:
+  it passed with `pruneMessageRoles` replaced by `messageRoles.clear()`, because a user message with
+  no role entry still mirrors through the undefined-role fallback. Role presence is behaviourally
+  invisible for user messages, so only a white-box assertion discriminates. **The §1.7/§2 lesson
+  generalises: a positive control is itself a claim that needs checking.**
+- It **asked whether each stated failure mode was reachable at all**, which is what produced
+  CORRECTION #E1. Step 0 says reproduce the symptom; item 3 shows that a symptom can be
+  unreproducible while the fix is still worth shipping — in which case the honest move is to ship it
+  with a corrected rationale, not to withdraw it and not to leave the false rationale standing.
+
+**Discovered here, already known:** the `lease-CAS concurrency proof` CI job is flaky — it failed
+PR #94 on a **docs-only** merge commit and passed on a bare re-run. That is `pigeon-1lha` (P2,
+filed 08-08), which already has the root cause: `SQLITE_BUSY` on concurrent schema init, no
+`busy_timeout` pragma, ~20% failure rate measured on pristine `main`. I filed a duplicate
+(`pigeon-j14t`) before searching, then closed it and moved the one new fact onto `pigeon-1lha`:
+**the flake fires in GitHub Actions too, where the job is advisory and therefore cannot block.** A
+flaky advisory check trains everyone to wave it through, including the day it is right.
 
 ---
 
