@@ -21,19 +21,28 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 
 ### Heavy commands and your serve's memory cgroup
 
-On cloudbox an agent's bash command normally runs in its own systemd scope
+On cloudbox an agent's bash command runs in its own systemd scope
 (`oc-agent.slice`, `MemoryMax=10G`), isolated from the `opencode serve` that spawned it.
-**A command whose text contains a bare `git` token is deliberately exempted** and runs
-inside the serve's own cgroup instead: `MemoryMax=14G`, `OOMPolicy=stop`, shared with the
-serve process and every peer session on that port. The exemption exists so opencode's
-`git ... : deny` permission rules still match — wrapping the command would blind them.
 
-The consequence is that `OOMPolicy=stop` makes **any** OOM in that cgroup stop the whole
-serve. That kills the plugin, so no `session.idle` fires and the session's Telegram
-notifications stop **silently** — it looks like a pigeon bug, not an OOM. It also takes out
-every other session on that port. This has happened (`pigeon-8bif`).
+**This changed on 2026-08-11** (workstation PR #349). Commands containing a bare `git`
+token used to be *exempted* from that scoping — they ran inside the serve's own cgroup
+(`MemoryMax=14G`, `OOMPolicy=stop`, shared with every peer session on that port), because
+rewriting the command text would have blinded opencode's `git ... : deny` permission rules.
+The wrap now happens at spawn time instead of by rewriting the command, so the deny globs
+still match **and** every command is scoped, `git` included. The old exemption is gone.
 
-So: **never chain `git` with an install or a test run in one bash call.** Split them.
+Two consequences worth keeping in mind:
+
+- An OOM in *your* scope now reports **exit 137** and kills only your command. Retrying
+  unchanged will fail identically; reduce parallelism instead (`--maxWorkers`, fewer jobs).
+- The historical hazard this section was written for — `OOMPolicy=stop` on the serve cgroup
+  taking out the plugin, so `session.idle` never fires and Telegram notifications stop
+  **silently**, looking like a pigeon bug rather than an OOM (`pigeon-8bif`) — no longer
+  applies to normal agent commands. It still applies if you ever see the wrapper's
+  `WARNING: ... running UNSCOPED` line, which means the scoping degraded.
+
+Splitting `git` from an install or test run into two bash calls is still good hygiene, and
+costs nothing:
 
 ```bash
 git pull --ff-only          # call 1 — unscoped, but trivial
@@ -43,6 +52,71 @@ npm install && npm run test # call 2 — scoped and capped
 The suite itself is modest (~1.0 GiB peak, measured cold and warm), so this is about not
 adding load to a cgroup that may already be near its ceiling — not about the suite being
 large. On macOS/devbox there is no such scoping at all, and everything runs unscoped.
+
+## Work in a Worktree, Not the Primary Root
+
+**In this repo the primary checkout is production.** `pigeon-daemon.service`
+runs `tsx` directly against `/home/dev/projects/pigeon`:
+
+```
+WorkingDirectory=/home/dev/projects/pigeon/packages/daemon
+ExecStart=... node .../tsx/dist/cli.mjs /home/dev/projects/pigeon/packages/daemon/src/index.ts
+```
+
+Whatever is checked out at that root is what runs at the next restart, and the
+documented deploy procedure ([cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
+is `git pull` there followed by a service restart. So an uncommitted edit or an
+unpushed commit at the root is not untidiness — it is a change to production
+that nobody reviewed, waiting for the next deploy to pick it up.
+
+**This already happened.** On 2026-08-11 a session committed `300304d`
+(`pigeon-ud6s`) directly onto local `main` at the root — unpushed, no branch, no
+PR. It sat there while `origin/main` moved on and was found only because a third
+session needed to pull for a deploy; it has since been rescued onto
+`pigeon-ud6s-300304d`. The same day, another session edited eight files at the
+root. Pigeon had 13 worktrees in active use at the time: the convention was not
+missing, it was unenforced.
+
+Start work with:
+
+```bash
+work <slug>     # creates ~/projects/pigeon/.worktrees/<slug> off origin/main
+```
+
+On **cloudbox**, a `pre-commit` hook refuses commits made at the primary root of
+`pigeon`, `mono` and `workstation`. On devbox and macOS the hook is not
+installed, so there the rule is convention only — follow it anyway. If the hook
+blocks you:
+
+1. **No local changes yet** — just `work <slug>` and commit there.
+2. **You already have uncommitted changes at the root** — copy them forward.
+   **Never `git stash` in the root**; it moves every session's changes, not just
+   yours, and has already destroyed a peer session's uncommitted database.
+   ```bash
+   work <slug>
+   p=$(mktemp /tmp/wg.XXXXXX.diff)
+   # `diff HEAD` (not bare `diff`) so STAGED work is included; --binary so
+   # binary files survive the round trip.
+   git -C ~/projects/pigeon diff HEAD --binary > "$p"
+   git -C ~/projects/pigeon/.worktrees/<slug> apply "$p"
+   # Untracked files are NOT in that diff -- list and copy them by hand:
+   git -C ~/projects/pigeon status --porcelain | grep '^??'
+   ```
+   The root is shared, so that diff may contain another session's work as well
+   as yours. Check before cleaning anything up there, and only once your
+   worktree commit exists.
+3. **Genuine hotfix that must land at the root** — `git commit --no-verify` is
+   supported, not a transgression. Say why in the commit message.
+
+The hook blocks *commits*, not *edits*, and `cherry-pick`/`revert`/`merge`/`rebase`
+all bypass it. The `merge` bypass is load-bearing here specifically: `git pull`
+at this root is the deploy step. So the hook is a backstop, not a guarantee —
+the convention above is what actually keeps production clean.
+
+A read-only detector (`trunk-drift-detector`, every 30 minutes on cloudbox)
+pages Telegram when any primary root is sitting on commits that exist on no
+remote, or has tracked edits while parked on trunk. If you get such an alert for
+pigeon, move the work into a worktree; do **not** reset, stash or clean the root.
 
 ## Architecture
 
@@ -132,6 +206,10 @@ Opencode events (stop, question, error) are sent back to Telegram as replies, ta
 **Durable notification delivery:** Stop, question, and swarm mirror notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
 
 **TUI-typed prompt mirror:** A prompt typed directly into the opencode TUI is posted into the session's topic as `🧑 <session>` (outbox `kind='mirror'`, `notificationId` `m:<sessionId>:<messageId>`), so a topic is no longer one-sided — it shows the prompts as well as the answers. The plugin accumulates user-role parts per message, flushes after 500ms of quiescence, and POSTs to daemon `/mirror`.
+
+"Typed into the TUI" is the **intent**, not the implemented predicate, and the gap between them has already caused one incident. What actually mirrors is *any user-role message not found in `injected_prompts`*. A session started by the `opencode-launch` CLI never records its launch prompt there, so that prompt mirrors even though no human typed it and the session is headless — which is how lgtm's automated reviews came to post `🧑 pr-4222 / Read the file .lgtm-review-prompt.md ...` into Telegram (`pigeon-8zqt`). Reason about this feature from the predicate, not the name.
+
+**Ancillary posts honour the quiet policy.** Both the mirror and the swarm feed are gated by `shouldEmitAncillaryFor` (`daemon/src/ancillary-gate.ts`), which applies the *same* `effectiveNotifyPolicy` + TTL used by `POST /stop`: `errors-only` and `none` suppress, everything else emits, and every error path fails **open**. Without it a declared-quiet session had its Stop suppressed while its mirror and swarm posts still landed — and since a Telegram topic is created by a session's first notification, each leak also created a topic, producing one forum topic per automated PR review. There is no ancillary analogue of an "error", so `errors-only` suppresses these outright. A swarm **retraction** (`wc:`) is the deliberate exception: it follows the fate of the `w:` notice it retracts rather than re-reading policy, because a suppressed retraction would strand a live notice that can never be withdrawn.
 
 Prompts the daemon *injected* must not be mirrored, because Telegram already showed them — and they arrive as ordinary user messages, indistinguishable from typing. So the daemon records `sha256(prompt)` in a counted `injected_prompts` table (15-min TTL, swept by the session reaper) immediately **before** each injection, and `/mirror` consumes one count and stays silent on a hit. Two details are load-bearing rather than defensive:
 

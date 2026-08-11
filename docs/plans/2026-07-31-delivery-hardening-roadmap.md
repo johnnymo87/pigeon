@@ -1876,8 +1876,30 @@ makes it delivery work that happens to also be a quality-of-life win.
   adds a one-shot provisional rename. **Generalisable lesson: a visibility feature changes which event
   arrives FIRST, and any write-once decision keyed on "first" is therefore in its blast radius.**
 
+  **Second fallout, and the more expensive one — `pigeon-8zqt`, PR #97 (`c3c7615`).** Neither Phase
+  bypassed the quiet policy on purpose; nobody noticed there *was* one to honour. A session declared
+  quiet by `session_origin` had its Stop suppressed while its mirror and swarm posts still landed —
+  and since a topic is created by the first notification, each leak also created a topic. Result: one
+  forum topic per automated lgtm review, user-reported as "my telegram is full of topics coming from
+  lgtm". Measured before the fix: **16 `mirror`, 4 `swarm`, 1 `stop`** for the quiet population.
+
+  **The trap worth carrying forward: `/mirror` is not "a prompt typed into the TUI", which is what
+  this spine and `AGENTS.md` both called it.** Its real predicate is *any user-role message not found
+  in `injected_prompts`*. A session launched by the `opencode-launch` CLI never records its launch
+  prompt there, so that prompt mirrors even though the session is headless and no human typed. The
+  owner of the quiet policy (me) reasoned from the feature's name, concluded mirror gating was dead
+  code for headless lgtm sessions, and advised the emitter's owner to skip it — the exact half that
+  was leaking. **Generalisable with F6's own lesson above: a visibility feature inherits every
+  suppression decision made elsewhere in the system, and the name of a feature is not its predicate.**
+
+  Fixed by `daemon/src/ancillary-gate.ts`, applying the same `effectiveNotifyPolicy` + TTL as
+  `POST /stop` at both emitters, failing open everywhere; a swarm retraction deliberately follows the
+  fate of the notice it retracts rather than re-reading policy. Production verification is still
+  outstanding (empty post-deploy window; wake armed). Source fix filed as `pigeon-w36w`.
+
   **Open, non-blocking:** `pigeon-rqyz` (below), `pigeon-kq6h` (P3, subagent misclassified as main when
-  `session.get` fails — pre-existing, but the mirror makes it louder), `pigeon-pre9` (P4 polish).
+  `session.get` fails — pre-existing, but the mirror makes it louder), `pigeon-pre9` (P4 polish),
+  `pigeon-w36w` (P2, record the launch prompt at source).
 
 - [ ] **F6a. `pigeon-rqyz`** (P3) — **`pigeon-d95y` is deployed to cloudbox ONLY.** devbox, macbook and
   chromebook still run daemon+plugin code without the mirror. Unlike F1–F3 this is *not* worker-only, so

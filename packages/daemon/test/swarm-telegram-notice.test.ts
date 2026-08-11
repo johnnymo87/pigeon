@@ -41,6 +41,10 @@ function mockStorage(opts: {
   senderSession?: { title?: string | null; label?: string | null; cwd?: string | null } | null;
   targetSession?: { title?: string | null; label?: string | null; cwd?: string | null } | null;
   outboxThrow?: boolean;
+  /** session_origin row for the RECEIVER. Default: none, so notices emit. */
+  originRow?: { notifyPolicy: string; source: string; createdAt: number } | null;
+  /** Whether the original `w:<id>` notice is already in the outbox. Default: yes. */
+  originalPosted?: boolean;
 } = {}): { storage: StorageDb; upsertCalls: any[] } {
   const upsertCalls: any[] = [];
   const senderSession = opts.senderSession === undefined
@@ -58,6 +62,9 @@ function mockStorage(opts: {
         return null;
       },
     },
+    sessionOrigins: {
+      get: () => opts.originRow ?? null,
+    },
     outbox: {
       upsert: (input: any, now: number) => {
         if (opts.outboxThrow) {
@@ -65,6 +72,10 @@ function mockStorage(opts: {
         }
         upsertCalls.push({ input, now });
       },
+      // A retraction only posts if the notice it retracts did. Default true so the
+      // pre-existing cancel tests keep exercising the emit path.
+      getByNotificationId: (id: string) =>
+        opts.originalPosted === false ? null : { notificationId: id },
     },
   } as unknown as StorageDb;
 
@@ -134,6 +145,42 @@ describe("enqueueSwarmTelegramNotice", () => {
     expect(upsertCalls).toHaveLength(1);
     const payload = JSON.parse(upsertCalls[0]!.input.payload);
     expect(payload.messages[0].text).toContain("bad surrogate \uFFFD here");
+  });
+});
+
+describe("swarm notices respect a declared-quiet receiver", () => {
+  // Companion to the /mirror regression: lgtm re-prompts its review sessions via
+  // /swarm/send on every reawaken, so an ungated feed reinstates the noise that the
+  // session_origin policy exists to remove -- and can create the topic itself.
+  const QUIET_ROW = { notifyPolicy: "errors-only", source: "declared", createdAt: 1786363200000 };
+
+  it("suppresses the notice when the receiver is declared quiet", () => {
+    const { storage, upsertCalls } = mockStorage({ originRow: QUIET_ROW });
+    enqueueSwarmTelegramNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(0);
+  });
+
+  it("still posts when the receiver's row is an explicit user override", () => {
+    const { storage, upsertCalls } = mockStorage({
+      originRow: { notifyPolicy: "all", source: "override", createdAt: 1786363200000 },
+    });
+    enqueueSwarmTelegramNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(1);
+  });
+
+  it("posts a retraction for a quiet receiver when the original notice WAS posted", () => {
+    // The retraction follows the original's fate, not a fresh policy read. Re-reading
+    // policy here would strand a live notice that can never be withdrawn.
+    const { storage, upsertCalls } = mockStorage({ originRow: QUIET_ROW, originalPosted: true });
+    enqueueSwarmCancelNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(1);
+    expect(upsertCalls[0]!.input.notificationId).toBe("wc:msg_1001");
+  });
+
+  it("skips the retraction when the original notice was never posted", () => {
+    const { storage, upsertCalls } = mockStorage({ originalPosted: false });
+    enqueueSwarmCancelNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(0);
   });
 });
 

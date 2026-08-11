@@ -11,6 +11,7 @@ import { openStorageDb } from "./storage/database";
 import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
 import { SWARM_RETENTION_MS } from "./storage/swarm-schema";
 import { Poller } from "./worker/poller";
+import { WorkerHealthMonitor } from "./worker/worker-health";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
 import { AlertDrainer, DEFAULT_DRAIN_INTERVAL_MS, type AlertDrainerNotifier } from "./swarm/alert-drainer";
@@ -164,6 +165,20 @@ async function sendTelegramMessage(
   }
 }
 
+/**
+ * Watches the outcome of our two worker write routes and alerts on a sustained failure
+ * (pigeon-n4v). Constructed unconditionally rather than gated on a plain-alert notifier:
+ * the alert row and the journal line are worth having on a host that cannot deliver them,
+ * since the absence of any durable record is exactly what made the 2026-07-14 outage
+ * undiagnosable sixteen days later. Undeliverable rows are retired by the hourly
+ * abandonOlderThan sweep, the same as every other alert on such a host.
+ */
+const workerHealthMonitor = new WorkerHealthMonitor({
+  alerts: storage.alerts,
+  log: (msg, fields) =>
+    console.warn(`[worker-health] ${msg}`, fields ? JSON.stringify(fields) : ""),
+});
+
 const poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
@@ -309,6 +324,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
       },
+      { healthMonitor: workerHealthMonitor },
     )
   : undefined;
 

@@ -6,6 +6,7 @@ import {
   formatSwarmCancelNotification,
 } from "../notification-service";
 import { splitTelegramMessage } from "../split-message";
+import { shouldEmitAncillaryFor } from "../ancillary-gate";
 
 export function enqueueSwarmTelegramNotice(
   storage: StorageDb,
@@ -15,6 +16,17 @@ export function enqueueSwarmTelegramNotice(
   try {
     if (!record.toSession) {
       console.log("[pigeon-daemon] swarm telegram notice skipped for channel broadcast", record.msgId);
+      return;
+    }
+
+    // A session declared quiet suppresses its swarm feed too. lgtm re-prompts its
+    // review sessions via /swarm/send on every reawaken, so without this the feed
+    // reinstates exactly the noise the origin policy exists to remove -- and can
+    // create the session's Telegram topic in the first place.
+    if (!shouldEmitAncillaryFor(storage, record.toSession, now)) {
+      console.log(
+        `[swarm-notice] quieted msgId=${record.msgId} sessionId=${record.toSession} reason=origin`,
+      );
       return;
     }
 
@@ -72,6 +84,18 @@ export function enqueueSwarmCancelNotice(
   try {
     if (!record.toSession) {
       console.log("[pigeon-daemon] swarm telegram cancel notice skipped for channel broadcast", record.msgId);
+      return;
+    }
+
+    // A retraction follows the fate of the notice it retracts, NOT a fresh policy
+    // read. If the original was posted and the session was quieted afterwards (or its
+    // quiet TTL expired the other way), re-evaluating policy here would strand a live
+    // "message dispatched" notice in the topic that can never be withdrawn. Absence of
+    // the original is the only correct reason to stay silent.
+    if (!storage.outbox.getByNotificationId(`w:${record.msgId}`)) {
+      console.log(
+        `[swarm-notice] cancel skipped msgId=${record.msgId} reason=original-not-posted`,
+      );
       return;
     }
 
