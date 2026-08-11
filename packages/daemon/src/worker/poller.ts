@@ -5,6 +5,8 @@
  * callbacks, and acks via POST /commands/:id/ack after successful dispatch.
  */
 
+import type { WorkerHealthObserver } from "./worker-health";
+
 export interface SendNotificationInput {
   sessionId: string;
   chatId: string;
@@ -255,10 +257,20 @@ export interface PollerCallbacks {
 
 export interface PollerDeps {
   fetchFn?: typeof fetch;
+  /**
+   * Observes the OUTCOME of the two worker write routes so a sustained failure raises an
+   * alarm instead of being retried in silence for six hours (pigeon-n4v).
+   *
+   * Instrumented here rather than in `OutboxSender` because this is the single choke point
+   * every caller passes through — the outbox's send AND its re-register arm, plus the
+   * session-start registration in index.ts, which an outbox-side hook would miss entirely.
+   */
+  healthMonitor?: WorkerHealthObserver;
 }
 
 export class Poller {
   private readonly fetchFn: typeof fetch;
+  private readonly healthMonitor: WorkerHealthObserver | undefined;
   private readonly pollIntervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
@@ -269,6 +281,7 @@ export class Poller {
     deps: PollerDeps = {},
   ) {
     this.fetchFn = deps.fetchFn ?? fetch;
+    this.healthMonitor = deps.healthMonitor;
     this.pollIntervalMs = config.pollIntervalMs ?? 5000;
   }
 
@@ -398,6 +411,7 @@ export class Poller {
         }),
       }),
     );
+    this.healthMonitor?.record("register", result);
     if (result.ok) {
       console.log(`[poller] registerSession sessionId=${sessionId} ok=true`);
     } else {
@@ -442,7 +456,7 @@ export class Poller {
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
     const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded } = input;
-    return safeExecuteWorkerFetch(() =>
+    const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
         headers: {
@@ -463,6 +477,8 @@ export class Poller {
         }),
       }),
     );
+    this.healthMonitor?.record("send", result);
+    return result;
   }
 
   async editNotification(
