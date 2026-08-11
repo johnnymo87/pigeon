@@ -314,7 +314,7 @@ If issues arise with forum topics, revert to DM operation immediately. Reverting
    ```
 5. **Confirm the outbox has drained before narrowing the allowlist.** Watch for terminal failures:
    ```bash
-   sudo journalctl -u pigeon-daemon -n 100 --no-pager | grep -i "outbox\|failed"
+   sudo journalctl --namespace=pigeon -u pigeon-daemon -n 100 --no-pager | grep -i "outbox\|failed"
    ```
 6. **Only now** remove the supergroup from `ALLOWED_CHAT_IDS` and deploy again.
 

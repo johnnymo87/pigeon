@@ -25,7 +25,7 @@ curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 
 Boot log to confirm arbiter started:
 
 ```bash
-journalctl -u pigeon-daemon --no-pager -n 50 | grep '\[pigeon-daemon\]'
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager -n 50 | grep '\[pigeon-daemon\]'
 # expect: "[pigeon-daemon] swarm arbiter started (interval=500ms)"
 # OR:     "[pigeon-daemon] swarm arbiter NOT started (no opencodeUrl in config)"
 #         (the latter means swarm sends will queue forever — fix config)
@@ -67,7 +67,7 @@ curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 
 The arbiter logs every dispatch attempt:
 
 ```bash
-journalctl -u pigeon-daemon --no-pager --since '5 minutes ago' \
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '5 minutes ago' \
   | grep '\[swarm-arbiter\]'
 ```
 
@@ -82,7 +82,7 @@ Three event types:
 For high-precision timing (arbiter runs at 500ms intervals — useful for proving serialization):
 
 ```bash
-journalctl -u pigeon-daemon --no-pager --since '2 minutes ago' -o short-precise \
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '2 minutes ago' -o short-precise \
   | grep swarm-arbiter
 ```
 
@@ -117,7 +117,7 @@ Swarm posts are rate-governed (`SWARM_SUB_BUDGET = 6` of the outbox governor's 1
 When the sub-budget is exhausted, the outbox sender logs a once-per-tick debug/info line:
 
 ```bash
-journalctl -u pigeon-daemon --no-pager --since '10 minutes ago' \
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '10 minutes ago' \
   | grep 'outbox sub-budget reached'
 ```
 
@@ -194,7 +194,7 @@ The arbiter's per-process `inflight` map is lost on restart, but the next tick r
 
 ```bash
 sudo systemctl restart pigeon-daemon.service
-journalctl -u pigeon-daemon --no-pager --since '30 seconds ago' \
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '30 seconds ago' \
   | grep -E 'swarm arbiter|listening on'
 # expect both:
 #   "[pigeon-daemon] swarm arbiter started (interval=500ms)"
@@ -240,7 +240,7 @@ nix-shell -p sqlite --run \
 ```bash
 curl -s http://127.0.0.1:4731/health
 curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ops-smoke' | jq .
-journalctl -u pigeon-daemon --no-pager -n 30 | grep -E 'swarm arbiter|listening on'
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager -n 30 | grep -E 'swarm arbiter|listening on'
 ```
 
 Expected:
