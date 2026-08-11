@@ -41,8 +41,16 @@ namespace (`LogNamespace = "pigeon"`, workstation-9f7a) so its retention is
 independent of noisier units — 90 days, against roughly a week in the shared
 journal. `opencode-serve` is not namespaced.
 
-Without the flag `journalctl -u pigeon-daemon.service` returns **zero entries and
-no error**, which is indistinguishable from "the daemon logged nothing". Add
+Without the flag `journalctl -u pigeon-daemon.service` returns **no error and no
+application output**. It is worse than empty: PID 1 is not namespaced, so systemd's
+own `Started` / `Stopped` / `Consumed … CPU time` lines still land in the default
+journal while every line the daemon writes goes to the namespace. Measured at the
+2026-08-11 cutover: 5 systemd lines in the default journal, 0 in the namespace, and
+0 application lines in the default journal afterwards.
+
+So the un-namespaced query looks like a daemon that is running but silent — a much
+easier thing to believe than an empty result, and the wrong conclusion ("it must be
+wedged") is one step away. Add
 `--namespace=pigeon` to anything reading pigeon's logs, including unit-less
 sweeps like `journalctl --since` or `-p err`, which otherwise skip pigeon
 entirely. This also covers `oc-auto-attach`, which pigeon spawns.
