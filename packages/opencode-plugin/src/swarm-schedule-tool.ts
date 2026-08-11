@@ -36,7 +36,6 @@ export class ScheduleRejectedError extends Error {
 export interface SwarmScheduleOptions {
   daemonBaseUrl: string // e.g. http://127.0.0.1:4731
   sessionId: string // injected from ToolContext; becomes default `to` and `from`
-  authToken?: string // when set, sent as `Authorization: Bearer <token>`
   fetchFn?: typeof fetch
   /** Injectable sleep (tests pass a no-op recorder). Defaults to setTimeout. */
   sleepFn?: (ms: number) => Promise<void>
@@ -128,7 +127,7 @@ export async function swarmSchedule(
 
   const bodyJson = JSON.stringify(body)
 
-  let token = opts.authToken ?? resolveDaemonToken()
+  let token = resolveDaemonToken()
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
@@ -184,7 +183,10 @@ export async function swarmSchedule(
       }
     }
 
-    const text = await res.text().catch(() => "")
+    // `let`, not `const`: the 401 re-auth branch below REPLACES `res`, and the
+    // 409, transient and permanent paths all report or PARSE `text`. Leaving it
+    // bound to the first response pairs the retry's status with the 401's body.
+    let text = await res.text().catch(() => "")
 
     // Special-case 503: Daemon scheduler is not running (a configuration problem).
     // MUST NOT be retried — retrying cannot help and merely wastes time on a configuration problem that cannot resolve itself.
@@ -200,7 +202,7 @@ export async function swarmSchedule(
     if (res.status === 401 && !authRetried) {
       authRetried = true
       invalidateDaemonToken()
-      const retryToken = opts.authToken ?? resolveDaemonToken()
+      const retryToken = resolveDaemonToken()
       if (retryToken) {
         headers["Authorization"] = `Bearer ${retryToken}`
       } else {
@@ -237,8 +239,12 @@ export async function swarmSchedule(
             }
           }
         }
+        // Re-auth did not cure it. Adopt THIS response's body once, here, so
+        // every path below (503, the 409 idempotency parse, transient and
+        // permanent) describes the same response its status came from.
+        text = await res.text().catch(() => "")
         if (res.status === 503) {
-          let daemonError = await res.text().catch(() => text)
+          let daemonError = text
           try {
             const json = JSON.parse(daemonError) as { error?: string }
             if (json && typeof json.error === "string") daemonError = json.error
