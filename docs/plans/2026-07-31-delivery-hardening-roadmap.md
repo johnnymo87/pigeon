@@ -1850,6 +1850,18 @@ makes it delivery work that happens to also be a quality-of-life win.
   none occurred in the window — and is covered by mechanism (same `sendPrompt` record site) rather than
   observation. Recorded as a gap rather than counted as a pass.
 
+  **Fallout, already fixed by a peer track — `pigeon-353p`, PR #86 (`5bb29d9`).** Phase 1 did not
+  introduce the bug but it *exposed* it, and that is the interesting part. Topic names are write-once
+  and are fixed by a session's **first** notification; before Phase 1 that was almost always a `stop`,
+  by which time opencode's summariser had produced a real title. Making swarm traffic visible meant a
+  swarm post became the first notification for any session messaged early — ~1s after creation, while
+  the title is still opencode core's `New session - <ISO>` placeholder — so those topics were named
+  after a timestamp permanently. Measured deltas: 976ms, 963ms, 1094ms, 32.9s, 110s, every one of them
+  a swarm post; every `stop`-first session was fine. The fix treats the placeholder as *absent* in both
+  daemon and worker (duplicated deliberately, since the worker deploys centrally while daemons lag) and
+  adds a one-shot provisional rename. **Generalisable lesson: a visibility feature changes which event
+  arrives FIRST, and any write-once decision keyed on "first" is therefore in its blast radius.**
+
   **Open, non-blocking:** `pigeon-rqyz` (below), `pigeon-kq6h` (P3, subagent misclassified as main when
   `session.get` fails — pre-existing, but the mirror makes it louder), `pigeon-pre9` (P4 polish).
 
