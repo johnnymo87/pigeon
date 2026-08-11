@@ -20,7 +20,7 @@ Use this when daemon behavior regresses in production or parity tests.
 
 ```bash
 systemctl status pigeon-daemon.service --no-pager
-journalctl -u pigeon-daemon.service -n 120 --no-pager
+journalctl --namespace=pigeon -u pigeon-daemon.service -n 120 --no-pager
 curl -s http://127.0.0.1:4731/health
 ```
 

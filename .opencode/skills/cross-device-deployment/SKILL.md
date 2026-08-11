@@ -136,6 +136,17 @@ All four machines run both `pigeon-daemon` and `opencode-serve` under their serv
 
 | Machine | Command |
 |---------|---------|
-| **devbox/cloudbox** | `journalctl -u pigeon-daemon.service -n 50 --no-pager` |
+| **devbox/cloudbox** | `journalctl --namespace=pigeon -u pigeon-daemon.service -n 50 --no-pager` |
 | **macbook** | `cat ~/Library/Logs/pigeon-daemon.err.log` |
 | **chromebook** | `journalctl --user -u pigeon-daemon.service -n 50 --no-pager` |
+
+**`--namespace=pigeon` is required on devbox/cloudbox and must NOT be used on
+chromebook.** Those two are NixOS hosts where pigeon-daemon is a *system* unit
+carrying `LogNamespace = "pigeon"` (workstation-9f7a), which gives it a private
+journal with 90-day retention instead of the ~6 days the shared journal manages.
+Chromebook runs pigeon as a *user* service with no namespace, so the flag would
+find nothing there.
+
+Omitting the flag where it is needed does not error — it prints **zero entries**,
+which looks exactly like a daemon that logged nothing. If a devbox/cloudbox log
+query comes back suspiciously empty, check the flag before concluding anything.

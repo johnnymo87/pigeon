@@ -31,9 +31,31 @@ Expected:
 ## Operational Logs
 
 ```bash
-journalctl -u pigeon-daemon.service -n 100 --no-pager
+journalctl --namespace=pigeon -u pigeon-daemon.service -n 100 --no-pager
 journalctl -u opencode-serve.service -n 100 --no-pager
 ```
+
+**Note the `--namespace=pigeon` on the first line and its absence on the second.**
+On the NixOS hosts (devbox, cloudbox) pigeon-daemon logs to a private journal
+namespace (`LogNamespace = "pigeon"`, workstation-9f7a) so its retention is
+independent of noisier units — 90 days, against roughly a week in the shared
+journal. `opencode-serve` is not namespaced.
+
+Without the flag `journalctl -u pigeon-daemon.service` returns **zero entries and
+no error**, which is indistinguishable from "the daemon logged nothing". Add
+`--namespace=pigeon` to anything reading pigeon's logs, including unit-less
+sweeps like `journalctl --since` or `-p err`, which otherwise skip pigeon
+entirely. This also covers `oc-auto-attach`, which pigeon spawns.
+
+To see everything in the namespace regardless of unit:
+
+```bash
+journalctl --namespace=pigeon --since '1 hour ago' --no-pager
+journalctl --namespace=pigeon --disk-usage      # its own quota, not the main one
+```
+
+History written before this landed stays in the default journal, so evidence
+from before the cutover needs the un-namespaced form.
 
 Look for:
 
