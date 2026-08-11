@@ -204,10 +204,25 @@ export function parseSwarmSendBody(
   };
 }
 
+/**
+ * opencode names a brand-new session `New session - <ISO timestamp>` and only replaces it once
+ * its summarizer produces a real title, seconds later. That placeholder is not a title: baking it
+ * into a Telegram forum topic name is permanent, because topic names are write-once (pigeon-353p).
+ *
+ * Treated as ABSENT rather than rewritten, so every existing consumer keeps its own fallback —
+ * `displayName` drops through to the session label, and the worker names the topic after the
+ * directory alone and marks it upgradable. Fail-open: if opencode changes the format this stops
+ * matching and behaviour reverts to what it was, never worse. The worker matches the same shape
+ * independently (`isPlaceholderTitle` in topics.ts) because daemons are deployed per-machine and
+ * one lagging daemon must not be able to mint placeholder-named topics.
+ */
+const PLACEHOLDER_TITLE_PATTERN = /^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?$/;
+
 function parseTitle(val: unknown): string | undefined {
   if (typeof val !== "string") return undefined;
   const trimmed = val.trim();
   if (trimmed === "") return undefined;
+  if (PLACEHOLDER_TITLE_PATTERN.test(trimmed)) return undefined;
   // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that Telegram
   // cannot encode, silently killing every notification for the session. See text.ts.
   return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);

@@ -12,6 +12,46 @@ export interface TopicRow {
   created_at: number;
   updated_at: number;
   closed_at: number | null;
+  /**
+   * 1 when the topic's name was derived WITHOUT a human-meaningful session title — i.e. it is
+   * just the abbreviated directory. Such a name may be upgraded exactly once, by the first
+   * notification that carries a real title (pigeon-353p). 0 for every name that is final:
+   * one built from a real title, and any name set by the manual `/rename` command.
+   */
+  name_provisional: number;
+}
+
+/**
+ * opencode core names a brand-new session `New session - <ISO timestamp>` and only replaces it
+ * seconds later, once its summarizer has produced a real title. Pigeon must never bake that
+ * placeholder into a forum topic name, because topic names are write-once (pigeon-353p).
+ *
+ * Matched here in the worker as well as in the daemon (`parseTitle`) deliberately: the worker
+ * deploys centrally while daemons are updated per-machine, so a lagging daemon would otherwise
+ * keep minting placeholder-named topics indefinitely. Fail-open by construction — if opencode
+ * changes the format this stops matching and we are back to today's behaviour, never worse.
+ */
+const PLACEHOLDER_TITLE_RE = /^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?$/;
+
+export function isPlaceholderTitle(title: string | null | undefined): boolean {
+  if (typeof title !== "string") return false;
+  return PLACEHOLDER_TITLE_RE.test(title.trim());
+}
+
+/**
+ * True when a stored topic NAME was built from the placeholder title — i.e. it looks like
+ * `New session - <ISO> · ~/path`.
+ *
+ * Only rows marked provisional by the one-off backfill (see the forum-migration runbook) can look
+ * like this; a name minted by current code never can, because the placeholder is stripped before
+ * `topicName` sees it. It matters because the upgrade path may reuse a provisional name AS the
+ * directory when a notification carries no dir, and that reuse is only sound for a name that
+ * really is directory-only. Without this check a backfilled row would be permanently renamed to
+ * `Real title · New session - <ISO> · ~/path`.
+ */
+export function hasPlaceholderName(name: string | null | undefined): boolean {
+  if (typeof name !== "string") return false;
+  return /^New session - \d{4}-\d{2}-\d{2}T/.test(name.trim());
 }
 
 /**
@@ -163,6 +203,10 @@ export async function reserve(
  * Finalize a reserved topic row with its assigned message_thread_id.
  * CAS operation: only succeeds if message_thread_id IS NULL (prevents late winner overwriting).
  * Optionally updates name if provided.
+ *
+ * `provisional` is written alongside the name, and only when a name is given: the two must agree,
+ * and the caller that supplies the name is the one that knows whether it came from a real title.
+ * It is set here rather than at `reserve` so that a steal-winner's view of the title wins.
  */
 export async function finalize(
   db: D1Database,
@@ -170,6 +214,7 @@ export async function finalize(
     sessionId: string;
     messageThreadId: number;
     name?: string | null;
+    provisional?: boolean;
     now?: number;
   },
 ): Promise<boolean> {
@@ -178,10 +223,10 @@ export async function finalize(
     const res = await db
       .prepare(
         `UPDATE topics
-         SET message_thread_id = ?, name = ?, updated_at = ?
+         SET message_thread_id = ?, name = ?, name_provisional = ?, updated_at = ?
          WHERE session_id = ? AND message_thread_id IS NULL`,
       )
-      .bind(opts.messageThreadId, opts.name, now, opts.sessionId)
+      .bind(opts.messageThreadId, opts.name, opts.provisional ? 1 : 0, now, opts.sessionId)
       .run();
     return (res.meta.changes ?? 0) > 0;
   } else {
@@ -198,7 +243,9 @@ export async function finalize(
 }
 
 /**
- * Rename a topic.
+ * Rename a topic. Unconditional — this is the manual `/rename` command's writer, and an explicit
+ * human name always wins. Clearing `name_provisional` here is what makes `/rename` a permanent
+ * opt-out of the automatic one-shot upgrade (pigeon-353p).
  */
 export async function rename(
   db: D1Database,
@@ -212,12 +259,45 @@ export async function rename(
   const res = await db
     .prepare(
       `UPDATE topics
-       SET name = ?, updated_at = ?
+       SET name = ?, name_provisional = 0, updated_at = ?
        WHERE session_id = ?`,
     )
     .bind(opts.name, now, opts.sessionId)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
+}
+
+/**
+ * Upgrade a provisional (directory-only) topic name to one built from a real session title.
+ *
+ * CAS on `name_provisional = 1`, so it is a no-op against a topic that has since been renamed by
+ * a human or already upgraded by a rival isolate. Returns whether this caller won.
+ *
+ * Accepted residual: the CAS protects the D1 row, not Telegram. A `/rename` that lands between
+ * this caller's `editForumTopic` and its CAS leaves Telegram showing the automatic name while D1
+ * holds the human one; re-issuing `/rename` converges. The window is milliseconds wide and the
+ * consequence is cosmetic, which is why it is not worth claiming the flag BEFORE the API call —
+ * that would trade this for the much worse "one transient Telegram failure and the topic is
+ * never upgraded", since every retry of the upgrade is driven by a later notification.
+ */
+export async function renameProvisional(
+  db: D1Database,
+  opts: {
+    sessionId: string;
+    name: string;
+    now?: number;
+  },
+): Promise<boolean> {
+  const now = opts.now ?? Date.now();
+  const res = await db
+    .prepare(
+      `UPDATE topics
+       SET name = ?, name_provisional = 0, updated_at = ?
+       WHERE session_id = ? AND name_provisional = 1`,
+    )
+    .bind(opts.name, now, opts.sessionId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 /**

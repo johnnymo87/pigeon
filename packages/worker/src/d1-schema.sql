@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS topics (
   chat_id           TEXT NOT NULL,
   message_thread_id INTEGER,
   name              TEXT,
+  -- 1 = name was built without a real session title (directory only) and may be upgraded once
+  -- by the first notification carrying one. See pigeon-353p.
+  name_provisional  INTEGER NOT NULL DEFAULT 0,
   state             TEXT NOT NULL DEFAULT 'open',
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL,
