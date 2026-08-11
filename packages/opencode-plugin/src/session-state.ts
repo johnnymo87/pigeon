@@ -135,16 +135,24 @@ export class SessionManager {
    * because `mainSessionIds` is untouched here. Restoring its mirror would need a
    * fresh authoritative read rather than an inference -- see `pigeon-nwrt`.
    */
-  resolveParentage(sessionID: string, parentID: string | undefined): void {
+  resolveParentage(sessionID: string, parentID: string | undefined): boolean {
     const entry = this.sessions.get(sessionID)
-    if (!entry) return
-    if (entry.parentage !== "unknown") return
-    if (!parentID) return
+    if (!entry) return false
+    if (entry.parentage !== "unknown") return false
+    if (!parentID) return false
+
+    const wasRegistered = this.isRegistered(sessionID)
 
     entry.parentID = parentID
     entry.parentage = "subagent"
     entry.lastSeenAt = Date.now()
     this.mainSessionIds.delete(sessionID)
+
+    // Reported so the caller can log it. A demotion after registration is the moment we
+    // learn a registration we already made was wrong: the daemon holds a row for a
+    // subagent, and if it had already notified, a Telegram topic exists that nothing
+    // reclaims. See `pigeon-umyr`.
+    return wasRegistered
   }
 
   /**
@@ -157,9 +165,7 @@ export class SessionManager {
     return this.sessions.get(sessionID)?.parentage === "main"
   }
 
-  getParentage(sessionID: string): Parentage | undefined {
-    return this.sessions.get(sessionID)?.parentage
-  }
+
 
   setTitle(sessionID: string, title: string | undefined): void {
     const entry = this.sessions.get(sessionID)

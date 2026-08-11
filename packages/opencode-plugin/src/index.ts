@@ -307,8 +307,10 @@ const plugin: Plugin = async (ctx) => {
           // Fallback: parentage is UNKNOWN, not "no parent". The session is still
           // treated as main so stops/errors/questions keep flowing (failing closed
           // here is what makes a real session go silent, invisibly), but it is not
-          // *confirmed* main, so it will not mirror prompts. A later
-          // `session.updated` resolves it either way. See `pigeon-kq6h`.
+          // *confirmed* main, so it will not mirror prompts. A later `session.updated`
+          // can only resolve this ONE way: if the session is really a subagent it is
+          // demoted, while a genuine main session stays unconfirmed and never mirrors
+          // again (`pigeon-nwrt`). See `pigeon-kq6h`.
           log("session.get failed, registering with unknown parentage", serializeError(err))
           sessionManager.onSessionCreated(sessionID, undefined, undefined, "unknown")
           doRegisterSession(sessionID, envInfo)
@@ -414,11 +416,26 @@ const plugin: Plugin = async (ctx) => {
           // (`pigeon-kq6h`). Runs before the early returns below, which discard it.
           //
           // Only a PRESENT parentID is acted on, and only for a session whose
-          // parentage is still unknown -- see `resolveParentage`. An update that omits
-          // the field must never promote anything, which is what the guard on the next
-          // line has pinned since `2fd9a56`.
-          if (sessionManager.isKnown(sessionID)) {
-            sessionManager.resolveParentage(sessionID, parentID)
+          // parentage is still unknown -- non-promotion lives in `resolveParentage`
+          // itself, which returns early when `parentID` is absent. (The separate
+          // `isMainSession` guard below, pinned since `2fd9a56`, is what stops an
+          // omitted parentID reaching the title path.)
+          //
+          // Awaiting an in-flight discovery first: `lateDiscoverSession` is dispatched
+          // fire-and-forget, and the session is not `isKnown` until it settles. A slow
+          // `session.get` timeout makes that window seconds wide, and a short-lived
+          // subagent may emit its only `session.updated` inside it -- discarding this
+          // event would forfeit the one repair available.
+          if (parentID && !sessionManager.isKnown(sessionID)) {
+            const discovery = sessionManager.getDiscoveryPromise(sessionID)
+            if (discovery) await discovery.catch(() => {})
+          }
+
+          if (sessionManager.resolveParentage(sessionID, parentID)) {
+            log("demoted a registered session to subagent; its daemon registration is now stale", {
+              sessionID,
+              parentID,
+            })
           }
 
           if (parentID) return

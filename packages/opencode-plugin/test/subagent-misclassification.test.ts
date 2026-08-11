@@ -259,6 +259,72 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     )
   })
 
+  /**
+   * The positive control for the mirror wiring, and it is load-bearing.
+   *
+   * Every other mirror assertion in this file is a `not.toHaveBeenCalled()`, and
+   * `message-tail.test.ts` injects its own predicate so it cannot see the wiring in
+   * `index.ts`. Without this test, changing that wiring to a constant `() => false`
+   * kills mirroring globally and the entire suite still passes -- and it would be
+   * invisible in production too, because a missing post is by design a silent gap.
+   */
+  test("POSITIVE CONTROL: a confirmed main session does mirror its typed prompt", async () => {
+    const postMirrorSpy = vi
+      .spyOn(daemonClient, "postMirror")
+      .mockResolvedValue({ mirrored: true })
+    vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
+
+    const hooks = await plugin(createMockCtx())
+
+    // session.created with no parentID: parentage is confirmed main, no session.get.
+    await hooks.event!({
+      event: {
+        type: "session.created",
+        properties: { info: { id: "ses_real_main", title: "Real main" } },
+      } as any,
+    })
+
+    await typePromptInto(hooks, "ses_real_main", "a genuine human-typed prompt")
+
+    await vi.waitFor(() => expect(postMirrorSpy).toHaveBeenCalled(), { timeout: 3000 })
+    expect(postMirrorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "ses_real_main" })
+    )
+  })
+
+  test("a session confirmed as main is never demoted by a later update that omits parentID", async () => {
+    vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
+    const notifyStopSpy = vi
+      .spyOn(daemonClient, "notifyStop")
+      .mockResolvedValue({ ok: true })
+
+    const hooks = await plugin(createMockCtx())
+
+    await hooks.event!({
+      event: {
+        type: "session.created",
+        properties: { info: { id: "ses_real_main", title: "Real main" } },
+      } as any,
+    })
+
+    // Monotonicity: confirmed knowledge must survive a payload that contradicts it.
+    await sessionUpdated(hooks, "ses_real_main", "ses_someone_else")
+
+    await hooks.event!({
+      event: {
+        type: "message.updated",
+        properties: { info: { id: "msg_a1", sessionID: "ses_real_main", role: "assistant" } },
+      } as any,
+    })
+    await hooks.event!({
+      event: { type: "session.idle", properties: { sessionID: "ses_real_main" } } as any,
+    })
+
+    expect(notifyStopSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "ses_real_main" })
+    )
+  })
+
   test("ensureRegistered still retries a failed registration for unknown parentage", async () => {
     const registerSessionSpy = vi
       .spyOn(daemonClient, "registerSession")
