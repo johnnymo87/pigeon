@@ -5,12 +5,16 @@ import {
   deleteTopicBySession,
   finalize,
   getBySession,
+  hasPlaceholderName,
+  isPlaceholderTitle,
   markOpen,
+  renameProvisional,
   reserve,
   stealReservation,
   topicName,
   MACHINE_ICON_COLORS,
   DEFAULT_ICON_COLOR,
+  type TopicRow,
 } from "./topics";
 
 export type ResolveTopicResult =
@@ -50,6 +54,67 @@ export async function resolveTopic(
   db: D1Database,
   opts: ResolveTopicOptions,
 ): Promise<ResolveTopicResult> {
+  // opencode's placeholder title is not a title. Normalising it away here — rather than trusting
+  // the daemon to have done it — is what stops a daemon that has not been updated yet from
+  // minting another timestamp-named topic (pigeon-353p).
+  const title = isPlaceholderTitle(opts.title) ? "" : opts.title.trim();
+
+  /**
+   * One-shot upgrade of a directory-only topic name, fired by the first notification that
+   * carries a real title. Best-effort and strictly cosmetic: every failure leaves the flag set
+   * (so the next titled notification retries) and never disturbs delivery of the notification
+   * that triggered it.
+   */
+  async function upgradeProvisionalName(
+    row: TopicRow,
+    messageThreadId: number,
+  ): Promise<void> {
+    if (row.name_provisional !== 1 || title === "") return;
+
+    // The provisional name IS the abbreviated directory (it is what `topicName(dir, "")`
+    // returned), so it is a sound fallback when this particular notification carries no dir.
+    // Re-abbreviating an already-abbreviated `~/...` is a no-op: topicName's regex only matches
+    // an absolute /home/<user> or /Users/<user> prefix. Two names are NOT directories and must
+    // never be fed back in: "session" (topicName's dir-less sentinel) and a backfilled
+    // `New session - <ISO> · ~/path`, which would otherwise be baked into the upgraded name.
+    const fallbackDir =
+      row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
+    const name = topicName(opts.dir || fallbackDir, title);
+
+    const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
+    try {
+      const res = await tgClient.editForumTopic({
+        chatId: opts.chatId,
+        messageThreadId,
+        name,
+      });
+
+      // `topic_not_modified` means Telegram already shows this name — most likely because a
+      // rival isolate got there first, or because a previous attempt succeeded and only the D1
+      // write was lost. Either way the desired end state holds, so clear the flag.
+      if (res.ok || res.kind === "topic_not_modified") {
+        await renameProvisional(db, { sessionId: opts.sessionId, name, now: opts.now });
+        return;
+      }
+
+      // Everything else — rate_limited, thread_not_found, revoked can_manage_topics, a 5xx —
+      // leaves the flag set so a later titled notification retries. Accepted residual: a
+      // PERMANENT edit failure therefore costs one wasted API call per titled notification for
+      // the life of the session, the same trade already accepted for the reopen retry below.
+      console.warn("[worker] provisional topic rename failed", {
+        sessionId: opts.sessionId,
+        messageThreadId,
+        kind: res.kind,
+      });
+    } catch (err) {
+      console.warn("[worker] provisional topic rename threw", {
+        sessionId: opts.sessionId,
+        messageThreadId,
+        error: String(err),
+      });
+    }
+  }
+
   // 1. Existing topic lookup
   let existing = await getBySession(db, opts.sessionId);
   if (existing && existing.message_thread_id !== null) {
@@ -77,6 +142,7 @@ export async function resolveTopic(
         } else if (reopenRes.kind === "topic_not_modified") {
           // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
           await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+          await upgradeProvisionalName(existing, existing.message_thread_id);
           return { ok: true, messageThreadId: existing.message_thread_id };
         } else {
           // Genuine reopen failure (e.g. Telegram 5xx, transient network error, bot lost can_manage_topics).
@@ -98,18 +164,27 @@ export async function resolveTopic(
           // needing a new attempt-count column. Additionally, because closed_at continues aging from the original
           // close rather than being reset to NULL by markOpen, a permanent reopen failure followed by session idleness
           // (>7d TTL) allows the reaper to delete the topic up to ~30 days earlier than if it had been re-closed on orphan cleanup.
+          //
+          // No provisional-name upgrade on this branch either: the reopen just failed, so
+          // spending another Telegram call on a cosmetic rename is unlikely to fare better.
+          // The name stays provisional and a later notification upgrades it once reopen works.
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
       } else {
         await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+        await upgradeProvisionalName(existing, existing.message_thread_id);
         return { ok: true, messageThreadId: existing.message_thread_id };
       }
     } else {
+      await upgradeProvisionalName(existing, existing.message_thread_id);
       return { ok: true, messageThreadId: existing.message_thread_id };
     }
   }
 
-  const name = topicName(opts.dir, opts.title);
+  const name = topicName(opts.dir, title);
+  // A name built without a real title is only ever the abbreviated directory, so it is eligible
+  // for exactly one automatic upgrade later (pigeon-353p).
+  const provisional = title === "";
   const now = opts.now ?? Date.now();
   const ttlMs = opts.ttlMs ?? RESERVATION_TTL_MS;
   const pollAttempts = opts.pollAttempts ?? 5;
@@ -153,6 +228,7 @@ export async function resolveTopic(
       sessionId: opts.sessionId,
       messageThreadId: threadId,
       name,
+      provisional,
       now: opts.now ?? Date.now(),
     });
 

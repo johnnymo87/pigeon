@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS topics (
   chat_id TEXT NOT NULL,
   message_thread_id INTEGER,
   name TEXT,
+  name_provisional INTEGER NOT NULL DEFAULT 0,
   state TEXT NOT NULL DEFAULT 'open',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -324,6 +325,49 @@ If issues arise with forum topics, revert to DM operation immediately. Reverting
   - Existing Telegram topics in the supergroup remain created in Telegram.
   - Rows in the D1 `topics` table remain (flag-off code never queries or writes to `topics`).
   - The `commands.message_thread_id` column remains in D1 (additive schema, fully ignored when unpopulated).
+
+---
+
+## Schema Addition: `topics.name_provisional` (pigeon-353p)
+
+**This ALTER must be applied BEFORE deploying the worker build that contains it.** It is not
+optional and the ordering is load-bearing: `finalize()` writes the column on every topic creation,
+and topic-table D1 calls are deliberately not wrapped in `withD1`
+(`notifications.ts:245-248`), so a missing column throws to the boundary catch as a 500. The
+daemon retries a 500 forever, so the failure mode is "no new topic can ever be created, with
+retry amplification" — not a degraded corner.
+
+```bash
+# 1. Apply
+npx wrangler d1 execute pigeon-router --remote \
+  --command "ALTER TABLE topics ADD COLUMN name_provisional INTEGER NOT NULL DEFAULT 0;"
+
+# 2. GATE: verify before deploying the worker
+npx wrangler d1 execute pigeon-router --remote --command "PRAGMA table_info(topics);"
+# Expected: a row named name_provisional. Do NOT deploy until you see it.
+
+# 3. Deploy
+npm run --workspace @pigeon/worker deploy
+```
+
+Rollback is safe in the other direction: an older worker build post-ALTER never reads or writes
+the column (`SELECT *` ignores it, inserts list columns explicitly), so it sits inert.
+
+**Optional backfill** for topics already stuck with a placeholder name. Safe to run any time
+after the worker deploy (the worker itself stops minting new placeholder names at that point,
+regardless of daemon versions):
+
+```bash
+npx wrangler d1 execute pigeon-router --remote \
+  --command "UPDATE topics SET name_provisional = 1 WHERE name LIKE 'New session - ____-__-__T%';"
+```
+
+The date-shaped `LIKE` (rather than a bare `New session - %`) is deliberate: a human who used
+`/rename` to a name that happens to start with those words must not be dragged back into
+automatic renaming.
+
+Backfilled rows are renamed lazily, by the next notification that carries a real title. A session
+that is already dead will keep its placeholder name until the reaper deletes the topic.
 
 ---
 

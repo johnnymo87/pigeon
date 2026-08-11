@@ -186,6 +186,67 @@ describe("createApp", () => {
     expect(storage?.sessions.get("ses_t2")?.title).toBe("Fix flaky auth test");
   });
 
+  it("treats opencode's placeholder title as absent (pigeon-353p)", async () => {
+    const app = newApp();
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_placeholder",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "New session - 2026-08-11T10:11:16.127Z",
+      }),
+    }));
+    expect(res.status).toBe(200);
+    expect(storage?.sessions.get("ses_placeholder")?.title ?? null).toBeNull();
+  });
+
+  it("a placeholder title does not clobber a real stored title (pigeon-353p)", async () => {
+    const app = newApp();
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_placeholder_2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "Real title",
+      }),
+    }));
+    await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_placeholder_2",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "New session - 2026-08-11T10:11:16.127Z",
+      }),
+    }));
+    expect(storage?.sessions.get("ses_placeholder_2")?.title).toBe("Real title");
+  });
+
+  it("a title that merely mentions a placeholder-like string is kept (pigeon-353p)", async () => {
+    const app = newApp();
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_placeholder_3",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: "New session handling in the reaper",
+      }),
+    }));
+    expect(res.status).toBe(200);
+    expect(storage?.sessions.get("ses_placeholder_3")?.title).toBe("New session handling in the reaper");
+  });
+
   it("does not clobber a stored title when /session-start omits it", async () => {
     const app = newApp();
     const res1 = await app(new Request("http://localhost/session-start", {
