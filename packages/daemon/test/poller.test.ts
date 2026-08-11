@@ -1028,3 +1028,114 @@ describe("Poller.registerSession() structured results", () => {
     });
   });
 });
+
+describe("Poller — worker health instrumentation", () => {
+  function makeMonitor() {
+    const seen: Array<{ endpoint: string; kind: string; status?: number }> = [];
+    return {
+      seen,
+      record(endpoint: "register" | "send", result: { kind: string; status?: number }) {
+        seen.push({
+          endpoint,
+          kind: result.kind,
+          ...(typeof result.status === "number" ? { status: result.status } : {}),
+        });
+      },
+    };
+  }
+
+  it("reports a registerSession 5xx to the health monitor", async () => {
+    const monitor = makeMonitor();
+    const fetchMock = vi.fn().mockResolvedValue(new Response("boom", { status: 503 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+      healthMonitor: monitor,
+    });
+
+    await poller.registerSession("sess-1");
+
+    expect(monitor.seen).toEqual([{ endpoint: "register", kind: "http_error", status: 503 }]);
+  });
+
+  it("reports a sendNotification 5xx to the health monitor", async () => {
+    const monitor = makeMonitor();
+    const fetchMock = vi.fn().mockResolvedValue(new Response("boom", { status: 500 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+      healthMonitor: monitor,
+    });
+
+    await poller.sendNotification({
+      sessionId: "sess-1",
+      chatId: "chat-1",
+      text: "hi",
+      replyMarkup: {},
+    });
+
+    expect(monitor.seen).toEqual([{ endpoint: "send", kind: "http_error", status: 500 }]);
+  });
+
+  it("reports successes too, since only a success can clear an episode", async () => {
+    const monitor = makeMonitor();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+      healthMonitor: monitor,
+    });
+
+    await poller.registerSession("sess-1");
+    await poller.sendNotification({
+      sessionId: "sess-1",
+      chatId: "chat-1",
+      text: "hi",
+      replyMarkup: {},
+    });
+
+    expect(monitor.seen).toEqual([
+      { endpoint: "register", kind: "success", status: 200 },
+      { endpoint: "send", kind: "success", status: 200 },
+    ]);
+  });
+
+  it("still returns the result to the caller when a monitor is wired", async () => {
+    const monitor = makeMonitor();
+    const fetchMock = vi.fn().mockResolvedValue(new Response("boom", { status: 503 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+      healthMonitor: monitor,
+    });
+
+    const res = await poller.sendNotification({
+      sessionId: "sess-1",
+      chatId: "chat-1",
+      text: "hi",
+      replyMarkup: {},
+    });
+
+    expect(res).toEqual({ ok: false, kind: "http_error", status: 503, body: "boom" });
+  });
+
+  it("does NOT report unregisterSession — it is not one of the two watched routes", async () => {
+    const monitor = makeMonitor();
+    const fetchMock = vi.fn().mockResolvedValue(new Response("boom", { status: 503 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+      healthMonitor: monitor,
+    });
+
+    await poller.unregisterSession("sess-1");
+
+    expect(monitor.seen).toEqual([]);
+  });
+
+  it("works with no monitor wired at all", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("boom", { status: 503 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(poller.registerSession("sess-1")).resolves.toMatchObject({ status: 503 });
+  });
+});
