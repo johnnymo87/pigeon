@@ -49,13 +49,14 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 
 | Item | Bead | What | Blocked? |
 |---|---|---|---|
-| **A** | `pigeon-ywlg` | Gate the swarm feed on notify policy | **Yes** — needs `shouldEmitAncillary` from `pigeon-qdcb.5` |
+| **A** | `pigeon-ywlg` | Gate the **mirror** *and* swarm feeds on notify policy | **NOT OURS** — the `pigeon-qdcb` owner took it 08-11 |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
 | **E** | `pigeon-pre9` | Deferred polish from adversarial review | No |
 
-**E is now the only unstarted unblocked item.** D is written, reviewed and green in PR #94, but it
+**E is now the only unstarted item that is ours.** A was reassigned on 08-11 (its scope was also
+wrong — read the correction box in item A). D is written, reviewed and green in PR #94, but it
 is **not ticked**, because a plugin change is not live until an `opencode serve` restart (§1.2) —
 see item D for what remains. **C is withdrawn** — the database it wanted repaired is healthy (see
 item C for the measurement). A and B are blocked on things outside this session's control, and
@@ -171,7 +172,11 @@ npm run typecheck   # expect exit 0 across all three workspaces
 
 ## §3 — THE ITEMS
 
-### [ ] A. `pigeon-ywlg` (P2) — gate the swarm feed on notify policy
+### [—] A. `pigeon-ywlg` (P2) — gate the mirror and swarm feeds on notify policy
+
+**REASSIGNED 2026-08-11 to the `pigeon-qdcb` owner — see the correction box below before reading
+anything else in this item.** What follows was written when we owned it and when the scope was
+believed to be swarm-only.
 
 **BLOCKED** on `shouldEmitAncillary` landing in `packages/daemon/src/notify-policy.ts`. That
 predicate is owned by the session holding `pigeon-qdcb` (see §4); as of 2026-08-11 the file exports
@@ -187,10 +192,38 @@ not premise: the gate is correct regardless of which caller drives the re-prompt
 post can *create* a topic for a session that was meant to be invisible — the same mechanism that
 produced `pigeon-353p`.
 
-**Scope is deliberately asymmetric: gate `kind='swarm'` only. Do NOT gate `kind='mirror'`.** Mirror
+> ### CORRECTION 2026-08-11 — the asymmetry below was WRONG, and backwards
+>
+> **RETRACTED by the `pigeon-qdcb` owner, who measured it.** The struck-through paragraph said to
+> gate `swarm` and skip `mirror`. In fact **`mirror` is the PRIMARY leak.** Counted on cloudbox, for
+> sessions holding a quiet lgtm origin row (`errors-only`/`none`): **`mirror` 16, `swarm` 4,
+> `stop` 1.** The **first** outbox entry for every new lgtm topic is `kind='mirror'` — so the mirror
+> is what *creates* the topic for a session whose Stops we correctly silence. That is the visible
+> symptom the user reported as "Telegram full of lgtm topics".
+>
+> **Why the reasoning failed, which generalises well beyond lgtm.** `/mirror` does not detect "a
+> human typed into a TUI". It mirrors any user-role message **not found in `injected_prompts`**.
+> lgtm starts sessions with `opencode-launch <dir> <prompt>` — the CLI, not daemon injection — so
+> its launch prompt is a user message the daemon never recorded and therefore never suppressed.
+> **Headlessness is irrelevant; the provenance of the prompt is what matters.** Any automation that
+> launches sessions outside the daemon's inject path leaks identically.
+>
+> This also corrects a claim in `AGENTS.md`, which describes the mirror as showing prompts "typed
+> directly into the opencode TUI". That is the intent, not the implemented predicate.
+>
+> **Ownership changed with it: the `pigeon-qdcb` owner has taken this fix** (their call, their
+> policy surface). Do not start a parallel patch. Their plan: gate **both** `/mirror` and the swarm
+> feed on `effectiveNotifyPolicy` at insert time, `errors-only`/`none` suppress, fail open on
+> lookup error, retraction follows the original's fate. The predicate contract below is unchanged —
+> **only the scope and the priority order changed.**
+>
+> Kept rather than deleted, per the same rule as item C: a wrong claim that silently vanishes gets
+> re-derived by the next reader from the same bad reasoning.
+
+~~**Scope is deliberately asymmetric: gate `kind='swarm'` only. Do NOT gate `kind='mirror'`.** Mirror
 fires when a human types into a TUI; lgtm sessions are headless, so gating mirror is near-dead code
 for exactly the population `qdcb` exists to silence. Revisit only if a human session is ever
-declared quiet.
+declared quiet.~~
 
 **Files:** `packages/daemon/src/swarm/telegram-notice.ts` — `enqueueSwarmTelegramNotice` (`:10`) and
 `enqueueSwarmCancelNotice` (`:67`), reached from the `/swarm/send` and `/swarm/schedule` handlers in
