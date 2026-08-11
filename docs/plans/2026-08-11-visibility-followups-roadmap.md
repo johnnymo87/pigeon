@@ -52,13 +52,21 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 | **A** | `pigeon-ywlg` → `pigeon-8zqt` | ~~Gate the swarm feed~~ → gate swarm **and mirror** on notify policy | **DONE** 2026-08-11, PR #97. Prod verification still outstanding (wake armed). Mirror was the primary leak — see CORRECTION #A1. |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
-| **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | No |
+| **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
 | **E** | `pigeon-pre9` | Deferred polish from adversarial review | No |
 
-**Start with D, then E.** They are the only live unblocked items. **C is withdrawn** — the database
-it wanted repaired is healthy (see item C for the measurement). A and B are blocked on things
-outside this session's control, and **B must be sequenced last** regardless, because A/D/E each
-re-widen the fleet skew B exists to close. Do not burn a cycle rediscovering any of this.
+**D and E are the live items; A is done and B is blocked.** A shipped on 08-11 as `pigeon-8zqt`
+(PR #97) after being reassigned to the `qdcb` owner, who also corrected its scope — read
+CORRECTION #A1 in item A before treating anything written about A here as current. D is written,
+reviewed and green in PR #94, but it is **not ticked**, because a plugin change is not live until
+an `opencode serve` restart (§1.2) — see item D for what remains. **C is withdrawn** — the
+database it wanted repaired is healthy (see item C for the measurement). B is blocked on a session
+existing on each host, and **must be sequenced last** regardless, because A/D/E each re-widen the
+fleet skew B exists to close. Do not burn a cycle rediscovering any of this.
+
+**Two new beads came out of D**, both filed rather than fixed inline, and neither blocks anything:
+`pigeon-nwrt` (P4 — restore the mirror for a main session whose `session.get` failed) and
+`pigeon-umyr` (P3 — a demoted subagent leaves a stale daemon registration and an orphan topic).
 
 ---
 
@@ -230,10 +238,38 @@ not premise: the gate is correct regardless of which caller drives the re-prompt
 post can *create* a topic for a session that was meant to be invisible — the same mechanism that
 produced `pigeon-353p`.
 
-**Scope is deliberately asymmetric: gate `kind='swarm'` only. Do NOT gate `kind='mirror'`.** Mirror
+> ### CORRECTION 2026-08-11 — the asymmetry below was WRONG, and backwards
+>
+> **RETRACTED by the `pigeon-qdcb` owner, who measured it.** The struck-through paragraph said to
+> gate `swarm` and skip `mirror`. In fact **`mirror` is the PRIMARY leak.** Counted on cloudbox, for
+> sessions holding a quiet lgtm origin row (`errors-only`/`none`): **`mirror` 16, `swarm` 4,
+> `stop` 1.** The **first** outbox entry for every new lgtm topic is `kind='mirror'` — so the mirror
+> is what *creates* the topic for a session whose Stops we correctly silence. That is the visible
+> symptom the user reported as "Telegram full of lgtm topics".
+>
+> **Why the reasoning failed, which generalises well beyond lgtm.** `/mirror` does not detect "a
+> human typed into a TUI". It mirrors any user-role message **not found in `injected_prompts`**.
+> lgtm starts sessions with `opencode-launch <dir> <prompt>` — the CLI, not daemon injection — so
+> its launch prompt is a user message the daemon never recorded and therefore never suppressed.
+> **Headlessness is irrelevant; the provenance of the prompt is what matters.** Any automation that
+> launches sessions outside the daemon's inject path leaks identically.
+>
+> This also corrects a claim in `AGENTS.md`, which describes the mirror as showing prompts "typed
+> directly into the opencode TUI". That is the intent, not the implemented predicate.
+>
+> **Ownership changed with it: the `pigeon-qdcb` owner has taken this fix** (their call, their
+> policy surface). Do not start a parallel patch. Their plan: gate **both** `/mirror` and the swarm
+> feed on `effectiveNotifyPolicy` at insert time, `errors-only`/`none` suppress, fail open on
+> lookup error, retraction follows the original's fate. The predicate contract below is unchanged —
+> **only the scope and the priority order changed.**
+>
+> Kept rather than deleted, per the same rule as item C: a wrong claim that silently vanishes gets
+> re-derived by the next reader from the same bad reasoning.
+
+~~**Scope is deliberately asymmetric: gate `kind='swarm'` only. Do NOT gate `kind='mirror'`.** Mirror
 fires when a human types into a TUI; lgtm sessions are headless, so gating mirror is near-dead code
 for exactly the population `qdcb` exists to silence. Revisit only if a human session is ever
-declared quiet.
+declared quiet.~~
 
 **Files:** `packages/daemon/src/swarm/telegram-notice.ts` — `enqueueSwarmTelegramNotice` (`:10`) and
 `enqueueSwarmCancelNotice` (`:67`), reached from the `/swarm/send` and `/swarm/schedule` handlers in
@@ -343,16 +379,52 @@ subagent then counts as a main session. Pre-existing — it already affects stop
 Phase 2 made it louder, because a misclassified subagent would **mirror its prompts to Telegram**,
 and subagent prompts are large (a full task brief).
 
-**Candidate fix:** fail closed — do not add to `mainSessionIds` on the error fallback. **Check the
-stop-notification implications before changing it**, since that path reads the same set and a
-fail-closed change there means a real session stops notifying. That trade runs against §1.6, so it
-needs an explicit argument rather than a default — a good candidate for the §2 step-2 consult.
+**DONE in PR #94** (`1a3d552` + `9921886`), reviewed and green. **Not ticked**: a plugin change is
+inert until an `opencode serve` restart (§1.2), so this is not live even on cloudbox. Tick it once
+merged AND a serve has restarted AND a subagent-heavy session has been observed not mirroring.
+
+**Reproduced first (§2 step 0), and it was real** — unlike item C. Driven through the real plugin
+entrypoint with `session.get` rejecting: the subagent mirrored a task brief and emitted a stop
+notification; the control (`session.get` succeeds, returns `parentID`) stayed silent.
+
+**The candidate fix above — "fail closed" — was wrong, and the item text was wrong to suggest it.**
+Failing closed silences a genuine main session that merely lost a `session.get` race. The real
+defect is that **one boolean serves two populations with opposite correct fail directions**:
+notifications must fail open (silence is unrecoverable), the mirror must fail closed (it posts a
+task brief). So parentage became three states — `main | subagent | unknown` — and each consumer
+picks: notifications keep the loose `isMainSession` (unchanged behaviour), the mirror takes a
+strict `isConfirmedMain`.
+
+**Two things worth not re-deriving:**
+
+- `session.updated` **already carries the authoritative `parentID`**, and the handler was throwing
+  it away in an early return. That is the repair, and it needs no retry machinery. Found by the
+  step-2 `oracle-fable` consult.
+- But resolution must be **monotonic and evidence-asymmetric**: only a *present* `parentID` acts
+  (by demoting), and only on a still-`unknown` session. An update **can omit** `parentID` for a
+  session that genuinely has a parent — pinned by `session-title.test.ts` since `2fd9a56` — so
+  promoting on absence reintroduces the leak. A symmetric first cut broke that test; the test was
+  load-bearing (§1.4) and the design changed, not the test.
+
+**Accepted cost:** a genuine main session whose `session.get` failed never mirrors again. It still
+receives every notification. Follow-up `pigeon-nwrt`.
+
+**What the review caught, and the transferable lesson.** All six original tests asserted the mirror
+*withholding*; none asserted it ever *posting*. Wiring the mirror predicate to a constant `false`
+killed mirroring globally and the **entire 2160-test suite still passed** — and it would have been
+invisible in production too, because a missing post is by design a silent gap. A positive control
+was added and **verified by mutation**. Generalise this: for any change whose failure mode is
+*silence*, negative tests alone are not coverage, because both the bug and the guard look identical
+from the outside.
 
 ---
 
 ### [ ] E. `pigeon-pre9` (P4) — deferred polish from the adversarial review
 
 Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Do them together in one PR or not at all.
+
+**Item 4 pairs naturally with D** — both are `message-tail.ts`/plugin changes needing the same serve
+restart, so landing them close together spends one restart instead of two.
 
 > **Line references corrected 2026-08-11.** The four below were transcribed from bead `pigeon-pre9`
 > and were **wrong against the tree this file sits on** — `app.ts:100-124` is `parseSwarmSendBody`,

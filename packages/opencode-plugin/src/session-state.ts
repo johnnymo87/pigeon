@@ -32,9 +32,33 @@ export function normalizeTitle(title: string | undefined): string | undefined {
 const State = { Created: 0, Registering: 1, Registered: 2, Notified: 3 } as const
 type State = (typeof State)[keyof typeof State]
 
+/**
+ * What we actually know about a session's parentage, as opposed to what we assume.
+ *
+ * `unknown` exists because `session.get` can fail during late discovery (serve under
+ * load, HTTP timeout). The old code collapsed that case into "no parentID", which is
+ * indistinguishable from a confirmed main session -- so a SUBAGENT became a main
+ * session (`pigeon-kq6h`).
+ *
+ * The reason this needs three states rather than a better default is that the two
+ * populations reading it want OPPOSITE fail directions:
+ *
+ *   - Notifications (stop/error/question/retry) must fail OPEN. Failing closed means a
+ *     genuine main session goes permanently silent, which is the unrecoverable
+ *     direction (§1.6 of the visibility roadmap; and see the `ensureRegistered`
+ *     docblock in index.ts for the incident that established it).
+ *   - The Telegram prompt mirror must fail CLOSED. A misclassified subagent would post
+ *     its full task brief into a topic, and Phase 2 already chose silence over noise
+ *     for its own leak direction.
+ *
+ * One boolean cannot serve both, which is why the boolean was the defect.
+ */
+export type Parentage = "main" | "subagent" | "unknown"
+
 type SessionEntry = {
   state: State
   parentID: string | undefined
+  parentage: Parentage
   lastNotifiedMessageId: string | undefined
   registrationPromise: Promise<void> | undefined
   lastSeenAt: number
@@ -59,12 +83,24 @@ export class SessionManager {
     this.discoveryPromises.delete(sessionID)
   }
 
-  onSessionCreated(sessionID: string, parentID?: string, title?: string): void {
+  /**
+   * @param parentage Defaults to a confident reading of `parentID`. Pass `"unknown"`
+   * when parentage could not be established (the `session.get` failure path), which
+   * still treats the session as main for notification purposes but withholds the
+   * confirmation the mirror requires.
+   */
+  onSessionCreated(
+    sessionID: string,
+    parentID?: string,
+    title?: string,
+    parentage: Parentage = parentID ? "subagent" : "main"
+  ): void {
     this.cleanupSession(sessionID)
 
     this.sessions.set(sessionID, {
       state: State.Created,
       parentID,
+      parentage,
       lastNotifiedMessageId: undefined,
       registrationPromise: undefined,
       lastSeenAt: Date.now(),
@@ -75,6 +111,61 @@ export class SessionManager {
       this.mainSessionIds.add(sessionID)
     }
   }
+
+  /**
+   * Late resolution of parentage from a `session.updated` payload.
+   *
+   * Deliberately **monotonic and evidence-asymmetric**, and both halves are
+   * load-bearing:
+   *
+   * 1. **Only ever acts on an `unknown` session.** Stored knowledge -- from
+   *    `session.created` or a successful `session.get` -- always beats an event
+   *    payload. `2fd9a56` ("harden session.updated title read, pin isMainSession
+   *    guard") established exactly this, and `session-title.test.ts` pins it: a known
+   *    child must stay a child even when an update omits its `parentID`.
+   * 2. **A present `parentID` demotes; an absent one proves nothing.** Absence is not
+   *    evidence of being a main session, precisely because that same test shows
+   *    updates can omit the field. Promoting on absence would let a subagent mirror
+   *    its task brief -- the bug this change exists to prevent -- so an unconfirmed
+   *    session stays unconfirmed.
+   *
+   * The cost of (2) is that a genuine main session which lost the `session.get` race
+   * never mirrors again. That is the already-accepted direction ("an undiscovered
+   * session drops its mirror", AGENTS.md): it still receives every notification,
+   * because `mainSessionIds` is untouched here. Restoring its mirror would need a
+   * fresh authoritative read rather than an inference -- see `pigeon-nwrt`.
+   */
+  resolveParentage(sessionID: string, parentID: string | undefined): boolean {
+    const entry = this.sessions.get(sessionID)
+    if (!entry) return false
+    if (entry.parentage !== "unknown") return false
+    if (!parentID) return false
+
+    const wasRegistered = this.isRegistered(sessionID)
+
+    entry.parentID = parentID
+    entry.parentage = "subagent"
+    entry.lastSeenAt = Date.now()
+    this.mainSessionIds.delete(sessionID)
+
+    // Reported so the caller can log it. A demotion after registration is the moment we
+    // learn a registration we already made was wrong: the daemon holds a row for a
+    // subagent, and if it had already notified, a Telegram topic exists that nothing
+    // reclaims. See `pigeon-umyr`.
+    return wasRegistered
+  }
+
+  /**
+   * Strict predicate: parentage was actually established, not assumed.
+   *
+   * Use for anything whose failure mode is posting something that should not have been
+   * posted. Use `isMainSession` for anything whose failure mode is silence.
+   */
+  isConfirmedMain(sessionID: string): boolean {
+    return this.sessions.get(sessionID)?.parentage === "main"
+  }
+
+
 
   setTitle(sessionID: string, title: string | undefined): void {
     const entry = this.sessions.get(sessionID)
