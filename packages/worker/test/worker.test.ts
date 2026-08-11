@@ -31,6 +31,8 @@ import {
   reserve,
   finalize,
   rename,
+  renameProvisional,
+  isPlaceholderTitle,
   markClosed,
   markOpen,
   deleteBySession,
@@ -78,6 +80,7 @@ import {
   closeForumTopic,
   reopenForumTopic,
   deleteForumTopic,
+  unpinAllForumTopicMessages,
 } from "../src/telegram";
 import { withD1, StorageError } from "../src/d1";
 
@@ -136,6 +139,7 @@ const d1SchemaStatements = [
     chat_id           TEXT NOT NULL,
     message_thread_id INTEGER,
     name              TEXT,
+    name_provisional  INTEGER NOT NULL DEFAULT 0,
     state             TEXT NOT NULL DEFAULT 'open',
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
@@ -1261,6 +1265,7 @@ describe("telegram client module classifier", () => {
       expect(typeof client.closeForumTopic).toBe("function");
       expect(typeof client.reopenForumTopic).toBe("function");
       expect(typeof client.deleteForumTopic).toBe("function");
+      expect(typeof client.unpinAllForumTopicMessages).toBe("function");
 
       const res = await client.createForumTopic({ chatId: "-10012345", name: "Bound Topic" });
       expect(res).toEqual({
@@ -1529,6 +1534,59 @@ describe("telegram client module classifier", () => {
           ok: false,
           error_code: 400,
           description: "Bad Request: TOPIC_NOT_FOUND",
+        },
+      });
+    });
+
+    it("unpinAllForumTopicMessages posts chat_id + message_thread_id and returns success shape", async () => {
+      let payload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(200, (opts: any) => {
+          const raw =
+            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          payload = JSON.parse(raw);
+          return { ok: true, result: true };
+        });
+
+      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+      expect(payload).toEqual({ chat_id: "-10012345", message_thread_id: 42 });
+    });
+
+    it("unpinAllForumTopicMessages error classification path", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: not enough rights to unpin a message",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "error",
+        errorCode: 400,
+        description: "Bad Request: not enough rights to unpin a message",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: not enough rights to unpin a message",
         },
       });
     });
@@ -3275,6 +3333,7 @@ describe("d1-ops", () => {
       chat_id           TEXT NOT NULL,
       message_thread_id INTEGER,
       name              TEXT,
+      name_provisional  INTEGER NOT NULL DEFAULT 0,
       state             TEXT NOT NULL DEFAULT 'open',
       created_at        INTEGER NOT NULL,
       updated_at        INTEGER NOT NULL,
@@ -6821,8 +6880,12 @@ describe("topics module and topicName", () => {
       ]);
 
       expect(createCalls).toBe(1);
-      expect(res1).toEqual({ ok: true, messageThreadId: 101 });
-      expect(res2).toEqual({ ok: true, messageThreadId: 101 });
+      expect(res1).toMatchObject({ ok: true, messageThreadId: 101 });
+      expect(res2).toMatchObject({ ok: true, messageThreadId: 101 });
+      // Exactly one caller created the topic, so exactly one carries `created` (pigeon-ud6s):
+      // whichever won the reserve. The other must not, or the auto-pin would be unpinned twice.
+      const createdFlags = [res1, res2].map((r) => (r as any).created === true);
+      expect(createdFlags.filter(Boolean)).toHaveLength(1);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(101);
@@ -6934,7 +6997,7 @@ describe("topics module and topicName", () => {
         botToken,
       });
 
-      expect(res2).toEqual({ ok: true, messageThreadId: 303 });
+      expect(res2).toEqual({ ok: true, messageThreadId: 303, created: true });
       expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
     });
 
@@ -7002,7 +7065,7 @@ describe("topics module and topicName", () => {
       });
 
       expect(createCalled).toBe(true);
-      expect(res).toEqual({ ok: true, messageThreadId: 404 });
+      expect(res).toEqual({ ok: true, messageThreadId: 404, created: true });
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(404);
@@ -7209,11 +7272,395 @@ describe("topics module and topicName", () => {
           now: now + 1000,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: 701 });
+        expect(res).toEqual({ ok: true, messageThreadId: 701, created: true });
 
         const row = await getBySession(env.DB, sessionId);
         expect(row?.message_thread_id).toBe(701);
         expect(row?.state).toBe("open");
+      });
+    });
+
+    describe("pigeon-353p: provisional names and the one-shot upgrade rename", () => {
+      const botToken = "fake-bot-token";
+
+      /**
+       * These tests inject a fake TelegramClient rather than using `fetchMock`.
+       * That is deliberate: `upgradeProvisionalName` swallows every error, so an unexpected call
+       * against an unregistered undici interceptor throws MockNotMatchedError, is caught, and the
+       * "no Telegram call was made" assertions pass whether or not the call happened. A counting
+       * fake makes those assertions capable of failing, and it also avoids leaking unconsumed
+       * interceptors into later tests in this file.
+       */
+      function fakeTg(handlers: {
+        createForumTopic?: (o: any) => any;
+        reopenForumTopic?: (o: any) => any;
+        editForumTopic?: (o: any) => any;
+        deleteForumTopic?: (o: any) => any;
+      }) {
+        const calls = { create: 0, reopen: 0, edit: 0, delete: 0 };
+        const editedNames: string[] = [];
+        const client = {
+          createForumTopic: async (o: any) => {
+            calls.create++;
+            return handlers.createForumTopic?.(o) ?? { ok: true, result: { message_thread_id: 1 } };
+          },
+          reopenForumTopic: async (o: any) => {
+            calls.reopen++;
+            return handlers.reopenForumTopic?.(o) ?? { ok: true, result: true };
+          },
+          editForumTopic: async (o: any) => {
+            calls.edit++;
+            editedNames.push(o.name);
+            return handlers.editForumTopic?.(o) ?? { ok: true, result: true };
+          },
+          deleteForumTopic: async (o: any) => {
+            calls.delete++;
+            return handlers.deleteForumTopic?.(o) ?? { ok: true, result: true };
+          },
+        };
+        return { client: client as any, calls, editedNames };
+      }
+
+      async function seedProvisionalTopic(
+        sessionId: string,
+        messageThreadId: number,
+        name: string,
+        now = Date.now(),
+      ): Promise<void> {
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name, now });
+        await finalize(env.DB, { sessionId, messageThreadId, name, provisional: true, now });
+      }
+
+      it("isPlaceholderTitle matches opencode's default title and nothing a human would type", () => {
+        expect(isPlaceholderTitle("New session - 2026-08-11T10:11:16.127Z")).toBe(true);
+        expect(isPlaceholderTitle("  New session - 2026-08-11T10:11:16.127Z  ")).toBe(true);
+        expect(isPlaceholderTitle("New session - 2026-08-11T10:11:16Z")).toBe(true);
+        expect(isPlaceholderTitle("")).toBe(false);
+        expect(isPlaceholderTitle("New session handling in the reaper")).toBe(false);
+        expect(isPlaceholderTitle("Fix New session - 2026-08-11T10:11:16.127Z parsing")).toBe(false);
+      });
+
+      it("a placeholder title never reaches the topic name; the topic is marked provisional", async () => {
+        const sessionId = "ses_prov_create";
+        const tg = fakeTg({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 900 } }) });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/protos/.worktrees/pr-698",
+          title: "New session - 2026-08-11T10:11:16.127Z",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(res).toMatchObject({ ok: true, messageThreadId: 900 });
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.name).toBe("~/projects/protos/.worktrees/pr-698");
+        expect(row?.name_provisional).toBe(1);
+      });
+
+      it("a real title at creation is not provisional", async () => {
+        const sessionId = "ses_prov_real";
+        const tg = fakeTg({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 901 } }) });
+
+        await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.name).toBe("Real title · ~/projects/pigeon");
+        expect(row?.name_provisional).toBe(0);
+      });
+
+      it("a later notification carrying a real title renames the topic once and clears the flag", async () => {
+        const sessionId = "ses_prov_upgrade";
+        await seedProvisionalTopic(sessionId, 902, "~/projects/protos/.worktrees/pr-698");
+        const tg = fakeTg({});
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/protos/.worktrees/pr-698",
+          title: "PR review using .lgtm-review-prompt.md",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 902 });
+        expect(tg.calls.edit).toBe(1);
+        expect(tg.editedNames[0]).toBe(
+          "PR review using .lgtm-review-prompt.md · ~/projects/protos/.worktrees/pr-698",
+        );
+
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.name).toBe("PR review using .lgtm-review-prompt.md · ~/projects/protos/.worktrees/pr-698");
+        expect(row?.name_provisional).toBe(0);
+
+        // Second notification for the same session must not touch Telegram again — the whole
+        // point of the flag is that the upgrade is one-shot, not per-notification.
+        const res2 = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/protos/.worktrees/pr-698",
+          title: "A drifted TUI title",
+          botToken,
+          tgClient: tg.client,
+        });
+        expect(res2).toEqual({ ok: true, messageThreadId: 902 });
+        expect(tg.calls.edit).toBe(1);
+        expect((await getBySession(env.DB, sessionId))?.name).toBe(
+          "PR review using .lgtm-review-prompt.md · ~/projects/protos/.worktrees/pr-698",
+        );
+      });
+
+      it("a provisional topic with no title yet burns no Telegram call", async () => {
+        const sessionId = "ses_prov_notitle";
+        await seedProvisionalTopic(sessionId, 903, "~/projects/pigeon");
+        const tg = fakeTg({});
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "New session - 2026-08-11T10:11:16.127Z",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 903 });
+        expect(tg.calls.edit).toBe(0);
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(1);
+      });
+
+      it("a failed edit leaves the flag set and never fails the notification", async () => {
+        const sessionId = "ses_prov_editfail";
+        await seedProvisionalTopic(sessionId, 904, "~/projects/pigeon");
+        const tg = fakeTg({
+          editForumTopic: () => ({ ok: false, kind: "rate_limited", retryAfter: 30 }),
+        });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        // Delivery is unaffected: a cosmetic rename must never turn into a 429 for the caller.
+        expect(res).toEqual({ ok: true, messageThreadId: 904 });
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.name).toBe("~/projects/pigeon");
+        expect(row?.name_provisional).toBe(1);
+      });
+
+      it("an editForumTopic that throws is swallowed and leaves the flag set", async () => {
+        const sessionId = "ses_prov_editthrow";
+        await seedProvisionalTopic(sessionId, 912, "~/projects/pigeon");
+        const tg = fakeTg({
+          editForumTopic: () => {
+            throw new Error("network down");
+          },
+        });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 912 });
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(1);
+      });
+
+      it("topic_not_modified counts as success and clears the flag", async () => {
+        const sessionId = "ses_prov_notmodified";
+        await seedProvisionalTopic(sessionId, 905, "~/projects/pigeon");
+        const tg = fakeTg({
+          editForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
+        });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 905 });
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(0);
+      });
+
+      it("falls back to the provisional name as the dir when the notification carries none", async () => {
+        const sessionId = "ses_prov_nodir";
+        await seedProvisionalTopic(sessionId, 906, "~/projects/pigeon");
+        const tg = fakeTg({});
+
+        await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
+      });
+
+      it("never reuses a backfilled placeholder NAME as the directory", async () => {
+        // The one-off runbook backfill marks pre-existing rows provisional, and their names are
+        // `New session - <ISO> · ~/path`, not a bare directory. Feeding one back in as the dir
+        // would permanently bake the timestamp into the upgraded name.
+        const sessionId = "ses_prov_backfilled";
+        await seedProvisionalTopic(
+          sessionId,
+          908,
+          "New session - 2026-08-11T10:11:16.127Z · ~/projects/pigeon",
+        );
+        const tg = fakeTg({});
+
+        await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(tg.editedNames).toEqual(["Real title"]);
+        expect((await getBySession(env.DB, sessionId))?.name).toBe("Real title");
+      });
+
+      it("a backfilled row still gets its path back when the notification carries a dir", async () => {
+        const sessionId = "ses_prov_backfilled_dir";
+        await seedProvisionalTopic(
+          sessionId,
+          913,
+          "New session - 2026-08-11T10:11:16.127Z · ~/projects/pigeon",
+        );
+        const tg = fakeTg({});
+
+        await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          tgClient: tg.client,
+        });
+
+        expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
+      });
+
+      it("upgrades on the reopen-succeeded branch of a closed topic", async () => {
+        const sessionId = "ses_prov_reopened";
+        const now = Date.now();
+        await seedProvisionalTopic(sessionId, 909, "~/projects/pigeon", now);
+        await markClosed(env.DB, { sessionId, now });
+        const tg = fakeTg({});
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          now: now + 1000,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 909 });
+        expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(0);
+      });
+
+      it("upgrades on the reopen topic_not_modified branch", async () => {
+        const sessionId = "ses_prov_reopen_notmod";
+        const now = Date.now();
+        await seedProvisionalTopic(sessionId, 910, "~/projects/pigeon", now);
+        await markClosed(env.DB, { sessionId, now });
+        const tg = fakeTg({
+          reopenForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
+        });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          now: now + 1000,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 910 });
+        expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(0);
+      });
+
+      it("does NOT spend a rename call on the branch where reopen genuinely failed", async () => {
+        const sessionId = "ses_prov_reopen_failed";
+        const now = Date.now();
+        await seedProvisionalTopic(sessionId, 911, "~/projects/pigeon", now);
+        await markClosed(env.DB, { sessionId, now });
+        const tg = fakeTg({
+          reopenForumTopic: () => ({ ok: false, kind: "error", status: 500 }),
+        });
+
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "/home/dev/projects/pigeon",
+          title: "Real title",
+          botToken,
+          now: now + 1000,
+          tgClient: tg.client,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: 911 });
+        expect(tg.calls.edit).toBe(0);
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(1);
+      });
+
+      it("renameProvisional is a CAS: it cannot overwrite a name a /rename already claimed", async () => {
+        const sessionId = "ses_prov_cas";
+        await seedProvisionalTopic(sessionId, 907, "~/projects/pigeon");
+
+        // A manual /rename lands first: it clears the provisional flag unconditionally.
+        expect(await rename(env.DB, { sessionId, name: "Human chosen" })).toBe(true);
+        expect((await getBySession(env.DB, sessionId))?.name_provisional).toBe(0);
+
+        // The in-flight auto-rename then loses the CAS and writes nothing.
+        expect(await renameProvisional(env.DB, { sessionId, name: "Robot chosen · ~/projects/pigeon" })).toBe(false);
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.name).toBe("Human chosen");
       });
     });
   });
@@ -7741,6 +8188,142 @@ describe("topics module and topicName", () => {
       const json = await res.json();
       expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
       expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
+    });
+  });
+
+  describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    function mockCreateTopic(threadId: number) {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => ({
+          ok: true,
+          result: { message_thread_id: threadId, name: "unpin · pigeon" },
+        }))
+        .persist();
+    }
+
+    let unpinMsgCounter = 960000;
+
+    function mockSendMessage() {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, () => ({ ok: true, result: { message_id: ++unpinMsgCounter } }))
+        .persist();
+    }
+
+    function captureUnpin(status = 200, body: unknown = { ok: true, result: true }) {
+      const payloads: any[] = [];
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(status, (opts: any) => {
+          const raw =
+            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          payloads.push(JSON.parse(raw));
+          return body;
+        })
+        .persist();
+      return payloads;
+    }
+
+    function notify(sessionId: string, text: string) {
+      return handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: topicChatId,
+            text,
+            title: "unpin",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+    }
+
+    it("newly created topic -> unpinAllForumTopicMessages called once with the new thread id", async () => {
+      const sessionId = "ses_ud6s_new_topic";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(931);
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      const res = await notify(sessionId, "first message in a brand new topic");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1);
+      expect(unpins[0].message_thread_id).toBe(931);
+      expect(String(unpins[0].chat_id)).toBe(topicChatId);
+    });
+
+    it("existing topic -> no unpin call on subsequent notifications", async () => {
+      const sessionId = "ses_ud6s_existing_topic";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(932);
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      await notify(sessionId, "first");
+      expect(unpins).toHaveLength(1);
+
+      const res = await notify(sessionId, "second");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1); // still 1: no unpin on reuse
+    });
+
+    it("unpin failure does not fail the notification", async () => {
+      const sessionId = "ses_ud6s_unpin_fails";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(933);
+      mockSendMessage();
+      const unpins = captureUnpin(500, { ok: false, error_code: 500, description: "oops" });
+
+      const res = await notify(sessionId, "unpin will fail");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1);
+    });
+
+    it("fallback to General (no thread) -> no unpin call", async () => {
+      const sessionId = "ses_ud6s_general_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => ({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: FORUM_CLOSED",
+        }))
+        .persist();
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      const res = await notify(sessionId, "goes to General");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(0);
     });
   });
 
@@ -8722,7 +9305,7 @@ describe("topics module and topicName", () => {
         now: now + 1000,
       });
 
-      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId });
+      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId, created: true });
       const rowTnf = await getBySession(env.DB, sessionIdTnf);
       expect(rowTnf?.message_thread_id).toBe(newThreadId);
       expect(rowTnf?.state).toBe("open");
