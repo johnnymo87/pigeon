@@ -80,6 +80,7 @@ import {
   closeForumTopic,
   reopenForumTopic,
   deleteForumTopic,
+  unpinAllForumTopicMessages,
 } from "../src/telegram";
 import { withD1, StorageError } from "../src/d1";
 
@@ -1264,6 +1265,7 @@ describe("telegram client module classifier", () => {
       expect(typeof client.closeForumTopic).toBe("function");
       expect(typeof client.reopenForumTopic).toBe("function");
       expect(typeof client.deleteForumTopic).toBe("function");
+      expect(typeof client.unpinAllForumTopicMessages).toBe("function");
 
       const res = await client.createForumTopic({ chatId: "-10012345", name: "Bound Topic" });
       expect(res).toEqual({
@@ -1532,6 +1534,59 @@ describe("telegram client module classifier", () => {
           ok: false,
           error_code: 400,
           description: "Bad Request: TOPIC_NOT_FOUND",
+        },
+      });
+    });
+
+    it("unpinAllForumTopicMessages posts chat_id + message_thread_id and returns success shape", async () => {
+      let payload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(200, (opts: any) => {
+          const raw =
+            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          payload = JSON.parse(raw);
+          return { ok: true, result: true };
+        });
+
+      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({ ok: true, result: true });
+      expect(payload).toEqual({ chat_id: "-10012345", message_thread_id: 42 });
+    });
+
+    it("unpinAllForumTopicMessages error classification path", async () => {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(
+          400,
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: not enough rights to unpin a message",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+
+      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
+        chatId: "-10012345",
+        messageThreadId: 42,
+      });
+
+      expect(res).toEqual({
+        ok: false,
+        kind: "error",
+        errorCode: 400,
+        description: "Bad Request: not enough rights to unpin a message",
+        response: {
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: not enough rights to unpin a message",
         },
       });
     });
@@ -6825,8 +6880,12 @@ describe("topics module and topicName", () => {
       ]);
 
       expect(createCalls).toBe(1);
-      expect(res1).toEqual({ ok: true, messageThreadId: 101 });
-      expect(res2).toEqual({ ok: true, messageThreadId: 101 });
+      expect(res1).toMatchObject({ ok: true, messageThreadId: 101 });
+      expect(res2).toMatchObject({ ok: true, messageThreadId: 101 });
+      // Exactly one caller created the topic, so exactly one carries `created` (pigeon-ud6s):
+      // whichever won the reserve. The other must not, or the auto-pin would be unpinned twice.
+      const createdFlags = [res1, res2].map((r) => (r as any).created === true);
+      expect(createdFlags.filter(Boolean)).toHaveLength(1);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(101);
@@ -6938,7 +6997,7 @@ describe("topics module and topicName", () => {
         botToken,
       });
 
-      expect(res2).toEqual({ ok: true, messageThreadId: 303 });
+      expect(res2).toEqual({ ok: true, messageThreadId: 303, created: true });
       expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
     });
 
@@ -7006,7 +7065,7 @@ describe("topics module and topicName", () => {
       });
 
       expect(createCalled).toBe(true);
-      expect(res).toEqual({ ok: true, messageThreadId: 404 });
+      expect(res).toEqual({ ok: true, messageThreadId: 404, created: true });
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(404);
@@ -7213,7 +7272,7 @@ describe("topics module and topicName", () => {
           now: now + 1000,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: 701 });
+        expect(res).toEqual({ ok: true, messageThreadId: 701, created: true });
 
         const row = await getBySession(env.DB, sessionId);
         expect(row?.message_thread_id).toBe(701);
@@ -8129,6 +8188,142 @@ describe("topics module and topicName", () => {
       const json = await res.json();
       expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
       expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
+    });
+  });
+
+  describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    function mockCreateTopic(threadId: number) {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => ({
+          ok: true,
+          result: { message_thread_id: threadId, name: "unpin · pigeon" },
+        }))
+        .persist();
+    }
+
+    let unpinMsgCounter = 960000;
+
+    function mockSendMessage() {
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, () => ({ ok: true, result: { message_id: ++unpinMsgCounter } }))
+        .persist();
+    }
+
+    function captureUnpin(status = 200, body: unknown = { ok: true, result: true }) {
+      const payloads: any[] = [];
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(status, (opts: any) => {
+          const raw =
+            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          payloads.push(JSON.parse(raw));
+          return body;
+        })
+        .persist();
+      return payloads;
+    }
+
+    function notify(sessionId: string, text: string) {
+      return handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: topicChatId,
+            text,
+            title: "unpin",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+    }
+
+    it("newly created topic -> unpinAllForumTopicMessages called once with the new thread id", async () => {
+      const sessionId = "ses_ud6s_new_topic";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(931);
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      const res = await notify(sessionId, "first message in a brand new topic");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1);
+      expect(unpins[0].message_thread_id).toBe(931);
+      expect(String(unpins[0].chat_id)).toBe(topicChatId);
+    });
+
+    it("existing topic -> no unpin call on subsequent notifications", async () => {
+      const sessionId = "ses_ud6s_existing_topic";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(932);
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      await notify(sessionId, "first");
+      expect(unpins).toHaveLength(1);
+
+      const res = await notify(sessionId, "second");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1); // still 1: no unpin on reuse
+    });
+
+    it("unpin failure does not fail the notification", async () => {
+      const sessionId = "ses_ud6s_unpin_fails";
+      await registerSession(sessionId, "devbox", "pigeon");
+      mockCreateTopic(933);
+      mockSendMessage();
+      const unpins = captureUnpin(500, { ok: false, error_code: 500, description: "oops" });
+
+      const res = await notify(sessionId, "unpin will fail");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(1);
+    });
+
+    it("fallback to General (no thread) -> no unpin call", async () => {
+      const sessionId = "ses_ud6s_general_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, () => ({
+          ok: false,
+          error_code: 400,
+          description: "Bad Request: FORUM_CLOSED",
+        }))
+        .persist();
+      mockSendMessage();
+      const unpins = captureUnpin();
+
+      const res = await notify(sessionId, "goes to General");
+
+      expect(res.status).toBe(200);
+      expect(unpins).toHaveLength(0);
     });
   });
 
@@ -9110,7 +9305,7 @@ describe("topics module and topicName", () => {
         now: now + 1000,
       });
 
-      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId });
+      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId, created: true });
       const rowTnf = await getBySession(env.DB, sessionIdTnf);
       expect(rowTnf?.message_thread_id).toBe(newThreadId);
       expect(rowTnf?.state).toBe("open");
