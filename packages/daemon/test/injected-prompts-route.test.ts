@@ -172,6 +172,47 @@ describe("POST /injected-prompts route", () => {
     }
   });
 
+  it("records the raw untrimmed text, so a trailing newline is suppressed and its trimmed form is not", async () => {
+    // Guards the record side specifically. Every other text in this file is
+    // trim-stable, so a `hashPrompt(text.trim())` in the route would pass them
+    // all while silently breaking every heredoc-built launch prompt: the
+    // recorded hash would be of the trimmed text and the mirror, which hashes
+    // the raw text, would never match it. The trim in the route is only the
+    // emptiness test, never applied to the hashed string.
+    const app = newApp();
+    const sessionId = "ses_raw";
+    const raw = "deploy the thing\n";
+
+    const recorded = await app(
+      new Request("http://localhost/injected-prompts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId, text: raw }),
+      }),
+    );
+    expect(await recorded.json()).toEqual({ recorded: true });
+
+    // The trimmed form is a DIFFERENT prompt and must still mirror.
+    const trimmed = await app(
+      new Request("http://localhost/mirror", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId, messageId: "m-trimmed", text: raw.trim() }),
+      }),
+    );
+    expect(await trimmed.json()).toEqual({ mirrored: true });
+
+    // The exact raw text is the one that was recorded, so it is suppressed.
+    const exact = await app(
+      new Request("http://localhost/mirror", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId, messageId: "m-raw", text: raw }),
+      }),
+    );
+    expect(await exact.json()).toEqual({ mirrored: false });
+  });
+
   it("returns 400 for missing/invalid sessionId, text, and whitespace-only text", async () => {
     const app = newApp();
 
