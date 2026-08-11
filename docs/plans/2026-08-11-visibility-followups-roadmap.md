@@ -49,7 +49,7 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 
 | Item | Bead | What | Blocked? |
 |---|---|---|---|
-| **A** | `pigeon-ywlg` | Gate the swarm feed on notify policy | **Yes** — needs `shouldEmitAncillary` from `pigeon-qdcb.5` |
+| **A** | `pigeon-ywlg` → `pigeon-8zqt` | ~~Gate the swarm feed~~ → gate swarm **and mirror** on notify policy | **DONE** 2026-08-11, PR #97. Prod verification still outstanding (wake armed). Mirror was the primary leak — see CORRECTION #A1. |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | No |
@@ -165,12 +165,61 @@ npm run typecheck   # expect exit 0 across all three workspaces
 
 ## §3 — THE ITEMS
 
-### [ ] A. `pigeon-ywlg` (P2) — gate the swarm feed on notify policy
+### [x] A. `pigeon-ywlg` (P2) — DONE 2026-08-11 as `pigeon-8zqt`, PR #97 (`c3c7615`)
 
-**BLOCKED** on `shouldEmitAncillary` landing in `packages/daemon/src/notify-policy.ts`. That
-predicate is owned by the session holding `pigeon-qdcb` (see §4); as of 2026-08-11 the file exports
-`effectiveNotifyPolicy` (`:76`), `decideNotify` (`:172`), `explainQuiet` (`:230`) — no
-`shouldEmitAncillary` yet. **Check for it before scheduling this item.**
+> **CORRECTION #A1 (2026-08-11, written by the `qdcb` owner who caused the error).**
+> This item shipped **wider than specified**, because the specification below was wrong on the
+> single most important point, and the wrongness was mine.
+>
+> ~~"Scope is deliberately asymmetric: gate `kind='swarm'` only. Do NOT gate `kind='mirror'`.
+> Mirror fires when a human types into a TUI; lgtm sessions are headless, so gating mirror is
+> near-dead code."~~
+>
+> **Mirror was the PRIMARY leak, not dead code.** Measured on cloudbox before the fix, outbox rows
+> for sessions holding a quiet `session_origin` row: **`mirror` 16, `swarm` 4, `stop` 1** (the stop
+> is by-design Error/Retry). The first outbox entry for every newly created lgtm topic was
+> `kind='mirror'`. The user's report was "my telegram is full of topics coming from lgtm".
+>
+> **Why the reasoning failed, which is the reusable part:** `/mirror` does not implement "a human
+> typed into a TUI" — that is the feature's *name*, and `AGENTS.md` repeated it as if it were the
+> predicate. What it actually does is mirror **any user-role message not found in
+> `injected_prompts`**. lgtm starts sessions with the `opencode-launch` CLI rather than the daemon's
+> injection path, so lgtm's own launch prompt is a user message the daemon never recorded and never
+> suppressed. Headlessness is irrelevant; the provenance of the *prompt* is what decides. Any
+> automation launching sessions outside the daemon leaks identically.
+>
+> I compounded it by reporting "the lgtm filtering works, 0 leaks" thirty minutes earlier — true,
+> but measured by grepping `[stop] queued`, an instrument that by construction cannot see a mirror
+> or a swarm post. §1.7 already warned about exactly this and I still did it. The correct
+> instrument was `outbox` joined to `session_origin`, grouped by `kind`.
+>
+> `AGENTS.md` now documents the real predicate next to the feature description.
+
+**Shipped:** `packages/daemon/src/ancillary-gate.ts` — `shouldEmitAncillary` (pure predicate) and
+`shouldEmitAncillaryFor` (reads the row, applies `effectiveNotifyPolicy` + TTL, fails open). Wired
+at the `/mirror` route in `app.ts` **and** both swarm emitters in `swarm/telegram-notice.ts`. It
+landed in its own module rather than `notify-policy.ts` as the contract below assumed; import from
+`./ancillary-gate`.
+
+**Verification:** the tests were confirmed to FAIL without the gate (neutered it → 3 targeted
+failures), not merely to pass with it. Full suite 1454/376/375 green. **Production confirmation is
+still OUTSTANDING** — the first 5 minutes after deploy contained zero outbox rows of any kind and
+zero new lgtm sessions, i.e. an empty window, not a clean one. A verification wake is armed
+(`bd:pigeon-8zqt`, 2026-08-12T03:01Z) carrying the measurement recipe and the §1.7 denominator
+check. **Do not mark this verified on an empty window.**
+
+**Note when re-measuring:** item D's PR #94 independently changes which sessions may mirror, and is
+plugin-side (needs a *serve* restart, not just a daemon restart). Some of any observed drop may be
+theirs. Count by session provenance or record which commit was deployed when you measured.
+
+**Follow-up filed, not done here:** `pigeon-w36w` (P2) — `opencode-launch` should record its launch
+prompt in `injected_prompts`, fixing the leak at source for automations that have **no**
+`session_origin` row and therefore nothing for this gate to act on. The two fixes are complementary
+and neither subsumes the other: the gate suppresses everything for a quiet session; the source fix
+suppresses only the launch prompt, but for every session.
+
+<details>
+<summary>Original specification, kept for the record (its mirror-scope clause is refuted above)</summary>
 
 **The problem, and it is worse than a duplicate.** `pigeon-qdcb` suppresses the Stop notification
 for a declared-quiet session, and the Phase 1 swarm feed then reinstates the noise through a side
@@ -208,6 +257,8 @@ declared quiet.
 topic; an `all`/no-row session is unchanged; a retraction still posts after a policy flip; policy
 lookup throwing still posts. Landing this does not disturb the `qdcb.5` soak, which reads
 `[stop] queued` lines only.
+
+</details>
 
 ---
 
