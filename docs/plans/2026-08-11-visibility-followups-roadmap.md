@@ -49,7 +49,7 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 
 | Item | Bead | What | Blocked? |
 |---|---|---|---|
-| **A** | `pigeon-ywlg` → `pigeon-8zqt` | ~~Gate the swarm feed~~ → gate swarm **and mirror** on notify policy | **DONE** 2026-08-11, PR #97. Prod verification still outstanding (wake armed). Mirror was the primary leak — see CORRECTION #A1. |
+| **A** | `pigeon-ywlg` → `pigeon-8zqt` | ~~Gate the swarm feed~~ → gate swarm **and mirror** on notify policy | **DONE + VERIFIED IN PROD** 2026-08-12, PR #97. 11 suppressions across 11 quiet sessions, 0 leaks, regression control passes. Mirror was the primary leak — see CORRECTION #A1. |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
 | **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
@@ -228,11 +228,43 @@ landed in its own module rather than `notify-policy.ts` as the contract below as
 `./ancillary-gate`.
 
 **Verification:** the tests were confirmed to FAIL without the gate (neutered it → 3 targeted
-failures), not merely to pass with it. Full suite 1454/376/375 green. **Production confirmation is
-still OUTSTANDING** — the first 5 minutes after deploy contained zero outbox rows of any kind and
-zero new lgtm sessions, i.e. an empty window, not a clean one. A verification wake is armed
-(`bd:pigeon-8zqt`, 2026-08-12T03:01Z) carrying the measurement recipe and the §1.7 denominator
-check. **Do not mark this verified on an empty window.**
+failures), not merely to pass with it. Full suite 1454/376/375 green.
+
+**Production confirmation: PASS**, measured 2026-08-12T03:0x UTC (~5h post-deploy) when the armed
+wake fired. The verdict rests on a **positive signal**, not on an absence:
+
+```
+journalctl -u pigeon-daemon | grep -E '\[mirror\] quieted|\[swarm-notice\] quieted'
+  → 11 suppression events (9 mirror + 2 swarm-notice), all reason=origin
+  → across 11 DISTINCT sessions, all 11 confirmed notify_policy='errors-only'
+  → 0 surviving mirror/swarm outbox rows for any of them
+```
+
+That is the denominator the first window lacked: 11 quiet sessions really did generate ancillary
+events after the deploy, and every one was suppressed. Regression control passes — a non-quiet
+session with no `session_origin` row still produced a `mirror` row after the deploy (the
+`pigeon-w36w` control, PR #100). The PR #94 confounder is moot here: `quieted … reason=origin`
+attributes each suppression to *this* code path, so no serve-restart archaeology is required.
+
+> **The instrument this section recommended is partly unusable, and finding out cost two wrong
+> answers.** Both are worth internalising because each produced a confident, plausible result.
+>
+> **The `outbox` table prunes sent rows.** It is a delivery queue, not a history. At verification
+> time it held 18 rows total and the pre-deploy baseline (`mirror` 16, `swarm` 4) had **vanished**,
+> along with every row from test sessions only 5 hours old. A before/after count over it therefore
+> reports `BEFORE: none` — which reads as *the bug never existed* rather than *the evidence
+> expired*, and would have been reported as a pass. Restrict both sides of a split to the retained
+> window, or use the journal, which persists. §1.7 says a checklist misses what it cannot observe;
+> this is the sharper version — **an instrument can stop being able to observe the past.**
+>
+> **A timestamp carried across a compaction boundary is an unverified claim.** The deploy epoch in
+> my own wake payload was `1786520089000`, which is *in the future* relative to the verification;
+> every before/after split silently used it (`window hours: -4.55`). Recompute such constants from
+> the human-readable time and check the sign of the window before trusting any split.
+>
+> A third, smaller instance: extracting `sessionId=` from *all* journal lines rather than only the
+> `quieted` ones inflated 11 sessions to 32 and manufactured 2 false leaks. Aim the extraction at
+> the predicate being measured.
 
 **Note when re-measuring:** item D's PR #94 independently changes which sessions may mirror, and is
 plugin-side (needs a *serve* restart, not just a daemon restart). Some of any observed drop may be
