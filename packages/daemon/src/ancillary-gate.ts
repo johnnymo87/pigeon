@@ -59,7 +59,7 @@ export function shouldEmitAncillaryFor(
       {
         policy: row.notifyPolicy,
         source: row.source,
-        createdAt: row.createdAt,
+        declaredAt: row.declaredAt ?? row.createdAt,
         now,
       },
       env,

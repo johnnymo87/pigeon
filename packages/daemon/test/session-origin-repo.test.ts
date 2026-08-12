@@ -35,6 +35,7 @@ describe("SessionOriginRepository", () => {
       source: "declared",
       createdAt: 1_000,
       updatedAt: 1_000,
+      declaredAt: 1_000,
     });
   });
 
@@ -288,5 +289,81 @@ describe("SessionOriginRepository", () => {
     expect(row?.source).toBe("override");
     expect(row?.createdAt).toBe(1_000);
     expect(row?.updatedAt).toBe(2_000);
+  });
+
+  it("new row gets declaredAt = createdAt = now", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.declaredAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(1_000);
+  });
+
+  it("genuine re-declaration preserves createdAt and updates declaredAt and updatedAt", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      5_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.declaredAt).toBe(5_000);
+    expect(row?.updatedAt).toBe(5_000);
+  });
+
+  it("rank-guard reject path leaves declaredAt unchanged", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "guess", notifyPolicy: "none", source: "inferred" },
+      5_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.declaredAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(1_000);
+  });
+
+  it("origin-fill path for unknown spawner leaves declaredAt unchanged", () => {
+    const s = newStorage();
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "unknown", notifyPolicy: "all", source: "override" },
+      1_000,
+    );
+    s.sessionOrigins.record(
+      { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+      5_000,
+    );
+    const row = s.sessionOrigins.get("ses_a");
+    expect(row?.origin).toBe("lgtm");
+    expect(row?.source).toBe("override");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.declaredAt).toBe(1_000);
+    expect(row?.updatedAt).toBe(5_000);
+  });
+
+  it("get() falls back to createdAt when declared_at is NULL in the DB", () => {
+    const s = newStorage();
+    s.db
+      .prepare(
+        `INSERT INTO session_origin (session_id, origin, notify_policy, source, created_at, updated_at, declared_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run("ses_legacy", "lgtm", "errors-only", "declared", 1_000, 2_000);
+
+    const row = s.sessionOrigins.get("ses_legacy");
+    expect(row?.createdAt).toBe(1_000);
+    expect(row?.declaredAt).toBe(1_000);
   });
 });

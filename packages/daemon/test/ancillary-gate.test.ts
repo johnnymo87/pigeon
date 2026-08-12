@@ -34,6 +34,7 @@ describe("shouldEmitAncillaryFor", () => {
       notifyPolicy: "errors-only",
       source: "declared",
       createdAt: now - 1000,
+      declaredAt: now - 1000,
     });
     expect(shouldEmitAncillaryFor(storage, "ses_a", now, {})).toBe(false);
   });
@@ -47,6 +48,7 @@ describe("shouldEmitAncillaryFor", () => {
       notifyPolicy: "all",
       source: "override",
       createdAt: now - 1000,
+      declaredAt: now - 1000,
     });
     expect(shouldEmitAncillaryFor(storage, "ses_a", now, {})).toBe(true);
   });
@@ -56,6 +58,7 @@ describe("shouldEmitAncillaryFor", () => {
       notifyPolicy: "errors-only",
       source: "declared",
       createdAt: now - DEFAULT_DECLARED_QUIET_TTL_MS - 1000,
+      declaredAt: now - DEFAULT_DECLARED_QUIET_TTL_MS - 1000,
     });
     expect(shouldEmitAncillaryFor(storage, "ses_a", now, {})).toBe(true);
   });
