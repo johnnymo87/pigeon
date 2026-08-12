@@ -52,13 +52,17 @@ inherited (**B**), and three items review found and we deliberately deferred (**
 | **A** | `pigeon-ywlg` → `pigeon-8zqt` | ~~Gate the swarm feed~~ → gate swarm **and mirror** on notify policy | **DONE + VERIFIED IN PROD** 2026-08-12, PR #97. 11 suppressions across 11 quiet sessions, 0 leaks, regression control passes. Mirror was the primary leak — see CORRECTION #A1. |
 | **B** | `pigeon-rqyz` + `pigeon-k0eh` | Fleet deploy (devbox, macbook, chromebook) | **Yes** — needs a session ON each host |
 | ~~**C**~~ | ~~`pigeon-rmr2`~~ | **WITHDRAWN — the DB is not corrupt.** Premise did not reproduce | n/a |
-| **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **PR #94 open** — merged? then deploy |
-| **E** | `pigeon-pre9` | Deferred polish from adversarial review | **MERGED** 2026-08-11, PR #99 — awaiting the same serve restart as D |
+| **D** | `pigeon-kq6h` | Subagent misclassified as main when `session.get` fails | **DONE + DEPLOYED** 2026-08-12, PR #94 (`023e8cc`) |
+| **E** | `pigeon-pre9` | Deferred polish from adversarial review | **DONE + DEPLOYED** 2026-08-12, PR #99 (`08aecb7`) |
 
-**Only B remains, and it is the deploy.** A, C, D and E are all resolved: **D and E are merged but
-NOT deployed**, and both are waiting on the *same* `opencode serve` restart (§1.2) — that restart is
-now the single action that converts four merged PRs into working behaviour, and it is also the first
-half of B. Do not tick D or E until it has happened.
+**Only B remains.** A, C, D and E are all resolved, and as of **2026-08-12 03:40 EDT D and E are
+also deployed and live on cloudbox** — they rode the 03:00:57 nightly serve restart together, as
+planned. See the deploy box under item E for the evidence and, more usefully, for what that evidence
+does *not* cover.
+
+B is now the whole of the remaining work: the other three hosts (devbox, macbook, chromebook) are
+still on old code, and every item A–E widened that skew. B is blocked on having a session **on each
+of those hosts** — cloudbox does not count, and no amount of work from here can substitute.
 
 Historical detail, still accurate: A shipped on 08-11 as `pigeon-8zqt`
 (PR #97) after being reassigned to the `qdcb` owner, who also corrected its scope — read
@@ -446,7 +450,11 @@ never true.
 
 ---
 
-### [ ] D. `pigeon-kq6h` (P3) — subagent misclassified as main when `session.get` fails
+### [x] D. `pigeon-kq6h` (P3) — subagent misclassified as main when `session.get` fails
+
+> **DEPLOYED AND TICKED 2026-08-12 03:40 EDT.** All three tick conditions met: merged (PR #94,
+> `023e8cc`), a serve restart has happened, and a subagent session has been observed not mirroring.
+> Evidence in the shared deploy box below item E.
 
 **Unblocked. The item with a real correctness argument.**
 
@@ -456,9 +464,10 @@ subagent then counts as a main session. Pre-existing — it already affects stop
 Phase 2 made it louder, because a misclassified subagent would **mirror its prompts to Telegram**,
 and subagent prompts are large (a full task brief).
 
-**DONE in PR #94** (`1a3d552` + `9921886`), reviewed and green. **Not ticked**: a plugin change is
+**DONE in PR #94** (`1a3d552` + `9921886`), reviewed and green. ~~**Not ticked**: a plugin change is
 inert until an `opencode serve` restart (§1.2), so this is not live even on cloudbox. Tick it once
-merged AND a serve has restarted AND a subagent-heavy session has been observed not mirroring.
+merged AND a serve has restarted AND a subagent-heavy session has been observed not mirroring.~~
+**All three met on 2026-08-12 — see the deploy box below item E.**
 
 **Reproduced first (§2 step 0), and it was real** — unlike item C. Driven through the real plugin
 entrypoint with `session.get` rejecting: the subagent mirrored a task brief and emitted a stop
@@ -496,11 +505,11 @@ from the outside.
 
 ---
 
-### [ ] E. `pigeon-pre9` (P4) — deferred polish from the adversarial review
+### [x] E. `pigeon-pre9` (P4) — deferred polish from the adversarial review
 
-**All four written, reviewed and merged in PR #99 (`e5addda`). NOT ticked: like D, the plugin half
-is inert until an `opencode serve` restart (§1.2).** Tick when a restarted serve has run the plugin
-half — the same restart D is waiting for, which is why they were landed together.
+**All four written, reviewed and merged in PR #99 (`e5addda`).** ~~NOT ticked: like D, the plugin
+half is inert until an `opencode serve` restart (§1.2).~~ **Deployed and ticked 2026-08-12 — see the
+deploy box below.**
 
 Four NICE-TO-HAVEs, all deliberately deferred, none urgent. Done together in one PR, as specified.
 
@@ -571,6 +580,38 @@ quiet session still consumes its injected counts rather than accumulating them u
   CORRECTION #E1. Step 0 says reproduce the symptom; item 3 shows that a symptom can be
   unreproducible while the fix is still worth shipping — in which case the honest move is to ship it
   with a corrected rationale, not to withdraw it and not to leave the false rationale standing.
+
+> **DEPLOY BOX — D AND E ARE LIVE ON CLOUDBOX (2026-08-12 03:40 EDT).** Both rode the same
+> `opencode serve` restart, as planned. Verified by a scheduled wake rather than by assumption,
+> because §1.2's failure mode (merged-but-inert looks exactly like deployed) is invisible.
+>
+> | Check | Evidence |
+> |---|---|
+> | Root has the code | `/home/dev/projects/pigeon` at `1631fd5`, clean; `023e8cc` (#94) and `08aecb7` (#99) both ancestors |
+> | Root got it *before* the restart | reflog: `pull --ff-only` at **2026-08-11 19:33:11 EDT**; `message-tail.ts` mtime matches |
+> | Serves restarted after | all four of 4096–4099 at **2026-08-12 03:00:57 EDT**, `nightly-restart-background` → `success` |
+> | The serve loads *that* file | `~/.config/opencode/plugins/opencode-pigeon.ts` → home-manager → **`/home/dev/projects/pigeon/packages/opencode-plugin/src/index.ts`**; relative imports therefore resolve into the repo tree |
+> | Plugin is running, not merely present | a stop notification was produced at 03:20:02 EDT, after the restart |
+> | Daemon half of E3 behaves | live `POST /mirror` with whitespace-only text → `{"mirrored":false}`, no outbox row, no topic |
+> | D's third condition | a subagent session (`ses_00b19d29…`) ran post-restart and produced **zero** outbox rows |
+>
+> **The load-bearing check is the third row from the bottom.** Everything else would have looked
+> identical if the serve loaded a Nix-store *copy* of the plugin rather than the working tree — in
+> which case the `git pull` would have deployed nothing and every other check would still be green.
+> Resolve the symlink before believing a pigeon plugin deploy.
+>
+> **What this does NOT establish, stated so nobody over-reads it.** The mirror path itself has not
+> been exercised since the restart: a mirror only fires for a *TUI-typed* prompt, and no human has
+> typed into a TUI on this host since 03:00. So E1/E2/E4 are verified *loaded*, not verified *firing*
+> — and E1's eviction needs 2000 message updates before it engages at all. D's subagent observation
+> is likewise weak on its own, because the bug it fixes only manifests when `session.get` **fails**,
+> which cannot be forced in production. The unit tests carry that weight; the deploy box only
+> establishes that the fixed code is the code now running.
+>
+> **Instrument warning, learned here.** Do not conclude anything from counting `outbox` rows. The
+> outbox is a **queue that is pruned after delivery**, not a history — see PR #104, whose title is
+> exactly that. "Zero mirror rows ever" is what a healthy, busy mirror path also looks like. I
+> nearly recorded that as evidence the feature had never fired.
 
 **Discovered here, already known:** the `lease-CAS concurrency proof` CI job is flaky — it failed
 PR #94 on a **docs-only** merge commit and passed on a bare re-run. That is `pigeon-1lha` (P2,
