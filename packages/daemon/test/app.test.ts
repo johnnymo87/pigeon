@@ -1924,6 +1924,7 @@ describe("createApp", () => {
         source: "declared",
         createdAt: 10_000,
         updatedAt: 10_000,
+        declaredAt: 10_000,
       });
     });
 
@@ -1951,6 +1952,7 @@ describe("createApp", () => {
         source: "declared",
         createdAt: 12_345,
         updatedAt: 12_345,
+        declaredAt: 12_345,
       });
     });
   });
@@ -2192,6 +2194,117 @@ describe("createApp", () => {
       logSpy.mockRestore();
     });
 
+    it("pigeon-n097: re-declaring quiet after TTL expiry re-silences both Stop and swarm notices while preserving createdAt", async () => {
+      const createdAt = 1_000;
+      const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+      const expiredTime = createdAt + ttl + 5_000; // past TTL
+      const redeclareTime = expiredTime + 1_000; // re-declaration time
+
+      let now = redeclareTime + 1_000;
+      const app = newApp(now);
+
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, createdAt);
+      storage!.sessions.upsert({ sessionId: "ses_b", notify: true }, createdAt);
+
+      // Initial declaration at t=1000
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        createdAt,
+      );
+
+      // Re-declare quiet policy at t=redeclareTime
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        redeclareTime,
+      );
+
+      // Verify createdAt is preserved but declaredAt and updatedAt are refreshed
+      const originRecord = storage!.sessionOrigins.get("ses_a");
+      expect(originRecord?.createdAt).toBe(createdAt);
+      expect(originRecord?.declaredAt).toBe(redeclareTime);
+      expect(originRecord?.updatedAt).toBe(redeclareTime);
+
+      // 1. Assert Stop is suppressed (notified: false, reason: "quiet_origin")
+      const stopRes = await stop(app, "Stop", "PR review .lgtm-review-prompt.md");
+      expect(stopRes.status).toBe(200);
+      const stopJson = await stopRes.json();
+      expect(stopJson).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+
+      // 2. Assert swarm send is 202 and swarm_messages row exists, but w: outbox row is absent
+      const swarmRes = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_b",
+            to: "ses_a",
+            kind: "chat",
+            payload: "re-review prompt",
+          }),
+        }),
+      );
+      expect(swarmRes.status).toBe(202);
+      const swarmJson = (await swarmRes.json()) as { accepted: boolean; msg_id: string };
+      expect(swarmJson.accepted).toBe(true);
+
+      // Non-vacuous check: swarm_messages row MUST exist
+      const storedSwarmMsg = storage!.swarm.getByMsgId(swarmJson.msg_id);
+      expect(storedSwarmMsg).toBeDefined();
+      expect(storedSwarmMsg?.msgId).toBe(swarmJson.msg_id);
+
+      // Outbox notice w:<msg_id> MUST BE ABSENT because the receiver is declared quiet
+      const outboxNotice = storage!.outbox.getByNotificationId(`w:${swarmJson.msg_id}`);
+      expect(outboxNotice).toBeNull();
+    });
+
+    it("pigeon-n097: positive control: expired quiet session without re-declaration delivers Stop and emits swarm notice", async () => {
+      const createdAt = 1_000;
+      const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+      const expiredTime = createdAt + ttl + 5_000;
+
+      const app = newApp(expiredTime);
+
+      storage!.sessions.upsert({ sessionId: "ses_a", notify: true }, createdAt);
+      storage!.sessions.upsert({ sessionId: "ses_b", notify: true }, createdAt);
+
+      // Initial declaration at t=1000
+      storage!.sessionOrigins.record(
+        { sessionId: "ses_a", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        createdAt,
+      );
+
+      // Do NOT re-declare. Now time is expiredTime.
+
+      // 1. Stop is delivered
+      const stopRes = await stop(app, "Stop", "PR review .lgtm-review-prompt.md");
+      expect(stopRes.status).toBe(202);
+      const stopJson = await stopRes.json();
+      expect(stopJson.ok).toBe(true);
+      expect(stopJson.deliveryState).toBe("queued");
+
+      // 2. Swarm send emits w: outbox notice
+      const swarmRes = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_b",
+            to: "ses_a",
+            kind: "chat",
+            payload: "re-review prompt",
+          }),
+        }),
+      );
+      expect(swarmRes.status).toBe(202);
+      const swarmJson = (await swarmRes.json()) as { accepted: boolean; msg_id: string };
+      expect(swarmJson.accepted).toBe(true);
+
+      const outboxNotice = storage!.outbox.getByNotificationId(`w:${swarmJson.msg_id}`);
+      expect(outboxNotice).not.toBeNull();
+      expect(outboxNotice?.sessionId).toBe("ses_a");
+      expect(outboxNotice?.kind).toBe("swarm");
+    });
+
     // pigeon-2z5w. The quieted line has always carried event/layer/origin; the queued
     // line carried none of them, so a DELIVERY from an errors-only session was
     // indistinguishable in the logs between "Error/Retry, delivered by design" and
@@ -2308,6 +2421,7 @@ describe("createApp", () => {
         source: "override",
         createdAt: 1_000,
         updatedAt: 1_000,
+        declaredAt: 1_000,
       });
     });
 
@@ -2362,6 +2476,7 @@ describe("createApp", () => {
         source: "override",
         createdAt: 1_000,
         updatedAt: 1_000,
+        declaredAt: 1_000,
       });
     });
 

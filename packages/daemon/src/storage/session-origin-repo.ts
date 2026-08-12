@@ -54,6 +54,7 @@ export interface SessionOriginRecord {
   source: OriginSource;
   createdAt: number;
   updatedAt: number;
+  declaredAt: number;
 }
 
 export interface RecordSessionOriginInput {
@@ -105,18 +106,18 @@ export class SessionOriginRepository {
         this.db
           .prepare(
             `UPDATE session_origin
-                SET origin = ?, notify_policy = ?, source = ?, updated_at = ?
+                SET origin = ?, notify_policy = ?, source = ?, updated_at = ?, declared_at = ?
               WHERE session_id = ?`,
           )
-          .run(input.origin, input.notifyPolicy, input.source, now, input.sessionId);
+          .run(input.origin, input.notifyPolicy, input.source, now, now, input.sessionId);
         return;
       }
       this.db
         .prepare(
-          `INSERT INTO session_origin (session_id, origin, notify_policy, source, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO session_origin (session_id, origin, notify_policy, source, created_at, updated_at, declared_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.sessionId, input.origin, input.notifyPolicy, input.source, now, now);
+        .run(input.sessionId, input.origin, input.notifyPolicy, input.source, now, now, now);
     });
     tx.immediate();
   }
@@ -130,6 +131,7 @@ export class SessionOriginRepository {
 
     const notifyPolicy = isNotifyPolicy(row.notify_policy) ? row.notify_policy : "all";
     const source = isOriginSource(row.source) ? row.source : "inferred";
+    const declaredAtRaw = row.declared_at != null ? row.declared_at : row.created_at;
 
     return {
       sessionId: String(row.session_id),
@@ -138,6 +140,7 @@ export class SessionOriginRepository {
       source,
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
+      declaredAt: Number(declaredAtRaw),
     };
   }
 

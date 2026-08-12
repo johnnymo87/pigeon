@@ -945,14 +945,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             {
               policy: originRow?.notifyPolicy ?? null,
               source: originRow?.source ?? null,
-              createdAt: originRow?.createdAt ?? null,
+              declaredAt: originRow?.declaredAt ?? originRow?.createdAt ?? null,
               now,
             },
             process.env,
           );
           effectivePolicy = effective.policy;
           if (effective.expired && originRow) {
-            const ageMs = now - originRow.createdAt;
+            const ageMs = now - originRow.declaredAt;
             console.log(
               `[stop] automated quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
               `source=${originRow.source} policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,

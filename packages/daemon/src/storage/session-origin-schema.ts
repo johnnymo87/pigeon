@@ -25,10 +25,19 @@ export function initSessionOriginSchema(db: BetterSqlite3.Database): void {
       notify_policy TEXT NOT NULL,
       source TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      declared_at INTEGER
     );
 
     -- Serves ad-hoc ops/debugging queries (e.g. SELECT count(*) FROM session_origin GROUP BY origin)
     CREATE INDEX IF NOT EXISTS idx_session_origin_origin ON session_origin(origin);
   `);
+
+  const columns = db.prepare("PRAGMA table_info(session_origin)").all() as Array<{ name: string }>;
+  const hasDeclaredAt = columns.some((col) => col.name === "declared_at");
+  if (!hasDeclaredAt) {
+    db.exec("ALTER TABLE session_origin ADD COLUMN declared_at INTEGER");
+  }
+
+  db.exec("UPDATE session_origin SET declared_at = created_at WHERE declared_at IS NULL");
 }

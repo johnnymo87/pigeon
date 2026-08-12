@@ -18,7 +18,7 @@ export const DEFAULT_DECLARED_QUIET_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 export interface EffectivePolicyInput {
   policy: NotifyPolicy | null;
   source: OriginSource | null;
-  createdAt: number | null;
+  declaredAt: number | null;
   now: number;
 }
 
@@ -62,22 +62,20 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * to un-quiet or change policy is permanent. Expiring an override would fail toward
  * silence, defeating the user's explicit choice.
  *
- * WHY the clock uses created_at instead of updated_at:
- * The suppression clock starts when provenance was FIRST declared. `record()` never
- * touches created_at on the UPDATE path, so repeated identical declared writes from the
- * reconciliation writer refresh only updated_at -- using that clock would extend quiet
- * status forever, which is the exact bug this exists to kill.
- * KNOWN CONSEQUENCE, and it fails toward NOISE: if a session id is ever REUSED across
- * runs (e.g. a future lgtm "iterative mode"), the new run's declared row inherits the old
- * created_at and is born already-expired, so every Stop delivers. That is loud, not
- * silent, so it is the acceptable direction -- but it would look like a spam bug to
- * whoever hits it, so change the clock deliberately rather than by surprise.
+ * WHY the clock uses declared_at instead of created_at or updated_at:
+ * The clock measures from the most recent declaration (declared_at), so quiet lasts
+ * TTL past the last time automation asserted it. An abandoned session still un-quiets
+ * TTL after its final dispatch (the safety property the TTL exists for).
+ * A human who adopts an lgtm session is re-silenced for TTL on each reawaken event,
+ * and the durable escape hatch is POST /sessions/enable-notify, which writes
+ * source: "override" — TTL-exempt before any clock is read, and protected by the rank
+ * guard from being undone by a later declared write.
  */
 export function effectiveNotifyPolicy(
   input: EffectivePolicyInput,
   env: Record<string, string | undefined> = process.env,
 ): EffectivePolicyResult {
-  const { policy, source, createdAt, now } = input;
+  const { policy, source, declaredAt, now } = input;
 
   if (policy === null) {
     return { policy: null, expired: false };
@@ -88,16 +86,16 @@ export function effectiveNotifyPolicy(
   }
 
   if ((policy === "errors-only" || policy === "none") && (source === "declared" || source === "inferred")) {
-    // An UNUSABLE clock (absent, NaN, Infinity -- e.g. a corrupt created_at read back
+    // An UNUSABLE clock (absent, NaN, Infinity -- e.g. a corrupt declared_at read back
     // through Number()) means we cannot prove the suppression is still young. Ambiguity
     // resolves toward DELIVERING, so treat it as expired rather than silencing forever:
     // a bad clock must not be a way to make a session permanently silent.
-    if (createdAt === null || !Number.isFinite(createdAt)) {
+    if (declaredAt === null || !Number.isFinite(declaredAt)) {
       return { policy: "all", expired: true };
     }
 
     const ttl = parseDeclaredQuietTtlMs(env);
-    if (now - createdAt > ttl) {
+    if (now - declaredAt > ttl) {
       return { policy: "all", expired: true };
     }
   }

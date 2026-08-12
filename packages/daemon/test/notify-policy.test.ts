@@ -281,7 +281,7 @@ describe("explainQuiet", () => {
     const now = 10_000_000;
     const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
     const effective = effectiveNotifyPolicy(
-      { policy: "errors-only", source: "declared", createdAt: now - ttl - 1000, now },
+      { policy: "errors-only", source: "declared", declaredAt: now - ttl - 1000, now },
       {},
     );
     expect(effective).toEqual({ policy: "all", expired: true });
@@ -304,7 +304,7 @@ describe("explainQuiet", () => {
     const now = 10_000_000;
     const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
     const effective = effectiveNotifyPolicy(
-      { policy: "errors-only", source: "declared", createdAt: now - ttl + 1000, now },
+      { policy: "errors-only", source: "declared", declaredAt: now - ttl + 1000, now },
       {},
     );
     expect(effective).toEqual({ policy: "errors-only", expired: false });
@@ -357,21 +357,21 @@ describe("effectiveNotifyPolicy", () => {
 
   it("returns null policy unchanged and not expired when policy is null", () => {
     expect(
-      effectiveNotifyPolicy({ policy: null, source: "declared", createdAt: now - ttl - 1000, now }, {}),
+      effectiveNotifyPolicy({ policy: null, source: "declared", declaredAt: now - ttl - 1000, now }, {}),
     ).toEqual({ policy: null, expired: false });
   });
 
   it("returns override rows unchanged regardless of age", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "override", createdAt: now - ttl - 100_000, now },
+        { policy: "errors-only", source: "override", declaredAt: now - ttl - 100_000, now },
         {},
       ),
     ).toEqual({ policy: "errors-only", expired: false });
 
     expect(
       effectiveNotifyPolicy(
-        { policy: "none", source: "override", createdAt: now - ttl - 100_000, now },
+        { policy: "none", source: "override", declaredAt: now - ttl - 100_000, now },
         {},
       ),
     ).toEqual({ policy: "none", expired: false });
@@ -380,7 +380,7 @@ describe("effectiveNotifyPolicy", () => {
   it("returns policy=all unchanged and not expired", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "all", source: "declared", createdAt: now - ttl - 100_000, now },
+        { policy: "all", source: "declared", declaredAt: now - ttl - 100_000, now },
         {},
       ),
     ).toEqual({ policy: "all", expired: false });
@@ -389,14 +389,14 @@ describe("effectiveNotifyPolicy", () => {
   it("expires declared or inferred quiet rows (errors-only / none) when older than TTL", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - ttl - 1, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - ttl - 1, now },
         {},
       ),
     ).toEqual({ policy: "all", expired: true });
 
     expect(
       effectiveNotifyPolicy(
-        { policy: "none", source: "inferred", createdAt: now - ttl - 1, now },
+        { policy: "none", source: "inferred", declaredAt: now - ttl - 1, now },
         {},
       ),
     ).toEqual({ policy: "all", expired: true });
@@ -405,7 +405,7 @@ describe("effectiveNotifyPolicy", () => {
   it("keeps quiet rows unchanged when within TTL", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - ttl + 1000, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - ttl + 1000, now },
         {},
       ),
     ).toEqual({ policy: "errors-only", expired: false });
@@ -414,30 +414,30 @@ describe("effectiveNotifyPolicy", () => {
   it("treats exact TTL boundary as NOT expired (strictly greater required)", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - ttl, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - ttl, now },
         {},
       ),
     ).toEqual({ policy: "errors-only", expired: false });
   });
 
-  it("treats an unusable clock as expired so a corrupt created_at cannot silence forever", () => {
+  it("treats an unusable clock as expired so a corrupt declared_at cannot silence forever", () => {
     // Fail open: with no usable clock we cannot prove the suppression is still young,
     // and the dangerous direction is silence, not noise.
     expect(
-      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: null, now }, {}),
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", declaredAt: null, now }, {}),
     ).toEqual({ policy: "all", expired: true });
 
     expect(
-      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: NaN, now }, {}),
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", declaredAt: NaN, now }, {}),
     ).toEqual({ policy: "all", expired: true });
 
     expect(
-      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", createdAt: Infinity, now }, {}),
+      effectiveNotifyPolicy({ policy: "errors-only", source: "declared", declaredAt: Infinity, now }, {}),
     ).toEqual({ policy: "all", expired: true });
 
     // ...but an unusable clock must NOT override a user's permanent un-quiet exemption.
     expect(
-      effectiveNotifyPolicy({ policy: "errors-only", source: "override", createdAt: NaN, now }, {}),
+      effectiveNotifyPolicy({ policy: "errors-only", source: "override", declaredAt: NaN, now }, {}),
     ).toEqual({ policy: "errors-only", expired: false });
   });
 
@@ -445,14 +445,14 @@ describe("effectiveNotifyPolicy", () => {
     const customTtlEnv = { PIGEON_DECLARED_QUIET_TTL_MS: "1000" }; // 1s
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - 500, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - 500, now },
         customTtlEnv,
       ),
     ).toEqual({ policy: "errors-only", expired: false });
 
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - 1001, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - 1001, now },
         customTtlEnv,
       ),
     ).toEqual({ policy: "all", expired: true });
@@ -462,7 +462,7 @@ describe("effectiveNotifyPolicy", () => {
     const zeroTtlEnv = { PIGEON_DECLARED_QUIET_TTL_MS: "0" };
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - 1, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - 1, now },
         zeroTtlEnv,
       ),
     ).toEqual({ policy: "all", expired: true });
@@ -474,7 +474,7 @@ describe("effectiveNotifyPolicy", () => {
     const badEnv1 = { PIGEON_DECLARED_QUIET_TTL_MS: "not-a-number" };
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - ttl - 1, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - ttl - 1, now },
         badEnv1,
       ),
     ).toEqual({ policy: "all", expired: true });
@@ -485,7 +485,7 @@ describe("effectiveNotifyPolicy", () => {
     const badEnv2 = { PIGEON_DECLARED_QUIET_TTL_MS: "-500" };
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "declared", createdAt: now - 100, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - 100, now },
         badEnv2,
       ),
     ).toEqual({ policy: "errors-only", expired: false }); // 100ms < 4h default
