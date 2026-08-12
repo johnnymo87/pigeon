@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { renderEnvelope, type EnvelopeFields } from "../src/swarm/envelope";
+import {
+  ECONOMY_FOOTER,
+  renderEnvelope,
+  type EnvelopeFields,
+} from "../src/swarm/envelope";
+
+const CLOSE_TAG_STR = "</swarm_message>";
 
 const FIELDS: EnvelopeFields = {
   v: "1",
@@ -61,6 +67,54 @@ describe("renderEnvelope", () => {
     ).toThrow();
   });
 
+  describe("message-economy footer", () => {
+    // The footer is out-of-band: it lives AFTER the close tag so the envelope
+    // body remains exactly the sender's payload. A receiver that reads
+    // "everything between the tags" is unaffected.
+    it("appends the footer after the close tag for a peer message", () => {
+      const out = renderEnvelope(FIELDS, "hello");
+      expect(out.endsWith(`${CLOSE_TAG_STR}\n\n${ECONOMY_FOOTER}`)).toBe(true);
+      expect(out.indexOf(ECONOMY_FOOTER)).toBeGreaterThan(
+        out.indexOf(CLOSE_TAG_STR),
+      );
+    });
+
+    it("omits the footer when the message is addressed to the sender", () => {
+      // The self-wake case (swarm_schedule with no `to`). Nagging yourself
+      // about chattiness costs tokens on every scheduled wake and warns about
+      // traffic that does not exist.
+      const out = renderEnvelope(
+        { ...FIELDS, kind: "wake.scheduled", to: "ses_a" },
+        "hello",
+      );
+      expect(out).not.toContain(ECONOMY_FOOTER);
+      expect(out.endsWith(CLOSE_TAG_STR)).toBe(true);
+    });
+
+    it("appends the footer to a SCHEDULED message aimed at another session", () => {
+      // Scheduling does not make a peer message free — the receiver still
+      // spends a turn. Only self-addressed messages are exempt.
+      const out = renderEnvelope(
+        { ...FIELDS, kind: "wake.scheduled", scheduledFor: 1770024000000 },
+        "hello",
+      );
+      expect(out).toContain(ECONOMY_FOOTER);
+    });
+
+    it("appends the footer to a channel broadcast (no 'to')", () => {
+      const out = renderEnvelope(
+        { ...FIELDS, to: null, channel: "workers" },
+        "hello",
+      );
+      expect(out).toContain(ECONOMY_FOOTER);
+    });
+
+    it("warns against back-and-forth and acks", () => {
+      expect(ECONOMY_FOOTER.toLowerCase()).toContain("ack");
+      expect(ECONOMY_FOOTER).not.toContain(CLOSE_TAG_STR);
+    });
+  });
+
   describe("byte-identical contract for non-scheduled messages", () => {
     it("matches exact hardcoded string literal when 'to' is set", () => {
       const fields: EnvelopeFields = {
@@ -75,7 +129,7 @@ describe("renderEnvelope", () => {
       };
       const out = renderEnvelope(fields, "hello");
       expect(out).toBe(
-        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" to="ses_target" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>',
+        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" to="ses_target" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>' + `\n\n${ECONOMY_FOOTER}`,
       );
     });
 
@@ -92,7 +146,7 @@ describe("renderEnvelope", () => {
       };
       const out = renderEnvelope(fields, "hello");
       expect(out).toBe(
-        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" channel="workers" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>',
+        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" channel="workers" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>' + `\n\n${ECONOMY_FOOTER}`,
       );
     });
 
@@ -109,7 +163,7 @@ describe("renderEnvelope", () => {
       };
       const out = renderEnvelope(fields, "hello");
       expect(out).toBe(
-        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" to="ses_target" msg_id="msg_123" reply_to="msg_000" priority="normal">\nhello\n</swarm_message>',
+        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" to="ses_target" msg_id="msg_123" reply_to="msg_000" priority="normal">\nhello\n</swarm_message>' + `\n\n${ECONOMY_FOOTER}`,
       );
     });
 
@@ -126,7 +180,7 @@ describe("renderEnvelope", () => {
       };
       const out = renderEnvelope(fields, "hello");
       expect(out).toBe(
-        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>',
+        '<swarm_message v="1" kind="wake.scheduled" from="ses_sender" msg_id="msg_123" priority="normal">\nhello\n</swarm_message>' + `\n\n${ECONOMY_FOOTER}`,
       );
     });
   });
@@ -140,7 +194,7 @@ describe("renderEnvelope", () => {
       };
       const out = renderEnvelope(fields, "hello");
       expect(out).toBe(
-        '<swarm_message v="1" kind="task.assign" from="ses_a" to="ses_b" msg_id="msg_01h" priority="normal" scheduled_for="2026-02-02T09:20:00.000Z" delivered_late_ms="742000">\nhello\n</swarm_message>',
+        '<swarm_message v="1" kind="task.assign" from="ses_a" to="ses_b" msg_id="msg_01h" priority="normal" scheduled_for="2026-02-02T09:20:00.000Z" delivered_late_ms="742000">\nhello\n</swarm_message>' + `\n\n${ECONOMY_FOOTER}`,
       );
     });
 

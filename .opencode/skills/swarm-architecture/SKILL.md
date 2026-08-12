@@ -80,6 +80,27 @@ Attributes:
 
 The payload is XML-escaped for `&`, `<`, `>` (see `envelope.ts` for the exact encoder).
 
+### Message-economy footer
+
+Every message whose `to` is **not** the sender gets `ECONOMY_FOOTER` appended
+*after* the close tag, separated by a blank line:
+
+```
+</swarm_message>
+
+[pigeon] Message economy — the unit of cost is the message, not the word. ...
+```
+
+Two invariants, both load-bearing:
+
+- **Outside the envelope, never inside.** The body between the tags stays
+  exactly the sender's payload, so a receiver reading "everything between the
+  tags" never attributes daemon prose to the sender.
+- **Self-addressed messages are exempt** (`to === from`, i.e. the scheduled
+  self-wake). There is no back-and-forth to deter, and the tokens would be
+  spent on every wake forever. Note a *scheduled* message aimed at **another**
+  session still gets the footer — scheduling does not make a peer message free.
+
 ## Routes
 
 ### `POST /swarm/send`
