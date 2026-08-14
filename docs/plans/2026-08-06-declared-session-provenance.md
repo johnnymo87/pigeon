@@ -12,11 +12,30 @@
 
 **Status (2026-08-13):** shipped and verified in production. The TTL added later by
 `pigeon-qdcb.12` carried a P1 defect — see the callout at Task 5 — fixed by `pigeon-n097`
-(PR #107) and confirmed against 12h of real lgtm traffic. Two deliberate follow-ups are filed
-and **not** started: `pigeon-vske` (P3, replace the global TTL dial with a per-row `expires_at`;
-its own bead says not to start it absent a second workload with a different window) and
-`pigeon-60sw` (P2, a human can permanently make a session loud but not permanently quiet —
-confirm the need before building).
+(PR #107) and confirmed against 12h of real lgtm traffic. 
+
+**The global TTL dial stays (2026-08-14).** `pigeon-vske` proposed replacing it with a per-row
+`expires_at` written by the caller. Investigated on request, consulted, and **closed without
+building**: the feature has no users. All 216 `session_origin` rows are `lgtm`/`errors-only`/
+`declared` — one origin has ever existed — and there is still exactly one external writer, because
+**Task 6's `opencode-launch --origin` never shipped** (verified against both the nix package and
+the deployed binary). Both proposed beneficiaries dissolve: lgtm would write `now+2h`, byte-identical
+to the current default, and a *human* standing rule belongs to `source='override'` (already
+TTL-exempt before any clock read, already protected by the rank guard) rather than to an expiry
+column. Reopen triggers are recorded on the bead; if they fire, the designated first response is
+**per-origin defaults inside the daemon** — a map from origin to TTL, no migration and no writer
+change — not per-row expiry, which is only justified if two workloads under the *same* origin need
+different windows.
+
+That investigation surfaced a real defect the TTL work had been obscuring: **`POST
+/sessions/enable-notify` has zero production callers.** Only daemon source and tests reference it —
+no Telegram command, no CLI, no plugin path. The comment in `notify-policy.ts` calls it "the durable
+escape hatch", and it is durable in *semantics*, but reaching it requires a hand-written curl with
+the machine's auth token. So the `override` mechanism that makes a human decision permanent is
+effectively unreachable in **both** directions: a human cannot durably silence a session
+(`pigeon-60sw`, P2), and a human who adopts an lgtm session is re-silenced for the TTL on every
+automated re-declaration with no practical escape. The write paths are missing, not the semantics.
+`pigeon-60sw` is unstarted pending confirmation that a standing quiet rule is actually wanted.
 
 ---
 
