@@ -10,6 +10,14 @@
 
 **Beads:** epic `pigeon-qdcb`, tasks `pigeon-qdcb.1` … `pigeon-qdcb.6`.
 
+**Status (2026-08-13):** shipped and verified in production. The TTL added later by
+`pigeon-qdcb.12` carried a P1 defect — see the callout at Task 5 — fixed by `pigeon-n097`
+(PR #107) and confirmed against 12h of real lgtm traffic. Two deliberate follow-ups are filed
+and **not** started: `pigeon-vske` (P3, replace the global TTL dial with a per-row `expires_at`;
+its own bead says not to start it absent a second workload with a different window) and
+`pigeon-60sw` (P2, a human can permanently make a session loud but not permanently quiet —
+confirm the need before building).
+
 ---
 
 ## Background — read this before touching anything
@@ -935,6 +943,30 @@ every lgtm dispatch immediately. It is a *reconciliation*, not the primary write
 after `opencode-launch` has already prompted the session, so a session that errors within
 milliseconds can still emit one Stop before the mark lands. That is fail-open noise, and it
 is rare — accept it, and let Task 6 close it properly.
+
+> **⚠️ "Reconciliation" here means ORDERING, not a timer. This sentence was misread once and it
+> cost a P1.** The word above describes *when* the write happens relative to the prompt — it is a
+> post-hoc backstop rather than an ordering-correct launcher write. It fires **once per dispatch**.
+> It is **not** a sweep, a heartbeat, or a periodic re-declaration of known sessions.
+>
+> Two days later, `pigeon-qdcb.12`'s TTL commit (`c031472`) generalised the word into exactly that,
+> shipping a comment asserting that "repeated identical declared writes from the reconciliation
+> writer … would extend quiet status forever" and choosing a `created_at` clock to defend against
+> it. **That writer has never existed.** The consequence (`pigeon-n097`, P1): re-declaring quiet
+> could not extend the window, so every lgtm re-review on a session older than the TTL leaked a
+> swarm notice and a Stop into Telegram — 162 of 162 quiet rows were expired and delivering. lgtm
+> was already re-declaring before each re-prompt *specifically* to prevent that
+> (`lgtm/src/dispatch.ts:230`), and the daemon discarded the declaration.
+>
+> Fixed by `pigeon-n097` (PR #107): the clock is now `declared_at`, refreshed only on a genuine
+> policy write. Verified on 12h of real traffic — 32 declarations across 27 sessions, 39
+> suppressions, **0** `automated quiet expired`, three genuine reawakens (gaps 24.8h/19.8h/2.5h)
+> each suppressed, and 145 ordinary notifications still delivered.
+>
+> The general lesson is worth more than the fix: **a comment that confidently explains a design
+> decision can be defending against a hypothetical.** The rationale read as deliberate for four
+> days. What settled it was counting the writer's actual calls (14/day, all adjacent to a dispatch)
+> rather than trusting the prose. When a comment names a mechanism, check that the mechanism exists.
 
 **Step 1: Write the failing test** in `tests/dispatch.test.ts`, asserting that `dispatch()`
 POSTs `{session_id, origin: "lgtm", notify_policy: "errors-only"}` to
