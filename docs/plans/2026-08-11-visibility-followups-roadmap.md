@@ -77,6 +77,12 @@ fleet skew B exists to close. Do not burn a cycle rediscovering any of this.
 `pigeon-nwrt` (P4 — restore the mirror for a main session whose `session.get` failed) and
 `pigeon-umyr` (P3 — a demoted subagent leaves a stale daemon registration and an orphan topic).
 
+**Successor spine, 2026-08-15:** item **A** gated the mirror and swarm feed on the notify policy but
+left the *shape* of that policy decision alone — it is still derived in three places and omitted in
+a fourth (`POST /question-asked`). That debt, plus the global quiet TTL, is tracked separately in
+`docs/plans/2026-08-15-quiet-policy-matrix-roadmap.md` (bead `pigeon-5ies`). Nothing there blocks
+**B**.
+
 ---
 
 ## §1 — OPERATING HAZARDS
