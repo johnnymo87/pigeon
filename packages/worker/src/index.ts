@@ -4,7 +4,7 @@ import { handleTelegramWebhook } from "./webhook";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
-import { runTopicReaper } from "./topic-reaper";
+import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -93,7 +93,7 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     // Every step is individually wrapped. These are independent janitorial jobs, and one
     // of them throwing is not a reason to skip the rest — before this, a throw in the
     // very first would have silently cancelled the session sweep, the capacity alert and
@@ -119,10 +119,10 @@ export default {
     // survives cleanup. Measuring first would nag about rows that are about to be
     // deleted in this same tick, training the reader to ignore the alert.
     //
-    // The sweep also runs BEFORE the topic reaper so that topics orphaned by the sweep
-    // start draining immediately rather than waiting an hour. Note "start": the reaper
-    // closes at most DEFAULT_ORPHAN_CAP (5) orphans per tick, so a bulk sweep's topics
-    // drain over several hours, not in this one.
+    // The sweep also runs BEFORE the topic reaper so that topics orphaned by the sweep are
+    // visible to it on this same tick. Note that the orphan half only acts during the daily
+    // close window (see shouldCloseOrphans), and closes at most DEFAULT_ORPHAN_CAP (30) per
+    // tick, so a bulk sweep's topics drain over the window's ticks — possibly tomorrow's.
     try {
       await sweepStaleSessions(env.DB);
     } catch (err) {
@@ -134,7 +134,13 @@ export default {
       console.error("Session high-water alert failed:", err);
     }
     try {
-      await runTopicReaper(env.DB, env);
+      // The orphan-closer is gated to a daily window (pigeon-4890) because each close posts a
+      // service message that marks the topic unread; the reap half still runs every tick.
+      // `scheduledTime` is the cron tick's own timestamp, so the gate cannot drift with however
+      // long the jobs above took.
+      await runTopicReaper(env.DB, env, {
+        closeOrphans: shouldCloseOrphans(controller.scheduledTime),
+      });
     } catch (err) {
       console.error("Topic reaper failed:", err);
     }

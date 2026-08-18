@@ -243,6 +243,19 @@ Photos, documents, audio, video, and voice messages sent to the Telegram bot are
 
 Media is stored temporarily in the `pigeon-media` R2 bucket with a 24-hour TTL, cleaned hourly by cron.
 
+### Topic Reaper and the daily close window
+
+The worker's hourly cron (`crons = ["0 * * * *"]`) runs two janitorial topic jobs, on **different cadences on purpose** (`pigeon-4890`):
+
+- **Reap** — `deleteForumTopic` on rows closed more than 30 days ago. Runs every tick. Deletion posts nothing into the group, so it is invisible in the sidebar and there is nothing to batch.
+- **Close orphans** — `closeForumTopic` on `state='open'` rows whose session is gone or idle past the 7-day TTL. Runs **only during UTC hours 12–15**, up to `DEFAULT_ORPHAN_CAP` (30) per tick.
+
+Closing a forum topic makes Telegram post a service message into it, which marks the topic **unread**. Running the closer every hour trickled newly-unread topics into the sidebar around the clock; gating it to a morning window collapses that into one batch at 12:00 UTC (08:00 ET).
+
+The window is four hours rather than one tick **instead of** a durable "last run was cut short" flag: `closeOrphanedTopics` aborts the whole run on a Telegram 429, and a backlog can exceed the cap, so hours 13–15 are a stateless catch-up. On an ordinary day the 12:00 tick drains everything and the later ticks find zero orphans and post nothing, so the catch-up is invisible unless needed. Changing the schedule means editing `TOPIC_CLOSE_WINDOW_START_HOUR_UTC` / `TOPIC_CLOSE_WINDOW_HOURS` in `packages/worker/src/topic-reaper.ts` and redeploying — it is a constant, not a `wrangler.toml` var, because a var change requires a deploy anyway.
+
+The gate reads `ScheduledController.scheduledTime` (the tick's own timestamp), not `Date.now()`, so it cannot drift with however long the earlier cron jobs took. Topic closes triggered by ordinary session lifecycle — `/kill`, `POST /sessions/unregister`, the daemon's reaper — are **not** gated and still happen immediately; the window governs only the janitorial sweep.
+
 ### Session Reaper
 
 A background hourly timer in the daemon cleans up stale Pigeon routing state. Sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week) are removed from local storage and unregistered from the worker, but their opencode transcripts are preserved. `opencode-serve` is restarted separately for process hygiene.
