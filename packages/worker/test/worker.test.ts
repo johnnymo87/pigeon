@@ -48,8 +48,12 @@ import {
   runTopicReaper,
   reapTopics,
   closeOrphanedTopics,
+  shouldCloseOrphans,
   REAP_TTL_MS,
   ORPHAN_TTL_MS,
+  DEFAULT_ORPHAN_CAP,
+  TOPIC_CLOSE_WINDOW_START_HOUR_UTC,
+  TOPIC_CLOSE_WINDOW_HOURS,
 } from "../src/topic-reaper";
 import {
   verifyWebhookSecret,
@@ -9584,6 +9588,157 @@ describe("topics module and topicName", () => {
       expect(deleted).toBe(true);
     });
 
+  });
+
+  // ─── pigeon-4890: daily topic-close window ─────────────────────────────────
+  //
+  // The orphan-closer posts a "topic closed" service message, which marks the topic UNREAD in
+  // the Telegram sidebar. Firing it on every hourly cron trickled those into the unread feed all
+  // day. It is now gated to a morning UTC window so the day's closures land in one batch, with
+  // the trailing hours of the window acting as a stateless catch-up for a 429 or an over-cap day.
+
+  describe("pigeon-4890: daily topic-close window", () => {
+    const topicChatId = "-1009900004890";
+    const botToken = "fake-bot-token";
+    const testEnv = {
+      TELEGRAM_TOPICS_ENABLED: "true",
+      TELEGRAM_BOT_TOKEN: botToken,
+    };
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    /** Epoch ms for a given UTC hour on a fixed date. */
+    function atUtcHour(hour: number): number {
+      return Date.UTC(2026, 7, 18, hour, 0, 0);
+    }
+
+    /** An open, finalized topic whose session row is absent => an orphan. */
+    async function seedOrphan(sessionId: string, threadId: number, now: number) {
+      const old = now - 8 * 86400 * 1000;
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: `pigeon · ${sessionId}`,
+        now: old,
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: old });
+    }
+
+    it("(a) the window opens at the configured hour and spans the configured number of hours", () => {
+      const start = TOPIC_CLOSE_WINDOW_START_HOUR_UTC;
+
+      expect(shouldCloseOrphans(atUtcHour(start))).toBe(true);
+      expect(shouldCloseOrphans(atUtcHour(start + TOPIC_CLOSE_WINDOW_HOURS - 1))).toBe(true);
+
+      expect(shouldCloseOrphans(atUtcHour(start - 1))).toBe(false);
+      expect(shouldCloseOrphans(atUtcHour(start + TOPIC_CLOSE_WINDOW_HOURS))).toBe(false);
+      expect(shouldCloseOrphans(atUtcHour(0))).toBe(false);
+    });
+
+    it("(b) closeOrphans:false skips the orphan-closer entirely, leaving the row open", async () => {
+      const now = atUtcHour(3);
+      await seedOrphan("ses_4890_gated", 68010, now);
+
+      let closeCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => {
+          closeCalls++;
+          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
+        });
+
+      const res = await runTopicReaper(env.DB, testEnv, { now, closeOrphans: false });
+
+      expect(res.closedOrphans).toBe(0);
+      expect(closeCalls).toBe(0);
+      expect((await getBySession(env.DB, "ses_4890_gated"))?.state).toBe("open");
+    });
+
+    it("(c) a batch larger than the old per-hour cap of 5 drains in a single run", async () => {
+      const now = atUtcHour(TOPIC_CLOSE_WINDOW_START_HOUR_UTC);
+      const batch = 8;
+      expect(DEFAULT_ORPHAN_CAP).toBeGreaterThanOrEqual(batch);
+
+      for (let i = 0; i < batch; i++) {
+        await seedOrphan(`ses_4890_batch_${i}`, 68100 + i, now);
+      }
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => ({ statusCode: 200, data: JSON.stringify({ ok: true, result: true }) }))
+        .persist();
+
+      const res = await runTopicReaper(env.DB, testEnv, { now });
+
+      // >= rather than ==: earlier cases in this describe leave their own orphans behind, and
+      // the point of the assertion is that ONE run drains more than the old cap of 5.
+      expect(res.closedOrphans).toBeGreaterThanOrEqual(batch);
+      for (let i = 0; i < batch; i++) {
+        expect((await getBySession(env.DB, `ses_4890_batch_${i}`))?.state).toBe("closed");
+      }
+    });
+
+    it("(d) scheduled() outside the window leaves an orphan open (pins the cron wiring)", async () => {
+      const now = atUtcHour(TOPIC_CLOSE_WINDOW_START_HOUR_UTC - 1);
+      const sessionId = "ses_4890_cron_outside";
+      await seedOrphan(sessionId, 68200, now);
+
+      let closeCalls = 0;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => {
+          closeCalls++;
+          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
+        })
+        .persist();
+
+      const cronEnv = { ...env, ...testEnv } as Env;
+      const ctx = createExecutionContext();
+      await worker.scheduled(
+        { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
+        cronEnv,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+
+      expect(closeCalls).toBe(0);
+      expect((await getBySession(env.DB, sessionId))?.state).toBe("open");
+    });
+
+    it("(e) scheduled() inside the window closes the orphan", async () => {
+      const now = atUtcHour(TOPIC_CLOSE_WINDOW_START_HOUR_UTC);
+      const sessionId = "ses_4890_cron_inside";
+      await seedOrphan(sessionId, 68300, now);
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
+        .reply(() => ({ statusCode: 200, data: JSON.stringify({ ok: true, result: true }) }))
+        .persist();
+
+      const cronEnv = { ...env, ...testEnv } as Env;
+      const ctx = createExecutionContext();
+      await worker.scheduled(
+        { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
+        cronEnv,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+
+      expect((await getBySession(env.DB, sessionId))?.state).toBe("closed");
+    });
   });
 
   // ─── Task T2.15: Webhook confirmations echo message_thread_id ───────────────

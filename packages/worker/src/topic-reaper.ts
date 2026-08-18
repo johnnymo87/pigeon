@@ -11,7 +11,41 @@ import {
 export const REAP_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const ORPHAN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (matches daemon's SESSION_TTL_MS)
 export const DEFAULT_REAP_CAP = 5;
-export const DEFAULT_ORPHAN_CAP = 5;
+export const DEFAULT_ORPHAN_CAP = 30;
+
+/**
+ * pigeon-4890 — the orphan-closer only runs during a morning UTC window.
+ *
+ * Closing a forum topic makes Telegram post a service message into it, which marks the topic
+ * UNREAD. Running the closer on every hourly cron therefore trickled up to DEFAULT_ORPHAN_CAP
+ * newly-unread topics into the sidebar around the clock. Batching them into one window turns
+ * that into a single moment of the day.
+ *
+ * The window is HOURS long rather than a single tick on purpose, and it replaces a durable
+ * "last run was cut short" flag with something stateless: `closeOrphanedTopics` aborts the whole
+ * run on a Telegram 429, and a backlog can exceed the per-run cap, so the trailing hours act as
+ * catch-up. On an ordinary day the first tick drains everything and the remaining ticks find zero
+ * orphans and post nothing at all, so the catch-up is invisible unless it is needed.
+ *
+ * 12:00 UTC is 08:00 US Eastern / 07:00 Central — the start of the operator's day.
+ */
+export const TOPIC_CLOSE_WINDOW_START_HOUR_UTC = 12;
+export const TOPIC_CLOSE_WINDOW_HOURS = 4;
+
+/**
+ * Whether a cron tick at `now` is inside the daily topic-close window.
+ *
+ * Takes the tick time explicitly (callers pass `ScheduledController.scheduledTime`) so the
+ * decision is a pure function of the cron schedule rather than of wall-clock drift inside the
+ * handler.
+ */
+export function shouldCloseOrphans(now: number): boolean {
+  const hour = new Date(now).getUTCHours();
+  return (
+    hour >= TOPIC_CLOSE_WINDOW_START_HOUR_UTC &&
+    hour < TOPIC_CLOSE_WINDOW_START_HOUR_UTC + TOPIC_CLOSE_WINDOW_HOURS
+  );
+}
 
 export interface ReapTopicsOptions {
   botToken: string;
@@ -47,6 +81,11 @@ export interface RunTopicReaperOptions {
   reapCap?: number;
   orphanCap?: number;
   tgClient?: TelegramClient;
+  /**
+   * Run the orphan-closer this tick. Defaults to true so the reaper stays window-agnostic —
+   * the cron handler owns the schedule decision via `shouldCloseOrphans`.
+   */
+  closeOrphans?: boolean;
 }
 
 export interface TopicReaperResult {
@@ -192,6 +231,12 @@ export async function runTopicReaper(
       closedOrphans: 0,
       rateLimited: true,
     };
+  }
+
+  // Reaping stays on the hourly cadence: deleteForumTopic removes the topic outright and posts
+  // no service message, so it is silent in the sidebar and there is nothing to batch.
+  if (opts.closeOrphans === false) {
+    return { reaped: reapRes.reaped, closedOrphans: 0, rateLimited: false };
   }
 
   const orphanRes = await closeOrphanedTopics(db, {
