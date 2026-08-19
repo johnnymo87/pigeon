@@ -1191,6 +1191,16 @@ blast radius but **do not cure the outage**.
 >   Enabling observability does **not** fix "noticed late". Needs Logpush to a durable sink (dashboard/
 >   account config, not wrangler.toml) **and** a daemon-side consecutive-5xx alert. This is the true
 >   server-durability successor to `pigeon-dul`.
+>
+>   **CORRECTION 2026-08-19 (`pigeon-5typ`).** "Consecutive-**5xx** alert" was the wrong spec, and
+>   building exactly it would have missed the incident it was written for. The alarm shipped as
+>   specified (PR #95) and treated every 4xx as neutral — but the 2026-07-14 outage was most likely a
+>   **429** from the session cap on `/sessions/register` (evidence on `pigeon-dul`), so the alarm built
+>   in response to that outage would have stayed silent through it. A sustained 4xx on a write route is
+>   a total outage for that function while the worker stays perfectly healthy. Fixed by adding a
+>   `client_error` class covering all 4xx. Read the spec as "consecutive-**failure** alert". Residual
+>   gap, now explicit: it detects only TOTAL failure of an endpoint, because any success clears the
+>   consecutive counter — a fault rejecting only a subset of payloads stays invisible (`pigeon-b6h4`).
 > - `pigeon-kdr` (P3): `send.insertMessage` fails *after* Telegram already sent → retry re-sends →
 >   duplicate messages during a D1 flap. Pre-existing (not a 5a regression); 5a merely made it
 >   observable. Real fix = reserve the dedup row before the Telegram call.

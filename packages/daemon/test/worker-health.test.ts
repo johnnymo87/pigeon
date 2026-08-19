@@ -6,6 +6,8 @@ import {
   SERVER_ERROR_MIN_SPAN_MS,
   TRANSPORT_THRESHOLD,
   TRANSPORT_MIN_SPAN_MS,
+  CLIENT_ERROR_THRESHOLD,
+  CLIENT_ERROR_MIN_SPAN_MS,
   classifyWorkerHealthSample,
 } from "../src/worker/worker-health";
 
@@ -45,6 +47,15 @@ function transportError(error = "fetch failed"): WorkerResult {
   return { ok: false, kind: "transport_error", error };
 }
 
+/**
+ * Same shape as `serverError`, named for the 4xx range so the intent of a test reads
+ * correctly. `serverError(404)` was always a misnomer -- it builds an http_error at
+ * whatever status you pass.
+ */
+function clientError(status = 404, body?: unknown): WorkerResult {
+  return { ok: false, kind: "http_error", status, ...(body !== undefined ? { body } : {}) };
+}
+
 function success(): WorkerResult {
   return { ok: true, kind: "success", status: 200, body: { ok: true } };
 }
@@ -59,6 +70,21 @@ function driveServerErrors(
 ): void {
   for (let i = 0; i < count; i++) {
     monitor.record(endpoint, serverError());
+    clock.now += stepMs;
+  }
+}
+
+/** Records `count` client errors, advancing the shared clock by `stepMs` after each. */
+function driveClientErrors(
+  monitor: WorkerHealthMonitor,
+  clock: { now: number },
+  count: number,
+  stepMs: number,
+  endpoint: "register" | "send" = "send",
+  status = 404,
+): void {
+  for (let i = 0; i < count; i++) {
+    monitor.record(endpoint, clientError(status));
     clock.now += stepMs;
   }
 }
@@ -87,11 +113,44 @@ describe("classifyWorkerHealthSample", () => {
     expect(classifyWorkerHealthSample(transportError())).toBe("transport");
   });
 
-  it("treats 4xx as neutral — the worker answered, but that is not evidence the 5xx cleared", () => {
-    expect(classifyWorkerHealthSample(serverError(400))).toBe("neutral");
-    expect(classifyWorkerHealthSample(serverError(403))).toBe("neutral");
-    expect(classifyWorkerHealthSample(serverError(404))).toBe("neutral");
-    expect(classifyWorkerHealthSample(serverError(429))).toBe("neutral");
+  /**
+   * REVERSAL (pigeon-5typ). These four were asserted `neutral` until 2026-08-19, on the
+   * grounds that a 4xx proves the worker is answering. True, and beside the point: a
+   * SUSTAINED 4xx on a write route is a total outage for that function while the worker
+   * stays perfectly healthy. The 2026-07-14 outage was most likely a 429 from the session
+   * cap on register, so the alarm built in response to it would have stayed silent through
+   * it.
+   *
+   * The original insight is preserved rather than discarded: a 4xx still must not CLEAR a
+   * 5xx episode. It now extends an episode of its OWN class, which is what keeps a stream
+   * of 404s from masking a live 5xx outage.
+   */
+  it("classifies every 4xx as a client error, including the July session-cap 429", () => {
+    expect(classifyWorkerHealthSample(clientError(400))).toBe("client_error");
+    expect(classifyWorkerHealthSample(clientError(401))).toBe("client_error");
+    expect(classifyWorkerHealthSample(clientError(403))).toBe("client_error");
+    expect(classifyWorkerHealthSample(clientError(404))).toBe("client_error");
+    expect(classifyWorkerHealthSample(clientError(429))).toBe("client_error");
+    expect(classifyWorkerHealthSample(clientError(499))).toBe("client_error");
+  });
+
+  /**
+   * A worker 400 is counted, which looks like it contradicts the 502/Telegram-400 carve-out
+   * below. It does not, and the difference is mechanical rather than a matter of taste.
+   *
+   * A Telegram 400 never reaches the daemon as an HTTP 400 -- it arrives as a 502 carrying
+   * `details.error_code` (delivery-policy.ts rule 6). A 502 is a 5xx, so `isTransportFailure`
+   * calls it transient and it is NEVER charged an outbox attempt: one poisoned message
+   * retries until the age cap and would trip the alarm by itself. Hence the carve-out.
+   *
+   * A worker 400 is worker field validation only, and delivery-policy rule 4 makes it
+   * TERMINAL -- the entry dies after a single attempt and cannot repeat. So five consecutive
+   * 400s require five DISTINCT rejected entries, which means daemon/worker version skew:
+   * the worker started requiring a field this daemon does not send. That is silent,
+   * permanent message loss on every notification, and nothing else alarms on it.
+   */
+  it("counts a worker 400 (field validation) because it is terminal, not a retry loop", () => {
+    expect(classifyWorkerHealthSample(clientError(400))).toBe("client_error");
   });
 
   it("treats app_rejection (2xx carrying ok:false) as neutral", () => {
@@ -253,12 +312,197 @@ describe("WorkerHealthMonitor — server error episodes", () => {
     const { sink, monitor } = createMonitor(clock);
 
     driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD - 1, 30_000);
-    monitor.record("send", serverError(400));
+    // A 502 relaying a Telegram 400 is the neutral case that survives pigeon-5typ; a plain
+    // 4xx is no longer neutral and would now open an episode of its own class.
+    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
     clock.now += 30_000;
     expect(sink.alerts).toHaveLength(0);
 
     monitor.record("send", serverError());
     expect(sink.alerts).toHaveLength(1);
+  });
+});
+
+describe("WorkerHealthMonitor — sustained 4xx (pigeon-5typ)", () => {
+  it("trips after the threshold once the time floor is cleared", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD, CLIENT_ERROR_MIN_SPAN_MS / 4);
+
+    expect(sink.alerts).toHaveLength(1);
+    expect(sink.alerts[0]!.severity).toBe("error");
+    expect(sink.alerts[0]!.refMsgId).toBe("worker4xx:send:1000000");
+    expect(sink.alerts[0]!.text).toContain("4xx");
+  });
+
+  /**
+   * The floor is the guard that separates a janitorial burst from an outage. A reaped
+   * session's entry is terminal after at most a re-register and one retry, so a cleanup
+   * cluster drains within a tick or two of the 5s outbox loop. Sustaining 4xx for five
+   * minutes requires doomed entries to keep ARRIVING, which cleanup does not do.
+   */
+  it("does NOT trip on a fast burst that clears the count but not the floor", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD * 3, 1_000);
+
+    expect(sink.alerts).toHaveLength(0);
+  });
+
+  /**
+   * Pins the floor at the exact boundary. The looser burst test above only proves the floor
+   * is longer than a few seconds; this one fails if the floor is shortened, lengthened, or
+   * if the comparison flips between `<` and `<=`.
+   */
+  it("does not trip until the floor is actually crossed", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    // Count satisfied immediately, so only the floor is under test.
+    for (let i = 0; i < CLIENT_ERROR_THRESHOLD; i++) {
+      monitor.record("send", clientError());
+    }
+    clock.now += CLIENT_ERROR_MIN_SPAN_MS - 1;
+    monitor.record("send", clientError());
+    expect(sink.alerts).toHaveLength(0);
+
+    clock.now += 1;
+    monitor.record("send", clientError());
+    expect(sink.alerts).toHaveLength(1);
+  });
+
+  /**
+   * The scenario the floor exists to tolerate, in ABSOLUTE time so that shortening the floor
+   * breaks this test. The tests above are all written relative to CLIENT_ERROR_MIN_SPAN_MS
+   * and therefore scale with it, which means none of them can detect the constant being
+   * lowered — the exact change that would make this alarm noisy.
+   *
+   * Basis: a reaped session's outbox entry 404s, may burn one re-registration, and is then
+   * terminal, so it contributes about two samples spaced by the 5s tick and the first
+   * backoff step. A handful of such entries draining together is ordinary janitorial
+   * traffic and can stretch over a couple of minutes. It must not page anyone.
+   */
+  it("tolerates a reaped-session cleanup cluster draining over two minutes", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    for (let i = 0; i < CLIENT_ERROR_THRESHOLD * 2; i++) {
+      monitor.record("send", clientError(404));
+      clock.now += 30_000;
+    }
+
+    expect(sink.alerts).toHaveLength(0);
+  });
+
+  it("does NOT trip below the threshold even after a long span", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD - 1, CLIENT_ERROR_MIN_SPAN_MS);
+
+    expect(sink.alerts).toHaveLength(0);
+  });
+
+  /**
+   * The success path hand-enumerates the classes it clears, so a forgotten third class
+   * fails SILENTLY: the episode would never clear, never re-alert, and never send a
+   * recovery. That is the failure this test exists to catch.
+   */
+  it("clears a tripped 4xx episode on the next success and emits a recovery", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD, CLIENT_ERROR_MIN_SPAN_MS / 4);
+    expect(sink.alerts).toHaveLength(1);
+
+    monitor.record("send", success());
+
+    expect(sink.alerts).toHaveLength(2);
+    expect(sink.alerts[1]!.severity).toBe("info");
+    expect(sink.alerts[1]!.refMsgId).toBe("worker4xxok:send:1000000");
+    expect(sink.alerts[1]!.text).toContain("recovered");
+
+    // And the cleared episode can trip again rather than being wedged shut.
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD, CLIENT_ERROR_MIN_SPAN_MS / 4);
+    expect(sink.alerts).toHaveLength(3);
+    expect(sink.alerts[2]!.severity).toBe("error");
+  });
+
+  it("keeps 4xx and 5xx episodes independent — neither clears the other", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    // Interleave: each class accrues its own count, and neither resets the other.
+    for (let i = 0; i < SERVER_ERROR_THRESHOLD - 1; i++) {
+      monitor.record("send", serverError());
+      monitor.record("send", clientError(429));
+      clock.now += 30_000;
+    }
+    expect(sink.alerts).toHaveLength(0);
+
+    monitor.record("send", serverError());
+    expect(sink.alerts).toHaveLength(1);
+    expect(sink.alerts[0]!.refMsgId).toContain("worker5xx:");
+  });
+
+  it("tracks 4xx per endpoint, so register and send alert independently", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    for (let i = 0; i < CLIENT_ERROR_THRESHOLD; i++) {
+      monitor.record("send", clientError(404));
+      monitor.record("register", clientError(429));
+      clock.now += CLIENT_ERROR_MIN_SPAN_MS / 4;
+    }
+
+    expect(sink.alerts).toHaveLength(2);
+    const refs = sink.alerts.map((a) => a.refMsgId).sort();
+    expect(refs).toEqual(["worker4xx:register:1000000", "worker4xx:send:1000000"]);
+  });
+
+  /**
+   * The 5xx send text promises "the daemon outbox is holding and retrying". For a 4xx that
+   * is a false reassurance: delivery-policy makes 400 terminal and 404 terminal once
+   * re-registration is spent, so those entries are DROPPED, not held. Telling an operator
+   * their messages are safe while they are being lost is worse than saying nothing.
+   */
+  it("does not promise the outbox is holding when a 4xx may be dropping entries", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    driveClientErrors(monitor, clock, CLIENT_ERROR_THRESHOLD, CLIENT_ERROR_MIN_SPAN_MS / 4);
+
+    const text = sink.alerts[0]!.text;
+    expect(text).not.toContain("the daemon outbox is holding and retrying");
+    expect(text).toMatch(/drop|lost|terminal/i);
+  });
+
+  it("a success clears all THREE classes for that endpoint", () => {
+    const clock = { now: 1_000_000 };
+    const { sink, monitor } = createMonitor(clock);
+
+    for (let i = 0; i < SERVER_ERROR_THRESHOLD - 1; i++) {
+      monitor.record("send", serverError());
+      clock.now += 30_000;
+    }
+    for (let i = 0; i < TRANSPORT_THRESHOLD - 1; i++) {
+      monitor.record("send", transportError());
+      clock.now += 120_000;
+    }
+    for (let i = 0; i < CLIENT_ERROR_THRESHOLD - 1; i++) {
+      monitor.record("send", clientError());
+      clock.now += 120_000;
+    }
+
+    monitor.record("send", success());
+
+    // Every class restarted from zero: one more failure of each must not reach a threshold.
+    monitor.record("send", serverError());
+    monitor.record("send", transportError());
+    monitor.record("send", clientError());
+    expect(sink.alerts).toHaveLength(0);
   });
 });
 
@@ -424,7 +668,7 @@ describe("WorkerHealthMonitor — robustness", () => {
     expect(logged[0]!.fields?.telegramErrorCode).toBe(400);
   });
 
-  it("does not log a plain 4xx — only a 5xx it chose not to count", () => {
+  it("does not log an uncounted 5xx below the alarm, nor a routine 4xx that clears", () => {
     const clock = { now: 1_000_000 };
     const logged: string[] = [];
     const monitor = new WorkerHealthMonitor({
@@ -433,7 +677,10 @@ describe("WorkerHealthMonitor — robustness", () => {
       log: (msg) => logged.push(msg),
     });
 
-    monitor.record("send", serverError(404));
+    // A single 4xx followed by a success is ordinary traffic (a reaped session's entry):
+    // it opens an episode that clears before ever reaching the threshold, and since the
+    // episode never alerted there is nothing to report.
+    monitor.record("send", clientError(404));
     monitor.record("send", success());
 
     expect(logged).toEqual([]);
