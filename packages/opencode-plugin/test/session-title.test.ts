@@ -634,6 +634,68 @@ describe("Session Title Management", () => {
         })
       })
 
+      test("mid-turn file attachment with empty summary at pre-question flush is not lost", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_q_file", title: "File Question Session" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "message.updated",
+            properties: { info: { id: "msg_q_1", sessionID: "ses_q_file", role: "assistant" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "message.part.updated",
+            properties: {
+              part: {
+                id: "part_f_1",
+                sessionID: "ses_q_file",
+                messageID: "msg_q_1",
+                type: "file",
+                mime: "image/png",
+                filename: "diagram.png",
+                url: "data:image/png;base64,diagramdata",
+              },
+            },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "question.asked",
+            properties: {
+              id: "q_file_1",
+              sessionID: "ses_q_file",
+              questions: [{ question: "Does diagram look correct?", header: "Review", options: [] }],
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_q_file",
+              media: [
+                {
+                  mime: "image/png",
+                  filename: "diagram.png",
+                  url: "data:image/png;base64,diagramdata",
+                },
+              ],
+            })
+          )
+        })
+      })
+
       test("session.error passes event: 'Error' and prepends turn narration to notifyStop", async () => {
         const mockCtx = createMockCtx()
         const hooks = await plugin(mockCtx)

@@ -653,32 +653,33 @@ const plugin: Plugin = async (ctx) => {
 
            // Flush any unnotified assistant text as a stop notification.
            // Fire-and-forget: stop flush failure must NOT block question delivery.
-           const currentMsgId = messageTail.getCurrentMessageId(sessionID)
-           if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
-             sessionManager.setNotified(sessionID, currentMsgId!)
-             const files = messageTail.getFiles(sessionID)
-             const summary = messageTail.consume(sessionID)
-             if (summary) {
-               // Fully detach: don't await the footer fetch inside the handler
-               void (async () => {
-                 try {
-                   const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
-                   const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
-                   await notifyStop({
-                     sessionId: sessionID,
-                     message: messageWithFooter,
-                     label,
-                     title: sessionManager.getTitle(sessionID),
-                     media: files.length > 0 ? files : undefined,
-                     daemonUrl,
-                     log,
-                   })
-                 } catch (err) {
-                   log("stop flush before question failed (non-blocking):", serializeError(err))
-                 }
-               })()
-             }
-           }
+            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
+            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
+              sessionManager.setNotified(sessionID, currentMsgId!)
+              const files = messageTail.getFiles(sessionID)
+              const summary = messageTail.consume(sessionID)
+              if (summary || files.length > 0) {
+                // Fully detach: don't await the footer fetch inside the handler
+                void (async () => {
+                  try {
+                    const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+                    const body = summary || "Output files attached"
+                    const messageWithFooter = tokenFooter ? `${body}\n\n${tokenFooter}` : body
+                    await notifyStop({
+                      sessionId: sessionID,
+                      message: messageWithFooter,
+                      label,
+                      title: sessionManager.getTitle(sessionID),
+                      media: files.length > 0 ? files : undefined,
+                      daemonUrl,
+                      log,
+                    })
+                  } catch (err) {
+                    log("stop flush before question failed (non-blocking):", serializeError(err))
+                  }
+                })()
+              }
+            }
 
           return
         }
