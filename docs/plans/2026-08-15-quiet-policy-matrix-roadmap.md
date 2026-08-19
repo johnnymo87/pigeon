@@ -55,7 +55,14 @@ topic is created by a session's **first** notification, each run also stranded a
 |---|---|---|---|
 | **A** | `pigeon-twdw` (P2) | Extract one `resolveEffectivePolicy` for all four emission sites | **FIRST** — see §1.1 |
 | **B** | `pigeon-c501` (P1) | `POST /question-asked` bypasses the policy matrix entirely | After **A** |
-| **C** | `pigeon-l4iw` (P2) | Move quiet expiry onto the row (`expires_at`), drop the global env TTL | After **A** |
+| ~~**C**~~ | ~~`pigeon-l4iw`~~ | ~~Per-row `expires_at`~~ — **WITHDRAWN**, duplicate of `pigeon-vske` (closed 2026-08-14). Reopen trigger 1 fired, 2 did not. **Watch, do not build.** | n/a |
+| **D** | `pigeon-60sw` (P2) | A human cannot express a standing quiet rule; `override` is unreachable for quiet | Independent |
+
+**Amended 2026-08-15, same day as creation.** C was withdrawn and D added once `bd dolt pull`
+surfaced work this file was written in ignorance of: `pigeon-vske` had already answered C, and its
+closure named D as the real defect underneath it. Both corrections are in §3 with their evidence.
+The spine's own rule — amend a wrong claim in the same commit as the fix — is why the original text
+is struck through rather than deleted. §1.3 carries a second correction of the same kind.
 
 **A is sequenced first despite being the lowest priority**, and that inversion is the single most
 important thing in this file. B is a P1 bug, but fixing it in place means teaching a *fourth* call
@@ -106,13 +113,29 @@ row would stay muted. Expiring to `'all'` deliberately overrides everything down
 `effectiveNotifyPolicy`, or an expired row silently defeats it. This was the trap fable found in the
 rejected directory design, and it is the same trap for any future layer.
 
-### 1.3 The clock is `created_at`, not `updated_at`
+### 1.3 The clock — and it is NOT `created_at`, whatever the deployed daemon tells you
 
-`notify-policy.ts:65-74`. lgtm's reconciliation writer re-declares identically; an `updated_at`
-clock would extend quiet forever, which is the exact bug the TTL exists to kill. Known consequence,
-documented there: a **reused** session id inherits the old `created_at` and is born expired, so it
-shouts. Loud, not silent — the acceptable direction — but it looks like a spam bug to whoever hits
-it. Change this clock deliberately or not at all (item **C** must preserve it).
+> **CORRECTED 2026-08-15, hours after this file was written.** The original entry said "the clock is
+> `created_at`, not `updated_at`" and told item **C** to preserve it. That was **wrong on `main`**,
+> and wrong because I read the daemon that devbox happens to be running instead of the code in the
+> repo. `pigeon-n097` (PR #107, `7d8c3ec`) had already changed it. The irony is exact: §2 step 0 of
+> this same file warns that a roadmap "preserves what is no longer true, or was never true, and does
+> so with authority", and this file managed it within a day of being written. Left visible rather
+> than silently rewritten.
+
+**On `main`:** the clock is `declared_at ?? created_at` (`session-origin-repo.ts:134`), where
+`declared_at` is refreshed only on a genuine policy write. The defect n097 fixed was exactly the
+one the old text described as a feature — measuring from the *first* declaration meant a session
+re-declared for 24h was never re-quieted.
+
+**On the devbox daemon as deployed:** the clock is `created_at`, because that root is 4 commits
+behind `origin/main` and its `session_origin` table has no `declared_at` column at all. See §1.8.
+
+**Both statements are true at once.** Never say "the clock" without saying which code you mean.
+
+What survives from the original entry, and still matters: an `updated_at` clock would extend quiet
+forever under a re-declaring writer, which is the bug the TTL exists to kill. Any change here must
+keep the refresh tied to a genuine policy write rather than to any write.
 
 ### 1.4 Topic names encode no provenance, and `LIKE '%thing%'` matches TITLE TEXT
 
@@ -157,7 +180,26 @@ Devbox runs the daemon with auth **disabled**; cloudbox runs it **enabled**
 anything writing a *quiet* policy, a 401 means the noise silently comes back. Any new declaring
 client must read the token (env, then file), as `my-podcasts`'s `_daemon_auth_headers()` does.
 
-### 1.8 House rule: ambiguity resolves toward DELIVERING
+### 1.8 The devbox root is production, is 4 commits behind, and that skew reads as a code bug
+
+`pigeon-daemon.service` runs `/home/dev/projects/pigeon` directly. As of 2026-08-15 that root is at
+`3fe2f2b` while `origin/main` is at `43012b9` — missing #107 (`pigeon-n097`, the `declared_at`
+column), #108, #109, #110. So **any measurement taken against the live devbox daemon is measuring
+pre-n097 behaviour**, and will contradict the source you are reading. That is what produced the
+CORRECTION in §1.3.
+
+Fleet deploy is tracked as item **B** of `docs/plans/2026-08-11-visibility-followups-roadmap.md`
+(`pigeon-rqyz` / `pigeon-k0eh`). Do not fix it inline from here; do check `git rev-parse HEAD`
+against `origin/main` before trusting any live measurement.
+
+The same "the checkout *is* production" rule applies in `my-podcasts`, and there it bites *faster*
+than expected: its systemd timers spawn fresh `uv run` processes that import from the working tree,
+so an **uncommitted edit is already deployed to them**. The `create_session` change ran in
+production for three days (declared rows on 08-13 and 08-14) before it was committed on 08-15. Only
+the long-running consumer held the old code until restart. Editing that root is deploying, with no
+commit and no review in between.
+
+### 1.9 House rule: ambiguity resolves toward DELIVERING
 
 Every error path in this subsystem fails **open**. A spurious post is recoverable noise; a silently
 withheld one is invisible. `ancillary-gate.ts:38-47` states it; `/stop` implements it three times
@@ -246,27 +288,67 @@ Record which was chosen and why, in the bead **and** here.
 
 ---
 
-### [ ] C — Move quiet expiry onto the row (`pigeon-l4iw`, P2)
+### ~~C — Move quiet expiry onto the row~~ — **WITHDRAWN 2026-08-15. Do not build. Watch instead.**
 
-**Symptom:** `DEFAULT_DECLARED_QUIET_TTL_MS` (`notify-policy.ts:16`) is a single global dial
-(`PIGEON_DECLARED_QUIET_TTL_MS`) sized against **one** workload — measured lgtm lifetimes of 0–59
-min, ~2× headroom.
+> `pigeon-l4iw` is **closed as a duplicate**. It duplicated `pigeon-vske`, which was investigated
+> with an oracle consult and **closed without building on 2026-08-14** (recorded in PR #109 and in
+> `docs/plans/2026-08-06-declared-session-provenance.md`). I filed it on 08-15 in ignorance because
+> my local Dolt DB was unsynced; `bd dolt pull` surfaced the prior decision. **Sync beads before
+> filing architectural work** — that is the cheap lesson here.
 
-**Why now:** a second declaring writer now exists in production — `my-podcasts` (`c2fea76`,
-`origin='my-podcasts-pipeline'`). Its sessions are minutes long, so 2h happens to be ample. That is
-luck, not design; the third writer will not be so lucky.
+The prior decision closed it **with named reopen triggers**, not bare. Their status, measured on the
+devbox daemon 2026-08-15:
 
-**The category error underneath:** the TTL exists because a declared/inferred suppression is an
-automated *guess* that could otherwise silence real work forever. A human's standing rule is not a
-guess. `source='override'` is already exempt (`notify-policy.ts:86`), so the exemption concept
-exists — it is just only reachable via `POST /sessions/enable-notify`, which only ever writes
-`policy='all'`.
+| Trigger | Status |
+|---|---|
+| 1. A second writer of declared quiet **ships and runs**, with rows carrying a second origin | **FIRED.** 5 rows, `origin='my-podcasts-pipeline'`, `none`/`declared`, 08-12 → 08-14. Four are real daily-timer runs. |
+| 2. That origin's lifetime **measurably conflicts** with the 2h window | **NOT fired.** These sessions create → prompt → delete in minutes. Zero `automated quiet expired` lines. |
+| 3. Two workloads under the **same origin** need different windows | **NOT fired.** |
 
-**Shape:** an `expires_at` column on `session_origin`, set by the writer. lgtm writes `now+2h`; a
-human or standing rule writes `null`. The global env dial goes away.
+**The designated response to 1+2 is per-origin defaults** — a daemon-side `origin → TTL` map, ~20
+lines, no migration, no writer change, no writer-trust boundary. Only trigger **3** justifies per-row
+`expires_at`, because only then does the writer know something the daemon cannot derive from the
+origin string. Since **2 has not fired, the correct action today is neither.**
 
-**Must survive the change:** §1.3 (the `created_at` clock) and §1.2 (expiry resolving to `'all'`).
-Both have load-bearing comments; move them with the code.
+Two arguments from that closure worth carrying, because my filing missed both:
+
+- A per-row expiry **trusts the writer**. A buggy far-future value silences a session forever, and
+  clamping it server-side reintroduces the very daemon-side dial the design exists to remove — the
+  dial does not leave, it becomes a ceiling.
+- "A human standing rule writes `null`" was never the right home for that use case. A non-expiring
+  human decision already has a mechanism: `source='override'`, TTL-exempt before any clock read and
+  protected by the rank guard. That is item **D**, not this.
+
+**If trigger 2 fires,** reopen `pigeon-vske` — not `pigeon-l4iw` — and build per-origin defaults.
+
+---
+
+### [ ] D — A human cannot express a standing quiet rule (`pigeon-60sw`, P2)
+
+**Not one of the three beads this spine was created for.** Added 2026-08-15 when `pigeon-vske`'s
+closure surfaced it as the *real* defect underneath item C.
+
+**Mechanism:** `effectiveNotifyPolicy` exempts `source==='override'` from the TTL before it reads
+any clock, so a non-expiring policy already exists and works. But the only write of
+`source:'override'` in the codebase hardcodes `notifyPolicy:'all'` (`app.ts:647`). The exemption is
+reachable **only** for "deliver everything". A human can permanently make a session loud, never
+permanently quiet.
+
+**Compounding:** `POST /sessions/enable-notify` has **zero production callers** — no Telegram
+command, no CLI, no plugin path; reaching it needs a hand-written curl with the machine's auth
+token. So the override path is unreachable in *both* directions.
+
+**The bead's blocking question is "confirm a human actually wants this", and this session supplies
+partial evidence — read the qualification.** A user did ask for a standing quiet rule in exactly
+these terms ("permanently, not for 2 hours"). But on refinement the *subject* was automation, which
+has its own mechanism, and that is how it was solved (`my-podcasts` `c2fea76`). So: real demand for
+durable quiet, **not** yet a proven case that `override` is the right vehicle. The case this needs
+is a human wanting quiet on a session whose launcher they do **not** control.
+
+**Deferred design from this session, recorded so it is not re-derived:** a `/quiet [none|errors-only]`
+Telegram command, reply-to-notification, writing `source='override'` — the exact inverse of
+`/sessions/enable-notify`, which would close both the asymmetry and the reachability gap in one
+route. Explicitly out of scope at the time; it is what item **D** would most likely become.
 
 ---
 
@@ -296,3 +378,17 @@ alreadyGone=0 failed=0`, no rate limiting encountered. D1 reconciled in one stat
 **Single choke point, verified:** exactly one `POST /session` exists in the whole `my-podcasts`
 repo (`pipeline/opencode_client.py`), so declaring inside `create_session()` covers every automated
 session that repo can produce.
+
+**The fix in production, 2026-08-15** (devbox daemon `session_origin`): 5 rows,
+`my-podcasts-pipeline` / `none` / `declared`. Four are real unattended runs — the `fp-digest` and
+`the-rundown` timers at ~04:33 on 08-13 and 08-14 — so the suppression has multi-day evidence, not
+just a synthetic probe. It is also the **only** origin ever written on this host.
+
+**Why only 4 runs and not ~300:** the daily timers spawn fresh processes and so picked up the
+working-tree edit immediately (§1.8), while the 15-minute consumer is long-running and held the old
+module until it was restarted on 08-15. The consumer's runs before that restart declared nothing.
+
+**Clock check, in case a future reader sees these timestamps and doubts them:** the daemon writes
+`Date.now()`, and the rows above precede the commit that created them (`c2fea76`, 08-15 05:21 EDT).
+That is not clock skew — it is §1.8's "editing the root is deploying". Verified by converting the
+raw epochs and comparing against `date` on the host.
