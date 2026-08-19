@@ -30,6 +30,17 @@
  * no signal — though it is also losing nothing at the time. A traffic-independent probe
  * (consecutive `poll()` failures, which run every 5s regardless) is the natural complement
  * and is deliberately left to a follow-up.
+ *
+ * Nor does it cover a PARTIAL failure, and that limit is easy to overestimate away. An
+ * episode counts CONSECUTIVE failures and ANY success on that endpoint clears it, so a
+ * fault that rejects only some payloads never accumulates the threshold as long as other
+ * traffic keeps succeeding — while the affected subset is failing 100% of the time. Two
+ * concrete shapes: worker field validation that fires only on entries carrying media or
+ * entities, and a session cap that flaps as the reaper frees slots. Every notification kind
+ * shares the one `send` counter (stop, question, swarm mirror, TUI mirror), so on an active
+ * machine successes interleave constantly and a partial fault can stay invisible here
+ * indefinitely. Catching that needs a failure RATE over a window, which is a genuinely
+ * different alarm and is not attempted here. Tracked as pigeon-b6h4.
  */
 
 import type { WorkerResult } from "./poller";
@@ -74,12 +85,20 @@ export const TRANSPORT_MIN_SPAN_MS = 300_000;
  *
  * Known gap, deliberately accepted rather than fixed: an entry whose 4xx is RETRIED
  * (a 403, or an exotic 4xx reaching delivery-policy's generic arm) is charged an attempt
- * each time, so one entry alone can emit up to MAX_ATTEMPTS=10 failures spanning ~825s of
- * backoff and trip this by itself. For a 403 that is correct — it is a worker-config
- * verdict that fails every send alike. For a hypothetical per-entry 4xx it would be a
- * misattributed alert, which this file already prefers over silence. If that ever bites,
- * the structural fix is a threshold above MAX_ATTEMPTS, which no single entry could reach;
- * it is not used today because it couples this constant to the outbox's.
+ * each time, so one entry alone can emit up to MAX_ATTEMPTS=10 failures and trip this by
+ * itself. Ten failures span NINE backoff gaps (5+10+30+60+120×5), so ~705s, and the trip
+ * lands around 345s in. For a 403 that is correct — it is a worker-config verdict that
+ * fails every send alike. For a hypothetical per-entry 4xx it would be a misattributed
+ * alert, which this file already prefers over silence. If that ever bites, the structural
+ * fix is a threshold above MAX_ATTEMPTS, which no single entry could reach; it is not used
+ * today because it couples this constant to the outbox's.
+ *
+ * A sustained send-429 is slower to detect than the floor suggests, because rule 5 pauses
+ * the whole outbox for up to MAX_PAUSE_MS (300s), so samples arrive about one per pause and
+ * five of them can take ~20 minutes. That is acceptable on both counts: the pause suppresses
+ * SUCCESS samples too, so the episode is never spuriously cleared mid-outage, and the
+ * register-cap 429 that motivated this class carries no retryAfter (worker sessions.ts), so
+ * it never takes the pause path and trips at full speed.
  */
 export const CLIENT_ERROR_THRESHOLD = 5;
 export const CLIENT_ERROR_MIN_SPAN_MS = 300_000;
@@ -312,7 +331,7 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
    * swarm and delivery are all dead too, which is a supervisor's problem and not this
    * alarm's. `AlertDrainer.sentIds` makes the same trade for the same reason.
    *
-   * Bounded by construction: at most one entry per (endpoint, class), so four.
+   * Bounded by construction: at most one entry per (endpoint, class), so six.
    */
   private readonly episodes = new Map<string, Episode>();
 
@@ -341,9 +360,11 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
         // A 5xx we decline to count is the one case where the alarm stays deliberately
         // quiet, so it is also the one case that would otherwise leave no trace at all.
         // Leave a journal line: "no durable record" is what made the outage that motivated
-        // this alarm undiagnosable. Since pigeon-5typ the only samples reaching here are
-        // that carved-out 502 and the unreachable app_rejection, so the 5xx guard below is
-        // now nearly the whole of this branch rather than a filter against routine 4xx.
+        // this alarm undiagnosable. Since pigeon-5typ the samples reaching here are the
+        // carved-out 502, the unreachable app_rejection, and an http_error below 400 —
+        // an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
+        // any other non-ok response. That last one stays silent even here, since the guard
+        // below is deliberately 5xx-only; it is remote enough not to be worth a line.
         if (result.kind === "http_error" && result.status >= 500) {
           this.log?.("worker 5xx not counted toward the alarm", {
             endpoint,

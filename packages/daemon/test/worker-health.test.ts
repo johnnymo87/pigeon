@@ -502,7 +502,6 @@ describe("WorkerHealthMonitor — sustained 4xx (pigeon-5typ)", () => {
     monitor.record("send", serverError());
     monitor.record("send", transportError());
     monitor.record("send", clientError());
-    clock.now += CLIENT_ERROR_MIN_SPAN_MS;
     expect(sink.alerts).toHaveLength(0);
   });
 });
