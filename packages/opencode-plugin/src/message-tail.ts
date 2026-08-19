@@ -16,6 +16,13 @@ export function stripMarkdown(text: string): string {
   return stripped.trim()
 }
 
+/**
+ * Joins one turn's per-step segments. The blank lines are load-bearing: the daemon's
+ * splitter prefers paragraph boundaries (split-message.ts:246-248), so a bare "\n———\n"
+ * lets a chunk end on a stranded rule.
+ */
+export const SEGMENT_SEPARATOR = "\n\n———\n\n"
+
 export type FileInfo = {
   mime: string;
   filename: string;
@@ -35,7 +42,11 @@ type PartInfo = Pick<Part, "id" | "sessionID" | "messageID" | "type">
 
 type SessionTail = {
   currentMessageId: string | undefined
+  pushedMessageIds: Set<string>
   text: string
+  consumedRawLength: number
+  segments: string[]
+  droppedSegments: number
   files: FileInfo[]
   seenAnyMessage: boolean
   lastSeenAt: number
@@ -74,10 +85,28 @@ async function waitForDiscovery(promise: Promise<void>, timeoutMs = 1000): Promi
 }
 
 /**
+ * Cap on retained segment text per turn. 40K is p99.9 of all-history turn size: exceeded
+ * by 26 of 22,923 turns. Enforced at PUSH time so plugin memory is bounded (40K x <=100
+ * retained sessions ~ 4MB) rather than only at read time.
+ *
+ * Dropping oldest-first deliberately does NOT bound an oversized FINAL segment. That is
+ * pre-existing behaviour (history holds a single 246K stop) and truncating a conclusion
+ * would be worse than a long one.
+ */
+const MAX_TURN_CHARS = 40_000
+
+/**
  * Cap on retained message-role entries. Sized well above any plausible number of messages that
  * could still receive parts, so eviction only ever reaches entries that are long finished.
  */
 const MAX_MESSAGE_ROLES = 2000
+
+/**
+ * Cap on retained pushed-message IDs per session to prevent unbounded memory growth on long-lived sessions.
+ * 500 entries is ample: the late-update hazard window is 37 seconds, and 500 assistant messages
+ * far exceeds what can occur in that time.
+ */
+const MAX_PUSHED_MESSAGE_IDS = 500
 
 export class MessageTail {
   private sessions = new Map<string, SessionTail>()
@@ -104,12 +133,26 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, text: "", files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, pushedMessageIds: new Set(), text: "", consumedRawLength: 0, segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
     }
     return tail
+  }
+
+  private pushSegment(tail: SessionTail): void {
+    const stripped = stripMarkdown(tail.text)
+    tail.text = ""
+    if (!stripped) return
+
+    tail.segments.push(stripped)
+
+    let total = tail.segments.reduce((n, s) => n + s.length, 0)
+    while (total > MAX_TURN_CHARS && tail.segments.length > 1) {
+      total -= tail.segments.shift()!.length
+      tail.droppedSegments++
+    }
   }
 
   onMessageUpdated(info: MessageInfo): void {
@@ -125,10 +168,25 @@ export class MessageTail {
     tail.seenAnyMessage = true
 
     if (info.role === "assistant") {
-      if (tail.currentMessageId !== info.id) {
+      // A message.updated for an already-completed message can arrive AFTER the next message
+      // started -- 2.41% of consecutive assistant pairs in production history, worst lag 37s.
+      // Flipping back would push a partial segment, empty the live buffer, and then push the
+      // same message again: visible duplicated and torn text. Today the same event only wipes
+      // text invisibly, which is why accumulating makes the guard mandatory rather than
+      // defensive.
+      if (tail.currentMessageId !== info.id && !tail.pushedMessageIds.has(info.id)) {
+        this.pushSegment(tail)
+        if (tail.currentMessageId) {
+          tail.pushedMessageIds.add(tail.currentMessageId)
+          while (tail.pushedMessageIds.size > MAX_PUSHED_MESSAGE_IDS) {
+            const oldest = tail.pushedMessageIds.values().next().value
+            if (oldest === undefined) break
+            tail.pushedMessageIds.delete(oldest)
+          }
+        }
         tail.currentMessageId = info.id
         tail.text = ""
-        tail.files = []
+        tail.consumedRawLength = 0
       }
       const pendingBuffer = this.userBuffers.get(info.id)
       if (pendingBuffer) {
@@ -242,7 +300,8 @@ export class MessageTail {
       tail.text += delta
     } else {
       const textPart = part as PartInfo & { text?: string }
-      tail.text = textPart.text ?? ""
+      const full = textPart.text ?? ""
+      tail.text = full.length >= tail.consumedRawLength ? full.slice(tail.consumedRawLength) : full
     }
   }
 
@@ -346,11 +405,46 @@ export class MessageTail {
 
   getSummary(sessionID: string): string {
     const tail = this.sessions.get(sessionID)
-    if (!tail || !tail.text) return ""
+    if (!tail) return ""
 
-    const text = stripMarkdown(tail.text)
-    if (!text) return ""
-    return text
+    const current = stripMarkdown(tail.text)
+    const parts = current ? [...tail.segments, current] : tail.segments
+    const body = parts.join(SEGMENT_SEPARATOR)
+    if (!tail.droppedSegments) return body
+    const n = tail.droppedSegments
+    return `… ${n} earlier step${n === 1 ? "" : "s"} omitted${SEGMENT_SEPARATOR}${body}`
+  }
+
+  /**
+   * Return the turn's accumulated text AND clear it. Every send site calls this, which is
+   * what makes "each segment is sent at most once" structural rather than a dedup rule --
+   * the pre-question flush (index.ts:653) sends mid-turn and the turn then continues.
+   *
+   * Deliberately clears BEFORE the POST succeeds. A daemon-down idle therefore loses the
+   * buffer; this codebase prefers loss over duplication (see the mirror design), and the
+   * daemon 202s into a durable outbox so only a dead daemon can hit it.
+   *
+   * NOTE: pushedMessageIds is deliberately NOT cleared here. The flip-back hazard (a late
+   * message.updated arriving up to 37s after a message completed) outlives turn boundaries.
+   * opencode message IDs never repeat, so pushedMessageIds is session-scoped, bounded by
+   * MAX_PUSHED_MESSAGE_IDS where IDs are added.
+   */
+  consume(sessionID: string): string {
+    const summary = this.getSummary(sessionID)
+    const tail = this.sessions.get(sessionID)
+    if (tail) {
+      tail.consumedRawLength += tail.text.length
+      tail.segments = []
+      tail.text = ""
+      tail.droppedSegments = 0
+      tail.files = []
+    }
+    return summary
+  }
+
+  getPushedMessageIdCount(sessionID: string): number {
+    const tail = this.sessions.get(sessionID)
+    return tail?.pushedMessageIds.size ?? 0
   }
 
   getCurrentMessageId(sessionID: string): string | undefined {

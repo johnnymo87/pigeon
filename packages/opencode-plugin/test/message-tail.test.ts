@@ -20,6 +20,208 @@ describe("MessageTail", () => {
     tail = new MessageTail()
   })
 
+  describe("turn accumulation", () => {
+    const push = (id: string, text: string) => {
+      tail.onMessageUpdated({ id, sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: `p-${id}`, sessionID: "s1", messageID: id, type: "text" }, text)
+    }
+
+    test("joins every assistant message's text in a turn, in order", () => {
+      push("msg-1", "Reading the file.")
+      push("msg-2", "Found the bug.")
+      push("msg-3", "Done.")
+
+      expect(tail.getSummary("s1")).toBe(
+        "Reading the file.\n\n———\n\nFound the bug.\n\n———\n\nDone.",
+      )
+    })
+
+    test("a single-message turn is byte-identical to the old behaviour", () => {
+      push("msg-1", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+
+    test("an intermediate message with only whitespace adds no separator", () => {
+      push("msg-1", "   ")
+      push("msg-2", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+
+    test("an intermediate message that strips to nothing adds no separator", () => {
+      push("msg-1", "```")
+      push("msg-2", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+
+    test("a late message.updated for a finished message does not duplicate or tear text", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "First step.")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Second ")
+
+      // m1 completes late (token usage lands ~seconds after m2 started)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "step.")
+
+      expect(tail.getSummary("s1")).toBe("First step.\n\n———\n\nSecond step.")
+      expect(tail.getCurrentMessageId("s1")).toBe("m2")
+    })
+  })
+
+  describe("turn accumulation cap", () => {
+    test("drops oldest segments and says so when over the cap", () => {
+      const big = "x".repeat(15_000)
+      for (let i = 1; i <= 4; i++) {
+        tail.onMessageUpdated({ id: `m${i}`, sessionID: "s1", role: "assistant" })
+        tail.onPartUpdated({ id: `p${i}`, sessionID: "s1", messageID: `m${i}`, type: "text" }, big)
+      }
+      const summary = tail.getSummary("s1")
+
+      expect(summary).toContain("… 1 earlier step omitted")
+      expect(summary.length).toBeLessThan(46_000)
+    })
+
+    test("does not truncate a single oversized final segment", () => {
+      const huge = "y".repeat(120_000)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, huge)
+
+      expect(tail.getSummary("s1")).toBe(huge)
+    })
+  })
+
+  describe("consume", () => {
+    test("returns the summary and clears it", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Done.")
+
+      expect(tail.consume("s1")).toBe("Done.")
+      expect(tail.consume("s1")).toBe("")
+    })
+
+    test("text produced after a consume is not re-sent with it", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Before.")
+      expect(tail.consume("s1")).toBe("Before.")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "After.")
+      expect(tail.consume("s1")).toBe("After.")
+    })
+
+    test("a late message.updated from before a consume cannot flip back after it", () => {
+      // turn 1: m1 then m2, so m1 is recorded as pushed
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "m1 text")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "m2 text")
+
+      // consume() -- the idle send
+      const turn1Summary = tail.consume("s1")
+      expect(turn1Summary).toBe("m1 text\n\n———\n\nm2 text")
+
+      // turn 2: m3 starts and streams partial text
+      tail.onMessageUpdated({ id: "m3", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p3", sessionID: "s1", messageID: "m3", type: "text" }, "m3 partial")
+
+      // late message.updated for m1 arrives (the 2.41% class, up to 37s late)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+
+      // assert: m3's text is NOT torn, m3 remains current, m3's later deltas still land
+      tail.onPartUpdated({ id: "p3", sessionID: "s1", messageID: "m3", type: "text" }, " and more")
+
+      expect(tail.getCurrentMessageId("s1")).toBe("m3")
+      expect(tail.getSummary("s1")).toBe("m3 partial and more")
+    })
+
+    test("the pushed-id set is bounded on a long-lived session", () => {
+      // drive well over the cap of assistant messages
+      for (let i = 1; i <= 600; i++) {
+        tail.onMessageUpdated({ id: `msg-${i}`, sessionID: "s1", role: "assistant" })
+        tail.onPartUpdated({ id: `p-${i}`, sessionID: "s1", messageID: `msg-${i}`, type: "text" }, `text ${i}`)
+      }
+
+      expect(tail.getPushedMessageIdCount("s1")).toBe(500)
+
+      // msg-600 is current, msg-599 is in pushedMessageIds
+      tail.onMessageUpdated({ id: "msg-599", sessionID: "s1", role: "assistant" })
+      expect(tail.getCurrentMessageId("s1")).toBe("msg-600")
+
+      // msg-1 was evicted from the bounded set
+      tail.onMessageUpdated({ id: "msg-1", sessionID: "s1", role: "assistant" })
+      expect(tail.getCurrentMessageId("s1")).toBe("msg-1")
+    })
+
+    test("a full-text part.updated arriving after a consume does not replay the sent text", () => {
+      // m1 streams "Step one." via delta
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Step one.")
+
+      // consume() -- the idle send
+      expect(tail.consume("s1")).toBe("Step one.")
+
+      // a NON-delta part.updated for m1 arrives carrying the full "Step one."
+      tail.onPartUpdated({
+        id: "p1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "text",
+        text: "Step one.",
+      })
+
+      // m2 starts and streams "Step two."
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Step two.")
+
+      // assert: consume() returns exactly "Step two." -- no duplicated "Step one."
+      expect(tail.consume("s1")).toBe("Step two.")
+    })
+
+    test("a full-text part.updated after a consume still captures genuinely NEW text", () => {
+      // m1 streams "Step one."
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Step one.")
+
+      // consume()
+      expect(tail.consume("s1")).toBe("Step one.")
+
+      // non-delta part.updated for m1 carrying "Step one. And more."
+      tail.onPartUpdated({
+        id: "p1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "text",
+        text: "Step one. And more.",
+      })
+
+      // assert: the summary contains " And more." and NOT a second "Step one."
+      expect(tail.getSummary("s1")).toBe("And more.")
+    })
+
+    test("a new message after a consume resets the consumed watermark", () => {
+      // m1 streams a long text, consume()
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Long text from first message.")
+      expect(tail.consume("s1")).toBe("Long text from first message.")
+
+      // m2 starts, then a NON-delta part.updated for m2 with SHORT text
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "p2",
+        sessionID: "s1",
+        messageID: "m2",
+        type: "text",
+        text: "Short.",
+      })
+
+      // assert: m2's short text is not truncated by m1's watermark
+      expect(tail.getSummary("s1")).toBe("Short.")
+    })
+  })
+
   describe("message accumulation", () => {
     test("should accumulate text from assistant messages only", () => {
       tail.onMessageUpdated({
@@ -160,7 +362,7 @@ describe("MessageTail", () => {
       expect(tail.getSummary("session-1")).toBe("")
     })
 
-    test("should reset text when new message starts", () => {
+    test("should accumulate text when new message starts", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -193,7 +395,7 @@ describe("MessageTail", () => {
         "Second message"
       )
 
-      expect(tail.getSummary("session-1")).toBe("Second message")
+      expect(tail.getSummary("session-1")).toBe("First message\n\n———\n\nSecond message")
     })
 
      test("should ignore parts from previous messages", () => {
@@ -239,7 +441,7 @@ describe("MessageTail", () => {
          "Second"
        )
 
-       expect(tail.getSummary("session-1")).toBe("Second")
+       expect(tail.getSummary("session-1")).toBe("First\n\n———\n\nSecond")
      })
 
      test("should accumulate parts arriving before onMessageUpdated", () => {
@@ -307,7 +509,7 @@ describe("MessageTail", () => {
        expect(tail.getSummary("session-1")).toBe("Early Late")
      })
 
-     test("should reset text when onMessageUpdated arrives with different messageID after late-start", () => {
+     test("should accumulate text when onMessageUpdated arrives with different messageID after late-start", () => {
        // Parts arrive before message.updated
        tail.onPartUpdated(
          {
@@ -337,7 +539,7 @@ describe("MessageTail", () => {
          "Second message"
        )
 
-       expect(tail.getSummary("session-1")).toBe("Second message")
+       expect(tail.getSummary("session-1")).toBe("First message\n\n———\n\nSecond message")
      })
    })
 
@@ -692,7 +894,7 @@ describe("MessageTail", () => {
   })
 
     describe("stripMarkdown edge cases - message reset", () => {
-      test("new assistant message clears head buffer", () => {
+      test("new assistant message accumulates segments", () => {
         const tail = new MessageTail()
 
         // First message
@@ -730,8 +932,7 @@ describe("MessageTail", () => {
         )
 
         const summary = tail.getSummary("ses1")
-        expect(summary).toContain("SECOND")
-        expect(summary).not.toContain("FIRST")
+        expect(summary).toBe("FIRST\n\n———\n\nSECOND")
       })
     })
 
@@ -1007,7 +1208,7 @@ describe("MessageTail", () => {
       expect(tail.getFiles("unknown-session")).toEqual([])
     })
 
-    test("resets files on new assistant message", () => {
+    test("preserves files on new assistant message", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -1032,7 +1233,36 @@ describe("MessageTail", () => {
         role: "assistant",
       })
 
-      expect(tail.getFiles("session-1")).toHaveLength(0)
+      expect(tail.getFiles("session-1")).toHaveLength(1)
+    })
+
+    test("files from earlier steps in a turn survive, and clear on consume", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "f1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "file",
+        mime: "image/png",
+        filename: "chart.png",
+        url: "https://x/1",
+      } as any)
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "f2",
+        sessionID: "s1",
+        messageID: "m2",
+        type: "file",
+        mime: "image/png",
+        filename: "after.png",
+        url: "https://x/2",
+      } as any)
+
+      expect(tail.getFiles("s1").map((f) => f.filename)).toEqual(["chart.png", "after.png"])
+
+      tail.consume("s1")
+      expect(tail.getFiles("s1")).toEqual([])
     })
 
     test("clears files on clear()", () => {
@@ -1598,6 +1828,38 @@ describe("MessageTail", () => {
       expect(mirrors).toHaveLength(1)
       expect(mirrors[0].text).toBe("Known main prompt")
       expect(elapsed).toBeLessThan(500)
+    })
+  })
+
+  describe("accepted trades", () => {
+    test("a not-yet-registered idle leaves the buffer to carry into the next stop", () => {
+      // shouldNotify() is false for an unregistered session, so index.ts returns BEFORE
+      // consume. Only the same-message-id branch has the "nothing new was produced"
+      // property; this branch carries the previous turn's narration forward. Accepted.
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Earlier.")
+      // no consume -- simulating the early return
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Later.")
+
+      expect(tail.consume("s1")).toBe("Earlier.\n\n———\n\nLater.")
+    })
+
+    test("clear() drops an unsent turn (session.deleted / kill path)", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Unsent.")
+      tail.clear("s1")
+      expect(tail.getSummary("s1")).toBe("")
+    })
+
+    test("a subagent session still accumulates but is never consumed by the idle path", () => {
+      // index.ts:476 returns early for non-main sessions. Bounded by the 40K cap and the
+      // 24h eviction sweep; recorded so it is not rediscovered as a leak.
+      const sub = new MessageTail({ isMainSession: () => false })
+      sub.onMessageUpdated({ id: "m1", sessionID: "sub-1", role: "assistant" })
+      sub.onPartUpdated({ id: "p1", sessionID: "sub-1", messageID: "m1", type: "text" }, "Work.")
+      expect(sub.getSummary("sub-1")).toBe("Work.")
     })
   })
 })

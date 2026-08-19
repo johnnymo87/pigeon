@@ -249,10 +249,16 @@ export class OutboxSender {
       }
 
       const entries = this.storage.outbox.getReady(now, 5);
+      const deferredSessions = new Set<string>();
       const deferredLowPrioritySessions = new Set<string>();
       let loggedSubBudgetDeferral = false;
+      let loggedGovernorChunkDeferral = false;
 
       batchLoop: for (const entry of entries) {
+        if (deferredSessions.has(entry.sessionId)) {
+          continue;
+        }
+
         const now = this.nowFn();
 
         // Prune send timestamps older than 60 seconds
@@ -261,9 +267,12 @@ export class OutboxSender {
         this.lowPrioritySendTimestamps = this.lowPrioritySendTimestamps.filter((t) => t > windowStart);
 
         // Proactive rate governor check before starting an entry.
-        // Checking per-entry (rather than between chunks) prevents torn messages where chunk 1 is sent
-        // but chunks 2-3 are deferred. An entry with multiple chunks may overshoot the limit slightly,
-        // which is an intended trade-off and why OUTBOX_RATE_LIMIT sits well below the Telegram group cap (20/min).
+        // Fast-path batch check: if the window is already at or above OUTBOX_RATE_LIMIT sends,
+        // no entry can send anything, so break the batch immediately.
+        // To prevent multi-chunk entries from overshooting when the window is partially full,
+        // a post-parse check below verifies sendTimestamps.length + messages.length <= OUTBOX_RATE_LIMIT.
+        // An entry with more chunks than OUTBOX_RATE_LIMIT can only overshoot when sent into
+        // an empty window (the starvation guard).
         if (this.sendTimestamps.length >= OUTBOX_RATE_LIMIT) {
           this.log("outbox rate governor limit reached, deferring remaining entries", {
             countInWindow: this.sendTimestamps.length,
@@ -317,6 +326,35 @@ export class OutboxSender {
 
         if (messages.length === 0) {
           this.markTerminal(entry, now, "payload_empty");
+          continue;
+        }
+
+        // The pre-entry governor check counts ENTRIES; a multi-chunk entry can therefore
+        // overshoot the window (11 used + an 11-chunk stop = 22 sends against Telegram's
+        // ~20/min group cap), and a resulting 429 pauses the WHOLE outbox for minutes.
+        // Turn-batched stops made multi-chunk entries common, so check chunks too.
+        //
+        // `this.sendTimestamps.length > 0` mirrors the sub-budget's oversized-entry escape:
+        // an entry with more chunks than the whole budget must still be able to send into an
+        // empty window, or it is starved forever.
+        if (
+          this.sendTimestamps.length > 0 &&
+          this.sendTimestamps.length + messages.length > OUTBOX_RATE_LIMIT
+        ) {
+          deferredSessions.add(entry.sessionId);
+          if (!loggedGovernorChunkDeferral) {
+            this.log("outbox rate governor limit reached for chunks, deferring entry", {
+              kind: entry.kind,
+              notificationId: entry.notificationId,
+              countInWindow: this.sendTimestamps.length,
+              chunks: messages.length,
+              limit: OUTBOX_RATE_LIMIT,
+            });
+            loggedGovernorChunkDeferral = true;
+          }
+          // continue, NOT break -- breaking abandons lower-ranked but still-eligible entries
+          // from DIFFERENT sessions in this batch. Same-session entries are deferred via
+          // deferredSessions to preserve delivery order (pigeon-81p).
           continue;
         }
 
