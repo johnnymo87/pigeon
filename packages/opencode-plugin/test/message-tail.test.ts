@@ -92,6 +92,26 @@ describe("MessageTail", () => {
     })
   })
 
+  describe("consume", () => {
+    test("returns the summary and clears it", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Done.")
+
+      expect(tail.consume("s1")).toBe("Done.")
+      expect(tail.consume("s1")).toBe("")
+    })
+
+    test("text produced after a consume is not re-sent with it", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Before.")
+      expect(tail.consume("s1")).toBe("Before.")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "After.")
+      expect(tail.consume("s1")).toBe("After.")
+    })
+  })
+
   describe("message accumulation", () => {
     test("should accumulate text from assistant messages only", () => {
       tail.onMessageUpdated({

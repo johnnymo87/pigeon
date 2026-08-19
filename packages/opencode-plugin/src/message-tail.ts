@@ -398,6 +398,27 @@ export class MessageTail {
     return `… ${n} earlier step${n === 1 ? "" : "s"} omitted${SEGMENT_SEPARATOR}${body}`
   }
 
+  /**
+   * Return the turn's accumulated text AND clear it. Every send site calls this, which is
+   * what makes "each segment is sent at most once" structural rather than a dedup rule --
+   * the pre-question flush (index.ts:653) sends mid-turn and the turn then continues.
+   *
+   * Deliberately clears BEFORE the POST succeeds. A daemon-down idle therefore loses the
+   * buffer; this codebase prefers loss over duplication (see the mirror design), and the
+   * daemon 202s into a durable outbox so only a dead daemon can hit it.
+   */
+  consume(sessionID: string): string {
+    const summary = this.getSummary(sessionID)
+    const tail = this.sessions.get(sessionID)
+    if (tail) {
+      tail.segments = []
+      tail.text = ""
+      tail.droppedSegments = 0
+      tail.pushedMessageIds.clear()
+    }
+    return summary
+  }
+
   getCurrentMessageId(sessionID: string): string | undefined {
     const tail = this.sessions.get(sessionID)
     return tail?.currentMessageId
