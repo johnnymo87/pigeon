@@ -52,6 +52,22 @@ describe("MessageTail", () => {
       push("msg-2", "Done.")
       expect(tail.getSummary("s1")).toBe("Done.")
     })
+
+    test("a late message.updated for a finished message does not duplicate or tear text", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "First step.")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Second ")
+
+      // m1 completes late (token usage lands ~seconds after m2 started)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "step.")
+
+      expect(tail.getSummary("s1")).toBe("First step.\n\n———\n\nSecond step.")
+      expect(tail.getCurrentMessageId("s1")).toBe("m2")
+    })
   })
 
   describe("turn accumulation cap", () => {

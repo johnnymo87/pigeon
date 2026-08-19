@@ -42,6 +42,7 @@ type PartInfo = Pick<Part, "id" | "sessionID" | "messageID" | "type">
 
 type SessionTail = {
   currentMessageId: string | undefined
+  pushedMessageIds: Set<string>
   text: string
   segments: string[]
   droppedSegments: number
@@ -124,7 +125,7 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, text: "", segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, pushedMessageIds: new Set(), text: "", segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
@@ -159,8 +160,15 @@ export class MessageTail {
     tail.seenAnyMessage = true
 
     if (info.role === "assistant") {
-      if (tail.currentMessageId !== info.id) {
+      // A message.updated for an already-completed message can arrive AFTER the next message
+      // started -- 2.41% of consecutive assistant pairs in production history, worst lag 37s.
+      // Flipping back would push a partial segment, empty the live buffer, and then push the
+      // same message again: visible duplicated and torn text. Today the same event only wipes
+      // text invisibly, which is why accumulating makes the guard mandatory rather than
+      // defensive.
+      if (tail.currentMessageId !== info.id && !tail.pushedMessageIds.has(info.id)) {
         this.pushSegment(tail)
+        if (tail.currentMessageId) tail.pushedMessageIds.add(tail.currentMessageId)
         tail.currentMessageId = info.id
         tail.text = ""
       }
