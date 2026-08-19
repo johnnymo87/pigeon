@@ -16,6 +16,13 @@ export function stripMarkdown(text: string): string {
   return stripped.trim()
 }
 
+/**
+ * Joins one turn's per-step segments. The blank lines are load-bearing: the daemon's
+ * splitter prefers paragraph boundaries (split-message.ts:246-248), so a bare "\n———\n"
+ * lets a chunk end on a stranded rule.
+ */
+export const SEGMENT_SEPARATOR = "\n\n———\n\n"
+
 export type FileInfo = {
   mime: string;
   filename: string;
@@ -36,6 +43,7 @@ type PartInfo = Pick<Part, "id" | "sessionID" | "messageID" | "type">
 type SessionTail = {
   currentMessageId: string | undefined
   text: string
+  segments: string[]
   files: FileInfo[]
   seenAnyMessage: boolean
   lastSeenAt: number
@@ -104,12 +112,18 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, text: "", files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, text: "", segments: [], files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
     }
     return tail
+  }
+
+  private pushSegment(tail: SessionTail): void {
+    const stripped = stripMarkdown(tail.text)
+    if (stripped) tail.segments.push(stripped)
+    tail.text = ""
   }
 
   onMessageUpdated(info: MessageInfo): void {
@@ -126,9 +140,9 @@ export class MessageTail {
 
     if (info.role === "assistant") {
       if (tail.currentMessageId !== info.id) {
+        this.pushSegment(tail)
         tail.currentMessageId = info.id
         tail.text = ""
-        tail.files = []
       }
       const pendingBuffer = this.userBuffers.get(info.id)
       if (pendingBuffer) {
@@ -346,11 +360,11 @@ export class MessageTail {
 
   getSummary(sessionID: string): string {
     const tail = this.sessions.get(sessionID)
-    if (!tail || !tail.text) return ""
+    if (!tail) return ""
 
-    const text = stripMarkdown(tail.text)
-    if (!text) return ""
-    return text
+    const current = stripMarkdown(tail.text)
+    const parts = current ? [...tail.segments, current] : tail.segments
+    return parts.join(SEGMENT_SEPARATOR)
   }
 
   getCurrentMessageId(sessionID: string): string | undefined {

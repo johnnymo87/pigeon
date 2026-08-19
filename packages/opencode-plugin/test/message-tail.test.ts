@@ -20,6 +20,40 @@ describe("MessageTail", () => {
     tail = new MessageTail()
   })
 
+  describe("turn accumulation", () => {
+    const push = (id: string, text: string) => {
+      tail.onMessageUpdated({ id, sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: `p-${id}`, sessionID: "s1", messageID: id, type: "text" }, text)
+    }
+
+    test("joins every assistant message's text in a turn, in order", () => {
+      push("msg-1", "Reading the file.")
+      push("msg-2", "Found the bug.")
+      push("msg-3", "Done.")
+
+      expect(tail.getSummary("s1")).toBe(
+        "Reading the file.\n\n———\n\nFound the bug.\n\n———\n\nDone.",
+      )
+    })
+
+    test("a single-message turn is byte-identical to the old behaviour", () => {
+      push("msg-1", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+
+    test("an intermediate message with only whitespace adds no separator", () => {
+      push("msg-1", "   ")
+      push("msg-2", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+
+    test("an intermediate message that strips to nothing adds no separator", () => {
+      push("msg-1", "```")
+      push("msg-2", "Done.")
+      expect(tail.getSummary("s1")).toBe("Done.")
+    })
+  })
+
   describe("message accumulation", () => {
     test("should accumulate text from assistant messages only", () => {
       tail.onMessageUpdated({
@@ -160,7 +194,7 @@ describe("MessageTail", () => {
       expect(tail.getSummary("session-1")).toBe("")
     })
 
-    test("should reset text when new message starts", () => {
+    test("should accumulate text when new message starts", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -193,7 +227,7 @@ describe("MessageTail", () => {
         "Second message"
       )
 
-      expect(tail.getSummary("session-1")).toBe("Second message")
+      expect(tail.getSummary("session-1")).toBe("First message\n\n———\n\nSecond message")
     })
 
      test("should ignore parts from previous messages", () => {
@@ -239,7 +273,7 @@ describe("MessageTail", () => {
          "Second"
        )
 
-       expect(tail.getSummary("session-1")).toBe("Second")
+       expect(tail.getSummary("session-1")).toBe("First\n\n———\n\nSecond")
      })
 
      test("should accumulate parts arriving before onMessageUpdated", () => {
@@ -307,7 +341,7 @@ describe("MessageTail", () => {
        expect(tail.getSummary("session-1")).toBe("Early Late")
      })
 
-     test("should reset text when onMessageUpdated arrives with different messageID after late-start", () => {
+     test("should accumulate text when onMessageUpdated arrives with different messageID after late-start", () => {
        // Parts arrive before message.updated
        tail.onPartUpdated(
          {
@@ -337,7 +371,7 @@ describe("MessageTail", () => {
          "Second message"
        )
 
-       expect(tail.getSummary("session-1")).toBe("Second message")
+       expect(tail.getSummary("session-1")).toBe("First message\n\n———\n\nSecond message")
      })
    })
 
@@ -692,7 +726,7 @@ describe("MessageTail", () => {
   })
 
     describe("stripMarkdown edge cases - message reset", () => {
-      test("new assistant message clears head buffer", () => {
+      test("new assistant message accumulates segments", () => {
         const tail = new MessageTail()
 
         // First message
@@ -730,8 +764,7 @@ describe("MessageTail", () => {
         )
 
         const summary = tail.getSummary("ses1")
-        expect(summary).toContain("SECOND")
-        expect(summary).not.toContain("FIRST")
+        expect(summary).toBe("FIRST\n\n———\n\nSECOND")
       })
     })
 
@@ -1007,7 +1040,7 @@ describe("MessageTail", () => {
       expect(tail.getFiles("unknown-session")).toEqual([])
     })
 
-    test("resets files on new assistant message", () => {
+    test("preserves files on new assistant message", () => {
       tail.onMessageUpdated({
         id: "msg-1",
         sessionID: "session-1",
@@ -1032,7 +1065,7 @@ describe("MessageTail", () => {
         role: "assistant",
       })
 
-      expect(tail.getFiles("session-1")).toHaveLength(0)
+      expect(tail.getFiles("session-1")).toHaveLength(1)
     })
 
     test("clears files on clear()", () => {
