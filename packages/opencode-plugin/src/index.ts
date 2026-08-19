@@ -482,11 +482,11 @@ const plugin: Plugin = async (ctx) => {
                return
              }
 
-             // Set dedup guard SYNCHRONOUSLY before async notifyStop
-             sessionManager.setNotified(sessionID, currentMsgId!)
+              // Set dedup guard SYNCHRONOUSLY before async notifyStop
+              sessionManager.setNotified(sessionID, currentMsgId!)
 
-              const summary = messageTail.getSummary(sessionID) || "Task completed"
               const files = messageTail.getFiles(sessionID)
+              const summary = messageTail.consume(sessionID) || "Task completed"
               const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
               const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
               log("sending notifyStop", { sessionID, summary: summary.slice(0, 100), hasTokenFooter: !!tokenFooter })
@@ -650,9 +650,9 @@ const plugin: Plugin = async (ctx) => {
            const currentMsgId = messageTail.getCurrentMessageId(sessionID)
            if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
              sessionManager.setNotified(sessionID, currentMsgId!)
-             const summary = messageTail.getSummary(sessionID)
+             const files = messageTail.getFiles(sessionID)
+             const summary = messageTail.consume(sessionID)
              if (summary) {
-               const files = messageTail.getFiles(sessionID)
                // Fully detach: don't await the footer fetch inside the handler
                void (async () => {
                  try {
