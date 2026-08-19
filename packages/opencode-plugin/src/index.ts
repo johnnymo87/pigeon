@@ -585,10 +585,16 @@ const plugin: Plugin = async (ctx) => {
                 ? `Error: ${errorMessage(error)}`
                 : "Session error occurred"
 
+              // The accumulated narration explains what the session was doing when it
+              // failed. It is a send site like any other, so it consumes -- clear-on-send
+              // stays structural.
+              const narration = messageTail.consume(sessionID)
+              const body = narration ? `${narration}\n\n${errorMsg}` : errorMsg
+
               notifyStop({
                 sessionId: sessionID,
                 event: "Error",
-                message: errorMsg,
+                message: body,
                 label,
                 title: sessionManager.getTitle(sessionID),
                 daemonUrl,

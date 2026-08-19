@@ -634,7 +634,7 @@ describe("Session Title Management", () => {
         })
       })
 
-      test("session.error passes event: 'Error' to notifyStop", async () => {
+      test("session.error passes event: 'Error' and prepends turn narration to notifyStop", async () => {
         const mockCtx = createMockCtx()
         const hooks = await plugin(mockCtx)
 
@@ -642,6 +642,28 @@ describe("Session Title Management", () => {
           event: {
             type: "session.created",
             properties: { info: { id: "ses_err_1", title: "Errored Session" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "message.updated",
+            properties: { info: { id: "msg_err_1", sessionID: "ses_err_1", role: "assistant" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "message.part.updated",
+            properties: {
+              part: {
+                id: "part_err_1",
+                sessionID: "ses_err_1",
+                messageID: "msg_err_1",
+                type: "text",
+                text: "I was modifying auth.ts when...",
+              },
+            },
           } as any,
         })
 
@@ -659,6 +681,38 @@ describe("Session Title Management", () => {
           expect(notifyStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_err_1",
+              event: "Error",
+              message: "I was modifying auth.ts when...\n\nError: Something broke",
+            })
+          )
+        })
+      })
+
+      test("session.error without narration sends only the error message", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_err_2", title: "Errored Session 2" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "session.error",
+            properties: {
+              sessionID: "ses_err_2",
+              error: new Error("Something broke"),
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_err_2",
               event: "Error",
               message: "Error: Something broke",
             })
