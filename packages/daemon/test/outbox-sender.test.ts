@@ -1907,7 +1907,7 @@ describe("OutboxSender rate governor", () => {
     expect(storage.outbox.getReady(5_000, 100).length).toBe(1);
   });
 
-  it("never tears an entry: per-entry governor check sends all chunks of a started entry (d)", async () => {
+  it("never tears an entry: sends all chunks of started entries and defers entry that would exceed budget (d)", async () => {
     for (let i = 0; i < 3; i++) {
       storage.outbox.upsert({
         ...BASE_OUTBOX_INPUT,
@@ -1921,20 +1921,28 @@ describe("OutboxSender rate governor", () => {
     }
 
     const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
     const sender = new OutboxSender({
       storage,
       sendNotification,
       chatId: "chat-123",
-      nowFn: () => 5_000,
+      nowFn: () => now,
     });
 
     await sender.processOnce();
 
+    // First two 5-chunk entries send (10 sends). Third 5-chunk entry is deferred (10 + 5 = 15 > 12)
+    expect(sendNotification).toHaveBeenCalledTimes(10);
+    expect(storage.outbox.getByNotificationId("notif-multichunk-0")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("notif-multichunk-1")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("notif-multichunk-2")!.state).toBe("queued");
+
+    // Advance window and verify third entry completes all 5 chunks without tearing
+    now += OUTBOX_RATE_WINDOW_MS + 1_000;
+    await sender.processOnce();
+
     expect(sendNotification).toHaveBeenCalledTimes(15);
-    for (let i = 0; i < 3; i++) {
-      const rec = storage.outbox.getByNotificationId(`notif-multichunk-${i}`);
-      expect(rec!.state).toBe("sent");
-    }
+    expect(storage.outbox.getByNotificationId("notif-multichunk-2")!.state).toBe("sent");
   });
 
   it("starvation guard: entry with more chunks than limit sends against empty window (e)", async () => {
@@ -1962,6 +1970,139 @@ describe("OutboxSender rate governor", () => {
     expect(sendNotification).toHaveBeenCalledTimes(15);
     const rec = storage.outbox.getByNotificationId("notif-large-1");
     expect(rec!.state).toBe("sent");
+  });
+
+  it("an entry whose chunks would exceed the window is deferred, not started", async () => {
+    // 11 sends already in the 60s window, then a 3-chunk stop entry
+    for (let i = 0; i < 11; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-seed-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: `seed-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-seed-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+    // 3-chunk stop entry
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-stop-3chunk",
+      kind: "stop",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-stop-3chunk",
+      }),
+    }, 1_100);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Process batch 1 (5 seeds)
+    await sender.processOnce();
+    // Process batch 2 (5 seeds)
+    await sender.processOnce();
+    // Process batch 3 (1 seed + 3-chunk stop)
+    await sender.processOnce();
+
+    // 11 seeds should be sent, but 3-chunk stop deferred because 11 + 3 = 14 > 12
+    expect(sendNotification).toHaveBeenCalledTimes(11);
+    const stopRec = storage.outbox.getByNotificationId("notif-stop-3chunk");
+    expect(stopRec!.state).toBe("queued");
+    expect(stopRec!.attempts).toBe(0);
+  });
+
+  it("an entry with more chunks than the whole budget still sends into an empty window", async () => {
+    const messages = Array.from({ length: 15 }, (_, i) => ({ text: `msg-${i}` }));
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-oversized-empty",
+      kind: "stop",
+      payload: JSON.stringify({
+        messages,
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-oversized-empty",
+      }),
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(15);
+    const rec = storage.outbox.getByNotificationId("notif-oversized-empty");
+    expect(rec!.state).toBe("sent");
+  });
+
+  it("a deferred multi-chunk entry does not block a later single-chunk entry in the same batch", async () => {
+    // Seed 10 single-chunk sends
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-seed-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: `seed-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-seed-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+    // 3-chunk entry (10 + 3 = 13 > 12 -> deferred)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-defer-3chunk",
+      kind: "stop",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-defer-3chunk",
+      }),
+    }, 1_020);
+    // 1-chunk entry (10 + 1 = 11 <= 12 -> should send!)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-eligible-1chunk",
+      kind: "question",
+      payload: JSON.stringify({
+        messages: [{ text: "q1" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-eligible-1chunk",
+      }),
+    }, 1_030);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    // Drain batch 1 (5 items)
+    await sender.processOnce();
+    // Drain batch 2 (5 items)
+    await sender.processOnce();
+    // Drain batch 3 (has 3-chunk entry and 1-chunk entry)
+    await sender.processOnce();
+
+    // Total sends = 10 (seeds) + 1 (eligible single chunk) = 11
+    expect(sendNotification).toHaveBeenCalledTimes(11);
+    expect(storage.outbox.getByNotificationId("notif-defer-3chunk")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("notif-eligible-1chunk")!.state).toBe("sent");
   });
 
   it("normal low-volume operation is completely unaffected (f)", async () => {
