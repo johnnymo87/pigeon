@@ -110,6 +110,50 @@ describe("MessageTail", () => {
       tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "After.")
       expect(tail.consume("s1")).toBe("After.")
     })
+
+    test("a late message.updated from before a consume cannot flip back after it", () => {
+      // turn 1: m1 then m2, so m1 is recorded as pushed
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "m1 text")
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "m2 text")
+
+      // consume() -- the idle send
+      const turn1Summary = tail.consume("s1")
+      expect(turn1Summary).toBe("m1 text\n\n———\n\nm2 text")
+
+      // turn 2: m3 starts and streams partial text
+      tail.onMessageUpdated({ id: "m3", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p3", sessionID: "s1", messageID: "m3", type: "text" }, "m3 partial")
+
+      // late message.updated for m1 arrives (the 2.41% class, up to 37s late)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+
+      // assert: m3's text is NOT torn, m3 remains current, m3's later deltas still land
+      tail.onPartUpdated({ id: "p3", sessionID: "s1", messageID: "m3", type: "text" }, " and more")
+
+      expect(tail.getCurrentMessageId("s1")).toBe("m3")
+      expect(tail.getSummary("s1")).toBe("m3 partial and more")
+    })
+
+    test("the pushed-id set is bounded on a long-lived session", () => {
+      // drive well over the cap of assistant messages
+      for (let i = 1; i <= 600; i++) {
+        tail.onMessageUpdated({ id: `msg-${i}`, sessionID: "s1", role: "assistant" })
+        tail.onPartUpdated({ id: `p-${i}`, sessionID: "s1", messageID: `msg-${i}`, type: "text" }, `text ${i}`)
+      }
+
+      expect(tail.getPushedMessageIdCount("s1")).toBe(500)
+
+      // msg-600 is current, msg-599 is in pushedMessageIds
+      tail.onMessageUpdated({ id: "msg-599", sessionID: "s1", role: "assistant" })
+      expect(tail.getCurrentMessageId("s1")).toBe("msg-600")
+
+      // msg-1 was evicted from the bounded set
+      tail.onMessageUpdated({ id: "msg-1", sessionID: "s1", role: "assistant" })
+      expect(tail.getCurrentMessageId("s1")).toBe("msg-1")
+    })
   })
 
   describe("message accumulation", () => {

@@ -100,6 +100,13 @@ const MAX_TURN_CHARS = 40_000
  */
 const MAX_MESSAGE_ROLES = 2000
 
+/**
+ * Cap on retained pushed-message IDs per session to prevent unbounded memory growth on long-lived sessions.
+ * 500 entries is ample: the late-update hazard window is 37 seconds, and 500 assistant messages
+ * far exceeds what can occur in that time.
+ */
+const MAX_PUSHED_MESSAGE_IDS = 500
+
 export class MessageTail {
   private sessions = new Map<string, SessionTail>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
@@ -168,7 +175,14 @@ export class MessageTail {
       // defensive.
       if (tail.currentMessageId !== info.id && !tail.pushedMessageIds.has(info.id)) {
         this.pushSegment(tail)
-        if (tail.currentMessageId) tail.pushedMessageIds.add(tail.currentMessageId)
+        if (tail.currentMessageId) {
+          tail.pushedMessageIds.add(tail.currentMessageId)
+          while (tail.pushedMessageIds.size > MAX_PUSHED_MESSAGE_IDS) {
+            const oldest = tail.pushedMessageIds.values().next().value
+            if (oldest === undefined) break
+            tail.pushedMessageIds.delete(oldest)
+          }
+        }
         tail.currentMessageId = info.id
         tail.text = ""
       }
@@ -406,6 +420,11 @@ export class MessageTail {
    * Deliberately clears BEFORE the POST succeeds. A daemon-down idle therefore loses the
    * buffer; this codebase prefers loss over duplication (see the mirror design), and the
    * daemon 202s into a durable outbox so only a dead daemon can hit it.
+   *
+   * NOTE: pushedMessageIds is deliberately NOT cleared here. The flip-back hazard (a late
+   * message.updated arriving up to 37s after a message completed) outlives turn boundaries.
+   * opencode message IDs never repeat, so pushedMessageIds is session-scoped, bounded by
+   * MAX_PUSHED_MESSAGE_IDS where IDs are added.
    */
   consume(sessionID: string): string {
     const summary = this.getSummary(sessionID)
@@ -414,10 +433,14 @@ export class MessageTail {
       tail.segments = []
       tail.text = ""
       tail.droppedSegments = 0
-      tail.pushedMessageIds.clear()
       tail.files = []
     }
     return summary
+  }
+
+  getPushedMessageIdCount(sessionID: string): number {
+    const tail = this.sessions.get(sessionID)
+    return tail?.pushedMessageIds.size ?? 0
   }
 
   getCurrentMessageId(sessionID: string): string | undefined {
