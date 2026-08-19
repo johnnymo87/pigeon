@@ -44,6 +44,7 @@ type SessionTail = {
   currentMessageId: string | undefined
   text: string
   segments: string[]
+  droppedSegments: number
   files: FileInfo[]
   seenAnyMessage: boolean
   lastSeenAt: number
@@ -82,6 +83,17 @@ async function waitForDiscovery(promise: Promise<void>, timeoutMs = 1000): Promi
 }
 
 /**
+ * Cap on retained segment text per turn. 40K is p99.9 of all-history turn size: exceeded
+ * by 26 of 22,923 turns. Enforced at PUSH time so plugin memory is bounded (40K x <=100
+ * retained sessions ~ 4MB) rather than only at read time.
+ *
+ * Dropping oldest-first deliberately does NOT bound an oversized FINAL segment. That is
+ * pre-existing behaviour (history holds a single 246K stop) and truncating a conclusion
+ * would be worse than a long one.
+ */
+const MAX_TURN_CHARS = 40_000
+
+/**
  * Cap on retained message-role entries. Sized well above any plausible number of messages that
  * could still receive parts, so eviction only ever reaches entries that are long finished.
  */
@@ -112,7 +124,7 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, text: "", segments: [], files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, text: "", segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
@@ -122,8 +134,16 @@ export class MessageTail {
 
   private pushSegment(tail: SessionTail): void {
     const stripped = stripMarkdown(tail.text)
-    if (stripped) tail.segments.push(stripped)
     tail.text = ""
+    if (!stripped) return
+
+    tail.segments.push(stripped)
+
+    let total = tail.segments.reduce((n, s) => n + s.length, 0)
+    while (total > MAX_TURN_CHARS && tail.segments.length > 1) {
+      total -= tail.segments.shift()!.length
+      tail.droppedSegments++
+    }
   }
 
   onMessageUpdated(info: MessageInfo): void {
@@ -364,7 +384,10 @@ export class MessageTail {
 
     const current = stripMarkdown(tail.text)
     const parts = current ? [...tail.segments, current] : tail.segments
-    return parts.join(SEGMENT_SEPARATOR)
+    const body = parts.join(SEGMENT_SEPARATOR)
+    if (!tail.droppedSegments) return body
+    const n = tail.droppedSegments
+    return `… ${n} earlier step${n === 1 ? "" : "s"} omitted${SEGMENT_SEPARATOR}${body}`
   }
 
   getCurrentMessageId(sessionID: string): string | undefined {

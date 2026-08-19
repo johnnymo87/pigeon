@@ -54,6 +54,28 @@ describe("MessageTail", () => {
     })
   })
 
+  describe("turn accumulation cap", () => {
+    test("drops oldest segments and says so when over the cap", () => {
+      const big = "x".repeat(15_000)
+      for (let i = 1; i <= 4; i++) {
+        tail.onMessageUpdated({ id: `m${i}`, sessionID: "s1", role: "assistant" })
+        tail.onPartUpdated({ id: `p${i}`, sessionID: "s1", messageID: `m${i}`, type: "text" }, big)
+      }
+      const summary = tail.getSummary("s1")
+
+      expect(summary).toContain("… 1 earlier step omitted")
+      expect(summary.length).toBeLessThan(46_000)
+    })
+
+    test("does not truncate a single oversized final segment", () => {
+      const huge = "y".repeat(120_000)
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, huge)
+
+      expect(tail.getSummary("s1")).toBe(huge)
+    })
+  })
+
   describe("message accumulation", () => {
     test("should accumulate text from assistant messages only", () => {
       tail.onMessageUpdated({
