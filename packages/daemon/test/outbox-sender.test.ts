@@ -2074,13 +2074,16 @@ describe("OutboxSender rate governor", () => {
       }),
     }, 1_020);
     // 1-chunk entry for sess-2 (10 + 1 = 11 <= 12 -> should send!)
+    // Must be 'stop' so sess-2 and sess-1 tie at kind-rank 2 in getReady's group subquery;
+    // created_at 1_030 > 1_020 then ensures sess-2 sorts AFTER sess-1's deferred entry,
+    // actually testing that the loop continue'd past the deferral.
     storage.outbox.upsert({
       ...BASE_OUTBOX_INPUT,
       notificationId: "notif-eligible-1chunk",
       sessionId: "sess-2",
-      kind: "question",
+      kind: "stop",
       payload: JSON.stringify({
-        messages: [{ text: "q1" }],
+        messages: [{ text: "s1" }],
         replyMarkup: { inline_keyboard: [] },
         notificationId: "notif-eligible-1chunk",
       }),
