@@ -249,11 +249,16 @@ export class OutboxSender {
       }
 
       const entries = this.storage.outbox.getReady(now, 5);
+      const deferredSessions = new Set<string>();
       const deferredLowPrioritySessions = new Set<string>();
       let loggedSubBudgetDeferral = false;
       let loggedGovernorChunkDeferral = false;
 
       batchLoop: for (const entry of entries) {
+        if (deferredSessions.has(entry.sessionId)) {
+          continue;
+        }
+
         const now = this.nowFn();
 
         // Prune send timestamps older than 60 seconds
@@ -336,6 +341,7 @@ export class OutboxSender {
           this.sendTimestamps.length > 0 &&
           this.sendTimestamps.length + messages.length > OUTBOX_RATE_LIMIT
         ) {
+          deferredSessions.add(entry.sessionId);
           if (!loggedGovernorChunkDeferral) {
             this.log("outbox rate governor limit reached for chunks, deferring entry", {
               kind: entry.kind,
@@ -347,7 +353,8 @@ export class OutboxSender {
             loggedGovernorChunkDeferral = true;
           }
           // continue, NOT break -- breaking abandons lower-ranked but still-eligible entries
-          // in this batch (same reasoning as the entry-ordering note above).
+          // from DIFFERENT sessions in this batch. Same-session entries are deferred via
+          // deferredSessions to preserve delivery order (pigeon-81p).
           continue;
         }
 

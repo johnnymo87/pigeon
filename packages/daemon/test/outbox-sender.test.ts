@@ -2048,7 +2048,7 @@ describe("OutboxSender rate governor", () => {
     expect(rec!.state).toBe("sent");
   });
 
-  it("a deferred multi-chunk entry does not block a later single-chunk entry in the same batch", async () => {
+  it("a deferred multi-chunk entry does not block a later single-chunk entry from a DIFFERENT session", async () => {
     // Seed 10 single-chunk sends
     for (let i = 0; i < 10; i++) {
       storage.outbox.upsert({
@@ -2061,10 +2061,11 @@ describe("OutboxSender rate governor", () => {
         }),
       }, 1_000 + i);
     }
-    // 3-chunk entry (10 + 3 = 13 > 12 -> deferred)
+    // 3-chunk entry for sess-1 (10 + 3 = 13 > 12 -> deferred)
     storage.outbox.upsert({
       ...BASE_OUTBOX_INPUT,
       notificationId: "notif-defer-3chunk",
+      sessionId: "sess-1",
       kind: "stop",
       payload: JSON.stringify({
         messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
@@ -2072,10 +2073,11 @@ describe("OutboxSender rate governor", () => {
         notificationId: "notif-defer-3chunk",
       }),
     }, 1_020);
-    // 1-chunk entry (10 + 1 = 11 <= 12 -> should send!)
+    // 1-chunk entry for sess-2 (10 + 1 = 11 <= 12 -> should send!)
     storage.outbox.upsert({
       ...BASE_OUTBOX_INPUT,
       notificationId: "notif-eligible-1chunk",
+      sessionId: "sess-2",
       kind: "question",
       payload: JSON.stringify({
         messages: [{ text: "q1" }],
@@ -2096,13 +2098,155 @@ describe("OutboxSender rate governor", () => {
     await sender.processOnce();
     // Drain batch 2 (5 items)
     await sender.processOnce();
-    // Drain batch 3 (has 3-chunk entry and 1-chunk entry)
+    // Drain batch 3 (has 3-chunk entry from sess-1 and 1-chunk entry from sess-2)
     await sender.processOnce();
 
-    // Total sends = 10 (seeds) + 1 (eligible single chunk) = 11
+    // Total sends = 10 (seeds) + 1 (eligible single chunk from sess-2) = 11
     expect(sendNotification).toHaveBeenCalledTimes(11);
     expect(storage.outbox.getByNotificationId("notif-defer-3chunk")!.state).toBe("queued");
     expect(storage.outbox.getByNotificationId("notif-eligible-1chunk")!.state).toBe("sent");
+  });
+
+  it("a deferred multi-chunk stop is not leapfrogged by a later question in the SAME session", async () => {
+    // Seed 10 single-chunk sends
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-seed-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: `seed-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-seed-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+    // 3-chunk stop for sess-1 (createdAt 1020) (10 + 3 = 13 > 12 -> deferred)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-stop-3chunk",
+      sessionId: "sess-1",
+      kind: "stop",
+      payload: JSON.stringify({
+        messages: [{ text: "c1" }, { text: "c2" }, { text: "c3" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-stop-3chunk",
+      }),
+    }, 1_020);
+    // 1-chunk question for sess-1 (createdAt 1030) (later same-session entry)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-question-1chunk",
+      sessionId: "sess-1",
+      kind: "question",
+      payload: JSON.stringify({
+        messages: [{ text: "q1" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-question-1chunk",
+      }),
+    }, 1_030);
+
+    const sentNotificationIds: string[] = [];
+    const sendNotification = vi.fn().mockImplementation((input: SendNotificationInput) => {
+      sentNotificationIds.push(input.notificationId ?? input.sessionId);
+      return Promise.resolve({ ok: true });
+    }) as ReturnType<typeof vi.fn> & SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Drain batch 1 (5 seeds)
+    await sender.processOnce();
+    // Drain batch 2 (5 seeds)
+    await sender.processOnce();
+    // Drain batch 3 (has 3-chunk stop and 1-chunk question for sess-1)
+    await sender.processOnce();
+
+    // Only 10 seeds sent this tick; question did NOT send because earlier stop in sess-1 was deferred
+    expect(sendNotification).toHaveBeenCalledTimes(10);
+    const stopRec = storage.outbox.getByNotificationId("notif-stop-3chunk");
+    const qRec = storage.outbox.getByNotificationId("notif-question-1chunk");
+    expect(stopRec!.state).toBe("queued");
+    expect(stopRec!.attempts).toBe(0);
+    expect(qRec!.state).toBe("queued");
+    expect(qRec!.attempts).toBe(0);
+
+    // Advance past 60s rate window so window empties
+    now = 70_000;
+    await sender.processOnce();
+
+    // Both should now be sent
+    expect(storage.outbox.getByNotificationId("notif-stop-3chunk")!.state).toBe("sent");
+    expect(storage.outbox.getByNotificationId("notif-question-1chunk")!.state).toBe("sent");
+
+    // Verify ordering: stop chunks sent BEFORE question chunk
+    // 10 seeds sent first, then stop chunks (#c0, #c1, notif-stop-3chunk), then notif-question-1chunk
+    const sendsAfterDrain = sentNotificationIds.slice(10);
+    expect(sendsAfterDrain).toEqual([
+      "notif-stop-3chunk#c0",
+      "notif-stop-3chunk#c1",
+      "notif-stop-3chunk",
+      "notif-question-1chunk",
+    ]);
+  });
+
+  it("a low-priority multi-chunk entry deferred by governor is not leapfrogged by a later same-session low-priority entry", async () => {
+    // Seed 10 single-chunk sends
+    for (let i = 0; i < 10; i++) {
+      storage.outbox.upsert({
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `notif-seed-${i}`,
+        payload: JSON.stringify({
+          messages: [{ text: `seed-${i}` }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: `notif-seed-${i}`,
+        }),
+      }, 1_000 + i);
+    }
+    // 3-chunk swarm entry for sess-1 (10 + 3 = 13 > 12 -> deferred by governor)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-swarm-3chunk",
+      sessionId: "sess-1",
+      kind: "swarm",
+      payload: JSON.stringify({
+        messages: [{ text: "sw1" }, { text: "sw2" }, { text: "sw3" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-swarm-3chunk",
+      }),
+    }, 1_020);
+    // 1-chunk mirror entry for sess-1 (createdAt 1030)
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "notif-mirror-1chunk",
+      sessionId: "sess-1",
+      kind: "mirror",
+      payload: JSON.stringify({
+        messages: [{ text: "m1" }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "notif-mirror-1chunk",
+      }),
+    }, 1_030);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce(); // batch 1 (5 seeds)
+    await sender.processOnce(); // batch 2 (5 seeds)
+    await sender.processOnce(); // batch 3
+
+    expect(sendNotification).toHaveBeenCalledTimes(10);
+    expect(storage.outbox.getByNotificationId("notif-swarm-3chunk")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("notif-mirror-1chunk")!.state).toBe("queued");
   });
 
   it("normal low-volume operation is completely unaffected (f)", async () => {
