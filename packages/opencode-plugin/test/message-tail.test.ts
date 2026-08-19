@@ -1720,4 +1720,36 @@ describe("MessageTail", () => {
       expect(elapsed).toBeLessThan(500)
     })
   })
+
+  describe("accepted trades", () => {
+    test("a not-yet-registered idle leaves the buffer to carry into the next stop", () => {
+      // shouldNotify() is false for an unregistered session, so index.ts returns BEFORE
+      // consume. Only the same-message-id branch has the "nothing new was produced"
+      // property; this branch carries the previous turn's narration forward. Accepted.
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Earlier.")
+      // no consume -- simulating the early return
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Later.")
+
+      expect(tail.consume("s1")).toBe("Earlier.\n\n———\n\nLater.")
+    })
+
+    test("clear() drops an unsent turn (session.deleted / kill path)", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Unsent.")
+      tail.clear("s1")
+      expect(tail.getSummary("s1")).toBe("")
+    })
+
+    test("a subagent session still accumulates but is never consumed by the idle path", () => {
+      // index.ts:476 returns early for non-main sessions. Bounded by the 40K cap and the
+      // 24h eviction sweep; recorded so it is not rediscovered as a leak.
+      const sub = new MessageTail({ isMainSession: () => false })
+      sub.onMessageUpdated({ id: "m1", sessionID: "sub-1", role: "assistant" })
+      sub.onPartUpdated({ id: "p1", sessionID: "sub-1", messageID: "m1", type: "text" }, "Work.")
+      expect(sub.getSummary("sub-1")).toBe("Work.")
+    })
+  })
 })
