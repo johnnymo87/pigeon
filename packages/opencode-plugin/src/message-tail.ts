@@ -44,6 +44,7 @@ type SessionTail = {
   currentMessageId: string | undefined
   pushedMessageIds: Set<string>
   text: string
+  consumedRawLength: number
   segments: string[]
   droppedSegments: number
   files: FileInfo[]
@@ -132,7 +133,7 @@ export class MessageTail {
   private getOrCreate(sessionID: string): SessionTail {
     let tail = this.sessions.get(sessionID)
     if (!tail) {
-      tail = { currentMessageId: undefined, pushedMessageIds: new Set(), text: "", segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
+      tail = { currentMessageId: undefined, pushedMessageIds: new Set(), text: "", consumedRawLength: 0, segments: [], droppedSegments: 0, files: [], seenAnyMessage: false, lastSeenAt: Date.now() }
       this.sessions.set(sessionID, tail)
     } else {
       tail.lastSeenAt = Date.now()
@@ -185,6 +186,7 @@ export class MessageTail {
         }
         tail.currentMessageId = info.id
         tail.text = ""
+        tail.consumedRawLength = 0
       }
       const pendingBuffer = this.userBuffers.get(info.id)
       if (pendingBuffer) {
@@ -298,7 +300,8 @@ export class MessageTail {
       tail.text += delta
     } else {
       const textPart = part as PartInfo & { text?: string }
-      tail.text = textPart.text ?? ""
+      const full = textPart.text ?? ""
+      tail.text = full.length >= tail.consumedRawLength ? full.slice(tail.consumedRawLength) : full
     }
   }
 
@@ -430,6 +433,7 @@ export class MessageTail {
     const summary = this.getSummary(sessionID)
     const tail = this.sessions.get(sessionID)
     if (tail) {
+      tail.consumedRawLength += tail.text.length
       tail.segments = []
       tail.text = ""
       tail.droppedSegments = 0

@@ -154,6 +154,72 @@ describe("MessageTail", () => {
       tail.onMessageUpdated({ id: "msg-1", sessionID: "s1", role: "assistant" })
       expect(tail.getCurrentMessageId("s1")).toBe("msg-1")
     })
+
+    test("a full-text part.updated arriving after a consume does not replay the sent text", () => {
+      // m1 streams "Step one." via delta
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Step one.")
+
+      // consume() -- the idle send
+      expect(tail.consume("s1")).toBe("Step one.")
+
+      // a NON-delta part.updated for m1 arrives carrying the full "Step one."
+      tail.onPartUpdated({
+        id: "p1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "text",
+        text: "Step one.",
+      })
+
+      // m2 starts and streams "Step two."
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p2", sessionID: "s1", messageID: "m2", type: "text" }, "Step two.")
+
+      // assert: consume() returns exactly "Step two." -- no duplicated "Step one."
+      expect(tail.consume("s1")).toBe("Step two.")
+    })
+
+    test("a full-text part.updated after a consume still captures genuinely NEW text", () => {
+      // m1 streams "Step one."
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Step one.")
+
+      // consume()
+      expect(tail.consume("s1")).toBe("Step one.")
+
+      // non-delta part.updated for m1 carrying "Step one. And more."
+      tail.onPartUpdated({
+        id: "p1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "text",
+        text: "Step one. And more.",
+      })
+
+      // assert: the summary contains " And more." and NOT a second "Step one."
+      expect(tail.getSummary("s1")).toBe("And more.")
+    })
+
+    test("a new message after a consume resets the consumed watermark", () => {
+      // m1 streams a long text, consume()
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({ id: "p1", sessionID: "s1", messageID: "m1", type: "text" }, "Long text from first message.")
+      expect(tail.consume("s1")).toBe("Long text from first message.")
+
+      // m2 starts, then a NON-delta part.updated for m2 with SHORT text
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "p2",
+        sessionID: "s1",
+        messageID: "m2",
+        type: "text",
+        text: "Short.",
+      })
+
+      // assert: m2's short text is not truncated by m1's watermark
+      expect(tail.getSummary("s1")).toBe("Short.")
+    })
   })
 
   describe("message accumulation", () => {
