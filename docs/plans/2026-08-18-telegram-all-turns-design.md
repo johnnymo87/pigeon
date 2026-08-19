@@ -116,9 +116,24 @@ reality — i.e. it overstates post count and understates per-post size.
 Accumulate every assistant message's text across a turn and send it in the **same
 single stop notification** that already fires at `session.idle`.
 
-Notification **count** is unchanged. No new outbox kind, no ancillary-gate change,
-no topic-model change. Only bodies get longer. That is what makes the experiment
-cheap to revert.
+Notification **count** is unchanged on the `session.idle` path. No new outbox kind,
+no ancillary-gate change, no topic-model change. Only bodies get longer. That is
+what makes the experiment cheap to revert.
+
+**Amended during implementation — two rare new sends exist at the pre-question
+flush**, both of which are the feature working rather than side effects. Found by
+adversarial review, recorded here so the post-deploy census (Task 11) is not read
+as a regression:
+
+1. Segments non-empty but the *current* message's text empty — the agent narrated
+   in step 1, step 2 was pure tool-calls, then it asked. The old `getSummary`
+   returned only `tail.text`, so it was `""` and no flush fired; the accumulated
+   narration now sends. Bounded by question volume (68 per 7 days).
+2. Files present with no text at all. The flush gate is now
+   `if (summary || files.length > 0)`, because `consume()` clears `files`
+   unconditionally and the old text-only gate therefore *discarded* mid-turn
+   attachments that used to survive to the later idle. Bounded by media volume
+   (8 tool attachments in 30 days).
 
 ### Mechanism
 
@@ -230,6 +245,21 @@ Stop and question share per-row tier 1, ordered by `created_at` within the tier
 (`outbox-repo.ts:126-130`). A large stop **delays** a question; it never
 **reorders** one. `pigeon-81p` was an inversion, and no inversion is reintroduced.
 
+**This claim was false for one commit, and the gap is instructive.** The
+chunk-aware governor (hazard 2 below) defers an oversized entry with `continue`
+rather than `break`, so that a deferred entry does not abandon unrelated entries
+later in the batch. That is right *across* sessions and wrong *within* one: a
+5-chunk stop deferred at 8/12 used let the **same session's** later 1-chunk
+question through ahead of it — exactly `pigeon-81p`, and a test shipped pinning
+the inversion as desired. The fix mirrors the existing `deferredLowPrioritySessions`
+pattern: a per-batch `deferredSessions` set makes a deferral block every later
+entry of that session while leaving other sessions eligible. `getReady`'s ordering
+is stable, so order is preserved across ticks as well as within a batch.
+
+The lesson worth keeping: "defer, don't drop" is order-preserving only if the
+deferral scope matches the ordering guarantee's scope. The governor reasons per
+*window*, the invariant is per *session*.
+
 However, the 2026-08-10 design's success criterion — "no question delayed more than
 one governor window, holds while queued question+stop+card ≤ 6 per window" — loses
 its arithmetic when one p99 stop is itself ~6 chunks. Worst realistic delay for a
@@ -313,6 +343,33 @@ governor fix.
 - Subagent sessions produce no notification change.
 - **Governor:** an entry whose chunk count would exceed the remaining window is
   deferred, not started; a question enqueued behind it still sends in the next window.
+
+Added after adversarial review, each pinning a defect that review actually found in
+the first implementation rather than a hypothetical:
+
+- **Same-session order under deferral:** a deferred multi-chunk stop is *not*
+  leapfrogged by a later same-session question, and the two arrive in `created_at`
+  order on the following tick. Pins the `pigeon-81p` invariant.
+- **Cross-session non-blocking:** a deferred entry still lets a *different*
+  session's entry send in the same batch. This one has to be constructed with care —
+  the first version of it passed even under `break`, because `getReady` groups a
+  session by its minimum kind-rank and the other session's row was being processed
+  *before* the deferral was ever reached. Both entries must be the same kind, with
+  the other session's `created_at` later, or the test pins nothing. Verified by
+  temporarily flipping `continue` to `break` and watching it fail.
+- **Flip-back across a consume boundary:** `consume()` must *not* clear
+  `pushedMessageIds`. The 37s late-update window outlives a turn, so clearing it
+  re-armed the hazard at every turn boundary. The set is session-scoped (opencode
+  ids never repeat) and bounded at add time by `MAX_PUSHED_MESSAGE_IDS = 500` —
+  ample, since exhausting it inside 37s needs 13.5 completed steps per second.
+- **No replay of consumed text:** a *full-text* (non-delta) `part.updated` for the
+  still-current message arriving after a `consume()` refills the buffer with text
+  already sent, which the next `pushSegment` would emit a second time. The old wipe
+  made this harmless; accumulation made it a visible duplicate. Guarded by a
+  per-message `consumedRawLength` watermark, reset whenever the current message
+  changes — measured in RAW characters, because the buffer is raw while `consume()`
+  returns stripped text.
+- **Mid-turn attachments with no text** survive the pre-question flush.
 
 ## Success criteria
 
