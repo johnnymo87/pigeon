@@ -1126,6 +1126,35 @@ describe("MessageTail", () => {
       expect(tail.getFiles("session-1")).toHaveLength(1)
     })
 
+    test("files from earlier steps in a turn survive, and clear on consume", () => {
+      tail.onMessageUpdated({ id: "m1", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "f1",
+        sessionID: "s1",
+        messageID: "m1",
+        type: "file",
+        mime: "image/png",
+        filename: "chart.png",
+        url: "https://x/1",
+      } as any)
+
+      tail.onMessageUpdated({ id: "m2", sessionID: "s1", role: "assistant" })
+      tail.onPartUpdated({
+        id: "f2",
+        sessionID: "s1",
+        messageID: "m2",
+        type: "file",
+        mime: "image/png",
+        filename: "after.png",
+        url: "https://x/2",
+      } as any)
+
+      expect(tail.getFiles("s1").map((f) => f.filename)).toEqual(["chart.png", "after.png"])
+
+      tail.consume("s1")
+      expect(tail.getFiles("s1")).toEqual([])
+    })
+
     test("clears files on clear()", () => {
       tail.onMessageUpdated({
         id: "msg-1",

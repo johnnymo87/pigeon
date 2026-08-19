@@ -415,6 +415,7 @@ export class MessageTail {
       tail.text = ""
       tail.droppedSegments = 0
       tail.pushedMessageIds.clear()
+      tail.files = []
     }
     return summary
   }
