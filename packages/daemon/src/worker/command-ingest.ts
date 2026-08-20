@@ -70,6 +70,24 @@ export const DEFAULT_DELIVERY_BUDGET_MS = 40_000;
 const QUESTION_OPTION_RE = /^q(\d+)$/;
 const WIZARD_OPTION_RE = /^v(\d+):q(\d+)$/;
 
+export function formatDeliveryMeta(meta?: Record<string, unknown>): string {
+  if (!meta) return "";
+  const parts: string[] = [];
+  if (meta.endpoint != null && meta.endpoint !== "") {
+    parts.push(`endpoint=${meta.endpoint}`);
+  }
+  if (meta.status != null) {
+    parts.push(`status=${meta.status}`);
+  }
+  if (meta.rejectReason != null && meta.rejectReason !== "") {
+    parts.push(`rejectReason=${meta.rejectReason}`);
+  }
+  if (meta.tokenFp != null && meta.tokenFp !== "") {
+    parts.push(`tokenFp=${meta.tokenFp}`);
+  }
+  return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+}
+
 function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   const command = msg.command.trim();
   if (QUESTION_OPTION_RE.test(command)) {
@@ -381,7 +399,7 @@ export async function ingestWorkerCommand(
       }
 
       throwIfTransientQuestionReplyFailure(result, commandId);
-      console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}`);
+      console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
       if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
         return;
       }
@@ -428,7 +446,7 @@ export async function ingestWorkerCommand(
     }
 
     throwIfTransientQuestionReplyFailure(result, commandId);
-    console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}`);
+    console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
     if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
       return;
     }
@@ -507,7 +525,7 @@ export async function ingestWorkerCommand(
 
       // If question reply fails (e.g., 404 question not found), fall through to
       // regular command delivery so the user's text isn't lost.
-      console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery`);
+      console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery${formatDeliveryMeta(result.meta)}`);
     } else {
       console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}, falling through to regular delivery`);
     }
@@ -994,7 +1012,7 @@ function isConnectionError(error: string | undefined): boolean {
 function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
   if (!isConnectionError(result.error)) return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
-  console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}`);
+  console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);
   throw new Error(error);
 }
 
@@ -1047,21 +1065,7 @@ async function deliverViaAdapter(
     return;
   }
 
-  const metaParts: string[] = [];
-  if (result.meta?.endpoint !== undefined && result.meta.endpoint !== null && result.meta.endpoint !== "") {
-    metaParts.push(`endpoint=${result.meta.endpoint}`);
-  }
-  if (result.meta?.status !== undefined && result.meta.status !== null) {
-    metaParts.push(`status=${result.meta.status}`);
-  }
-  if (result.meta?.rejectReason !== undefined && result.meta.rejectReason !== null && result.meta.rejectReason !== "") {
-    metaParts.push(`rejectReason=${result.meta.rejectReason}`);
-  }
-  if (result.meta?.tokenFp !== undefined && result.meta.tokenFp !== null && result.meta.tokenFp !== "") {
-    metaParts.push(`tokenFp=${result.meta.tokenFp}`);
-  }
-  const metaSuffix = metaParts.length > 0 ? ` ${metaParts.join(" ")}` : "";
-  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}${metaSuffix}`);
+  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}${formatDeliveryMeta(result.meta)}`);
 
   if (isConnectionError(result.error)) {
     // The plugin endpoint did not confirm delivery (connection refused, or a

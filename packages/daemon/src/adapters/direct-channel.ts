@@ -83,6 +83,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
       || "OpenCode direct-channel execution failed";
 
     const tokenFp = tokenFingerprint(authToken);
+    // meta.rejectReason carries AckRejectReason on the execute path (e.g. UNAUTHORIZED, BUSY)
     const rejectReason = result.ack?.rejectReason;
 
     return {
@@ -136,6 +137,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
     }
 
     const tokenFp = tokenFingerprint(authToken);
+    // meta.rejectReason carries ResultErrorCode on the question-reply path (e.g. QUESTION_NOT_FOUND)
     const rejectReason = result.result?.errorCode;
 
     return {

@@ -280,7 +280,7 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
       expect(result.meta?.rejectReason).toBeUndefined();
     });
 
-    it("surfaces endpoint, status, rejectReason, and tokenFp on deliverQuestionReply failure without leaking raw token", async () => {
+    it("surfaces endpoint, status, and tokenFp without leaking raw token when deliverQuestionReply fails on 401; a stale-token 401 on question-reply yields status and endpoint but no rejectReason (see pigeon-m426.4)", async () => {
       const rawSecretToken = "secret-question-reply-token";
       const session: SessionRecord = {
         sessionId: "s1",
@@ -293,16 +293,16 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
       const fetchFn = vi.fn(async () => {
         return new Response(
           JSON.stringify({
-            result: {
-              type: OpencodeDirectMessageType.QuestionReplyResult,
+            ack: {
+              type: OpencodeDirectMessageType.Ack,
               version: OPENCODE_DIRECT_PROTOCOL_VERSION,
               requestId: "c1",
+              commandId: "c1",
               sessionId: "s1",
-              questionRequestId: "q1",
-              success: false,
-              finishedAt: Date.now(),
-              errorCode: ResultErrorCode.Unauthorized,
-              errorMessage: "Auth token invalid",
+              accepted: false,
+              acceptedAt: Date.now(),
+              rejectReason: AckRejectReason.Unauthorized,
+              message: "Unauthorized",
             },
           }),
           { status: 401, headers: { "content-type": "application/json" } },
@@ -320,13 +320,14 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
       );
 
       expect(result.ok).toBe(false);
+      expect(result.error).toBe("Invalid question reply result");
       const expectedTokenFp = createHash("sha256").update(rawSecretToken).digest("hex").slice(0, 8);
       expect(result.meta).toEqual({
         endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
         status: 401,
-        rejectReason: ResultErrorCode.Unauthorized,
         tokenFp: expectedTokenFp,
       });
+      expect(result.meta?.rejectReason).toBeUndefined();
 
       // Security assertion
       expect(JSON.stringify(result.meta)).not.toContain(rawSecretToken);
