@@ -28,14 +28,22 @@ change — not per-row expiry, which is only justified if two workloads under th
 different windows.
 
 That investigation surfaced a real defect the TTL work had been obscuring: **`POST
-/sessions/enable-notify` has zero production callers.** Only daemon source and tests reference it —
-no Telegram command, no CLI, no plugin path. The comment in `notify-policy.ts` calls it "the durable
-escape hatch", and it is durable in *semantics*, but reaching it requires a hand-written curl with
-the machine's auth token. So the `override` mechanism that makes a human decision permanent is
-effectively unreachable in **both** directions: a human cannot durably silence a session
-(`pigeon-60sw`, P2), and a human who adopts an lgtm session is re-silenced for the TTL on every
-automated re-declaration with no practical escape. The write paths are missing, not the semantics.
-`pigeon-60sw` is unstarted pending confirmation that a standing quiet rule is actually wanted.
+/sessions/enable-notify` had zero production callers.** Only daemon source and tests referenced it —
+no Telegram command, no CLI, no plugin path. `notify-policy.ts` called it "the durable escape
+hatch": durable in *semantics*, but reaching it required a hand-written curl with the machine's auth
+token. The `override` mechanism that makes a human decision permanent was therefore unreachable in
+**both** directions — a human could not durably silence a session (`pigeon-60sw`), and a human who
+adopted an lgtm session was re-silenced for the TTL on every automated re-declaration with no
+practical escape.
+
+> **RESOLVED 2026-08-20 BY REMOVAL, not by building the missing write path (`pigeon-60sw`, PR #120).**
+> Given zero callers, 0/372 sessions with `notify=0` and 0/454 rows using the source, the route and
+> the `override` source were deleted outright rather than made reachable. **`source='override'` no
+> longer exists**; do not design against it. Two consequences for anything below that assumes it:
+> the escape hatch is now `DELETE /session-origin`, and because `override` was the only TTL-exempt
+> case, **every suppression is now TTL-bounded — no session can be permanently silent.** The
+> capability deliberately given up is that no user-set state survives a later automated quiet write;
+> the TTL bounds that at one window, and noise-after-TTL is the recoverable direction.
 
 ---
 
