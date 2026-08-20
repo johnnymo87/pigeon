@@ -43,10 +43,10 @@ describe("shouldEmitAncillaryFor", () => {
     expect(shouldEmitAncillaryFor(storageWith(null), "ses_a", now, {})).toBe(true);
   });
 
-  it("emits for a user override, which must never be re-silenced", () => {
+  it("emits when policy is 'all'", () => {
     const storage = storageWith({
       notifyPolicy: "all",
-      source: "override",
+      source: "declared",
       createdAt: now - 1000,
       declaredAt: now - 1000,
     });

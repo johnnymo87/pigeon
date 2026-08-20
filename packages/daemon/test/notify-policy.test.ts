@@ -310,20 +310,59 @@ describe("effectiveNotifyPolicy", () => {
     ).toEqual({ policy: null, expired: false });
   });
 
-  it("returns override rows unchanged regardless of age", () => {
+  it("no suppression is exempt from the TTL: quiet rows (errors-only / none) expire after TTL regardless of source", () => {
     expect(
       effectiveNotifyPolicy(
-        { policy: "errors-only", source: "override", declaredAt: now - ttl - 100_000, now },
+        { policy: "errors-only", source: "declared", declaredAt: now - ttl - 100_000, now },
         {},
       ),
-    ).toEqual({ policy: "errors-only", expired: false });
+    ).toEqual({ policy: "all", expired: true });
 
     expect(
       effectiveNotifyPolicy(
-        { policy: "none", source: "override", declaredAt: now - ttl - 100_000, now },
+        { policy: "none", source: "inferred", declaredAt: now - ttl - 100_000, now },
         {},
       ),
-    ).toEqual({ policy: "none", expired: false });
+    ).toEqual({ policy: "all", expired: true });
+
+    // Even if legacy 'override' source is passed, errors-only / none must expire after TTL
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "errors-only", source: "override" as any, declaredAt: now - ttl - 100_000, now },
+        {},
+      ),
+    ).toEqual({ policy: "all", expired: true });
+
+    expect(
+      effectiveNotifyPolicy(
+        { policy: "none", source: "override" as any, declaredAt: now - ttl - 100_000, now },
+        {},
+      ),
+    ).toEqual({ policy: "all", expired: true });
+  });
+
+  it("legacy override row degrade: stored row with source='override' (or degraded 'inferred') and policy='all' resolves to deliver regardless of age", () => {
+    // Legacy enable-notify always wrote policy='all'. On read, source='override' degrades to 'inferred',
+    // and policy='all' stays 'all' and not expired regardless of how old the row is.
+    const effectiveDegraded = effectiveNotifyPolicy(
+      { policy: "all", source: "inferred", declaredAt: now - ttl - 100_000, now },
+      {},
+    );
+    expect(effectiveDegraded).toEqual({ policy: "all", expired: false });
+    expect(decideNotify({ event: "Stop", policy: effectiveDegraded.policy })).toEqual({
+      deliver: true,
+      layer: "origin",
+    });
+
+    const effectiveRaw = effectiveNotifyPolicy(
+      { policy: "all", source: "override" as any, declaredAt: now - ttl - 100_000, now },
+      {},
+    );
+    expect(effectiveRaw).toEqual({ policy: "all", expired: false });
+    expect(decideNotify({ event: "Stop", policy: effectiveRaw.policy })).toEqual({
+      deliver: true,
+      layer: "origin",
+    });
   });
 
   it("returns policy=all unchanged and not expired", () => {
@@ -384,10 +423,9 @@ describe("effectiveNotifyPolicy", () => {
       effectiveNotifyPolicy({ policy: "errors-only", source: "declared", declaredAt: Infinity, now }, {}),
     ).toEqual({ policy: "all", expired: true });
 
-    // ...but an unusable clock must NOT override a user's permanent un-quiet exemption.
     expect(
-      effectiveNotifyPolicy({ policy: "errors-only", source: "override", declaredAt: NaN, now }, {}),
-    ).toEqual({ policy: "errors-only", expired: false });
+      effectiveNotifyPolicy({ policy: "none", source: "inferred", declaredAt: NaN, now }, {}),
+    ).toEqual({ policy: "all", expired: true });
   });
 
   it("customizes TTL via PIGEON_DECLARED_QUIET_TTL_MS env var", () => {

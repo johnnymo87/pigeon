@@ -160,9 +160,9 @@ describe("swarm notices respect a declared-quiet receiver", () => {
     expect(upsertCalls).toHaveLength(0);
   });
 
-  it("still posts when the receiver's row is an explicit user override", () => {
+  it("still posts when the receiver's policy is 'all'", () => {
     const { storage, upsertCalls } = mockStorage({
-      originRow: { notifyPolicy: "all", source: "override", createdAt: 1786363200000 },
+      originRow: { notifyPolicy: "all", source: "declared", createdAt: 1786363200000 },
     });
     enqueueSwarmTelegramNotice(storage, makeRecord(), 1786363205000);
     expect(upsertCalls).toHaveLength(1);

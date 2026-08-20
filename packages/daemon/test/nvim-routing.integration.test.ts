@@ -61,7 +61,7 @@ describe("nvim session routing — HTTP session model", () => {
     expect(listBody.sessions[0]?.nvim_socket).toBe("/tmp/nvim.sock");
   });
 
-  it("enable-notify preserves nvim_socket", async () => {
+  it("session-start upsert preserves nvim_socket", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 20_000 });
 
@@ -79,27 +79,22 @@ describe("nvim session routing — HTTP session model", () => {
       }),
     );
 
-    // Enable notify — nvim_socket should be preserved
+    // Re-register session with updated label — nvim_socket should be preserved
     const response = await app(
-      new Request("http://localhost/sessions/enable-notify", {
+      new Request("http://localhost/session-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: "nvim-sess-2",
-          label: "Notified Nvim",
+          label: "Updated Nvim",
         }),
       }),
     );
 
     expect(response.status).toBe(200);
-    const body = (await response.json()) as {
-      ok: boolean;
-      session: Record<string, unknown>;
-    };
-    expect(body.ok).toBe(true);
-    expect(body.session.notify).toBe(true);
-    expect(body.session.label).toBe("Notified Nvim");
-    expect(body.session.nvim_socket).toBe("/tmp/nvim2.sock");
+    const session = storage.sessions.get("nvim-sess-2");
+    expect(session?.label).toBe("Updated Nvim");
+    expect(session?.nvimSocket).toBe("/tmp/nvim2.sock");
   });
 });
 
