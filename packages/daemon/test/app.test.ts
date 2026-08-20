@@ -1314,6 +1314,321 @@ describe("createApp", () => {
     expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
   });
 
+  describe("POST /question-asked quiet notification policy (pigeon-c501)", () => {
+    it("quiet (errors-only) session asks a single question: delivers unthreaded with no dir", async () => {
+      storage = openStorageDb(":memory:");
+      const now = 50_000;
+      const app = createApp(storage, {
+        nowFn: () => now,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_quiet",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "Quiet Session",
+        }),
+      }));
+
+      storage.sessionOrigins.record(
+        { sessionId: "ses_q_quiet", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        now,
+      );
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_quiet",
+          request_id: "req_q1",
+          questions: [{ question: "Confirm?", header: "Confirm", options: [] }],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const json = await response.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("accepted");
+      expect(json.notificationId).toBe("q:ses_q_quiet:req_q1");
+
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_quiet:req_q1");
+      expect(outboxRow).not.toBeNull();
+      expect(outboxRow?.state).toBe("queued");
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(false);
+      expect(payload.dir).toBeUndefined();
+      expect(payload.title).toBe("Quiet Session");
+
+      // The WHOLE POINT of delivering-instead-of-suppressing is that the question stays
+      // ANSWERABLE: a blocking question with no way to reply is the silent deadlock this
+      // design exists to avoid. Going unthreaded must not cost the reply affordance.
+      // This fixture has no options, so there are no inline buttons -- it is answered by
+      // REPLYING to the message, which the worker routes via (chat_id, message_id)
+      // independently of any thread. So what must survive here is the message itself.
+      expect(payload.replyMarkup).toBeDefined();
+      expect(payload.message?.text).toBeTruthy();
+      expect(outboxRow?.token).toBeTruthy();
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[question] quiet session — delivering unthreaded sessionId=ses_q_quiet origin=lgtm policy=errors-only",
+      );
+      logSpy.mockRestore();
+    });
+
+    it("quiet (errors-only) session asks multiple questions (wizard): delivers unthreaded with no dir", async () => {
+      storage = openStorageDb(":memory:");
+      const now = 50_000;
+      const app = createApp(storage, {
+        nowFn: () => now,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_wiz_quiet",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "Wiz Quiet Session",
+        }),
+      }));
+
+      storage.sessionOrigins.record(
+        { sessionId: "ses_q_wiz_quiet", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        now,
+      );
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_wiz_quiet",
+          request_id: "req_wiz",
+          questions: [
+            { question: "Q1", header: "H1", options: [{ label: "A", description: "" }] },
+            { question: "Q2", header: "H2", options: [{ label: "B", description: "" }] },
+          ],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const json = await response.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+      expect(json.deliveryState).toBe("accepted");
+
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_wiz_quiet:req_wiz");
+      expect(outboxRow).not.toBeNull();
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(false);
+      expect(payload.dir).toBeUndefined();
+      expect(payload.title).toBe("Wiz Quiet Session");
+      expect(payload.message.text).toContain("Question 1 of 2");
+
+      // This fixture HAS options, so the wizard is answered by pressing an inline button.
+      // The callback token is what routes the press back to the session, and it is carried
+      // in callback_data rather than in any thread context -- pin that going unthreaded
+      // does not cost it, or a quiet session's wizard becomes unanswerable.
+      expect(JSON.stringify(payload.replyMarkup)).toContain("cmd:");
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[question] quiet session — delivering unthreaded sessionId=ses_q_wiz_quiet origin=lgtm policy=errors-only",
+      );
+      logSpy.mockRestore();
+    });
+
+    it("none policy behaves the same as errors-only: delivers unthreaded with no dir", async () => {
+      storage = openStorageDb(":memory:");
+      const now = 50_000;
+      const app = createApp(storage, {
+        nowFn: () => now,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_none",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "None Session",
+        }),
+      }));
+
+      storage.sessionOrigins.record(
+        { sessionId: "ses_q_none", origin: "ci", notifyPolicy: "none", source: "declared" },
+        now,
+      );
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_none",
+          request_id: "req_none",
+          questions: [{ question: "Proceed?", header: "Proceed", options: [] }],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const json = await response.json() as Record<string, unknown>;
+      expect(json.ok).toBe(true);
+
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_none:req_none");
+      expect(outboxRow).not.toBeNull();
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(false);
+      expect(payload.dir).toBeUndefined();
+      expect(payload.title).toBe("None Session");
+    });
+
+    it("no session_origin row: delivers threaded with dir present", async () => {
+      storage = openStorageDb(":memory:");
+      const now = 50_000;
+      const app = createApp(storage, {
+        nowFn: () => now,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_normal",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "Normal Session",
+        }),
+      }));
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_normal",
+          request_id: "req_norm",
+          questions: [{ question: "Proceed?", header: "Proceed", options: [] }],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_normal:req_norm");
+      expect(outboxRow).not.toBeNull();
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(true);
+      expect(payload.dir).toBe("/home/dev/projects/pigeon");
+      expect(payload.title).toBe("Normal Session");
+    });
+
+    it("TTL-expired quiet row: delivers threaded with dir present", async () => {
+      storage = openStorageDb(":memory:");
+      const createdAt = 1_000;
+      const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+      const expiredNow = createdAt + ttl + 5_000;
+
+      const app = createApp(storage, {
+        nowFn: () => expiredNow,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_expired",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "Expired Session",
+        }),
+      }));
+
+      storage.sessionOrigins.record(
+        { sessionId: "ses_q_expired", origin: "lgtm", notifyPolicy: "errors-only", source: "declared" },
+        createdAt,
+      );
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_expired",
+          request_id: "req_exp",
+          questions: [{ question: "Proceed?", header: "Proceed", options: [] }],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_expired:req_exp");
+      expect(outboxRow).not.toBeNull();
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(true);
+      expect(payload.dir).toBe("/home/dev/projects/pigeon");
+      expect(payload.title).toBe("Expired Session");
+    });
+
+    it("fail-open: storage.sessionOrigins.get throws -> still delivered threaded with dir present", async () => {
+      storage = openStorageDb(":memory:");
+      const now = 50_000;
+      const app = createApp(storage, {
+        nowFn: () => now,
+        chatId: "chat-123",
+        machineId: "devbox",
+      });
+
+      await app(new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_throw",
+          notify: true,
+          cwd: "/home/dev/projects/pigeon",
+          title: "Throw Session",
+        }),
+      }));
+
+      vi.spyOn(storage.sessionOrigins, "get").mockImplementationOnce(() => {
+        throw new Error("DB failure");
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const response = await app(new Request("http://localhost/question-asked", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_q_throw",
+          request_id: "req_throw",
+          questions: [{ question: "Proceed?", header: "Proceed", options: [] }],
+        }),
+      }));
+
+      expect(response.status).toBe(202);
+      const outboxRow = storage.outbox.getByNotificationId("q:ses_q_throw:req_throw");
+      expect(outboxRow).not.toBeNull();
+      const payload = JSON.parse(outboxRow!.payload);
+      expect(payload.threaded).toBe(true);
+      expect(payload.dir).toBe("/home/dev/projects/pigeon");
+      expect(payload.title).toBe("Throw Session");
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[question] session_origin read failed sessionId=ses_q_throw, delivering:"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+  });
+
   describe("POST /session-origin", () => {
     async function post(app: ReturnType<typeof createApp>, body: unknown) {
       return app(new Request("http://localhost/session-origin", {

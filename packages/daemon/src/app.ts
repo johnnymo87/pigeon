@@ -1,5 +1,5 @@
 import type { StorageDb } from "./storage/database";
-import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy, type SessionOriginRecord } from "./storage/session-origin-repo";
+import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
@@ -11,7 +11,7 @@ import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
 import { clampPreservingSurrogates } from "./text";
-import { decideNotify, effectiveNotifyPolicy, type NotifyDecision } from "./notify-policy";
+import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { hashPrompt } from "./hash-prompt";
@@ -881,46 +881,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         const effectiveTitle = requestTitle ?? session.title;
 
-        let originRow: SessionOriginRecord | null = null;
-        try {
-          originRow = storage.sessionOrigins.get(sessionId);
-        } catch (err) {
-          // Fail open: a provenance read that throws must not cost the user a
-          // notification. Deliver and leave a trace.
-          console.error(`[stop] session_origin read failed sessionId=${sessionId}, delivering:`, err);
-        }
-
-        let effectivePolicy: NotifyPolicy | null = originRow?.notifyPolicy ?? null;
-        try {
-          const now = nowFn();
-          const effective = effectiveNotifyPolicy(
-            {
-              policy: originRow?.notifyPolicy ?? null,
-              source: originRow?.source ?? null,
-              declaredAt: originRow?.declaredAt ?? originRow?.createdAt ?? null,
-              now,
-            },
-            process.env,
-          );
-          effectivePolicy = effective.policy;
-          if (effective.expired && originRow) {
-            const ageMs = now - originRow.declaredAt;
-            console.log(
-              `[stop] automated quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
-              `source=${originRow.source} policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,
-            );
-          }
-        } catch (err) {
-          // Fail open. Falling back to the STORED policy would keep an expired row
-          // suppressing, i.e. an exception in this arithmetic could silence a session
-          // forever -- the one direction the house rule forbids. A spurious notification
-          // is recoverable; an invisible one is not.
-          console.error(
-            `[stop] effective notify policy calculation failed sessionId=${sessionId}, delivering:`,
-            err,
-          );
-          effectivePolicy = "all";
-        }
+        const resolved = resolveEffectivePolicy(storage, sessionId, nowFn(), "stop");
+        const effectivePolicy = resolved.policy;
 
         let decision: NotifyDecision;
         try {
@@ -938,7 +900,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!decision.deliver) {
           console.log(
             `[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}" ` +
-            `layer=${decision.layer} origin=${originRow?.origin ?? "-"}`,
+            `layer=${decision.layer} origin=${resolved.origin ?? "-"}`,
           );
           return Response.json({ ok: true, notified: false, reason: `quiet_${decision.layer}` });
         }
@@ -1005,7 +967,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // permanent. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
         // policy=all here and is explained by the `automated quiet expired` line above.
         // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
-        console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${originRow?.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
+        console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${resolved.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
         return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
       }
 
@@ -1086,6 +1048,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }, now);
 
         // Format the notification payload for the outbox
+        const resolved = resolveEffectivePolicy(storage, sessionId, now, "question");
+        const quiet = resolved.policy === "none" || resolved.policy === "errors-only";
+        if (quiet) {
+          console.log(
+            `[question] quiet session — delivering unthreaded sessionId=${sessionId} origin=${resolved.origin ?? "-"} policy=${resolved.policy}`,
+          );
+        }
+
         let notificationPayload: {
           message: { text: string; entities: unknown[] };
           replyMarkup: unknown;
@@ -1112,8 +1082,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             replyMarkup: notification.replyMarkup,
             notificationId,
             title: effectiveTitle ?? undefined,
-            dir: session.cwd ?? undefined,
-            threaded: true,
+            dir: quiet ? undefined : session.cwd ?? undefined,
+            threaded: !quiet,
           };
         } else {
           // Single-question: existing behavior
@@ -1130,8 +1100,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             replyMarkup: notification.replyMarkup,
             notificationId,
             title: effectiveTitle ?? undefined,
-            dir: session.cwd ?? undefined,
-            threaded: true,
+            dir: quiet ? undefined : session.cwd ?? undefined,
+            threaded: !quiet,
           };
         }
 

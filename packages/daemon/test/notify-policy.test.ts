@@ -4,6 +4,7 @@ import {
   decideNotify,
   effectiveNotifyPolicy,
   explainQuiet,
+  resolveEffectivePolicy,
 } from "../src/notify-policy";
 
 describe("decideNotify", () => {
@@ -479,5 +480,182 @@ describe("effectiveNotifyPolicy", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("-500"));
 
     warnSpy.mockRestore();
+  });
+});
+
+describe("resolveEffectivePolicy", () => {
+  const now = 10_000_000;
+  const ttl = DEFAULT_DECLARED_QUIET_TTL_MS;
+
+  function storageWith(row: unknown) {
+    return {
+      sessionOrigins: {
+        get: () => row,
+      },
+    } as any;
+  }
+
+  it("returns null policy and not expired when session has no origin row", () => {
+    const storage = storageWith(null);
+    expect(resolveEffectivePolicy(storage, "ses_1", now, "stop", {})).toEqual({
+      policy: null,
+      expired: false,
+      origin: null,
+      source: null,
+      declaredAt: null,
+    });
+  });
+
+  it("returns stored policy unchanged and not expired when within TTL", () => {
+    const storage = storageWith({
+      sessionId: "ses_1",
+      origin: "lgtm",
+      notifyPolicy: "errors-only",
+      source: "declared",
+      createdAt: now - 5000,
+      declaredAt: now - 5000,
+      updatedAt: now - 5000,
+    });
+    expect(resolveEffectivePolicy(storage, "ses_1", now, "stop", {})).toEqual({
+      policy: "errors-only",
+      expired: false,
+      origin: "lgtm",
+      source: "declared",
+      declaredAt: now - 5000,
+    });
+  });
+
+  it("expires quiet policy to 'all' and logs message with ageMs when older than TTL", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const declaredAt = now - ttl - 5000;
+    const storage = storageWith({
+      sessionId: "ses_1",
+      origin: "lgtm",
+      notifyPolicy: "errors-only",
+      source: "declared",
+      createdAt: declaredAt,
+      declaredAt,
+      updatedAt: declaredAt,
+    });
+
+    const result = resolveEffectivePolicy(storage, "ses_1", now, "stop", {});
+    expect(result).toEqual({
+      policy: "all",
+      expired: true,
+      origin: "lgtm",
+      source: "declared",
+      declaredAt,
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      `[stop] automated quiet expired sessionId=ses_1 origin=lgtm source=declared policy=errors-only ageMs=${ttl + 5000} — delivering`,
+    );
+    logSpy.mockRestore();
+  });
+
+  it("logs with the provided tag on expiry (e.g. ancillary)", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const declaredAt = now - ttl - 1000;
+    const storage = storageWith({
+      sessionId: "ses_ancillary",
+      origin: "ci",
+      notifyPolicy: "none",
+      source: "declared",
+      createdAt: declaredAt,
+      declaredAt,
+      updatedAt: declaredAt,
+    });
+
+    const result = resolveEffectivePolicy(storage, "ses_ancillary", now, "ancillary", {});
+    expect(result.policy).toBe("all");
+    expect(result.expired).toBe(true);
+
+    expect(logSpy).toHaveBeenCalledWith(
+      `[ancillary] automated quiet expired sessionId=ses_ancillary origin=ci source=declared policy=none ageMs=${ttl + 1000} — delivering`,
+    );
+    logSpy.mockRestore();
+  });
+
+  it("fixes latent NaN: logs ageMs=unknown when declaredAt is null or non-finite", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const storage = storageWith({
+      sessionId: "ses_nan",
+      origin: "lgtm",
+      notifyPolicy: "errors-only",
+      source: "declared",
+      createdAt: NaN,
+      declaredAt: NaN,
+      updatedAt: NaN,
+    });
+
+    const result = resolveEffectivePolicy(storage, "ses_nan", now, "stop", {});
+    expect(result.policy).toBe("all");
+    expect(result.expired).toBe(true);
+
+    expect(logSpy).toHaveBeenCalledWith(
+      `[stop] automated quiet expired sessionId=ses_nan origin=lgtm source=declared policy=errors-only ageMs=unknown — delivering`,
+    );
+    logSpy.mockRestore();
+  });
+
+  it("fails open to policy=null if storage.sessionOrigins.get throws", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const storage = {
+      sessionOrigins: {
+        get: () => {
+          throw new Error("DB read error");
+        },
+      },
+    } as any;
+
+    const result = resolveEffectivePolicy(storage, "ses_err", now, "stop", {});
+    expect(result).toEqual({
+      policy: null,
+      expired: false,
+      origin: null,
+      source: null,
+      declaredAt: null,
+    });
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[stop] session_origin read failed sessionId=ses_err, delivering:"),
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it("fails open to policy='all' if effectiveNotifyPolicy calculation throws", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const storage = storageWith({
+      sessionId: "ses_calc_err",
+      origin: "lgtm",
+      notifyPolicy: "errors-only",
+      source: "declared",
+      createdAt: now - 1000,
+      declaredAt: now - 1000,
+      updatedAt: now - 1000,
+    });
+
+    // Pass invalid env or proxy that throws
+    const throwingEnv = new Proxy({}, {
+      get() {
+        throw new Error("Env lookup error");
+      },
+    });
+
+    const result = resolveEffectivePolicy(storage, "ses_calc_err", now, "stop", throwingEnv as any);
+    expect(result).toEqual({
+      policy: "all",
+      expired: false,
+      origin: "lgtm",
+      source: "declared",
+      declaredAt: now - 1000,
+    });
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[stop] effective notify policy calculation failed sessionId=ses_calc_err, delivering:"),
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
   });
 });

@@ -54,13 +54,21 @@ describe("shouldEmitAncillaryFor", () => {
   });
 
   it("emits once the declared quiet TTL has expired, on the same clock as POST /stop", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const declaredAt = now - DEFAULT_DECLARED_QUIET_TTL_MS - 1000;
     const storage = storageWith({
+      sessionId: "ses_a",
+      origin: "lgtm",
       notifyPolicy: "errors-only",
       source: "declared",
-      createdAt: now - DEFAULT_DECLARED_QUIET_TTL_MS - 1000,
-      declaredAt: now - DEFAULT_DECLARED_QUIET_TTL_MS - 1000,
+      createdAt: declaredAt,
+      declaredAt,
     });
     expect(shouldEmitAncillaryFor(storage, "ses_a", now, {})).toBe(true);
+    expect(logSpy).toHaveBeenCalledWith(
+      `[ancillary] automated quiet expired sessionId=ses_a origin=lgtm source=declared policy=errors-only ageMs=${DEFAULT_DECLARED_QUIET_TTL_MS + 1000} — delivering`,
+    );
+    logSpy.mockRestore();
   });
 
   it("FAILS OPEN when the provenance read throws", () => {
