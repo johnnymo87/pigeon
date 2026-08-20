@@ -56,7 +56,7 @@ topic is created by a session's **first** notification, each run also stranded a
 | **A** | `pigeon-twdw` (P2) | Extract one `resolveEffectivePolicy` for all four emission sites | **FIRST** — see §1.1 |
 | **B** | `pigeon-c501` (P1) | `POST /question-asked` bypasses the policy matrix entirely | After **A** |
 | ~~**C**~~ | ~~`pigeon-l4iw`~~ | ~~Per-row `expires_at`~~ — **WITHDRAWN**, duplicate of `pigeon-vske` (closed 2026-08-14). Reopen trigger 1 fired, 2 did not. **Watch, do not build.** | n/a |
-| **D** | `pigeon-60sw` (P2) | A human cannot express a standing quiet rule; `override` is unreachable for quiet | Independent |
+| ~~**D**~~ | ~~`pigeon-60sw`~~ | ~~A human cannot express a standing quiet rule~~ — **CLOSED 2026-08-20 by REMOVAL** (PR #120). `override` was unreachable in both directions, so the route and the source were deleted rather than made reachable. `source='override'` no longer exists and **every suppression is now TTL-bounded**. | n/a |
 
 **Amended 2026-08-15, same day as creation.** C was withdrawn and D added once `bd dolt pull`
 surfaced work this file was written in ignorance of: `pigeon-vske` had already answered C, and its
@@ -261,8 +261,21 @@ npm run typecheck   # expect exit 0 across all three workspaces
 **Done looks like:** one function, four callers, no behaviour change, full suite green. A pure
 refactor — if the diff changes any delivery decision, something is wrong.
 
-**Payoff beyond this spine:** the title-layer retirement (`pigeon-qdcb.5`) becomes a deletion in one
-place instead of three.
+**Payoff beyond this spine:** ~~the title-layer retirement (`pigeon-qdcb.5`) becomes a deletion in one
+place instead of three.~~ **That payoff has expired — the extraction did not land first.** The title
+layer was retired and deleted on 2026-08-20 (`pigeon-qdcb.5` / `pigeon-ycjg`, PR #118) while the
+sites were still separate, so that deletion has already been paid for at three call sites. Do not
+cite it as a reason to do **A**; the standing reason is the one above it — a new layer added to the
+matrix in its current shape gets taught to three sites and forgotten at the fourth, which is exactly
+how `pigeon-8zqt` and `pigeon-c501` happened.
+
+**Two premises in this document changed on 2026-08-20; re-read §1.1 against the code, not this
+file.** (1) `effectiveNotifyPolicy` no longer branches on `source` at all — `override` was removed
+(`pigeon-60sw`, PR #120), so the TTL now applies to every quiet policy and there is no exempt case
+for a resolver to preserve. (2) `decideNotify` no longer has a title branch, but it *gained* two:
+`errors-only` now suppresses `Retry`, and suppresses `Error` when `errorKind === 'aborted'`
+(`pigeon-xbhg`, PR #117). Any extracted resolver must carry `errorKind` through, or it will silently
+re-deliver the aborted-error noise that PR just removed.
 
 ---
 

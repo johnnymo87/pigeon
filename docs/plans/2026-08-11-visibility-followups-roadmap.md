@@ -369,8 +369,9 @@ declared quiet.~~
   its Stops.
 - `'none'` and `'errors-only'` → suppress. `'all'` and no-row → post.
 - Ambiguity or lookup error → **POST** (§1.6).
-- **Do not** gate on `isQuietTitle` / the title regex. It is off by default as of PR #88 and is being
-  deleted under `pigeon-ycjg`; a new caller would resurrect the dependency that cycle just retired.
+- **Do not** gate on `isQuietTitle` / the title regex. It is **gone** — deleted 2026-08-20 under
+  `pigeon-ycjg` (PR #118) after a clean 9-day soak, along with `PIGEON_QUIET_TITLE_LAYER`. There is
+  nothing left to call; `session_origin` provenance is the only suppression layer.
 - **Retractions follow the fate of the original**, not a fresh policy read. If `w:<msg_id>` was
   posted and policy flipped since, still post `wc:<msg_id>` — check for the original's outbox row
   rather than re-evaluating the predicate. Otherwise you strand a live notice that can never be
