@@ -92,35 +92,35 @@ sudo systemctl restart opencode-serve.service
 systemctl status opencode-serve.service --no-pager
 ```
 
-## Emergency: re-enable the quiet-title layer (lgtm notification spam)
+## Automated Sessions Suddenly Spamming Telegram
 
-Symptom: routine lgtm PR-review sessions are posting Stop notifications to Telegram again.
-As of `pigeon-qdcb.5` the legacy title-regex layer is **off by default** — suppression now comes
-from `session_origin` rows written by lgtm at spawn time. If those writes stop landing, the regex
-safety net is no longer there to catch it, and the spam is the expected symptom.
+Symptom: lgtm (or other automated) PR-review sessions start posting `Stop` notifications into
+Telegram again.
 
-Prefer fixing the origin writer. Use this lever only to stop the bleeding, and remember it
-re-enables a heuristic that also silences *genuine work on lgtm itself* whose title matches.
+**There is no feature flag to flip.** The legacy quiet-title regex was deleted in `pigeon-ycjg`
+(2026-08-20) after a 9-day soak, and `PIGEON_QUIET_TITLE_LAYER=on` is now a silent no-op — the code
+it gated no longer exists. `session_origin` provenance is the ONLY suppression layer. Setting that
+variable will look like it worked and change nothing, so do not reach for it.
 
-The unit is NixOS-generated with `Environment=` baked into its store path and no
-`EnvironmentFile`, so you cannot just export a variable — you need a drop-in:
+Diagnose in this order:
 
-```bash
-sudo systemctl edit pigeon-daemon.service   # opens a drop-in, not the unit
-# add exactly:
-#   [Service]
-#   Environment=PIGEON_QUIET_TITLE_LAYER=on
-sudo systemctl restart pigeon-daemon.service
-systemctl show pigeon-daemon.service -p Environment | tr ' ' '\n' | grep QUIET_TITLE  # verify
-```
+1. **Is the session marked?** `curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" "http://127.0.0.1:4731/session-origin?session_id=<sid>"`.
+   No row means the WRITER failed — the daemon is behaving correctly and the fix belongs in the
+   caller (`~/projects/lgtm`, `markOrigin` in `src/dispatch.ts` at fresh+reawaken, and `gather.ts`).
+2. **Which lines are leaking?** A delivered Stop from an unmarked session logs as
+   `[stop] queued ... origin=- policy=- label=<title>`; a correct suppression logs as
+   `[stop] quieted ... layer=origin`. Grep both journal namespaces — they are complementary, not
+   duplicates: `{ journalctl -u pigeon-daemon --no-pager; journalctl --namespace=pigeon -u pigeon-daemon --no-pager; }`.
+3. **Is it a TTL expiry rather than a leak?** `[stop] automated quiet expired` means the row was
+   found but had aged past the declared-quiet TTL, which is by design: quiet lasts TTL past the last
+   declaration. A human who wants permanent audibility uses `POST /sessions/enable-notify`
+   (`source='override'`, TTL-exempt).
+4. **Is it Retry/Error rather than Stop?** `errors-only` suppresses `Stop`, `Retry`, and aborted
+   `Error`s, but still delivers genuine errors by design (`pigeon-xbhg`). A real failure notification
+   is not a leak.
 
-The variable is read at call time (`decideNotify`'s `env = process.env` default), so one restart
-is sufficient — no rebuild.
-
-**The drop-in is unmanaged drift on NixOS.** It survives rebuilds and will silently outlive the
-incident. Remove it (`sudo systemctl revert pigeon-daemon.service` + restart) once the origin
-writer is fixed, and note that the regex is scheduled for deletion — after which this lever
-stops existing and the drop-in becomes a no-op that looks like it is still protecting you.
+If the deletion itself proves wrong, the recovery is `git revert` of the deletion commit plus a
+per-machine redeploy (`git pull`, `npm install`, restart) — not an environment variable.
 
 ## Media Relay Diagnostics
 

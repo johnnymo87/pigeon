@@ -634,9 +634,12 @@ flaky advisory check trains everyone to wave it through, including the day it is
 Held by the session working `pigeon-qdcb` ("Pigeon LGTM filtering gaps"), confirmed by direct
 consultation 2026-08-11. **Do not touch, do not wait on, do not re-file:**
 
-- `pigeon-qdcb.5` — mid-soak. The lgtm quiet-title regex is off by default as of PR #88 (`b4daef7`);
-  suppression now comes solely from `session_origin` provenance. `PIGEON_QUIET_TITLE_LAYER=on`
-  restores it in one restart. Soak verdict due **08-19**.
+- `pigeon-qdcb.5` — **soak passed, layer DELETED (2026-08-20).** The lgtm quiet-title regex went off
+  by default in PR #88 (`b4daef7`) and was removed entirely in `pigeon-ycjg` after 9 days: 308 lgtm
+  launches, zero leaks, 18 restarts including 8 nightly resets, and 124 `[stop] quieted` lines in
+  the window all reading `layer=origin` with zero `layer=title`. Suppression now comes solely from
+  `session_origin` provenance. **`PIGEON_QUIET_TITLE_LAYER=on` no longer does anything** — the code
+  it gated is gone, so there is no one-restart rollback. Recovery is in the daemon-operations skill.
 - `pigeon-ycjg` — the actual regex deletion, blocked on that soak.
 - `pigeon-qdcb.4` / `.10` / `.11` — parked by them; nothing waits on them.
 - `pigeon-9jz`, `pigeon-k4c.*` — other tracks.

@@ -1,4 +1,3 @@
-import { isQuietTitle } from "./quiet-title";
 import type { NotifyPolicy, OriginSource } from "./storage/session-origin-repo";
 
 /**
@@ -49,11 +48,7 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * WHY expiry returns 'all' and not null:
  * Expiry MUST NOT resolve to policy = null. Expiring to 'all' decides explicitly at
  * the origin layer instead of falling through to whatever downstream default happens
- * to be configured, ensuring the outcome does not silently depend on the title layer's
- * configuration. With PIGEON_QUIET_TITLE_LAYER=on (the rollback configuration, and
- * historical default), falling through to null WOULD be a silent NO-OP for ~88% of lgtm
- * titles (where the regex matches production titles like "PR review .lgtm-review-prompt.md"),
- * keeping expired sessions muted. Expiring to 'all' explicitly overrides downstream layers.
+ * to be configured. Expiring to 'all' explicitly overrides downstream layers.
  * (Deliberately no line numbers here: this is the load-bearing comment in the change and
  * line citations rot on the first edit above them.)
  *
@@ -106,17 +101,17 @@ export function effectiveNotifyPolicy(
 /**
  * Which notification layer made the suppression decision.
  *
- * NOTE: Values here ("origin", "title", "default") are templated directly into
- * the POST /stop response as `quiet_${layer}` (e.g. `quiet_origin`, `quiet_title`).
+ * NOTE: Values here ("origin", "default") are templated directly into
+ * the POST /stop response as `quiet_${layer}` (e.g. `quiet_origin`).
  * They are part of the wire contract consumed by callers and tests; adding or
  * changing a variant requires a deliberate decision about its wire string.
  */
-export type NotifyLayer = "origin" | "title" | "default";
+export type NotifyLayer = "origin" | "default";
 
 export interface NotifyDecisionInput {
   event: string;
   policy: NotifyPolicy | null;
-  title: string | null | undefined;
+  title?: string | null | undefined;
   errorKind?: string | null;
 }
 
@@ -128,37 +123,12 @@ export interface NotifyDecision {
 /** Events that `none` suppresses in addition to Stop. */
 const ERROR_EVENTS = new Set(["Error", "Retry"]);
 
-/** Recognised spellings for switching the transitional title layer off. */
-const LAYER_OFF_VALUES = new Set(["off", "false", "0", "no"]);
-/** Recognised spellings for leaving it on. */
-const LAYER_ON_VALUES = new Set(["on", "true", "1", "yes"]);
-
-function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
-  const raw = env.PIGEON_QUIET_TITLE_LAYER?.trim();
-  if (!raw) return false;
-
-  const val = raw.toLowerCase();
-  if (LAYER_OFF_VALUES.has(val)) return false;
-  if (LAYER_ON_VALUES.has(val)) return true;
-
-  // An unparseable value must resolve the same way as an absent one (default),
-  // and the repo's standing bias is that ambiguity resolves toward DELIVERING notifications.
-  // A typo'd re-enable (e.g. "=enabled") failing loud (noise) is strictly safer than failing silent.
-  console.warn(
-    `[notify-policy] unrecognised PIGEON_QUIET_TITLE_LAYER="${raw}", leaving title layer disabled`,
-  );
-  return false;
-}
-
 /**
  * Which notification layer decided, and what it decided.
  *
  * Precedence, strongest first:
  *   1. session_origin.notify_policy  (declared provenance)
- *   2. the legacy quiet-title regex  (transitional; off by default, re-enable
- *      with PIGEON_QUIET_TITLE_LAYER=on; retained for soak, deletion tracked
- *      by follow-up bead)
- *   3. deliver
+ *   2. deliver
  *
  * The caller checks `sessions.notify` BEFORE calling this (the `!session.notify` short-circuit in the POST /stop handler); that short-circuit
  * is upstream of the whole matrix.
@@ -178,9 +148,9 @@ function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
  */
 export function decideNotify(
   input: NotifyDecisionInput,
-  env: Record<string, string | undefined> = process.env,
+  _env: Record<string, string | undefined> = process.env,
 ): NotifyDecision {
-  const { event, policy, title, errorKind } = input;
+  const { event, policy, errorKind } = input;
 
   if (policy === "none") {
     if (event === "Stop" || ERROR_EVENTS.has(event)) return { deliver: false, layer: "origin" };
@@ -195,15 +165,10 @@ export function decideNotify(
 
   if (policy === "all") return { deliver: true, layer: "origin" };
 
-  const titleLayerOn = isTitleLayerOn(env);
-  if (titleLayerOn && event === "Stop" && isQuietTitle(title, env)) {
-    return { deliver: false, layer: "title" };
-  }
-
   return { deliver: true, layer: "default" };
 }
 
-export type QuietReason = "unregistered" | "notify-flag" | "origin" | "title";
+export type QuietReason = "unregistered" | "notify-flag" | "origin";
 
 export interface QuietExplanation {
   reason: QuietReason;
@@ -269,7 +234,6 @@ export function explainQuiet(
   if (!decision.deliver) {
     switch (decision.layer) {
       case "origin":
-      case "title":
         return { reason: decision.layer, origin, policy };
       case "default":
         // Unreachable today: decideNotify only ever returns layer "default"

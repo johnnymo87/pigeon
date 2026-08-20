@@ -34,7 +34,7 @@ export type OriginSource = (typeof ORIGIN_SOURCES)[number];
  * `none`        — suppress Stop, Error and Retry alike.
  *
  * An unrecognised value read back from the DB is treated as `all`: ambiguity resolves
- * toward delivering (see `isQuietTitle` in `quiet-title.ts`).
+ * toward delivering.
  */
 export const NOTIFY_POLICIES = ["all", "errors-only", "none"] as const;
 export type NotifyPolicy = (typeof NOTIFY_POLICIES)[number];
