@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import { startDirectChannelServer } from "../../opencode-plugin/src/direct-channel";
 import {
   OPENCODE_DIRECT_PROTOCOL_VERSION,
   OpencodeDirectMessageType,
@@ -376,6 +377,74 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
       expect(successResult.meta).toEqual({ status: 200 });
       expect(successResult.meta?.endpoint).toBeUndefined();
       expect(successResult.meta?.tokenFp).toBeUndefined();
+    });
+
+    it("contract test: real startDirectChannelServer with mismatched auth token returns meta.rejectReason === AckRejectReason.Unauthorized", async () => {
+      const server = await startDirectChannelServer({
+        authToken: "valid-server-token-123",
+        onExecute: async () => ({ success: true }),
+      });
+
+      try {
+        const adapter = new DirectChannelAdapter();
+        const sessionWithWrongToken: SessionRecord = {
+          sessionId: "sess-contract-401",
+          backendKind: "opencode-plugin-direct",
+          backendProtocolVersion: 1,
+          backendEndpoint: server.endpoint,
+          backendAuthToken: "wrong-client-token-456",
+        } as unknown as SessionRecord;
+
+        const result = await adapter.deliverCommand(sessionWithWrongToken, "echo test", {
+          commandId: "cmd-contract-1",
+          chatId: "42",
+        });
+
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe(AckRejectReason.Unauthorized);
+        expect(result.meta).toBeDefined();
+        expect(result.meta?.status).toBe(401);
+        expect(result.meta?.rejectReason).toBe(AckRejectReason.Unauthorized);
+        expect(result.meta?.endpoint).toBe(server.endpoint);
+        expect(result.meta?.attempts).toBe(1);
+        const expectedTokenFp = createHash("sha256").update("wrong-client-token-456").digest("hex").slice(0, 8);
+        expect(result.meta?.tokenFp).toBe(expectedTokenFp);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it("contract test: real startDirectChannelServer question-reply with mismatched auth token returns status 401 with NO meta.rejectReason", async () => {
+      const server = await startDirectChannelServer({
+        authToken: "valid-server-token-123",
+        onExecute: async () => ({ success: true }),
+        onQuestionReply: async () => ({ success: true }),
+      });
+
+      try {
+        const adapter = new DirectChannelAdapter();
+        const sessionWithWrongToken: SessionRecord = {
+          sessionId: "sess-contract-qr-401",
+          backendKind: "opencode-plugin-direct",
+          backendProtocolVersion: 1,
+          backendEndpoint: server.endpoint,
+          backendAuthToken: "wrong-client-token-456",
+        } as unknown as SessionRecord;
+
+        const result = await adapter.deliverQuestionReply!(
+          sessionWithWrongToken,
+          { questionRequestId: "qreq-1", answers: [["yes"]] },
+          { commandId: "cmd-contract-2", chatId: "42" },
+        );
+
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe("Invalid question reply result");
+        expect(result.meta).toBeDefined();
+        expect(result.meta?.status).toBe(401);
+        expect(result.meta?.rejectReason).toBeUndefined();
+      } finally {
+        await server.close();
+      }
     });
   });
 });

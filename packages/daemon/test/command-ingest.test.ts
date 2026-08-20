@@ -4280,4 +4280,330 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
 
     storage.db.close();
   });
+
+  describe("direct-channel 401 classification and revival (pigeon-m426.2)", () => {
+    const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as ReviveAndDeliverDeps["spawn"];
+
+    it("delivers via revive when direct-channel returns UNAUTHORIZED rejectReason (does not drop)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-401-revive",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "stale-token",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+      const replies: string[] = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-401-1",
+          sessionId: "sess-401-revive",
+          command: "fix the bug",
+          chatId: "42",
+        }),
+        {
+          createAdapter: () => ({
+            name: "direct-channel",
+            async deliverCommand() {
+              return {
+                ok: false,
+                error: AckRejectReason.Unauthorized,
+                meta: {
+                  endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                  status: 401,
+                  attempts: 1,
+                  rejectReason: AckRejectReason.Unauthorized,
+                },
+              };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-401-revive", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+          sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        },
+      );
+
+      // Prompt revived and delivered
+      expect(sendPromptCalls).toEqual([{ sid: "sess-401-revive", dir: "/tmp/proj", prompt: "fix the bug" }]);
+      // User must NOT receive "Command rejected"
+      expect(replies).toEqual([]);
+      // Command acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not enter the ambiguous retry loop on UNAUTHORIZED rejectReason (attempts=1, no sleep)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-401-no-loop",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "stale-token",
+      }, 1_000);
+
+      let deliverAttempts = 0;
+      let sleepCalls = 0;
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-401-2",
+          sessionId: "sess-401-no-loop",
+          command: "echo hello",
+          chatId: "42",
+        }),
+        {
+          createAdapter: () => ({
+            name: "direct-channel",
+            async deliverCommand() {
+              deliverAttempts++;
+              return {
+                ok: false,
+                error: AckRejectReason.Unauthorized,
+                meta: {
+                  endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                  status: 401,
+                  attempts: 1,
+                  rejectReason: AckRejectReason.Unauthorized,
+                },
+              };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-401-no-loop", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+          deliveryBudgetMs: 40_000,
+          sleep: async () => { sleepCalls++; },
+        },
+      );
+
+      // Exactly 1 attempt through adapter, 0 sleeps, straight to revive
+      expect(deliverAttempts).toBe(1);
+      expect(sleepCalls).toBe(0);
+      expect(sendPromptCalls).toEqual([{ sid: "sess-401-no-loop", dir: "/tmp/proj", prompt: "echo hello" }]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("preserves bounded-drop behavior for question-reply with status 401 and NO rejectReason (does not throw/retry forever)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-qr-401",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-qr-401",
+        requestId: "req-qr-401",
+        questions: [{ question: "Deploy?", header: "Deploy", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+      const editedNotifications: Array<{ id: string; text: string }> = [];
+
+      // Calling ingestWorkerCommand must NOT throw (which would trigger an infinite poller retry loop)
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-qr-401",
+            sessionId: "sess-qr-401",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                // The question-reply 401 degradation shape: error='Invalid question reply result', meta.status=401, NO rejectReason
+                return {
+                  ok: false,
+                  error: "Invalid question reply result",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 401,
+                    tokenFp: "abcdef12",
+                  },
+                };
+              },
+            }),
+            editNotification: async (notificationId, text) => {
+              editedNotifications.push({ id: notificationId, text });
+              return { ok: true };
+            },
+            sendTelegramReply: async (_chatId, text) => {
+              replies.push(text);
+            },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Single question row kept so on-screen keyboard stays retryable
+      expect(storage.pendingQuestions.getBySessionId("sess-qr-401")).not.toBeNull();
+      // User notified about failed question reply (bounded drop)
+      expect(replies).toEqual([
+        "Couldn't deliver your answer: Invalid question reply result\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+      ]);
+      // Inbox marked done (command acked)
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("preserves bounded-drop behavior for question-reply when meta.rejectReason is UNAUTHORIZED (does not throw / arm infinite loop)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-qr-unauth-reason",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-qr-unauth-reason",
+        requestId: "req-qr-unauth-reason",
+        questions: [{ question: "Deploy?", header: "Deploy", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+      const editedNotifications: Array<{ id: string; text: string }> = [];
+
+      // Calling ingestWorkerCommand must NOT throw when meta.rejectReason is "UNAUTHORIZED"
+      // (meta.rejectReason carries ResultErrorCode on question-reply, which is type-punned with AckRejectReason).
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-qr-unauth-reason",
+            sessionId: "sess-qr-unauth-reason",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "Unauthorized",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 401,
+                    rejectReason: "UNAUTHORIZED",
+                    tokenFp: "abcdef12",
+                  },
+                };
+              },
+            }),
+            editNotification: async (notificationId, text) => {
+              editedNotifications.push({ id: notificationId, text });
+              return { ok: true };
+            },
+            sendTelegramReply: async (_chatId, text) => {
+              replies.push(text);
+            },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Single question row kept so on-screen keyboard stays retryable
+      expect(storage.pendingQuestions.getBySessionId("sess-qr-unauth-reason")).not.toBeNull();
+      // User notified about failed question reply (bounded drop)
+      expect(replies).toEqual([
+        "Couldn't deliver your answer: Unauthorized\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+      ]);
+      // Inbox marked done (command acked)
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it.each([
+      AckRejectReason.Busy,
+      AckRejectReason.Unavailable,
+      AckRejectReason.UnsupportedVersion,
+      AckRejectReason.InvalidPayload,
+      AckRejectReason.InvalidSession,
+    ])("classifies %s rejectReason as terminal and drops command without reviving", async (rejectReason) => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: `sess-${rejectReason}`,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+      const replies: string[] = [];
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: `cmd-${rejectReason}`,
+          sessionId: `sess-${rejectReason}`,
+          command: "do work",
+          chatId: "42",
+        }),
+        {
+          createAdapter: () => ({
+            name: "direct-channel",
+            async deliverCommand() {
+              return {
+                ok: false,
+                error: rejectReason,
+                meta: {
+                  endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                  status: 400,
+                  attempts: 1,
+                  rejectReason,
+                },
+              };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: `sess-${rejectReason}`, directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+          sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        },
+      );
+
+      // Must NOT revive
+      expect(sendPromptCalls).toHaveLength(0);
+      // User notified of command rejection
+      expect(replies).toEqual([`Command rejected: ${rejectReason}`]);
+      // Inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+  });
 });

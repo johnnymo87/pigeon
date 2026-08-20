@@ -8,6 +8,7 @@ import {
   type OpencodeDirectExecuteResult,
 } from "../opencode-direct/adapter";
 import {
+  AckRejectReason,
   OpencodeDirectSource,
   type OpencodeDirectSource as OpencodeDirectSourceType,
 } from "../opencode-direct/contracts";
@@ -618,34 +619,55 @@ export async function ingestWorkerCommand(
 
 
 
+// Disambiguation: This function classifies command delivery failures for inbound worker commands, unrelated to classifyDeliveryFailure in worker/delivery-policy.ts which classifies outbound notification delivery failures.
 /**
  * Classify a failed delivery so we can decide whether retrying *through the
  * plugin* can help, vs. going straight to the revive fallback, vs. giving up.
+ *
+ * NOTE: The `meta.rejectReason` rule is strictly for execute-path commands.
+ * On the question-reply path, `meta.rejectReason` carries `ResultErrorCode`
+ * (type-punned with `AckRejectReason`), and question replies cannot be revived.
+ * Callers on the question-reply path (specifically `throwIfTransientQuestionReplyFailure`)
+ * must pass `{ error: result.error }` without `meta`.
  *
  * - `ambiguous`: a timeout/abort. The plugin may be alive but busy (event-loop
  *   starved mid-turn); the injection may or may not have landed. Retrying
  *   through the idempotent plugin can still produce a clean 1× delivery, so we
  *   retry within the budget before reviving.
- * - `definitely_not_delivered`: a connection-level failure (refused/DNS/network).
- *   The plugin process is unreachable, so retrying it is pointless — revive now.
- * - `terminal`: anything else (e.g. the plugin actively rejected the command).
+ * - `definitely_not_delivered`: a connection-level failure (refused/DNS/network),
+ *   or an UNAUTHORIZED rejection from direct-channel token check.
+ *   The plugin process is unreachable or rejected before reading the body (the token
+ *   check runs before route dispatch and before body read, provably guaranteeing zero
+ *   injection occurred for that individual request), so retrying it is pointless — revive now.
+ *   (At command scope, duplicate injection remains possible if an earlier attempt timed
+ *   out ambiguously before the plugin restarted with a new token — the same accepted at-least-once
+ *   tradeoff documented at lines 1084-1090.)
+ * - `terminal`: anything else (e.g. the plugin actively rejected the command mid-turn
+ *   or with deterministic validation errors like BUSY/UNAVAILABLE/UNSUPPORTED_VERSION/INVALID_PAYLOAD).
  *   Ack and move on; neither retry nor revive would help.
  */
 type DeliveryFailureKind = "ambiguous" | "definitely_not_delivered" | "terminal";
 
-function classifyDeliveryFailure(error: string | undefined): DeliveryFailureKind {
-  if (!error) return "terminal";
-  const lower = error.toLowerCase();
-  if (lower.includes("timed out") || lower.includes("abort")) {
-    return "ambiguous";
+function classifyDeliveryFailure(
+  result: Pick<CommandDeliveryResult, "error" | "meta">,
+): DeliveryFailureKind {
+  const error = result.error;
+  if (error) {
+    const lower = error.toLowerCase();
+    if (lower.includes("timed out") || lower.includes("abort")) {
+      return "ambiguous";
+    }
+    if (
+      lower.includes("unable to connect") ||
+      lower.includes("econnrefused") ||
+      lower.includes("connection refused") ||
+      lower.includes("fetch failed") ||
+      lower.includes("network error")
+    ) {
+      return "definitely_not_delivered";
+    }
   }
-  if (
-    lower.includes("unable to connect") ||
-    lower.includes("econnrefused") ||
-    lower.includes("connection refused") ||
-    lower.includes("fetch failed") ||
-    lower.includes("network error")
-  ) {
+  if (result.meta?.rejectReason === AckRejectReason.Unauthorized) {
     return "definitely_not_delivered";
   }
   return "terminal";
@@ -1003,14 +1025,21 @@ async function dropUnanswerableQuestion(
   );
 }
 
-function isConnectionError(error: string | undefined): boolean {
+function isConnectionError(result: Pick<CommandDeliveryResult, "error" | "meta">): boolean {
   // Both ambiguous (timeout) and definitely-not-delivered failures warrant the
   // revive fallback; only terminal failures do not.
-  return classifyDeliveryFailure(error) !== "terminal";
+  return classifyDeliveryFailure(result) !== "terminal";
 }
 
 function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
-  if (!isConnectionError(result.error)) return;
+  // Deliberately classify from `{ error: result.error }` only, omitting `meta`.
+  // `meta.rejectReason` is type-punned across channels: it carries AckRejectReason
+  // on execute but ResultErrorCode on question-reply (both use "UNAUTHORIZED").
+  // A question-reply 401/unauthorized rejection is permanent (and question replies
+  // cannot be revived anyway since opencode-serve revive only supports sendPrompt).
+  // Passing meta here would classify UNAUTHORIZED as definitely_not_delivered and
+  // throw, arming an infinite poller retry loop.
+  if (!isConnectionError({ error: result.error })) return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
   console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);
   throw new Error(error);
@@ -1050,7 +1079,7 @@ async function deliverViaAdapter(
   // loop — retrying a dead/​rejecting plugin can't help.
   while (
     !result.ok &&
-    classifyDeliveryFailure(result.error) === "ambiguous" &&
+    classifyDeliveryFailure(result) === "ambiguous" &&
     now() - startedAt < budgetMs
   ) {
     await sleep(Math.min(1_000 * attempts, 5_000));
@@ -1067,7 +1096,7 @@ async function deliverViaAdapter(
 
   console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}${formatDeliveryMeta(result.meta)}`);
 
-  if (isConnectionError(result.error)) {
+  if (isConnectionError(result)) {
     // The plugin endpoint did not confirm delivery (connection refused, or a
     // timeout where the plugin was alive but busy). We cannot tell whether the
     // prompt was injected, so to guarantee at-least-once delivery we revive via

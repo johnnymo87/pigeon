@@ -80,6 +80,47 @@ describe("opencode direct-channel routing integration", () => {
     storage.db.close();
   });
 
+  it("revives and delivers via opencodeClient when plugin direct auth token is wrong (pigeon-m426.2)", async () => {
+    const server = await startDirectChannelServer({
+      onExecute: async () => ({ success: true }),
+    });
+    closers.push(server.close);
+
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-int-2b",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: server.endpoint,
+      backendAuthToken: "wrong-token-401",
+    }, 1_000);
+
+    const sendPromptCalls: Array<{ sid: string; dir: string; prompt: string }> = [];
+    const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as any;
+
+    await expect(
+      ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-int-2b", sessionId: "sess-int-2b", command: "echo revived-401", chatId: "99" }),
+        {
+          opencodeClient: {
+            async getSession() { return { id: "sess-int-2b", directory: "/tmp/proj" }; },
+            async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
+          },
+          spawn: mockSpawn,
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    // Prompt revived via opencodeClient
+    expect(sendPromptCalls).toEqual([{ sid: "sess-int-2b", dir: "/tmp/proj", prompt: "echo revived-401" }]);
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    // backendEndpoint cleared after successful revive (revive-and-deliver.ts:93)
+    expect(storage.sessions.get("sess-int-2b")?.backendEndpoint).toBeNull();
+    storage.db.close();
+  });
+
   it("returns normally (Poller acks) when plugin handler returns execution failure", async () => {
     const onExecute = vi.fn(async () => ({
       success: false,
