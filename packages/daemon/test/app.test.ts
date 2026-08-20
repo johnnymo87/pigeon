@@ -2110,4 +2110,309 @@ describe("createApp", () => {
       expect(storage!.sessionOrigins.get("ses_unknown")).toBeNull();
     });
   });
+
+  describe("POST /session-start diagnostic logging (pigeon-m426.5)", () => {
+    it("emits log line with endpoint, tokenFp, and changed=false on fresh registration without leaking raw token", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const rawSecretToken = "super-secret-auth-token-12345-uuid-67890";
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-fresh-1",
+            backend_kind: "opencode-plugin-direct",
+            backend_protocol_version: 1,
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: rawSecretToken,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      expect(res.status).toBe(200);
+      const regLog = logs.find((l) => l.includes("[session-start] registered"));
+      expect(regLog).toBeDefined();
+      expect(regLog).toBe(
+        "[session-start] registered sessionId=sess-fresh-1 endpoint=http://127.0.0.1:9999/pigeon/direct/execute tokenFp=b7fee892 changed=false",
+      );
+
+      // Security check: raw token NEVER in any log output
+      for (const log of logs) {
+        expect(log).not.toContain(rawSecretToken);
+      }
+    });
+
+    it("reports changed=true with previous endpoint and tokenFp when re-registered with different values", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const oldToken = "super-secret-auth-token-12345-uuid-67890"; // tokenFp: 3c9909af
+      const newToken = "brand-new-auth-token-99999-uuid-11111"; // sha256 -> slice 0..8
+
+      // First registration
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-rereg-1",
+            backend_kind: "opencode-plugin-direct",
+            backend_protocol_version: 1,
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: oldToken,
+          }),
+        }),
+      );
+
+      // Second registration (e.g. revive/restart on new port with new token)
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-rereg-1",
+            backend_kind: "opencode-plugin-direct",
+            backend_protocol_version: 1,
+            backend_endpoint: "http://127.0.0.1:8888/pigeon/direct/execute",
+            backend_auth_token: newToken,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      expect(res.status).toBe(200);
+      const regLogs = logs.filter((l) => l.includes("[session-start] registered"));
+      expect(regLogs).toHaveLength(2);
+      expect(regLogs[0]).toBe(
+        "[session-start] registered sessionId=sess-rereg-1 endpoint=http://127.0.0.1:9999/pigeon/direct/execute tokenFp=b7fee892 changed=false",
+      );
+      expect(regLogs[1]).toMatch(
+        /^\[session-start\] registered sessionId=sess-rereg-1 endpoint=http:\/\/127\.0\.0\.1:8888\/pigeon\/direct\/execute tokenFp=[a-f0-9]{8} changed=true prevEndpoint=http:\/\/127\.0\.0\.1:9999\/pigeon\/direct\/execute prevTokenFp=b7fee892$/,
+      );
+
+      // Security check: raw tokens NEVER in any log output
+      for (const log of logs) {
+        expect(log).not.toContain(oldToken);
+        expect(log).not.toContain(newToken);
+      }
+    });
+
+    it("reports changed=false and omits prev fields when re-registered with identical endpoint and token", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const token = "super-secret-auth-token-12345-uuid-67890";
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-same-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token,
+          }),
+        }),
+      );
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-same-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      const regLogs = logs.filter((l) => l.includes("[session-start] registered"));
+      expect(regLogs).toHaveLength(2);
+      expect(regLogs[1]).toBe(
+        "[session-start] registered sessionId=sess-same-1 endpoint=http://127.0.0.1:9999/pigeon/direct/execute tokenFp=b7fee892 changed=false",
+      );
+    });
+
+    it("does not crash or emit bogus tokenFp when registration has no backend token or endpoint", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-nvim-1",
+            nvim_socket: "/tmp/nvim.sock",
+            tty: "/dev/pts/1",
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      expect(res.status).toBe(200);
+      const regLog = logs.find((l) => l.includes("[session-start] registered"));
+      expect(regLog).toBeDefined();
+      expect(regLog).toBe("[session-start] registered sessionId=sess-nvim-1 changed=false");
+      expect(regLog).not.toContain("tokenFp");
+      expect(regLog).not.toContain("endpoint=");
+      expect(regLog).not.toContain("undefined");
+    });
+
+    it("does not crash or emit bogus tokenFp when registration has endpoint but no auth token", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-no-token-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      expect(res.status).toBe(200);
+      const regLog = logs.find((l) => l.includes("[session-start] registered"));
+      expect(regLog).toBeDefined();
+      expect(regLog).toBe(
+        "[session-start] registered sessionId=sess-no-token-1 endpoint=http://127.0.0.1:9999/pigeon/direct/execute changed=false",
+      );
+      expect(regLog).not.toContain("tokenFp");
+      expect(regLog).not.toContain("undefined");
+    });
+
+    it("reports changed=true when only endpoint changes", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const token = "super-secret-auth-token-12345-uuid-67890";
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-ep-change-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token,
+          }),
+        }),
+      );
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-ep-change-1",
+            backend_endpoint: "http://127.0.0.1:8888/pigeon/direct/execute",
+            backend_auth_token: token,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      const regLogs = logs.filter((l) => l.includes("[session-start] registered"));
+      expect(regLogs).toHaveLength(2);
+      expect(regLogs[1]).toBe(
+        "[session-start] registered sessionId=sess-ep-change-1 endpoint=http://127.0.0.1:8888/pigeon/direct/execute tokenFp=b7fee892 changed=true prevEndpoint=http://127.0.0.1:9999/pigeon/direct/execute prevTokenFp=b7fee892",
+      );
+    });
+
+    it("reports changed=true when only token changes", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const token1 = "super-secret-auth-token-12345-uuid-67890";
+      const token2 = "brand-new-auth-token-99999-uuid-11111";
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-tok-change-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token1,
+          }),
+        }),
+      );
+
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-tok-change-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token2,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      const regLogs = logs.filter((l) => l.includes("[session-start] registered"));
+      expect(regLogs).toHaveLength(2);
+      expect(regLogs[1]).toMatch(
+        /^\[session-start\] registered sessionId=sess-tok-change-1 endpoint=http:\/\/127\.0\.0\.1:9999\/pigeon\/direct\/execute tokenFp=[a-f0-9]{8} changed=true prevEndpoint=http:\/\/127\.0\.0\.1:9999\/pigeon\/direct\/execute prevTokenFp=b7fee892$/,
+      );
+    });
+
+    it("reports changed=true when upgrading a session that had no backend endpoint/token", async () => {
+      const app = newApp();
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
+
+      const token = "super-secret-auth-token-12345-uuid-67890";
+
+      // Session start without backend endpoint/token
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-upgrade-1",
+            label: "initial session",
+          }),
+        }),
+      );
+
+      // Upgrade with direct channel endpoint and token
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-upgrade-1",
+            backend_endpoint: "http://127.0.0.1:9999/pigeon/direct/execute",
+            backend_auth_token: token,
+          }),
+        }),
+      );
+      logSpy.mockRestore();
+
+      const regLogs = logs.filter((l) => l.includes("[session-start] registered"));
+      expect(regLogs).toHaveLength(2);
+      expect(regLogs[0]).toBe("[session-start] registered sessionId=sess-upgrade-1 changed=false");
+      expect(regLogs[1]).toBe(
+        "[session-start] registered sessionId=sess-upgrade-1 endpoint=http://127.0.0.1:9999/pigeon/direct/execute tokenFp=b7fee892 changed=true",
+      );
+    });
+  });
 });

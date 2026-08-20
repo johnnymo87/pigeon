@@ -16,6 +16,7 @@ import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
+import { tokenFingerprint } from "./adapters/direct-channel";
 
 interface LegacySession {
   session_id: string;
@@ -545,6 +546,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const nvim_socket = body.nvim_socket as string | undefined;
 
+        const backendEndpoint =
+          (typeof body.backend_endpoint === "string" ? body.backend_endpoint : undefined)
+          ?? existing?.backendEndpoint;
+        const backendAuthToken =
+          (typeof body.backend_auth_token === "string" ? body.backend_auth_token : undefined)
+          ?? existing?.backendAuthToken;
+
         storage.sessions.upsert(
           {
             sessionId,
@@ -564,15 +572,38 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             backendProtocolVersion:
               (typeof body.backend_protocol_version === "number" ? body.backend_protocol_version : undefined)
               ?? existing?.backendProtocolVersion,
-            backendEndpoint:
-              (typeof body.backend_endpoint === "string" ? body.backend_endpoint : undefined)
-              ?? existing?.backendEndpoint,
-            backendAuthToken:
-              (typeof body.backend_auth_token === "string" ? body.backend_auth_token : undefined)
-              ?? existing?.backendAuthToken,
+            backendEndpoint,
+            backendAuthToken,
           },
           nowFn(),
         );
+
+        const prevEndpoint = existing?.backendEndpoint;
+        const prevAuthToken = existing?.backendAuthToken;
+        const prevTokenFp = tokenFingerprint(prevAuthToken);
+        const tokenFp = tokenFingerprint(backendAuthToken);
+
+        const endpointChanged = existing != null && prevEndpoint !== backendEndpoint;
+        const tokenChanged = existing != null && prevAuthToken !== backendAuthToken;
+        const changed = endpointChanged || tokenChanged;
+
+        const logParts: string[] = [`[session-start] registered sessionId=${sessionId}`];
+        if (backendEndpoint) {
+          logParts.push(`endpoint=${backendEndpoint}`);
+        }
+        if (tokenFp) {
+          logParts.push(`tokenFp=${tokenFp}`);
+        }
+        logParts.push(`changed=${changed}`);
+        if (changed) {
+          if (prevEndpoint) {
+            logParts.push(`prevEndpoint=${prevEndpoint}`);
+          }
+          if (prevTokenFp) {
+            logParts.push(`prevTokenFp=${prevTokenFp}`);
+          }
+        }
+        console.log(logParts.join(" "));
 
         if (onSessionStart && ((body.notify as boolean | undefined) ?? existing?.notify ?? false)) {
           await onSessionStart(sessionId, true, (typeof body.label === "string" ? body.label : null) ?? existing?.label);
