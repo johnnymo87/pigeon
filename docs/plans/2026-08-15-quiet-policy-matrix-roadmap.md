@@ -316,8 +316,16 @@ Two arguments from that closure worth carrying, because my filing missed both:
   clamping it server-side reintroduces the very daemon-side dial the design exists to remove — the
   dial does not leave, it becomes a ceiling.
 - "A human standing rule writes `null`" was never the right home for that use case. A non-expiring
-  human decision already has a mechanism: `source='override'`, TTL-exempt before any clock read and
-  protected by the rank guard. That is item **D**, not this.
+  human decision *had* a mechanism: `source='override'`, TTL-exempt before any clock read and
+  protected by the rank guard. That was item **D**, not this.
+
+  > **SUPERSEDED 2026-08-20 (`pigeon-60sw`).** `source='override'` and its only writer,
+  > `POST /sessions/enable-notify`, have been REMOVED. The route had zero production callers, and
+  > 0 of 454 live rows used the source. Do not design against it. The invariant is now that **every
+  > suppression is TTL-bounded** — no session can be permanently silent — and the escape hatch is
+  > `DELETE /session-origin`. The capability deliberately given up: there is no longer any state a
+  > user can put a session in that survives a later automated quiet write. Anything below that
+  > proposes building on `override` needs rethinking from that premise.
 
 **If trigger 2 fires,** reopen `pigeon-vske` — not `pigeon-l4iw` — and build per-origin defaults.
 

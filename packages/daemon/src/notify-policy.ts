@@ -16,6 +16,12 @@ export const DEFAULT_DECLARED_QUIET_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
 export interface EffectivePolicyInput {
   policy: NotifyPolicy | null;
+  /**
+   * NOT read by effectiveNotifyPolicy any more, and that is deliberate rather than an oversight:
+   * since `override` was removed (pigeon-60sw) the TTL applies to every quiet source, so there is
+   * nothing left to branch on. It is retained because callers log it alongside the decision.
+   * If you are tempted to delete it, that is a caller-signature change, not a cleanup.
+   */
   source: OriginSource | null;
   declaredAt: number | null;
   now: number;
