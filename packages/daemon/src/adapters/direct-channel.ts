@@ -137,7 +137,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
     }
 
     const tokenFp = tokenFingerprint(authToken);
-    // meta.rejectReason carries ResultErrorCode on the question-reply path (e.g. QUESTION_NOT_FOUND)
+    // meta.rejectReason carries ResultErrorCode on the question-reply path (e.g. INVALID_SESSION, UNAUTHORIZED)
     const rejectReason = result.result?.errorCode;
 
     return {

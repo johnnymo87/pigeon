@@ -624,6 +624,12 @@ export async function ingestWorkerCommand(
  * Classify a failed delivery so we can decide whether retrying *through the
  * plugin* can help, vs. going straight to the revive fallback, vs. giving up.
  *
+ * NOTE: The `meta.rejectReason` rule is strictly for execute-path commands.
+ * On the question-reply path, `meta.rejectReason` carries `ResultErrorCode`
+ * (type-punned with `AckRejectReason`), and question replies cannot be revived.
+ * Callers on the question-reply path (specifically `throwIfTransientQuestionReplyFailure`)
+ * must pass `{ error: result.error }` without `meta`.
+ *
  * - `ambiguous`: a timeout/abort. The plugin may be alive but busy (event-loop
  *   starved mid-turn); the injection may or may not have landed. Retrying
  *   through the idempotent plugin can still produce a clean 1× delivery, so we
@@ -632,7 +638,10 @@ export async function ingestWorkerCommand(
  *   or an UNAUTHORIZED rejection from direct-channel token check.
  *   The plugin process is unreachable or rejected before reading the body (the token
  *   check runs before route dispatch and before body read, provably guaranteeing zero
- *   injection occurred), so retrying it is pointless — revive now.
+ *   injection occurred for that individual request), so retrying it is pointless — revive now.
+ *   (At command scope, duplicate injection remains possible if an earlier attempt timed
+ *   out ambiguously before the plugin restarted with a new token — the same accepted at-least-once
+ *   tradeoff documented at lines 1084-1090.)
  * - `terminal`: anything else (e.g. the plugin actively rejected the command mid-turn
  *   or with deterministic validation errors like BUSY/UNAVAILABLE/UNSUPPORTED_VERSION/INVALID_PAYLOAD).
  *   Ack and move on; neither retry nor revive would help.
@@ -1023,7 +1032,14 @@ function isConnectionError(result: Pick<CommandDeliveryResult, "error" | "meta">
 }
 
 function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
-  if (!isConnectionError(result)) return;
+  // Deliberately classify from `{ error: result.error }` only, omitting `meta`.
+  // `meta.rejectReason` is type-punned across channels: it carries AckRejectReason
+  // on execute but ResultErrorCode on question-reply (both use "UNAUTHORIZED").
+  // A question-reply 401/unauthorized rejection is permanent (and question replies
+  // cannot be revived anyway since opencode-serve revive only supports sendPrompt).
+  // Passing meta here would classify UNAUTHORIZED as definitely_not_delivered and
+  // throw, arming an infinite poller retry loop.
+  if (!isConnectionError({ error: result.error })) return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
   console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);
   throw new Error(error);

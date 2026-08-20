@@ -116,6 +116,8 @@ describe("opencode direct-channel routing integration", () => {
     // Prompt revived via opencodeClient
     expect(sendPromptCalls).toEqual([{ sid: "sess-int-2b", dir: "/tmp/proj", prompt: "echo revived-401" }]);
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
+    // backendEndpoint cleared after successful revive (revive-and-deliver.ts:93)
+    expect(storage.sessions.get("sess-int-2b")?.backendEndpoint).toBeNull();
     storage.db.close();
   });
 

@@ -4471,6 +4471,78 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       storage.db.close();
     });
 
+    it("preserves bounded-drop behavior for question-reply when meta.rejectReason is UNAUTHORIZED (does not throw / arm infinite loop)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-qr-unauth-reason",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-qr-unauth-reason",
+        requestId: "req-qr-unauth-reason",
+        questions: [{ question: "Deploy?", header: "Deploy", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+      const editedNotifications: Array<{ id: string; text: string }> = [];
+
+      // Calling ingestWorkerCommand must NOT throw when meta.rejectReason is "UNAUTHORIZED"
+      // (meta.rejectReason carries ResultErrorCode on question-reply, which is type-punned with AckRejectReason).
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-qr-unauth-reason",
+            sessionId: "sess-qr-unauth-reason",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "Unauthorized",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 401,
+                    rejectReason: "UNAUTHORIZED",
+                    tokenFp: "abcdef12",
+                  },
+                };
+              },
+            }),
+            editNotification: async (notificationId, text) => {
+              editedNotifications.push({ id: notificationId, text });
+              return { ok: true };
+            },
+            sendTelegramReply: async (_chatId, text) => {
+              replies.push(text);
+            },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Single question row kept so on-screen keyboard stays retryable
+      expect(storage.pendingQuestions.getBySessionId("sess-qr-unauth-reason")).not.toBeNull();
+      // User notified about failed question reply (bounded drop)
+      expect(replies).toEqual([
+        "Couldn't deliver your answer: Unauthorized\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+      ]);
+      // Inbox marked done (command acked)
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
     it.each([
       AckRejectReason.Busy,
       AckRejectReason.Unavailable,
