@@ -42,3 +42,26 @@ export function errorMessage(err: unknown): string {
   }
   return String(err)
 }
+
+/**
+ * Determine whether an error object represents an aborted session/message.
+ *
+ * Keys strictly on `name === "MessageAbortedError"`, matching the closed union
+ * `ProviderAuthError | UnknownError | MessageOutputLengthError | MessageAbortedError | ApiError`
+ * typed in `@opencode-ai/sdk/dist/gen/types.gen.d.ts` (lines 80-85, 518-524).
+ *
+ * Within that closed union, `/abort/i` on `name` is exactly equivalent to
+ * `name === "MessageAbortedError"` since none of the other four union names match.
+ * Keying on the exact typed name avoids dangerous false positives: client libraries
+ * that abort an internal controller on a network timeout produce `name: "AbortError"`,
+ * which is a genuine failure that must notify the user.
+ *
+ * No message fallback is used: `errorMessage` prefers `data.message`, so an `APIError`
+ * whose provider response body is literally "Aborted" would be suppressed even though
+ * it is a genuine, possibly non-retryable failure. `session.error` arrives over SSE
+ * as JSON with `name` preserved, so detection keys solely on the typed name.
+ */
+export function isAbortError(err: unknown): boolean {
+  if (err === null || err === undefined || typeof err !== "object") return false
+  return (err as { name?: unknown }).name === "MessageAbortedError"
+}

@@ -314,6 +314,44 @@ describe("daemon-client", () => {
       expect("title" in requestLog[0].body).toBe(false)
     })
 
+    test("should include error_kind in POST body when provided and omit when absent", async () => {
+      // given with errorKind
+      const optsWithErrorKind = {
+        sessionId: "test-session-abort",
+        event: "Error",
+        message: "Error: Aborted",
+        label: "Test Session",
+        errorKind: "aborted",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      await notifyStop(optsWithErrorKind)
+
+      // then
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0].body.error_kind).toBe("aborted")
+
+      // given without errorKind
+      requestLog = []
+      const optsWithoutErrorKind = {
+        sessionId: "test-session-no-error-kind",
+        event: "Error",
+        message: "Error: Something broke",
+        label: "Test Session",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      // when
+      await notifyStop(optsWithoutErrorKind)
+
+      // then
+      expect(requestLog).toHaveLength(1)
+      expect("error_kind" in requestLog[0].body).toBe(false)
+    })
+
     test("should handle failure gracefully", async () => {
       // given - invalid URL
       const opts = {

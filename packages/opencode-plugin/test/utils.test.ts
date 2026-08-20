@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { serializeError, errorMessage } from "../src/utils"
+import { serializeError, errorMessage, isAbortError } from "../src/utils"
 
 describe("serializeError", () => {
   describe("Error instances", () => {
@@ -177,6 +177,106 @@ describe("errorMessage", () => {
 
     test("number returns stringified number", () => {
       expect(errorMessage(500)).toBe("500")
+    })
+  })
+})
+
+describe("isAbortError", () => {
+  describe("positive cases (aborts)", () => {
+    test("MessageAbortedError matching SDK closed union", () => {
+      expect(
+        isAbortError({
+          name: "MessageAbortedError",
+          data: { message: "user cancelled" },
+        })
+      ).toBe(true)
+      expect(isAbortError({ name: "MessageAbortedError" })).toBe(true)
+    })
+  })
+
+  describe("negative cases (genuine errors that must NOT be treated as aborts)", () => {
+    test("AbortError from client library network timeout must notify", () => {
+      // Network timeout shape (e.g. client library AbortController timeout) - must notify, NOT an abort
+      const err = new Error("The operation was aborted")
+      err.name = "AbortError"
+      expect(isAbortError(err)).toBe(false)
+    })
+
+    test("off-contract name Aborted", () => {
+      expect(isAbortError({ name: "Aborted" })).toBe(false)
+    })
+
+    test("plain Error or string with message Aborted (no name MessageAbortedError)", () => {
+      expect(isAbortError(new Error("Aborted"))).toBe(false)
+      expect(isAbortError(new Error("aborted"))).toBe(false)
+      expect(isAbortError(new Error("  Aborted  "))).toBe(false)
+      expect(isAbortError("Aborted")).toBe(false)
+      expect(isAbortError("aborted")).toBe(false)
+      expect(isAbortError("  Aborted  ")).toBe(false)
+      expect(isAbortError({ message: "Aborted" })).toBe(false)
+      expect(isAbortError({ data: { message: "Aborted" } })).toBe(false)
+    })
+
+    test("other closed union members from gen/types.gen.d.ts", () => {
+      // ProviderAuthError
+      expect(
+        isAbortError({
+          name: "ProviderAuthError",
+          data: { providerID: "anthropic", message: "Invalid API key" },
+        })
+      ).toBe(false)
+
+      // UnknownError
+      expect(
+        isAbortError({
+          name: "UnknownError",
+          data: { message: "An unknown error occurred" },
+        })
+      ).toBe(false)
+
+      // MessageOutputLengthError
+      expect(
+        isAbortError({
+          name: "MessageOutputLengthError",
+          data: {},
+        })
+      ).toBe(false)
+
+      // APIError (even with message: "Aborted" provider response body)
+      expect(
+        isAbortError({
+          name: "APIError",
+          data: {
+            message: "Aborted",
+            statusCode: 500,
+            isRetryable: false,
+          },
+        })
+      ).toBe(false)
+    })
+
+    test("Error with message Rate limited", () => {
+      expect(isAbortError(new Error("Rate limited"))).toBe(false)
+    })
+
+    test("error whose message merely contains the word abort (must still notify)", () => {
+      expect(isAbortError(new Error("tool aborted the request"))).toBe(false)
+      expect(isAbortError("tool aborted the request")).toBe(false)
+      expect(isAbortError({ message: "tool aborted the request" })).toBe(false)
+      expect(isAbortError({ data: { message: "tool aborted the request" } })).toBe(false)
+    })
+
+    test("other non-abort errors", () => {
+      expect(isAbortError(new Error("ECONNREFUSED"))).toBe(false)
+      expect(isAbortError(new TypeError("undefined is not a function"))).toBe(false)
+    })
+
+    test("null, undefined, primitives, empty objects", () => {
+      expect(isAbortError(null)).toBe(false)
+      expect(isAbortError(undefined)).toBe(false)
+      expect(isAbortError({})).toBe(false)
+      expect(isAbortError(42)).toBe(false)
+      expect(isAbortError("")).toBe(false)
     })
   })
 })

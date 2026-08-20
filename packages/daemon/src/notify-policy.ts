@@ -117,6 +117,7 @@ export interface NotifyDecisionInput {
   event: string;
   policy: NotifyPolicy | null;
   title: string | null | undefined;
+  errorKind?: string | null;
 }
 
 export interface NotifyDecision {
@@ -124,7 +125,7 @@ export interface NotifyDecision {
   layer: NotifyLayer;
 }
 
-/** Events that `errors-only` still delivers. */
+/** Events that `none` suppresses in addition to Stop. */
 const ERROR_EVENTS = new Set(["Error", "Retry"]);
 
 /** Recognised spellings for switching the transitional title layer off. */
@@ -163,15 +164,23 @@ function isTitleLayerOn(env: Record<string, string | undefined>): boolean {
  * is upstream of the whole matrix.
  *
  * Every unnamed case delivers. `Error` and `Retry` arrive on the same POST /stop as `Stop`
- * (see the `Error` and `Retry` calls into `notifyStop` in opencode-plugin/src/index.ts), and have always been delivered for lgtm sessions
- * because the old gate tested `event === "Stop"`. Silencing them here would be a
- * regression that no counter would surface.
+ * (see the `Error` and `Retry` calls into `notifyStop` in opencode-plugin/src/index.ts).
+ * Under `errors-only`, `Retry` is suppressed because rate-limit retries are transient,
+ * self-healing, and have nothing for a human to do (pure noise in Telegram).
+ * Aborted `Error` events (`errorKind === "aborted"`) are also suppressed under `errors-only`
+ * as expected routine stops. Genuine, non-abort errors are delivered.
+ *
+ * Retry suppression is bounded by the declared-quiet TTL: `POST /stop` runs
+ * `effectiveNotifyPolicy` BEFORE `decideNotify`, so declared/inferred quiet expires
+ * to `all` after the TTL and a session retrying past it becomes audible again;
+ * a session that exhausts its retries surfaces via a delivered (non-abort) `Error`.
+ * This TTL coupling ensures retry suppression cannot indefinitely mask a stuck session.
  */
 export function decideNotify(
   input: NotifyDecisionInput,
   env: Record<string, string | undefined> = process.env,
 ): NotifyDecision {
-  const { event, policy, title } = input;
+  const { event, policy, title, errorKind } = input;
 
   if (policy === "none") {
     if (event === "Stop" || ERROR_EVENTS.has(event)) return { deliver: false, layer: "origin" };
@@ -179,7 +188,8 @@ export function decideNotify(
   }
 
   if (policy === "errors-only") {
-    if (event === "Stop") return { deliver: false, layer: "origin" };
+    if (event === "Stop" || event === "Retry") return { deliver: false, layer: "origin" };
+    if (event === "Error" && errorKind === "aborted") return { deliver: false, layer: "origin" };
     return { deliver: true, layer: "origin" };
   }
 

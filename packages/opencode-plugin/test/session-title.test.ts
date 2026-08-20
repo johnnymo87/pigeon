@@ -777,6 +777,71 @@ describe("Session Title Management", () => {
               sessionId: "ses_err_2",
               event: "Error",
               message: "Error: Something broke",
+              errorKind: undefined,
+            })
+          )
+        })
+        // Explicitly assert errorKind is undefined on the notifyStop call arg.
+        // Wire omission of error_kind in HTTP body is pinned in daemon-client.test.ts.
+        expect(notifyStopSpy.mock.calls[0][0].errorKind).toBeUndefined()
+      })
+
+      test("session.error with abort error passes errorKind: 'aborted' to notifyStop", async () => {
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_err_abort_1", title: "Aborted Session 1" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "session.error",
+            properties: {
+              sessionID: "ses_err_abort_1",
+              error: { name: "MessageAbortedError", data: { message: "operation aborted" } },
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_err_abort_1",
+              event: "Error",
+              message: "Error: operation aborted",
+              errorKind: "aborted",
+            })
+          )
+        })
+
+        await hooks.event!({
+          event: {
+            type: "session.created",
+            properties: { info: { id: "ses_err_abort_2", title: "Aborted Session 2" } },
+          } as any,
+        })
+
+        await hooks.event!({
+          event: {
+            type: "session.error",
+            properties: {
+              sessionID: "ses_err_abort_2",
+              error: { name: "MessageAbortedError", data: { message: "cancelled" } },
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyStopSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_err_abort_2",
+              event: "Error",
+              message: "Error: cancelled",
+              errorKind: "aborted",
             })
           )
         })

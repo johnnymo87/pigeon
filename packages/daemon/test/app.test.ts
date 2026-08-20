@@ -2074,12 +2074,18 @@ describe("createApp", () => {
       }
     });
 
-    async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review") {
+    async function stop(app: ReturnType<typeof createApp>, event = "Stop", title = "PR review", errorKind?: string | null) {
       return app(
         new Request("http://localhost/stop", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ session_id: "ses_a", event, summary: "done", title }),
+          body: JSON.stringify({
+            session_id: "ses_a",
+            event,
+            summary: "done",
+            title,
+            ...(errorKind !== undefined ? { error_kind: errorKind } : {}),
+          }),
         }),
       );
     }
@@ -2099,7 +2105,7 @@ describe("createApp", () => {
       expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
     });
 
-    it("errors-only + Error -> delivered (202 queued)", async () => {
+    it("errors-only + Error without error_kind -> delivered (202 queued, fail-open)", async () => {
       const app = newApp();
       seed(app, "errors-only");
       const res = await stop(app, "Error");
@@ -2109,14 +2115,28 @@ describe("createApp", () => {
       expect(json.deliveryState).toBe("queued");
     });
 
-    it("errors-only + Retry -> delivered (202 queued)", async () => {
+    it("errors-only + Error with non-aborted error_kind -> delivered (202 queued)", async () => {
       const app = newApp();
       seed(app, "errors-only");
-      const res = await stop(app, "Retry");
+      const res = await stop(app, "Error", "PR review", "rate_limited");
       expect(res.status).toBe(202);
       const json = await res.json();
       expect(json.ok).toBe(true);
       expect(json.deliveryState).toBe("queued");
+    });
+
+    it("errors-only + Error with error_kind=aborted -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Error", "PR review", "aborted");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
+    });
+
+    it("errors-only + Retry -> quiet_origin", async () => {
+      const app = newApp();
+      seed(app, "errors-only");
+      const res = await stop(app, "Retry");
+      expect(await res.json()).toEqual({ ok: true, notified: false, reason: "quiet_origin" });
     });
 
     it("notify=false on session short-circuits ahead of policy layer even with notifyPolicy=all", async () => {
@@ -2316,14 +2336,14 @@ describe("createApp", () => {
       seed(app, "errors-only");
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-      // errors-only suppresses Stop but delivers Retry -- the by-design case that
+      // errors-only suppresses Stop and Retry but delivers Error -- the by-design case that
       // used to be unreadable in the logs.
-      const res = await stop(app, "Retry", "PR review .lgtm-review-prompt.md");
+      const res = await stop(app, "Error", "PR review .lgtm-review-prompt.md");
       expect(res.status).toBe(202);
 
       expect(logSpy).toHaveBeenCalledWith(
         expect.stringMatching(
-          /\[stop\] queued sessionId=ses_a event=Retry .*origin=lgtm policy=errors-only/,
+          /\[stop\] queued sessionId=ses_a event=Error .*origin=lgtm policy=errors-only/,
         ),
       );
 
