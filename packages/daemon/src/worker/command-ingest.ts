@@ -1047,7 +1047,21 @@ async function deliverViaAdapter(
     return;
   }
 
-  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}`);
+  const metaParts: string[] = [];
+  if (result.meta?.endpoint !== undefined && result.meta.endpoint !== null && result.meta.endpoint !== "") {
+    metaParts.push(`endpoint=${result.meta.endpoint}`);
+  }
+  if (result.meta?.status !== undefined && result.meta.status !== null) {
+    metaParts.push(`status=${result.meta.status}`);
+  }
+  if (result.meta?.rejectReason !== undefined && result.meta.rejectReason !== null && result.meta.rejectReason !== "") {
+    metaParts.push(`rejectReason=${result.meta.rejectReason}`);
+  }
+  if (result.meta?.tokenFp !== undefined && result.meta.tokenFp !== null && result.meta.tokenFp !== "") {
+    metaParts.push(`tokenFp=${result.meta.tokenFp}`);
+  }
+  const metaSuffix = metaParts.length > 0 ? ` ${metaParts.join(" ")}` : "";
+  console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}${metaSuffix}`);
 
   if (isConnectionError(result.error)) {
     // The plugin endpoint did not confirm delivery (connection refused, or a

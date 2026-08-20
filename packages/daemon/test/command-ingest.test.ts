@@ -3830,3 +3830,106 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     storage.db.close();
   });
 });
+
+describe("diagnostic failure logging (pigeon-m426.1)", () => {
+  it("logs enriched failure line with endpoint, status, rejectReason, and tokenFp when adapter returns them", async () => {
+    const storage = openStorageDb(":memory:");
+    const rawSecretToken = "super-secret-auth-token-12345-uuid-67890";
+    storage.sessions.upsert({
+      sessionId: "sess-diag-1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: rawSecretToken,
+    }, 1_000);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-diag-1", sessionId: "sess-diag-1", command: "test command", chatId: "10" }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() {
+            return {
+              ok: false,
+              error: "UNAUTHORIZED",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 401,
+                attempts: 1,
+                rejectReason: "UNAUTHORIZED",
+                tokenFp: "3c9909af",
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const deliveryFailWarn = warns.find(w => w.includes("[command-ingest] delivery failed"));
+    expect(deliveryFailWarn).toBeDefined();
+    expect(deliveryFailWarn).toBe(
+      "[command-ingest] delivery failed commandId=cmd-diag-1 adapter=direct-channel sessionId=sess-diag-1 attempts=1 error=UNAUTHORIZED endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=401 rejectReason=UNAUTHORIZED tokenFp=3c9909af",
+    );
+
+    // Security check: raw token NEVER in any log
+    for (const warn of warns) {
+      expect(warn).not.toContain(rawSecretToken);
+    }
+    storage.db.close();
+  });
+
+  it("omits absent diagnostic fields from the log line rather than printing undefined", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-diag-2",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "token-val",
+    }, 1_000);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-diag-2", sessionId: "sess-diag-2", command: "test command", chatId: "10" }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() {
+            return {
+              ok: false,
+              error: "Network error",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 0,
+                attempts: 1,
+                // rejectReason and tokenFp omitted
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const deliveryFailWarn = warns.find(w => w.includes("[command-ingest] delivery failed"));
+    expect(deliveryFailWarn).toBeDefined();
+    expect(deliveryFailWarn).toBe(
+      "[command-ingest] delivery failed commandId=cmd-diag-2 adapter=direct-channel sessionId=sess-diag-2 attempts=1 error=Network error endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0",
+    );
+    expect(deliveryFailWarn).not.toContain("undefined");
+    expect(deliveryFailWarn).not.toContain("rejectReason=");
+    expect(deliveryFailWarn).not.toContain("tokenFp=");
+
+    storage.db.close();
+  });
+});

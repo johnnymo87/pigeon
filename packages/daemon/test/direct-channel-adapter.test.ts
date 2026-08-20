@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   OPENCODE_DIRECT_PROTOCOL_VERSION,
   OpencodeDirectMessageType,
+  AckRejectReason,
+  ResultErrorCode,
 } from "../src/opencode-direct/contracts";
 import { DirectChannelAdapter } from "../src/adapters/direct-channel";
 import type { SessionRecord } from "../src/storage/types";
@@ -110,5 +113,268 @@ describe("DirectChannelAdapter execute (Phase 2)", () => {
 
     expect(recordedAtCallTime).toBe(true);
     expect(db.injectedPrompts.has("s1", hashPrompt("fix the bug"))).toBe(true);
+  });
+
+  describe("diagnostic metadata enrichment and security (pigeon-m426.1)", () => {
+    it("surfaces endpoint, status, rejectReason, and tokenFp on 401 UNAUTHORIZED deliverCommand failure without leaking raw token", async () => {
+      const rawSecretToken = "super-secret-auth-token-12345-uuid-67890";
+      const session: SessionRecord = {
+        sessionId: "s1",
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        backendAuthToken: rawSecretToken,
+      } as unknown as SessionRecord;
+
+      const fetchFn = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            ack: {
+              type: OpencodeDirectMessageType.Ack,
+              version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+              requestId: "c1",
+              commandId: "c1",
+              sessionId: "s1",
+              accepted: false,
+              acceptedAt: Date.now(),
+              rejectReason: AckRejectReason.Unauthorized,
+              message: "Invalid auth token",
+            },
+          }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      });
+
+      const adapter = new DirectChannelAdapter({
+        fetchFn: fetchFn as unknown as typeof fetch,
+        sleep: async () => {},
+      });
+
+      const result = await adapter.deliverCommand(session, "run something", {
+        commandId: "c1",
+        chatId: "5",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe(AckRejectReason.Unauthorized);
+
+      const expectedTokenFp = createHash("sha256").update(rawSecretToken).digest("hex").slice(0, 8);
+      expect(result.meta).toEqual({
+        endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        status: 401,
+        attempts: 1,
+        rejectReason: "UNAUTHORIZED",
+        tokenFp: expectedTokenFp,
+      });
+
+      // Security assertion: raw secret auth token must appear NOWHERE in meta or error
+      const metaString = JSON.stringify(result.meta);
+      expect(metaString).not.toContain(rawSecretToken);
+      expect(result.error).not.toContain(rawSecretToken);
+      // Ensure tokenFp is NOT a prefix of the raw token itself
+      expect(rawSecretToken.startsWith(result.meta!.tokenFp as string)).toBe(false);
+    });
+
+    it("generates stable tokenFp for the same token across multiple calls", async () => {
+      const token = "consistent-token-value";
+      const session1: SessionRecord = {
+        sessionId: "s1",
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        backendAuthToken: token,
+      } as unknown as SessionRecord;
+      const session2: SessionRecord = {
+        sessionId: "s2",
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:4097/pigeon/direct/execute",
+        backendAuthToken: token,
+      } as unknown as SessionRecord;
+
+      const fetchFn = vi.fn(async () => {
+        return new Response(JSON.stringify({ error: "fail" }), { status: 500 });
+      });
+
+      const adapter = new DirectChannelAdapter({
+        fetchFn: fetchFn as unknown as typeof fetch,
+        sleep: async () => {},
+      });
+
+      const result1 = await adapter.deliverCommand(session1, "cmd1", { commandId: "c1" });
+      const result2 = await adapter.deliverCommand(session2, "cmd2", { commandId: "c2" });
+
+      const fp1 = result1.meta?.tokenFp;
+      const fp2 = result2.meta?.tokenFp;
+
+      expect(fp1).toBeDefined();
+      expect(typeof fp1).toBe("string");
+      expect(fp1).toHaveLength(8);
+      expect(fp1).toBe(fp2);
+      expect(fp1).toBe(createHash("sha256").update(token).digest("hex").slice(0, 8));
+    });
+
+    it("surfaces endpoint and tokenFp on early return when missing backendEndpoint or backendAuthToken", async () => {
+      const rawSecretToken = "token-for-missing-endpoint";
+      const adapter = new DirectChannelAdapter();
+
+      // Case 1: has endpoint, missing token
+      const sessionWithOnlyEndpoint: SessionRecord = {
+        sessionId: "s1",
+        backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        backendAuthToken: "",
+      } as unknown as SessionRecord;
+
+      const result1 = await adapter.deliverCommand(sessionWithOnlyEndpoint, "cmd", { commandId: "c1" });
+      expect(result1.ok).toBe(false);
+      expect(result1.error).toBe("Session missing backendEndpoint or backendAuthToken");
+      expect(result1.meta).toEqual({
+        endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      });
+
+      // Case 2: has token, missing endpoint
+      const sessionWithOnlyToken: SessionRecord = {
+        sessionId: "s2",
+        backendEndpoint: "",
+        backendAuthToken: rawSecretToken,
+      } as unknown as SessionRecord;
+
+      const result2 = await adapter.deliverCommand(sessionWithOnlyToken, "cmd", { commandId: "c2" });
+      expect(result2.ok).toBe(false);
+      expect(result2.error).toBe("Session missing backendEndpoint or backendAuthToken");
+      const expectedTokenFp = createHash("sha256").update(rawSecretToken).digest("hex").slice(0, 8);
+      expect(result2.meta).toEqual({
+        tokenFp: expectedTokenFp,
+      });
+      expect(JSON.stringify(result2.meta)).not.toContain(rawSecretToken);
+
+      // Case 3: both missing
+      const sessionWithNeither: SessionRecord = {
+        sessionId: "s3",
+        backendEndpoint: "",
+        backendAuthToken: "",
+      } as unknown as SessionRecord;
+
+      const result3 = await adapter.deliverCommand(sessionWithNeither, "cmd", { commandId: "c3" });
+      expect(result3.ok).toBe(false);
+      expect(result3.error).toBe("Session missing backendEndpoint or backendAuthToken");
+      expect(result3.meta?.endpoint).toBeUndefined();
+      expect(result3.meta?.tokenFp).toBeUndefined();
+    });
+
+    it("does not include endpoint, tokenFp, or rejectReason in meta on deliverCommand success", async () => {
+      const fetchFn = vi.fn(async () => successResponse());
+      const adapter = new DirectChannelAdapter({
+        fetchFn: fetchFn as unknown as typeof fetch,
+        sleep: async () => {},
+      });
+
+      const result = await adapter.deliverCommand(makeSession(), "cmd", { commandId: "c1" });
+      expect(result.ok).toBe(true);
+      expect(result.meta).toEqual({
+        attempts: 1,
+        status: 200,
+      });
+      expect(result.meta?.endpoint).toBeUndefined();
+      expect(result.meta?.tokenFp).toBeUndefined();
+      expect(result.meta?.rejectReason).toBeUndefined();
+    });
+
+    it("surfaces endpoint, status, rejectReason, and tokenFp on deliverQuestionReply failure without leaking raw token", async () => {
+      const rawSecretToken = "secret-question-reply-token";
+      const session: SessionRecord = {
+        sessionId: "s1",
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        backendAuthToken: rawSecretToken,
+      } as unknown as SessionRecord;
+
+      const fetchFn = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            result: {
+              type: OpencodeDirectMessageType.QuestionReplyResult,
+              version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+              requestId: "c1",
+              sessionId: "s1",
+              questionRequestId: "q1",
+              success: false,
+              finishedAt: Date.now(),
+              errorCode: ResultErrorCode.Unauthorized,
+              errorMessage: "Auth token invalid",
+            },
+          }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      });
+
+      const adapter = new DirectChannelAdapter({
+        fetchFn: fetchFn as unknown as typeof fetch,
+      });
+
+      const result = await adapter.deliverQuestionReply!(
+        session,
+        { questionRequestId: "q1", answers: [["A"]] },
+        { commandId: "c1" },
+      );
+
+      expect(result.ok).toBe(false);
+      const expectedTokenFp = createHash("sha256").update(rawSecretToken).digest("hex").slice(0, 8);
+      expect(result.meta).toEqual({
+        endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        status: 401,
+        rejectReason: ResultErrorCode.Unauthorized,
+        tokenFp: expectedTokenFp,
+      });
+
+      // Security assertion
+      expect(JSON.stringify(result.meta)).not.toContain(rawSecretToken);
+      expect(result.error).not.toContain(rawSecretToken);
+
+      // Question reply early return on missing endpoint/token
+      const sessionMissingEndpoint: SessionRecord = {
+        sessionId: "s1",
+        backendEndpoint: "",
+        backendAuthToken: rawSecretToken,
+      } as unknown as SessionRecord;
+      const earlyResult = await adapter.deliverQuestionReply!(
+        sessionMissingEndpoint,
+        { questionRequestId: "q1", answers: [["A"]] },
+        { commandId: "c2" },
+      );
+      expect(earlyResult.ok).toBe(false);
+      expect(earlyResult.meta).toEqual({
+        tokenFp: expectedTokenFp,
+      });
+
+      // Question reply success path: meta only has status
+      const successFetchFn = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            result: {
+              type: OpencodeDirectMessageType.QuestionReplyResult,
+              version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+              requestId: "c3",
+              sessionId: "s1",
+              questionRequestId: "q1",
+              success: true,
+              finishedAt: Date.now(),
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      });
+      const successAdapter = new DirectChannelAdapter({ fetchFn: successFetchFn as unknown as typeof fetch });
+      const successResult = await successAdapter.deliverQuestionReply!(
+        session,
+        { questionRequestId: "q1", answers: [["A"]] },
+        { commandId: "c3" },
+      );
+      expect(successResult.ok).toBe(true);
+      expect(successResult.meta).toEqual({ status: 200 });
+      expect(successResult.meta?.endpoint).toBeUndefined();
+      expect(successResult.meta?.tokenFp).toBeUndefined();
+    });
   });
 });
