@@ -1,8 +1,15 @@
+import { createHash } from "node:crypto";
 import { spawn } from "child_process";
 import { describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
-import { ingestWorkerCommand } from "../src/worker/command-ingest";
-import { ResultErrorCode } from "../src/opencode-direct/contracts";
+import { formatDeliveryMeta, ingestWorkerCommand } from "../src/worker/command-ingest";
+import {
+  OPENCODE_DIRECT_PROTOCOL_VERSION,
+  OpencodeDirectMessageType,
+  AckRejectReason,
+  ResultErrorCode,
+} from "../src/opencode-direct/contracts";
+import { DirectChannelAdapter } from "../src/adapters/direct-channel";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, QuestionReplyInput } from "../src/adapters/types";
 import type { ExecuteMessage } from "../src/worker/poller";
 import type { ReviveAndDeliverDeps } from "../src/worker/revive-and-deliver";
@@ -3827,6 +3834,450 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     // the identity check logs "metadata mismatched"; the shape guard does not
     expect(warns.some(w => w.includes("metadata mismatched"))).toBe(true);
     expect(warns.some(w => w.includes("shape does not match"))).toBe(false);
+    storage.db.close();
+  });
+});
+
+describe("diagnostic failure logging (pigeon-m426.1)", () => {
+  it("logs enriched failure line with endpoint, status, rejectReason, and tokenFp when adapter returns them", async () => {
+    const storage = openStorageDb(":memory:");
+    const rawSecretToken = "super-secret-auth-token-12345-uuid-67890";
+    storage.sessions.upsert({
+      sessionId: "sess-diag-1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: rawSecretToken,
+    }, 1_000);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-diag-1", sessionId: "sess-diag-1", command: "test command", chatId: "10" }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() {
+            return {
+              ok: false,
+              error: "UNAUTHORIZED",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 401,
+                attempts: 1,
+                rejectReason: "UNAUTHORIZED",
+                tokenFp: "3c9909af",
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const deliveryFailWarn = warns.find(w => w.includes("[command-ingest] delivery failed"));
+    expect(deliveryFailWarn).toBeDefined();
+    expect(deliveryFailWarn).toBe(
+      "[command-ingest] delivery failed commandId=cmd-diag-1 adapter=direct-channel sessionId=sess-diag-1 attempts=1 error=UNAUTHORIZED endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=401 rejectReason=UNAUTHORIZED tokenFp=3c9909af",
+    );
+
+    // Security check: raw token NEVER in any log
+    for (const warn of warns) {
+      expect(warn).not.toContain(rawSecretToken);
+    }
+    storage.db.close();
+  });
+
+  it("omits absent diagnostic fields from the log line rather than printing undefined", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-diag-2",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "token-val",
+    }, 1_000);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-diag-2", sessionId: "sess-diag-2", command: "test command", chatId: "10" }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() {
+            return {
+              ok: false,
+              error: "Network error",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 0,
+                attempts: 1,
+                // rejectReason and tokenFp omitted
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const deliveryFailWarn = warns.find(w => w.includes("[command-ingest] delivery failed"));
+    expect(deliveryFailWarn).toBeDefined();
+    expect(deliveryFailWarn).toBe(
+      "[command-ingest] delivery failed commandId=cmd-diag-2 adapter=direct-channel sessionId=sess-diag-2 attempts=1 error=Network error endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0",
+    );
+    expect(deliveryFailWarn).not.toContain("undefined");
+    expect(deliveryFailWarn).not.toContain("rejectReason=");
+    expect(deliveryFailWarn).not.toContain("tokenFp=");
+
+    storage.db.close();
+  });
+
+  describe("formatDeliveryMeta helper", () => {
+    it("returns empty string when meta is undefined, null, or empty", () => {
+      expect(formatDeliveryMeta(undefined)).toBe("");
+      expect(formatDeliveryMeta(null as unknown as Record<string, unknown>)).toBe("");
+      expect(formatDeliveryMeta({})).toBe("");
+    });
+
+    it("formats all fields with leading space and handles status=0", () => {
+      expect(formatDeliveryMeta({
+        endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        status: 401,
+        rejectReason: "UNAUTHORIZED",
+        tokenFp: "3c9909af",
+      })).toBe(" endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=401 rejectReason=UNAUTHORIZED tokenFp=3c9909af");
+
+      expect(formatDeliveryMeta({
+        endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+        status: 0,
+      })).toBe(" endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0");
+    });
+
+    it("ignores empty strings for string fields", () => {
+      expect(formatDeliveryMeta({
+        endpoint: "",
+        status: 200,
+        rejectReason: "",
+        tokenFp: "",
+      })).toBe(" status=200");
+    });
+  });
+
+  it("integrates real DirectChannelAdapter through execute failure path on plugin 401 ack and logs status=401 rejectReason=UNAUTHORIZED tokenFp without leaking raw token", async () => {
+    const storage = openStorageDb(":memory:");
+    const rawSecretToken = "super-secret-auth-token-integration-12345";
+    const expectedTokenFp = createHash("sha256").update(rawSecretToken).digest("hex").slice(0, 8);
+
+    storage.sessions.upsert({
+      sessionId: "sess-real-int-1",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: rawSecretToken,
+    }, 1_000);
+
+    const fetchFn = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          ack: {
+            type: OpencodeDirectMessageType.Ack,
+            version: OPENCODE_DIRECT_PROTOCOL_VERSION,
+            requestId: "cmd-real-1",
+            commandId: "cmd-real-1",
+            sessionId: "sess-real-int-1",
+            accepted: false,
+            acceptedAt: Date.now(),
+            rejectReason: AckRejectReason.Unauthorized,
+            message: "Unauthorized",
+          },
+        }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-real-1", sessionId: "sess-real-int-1", command: "test command", chatId: "10" }),
+      {
+        createAdapter: () => new DirectChannelAdapter({
+          fetchFn: fetchFn as unknown as typeof fetch,
+          sleep: async () => {},
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const deliveryFailWarn = warns.find(w => w.includes("[command-ingest] delivery failed"));
+    expect(deliveryFailWarn).toBeDefined();
+    expect(deliveryFailWarn).toBe(
+      `[command-ingest] delivery failed commandId=cmd-real-1 adapter=direct-channel sessionId=sess-real-int-1 attempts=1 error=UNAUTHORIZED endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=401 rejectReason=UNAUTHORIZED tokenFp=${expectedTokenFp}`,
+    );
+    expect(deliveryFailWarn).toContain("status=401");
+    expect(deliveryFailWarn).toContain("rejectReason=UNAUTHORIZED");
+    expect(deliveryFailWarn).toContain(`tokenFp=${expectedTokenFp}`);
+    expect(deliveryFailWarn).not.toContain(rawSecretToken);
+
+    for (const warn of warns) {
+      expect(warn).not.toContain(rawSecretToken);
+    }
+    storage.db.close();
+  });
+
+  it("logs enriched failure line on wizard final delivery failure", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-wiz-fail",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "tok-wiz",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-wiz-fail",
+      requestId: "req-wiz-fail",
+      questions: [
+        { question: "Q1?", header: "H1", options: [{ label: "Opt1", description: "" }] },
+        { question: "Q2?", header: "H2", options: [{ label: "Opt2", description: "" }] },
+      ],
+    }, now);
+    const initial = storage.pendingQuestions.getBySessionId("sess-wiz-fail")!;
+    storage.pendingQuestions.advanceStep(initial, ["Opt1"]);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-wiz-fail",
+        sessionId: "sess-wiz-fail",
+        command: "v1:q0",
+        chatId: "1",
+      }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply() {
+            return {
+              ok: false,
+              error: "INTERNAL",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 500,
+                rejectReason: ResultErrorCode.Internal,
+                tokenFp: "a1b2c3d4",
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const wizWarn = warns.find(w => w.includes("[command-ingest] wizard final delivery failed"));
+    expect(wizWarn).toBeDefined();
+    expect(wizWarn).toBe(
+      "[command-ingest] wizard final delivery failed commandId=cmd-wiz-fail error=INTERNAL endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=500 rejectReason=INTERNAL tokenFp=a1b2c3d4",
+    );
+
+    storage.db.close();
+  });
+
+  it("logs enriched failure line on single question reply failure", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-single-fail",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "tok-single",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-single-fail",
+      requestId: "req-single-fail",
+      questions: [
+        { question: "Single Q?", header: "H", options: [{ label: "OptA", description: "" }] },
+      ],
+    }, now);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-single-fail",
+        sessionId: "sess-single-fail",
+        command: "q0",
+        chatId: "1",
+      }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() { return { ok: false, error: "should not be called" }; },
+          async deliverQuestionReply() {
+            return {
+              ok: false,
+              error: "Invalid question reply result",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 401,
+                tokenFp: "e5f60718",
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const singleWarn = warns.find(w => w.includes("[command-ingest] question reply failed"));
+    expect(singleWarn).toBeDefined();
+    expect(singleWarn).toBe(
+      "[command-ingest] question reply failed commandId=cmd-single-fail error=Invalid question reply result endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=401 tokenFp=e5f60718",
+    );
+
+    storage.db.close();
+  });
+
+  it("logs enriched failure line on metadata fallback question reply failure", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-meta-fail",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "tok-meta",
+    }, now);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({
+        commandId: "cmd-meta-fail",
+        sessionId: "sess-meta-fail",
+        command: "my answer text",
+        chatId: "1",
+        metadata: { questionRequestId: "req-meta-fallback" },
+      }),
+      {
+        createAdapter: () => ({
+          name: "direct-channel",
+          async deliverCommand() { return { ok: true }; },
+          async deliverQuestionReply() {
+            return {
+              ok: false,
+              error: "404 question not found",
+              meta: {
+                endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                status: 404,
+                tokenFp: "99887766",
+              },
+            };
+          },
+        }),
+      },
+    );
+    spy.mockRestore();
+
+    const fallbackWarn = warns.find(w => w.includes("[command-ingest] metadata fallback question reply failed"));
+    expect(fallbackWarn).toBeDefined();
+    expect(fallbackWarn).toBe(
+      "[command-ingest] metadata fallback question reply failed commandId=cmd-meta-fail error=404 question not found, falling through to regular delivery endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=404 tokenFp=99887766",
+    );
+
+    storage.db.close();
+  });
+
+  it("logs enriched failure line on transient question reply failure without changing thrown error message", async () => {
+    const now = Date.now();
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-trans-fail",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+      backendAuthToken: "tok-trans",
+    }, now);
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-trans-fail",
+      requestId: "req-trans-fail",
+      questions: [
+        { question: "Single Q?", header: "H", options: [{ label: "OptA", description: "" }] },
+      ],
+    }, now);
+
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+
+    let thrownError: Error | null = null;
+    try {
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-trans-fail",
+          sessionId: "sess-trans-fail",
+          command: "q0",
+          chatId: "1",
+        }),
+        {
+          createAdapter: () => ({
+            name: "direct-channel",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              return {
+                ok: false,
+                error: "fetch failed",
+                meta: {
+                  endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
+                  status: 0,
+                  tokenFp: "11223344",
+                },
+              };
+            },
+          }),
+        },
+      );
+    } catch (e) {
+      thrownError = e as Error;
+    }
+    spy.mockRestore();
+
+    expect(thrownError).not.toBeNull();
+    // Thrown error message must NOT have meta suffix (feeds retry logic)
+    expect(thrownError!.message).toBe("fetch failed");
+
+    const transWarn = warns.find(w => w.includes("[command-ingest] transient question reply failure"));
+    expect(transWarn).toBeDefined();
+    expect(transWarn).toBe(
+      "[command-ingest] transient question reply failure commandId=cmd-trans-fail error=fetch failed endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0 tokenFp=11223344",
+    );
+
     storage.db.close();
   });
 });

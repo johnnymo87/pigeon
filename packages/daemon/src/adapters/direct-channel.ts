@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { SessionRecord } from "../storage/types";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult, QuestionReplyInput } from "./types";
 import {
@@ -8,6 +9,11 @@ import {
 import { OpencodeDirectSource } from "../opencode-direct/contracts";
 
 export interface DirectChannelAdapterDeps extends OpencodeDirectAdapterDeps {}
+
+function tokenFingerprint(token?: string | null): string | undefined {
+  if (!token) return undefined;
+  return createHash("sha256").update(token).digest("hex").slice(0, 8);
+}
 
 export class DirectChannelAdapter implements CommandDeliveryAdapter {
   readonly name = "direct-channel";
@@ -23,9 +29,14 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
     const authToken = session.backendAuthToken;
 
     if (!endpoint || !authToken) {
+      const tokenFp = tokenFingerprint(authToken);
       return {
         ok: false,
         error: "Session missing backendEndpoint or backendAuthToken",
+        meta: {
+          ...(endpoint ? { endpoint } : {}),
+          ...(tokenFp ? { tokenFp } : {}),
+        },
       };
     }
 
@@ -71,12 +82,19 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
       || result.ack?.rejectReason
       || "OpenCode direct-channel execution failed";
 
+    const tokenFp = tokenFingerprint(authToken);
+    // meta.rejectReason carries AckRejectReason on the execute path (e.g. UNAUTHORIZED, BUSY)
+    const rejectReason = result.ack?.rejectReason;
+
     return {
       ok: false,
       error,
       meta: {
-        attempts: result.attempts,
+        endpoint,
         status: result.status,
+        attempts: result.attempts,
+        ...(rejectReason ? { rejectReason } : {}),
+        ...(tokenFp ? { tokenFp } : {}),
       },
     };
   }
@@ -90,9 +108,14 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
     const authToken = session.backendAuthToken;
 
     if (!endpoint || !authToken) {
+      const tokenFp = tokenFingerprint(authToken);
       return {
         ok: false,
         error: "Session missing backendEndpoint or backendAuthToken",
+        meta: {
+          ...(endpoint ? { endpoint } : {}),
+          ...(tokenFp ? { tokenFp } : {}),
+        },
       };
     }
 
@@ -113,10 +136,19 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
       return { ok: true, meta: { status: result.status } };
     }
 
+    const tokenFp = tokenFingerprint(authToken);
+    // meta.rejectReason carries ResultErrorCode on the question-reply path (e.g. QUESTION_NOT_FOUND)
+    const rejectReason = result.result?.errorCode;
+
     return {
       ok: false,
       error: result.error || "Question reply delivery failed",
-      meta: { status: result.status },
+      meta: {
+        endpoint,
+        status: result.status,
+        ...(rejectReason ? { rejectReason } : {}),
+        ...(tokenFp ? { tokenFp } : {}),
+      },
     };
   }
 }
