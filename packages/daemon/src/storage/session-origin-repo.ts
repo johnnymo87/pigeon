@@ -14,18 +14,9 @@ import type BetterSqlite3 from "better-sqlite3";
  *
  * - `inferred`: automated guess based on TUI title or session heuristics.
  * - `declared`: explicitly set during launch (e.g. via launcher/automation).
- * - `override`: user-issued un-quiet / policy change that automated `declared`
- *   writers must not undo.
  */
-export const ORIGIN_SOURCES = ["inferred", "declared", "override"] as const;
+export const ORIGIN_SOURCES = ["inferred", "declared"] as const;
 
-/**
- * Placeholder `origin` for a row created by the un-quiet lever on a session nobody had
- * declared provenance for yet. `origin` means WHO SPAWNED the session, which the lever
- * does not know; writing "override" there would put a non-spawner into the spawner index.
- * A later declared writer is allowed to replace this sentinel (see `record`).
- */
-export const ORIGIN_UNKNOWN = "unknown";
 export type OriginSource = (typeof ORIGIN_SOURCES)[number];
 
 /**
@@ -75,9 +66,8 @@ export class SessionOriginRepository {
 
   /**
    * Insert-or-upgrade. A write from a weaker source never overwrites a stronger one, so a
-   * later inferred guess or automated declared write can never downgrade what a user
-   * override established. Equal-or-stronger writes refresh the payload and updated_at
-   * but preserve created_at.
+   * later inferred guess can never downgrade an explicitly declared origin. Equal-or-stronger
+   * writes refresh the payload and updated_at but preserve created_at.
    */
   record(input: RecordSessionOriginInput, now = Date.now()): void {
     // tx.immediate() acquires write lock up front. Because record() reads before writing,
@@ -86,20 +76,6 @@ export class SessionOriginRepository {
     const tx = this.db.transaction(() => {
       const existing = this.get(input.sessionId);
       if (existing && rank(input.source) < rank(existing.source)) {
-        // The rank guard protects the POLICY, but `origin` and `notify_policy` answer two
-        // different questions: who spawned the session, and whether to notify. Rejecting the
-        // whole write conflates them, and locks the reconciliation writer out of ever naming
-        // the spawner of a session the user un-quieted before any writer had run — those rows
-        // are stamped with the ORIGIN_UNKNOWN sentinel and would keep it forever.
-        //
-        // So let a weaker write fill in a still-unknown origin, and ONLY that. notify_policy
-        // and source are untouched, so this cannot resurrect suppression on an overridden
-        // session — the case the guard exists for.
-        if (existing.origin === ORIGIN_UNKNOWN && input.origin !== ORIGIN_UNKNOWN) {
-          this.db
-            .prepare("UPDATE session_origin SET origin = ?, updated_at = ? WHERE session_id = ?")
-            .run(input.origin, now, input.sessionId);
-        }
         return;
       }
       if (existing) {

@@ -16,6 +16,12 @@ export const DEFAULT_DECLARED_QUIET_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
 export interface EffectivePolicyInput {
   policy: NotifyPolicy | null;
+  /**
+   * NOT read by effectiveNotifyPolicy any more, and that is deliberate rather than an oversight:
+   * since `override` was removed (pigeon-60sw) the TTL applies to every quiet source, so there is
+   * nothing left to branch on. It is retained because callers log it alongside the decision.
+   * If you are tempted to delete it, that is a caller-signature change, not a cleanup.
+   */
   source: OriginSource | null;
   declaredAt: number | null;
   now: number;
@@ -52,35 +58,31 @@ function parseDeclaredQuietTtlMs(env: Record<string, string | undefined>): numbe
  * (Deliberately no line numbers here: this is the load-bearing comment in the change and
  * line citations rot on the first edit above them.)
  *
- * WHY 'override' is exempt:
- * User-issued un-quiet actions write source = 'override'. A user's explicit decision
- * to un-quiet or change policy is permanent. Expiring an override would fail toward
- * silence, defeating the user's explicit choice.
+ * Invariant: All suppression is TTL-bounded; nothing is permanently silent.
+ * The ops-facing escape hatch is DELETE /session-origin.
  *
  * WHY the clock uses declared_at instead of created_at or updated_at:
  * The clock measures from the most recent declaration (declared_at), so quiet lasts
  * TTL past the last time automation asserted it. An abandoned session still un-quiets
  * TTL after its final dispatch (the safety property the TTL exists for).
  * A human who adopts an lgtm session is re-silenced for TTL on each reawaken event,
- * and the durable escape hatch is POST /sessions/enable-notify, which writes
- * source: "override" — TTL-exempt before any clock is read, and protected by the rank
- * guard from being undone by a later declared write.
+ * and the escape hatch is DELETE /session-origin to immediately clear provenance.
  */
 export function effectiveNotifyPolicy(
   input: EffectivePolicyInput,
   env: Record<string, string | undefined> = process.env,
 ): EffectivePolicyResult {
-  const { policy, source, declaredAt, now } = input;
+  const { policy, declaredAt, now } = input;
 
   if (policy === null) {
     return { policy: null, expired: false };
   }
 
-  if (source === "override" || policy === "all") {
+  if (policy === "all") {
     return { policy, expired: false };
   }
 
-  if ((policy === "errors-only" || policy === "none") && (source === "declared" || source === "inferred")) {
+  if (policy === "errors-only" || policy === "none") {
     // An UNUSABLE clock (absent, NaN, Infinity -- e.g. a corrupt declared_at read back
     // through Number()) means we cannot prove the suppression is still young. Ambiguity
     // resolves toward DELIVERING, so treat it as expired rather than silencing forever:

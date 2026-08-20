@@ -113,8 +113,8 @@ Diagnose in this order:
    duplicates: `{ journalctl -u pigeon-daemon --no-pager; journalctl --namespace=pigeon -u pigeon-daemon --no-pager; }`.
 3. **Is it a TTL expiry rather than a leak?** `[stop] automated quiet expired` means the row was
    found but had aged past the declared-quiet TTL, which is by design: quiet lasts TTL past the last
-   declaration. A human who wants permanent audibility uses `POST /sessions/enable-notify`
-   (`source='override'`, TTL-exempt).
+   declaration. All suppression is TTL-bounded, so no session is permanently silent. The escape hatch
+   to clear suppression immediately is `DELETE /session-origin?session_id=<sid>`.
 4. **Is it Retry/Error rather than Stop?** `errors-only` suppresses `Stop`, `Retry`, and aborted
    `Error`s, but still delivers genuine errors by design (`pigeon-xbhg`). A real failure notification
    is not a leak.
