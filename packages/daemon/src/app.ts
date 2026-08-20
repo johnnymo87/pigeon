@@ -546,12 +546,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const nvim_socket = body.nvim_socket as string | undefined;
 
-        const backendEndpoint =
-          (typeof body.backend_endpoint === "string" ? body.backend_endpoint : undefined)
-          ?? existing?.backendEndpoint;
-        const backendAuthToken =
-          (typeof body.backend_auth_token === "string" ? body.backend_auth_token : undefined)
-          ?? existing?.backendAuthToken;
+        const suppliedEndpoint =
+          typeof body.backend_endpoint === "string" ? body.backend_endpoint : undefined;
+        const suppliedAuthToken =
+          typeof body.backend_auth_token === "string" ? body.backend_auth_token : undefined;
+
+        const backendEndpoint = suppliedEndpoint ?? existing?.backendEndpoint;
+        const backendAuthToken = suppliedAuthToken ?? existing?.backendAuthToken;
 
         storage.sessions.upsert(
           {
@@ -585,7 +586,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const endpointChanged = existing != null && prevEndpoint !== backendEndpoint;
         const tokenChanged = existing != null && prevAuthToken !== backendAuthToken;
-        const changed = endpointChanged || tokenChanged;
+        const changed = existing == null ? "new" : (endpointChanged || tokenChanged ? "true" : "false");
+
+        const inheritedFields: string[] = [];
+        if (suppliedEndpoint === undefined && existing?.backendEndpoint != null) {
+          inheritedFields.push("endpoint");
+        }
+        if (suppliedAuthToken === undefined && existing?.backendAuthToken != null) {
+          inheritedFields.push("token");
+        }
 
         const logParts: string[] = [`[session-start] registered sessionId=${sessionId}`];
         if (backendEndpoint) {
@@ -595,13 +604,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           logParts.push(`tokenFp=${tokenFp}`);
         }
         logParts.push(`changed=${changed}`);
-        if (changed) {
+        if (changed === "true") {
           if (prevEndpoint) {
             logParts.push(`prevEndpoint=${prevEndpoint}`);
           }
           if (prevTokenFp) {
             logParts.push(`prevTokenFp=${prevTokenFp}`);
           }
+        }
+        if (inheritedFields.length > 0) {
+          logParts.push(`inherited=${inheritedFields.join(",")}`);
         }
         console.log(logParts.join(" "));
 
