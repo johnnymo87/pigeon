@@ -92,36 +92,6 @@ sudo systemctl restart opencode-serve.service
 systemctl status opencode-serve.service --no-pager
 ```
 
-## Emergency: re-enable the quiet-title layer (lgtm notification spam)
-
-Symptom: routine lgtm PR-review sessions are posting Stop notifications to Telegram again.
-As of `pigeon-qdcb.5` the legacy title-regex layer is **off by default** — suppression now comes
-from `session_origin` rows written by lgtm at spawn time. If those writes stop landing, the regex
-safety net is no longer there to catch it, and the spam is the expected symptom.
-
-Prefer fixing the origin writer. Use this lever only to stop the bleeding, and remember it
-re-enables a heuristic that also silences *genuine work on lgtm itself* whose title matches.
-
-The unit is NixOS-generated with `Environment=` baked into its store path and no
-`EnvironmentFile`, so you cannot just export a variable — you need a drop-in:
-
-```bash
-sudo systemctl edit pigeon-daemon.service   # opens a drop-in, not the unit
-# add exactly:
-#   [Service]
-#   Environment=PIGEON_QUIET_TITLE_LAYER=on
-sudo systemctl restart pigeon-daemon.service
-systemctl show pigeon-daemon.service -p Environment | tr ' ' '\n' | grep QUIET_TITLE  # verify
-```
-
-The variable is read at call time (`decideNotify`'s `env = process.env` default), so one restart
-is sufficient — no rebuild.
-
-**The drop-in is unmanaged drift on NixOS.** It survives rebuilds and will silently outlive the
-incident. Remove it (`sudo systemctl revert pigeon-daemon.service` + restart) once the origin
-writer is fixed, and note that the regex is scheduled for deletion — after which this lever
-stops existing and the drop-in becomes a no-op that looks like it is still protecting you.
-
 ## Media Relay Diagnostics
 
 If media isn't arriving in Telegram or OpenCode:

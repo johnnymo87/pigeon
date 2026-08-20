@@ -616,24 +616,21 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
-        // Write an override row to session_origin so quiet-title and session_origin policy layers
-        // stop suppressing notifications for this session.
-        // We WRITE an explicit 'all' override row rather than deleting for two reasons:
-        // 1. Deleting is not durable: an automated declared writer ships next and would re-insert
-        //    the quiet row, silently re-quieting the session.
-        // 2. Deleting does not work for title-quieted sessions: deleting leaves policy === null,
-        //    which falls through to the title regex and keeps suppressing. Only an explicit 'all'
-        //    row short-circuits above the title regex.
+        // Write an override row to session_origin so session_origin policy
+        // stops suppressing notifications for this session.
+        // We WRITE an explicit 'all' override row rather than deleting because
+        // deleting is not durable: an automated declared writer ships next and would re-insert
+        // the quiet row, silently re-quieting the session.
         //
         // On failure we REPORT it rather than swallowing it. Note this is not the same shape of
         // fail-open as POST /stop, and the difference is deliberate. There, ambiguity resolves
         // toward delivering because the handler still controls the delivery. Here it does not:
-        // if this write is lost, the pre-existing errors-only row (or, with no row, the title
-        // regex) keeps suppressing, so the session stays SILENT. Setting sessions.notify = true
-        // does not save it — that short-circuit sits UPSTREAM of the policy matrix and was never
-        // what suppressed this session. Answering {ok:true} would tell the user their only
-        // escape hatch worked while the session goes on hiding real work, which is precisely the
-        // outcome app.ts:113 forbids. A loud 500 they can retry is the honest answer.
+        // if this write is lost, the pre-existing errors-only row keeps suppressing, so the session
+        // stays SILENT. Setting sessions.notify = true does not save it — that short-circuit sits
+        // UPSTREAM of the policy matrix and was never what suppressed this session. Answering
+        // {ok:true} would tell the user their only escape hatch worked while the session goes on
+        // hiding real work, which is precisely the outcome we forbid. A loud 500 they can retry
+        // is the honest answer.
         //
         // The request is then partially applied on two axes: sessions.notify is already
         // committed, and returning here skips onSessionStart's worker re-registration below.
@@ -734,7 +731,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json(
             {
               error: "No origin recorded for session",
-              hint: "No origin recorded means no override or declared origin exists. The legacy title regex and default delivery policy apply.",
+              hint: "No origin recorded means no override or declared origin exists. The default delivery policy applies.",
             },
             { status: 404 },
           );
@@ -748,8 +745,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       //   POST /sessions/enable-notify — user-facing "never silence this session again".
       //     Writes an override row that later declared writers cannot undo.
       //   DELETE /session-origin      — ops-facing "forget everything, return to the normal
-      //     pipeline". Afterwards declared writers may re-quiet the session and the legacy
-      //     title regex applies again. This is the weakest state, not a quieter one.
+      //     pipeline". Afterwards declared writers may re-quiet the session. This is the weakest
+      //     state, not a quieter one.
       // Idempotent by design: a hard reset that errors when already reset is a worse ops tool.
       if (request.method === "DELETE" && url.pathname === "/session-origin") {
         const sessionId = url.searchParams.get("session_id") ?? "";

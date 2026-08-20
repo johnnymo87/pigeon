@@ -7,9 +7,20 @@ import {
 } from "../src/notify-policy";
 
 describe("decideNotify", () => {
-  it("delivers everything when there is no origin row and the title does not match", () => {
+  it("delivers everything when there is no origin row", () => {
     for (const event of ["Stop", "Error", "Retry"]) {
       expect(decideNotify({ event, policy: null, title: "Feature work" }, {})).toEqual({
+        deliver: true,
+        layer: "default",
+      });
+    }
+  });
+
+  it("delivers even when title looks like automation if policy is null", () => {
+    for (const event of ["Stop", "Error", "Retry"]) {
+      expect(
+        decideNotify({ event, policy: null, title: "Task .lgtm-review-prompt.md" }, {}),
+      ).toEqual({
         deliver: true,
         layer: "default",
       });
@@ -114,108 +125,13 @@ describe("decideNotify", () => {
     });
   });
 
-  it("falls back to the title layer only when there is no origin row", () => {
-    expect(
-      decideNotify(
-        { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "on" },
-      ),
-    ).toEqual({
-      deliver: false,
-      layer: "title",
-    });
-    // ...and the title layer keeps its old event scope: Stop only.
-    expect(
-      decideNotify(
-        { event: "Error", policy: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "on" },
-      ),
-    ).toEqual({
-      deliver: true,
-      layer: "default",
-    });
-  });
-
-  it("an origin row wins over a matching title", () => {
+  it("an origin row wins regardless of title", () => {
     expect(
       decideNotify({ event: "Stop", policy: "all", title: "Task .lgtm-review-prompt.md" }, {}),
     ).toEqual({
       deliver: true,
       layer: "origin",
     });
-  });
-
-  it("the title layer recognises off values in PIGEON_QUIET_TITLE_LAYER", () => {
-    const offValues = ["off", "OFF", "Off", " off ", "false", "0", "no"];
-    for (const val of offValues) {
-      expect(
-        decideNotify(
-          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-          { PIGEON_QUIET_TITLE_LAYER: val },
-        ),
-      ).toEqual({ deliver: true, layer: "default" });
-    }
-  });
-
-  it("the title layer is enabled for recognised on values in PIGEON_QUIET_TITLE_LAYER", () => {
-    const onValues = ["on", "ON", "On", "1", "true", "yes"];
-    for (const val of onValues) {
-      expect(
-        decideNotify(
-          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-          { PIGEON_QUIET_TITLE_LAYER: val },
-        ),
-      ).toEqual({ deliver: false, layer: "title" });
-    }
-  });
-
-  it("the title layer defaults off for empty string or unset PIGEON_QUIET_TITLE_LAYER", () => {
-    expect(
-      decideNotify(
-        { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "" },
-      ),
-    ).toEqual({ deliver: true, layer: "default" });
-
-    expect(
-      decideNotify(
-        { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-        {},
-      ),
-    ).toEqual({ deliver: true, layer: "default" });
-  });
-
-  it("unrecognised PIGEON_QUIET_TITLE_LAYER value defaults off and logs console.warn", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const unrecognisedValues = ["disabled", "nope"];
-
-    for (const val of unrecognisedValues) {
-      expect(
-        decideNotify(
-          { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-          { PIGEON_QUIET_TITLE_LAYER: val },
-        ),
-      ).toEqual({ deliver: true, layer: "default" });
-
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining(val),
-      );
-    }
-
-    warnSpy.mockRestore();
-  });
-
-  it("defaults title layer off when no env is provided, and =on restores suppression", () => {
-    expect(
-      decideNotify({ event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" }, {}),
-    ).toEqual({ deliver: true, layer: "default" });
-
-    expect(
-      decideNotify(
-        { event: "Stop", policy: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "on" },
-      ),
-    ).toEqual({ deliver: false, layer: "title" });
   });
 });
 
@@ -283,7 +199,7 @@ describe("explainQuiet", () => {
     });
   });
 
-  it("returns null when policy is all even if title matches quiet regex", () => {
+  it("returns null when policy is all even if title matches quiet pattern", () => {
     expect(
       explainQuiet(
         { registered: true, notify: true, policy: "all", origin: "lgtm", title: "Task .lgtm-review-prompt.md" },
@@ -292,17 +208,13 @@ describe("explainQuiet", () => {
     ).toBeNull();
   });
 
-  it("returns title when no row (policy null) and title matches quiet pattern", () => {
+  it("returns null when no row (policy null) even if title matches automation pattern", () => {
     expect(
       explainQuiet(
         { registered: true, notify: true, policy: null, origin: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "on" },
+        {},
       ),
-    ).toEqual({
-      reason: "title",
-      origin: null,
-      policy: null,
-    });
+    ).toBeNull();
   });
 
   it("returns null when no row and title is ordinary", () => {
@@ -310,15 +222,6 @@ describe("explainQuiet", () => {
       explainQuiet(
         { registered: true, notify: true, policy: null, origin: null, title: "Fix auth bug" },
         {},
-      ),
-    ).toBeNull();
-  });
-
-  it("returns null when title matches but PIGEON_QUIET_TITLE_LAYER=off in env", () => {
-    expect(
-      explainQuiet(
-        { registered: true, notify: true, policy: null, origin: null, title: "Task .lgtm-review-prompt.md" },
-        { PIGEON_QUIET_TITLE_LAYER: "off" },
       ),
     ).toBeNull();
   });
