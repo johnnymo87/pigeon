@@ -923,6 +923,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const event = typeof body.event === "string" ? body.event : "Stop";
         const label = typeof body.label === "string" ? body.label : null;
         const requestTitle = parseTitle(body.title);
+        const errorKind = typeof body.error_kind === "string" ? body.error_kind : null;
 
         if (requestTitle !== undefined) {
           storage.sessions.setTitle(sessionId, requestTitle, nowFn());
@@ -976,6 +977,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             event,
             policy: effectivePolicy,
             title: effectiveTitle,
+            errorKind,
           });
         } catch (err) {
           console.error(`[stop] notify decision failed sessionId=${sessionId}, delivering:`, err);
@@ -1045,7 +1047,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
         // here, a DELIVERY from a session carrying a quiet policy is ambiguous in the logs
-        // between "Error/Retry, which errors-only delivers by design" and "a Stop leaked
+        // between "a genuine non-abort Error, which errors-only delivers by design" and "a Stop leaked
         // past the origin layer" -- the two cases a soak of the title layer has to tell
         // apart. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
         // policy=all here and is explained by the `automated quiet expired` line above.

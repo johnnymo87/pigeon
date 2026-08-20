@@ -30,7 +30,7 @@ export type OriginSource = (typeof ORIGIN_SOURCES)[number];
 
 /**
  * `all`         — deliver every event (the default for anything with no row).
- * `errors-only` — suppress routine Stop; still deliver Error and Retry.
+ * `errors-only` — suppress routine Stop and Retry, and aborted Error; still deliver genuine Error.
  * `none`        — suppress Stop, Error and Retry alike.
  *
  * An unrecognised value read back from the DB is treated as `all`: ambiguity resolves

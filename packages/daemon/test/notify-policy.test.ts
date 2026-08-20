@@ -27,11 +27,12 @@ describe("decideNotify", () => {
     }
   });
 
-  it("policy=errors-only suppresses Stop but DELIVERS Error and Retry", () => {
-    // This mirrors current production behaviour exactly: the old gate tested
-    // `event === "Stop"`, so lgtm errors and retries have always been
-    // delivered. Suppressing them here would be a silent regression.
+  it("policy=errors-only suppresses Stop and Retry, but DELIVERS non-aborted Error", () => {
     expect(decideNotify({ event: "Stop", policy: "errors-only", title: "PR review" }, {})).toEqual({
+      deliver: false,
+      layer: "origin",
+    });
+    expect(decideNotify({ event: "Retry", policy: "errors-only", title: "PR review" }, {})).toEqual({
       deliver: false,
       layer: "origin",
     });
@@ -39,9 +40,54 @@ describe("decideNotify", () => {
       deliver: true,
       layer: "origin",
     });
-    expect(decideNotify({ event: "Retry", policy: "errors-only", title: "PR review" }, {})).toEqual({
+    expect(decideNotify({ event: "Error", policy: "errors-only", title: "PR review", errorKind: "rate_limited" }, {})).toEqual({
       deliver: true,
       layer: "origin",
+    });
+    // Missing/null/unknown errorKind must FAIL OPEN and deliver
+    expect(decideNotify({ event: "Error", policy: "errors-only", title: "PR review", errorKind: null }, {})).toEqual({
+      deliver: true,
+      layer: "origin",
+    });
+    expect(decideNotify({ event: "Error", policy: "errors-only", title: "PR review", errorKind: undefined }, {})).toEqual({
+      deliver: true,
+      layer: "origin",
+    });
+  });
+
+  it("policy=errors-only suppresses aborted Error (errorKind=aborted)", () => {
+    expect(decideNotify({ event: "Error", policy: "errors-only", title: "PR review", errorKind: "aborted" }, {})).toEqual({
+      deliver: false,
+      layer: "origin",
+    });
+  });
+
+  it("policy=none suppresses Error regardless of errorKind", () => {
+    expect(decideNotify({ event: "Error", policy: "none", title: "PR review", errorKind: "aborted" }, {})).toEqual({
+      deliver: false,
+      layer: "origin",
+    });
+    expect(decideNotify({ event: "Error", policy: "none", title: "PR review", errorKind: "other" }, {})).toEqual({
+      deliver: false,
+      layer: "origin",
+    });
+    expect(decideNotify({ event: "Error", policy: "none", title: "PR review", errorKind: null }, {})).toEqual({
+      deliver: false,
+      layer: "origin",
+    });
+  });
+
+  it("policy=all delivers Error even when errorKind=aborted", () => {
+    expect(decideNotify({ event: "Error", policy: "all", title: "PR review", errorKind: "aborted" }, {})).toEqual({
+      deliver: true,
+      layer: "origin",
+    });
+  });
+
+  it("policy=null delivers Error even when errorKind=aborted (no origin suppression)", () => {
+    expect(decideNotify({ event: "Error", policy: null, title: "PR review", errorKind: "aborted" }, {})).toEqual({
+      deliver: true,
+      layer: "default",
     });
   });
 

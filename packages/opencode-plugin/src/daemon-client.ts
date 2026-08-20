@@ -31,6 +31,7 @@ type NotifyStopOpts = {
   label: string
   title?: string
   media?: FileMedia[]
+  errorKind?: string | null
   daemonUrl?: string
   log: LogFn
 }
@@ -184,14 +185,15 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
    try {
      const res = await fetchDaemon(`${url}/stop`, {
        method: "POST",
-         body: JSON.stringify({
-           session_id: opts.sessionId,
-           event: opts.event ?? "Stop",
-           message: opts.message,
-           label: opts.label,
-           ...(opts.title ? { title: opts.title } : {}),
-           ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
-         }),
+          body: JSON.stringify({
+            session_id: opts.sessionId,
+            event: opts.event ?? "Stop",
+            message: opts.message,
+            label: opts.label,
+            ...(opts.title ? { title: opts.title } : {}),
+            ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
+            ...(opts.errorKind ? { error_kind: opts.errorKind } : {}),
+          }),
        signal: AbortSignal.timeout(3000),
      })
 

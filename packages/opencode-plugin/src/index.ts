@@ -17,7 +17,7 @@ import { createSwarmListTool, SWARM_LIST_TOOL_NAME } from "./swarm-list-tool"
 import { createSwarmScheduleTool, SWARM_SCHEDULE_TOOL_NAME } from "./swarm-schedule-tool"
 import { createSwarmScheduledTool, SWARM_SCHEDULED_TOOL_NAME } from "./swarm-scheduled-tool"
 import { resolveServeAuthHeader } from "./serve-auth"
-import { errorMessage, serializeError } from "./utils"
+import { errorMessage, serializeError, isAbortError } from "./utils"
 
 const plugin: Plugin = async (ctx) => {
   try {
@@ -591,12 +591,15 @@ const plugin: Plugin = async (ctx) => {
               const narration = messageTail.consume(sessionID)
               const body = narration ? `${narration}\n\n${errorMsg}` : errorMsg
 
+              const errorKind = isAbortError(error) ? "aborted" : undefined
+
               notifyStop({
                 sessionId: sessionID,
                 event: "Error",
                 message: body,
                 label,
                 title: sessionManager.getTitle(sessionID),
+                errorKind,
                 daemonUrl,
                 log,
               }).catch((err) => {
