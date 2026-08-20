@@ -1045,8 +1045,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
         // here, a DELIVERY from a session carrying a quiet policy is ambiguous in the logs
         // between "a genuine non-abort Error, which errors-only delivers by design" and "a Stop leaked
-        // past the origin layer" -- the two cases a soak of the title layer has to tell
-        // apart. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
+        // past the origin layer" -- and the origin layer is now the ONLY suppression layer, so this
+        // line is the sole audit trail for that distinction. Do not drop these fields: the
+        // quiet-title soak they were added for is over, but the leak question they answer is
+        // permanent. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
         // policy=all here and is explained by the `automated quiet expired` line above.
         // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
         console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${originRow?.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);

@@ -92,6 +92,36 @@ sudo systemctl restart opencode-serve.service
 systemctl status opencode-serve.service --no-pager
 ```
 
+## Automated Sessions Suddenly Spamming Telegram
+
+Symptom: lgtm (or other automated) PR-review sessions start posting `Stop` notifications into
+Telegram again.
+
+**There is no feature flag to flip.** The legacy quiet-title regex was deleted in `pigeon-ycjg`
+(2026-08-20) after a 9-day soak, and `PIGEON_QUIET_TITLE_LAYER=on` is now a silent no-op — the code
+it gated no longer exists. `session_origin` provenance is the ONLY suppression layer. Setting that
+variable will look like it worked and change nothing, so do not reach for it.
+
+Diagnose in this order:
+
+1. **Is the session marked?** `curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" "http://127.0.0.1:4731/session-origin?session_id=<sid>"`.
+   No row means the WRITER failed — the daemon is behaving correctly and the fix belongs in the
+   caller (`~/projects/lgtm`, `markOrigin` in `src/dispatch.ts` at fresh+reawaken, and `gather.ts`).
+2. **Which lines are leaking?** A delivered Stop from an unmarked session logs as
+   `[stop] queued ... origin=- policy=- label=<title>`; a correct suppression logs as
+   `[stop] quieted ... layer=origin`. Grep both journal namespaces — they are complementary, not
+   duplicates: `{ journalctl -u pigeon-daemon --no-pager; journalctl --namespace=pigeon -u pigeon-daemon --no-pager; }`.
+3. **Is it a TTL expiry rather than a leak?** `[stop] automated quiet expired` means the row was
+   found but had aged past the declared-quiet TTL, which is by design: quiet lasts TTL past the last
+   declaration. A human who wants permanent audibility uses `POST /sessions/enable-notify`
+   (`source='override'`, TTL-exempt).
+4. **Is it Retry/Error rather than Stop?** `errors-only` suppresses `Stop`, `Retry`, and aborted
+   `Error`s, but still delivers genuine errors by design (`pigeon-xbhg`). A real failure notification
+   is not a leak.
+
+If the deletion itself proves wrong, the recovery is `git revert` of the deletion commit plus a
+per-machine redeploy (`git pull`, `npm install`, restart) — not an environment variable.
+
 ## Media Relay Diagnostics
 
 If media isn't arriving in Telegram or OpenCode:
