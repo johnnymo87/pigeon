@@ -1365,6 +1365,16 @@ describe("createApp", () => {
       expect(payload.dir).toBeUndefined();
       expect(payload.title).toBe("Quiet Session");
 
+      // The WHOLE POINT of delivering-instead-of-suppressing is that the question stays
+      // ANSWERABLE: a blocking question with no way to reply is the silent deadlock this
+      // design exists to avoid. Going unthreaded must not cost the reply affordance.
+      // This fixture has no options, so there are no inline buttons -- it is answered by
+      // REPLYING to the message, which the worker routes via (chat_id, message_id)
+      // independently of any thread. So what must survive here is the message itself.
+      expect(payload.replyMarkup).toBeDefined();
+      expect(payload.message?.text).toBeTruthy();
+      expect(outboxRow?.token).toBeTruthy();
+
       expect(logSpy).toHaveBeenCalledWith(
         "[question] quiet session — delivering unthreaded sessionId=ses_q_quiet origin=lgtm policy=errors-only",
       );
@@ -1422,6 +1432,12 @@ describe("createApp", () => {
       expect(payload.dir).toBeUndefined();
       expect(payload.title).toBe("Wiz Quiet Session");
       expect(payload.message.text).toContain("Question 1 of 2");
+
+      // This fixture HAS options, so the wizard is answered by pressing an inline button.
+      // The callback token is what routes the press back to the session, and it is carried
+      // in callback_data rather than in any thread context -- pin that going unthreaded
+      // does not cost it, or a quiet session's wizard becomes unanswerable.
+      expect(JSON.stringify(payload.replyMarkup)).toContain("cmd:");
 
       expect(logSpy).toHaveBeenCalledWith(
         "[question] quiet session — delivering unthreaded sessionId=ses_q_wiz_quiet origin=lgtm policy=errors-only",

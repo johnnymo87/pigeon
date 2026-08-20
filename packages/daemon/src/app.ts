@@ -1052,7 +1052,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const quiet = resolved.policy === "none" || resolved.policy === "errors-only";
         if (quiet) {
           console.log(
-            `[question] quiet session — delivering unthreaded sessionId=${sessionId} origin=${resolved.origin} policy=${resolved.policy}`,
+            `[question] quiet session — delivering unthreaded sessionId=${sessionId} origin=${resolved.origin ?? "-"} policy=${resolved.policy}`,
           );
         }
 

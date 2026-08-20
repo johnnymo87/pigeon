@@ -55,8 +55,12 @@ export function shouldEmitAncillaryFor(
     const resolved = resolveEffectivePolicy(storage, sessionId, now, "ancillary", env);
     return shouldEmitAncillary(resolved.policy);
   } catch (err) {
+    // BACKSTOP ONLY. resolveEffectivePolicy catches both the storage read and the TTL
+    // arithmetic internally, so this no longer catches "the policy read failed" -- by the
+    // time it fires, something more exotic has gone wrong (e.g. property access on a
+    // hostile `storage`). Worded generically so the message cannot misdescribe the cause.
     console.error(
-      `[ancillary-gate] policy read failed sessionId=${sessionId}, emitting:`,
+      `[ancillary-gate] policy resolution failed unexpectedly sessionId=${sessionId}, emitting:`,
       err,
     );
     return true;

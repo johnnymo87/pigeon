@@ -101,6 +101,17 @@ export function effectiveNotifyPolicy(
   return { policy, expired: false };
 }
 
+/**
+ * Which emission site asked for the decision. Used ONLY for logging -- it is templated
+ * into `[${tag}] automated quiet expired ...`, which is the line ops greps to see whether
+ * a suppression is still in force (it is what verified pigeon-n097 against real traffic).
+ *
+ * A UNION rather than a bare string on purpose: the tag is the grep key for that audit
+ * trail, so a typo in a future caller would silently fragment it into a second spelling
+ * nobody searches for. Adding a site means adding it here, deliberately.
+ */
+export type PolicyResolutionTag = "stop" | "ancillary" | "question";
+
 export interface ResolvedPolicy {
   policy: NotifyPolicy | null;
   expired: boolean;
@@ -122,7 +133,7 @@ export function resolveEffectivePolicy(
   storage: Pick<StorageDb, "sessionOrigins">,
   sessionId: string,
   now: number,
-  tag: string, // "stop" | "ancillary" | "question" — used ONLY for logging
+  tag: PolicyResolutionTag,
   env: Record<string, string | undefined> = process.env,
 ): ResolvedPolicy {
   let originRow: SessionOriginRecord | null = null;
