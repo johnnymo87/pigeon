@@ -1048,6 +1048,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }, now);
 
         // Format the notification payload for the outbox
+        const resolved = resolveEffectivePolicy(storage, sessionId, now, "question");
+        const quiet = resolved.policy === "none" || resolved.policy === "errors-only";
+        if (quiet) {
+          console.log(
+            `[question] quiet session — delivering unthreaded sessionId=${sessionId} origin=${resolved.origin} policy=${resolved.policy}`,
+          );
+        }
+
         let notificationPayload: {
           message: { text: string; entities: unknown[] };
           replyMarkup: unknown;
@@ -1074,8 +1082,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             replyMarkup: notification.replyMarkup,
             notificationId,
             title: effectiveTitle ?? undefined,
-            dir: session.cwd ?? undefined,
-            threaded: true,
+            dir: quiet ? undefined : session.cwd ?? undefined,
+            threaded: !quiet,
           };
         } else {
           // Single-question: existing behavior
@@ -1092,8 +1100,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             replyMarkup: notification.replyMarkup,
             notificationId,
             title: effectiveTitle ?? undefined,
-            dir: session.cwd ?? undefined,
-            threaded: true,
+            dir: quiet ? undefined : session.cwd ?? undefined,
+            threaded: !quiet,
           };
         }
 
