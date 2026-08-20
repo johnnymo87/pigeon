@@ -1,4 +1,4 @@
-import { effectiveNotifyPolicy } from "./notify-policy";
+import { resolveEffectivePolicy } from "./notify-policy";
 import type { StorageDb } from "./storage/database";
 
 /**
@@ -52,20 +52,8 @@ export function shouldEmitAncillaryFor(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   try {
-    const row = storage.sessionOrigins.get(sessionId);
-    if (!row) return true;
-
-    const effective = effectiveNotifyPolicy(
-      {
-        policy: row.notifyPolicy,
-        source: row.source,
-        declaredAt: row.declaredAt ?? row.createdAt,
-        now,
-      },
-      env,
-    );
-
-    return shouldEmitAncillary(effective.policy);
+    const resolved = resolveEffectivePolicy(storage, sessionId, now, "ancillary", env);
+    return shouldEmitAncillary(resolved.policy);
   } catch (err) {
     console.error(
       `[ancillary-gate] policy read failed sessionId=${sessionId}, emitting:`,

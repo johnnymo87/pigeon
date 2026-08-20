@@ -1,4 +1,5 @@
-import type { NotifyPolicy, OriginSource } from "./storage/session-origin-repo";
+import type { StorageDb } from "./storage/database";
+import type { NotifyPolicy, OriginSource, SessionOriginRecord } from "./storage/session-origin-repo";
 
 /**
  * How long an AUTOMATED (declared/inferred) suppression stays in force.
@@ -98,6 +99,100 @@ export function effectiveNotifyPolicy(
   }
 
   return { policy, expired: false };
+}
+
+export interface ResolvedPolicy {
+  policy: NotifyPolicy | null;
+  expired: boolean;
+  origin: string | null;
+  source: OriginSource | null;
+  declaredAt: number | null;
+}
+
+/**
+ * Resolves the effective notification policy for a session, loading its origin
+ * provenance record from storage, applying TTL expiry, and logging expiry / errors.
+ *
+ * Fail-open behaviour is preserved exactly:
+ * - Storage read failure -> policy: null (logs error)
+ * - Calculation failure -> policy: "all" (logs error)
+ * - No row -> policy: null
+ */
+export function resolveEffectivePolicy(
+  storage: Pick<StorageDb, "sessionOrigins">,
+  sessionId: string,
+  now: number,
+  tag: string, // "stop" | "ancillary" | "question" — used ONLY for logging
+  env: Record<string, string | undefined> = process.env,
+): ResolvedPolicy {
+  let originRow: SessionOriginRecord | null = null;
+  try {
+    originRow = storage.sessionOrigins.get(sessionId);
+  } catch (err) {
+    // Fail open: a provenance read that throws must not cost the user a notification.
+    console.error(`[${tag}] session_origin read failed sessionId=${sessionId}, delivering:`, err);
+    return {
+      policy: null,
+      expired: false,
+      origin: null,
+      source: null,
+      declaredAt: null,
+    };
+  }
+
+  if (!originRow) {
+    return {
+      policy: null,
+      expired: false,
+      origin: null,
+      source: null,
+      declaredAt: null,
+    };
+  }
+
+  const declaredAt = originRow.declaredAt ?? originRow.createdAt ?? null;
+  try {
+    const effective = effectiveNotifyPolicy(
+      {
+        policy: originRow.notifyPolicy,
+        source: originRow.source,
+        declaredAt,
+        now,
+      },
+      env,
+    );
+
+    if (effective.expired) {
+      const ageMs =
+        typeof declaredAt === "number" && Number.isFinite(declaredAt)
+          ? now - declaredAt
+          : "unknown";
+      console.log(
+        `[${tag}] automated quiet expired sessionId=${sessionId} origin=${originRow.origin} ` +
+        `source=${originRow.source} policy=${originRow.notifyPolicy} ageMs=${ageMs} — delivering`,
+      );
+    }
+
+    return {
+      policy: effective.policy,
+      expired: effective.expired,
+      origin: originRow.origin,
+      source: originRow.source,
+      declaredAt,
+    };
+  } catch (err) {
+    console.error(
+      `[${tag}] effective notify policy calculation failed sessionId=${sessionId}, delivering:`,
+      err,
+    );
+    return {
+      policy: "all",
+      expired: false,
+      origin: originRow.origin,
+      source: originRow.source,
+      declaredAt,
+    };
+  }
 }
 
 /**
