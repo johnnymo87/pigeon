@@ -228,6 +228,14 @@ Both remaining leaks fail toward silence rather than duplicates (an unconsumed c
 
 **Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
 
+**A quiet session's questions are delivered, but unthreaded (`pigeon-c501`).** Every other suppressible event is telemetry — silencing a Stop changes what a human *sees*. A question is a blocking call *to* a human, and Telegram is the only answer channel a headless session has, so suppressing one is not "quiet", it is a silent indefinite hang: the drop is one-shot, no later policy read re-fires it, the plugin's queue gives up after 2 minutes, and its `onExpired` only logs. So under `none` or `errors-only` the daemon still posts the question, with `threaded: false` and no `dir`, which removes the actual harm — **a question would otherwise create the very forum topic the quiet policy exists to prevent** — while keeping it answerable. It lands in the main chat instead of a topic; both button and reply-to-message routing are thread-independent, so answering works normally.
+
+`threaded: false` must be set **explicitly**. The worker gates on `threaded !== false`, so an absent field still takes the threaded path, and omitting `dir` alone does not stop topic creation.
+
+Note what this does *not* change: a genuine non-abort `Error` under `errors-only` still delivers threaded and can still create a topic. That carve-out is deliberate — it is how failing automation shouts.
+
+**All four emission sites share one derivation** (`resolveEffectivePolicy` in `daemon/src/notify-policy.ts`, `pigeon-twdw`): `POST /stop`, `POST /question-asked`, the ancillary gate (mirror + swarm feed), and `explainQuiet`. Before this, the matrix was derived in three places and omitted in a fourth — which is exactly how both `pigeon-8zqt` and `pigeon-c501` happened. **Teach any new layer to the resolver, not to a call site.** Its `tag` parameter is a typed union because it is templated into the `[<tag>] automated quiet expired` line that ops greps; a typo would silently fragment that audit trail.
+
 **Multi-question wizard:** When a question has multiple sub-questions, the daemon renders them one at a time in a single Telegram message that is edited in-place as the user answers each step. Button callbacks include a version number (`cmd:TOKEN:v{version}:q{index}`) to prevent stale presses. On the final step, all accumulated answers are delivered to the plugin as a single reply.
 
 **Rate limit retry notifications:** When OpenCode hits a rate limit and retries, the plugin detects `session.status` events of type `"retry"` and sends a notification with the attempt number, error message, and next retry time.
