@@ -53,8 +53,8 @@ topic is created by a session's **first** notification, each run also stranded a
 
 | Item | Bead | What | Sequence |
 |---|---|---|---|
-| **A** | `pigeon-twdw` (P2) | Extract one `resolveEffectivePolicy` for all four emission sites | **FIRST** — see §1.1 |
-| **B** | `pigeon-c501` (P1) | `POST /question-asked` bypasses the policy matrix entirely | After **A** |
+| ~~**A**~~ | ~~`pigeon-twdw`~~ | ~~Extract one `resolveEffectivePolicy`~~ — **DONE 2026-08-20** (PR #122). | n/a |
+| ~~**B**~~ | ~~`pigeon-c501`~~ | ~~`POST /question-asked` bypasses the policy matrix~~ — **DONE 2026-08-20** (PR #122), by delivering unthreaded rather than suppressing. See §B for why the recommended option was overridden. | n/a |
 | ~~**C**~~ | ~~`pigeon-l4iw`~~ | ~~Per-row `expires_at`~~ — **WITHDRAWN**, duplicate of `pigeon-vske` (closed 2026-08-14). Reopen trigger 1 fired, 2 did not. **Watch, do not build.** | n/a |
 | ~~**D**~~ | ~~`pigeon-60sw`~~ | ~~A human cannot express a standing quiet rule~~ — **CLOSED 2026-08-20 by REMOVAL** (PR #120). `override` was unreachable in both directions, so the route and the source were deleted rather than made reachable. `source='override'` no longer exists and **every suppression is now TTL-bounded**. | n/a |
 
@@ -242,7 +242,23 @@ npm run typecheck   # expect exit 0 across all three workspaces
 
 ## §3 — THE ITEMS
 
-### [ ] A — Extract one `resolveEffectivePolicy` (`pigeon-twdw`, P2)
+### [x] A — Extract one `resolveEffectivePolicy` (`pigeon-twdw`, P2) — **DONE 2026-08-20, PR #122**
+
+> **Outcome.** `resolveEffectivePolicy(storage, sessionId, now, tag, env)` in `notify-policy.ts`;
+> `POST /stop`, `shouldEmitAncillaryFor` and `POST /question-asked` all route through it. No delivery
+> decision changed. Both fail-open fallbacks were preserved **separately** rather than collapsed
+> (read throws → `policy: null`; TTL arithmetic throws → `"all"`), and `/stop`'s third catch around
+> `decideNotify` stayed at the call site because it is not policy resolution.
+>
+> `pigeon-std6` folded in: the expiry log moved into the resolver and is keyed by `tag`, so
+> `[ancillary] automated quiet expired` now exists beside the `[stop]` one. The `/stop` string is
+> byte-identical — ops greps it. `tag` is a **union**, not a string: it is the grep key for that
+> audit trail, so a typo in a future caller would silently fragment it.
+>
+> **The trap did not fire, and we checked rather than assumed.** Before refactoring, the existing
+> #117 pins were mutation-tested: dropping `errorKind` fails `app.test.ts:1928`, failing closed
+> fails two more. Had those pins been inadequate, the refactor would have silently re-delivered
+> aborted-error noise with nothing to show for it.
 
 **Do this first.** See §0 for why a P2 outranks a P1 here.
 
@@ -279,7 +295,36 @@ re-deliver the aborted-error noise that PR just removed.
 
 ---
 
-### [ ] B — `POST /question-asked` bypasses the matrix (`pigeon-c501`, P1)
+### [x] B — `POST /question-asked` bypasses the matrix (`pigeon-c501`, P1) — **DONE 2026-08-20, PR #122**
+
+> **DECISION: option (e), not the (a) recommended below.** Deliver the question, but **unthreaded**
+> (`threaded: false`, no `dir`), so it never creates a topic. Recorded here because this file asked
+> for the choice and its reasoning.
+>
+> **Why (a) was rejected:** it is a **no-op in production**. All 474 `session_origin` rows are
+> `errors-only`; there are **zero** `none` rows. (a) would have left the topic-creation half fully
+> live for the only real consumer.
+>
+> **Why nothing is suppressed:** Stop/Error/Retry are telemetry — suppression changes what a human
+> *sees*. A question is a blocking call *to* a human, and Telegram is the only answer channel for a
+> headless session. Suppression there is not "quiet", it is a silent indefinite hang.
+>
+> **And nothing rescues a dropped question.** It is one-shot; no later policy read re-fires it. The
+> plugin queue gives up after `DEFAULT_MAX_RETRY_MS` (2 minutes) and `onExpired` only logs. **An
+> earlier note claiming the 2h TTL "un-blocks a suppressed question" was wrong and is retracted.**
+>
+> **Measured, with the instrument checked:** 0 of 474 lgtm sessions have ever asked a question in
+> 14 days, so this bug was latent. The first measurement returned a FALSE zero — the route's success
+> path logs nothing — and was redone via outbox `q:` ids with an `s:` positive control.
+>
+> `threaded: false` is set **explicitly**: the worker gates on `threaded !== false`, so omitting the
+> field still creates a topic, and dropping `dir` alone does not prevent it.
+>
+> **Still by design:** a genuine non-abort `Error` under `errors-only` delivers threaded and can
+> create a topic. That carve-out exists so failing automation can shout. Not a regression.
+
+<details><summary>Original framing, kept for the record</summary>
+
 
 **Symptom:** a session with `notify_policy='none'` still posts its questions to Telegram, and since
 the payload carries `threaded: true` + `dir` (`app.ts:1160-1161`), a question also **creates** the
@@ -298,6 +343,8 @@ visible in the TUI, so suppression costs nothing.
 - (c) Suppress under both; accept the headless deadlock.
 
 Record which was chosen and why, in the bead **and** here.
+
+</details>
 
 ---
 
