@@ -10,7 +10,7 @@ import { OpencodeDirectSource } from "../opencode-direct/contracts";
 
 export interface DirectChannelAdapterDeps extends OpencodeDirectAdapterDeps {}
 
-function tokenFingerprint(token?: string | null): string | undefined {
+export function tokenFingerprint(token?: string | null): string | undefined {
   if (!token) return undefined;
   return createHash("sha256").update(token).digest("hex").slice(0, 8);
 }
