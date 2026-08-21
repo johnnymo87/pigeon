@@ -134,6 +134,44 @@ export function chunkNotificationId(
   return isLast ? notificationId : `${notificationId}#c${index}`;
 }
 
+/**
+ * Commit a successful delivery: move the entry to 'sent' and record the ledger row
+ * that the unread badge counts, atomically.
+ *
+ * Extracted and exported for one reason: the property that matters here is the
+ * COUPLING -- a session_events row exists if and only if this call is the one that
+ * performed the state transition. Inline in processOnce(), that coupling is
+ * unreachable from any test, because the only way to exercise it is a second caller
+ * and there is exactly one today. Mutation testing confirmed it: decoupling the
+ * append from the guard survived the whole suite. Naming the unit makes the guard's
+ * purpose testable now rather than after a future caller has already double-counted
+ * every message in the fleet.
+ */
+export function commitDelivery(
+  storage: StorageDb,
+  entry: { notificationId: string; sessionId: string; kind: string },
+  now: number,
+  chunks: number,
+  log: (msg: string, fields?: Record<string, unknown>) => void,
+): void {
+  storage.db.transaction(() => {
+    if (!storage.outbox.markSent(entry.notificationId, now)) return;
+    storage.sessionEvents.append({
+      sessionId: entry.sessionId,
+      notificationId: entry.notificationId,
+      kind: entry.kind,
+      // Delivery clock, not entry.createdAt: the governor holds bursts, so an entry
+      // created before a read and delivered after it must sort ABOVE the watermark.
+      sentAt: now,
+    });
+    // Logged inside the guard, deliberately. This line is the only instrument that
+    // measures delivery volume (it sized the ledger's retention, and Task 8
+    // re-measures with it). Left outside, it would diverge from the ledger in
+    // exactly the second-caller scenario the guard exists for.
+    log("outbox entry sent", { notificationId: entry.notificationId, sessionId: entry.sessionId, chunks });
+  })();
+}
+
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
@@ -614,13 +652,8 @@ export class OutboxSender {
           }
 
           if (allOk) {
-            this.storage.outbox.markSent(entry.notificationId, now);
+            commitDelivery(this.storage, entry, now, messages.length, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
-            this.log("outbox entry sent", {
-              notificationId: entry.notificationId,
-              sessionId: entry.sessionId,
-              chunks: messages.length,
-            });
           }
         } catch (err) {
           const backoff = getBackoff(entry.retryCount);

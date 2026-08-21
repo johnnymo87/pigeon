@@ -134,12 +134,27 @@ export class OutboxRepository {
     return rows.map(asOutbox);
   }
 
-  markSent(id: string, now = Date.now()): void {
-    this.db
+  /**
+   * Mark an entry delivered. Returns true only if this call performed the
+   * transition, so callers can attach exactly-once side effects to it.
+   *
+   * The `state != 'sent'` guard is what makes that promise real. Without it the
+   * statement is idempotent in the database but not in its report: a second caller
+   * would be told it had just delivered something, and the unread ledger keyed off
+   * that answer would double-count every message. Today there is exactly one caller,
+   * inside a reentrancy-guarded loop, so the guard protects a future change rather
+   * than a present bug -- which is precisely when it is cheap to add.
+   *
+   * Mirrors AlertRepository.markSent, which already returns boolean for this reason.
+   */
+  markSent(id: string, now = Date.now()): boolean {
+    const info = this.db
       .prepare(
-        "UPDATE outbox SET state = 'sent', next_retry_at = NULL, updated_at = ? WHERE notification_id = ?",
+        `UPDATE outbox SET state = 'sent', next_retry_at = NULL, updated_at = ?
+         WHERE notification_id = ? AND state != 'sent'`,
       )
       .run(now, id);
+    return info.changes > 0;
   }
 
   markRetry(

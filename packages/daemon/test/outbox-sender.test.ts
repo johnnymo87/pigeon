@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
 import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
-import { chunkNotificationId, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET } from "../src/worker/outbox-sender";
+import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -2898,5 +2898,119 @@ describe("outbox terminal drop uniform logging", () => {
       ageMs: 4000,
       lastError: 'HTTP 400 - {"error":"Bad registration request"}',
     });
+  });
+});
+
+describe("OutboxSender ledger append (unread substrate)", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("records a ledger row when an entry is delivered", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification({ ok: true }),
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    const row = storage.sessionEvents.unreadBySession().get("sess-1");
+    expect(row?.unread).toBe(1);
+    // sent_at is the DELIVERY clock, not the entry's created_at (1_000).
+    expect(row?.lastEventAt).toBe(5_000);
+  });
+
+  // The whole correctness argument for the ledger: a row exists only because
+  // Telegram accepted the message. If delivery failed, there must be nothing.
+  it("records nothing when delivery fails", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification({ ok: false }) as unknown as SendNotificationFn,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(storage.sessionEvents.unreadBySession().has("sess-1")).toBe(false);
+  });
+
+  it("preserves the entry's kind, so the mirror exclusion can work downstream", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, kind: "mirror" }, 1_000);
+    const sender = new OutboxSender({
+      storage,
+      sendNotification: makeSendNotification({ ok: true }),
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    // Present (we know about the session) but not counted (it is the user's own text).
+    const map = storage.sessionEvents.unreadBySession();
+    expect(map.has("sess-1")).toBe(true);
+    expect(map.get("sess-1")?.unread).toBe(0);
+  });
+
+  // markSent is unguarded today and safe only by call-site discipline. A future
+  // second caller would silently double every count, so the guard is what makes the
+  // ledger's arithmetic robust rather than merely lucky.
+  it("markSent is idempotent, so a second call cannot inflate the count", () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    expect(storage.outbox.markSent("notif-1", 1_000)).toBe(true);
+    expect(storage.outbox.markSent("notif-1", 1_001)).toBe(false);
+  });
+
+  it("markSent reports false for an unknown notification id", () => {
+    expect(storage.outbox.markSent("does-not-exist", 1_000)).toBe(false);
+  });
+});
+
+describe("commitDelivery: the guard and the ledger row are one unit", () => {
+  let storage: StorageDb;
+  beforeEach(() => { storage = openStorageDb(":memory:"); });
+  afterEach(() => { storage.db.close(); });
+
+  const entry = { notificationId: "notif-1", sessionId: "sess-1", kind: "stop" };
+  const noop = () => {};
+
+  // This is the invariant the state != 'sent' guard exists to protect, and it is
+  // unreachable through processOnce() because only one caller exists today. A second
+  // caller must not be able to conjure a second ledger row out of an entry that was
+  // already delivered -- otherwise every count in the fleet silently doubles.
+  it("a second commit of an already-sent entry adds no second row", () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+
+    commitDelivery(storage, entry, 5_000, 1, noop);
+    commitDelivery(storage, entry, 6_000, 1, noop);
+
+    const row = storage.sessionEvents.unreadBySession().get("sess-1");
+    expect(row?.unread).toBe(1);
+    expect(row?.lastEventAt).toBe(5_000);
+  });
+
+  it("does not log a second delivery either, so the instrument stays 1:1", () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const log = vi.fn();
+
+    commitDelivery(storage, entry, 5_000, 1, log);
+    commitDelivery(storage, entry, 6_000, 1, log);
+
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes nothing at all for an entry that is not in the outbox", () => {
+    commitDelivery(storage, { ...entry, notificationId: "ghost" }, 5_000, 1, noop);
+    expect(storage.sessionEvents.unreadBySession().size).toBe(0);
   });
 });
