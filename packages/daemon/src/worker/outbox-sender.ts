@@ -146,6 +146,13 @@ export function chunkNotificationId(
  * append from the guard survived the whole suite. Naming the unit makes the guard's
  * purpose testable now rather than after a future caller has already double-counted
  * every message in the fleet.
+ *
+ * One seam, named rather than hidden: because the append shares markSent's
+ * transaction, an append that throws (disk full, I/O error) now rolls the 'sent'
+ * transition back too, and the caller's catch schedules a retry -- re-sending a
+ * message Telegram has already displayed. This ENLARGES a pre-existing seam rather
+ * than creating one (a throwing markSent always did this), and the direction is
+ * consistent with the outbox's at-least-once contract, so it is accepted here.
  */
 export function commitDelivery(
   storage: StorageDb,

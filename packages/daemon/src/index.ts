@@ -10,6 +10,7 @@ import { startServer } from "./server";
 import { openStorageDb } from "./storage/database";
 import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
 import { SWARM_RETENTION_MS } from "./storage/swarm-schema";
+import { SESSION_EVENTS_RETENTION_MS } from "./storage/session-events-schema";
 import { Poller } from "./worker/poller";
 import { WorkerHealthMonitor } from "./worker/worker-health";
 import { OutboxSender } from "./worker/outbox-sender";
@@ -425,6 +426,14 @@ setInterval(() => {
 
   const swarmCleaned = storage.swarm.cleanupOlderThan(now - SWARM_RETENTION_MS);
   if (swarmCleaned > 0) console.log(`[swarm] cleaned ${swarmCleaned} old messages`);
+
+  // Unlike the swarm cleanup above, which spares 'queued' rows, every ledger row is
+  // prunable: a row exists only because delivery already succeeded, so there is no
+  // in-flight state to protect. session_reads is deliberately NOT pruned -- a
+  // watermark is one row per session and outliving its events is exactly what
+  // AUTOINCREMENT makes safe.
+  const eventsCleaned = storage.sessionEvents.pruneOlderThan(now - SESSION_EVENTS_RETENTION_MS);
+  if (eventsCleaned > 0) console.log(`[session-events] cleaned ${eventsCleaned} old rows`);
 }, 60 * 60 * 1000);
 
 // Reap stale Pigeon registry entries every hour. This must not delete opencode

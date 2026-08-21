@@ -2962,9 +2962,10 @@ describe("OutboxSender ledger append (unread substrate)", () => {
     expect(map.get("sess-1")?.unread).toBe(0);
   });
 
-  // markSent is unguarded today and safe only by call-site discipline. A future
-  // second caller would silently double every count, so the guard is what makes the
-  // ledger's arithmetic robust rather than merely lucky.
+  // Before this change markSent was unguarded and safe only by call-site discipline:
+  // one caller, in a reentrancy-guarded loop. The guard is now what makes the
+  // ledger's arithmetic robust rather than merely lucky, since a second caller would
+  // otherwise be told it had just delivered something and double every count.
   it("markSent is idempotent, so a second call cannot inflate the count", () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
     expect(storage.outbox.markSent("notif-1", 1_000)).toBe(true);

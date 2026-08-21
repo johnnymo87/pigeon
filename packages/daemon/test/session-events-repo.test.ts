@@ -50,10 +50,13 @@ describe("session events schema", () => {
     expect(seq.length).toBe(1);
   });
 
-  // The retention constant is a multiple of the session TTL rather than a literal so
-  // the two cannot drift apart. It is a margin, not a guarantee -- see the design doc.
-  it("derives retention from SESSION_TTL_MS rather than hardcoding a span", () => {
-    expect(SESSION_EVENTS_RETENTION_MS).toBe(2 * SESSION_TTL_MS);
+  // Assert the PROPERTY, not the definition. `toBe(2 * SESSION_TTL_MS)` merely
+  // restates the constant and passes even if it is inlined as a literal of the same
+  // value. What actually matters is that the ledger outlives the session it
+  // describes, with margin for the hourly prune's granularity.
+  it("retains events strictly longer than a session can live", () => {
+    expect(SESSION_EVENTS_RETENTION_MS).toBeGreaterThan(SESSION_TTL_MS);
+    expect(SESSION_EVENTS_RETENTION_MS - SESSION_TTL_MS).toBeGreaterThan(60 * 60 * 1000);
   });
 });
 
