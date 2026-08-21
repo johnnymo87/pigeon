@@ -14,6 +14,8 @@ import { initAlertSchema, AlertRepository } from "./alert-repo";
 import { initSwarmSchema } from "./swarm-schema";
 import { SwarmRepository } from "./swarm-repo";
 import { initSessionOriginSchema } from "./session-origin-schema";
+import { initSessionEventsSchema } from "./session-events-schema";
+import { SessionEventsRepo } from "./session-events-repo";
 import { SessionOriginRepository } from "./session-origin-repo";
 import { initRouteSchema } from "../routing/route-schema";
 import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMetaRepo } from "../routing/route-repo";
@@ -32,6 +34,8 @@ export interface StorageDb {
   alerts: AlertRepository;
   swarm: SwarmRepository;
   sessionOrigins: SessionOriginRepository;
+  /** Durable log of what was delivered to a topic, plus the read watermark. */
+  sessionEvents: SessionEventsRepo;
   injectedPrompts: InjectedPromptsRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
@@ -51,6 +55,7 @@ export function openStorageDb(path: string): StorageDb {
   initSchema(db);
   initSwarmSchema(db);
   initSessionOriginSchema(db);
+  initSessionEventsSchema(db);
   initInjectedPromptsSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
@@ -69,6 +74,7 @@ export function openStorageDb(path: string): StorageDb {
     alerts: new AlertRepository(db),
     swarm: new SwarmRepository(db),
     sessionOrigins: new SessionOriginRepository(db),
+    sessionEvents: new SessionEventsRepo(db),
     injectedPrompts: new InjectedPromptsRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
