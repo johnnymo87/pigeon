@@ -10,6 +10,35 @@
 
 **Beads:** epic `pigeon-qdcb`, tasks `pigeon-qdcb.1` … `pigeon-qdcb.6`.
 
+> ## FINAL OUTCOME (2026-08-21): objective achieved and measured. This plan is history, not a to-do.
+>
+> **Measured on production traffic**, 14.6h window with a real denominator of 35 lgtm sessions:
+> **47 lgtm notifications suppressed, 0 delivered.** The pre-work baseline was 105 delivered over
+> 9 days (~11.7/day). Evidence on `pigeon-xbhg`.
+>
+> **The title regex this plan set out to replace is GONE** — deleted under `pigeon-ycjg` (PR #118)
+> after a clean 9-day soak (308 launches, 0 leaks, 454 positive-control hits).
+> `PIGEON_QUIET_TITLE_LAYER` is a silent no-op and `NotifyLayer` has no `title` variant. The
+> sentence in **Architecture** above promising the regex "stays behind a flag until a fired-counter
+> proves it is dead" is discharged: the counter proved it, and it was removed.
+>
+> **The invariant this work actually established, which was not in the original design:** every
+> suppression is TTL-bounded (2h from `declared_at`). No session can be permanently silent. That
+> emerged from `pigeon-qdcb.12` and was completed by `pigeon-60sw` (PR #120). The ops lever is
+> `DELETE /session-origin?session_id=ses_...`.
+>
+> **Task 4 below is VOID** — see the callout on it.
+>
+> **Three tail items remain, none affecting the objective:** `qdcb.4` (launcher flags, now
+> unblocked), `qdcb.11` (re-scoped to a convenience, P3), `qdcb.10` (row reaping, P4). Do not read
+> the epic's 9/12 as "the main risk is open".
+>
+> **Spun out and closed since:** `pigeon-5ies` collapsed the quiet-policy matrix into one
+> `resolveEffectivePolicy` (it had been derived in three places and omitted in a fourth), which is
+> how `pigeon-c501` — a quiet session's *question* creating the very topic the policy exists to
+> prevent — was found and fixed. Questions are now delivered **unthreaded** rather than suppressed,
+> because a question is a blocking call to a human and suppressing one is a silent hang, not quiet.
+
 **Status (2026-08-13):** shipped and verified in production. The TTL added later by
 `pigeon-qdcb.12` carried a P1 defect — see the callout at Task 5 — fixed by `pigeon-n097`
 (PR #107) and confirmed against 12h of real lgtm traffic. 
@@ -881,7 +910,20 @@ Refs pigeon-qdcb.2"
 
 ---
 
-## Task 4: un-quiet lever (`enable-notify` clears policy + sid-addressable override)
+## Task 4: un-quiet lever (`enable-notify` clears policy + sid-addressable override) — **VOID**
+
+> **VOID as of 2026-08-20 (`pigeon-60sw`, PR #120). Do not implement any of what follows.**
+> `POST /sessions/enable-notify` and `source='override'` were **deleted**, not built out. The route
+> had zero production callers and reaching it required a hand-written curl with the machine's auth
+> token, so the mechanism was unreachable in *both* directions. Rather than make it reachable, it
+> was removed and replaced by two things that already existed: the 2h TTL (which means nothing is
+> permanently silent) and `DELETE /session-origin?session_id=ses_...` as the ops lever.
+>
+> The premise below — "a quieted session emits no Telegram message, so there is nothing to
+> swipe-reply to" — is also **no longer true**. A quiet session still delivers genuine non-abort
+> errors (threaded) and, since `pigeon-c501`, its questions (unthreaded, in the main chat). Both are
+> reply targets, and reply routing is thread-independent. See `pigeon-qdcb.11` for the re-scoped
+> Telegram-side lever, which is now a convenience rather than the only way out.
 
 **Beads:** `pigeon-qdcb.6`
 
@@ -1061,7 +1103,24 @@ Refs pigeon-qdcb.3"
 
 ---
 
-## Task 6: `opencode-launch --origin` / `--notify-policy`
+## Task 6: `opencode-launch --origin` / `--notify-policy` — **NEVER SHIPPED, now unblocked**
+
+> **Status 2026-08-21 (`pigeon-qdcb.4`).** This task never shipped; verified against both the nix
+> package and the deployed binary. It was held because the flags would have had to reason about
+> source ranking while `override` was unevenly deployed — and `source='override'` has since been
+> **deleted** (`pigeon-60sw`, PR #120), so there is no ranking left to respect. `effectiveNotifyPolicy`
+> no longer branches on `source` at all.
+>
+> It is a **generalization, not a fix**: lgtm already declares correctly via Task 5's reconciliation
+> writer, and the quiet path is verified working. What this buys is letting *any* automation declare
+> at launch in one step.
+>
+> Respect the deployment shape when it is built: `opencode-launch` is a nix package in `workstation`
+> and the daemon is per-machine, so the two can be skewed in **either** direction. Both skews must
+> degrade to "louder than intended", never to a lost launch or a silent session, and a new launcher
+> against an old daemon should warn rather than fail. `POST /injected-prompts` is the precedent — it
+> takes raw text and lets the daemon hash it, precisely because a bash caller cannot keep a hash in
+> sync.
 
 **Beads:** `pigeon-qdcb.4` — **repo: `~/projects/workstation`, needs a nix rebuild**
 
