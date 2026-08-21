@@ -510,6 +510,39 @@ describe("storage schema and repositories", () => {
 
       storage.db.close();
     });
+
+    it("expire sets expires_at to now, hiding row from getBySessionId while preserving it for getBySessionIdIncludingExpired", () => {
+      const storage = createStorage();
+      const createdAt = 1_000;
+      storage.pendingQuestions.store({
+        sessionId: "sess-expire-test",
+        requestId: "req-expire-test",
+        questions: [{ question: "Test?", header: "H", options: [] }],
+      }, createdAt);
+
+      expect(storage.pendingQuestions.getBySessionId("sess-expire-test", createdAt + 100)).not.toBeNull();
+
+      const expireNow = 2_000;
+      const result = storage.pendingQuestions.expire("sess-expire-test", expireNow);
+      expect(result).toBe(true);
+
+      // Hidden from getBySessionId at expireNow
+      expect(storage.pendingQuestions.getBySessionId("sess-expire-test", expireNow)).toBeNull();
+
+      // Still visible via getBySessionIdIncludingExpired
+      const expiredRecord = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-expire-test");
+      expect(expiredRecord).not.toBeNull();
+      expect(expiredRecord!.sessionId).toBe("sess-expire-test");
+      expect(expiredRecord!.expiresAt).toBe(expireNow);
+
+      storage.db.close();
+    });
+
+    it("expire returns false when session does not exist", () => {
+      const storage = createStorage();
+      expect(storage.pendingQuestions.expire("nonexistent", 2_000)).toBe(false);
+      storage.db.close();
+    });
   });
 
   describe("additive migrations error handling", () => {

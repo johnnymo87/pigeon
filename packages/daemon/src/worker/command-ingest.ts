@@ -404,6 +404,9 @@ export async function ingestWorkerCommand(
       if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
         return;
       }
+      if (await dropUnreachableQuestionRegistration(storage, commandId, msg, result, options)) {
+        return;
+      }
       // Deliberately keep the pending question row and leave the notification
       // alone. The final step never calls advanceStep, so `version` is unchanged
       // by this failure and the keyboard still on screen remains valid — the
@@ -449,6 +452,9 @@ export async function ingestWorkerCommand(
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
     if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+      return;
+    }
+    if (await dropUnreachableQuestionRegistration(storage, commandId, msg, result, options)) {
       return;
     }
     // Row preserved for the same reason as the wizard final step above: the
@@ -980,6 +986,59 @@ function questionReplyFailedMessage(error: string | undefined): string {
   return `Couldn't deliver your answer: ${reason}\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.`;
 }
 
+function unreachableQuestionRegistrationMessage(): string {
+  return "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.";
+}
+
+/**
+ * Handle a question-reply delivery failure where the session's direct-channel
+ * registration is unreachable (dead port or recycled port returning 401).
+ *
+ * This registration can never deliver this answer, and no retry through it will
+ * heal it. Expire the row so it stops hijacking ordinary prompts into the
+ * question-reply path, while leaving it visible to
+ * `getBySessionIdIncludingExpired` so the resurrection path can still find it on
+ * a re-tap.
+ *
+ * Key on `meta.status === 401` exactly. Do not broaden to any non-envelope response
+ * (e.g. 501 from a version-skewed plugin where the session is live and the question
+ * is still answerable in the TUI).
+ *
+ * Do not edit/strip the notification keyboard — the re-tap is the retry path.
+ *
+ * Returns true when handled.
+ */
+async function dropUnreachableQuestionRegistration(
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  result: CommandDeliveryResult,
+  options: WorkerCommandIngestOptions,
+): Promise<boolean> {
+  const is401 = result.meta?.status === 401;
+  const isDefinitelyNotDelivered =
+    classifyDeliveryFailure({ error: result.error }) === "definitely_not_delivered";
+
+  if (!is401 && !isDefinitelyNotDelivered) {
+    return false;
+  }
+
+  const now = options.now ? options.now() : Date.now();
+  storage.pendingQuestions.expire(msg.sessionId, now);
+  const flavour = is401 ? "recycled-port (401)" : "dead-port";
+  console.warn(
+    `[command-ingest] question registration unreachable (${flavour}) sessionId=${msg.sessionId} commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`,
+  );
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    unreachableQuestionRegistrationMessage(),
+    options.sendTelegramReply,
+  );
+  return true;
+}
+
 /**
  * The session's adapter cannot accept question replies at all, so this pending
  * question is permanently unanswerable from Telegram.
@@ -1039,7 +1098,10 @@ function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, com
   // cannot be revived anyway since opencode-serve revive only supports sendPrompt).
   // Passing meta here would classify UNAUTHORIZED as definitely_not_delivered and
   // throw, arming an infinite poller retry loop.
-  if (!isConnectionError({ error: result.error })) return;
+  //
+  // Pigeon-m426.4: Throw ONLY for "ambiguous" (timeout/abort). "definitely_not_delivered"
+  // (dead port / connection refused) stops throwing, allowing bounded drop and row expiry.
+  if (classifyDeliveryFailure({ error: result.error }) !== "ambiguous") return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
   console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);
   throw new Error(error);

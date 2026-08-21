@@ -429,6 +429,24 @@ export class PendingQuestionRepository {
   }
 
   /**
+   * Expire the pending-questions row by setting `expires_at = now`.
+   *
+   * This hides the row from `getBySessionId` (which filters `expires_at > now`)
+   * so it stops hijacking ordinary prompts into the question-reply path, while
+   * leaving it visible to `getBySessionIdIncludingExpired` so the resurrection
+   * path can still find it on a re-tap.
+   *
+   * Expire, never delete: deleting would destroy accumulated multi-step wizard
+   * answers and the resurrection retry path.
+   */
+  expire(sessionId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare("UPDATE pending_questions SET expires_at = ? WHERE session_id = ?")
+      .run(now, sessionId);
+    return result.changes > 0;
+  }
+
+  /**
    * Advance a wizard by one step, using a record the caller already holds.
    *
    * Takes the record rather than re-reading by session id because the caller
