@@ -371,7 +371,7 @@ describe("ingestWorkerCommand", () => {
     storage.db.close();
   });
 
-  it("leaves pending question replies retryable when direct-channel delivery has a connection error", async () => {
+  it("leaves pending question replies retryable when direct-channel delivery has a transient timeout error", async () => {
     const now = Date.now();
     const storage = openStorageDb(":memory:");
     storage.sessions.upsert({
@@ -409,7 +409,7 @@ describe("ingestWorkerCommand", () => {
         async deliverQuestionReply(_session: unknown, reply: QuestionReplyInput) {
           attempts++;
           if (attempts === 1) {
-            return { ok: false as const, error: "fetch failed" };
+            return { ok: false as const, error: "request timed out" };
           }
           capturedReply = reply;
           return { ok: true as const };
@@ -417,7 +417,7 @@ describe("ingestWorkerCommand", () => {
       }),
     };
 
-    await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow(/fetch failed/);
+    await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow(/request timed out/);
 
     expect(storage.inbox.listUnfinished().map((row) => row.commandId)).toEqual(["cmd-q-retry"]);
     expect(storage.pendingQuestions.getBySessionId("sess-q-retry")).not.toBeNull();
@@ -1925,7 +1925,53 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       storage.db.close();
     });
 
-    it("does not fall through to regular command delivery when metadata fallback hits a connection error", async () => {
+    it("falls through to regular command delivery when metadata fallback hits connection refused / fetch failed (not transient)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-refused",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      let deliverCommandCalled = false;
+      let deliveredCommandText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-refused",
+          sessionId: "sess-meta-refused",
+          command: "my plain text answer",
+          chatId: "1",
+          metadata: { questionRequestId: "req-meta-refused" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand(_session, command) {
+              deliverCommandCalled = true;
+              deliveredCommandText = command;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "fetch failed", meta: { status: 0 } };
+            },
+          }),
+        },
+      );
+
+      expect(deliverCommandCalled).toBe(true);
+      expect(deliveredCommandText).toBe("my plain text answer");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("does not fall through to regular command delivery when metadata fallback hits a transient timeout error", async () => {
       const now = Date.now();
       const storage = openStorageDb(":memory:");
       storage.sessions.upsert({
@@ -1956,11 +2002,11 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: true as const };
             },
             async deliverQuestionReply() {
-              return { ok: false as const, error: "fetch failed" };
+              return { ok: false as const, error: "request timed out" };
             },
           }),
         },
-      )).rejects.toThrow(/fetch failed/);
+      )).rejects.toThrow(/request timed out/);
 
       expect(deliverCommandCalled).toBe(false);
       expect(storage.inbox.listUnfinished().map((row) => row.commandId)).toEqual(["cmd-meta-retry"]);
@@ -3429,7 +3475,7 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
 
     const replies: string[] = [];
 
-    // A connection error is transient: it throws so the Poller retries the whole
+    // A timeout is transient: it throws so the Poller retries the whole
     // command. Any message sent before that point is sent again on every retry.
     await expect(ingestWorkerCommand(
       storage,
@@ -3438,7 +3484,7 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
         createAdapter: () => ({
           name: "mock-direct",
           async deliverCommand() { return { ok: true as const }; },
-          async deliverQuestionReply() { return { ok: false as const, error: "ECONNREFUSED" }; },
+          async deliverQuestionReply() { return { ok: false as const, error: "request timed out" }; },
         }),
         sendTelegramReply: async (_c, text) => { replies.push(text); },
       },
@@ -4252,7 +4298,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
             async deliverQuestionReply() {
               return {
                 ok: false,
-                error: "fetch failed",
+                error: "request timed out",
                 meta: {
                   endpoint: "http://127.0.0.1:4096/pigeon/direct/execute",
                   status: 0,
@@ -4270,12 +4316,12 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
 
     expect(thrownError).not.toBeNull();
     // Thrown error message must NOT have meta suffix (feeds retry logic)
-    expect(thrownError!.message).toBe("fetch failed");
+    expect(thrownError!.message).toBe("request timed out");
 
     const transWarn = warns.find(w => w.includes("[command-ingest] transient question reply failure"));
     expect(transWarn).toBeDefined();
     expect(transWarn).toBe(
-      "[command-ingest] transient question reply failure commandId=cmd-trans-fail error=fetch failed endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0 tokenFp=11223344",
+      "[command-ingest] transient question reply failure commandId=cmd-trans-fail error=request timed out endpoint=http://127.0.0.1:4096/pigeon/direct/execute status=0 tokenFp=11223344",
     );
 
     storage.db.close();
@@ -4459,11 +4505,12 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
         ),
       ).resolves.toBeUndefined();
 
-      // Single question row kept so on-screen keyboard stays retryable
-      expect(storage.pendingQuestions.getBySessionId("sess-qr-401")).not.toBeNull();
-      // User notified about failed question reply (bounded drop)
+      // Single question row expired (hidden from getBySessionId, visible to getBySessionIdIncludingExpired)
+      expect(storage.pendingQuestions.getBySessionId("sess-qr-401")).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-qr-401")).not.toBeNull();
+      // User notified with truthful unreachable-registration message
       expect(replies).toEqual([
-        "Couldn't deliver your answer: Invalid question reply result\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       // Inbox marked done (command acked)
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -4492,8 +4539,10 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       const replies: string[] = [];
       const editedNotifications: Array<{ id: string; text: string }> = [];
 
-      // Calling ingestWorkerCommand must NOT throw when meta.rejectReason is "UNAUTHORIZED"
+      // PIN TEST: Calling ingestWorkerCommand must NOT throw when meta.rejectReason is "UNAUTHORIZED"
       // (meta.rejectReason carries ResultErrorCode on question-reply, which is type-punned with AckRejectReason).
+      // If meta is passed to throwIfTransientQuestionReplyFailure, UNAUTHORIZED is classified as
+      // definitely_not_delivered and throws, creating an infinite poller retry loop. The resolves assertion is the pin.
       await expect(
         ingestWorkerCommand(
           storage,
@@ -4531,11 +4580,12 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
         ),
       ).resolves.toBeUndefined();
 
-      // Single question row kept so on-screen keyboard stays retryable
-      expect(storage.pendingQuestions.getBySessionId("sess-qr-unauth-reason")).not.toBeNull();
-      // User notified about failed question reply (bounded drop)
+      // Row is expired, not deleted
+      expect(storage.pendingQuestions.getBySessionId("sess-qr-unauth-reason")).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-qr-unauth-reason")).not.toBeNull();
+      // User notified with truthful unreachable-registration message
       expect(replies).toEqual([
-        "Couldn't deliver your answer: Unauthorized\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       // Inbox marked done (command acked)
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -4601,6 +4651,449 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       // User notified of command rejection
       expect(replies).toEqual([`Command rejected: ${rejectReason}`]);
       // Inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+  });
+
+  describe("bounded question reply staleness failures (pigeon-m426.4)", () => {
+    it("dead port (fetch failed): does NOT throw, row is expired, truthful message sent, inbox acked", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-dead-port",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-dead-port",
+        requestId: "req-dead-port",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-dead-port",
+            sessionId: "sess-dead-port",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "fetch failed",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 0,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Row is expired (hidden from getBySessionId, preserved in getBySessionIdIncludingExpired)
+      expect(storage.pendingQuestions.getBySessionId("sess-dead-port")).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-dead-port")).not.toBeNull();
+      // Truthful message sent
+      expect(replies).toEqual([
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+      ]);
+      // Inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("401 (Invalid question reply result, meta.status: 401): does NOT throw, row is expired, truthful message sent, inbox acked", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-401-explicit",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-401-explicit",
+        requestId: "req-401-explicit",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-401-explicit",
+            sessionId: "sess-401-explicit",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "Invalid question reply result",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 401,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(storage.pendingQuestions.getBySessionId("sess-401-explicit")).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-401-explicit")).not.toBeNull();
+      expect(replies).toEqual([
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+      ]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("timeout still throws (request timed out) and row is untouched", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-timeout",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-timeout",
+        requestId: "req-timeout",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-timeout",
+            sessionId: "sess-timeout",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "request timed out",
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).rejects.toThrow("request timed out");
+
+      // Row is untouched and still live
+      expect(storage.pendingQuestions.getBySessionId("sess-timeout")).not.toBeNull();
+      expect(replies).toHaveLength(0);
+      // Command is NOT acked
+      expect(storage.inbox.listUnfinished()).toHaveLength(1);
+
+      storage.db.close();
+    });
+
+    it("501 does NOT expire: row stays live, existing failure message sent", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-501",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-501",
+        requestId: "req-501",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      const replies: string[] = [];
+
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-501",
+            sessionId: "sess-501",
+            command: "q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "Invalid question reply result",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 501,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Row stays live (narrow key pins 401, not 501)
+      expect(storage.pendingQuestions.getBySessionId("sess-501")).not.toBeNull();
+      // Existing message sent
+      expect(replies).toEqual([
+        "Couldn't deliver your answer: Invalid question reply result\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.",
+      ]);
+      // Inbox marked done
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("wizard final step with accumulated answers, dead port: row expired but answers_json_v2 preserved", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-wiz-dead-port",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      const q1 = { question: "Q1?", header: "H1", options: [{ label: "Opt1", description: "" }] };
+      const q2 = { question: "Q2?", header: "H2", options: [{ label: "Opt2", description: "" }] };
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-wiz-dead-port",
+        requestId: "req-wiz-dead-port",
+        questions: [q1, q2],
+      }, now);
+
+      // Advance step 0 with answer ["Opt1"]
+      const step0Record = storage.pendingQuestions.getBySessionId("sess-wiz-dead-port")!;
+      const step1Record = storage.pendingQuestions.advanceStep(step0Record, ["Opt1"])!;
+      expect(step1Record.currentStep).toBe(1);
+      expect(step1Record.answers).toEqual([["Opt1"]]);
+
+      const replies: string[] = [];
+
+      // Now answer final step (step 1) via command
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-wiz-dead-port",
+            sessionId: "sess-wiz-dead-port",
+            command: "v1:q0",
+            chatId: "42",
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "fetch failed",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 0,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Row is expired, not deleted
+      expect(storage.pendingQuestions.getBySessionId("sess-wiz-dead-port")).toBeNull();
+      const expiredRecord = storage.pendingQuestions.getBySessionIdIncludingExpired("sess-wiz-dead-port");
+      expect(expiredRecord).not.toBeNull();
+      expect(expiredRecord!.answers).toEqual([["Opt1"]]);
+      expect(expiredRecord!.currentStep).toBe(1);
+
+      // Truthful message sent
+      expect(replies).toEqual([
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+      ]);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("end-to-end recovery: expired row + re-tap carrying metadata.questionRequestId resurrects and delivers", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-recov",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-recov",
+        requestId: "req-recov",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      // Expire the row
+      storage.pendingQuestions.expire("sess-recov", "req-recov", now);
+      expect(storage.pendingQuestions.getBySessionId("sess-recov")).toBeNull();
+
+      let deliveredAnswers: string[][] | null = null;
+      let deliveredRequestId: string | null = null;
+
+      // Re-tap carrying questionRequestId
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-recov",
+            sessionId: "sess-recov",
+            command: "q0",
+            chatId: "42",
+            metadata: {
+              questionRequestId: "req-recov",
+            },
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply(_session, payload) {
+                deliveredRequestId = payload.questionRequestId;
+                deliveredAnswers = payload.answers;
+                return { ok: true };
+              },
+            }),
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Delivered successfully
+      expect(deliveredRequestId).toBe("req-recov");
+      expect(deliveredAnswers).toEqual([["Yes"]]);
+      // On success, pending question is deleted
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-recov")).toBeNull();
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("resurrected row + unreachable failure (tap 2 retry failure): deletes row and sends truthful non-asserting message", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-unreachable",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-unreachable",
+        requestId: "req-res-unreachable",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      // Expire the row (e.g. from tap 1 unreachable failure)
+      storage.pendingQuestions.expire("sess-res-unreachable", "req-res-unreachable", now);
+      expect(storage.pendingQuestions.getBySessionId("sess-res-unreachable")).toBeNull();
+
+      const replies: string[] = [];
+
+      // Tap 2: re-tap carrying questionRequestId, but endpoint is still unreachable (e.g. fetch failed / dead port)
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-res-unreachable",
+            sessionId: "sess-res-unreachable",
+            command: "q0",
+            chatId: "42",
+            metadata: {
+              questionRequestId: "req-res-unreachable",
+            },
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "fetch failed",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 0,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Row is DELETED (not expired), bounds the loop
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-unreachable")).toBeNull();
+      // Non-asserting message sent
+      expect(replies).toEqual([
+        "Still couldn't reach the session that asked this question. Your answer wasn't delivered — send it as a normal message if you still want it to reach the session.",
+      ]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();

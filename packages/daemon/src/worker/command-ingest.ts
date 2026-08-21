@@ -401,7 +401,10 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
-      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, result, options)) {
+        return;
+      }
+      if (await dropUnreachableQuestionRegistration(storage, commandId, msg, pendingQuestion.requestId, result, options)) {
         return;
       }
       // Deliberately keep the pending question row and leave the notification
@@ -448,7 +451,10 @@ export async function ingestWorkerCommand(
 
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
-    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, options)) {
+    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, result, options)) {
+      return;
+    }
+    if (await dropUnreachableQuestionRegistration(storage, commandId, msg, pendingQuestion.requestId, result, options)) {
       return;
     }
     // Row preserved for the same reason as the wizard final step above: the
@@ -524,8 +530,11 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
 
-      // If question reply fails (e.g., 404 question not found), fall through to
-      // regular command delivery so the user's text isn't lost.
+      // If question reply fails (e.g., 404 question not found or connection refused),
+      // fall through to regular command delivery so the user's text isn't lost.
+      // Fall-through on refused is intentional: raw option tokens have already been
+      // filtered out above, so msg.command is genuinely typed prose that should reach
+      // the session as a prompt.
       console.warn(`[command-ingest] metadata fallback question reply failed commandId=${commandId} error=${result.error}, falling through to regular delivery${formatDeliveryMeta(result.meta)}`);
     } else {
       console.warn(`[command-ingest] metadata fallback: adapter does not support question replies commandId=${commandId}, falling through to regular delivery`);
@@ -907,8 +916,8 @@ function mediaPlaceholderCommand(media: NonNullable<ExecuteMessage["media"]>): s
  * expires on its own TTL rather than lingering forever.
  */
 /**
- * A resurrected question that opencode then refused is a question that really
- * is gone — the row outlived the thing it described.
+ * A resurrected question that opencode refused (the question is gone) or whose
+ * registration is still unreachable (tap 2 retry failure) bounds the retry loop.
  *
  * Handled apart from the live-row failure paths, which keep the row on purpose
  * so the on-screen keyboard stays valid for a retry. That reasoning inverts
@@ -918,6 +927,10 @@ function mediaPlaceholderCommand(media: NonNullable<ExecuteMessage["media"]>): s
  * restores the pre-resurrection escape hatch — the next message to the session
  * is treated as an ordinary prompt and reaches opencode.
  *
+ * Branching the reply wording: if the failure is unreachable registration (dead
+ * port or 401), assert nothing about the question state in opencode; otherwise
+ * (genuine refusal), state that the question is no longer open.
+ *
  * Returns true when it handled the command.
  */
 async function dropResurrectedQuestionThatIsGone(
@@ -925,16 +938,23 @@ async function dropResurrectedQuestionThatIsGone(
   storage: StorageDb,
   commandId: string,
   msg: ExecuteMessage,
+  result: CommandDeliveryResult,
   options: WorkerCommandIngestOptions,
 ): Promise<boolean> {
   if (!resurrected) return false;
   storage.pendingQuestions.delete(msg.sessionId);
-  console.warn(`[command-ingest] resurrected question is gone, dropping row sessionId=${msg.sessionId} commandId=${commandId}`);
+  const isUnreachable = isUnreachableRegistrationFailure(result);
+  console.warn(
+    `[command-ingest] resurrected question is gone (${isUnreachable ? "unreachable" : "refused"}), dropping row sessionId=${msg.sessionId} commandId=${commandId}`,
+  );
+  const message = isUnreachable
+    ? "Still couldn't reach the session that asked this question. Your answer wasn't delivered — send it as a normal message if you still want it to reach the session."
+    : "That question is no longer open in the session, so your answer wasn't recorded. Tapping again won't help — send it as a normal message if you still want it to reach the session.";
   await dropCommand(
     storage,
     commandId,
     msg.chatId,
-    "That question is no longer open in the session, so your answer wasn't recorded. Tapping again won't help — send it as a normal message if you still want it to reach the session.",
+    message,
     options.sendTelegramReply,
   );
   return true;
@@ -978,6 +998,64 @@ function isOptionToken(command: string): boolean {
 function questionReplyFailedMessage(error: string | undefined): string {
   const reason = error ?? "unknown error";
   return `Couldn't deliver your answer: ${reason}\n\nYour answer wasn't recorded. Tap the option again, or reply with text, to retry.`;
+}
+
+function unreachableQuestionRegistrationMessage(): string {
+  return "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.";
+}
+
+function isUnreachableRegistrationFailure(result: Pick<CommandDeliveryResult, "error" | "meta">): boolean {
+  return (
+    result.meta?.status === 401
+    || classifyDeliveryFailure({ error: result.error }) === "definitely_not_delivered"
+  );
+}
+
+/**
+ * Handle a question-reply delivery failure where the session's direct-channel
+ * registration is unreachable (dead port or recycled port returning 401).
+ *
+ * This registration can never deliver this answer, and no retry through it will
+ * heal it. Expire the row so it stops hijacking ordinary prompts into the
+ * question-reply path, while leaving it visible to
+ * `getBySessionIdIncludingExpired` so the resurrection path can still find it on
+ * a re-tap.
+ *
+ * Key on `meta.status === 401` exactly. Do not broaden to any non-envelope response
+ * (e.g. 501 from a version-skewed plugin where the session is live and the question
+ * is still answerable in the TUI).
+ *
+ * Do not edit/strip the notification keyboard — the re-tap is the retry path.
+ *
+ * Returns true when handled.
+ */
+async function dropUnreachableQuestionRegistration(
+  storage: StorageDb,
+  commandId: string,
+  msg: ExecuteMessage,
+  requestId: string,
+  result: CommandDeliveryResult,
+  options: WorkerCommandIngestOptions,
+): Promise<boolean> {
+  if (!isUnreachableRegistrationFailure(result)) {
+    return false;
+  }
+
+  const is401 = result.meta?.status === 401;
+  const now = options.now ? options.now() : Date.now();
+  storage.pendingQuestions.expire(msg.sessionId, requestId, now);
+  const flavour = is401 ? "recycled-port (401)" : "dead-port";
+  console.warn(
+    `[command-ingest] question registration unreachable (${flavour}) sessionId=${msg.sessionId} commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`,
+  );
+  await dropCommand(
+    storage,
+    commandId,
+    msg.chatId,
+    unreachableQuestionRegistrationMessage(),
+    options.sendTelegramReply,
+  );
+  return true;
 }
 
 /**
@@ -1039,7 +1117,13 @@ function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, com
   // cannot be revived anyway since opencode-serve revive only supports sendPrompt).
   // Passing meta here would classify UNAUTHORIZED as definitely_not_delivered and
   // throw, arming an infinite poller retry loop.
-  if (!isConnectionError({ error: result.error })) return;
+  //
+  // Pigeon-m426.4: Throw ONLY for "ambiguous" (timeout/abort). "definitely_not_delivered"
+  // (dead port / connection refused) stops throwing, allowing bounded drop and row expiry.
+  // Note: A recycled port held by a listener that accepts but never completes HTTP yields
+  // "abort" -> ambiguous -> throws -> unbounded 60s re-lease loop by design until inbox
+  // attempt counting is added.
+  if (classifyDeliveryFailure({ error: result.error }) !== "ambiguous") return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
   console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);
   throw new Error(error);
