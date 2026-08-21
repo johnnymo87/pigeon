@@ -165,6 +165,89 @@ describe("session events repo", () => {
   });
 });
 
+describe("markAllRead: what an inbound Telegram action does", () => {
+  it("advances to this session's max, clearing the badge", () => {
+    const { repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.append({ sessionId: "s1", notificationId: "n2", kind: "stop", sentAt: 2 });
+    repo.markAllRead("s1", 100);
+    expect(repo.unreadBySession().get("s1")?.unread).toBe(0);
+  });
+
+  // Off by one here is invisible: the badge simply never reaches zero, and the user
+  // concludes the feature is broken rather than that a bound is wrong.
+  it("clears completely, leaving nothing behind", () => {
+    const { repo } = seeded();
+    const last = repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.markAllRead("s1", 100);
+    expect(repo.lastReadId("s1")).toBe(last);
+  });
+
+  it("touches only the named session", () => {
+    const { repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.append({ sessionId: "s2", notificationId: "n2", kind: "stop", sentAt: 2 });
+    repo.markAllRead("s1", 100);
+    const map = repo.unreadBySession();
+    expect(map.get("s1")?.unread).toBe(0);
+    expect(map.get("s2")?.unread).toBe(1);
+  });
+
+  // The semantic the whole feature rests on, and it was asserted nowhere
+  // end-to-end: acting in Telegram clears, and the NEXT delivery counts again.
+  it("a delivery after the clear counts as unread again", () => {
+    const { repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.markAllRead("s1", 100);
+    repo.append({ sessionId: "s1", notificationId: "n2", kind: "stop", sentAt: 2 });
+    expect(repo.unreadBySession().get("s1")?.unread).toBe(1);
+  });
+
+  // Seeded with ANOTHER session's events on purpose. Ids are global (AUTOINCREMENT),
+  // so a query that forgets its WHERE session_id would happily hand this session a
+  // watermark borrowed from a session it has nothing to do with -- and an empty
+  // database cannot tell the difference.
+  it("is a no-op for a session with no events, rather than throwing", () => {
+    const { db, repo } = seeded();
+    repo.append({ sessionId: "other", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.append({ sessionId: "other", notificationId: "n2", kind: "stop", sentAt: 2 });
+
+    expect(() => repo.markAllRead("never-seen", 100)).not.toThrow();
+    expect(repo.lastReadId("never-seen")).toBe(0);
+    // lastReadId reports 0 for "no row" AND for "a row holding 0", so assert on the
+    // table: a session we know nothing about must not acquire a watermark at all.
+    const rows = db
+      .prepare("SELECT COUNT(*) AS n FROM session_reads WHERE session_id = ?")
+      .get("never-seen") as { n: number };
+    expect(rows.n).toBe(0);
+  });
+
+  it("does not borrow another session's ids when clearing", () => {
+    const { repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.append({ sessionId: "loud", notificationId: "n2", kind: "stop", sentAt: 2 });
+    repo.append({ sessionId: "loud", notificationId: "n3", kind: "stop", sentAt: 3 });
+
+    repo.markAllRead("s1", 100);
+
+    // s1's own max is 1. Clearing to the GLOBAL max (3) would silently pre-read
+    // events that have not happened yet for this session.
+    expect(repo.lastReadId("s1")).toBe(1);
+  });
+
+  // Monotone: a clear can never drag the watermark backwards, even if the ledger
+  // has since been pruned below an existing watermark.
+  it("never regresses a watermark that is already ahead", () => {
+    const { db, repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
+    repo.append({ sessionId: "s1", notificationId: "n2", kind: "stop", sentAt: 2 });
+    repo.advanceRead("s1", 2, 100);
+    db.exec("DELETE FROM session_events WHERE id = 2");
+    repo.markAllRead("s1", 101);
+    expect(repo.lastReadId("s1")).toBe(2);
+  });
+});
+
 describe("session events retention", () => {
   it("prunes rows older than the cutoff and keeps newer ones", () => {
     const { repo } = seeded();

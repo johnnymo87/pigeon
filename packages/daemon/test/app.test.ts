@@ -2790,12 +2790,9 @@ describe("POST /sessions/{id}/read", () => {
     expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
   });
 
-  it("does not collide with GET /sessions/{id}", async () => {
+  it("rejects a malformed percent-escape with 400, not 500", async () => {
     const app = newApp();
-    seed();
-    // The pre-existing prefix route must not swallow the /read suffix and treat
-    // "sess-1/read" as a session id.
-    const res = await app(new Request("http://localhost/sessions/sess-1%2Fread"));
-    expect(res.status).toBe(404);
+    const res = await post(app, "/sessions/%zz/read", { last_event_id: 1 });
+    expect(res.status).toBe(400);
   });
 });

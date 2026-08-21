@@ -366,11 +366,40 @@ export class Poller {
   }
 
   /** Dispatch a message to the appropriate callback and ack on success. */
+  private static readonly KNOWN_COMMAND_TYPES = new Set([
+    "execute", "launch", "kill", "interrupt", "compact",
+    "mcp_list", "mcp_enable", "mcp_disable", "model_list", "model_set",
+  ]);
+
+  private isKnownCommandType(msg: WorkerMessage): boolean {
+    return Poller.KNOWN_COMMAND_TYPES.has((msg as { commandType: string }).commandType);
+  }
+
   private async dispatch(msg: WorkerMessage): Promise<void> {
+    // Only clear for a command we can actually dispatch. An unrecognised type warns
+    // and returns WITHOUT acking, so it is redelivered until the worker's 24h
+    // cleanup -- and clearing there would re-clear on every one of those retries.
+    // That is the realistic trigger, since version skew (worker deploying a new
+    // command type first) produces exactly it.
+    if (!this.isKnownCommandType(msg)) {
+      console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
+      return;
+    }
+
     // Before dispatch, not after: the user has already acted by the time this
-    // arrives, so a handler that fails (and leaves the command to retry) must not
-    // also leave the session looking unread. Clearing is idempotent -- it advances
-    // to the current max -- so the retry re-clears harmlessly.
+    // arrives, so a handler that fails -- leaving the command to retry -- must not
+    // also leave the session looking unread.
+    //
+    // Note what this is NOT: markAllRead advances to the max event id AT CALL TIME,
+    // so it is monotone but not idempotent across time. A handler that fails
+    // persistently is redispatched roughly once a lease expiry (60s) until the
+    // worker's 24h cleanup, and each attempt re-clears at a later mark -- marking
+    // read anything delivered in between. That is the over-clear direction, which
+    // this feature otherwise avoids. Accepted rather than hidden: it needs a
+    // persistently failing handler AND concurrent delivery to the same session, the
+    // user is usually still in the topic, and it is bounded by the 24h cleanup.
+    // The exact fix (clamp to the command's created_at, which the worker already
+    // stores but does not send) is tracked separately.
     const sessionId = (msg as { sessionId?: unknown }).sessionId;
     if (typeof sessionId === "string" && sessionId) {
       try {
@@ -402,9 +431,6 @@ export class Poller {
         await this.callbacks.onModelList(msg);
       } else if (msg.commandType === "model_set") {
         await this.callbacks.onModelSet(msg);
-      } else {
-        console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
-        return;
       }
     } catch (err) {
       // Callback threw — skip ack so the lease expires and command retries

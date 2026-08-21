@@ -1208,6 +1208,22 @@ describe("Poller: inbound action clears unread", () => {
     expect(callbacks.onCommand).toHaveBeenCalledTimes(1);
   });
 
+  // Version skew -- the worker deploying a new command type before the daemon knows
+  // it -- produces an unrecognised message that warns and returns WITHOUT acking, so
+  // it is redelivered until the worker's 24h cleanup. Clearing there would re-clear
+  // on every retry, silently marking read whatever arrived in between.
+  it("does not clear for an unrecognised command type", async () => {
+    const { seen, poller } = driveWith({
+      commandId: "c9",
+      commandType: "teleport",
+      sessionId: "s9",
+      chatId: "c",
+    });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([]);
+  });
+
   it("is optional -- a poller wired without it still dispatches", async () => {
     const callbacks = makeCallbacks();
     const fetchFn = makeFetch([() => json200(makeExecuteMsg()), () => ackOk()]);

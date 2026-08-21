@@ -1146,9 +1146,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         && url.pathname.startsWith("/sessions/")
         && url.pathname.endsWith("/read")
       ) {
-        const sessionId = decodeURIComponent(
-          url.pathname.slice("/sessions/".length, -"/read".length),
-        );
+        let sessionId: string;
+        try {
+          sessionId = decodeURIComponent(
+            url.pathname.slice("/sessions/".length, -"/read".length),
+          );
+        } catch {
+          // decodeURIComponent throws URIError on a malformed escape (/sessions/%zz/
+          // read), which the outer handler would report as a 500. Same reasoning as
+          // the JSON guard below: a client's bad input is not a daemon fault.
+          return Response.json({ error: "invalid session id encoding" }, { status: 400 });
+        }
         if (!sessionId) {
           return Response.json({ error: "session id is required" }, { status: 400 });
         }
