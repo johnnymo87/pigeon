@@ -1925,6 +1925,52 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       storage.db.close();
     });
 
+    it("falls through to regular command delivery when metadata fallback hits connection refused / fetch failed (not transient)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-refused",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      let deliverCommandCalled = false;
+      let deliveredCommandText: string | null = null;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-refused",
+          sessionId: "sess-meta-refused",
+          command: "my plain text answer",
+          chatId: "1",
+          metadata: { questionRequestId: "req-meta-refused" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand(_session, command) {
+              deliverCommandCalled = true;
+              deliveredCommandText = command;
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              return { ok: false as const, error: "fetch failed", meta: { status: 0 } };
+            },
+          }),
+        },
+      );
+
+      expect(deliverCommandCalled).toBe(true);
+      expect(deliveredCommandText).toBe("my plain text answer");
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
     it("does not fall through to regular command delivery when metadata fallback hits a transient timeout error", async () => {
       const now = Date.now();
       const storage = openStorageDb(":memory:");
@@ -4464,7 +4510,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-qr-401")).not.toBeNull();
       // User notified with truthful unreachable-registration message
       expect(replies).toEqual([
-        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       // Inbox marked done (command acked)
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -4539,7 +4585,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-qr-unauth-reason")).not.toBeNull();
       // User notified with truthful unreachable-registration message
       expect(replies).toEqual([
-        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       // Inbox marked done (command acked)
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -4666,7 +4712,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-dead-port")).not.toBeNull();
       // Truthful message sent
       expect(replies).toEqual([
-        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       // Inbox marked done
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -4726,7 +4772,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       expect(storage.pendingQuestions.getBySessionId("sess-401-explicit")).toBeNull();
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-401-explicit")).not.toBeNull();
       expect(replies).toEqual([
-        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -4916,7 +4962,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
 
       // Truthful message sent
       expect(replies).toEqual([
-        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer wasn't recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
+        "Couldn't reach the session that asked this question — it looks like it restarted.\n\nYour answer may not have been recorded. Tap the option again to retry once; if that fails, send it as a normal message.",
       ]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -4942,7 +4988,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       }, now);
 
       // Expire the row
-      storage.pendingQuestions.expire("sess-recov", now);
+      storage.pendingQuestions.expire("sess-recov", "req-recov", now);
       expect(storage.pendingQuestions.getBySessionId("sess-recov")).toBeNull();
 
       let deliveredAnswers: string[][] | null = null;
@@ -4980,6 +5026,74 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       expect(deliveredAnswers).toEqual([["Yes"]]);
       // On success, pending question is deleted
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-recov")).toBeNull();
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("resurrected row + unreachable failure (tap 2 retry failure): deletes row and sends truthful non-asserting message", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-res-unreachable",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId: "sess-res-unreachable",
+        requestId: "req-res-unreachable",
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "" }] }],
+      }, now);
+
+      // Expire the row (e.g. from tap 1 unreachable failure)
+      storage.pendingQuestions.expire("sess-res-unreachable", "req-res-unreachable", now);
+      expect(storage.pendingQuestions.getBySessionId("sess-res-unreachable")).toBeNull();
+
+      const replies: string[] = [];
+
+      // Tap 2: re-tap carrying questionRequestId, but endpoint is still unreachable (e.g. fetch failed / dead port)
+      await expect(
+        ingestWorkerCommand(
+          storage,
+          makeMsg({
+            commandId: "cmd-res-unreachable",
+            sessionId: "sess-res-unreachable",
+            command: "q0",
+            chatId: "42",
+            metadata: {
+              questionRequestId: "req-res-unreachable",
+            },
+          }),
+          {
+            createAdapter: () => ({
+              name: "direct-channel",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              async deliverQuestionReply() {
+                return {
+                  ok: false,
+                  error: "fetch failed",
+                  meta: {
+                    endpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+                    status: 0,
+                  },
+                };
+              },
+            }),
+            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Row is DELETED (not expired), bounds the loop
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-unreachable")).toBeNull();
+      // Non-asserting message sent
+      expect(replies).toEqual([
+        "Still couldn't reach the session that asked this question. Your answer wasn't delivered — send it as a normal message if you still want it to reach the session.",
+      ]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();

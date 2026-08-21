@@ -436,13 +436,16 @@ export class PendingQuestionRepository {
    * leaving it visible to `getBySessionIdIncludingExpired` so the resurrection
    * path can still find it on a re-tap.
    *
+   * Keyed on both sessionId and requestId so a late failure cannot expire a
+   * newly arrived question that replaced the failed one.
+   *
    * Expire, never delete: deleting would destroy accumulated multi-step wizard
    * answers and the resurrection retry path.
    */
-  expire(sessionId: string, now = Date.now()): boolean {
+  expire(sessionId: string, requestId: string, now = Date.now()): boolean {
     const result = this.db
-      .prepare("UPDATE pending_questions SET expires_at = ? WHERE session_id = ?")
-      .run(now, sessionId);
+      .prepare("UPDATE pending_questions SET expires_at = ? WHERE session_id = ? AND request_id = ?")
+      .run(now, sessionId, requestId);
     return result.changes > 0;
   }
 
