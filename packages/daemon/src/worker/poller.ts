@@ -253,6 +253,20 @@ export interface PollerCallbacks {
   onMcpDisable: (msg: McpDisableMessage) => Promise<void>;
   onModelList: (msg: ModelListMessage) => Promise<void>;
   onModelSet: (msg: ModelSetMessage) => Promise<void>;
+  /**
+   * Called for every inbound message that names a session, before it is dispatched.
+   *
+   * This is the "any inbound action" boundary for the unread badge. Clearing here
+   * rather than in the reply handler is deliberate: answering a question card is a
+   * CALLBACK, not a reply, and it arrives as an execute command like any other. If
+   * only replies cleared, the needs-you pin would drop out of the switcher while the
+   * badge kept contradicting it -- the most common interaction producing the most
+   * confusing state. Slash commands, interrupts and compactions are user actions on
+   * a session too, and all of them mean the user is looking at it.
+   *
+   * Optional so the poller stays usable (and testable) without storage wired in.
+   */
+  onInboundForSession?: (sessionId: string) => void;
 }
 
 export interface PollerDeps {
@@ -353,6 +367,20 @@ export class Poller {
 
   /** Dispatch a message to the appropriate callback and ack on success. */
   private async dispatch(msg: WorkerMessage): Promise<void> {
+    // Before dispatch, not after: the user has already acted by the time this
+    // arrives, so a handler that fails (and leaves the command to retry) must not
+    // also leave the session looking unread. Clearing is idempotent -- it advances
+    // to the current max -- so the retry re-clears harmlessly.
+    const sessionId = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof sessionId === "string" && sessionId) {
+      try {
+        this.callbacks.onInboundForSession?.(sessionId);
+      } catch (err) {
+        // A badge is never worth dropping a command for.
+        console.warn("[poller] onInboundForSession failed:", err instanceof Error ? err.message : String(err));
+      }
+    }
+
     try {
       if (msg.commandType === "execute") {
         await this.callbacks.onCommand(msg);

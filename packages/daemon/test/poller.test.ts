@@ -1139,3 +1139,81 @@ describe("Poller — worker health instrumentation", () => {
     await expect(poller.registerSession("sess-1")).resolves.toMatchObject({ status: 503 });
   });
 });
+
+describe("Poller: inbound action clears unread", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function driveWith(msg: unknown, overrides?: Record<string, unknown>) {
+    const seen: string[] = [];
+    const callbacks = makeCallbacks({
+      onInboundForSession: (id: string) => seen.push(id),
+      ...overrides,
+    } as Partial<PollerCallbacks>);
+    const fetchFn = makeFetch([() => json200(msg), () => ackOk()]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    return { seen, callbacks, poller };
+  }
+
+  // Answering a question card is a CALLBACK, not a reply -- but it reaches the
+  // daemon as an execute command, exactly like a typed reply. Clearing at dispatch
+  // rather than in the reply handler is what keeps the badge from contradicting the
+  // needs-you pin after the most common interaction of all. Slash commands,
+  // interrupts and compactions are user actions on a session too.
+  it.each([
+    ["execute", makeExecuteMsg({ sessionId: "s1" })],
+    ["interrupt", { commandId: "c2", commandType: "interrupt", sessionId: "s2", chatId: "c" }],
+    ["compact", { commandId: "c3", commandType: "compact", sessionId: "s3", chatId: "c" }],
+    ["kill", { commandId: "c4", commandType: "kill", sessionId: "s4", chatId: "c" }],
+    ["model_set", { commandId: "c5", commandType: "model_set", sessionId: "s5", chatId: "c", model: "m" }],
+  ])("clears on an inbound %s command", async (_label, msg) => {
+    const { seen, poller } = driveWith(msg);
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([(msg as { sessionId: string }).sessionId]);
+  });
+
+  // A launch has no session yet -- it creates one. Nothing to clear, and reaching
+  // for an absent sessionId must not throw inside dispatch.
+  it("does not clear for a launch, which carries no session", async () => {
+    const { seen, poller } = driveWith(makeLaunchMsg());
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([]);
+  });
+
+  it("clears even when the handler throws, because the user still acted", async () => {
+    const { seen, poller } = driveWith(makeExecuteMsg({ sessionId: "s7" }), {
+      onCommand: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual(["s7"]);
+  });
+
+  // A badge is never worth dropping a command for.
+  it("still dispatches when the clear hook itself throws", async () => {
+    const callbacks = makeCallbacks({
+      onInboundForSession: () => { throw new Error("db gone"); },
+    } as Partial<PollerCallbacks>);
+    const fetchFn = makeFetch([() => json200(makeExecuteMsg()), () => ackOk()]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callbacks.onCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("is optional -- a poller wired without it still dispatches", async () => {
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([() => json200(makeExecuteMsg()), () => ackOk()]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callbacks.onCommand).toHaveBeenCalledTimes(1);
+  });
+});
