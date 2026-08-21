@@ -1132,6 +1132,64 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         return Response.json({ ok: true, cleared: deleted });
       }
 
+      // Advance a session's unread watermark. Declared BEFORE the /sessions/ prefix
+      // route below, which would otherwise decode "{id}/read" as the session id.
+      //
+      // The caller marks read against the snapshot it actually displayed, never
+      // "now", so anything delivered between render and keypress stays unread. The
+      // repo's MAX() makes a late write from a stale snapshot a no-op, which means
+      // the error direction here is always "under-clear" -- self-healing on the next
+      // read -- rather than "over-clear", which would silently hide messages nobody
+      // saw.
+      if (
+        request.method === "POST"
+        && url.pathname.startsWith("/sessions/")
+        && url.pathname.endsWith("/read")
+      ) {
+        let sessionId: string;
+        try {
+          sessionId = decodeURIComponent(
+            url.pathname.slice("/sessions/".length, -"/read".length),
+          );
+        } catch {
+          // decodeURIComponent throws URIError on a malformed escape (/sessions/%zz/
+          // read), which the outer handler would report as a 500. Same reasoning as
+          // the JSON guard below: a client's bad input is not a daemon fault.
+          return Response.json({ error: "invalid session id encoding" }, { status: 400 });
+        }
+        if (!sessionId) {
+          return Response.json({ error: "session id is required" }, { status: 400 });
+        }
+
+        let body: Record<string, unknown>;
+        try {
+          body = await readJsonBody(request);
+        } catch {
+          // Without this the outer handler reports a client's bad JSON as a 500.
+          // The picker writes here fire-and-forget, so a malformed body must not
+          // masquerade as a daemon fault in the logs.
+          return Response.json({ error: "invalid JSON body" }, { status: 400 });
+        }
+
+        const lastEventId = body.last_event_id;
+        if (
+          typeof lastEventId !== "number"
+          || !Number.isInteger(lastEventId)
+          || lastEventId < 0
+        ) {
+          return Response.json(
+            { error: "last_event_id must be a non-negative integer" },
+            { status: 400 },
+          );
+        }
+
+        // Deliberately no 404 for an unknown session. The ledger outlives the
+        // sessions row by design, so a read for a session the reaper has already
+        // removed is still meaningful and must be recorded.
+        storage.sessionEvents.advanceRead(sessionId, lastEventId, nowFn());
+        return Response.json({ ok: true });
+      }
+
       if (url.pathname.startsWith("/sessions/")) {
         const sessionId = decodeURIComponent(url.pathname.slice("/sessions/".length));
 

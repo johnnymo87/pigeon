@@ -2675,3 +2675,124 @@ describe("createApp", () => {
     });
   });
 });
+
+describe("POST /sessions/{id}/read", () => {
+  let storage: StorageDb | null = null;
+
+  afterEach(() => {
+    if (storage) {
+      storage.db.close();
+      storage = null;
+    }
+  });
+
+  function newApp(now = 1_000) {
+    storage = openStorageDb(":memory:");
+    return createApp(storage, { nowFn: () => now });
+  }
+
+  function seed(sessionId = "sess-1", count = 3) {
+    for (let i = 1; i <= count; i++) {
+      storage!.sessionEvents.append({
+        sessionId,
+        notificationId: `n${i}`,
+        kind: "stop",
+        sentAt: i,
+      });
+    }
+  }
+
+  async function post(app: ReturnType<typeof createApp>, path: string, body: unknown) {
+    return app(
+      new Request(`http://localhost${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: typeof body === "string" ? body : JSON.stringify(body),
+      }),
+    );
+  }
+
+  it("advances the watermark and returns 200", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    expect(res.status).toBe(200);
+    expect(storage!.sessionEvents.unreadBySession().get("sess-1")?.unread).toBe(0);
+  });
+
+  it("accepts a stale id without regressing the watermark", async () => {
+    const app = newApp();
+    seed();
+    await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 1 });
+    expect(res.status).toBe(200);
+    // Still fully read: a jump from an older snapshot landing late must not
+    // resurrect messages the user has already seen.
+    expect(storage!.sessionEvents.unreadBySession().get("sess-1")?.unread).toBe(0);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(3);
+  });
+
+  it("marks only up to the id supplied, not everything", async () => {
+    const app = newApp();
+    seed();
+    await post(app, "/sessions/sess-1/read", { last_event_id: 2 });
+    expect(storage!.sessionEvents.unreadBySession().get("sess-1")?.unread).toBe(1);
+  });
+
+  it("rejects a missing last_event_id with 400, not 500", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", {});
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  it("rejects a non-numeric last_event_id with 400", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: "3" });
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  it("rejects a malformed JSON body with 400, not 500", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", "{not json");
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a negative last_event_id with 400", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: -1 });
+    expect(res.status).toBe(400);
+  });
+
+  // The ledger deliberately outlives the sessions row, so a read for a session
+  // pigeon has already reaped must still be recorded rather than 404'd.
+  it("records a read for a session that is not in the sessions table", async () => {
+    const app = newApp();
+    seed("ghost");
+    const res = await post(app, "/sessions/ghost/read", { last_event_id: 3 });
+    expect(res.status).toBe(200);
+    expect(storage!.sessionEvents.lastReadId("ghost")).toBe(3);
+  });
+
+  // The route must match on METHOD as well as shape. Without the method check it
+  // swallows GET and DELETE on the same path -- so a DELETE meant for the prefix
+  // route below would be answered by the watermark handler instead.
+  it("ignores non-POST requests to the same path", async () => {
+    const app = newApp();
+    seed();
+    const res = await app(new Request("http://localhost/sessions/sess-1/read"));
+    expect(res.status).toBe(404);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  it("rejects a malformed percent-escape with 400, not 500", async () => {
+    const app = newApp();
+    const res = await post(app, "/sessions/%zz/read", { last_event_id: 1 });
+    expect(res.status).toBe(400);
+  });
+});

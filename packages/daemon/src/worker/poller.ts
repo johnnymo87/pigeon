@@ -253,6 +253,20 @@ export interface PollerCallbacks {
   onMcpDisable: (msg: McpDisableMessage) => Promise<void>;
   onModelList: (msg: ModelListMessage) => Promise<void>;
   onModelSet: (msg: ModelSetMessage) => Promise<void>;
+  /**
+   * Called for every inbound message that names a session, before it is dispatched.
+   *
+   * This is the "any inbound action" boundary for the unread badge. Clearing here
+   * rather than in the reply handler is deliberate: answering a question card is a
+   * CALLBACK, not a reply, and it arrives as an execute command like any other. If
+   * only replies cleared, the needs-you pin would drop out of the switcher while the
+   * badge kept contradicting it -- the most common interaction producing the most
+   * confusing state. Slash commands, interrupts and compactions are user actions on
+   * a session too, and all of them mean the user is looking at it.
+   *
+   * Optional so the poller stays usable (and testable) without storage wired in.
+   */
+  onInboundForSession?: (sessionId: string) => void;
 }
 
 export interface PollerDeps {
@@ -352,7 +366,50 @@ export class Poller {
   }
 
   /** Dispatch a message to the appropriate callback and ack on success. */
+  private static readonly KNOWN_COMMAND_TYPES = new Set([
+    "execute", "launch", "kill", "interrupt", "compact",
+    "mcp_list", "mcp_enable", "mcp_disable", "model_list", "model_set",
+  ]);
+
+  private isKnownCommandType(msg: WorkerMessage): boolean {
+    return Poller.KNOWN_COMMAND_TYPES.has((msg as { commandType: string }).commandType);
+  }
+
   private async dispatch(msg: WorkerMessage): Promise<void> {
+    // Only clear for a command we can actually dispatch. An unrecognised type warns
+    // and returns WITHOUT acking, so it is redelivered until the worker's 24h
+    // cleanup -- and clearing there would re-clear on every one of those retries.
+    // That is the realistic trigger, since version skew (worker deploying a new
+    // command type first) produces exactly it.
+    if (!this.isKnownCommandType(msg)) {
+      console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
+      return;
+    }
+
+    // Before dispatch, not after: the user has already acted by the time this
+    // arrives, so a handler that fails -- leaving the command to retry -- must not
+    // also leave the session looking unread.
+    //
+    // Note what this is NOT: markAllRead advances to the max event id AT CALL TIME,
+    // so it is monotone but not idempotent across time. A handler that fails
+    // persistently is redispatched roughly once a lease expiry (60s) until the
+    // worker's 24h cleanup, and each attempt re-clears at a later mark -- marking
+    // read anything delivered in between. That is the over-clear direction, which
+    // this feature otherwise avoids. Accepted rather than hidden: it needs a
+    // persistently failing handler AND concurrent delivery to the same session, the
+    // user is usually still in the topic, and it is bounded by the 24h cleanup.
+    // The exact fix (clamp to the command's created_at, which the worker already
+    // stores but does not send) is tracked separately.
+    const sessionId = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof sessionId === "string" && sessionId) {
+      try {
+        this.callbacks.onInboundForSession?.(sessionId);
+      } catch (err) {
+        // A badge is never worth dropping a command for.
+        console.warn("[poller] onInboundForSession failed:", err instanceof Error ? err.message : String(err));
+      }
+    }
+
     try {
       if (msg.commandType === "execute") {
         await this.callbacks.onCommand(msg);
@@ -374,9 +431,6 @@ export class Poller {
         await this.callbacks.onModelList(msg);
       } else if (msg.commandType === "model_set") {
         await this.callbacks.onModelSet(msg);
-      } else {
-        console.warn("[poller] unknown commandType:", (msg as WorkerMessage & { commandType: string }).commandType);
-        return;
       }
     } catch (err) {
       // Callback threw — skip ack so the lease expires and command retries

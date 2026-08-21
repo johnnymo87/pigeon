@@ -189,6 +189,14 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         chatId: config.telegramChatId,
       },
       {
+        // Any inbound action on a session means the user is looking at it, so the
+        // unread badge clears. This is the single boundary every Telegram-originated
+        // command crosses -- a typed reply and a question-card callback both arrive
+        // here as execute commands -- which is why it lives at dispatch rather than
+        // in the reply handler.
+        onInboundForSession: (sessionId) => {
+          storage.sessionEvents.markAllRead(sessionId, Date.now());
+        },
         onCommand: async (msg) => {
           // Resolve the target session's owning-serve client so the plugin-free
           // revive fallback (getSession + sendPrompt in revive-and-deliver) hits
