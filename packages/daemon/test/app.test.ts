@@ -2802,20 +2802,24 @@ describe("POST /sessions/{id}/read", () => {
     expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
   });
 
-  // The ceiling is the GLOBAL max, deliberately, not this session's own max. A
-  // per-session ceiling is not monotonic: prune this session's rows and its max
-  // drops -- to nothing at all once fully pruned -- so a legitimate mark-read
-  // held from before the prune would be refused and the badge would never
-  // clear. The global max only rises while anything is being delivered, and an
-  // honest client read its id from this same database, so its value is always
-  // <= the global max. The race is only in the reject direction: a concurrent
-  // append can raise the ceiling, never lower it.
-  it("accepts an id issued to ANOTHER session, because the ceiling is global", async () => {
+  // THE CEILING IS PER-SESSION, and this is the test that makes that choice
+  // falsifiable. The picker holds a map of sessions each with its own
+  // lastEventId, so posting one row's id to a NEIGHBOURING session's path is at
+  // least as plausible a client bug as the timestamp mix-up. A global ceiling
+  // would accept this silently: a busy session's id 1000 landing on a quiet
+  // session whose own max is 3 would hide everything that session receives until
+  // the ledger issues its thousandth id.
+  it("rejects an id issued to ANOTHER session -- the neighbouring-row mix-up", async () => {
     const app = newApp();
+    // Order matters: sess-1 takes ids 1-2, the busy neighbour takes 3-7. Seeding
+    // the other way round hands sess-1 the HIGH ids and the test passes
+    // vacuously against its own premise.
+    seed("sess-1", 2);
     seed("other", 5);
-    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 5 });
-    expect(res.status).toBe(200);
-    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(5);
+    expect(storage!.sessionEvents.maxEventIdForSession("sess-1")).toBe(2);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 7 });
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
   });
 
   // Fully-pruned ledger: the ceiling collapses to 0, so a positive id is
@@ -2827,7 +2831,36 @@ describe("POST /sessions/{id}/read", () => {
     expect(rejected.status).toBe(400);
     const zero = await post(app, "/sessions/sess-1/read", { last_event_id: 0 });
     expect(zero.status).toBe(200);
-    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+    // NOT `lastReadId === 0` -- that returns 0 for a MISSING row too, so it
+    // would pass whether the write landed or was dropped. Assert the row exists.
+    const row = storage!.db
+      .prepare("SELECT last_read_id AS id FROM session_reads WHERE session_id = ?")
+      .get("sess-1") as { id: number } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.id).toBe(0);
+  });
+
+  // PRUNE x CEILING. Retention is the whole reason the ceiling shape was
+  // argued over, so it gets a test rather than a paragraph. After the session's
+  // rows age out its ceiling collapses to 0 and a held id is refused -- and that
+  // costs nothing, because unreadBySession groups over session_events, so a
+  // fully-pruned session is ABSENT from the map and renders as unknown rather
+  // than a count. There is no badge left to clear, so the refusal cannot strand
+  // one. Asserted here, not assumed.
+  it("refuses a held id once the session's rows are pruned, and that strands no badge", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    expect(storage!.sessionEvents.unreadBySession().has("sess-1")).toBe(true);
+
+    // sent_at 1..3, so a cutoff above them takes every row.
+    const removed = storage!.sessionEvents.pruneOlderThan(1_000);
+    expect(removed).toBe(3);
+
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    expect(res.status).toBe(400);
+
+    // The refusal is harmless precisely because there is nothing to clear.
+    expect(storage!.sessionEvents.unreadBySession().has("sess-1")).toBe(false);
   });
 
   // The clamp lives at the UNTRUSTED BOUNDARY, not in the repo, and this pins
@@ -2852,8 +2885,9 @@ describe("POST /sessions/{id}/read", () => {
     expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(999_999);
   });
 
-  // The inbound-action clear (an internal caller) keeps working with the guard
-  // in place. Distinct from the layering test above: this one is the real path.
+  // markAllRead -- the repo call the inbound-action clear uses -- keeps working
+  // with the guard in place. This drives the REPO, not the wired handler, so it
+  // is a unit test of that path and not an integration test of the clear.
   it("does not interfere with the internal inbound-action clear", async () => {
     newApp();
     seed("sess-1", 3);

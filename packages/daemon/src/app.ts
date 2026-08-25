@@ -1199,11 +1199,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // direction: a concurrent append raises the ceiling, never lowers it.
         // REJECT rather than silently capping, so a client bug surfaces as a
         // badge that visibly refuses to clear instead of being absorbed.
-        const ceiling = storage.sessionEvents.maxEventId();
+        const ceiling = storage.sessionEvents.maxEventIdForSession(sessionId);
         if (lastEventId > ceiling) {
+          // LOG, because the caller is fire-and-forget and will never read this
+          // body. Without a line here the only symptom of a client bug is badges
+          // that quietly stop clearing -- the original complaint minus the data
+          // loss. Matches the "[stop] rejected" lines above.
+          console.warn(
+            `[read] rejected last_event_id ${lastEventId} for ${sessionId}: `
+              + `exceeds this session's max event id ${ceiling}`,
+          );
           return Response.json(
             {
-              error: "last_event_id exceeds the ledger's maximum event id",
+              error: "last_event_id exceeds this session's maximum event id",
               last_event_id: lastEventId,
               max_event_id: ceiling,
             },

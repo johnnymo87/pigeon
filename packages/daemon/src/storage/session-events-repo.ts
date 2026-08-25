@@ -117,23 +117,34 @@ export class SessionEventsRepo {
   }
 
   /**
-   * The highest id the ledger has ever issued that still survives, or 0 when it
-   * is empty.
+   * The highest id this session's surviving ledger rows carry, or 0 when it has
+   * none.
    *
-   * GLOBAL, not per-session, and that is the whole point. A per-session ceiling
-   * is not monotonic: prune a session's rows and its max drops, to nothing at
-   * all once fully pruned, so a legitimate mark-read held from before the prune
-   * would be refused and that badge would never clear again. The global max only
-   * rises while anything at all is being delivered.
+   * PER-SESSION, and that is the point rather than an accident. The picker holds
+   * a map of sessions, each with its own lastEventId, so posting one row's id to
+   * a NEIGHBOURING session's path is at least as plausible a client bug as the
+   * timestamp mix-up this ceiling was written for. A global ceiling accepts it:
+   * post a busy session's id 1000 to a quiet session whose own max is 3 and the
+   * quiet session's watermark jumps to 1000, hiding every event it receives
+   * until the ledger issues its thousandth id. A per-session ceiling bounds the
+   * same mistake to ids this session actually issued, so the worst case
+   * over-clears only what it already had and the badge revives on the very next
+   * delivery.
    *
-   * Note this is still not strictly monotonic -- pruning the newest rows would
-   * lower it -- but retention is anchored on sent_at with a 14-day horizon, so
-   * the rows near the maximum are exactly the ones pruning never takes.
+   * Refusing when the session has no surviving rows costs nothing: unreadBySession
+   * groups over session_events, so a fully-pruned session produces no row at all
+   * and renders as unknown rather than a count. There is no badge to clear, so a
+   * refusal cannot strand one.
+   *
+   * Deliberately NOT sqlite_sequence, which the schema keeps as a durable
+   * high-water mark so a recycled id cannot land below a surviving watermark.
+   * That artifact is global and would reintroduce exactly the neighbouring-session
+   * acceptance above.
    */
-  maxEventId(): number {
+  maxEventIdForSession(sessionId: string): number {
     const row = this.db
-      .prepare("SELECT MAX(id) AS id FROM session_events")
-      .get() as { id: number | null } | undefined;
+      .prepare("SELECT MAX(id) AS id FROM session_events WHERE session_id = ?")
+      .get(sessionId) as { id: number | null } | undefined;
     return row && row.id !== null ? Number(row.id) : 0;
   }
 
