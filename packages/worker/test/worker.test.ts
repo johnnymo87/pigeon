@@ -8663,7 +8663,7 @@ describe("topics module and topicName", () => {
       const request = new Request("https://worker/sessions/unregister", {
         method: "POST",
         headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId, immediate: true }),
       });
 
       const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
@@ -8697,7 +8697,7 @@ describe("topics module and topicName", () => {
       const request = new Request("https://worker/sessions/unregister", {
         method: "POST",
         headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId, immediate: true }),
       });
 
       const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
@@ -8728,7 +8728,7 @@ describe("topics module and topicName", () => {
       const request = new Request("https://worker/sessions/unregister", {
         method: "POST",
         headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId, immediate: true }),
       });
 
       const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
@@ -8802,6 +8802,85 @@ describe("topics module and topicName", () => {
       expect(telegramCalled).toBe(false);
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
+    });
+
+    it("(f) flag ON, no `immediate` -> topic is LEFT OPEN for the daily close window, zero Telegram calls", async () => {
+      // pigeon-xehy. This is the janitorial path: the daemon's hourly session reaper, dead-session
+      // cleanup and the outbox's compensating unregister all land here. Leaving the row
+      // state='open' with its `sessions` row deleted is precisely what `listOrphaned` selects, so
+      // the windowed orphan-closer collects it instead of a service message appearing off-window.
+      const sessionId = "ses_t210_case_f";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg f", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61006, now });
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+      expect(row?.closed_at).toBeNull();
+
+      // and the session row itself is still gone, which is what makes it an orphan
+      const sess = await env.DB.prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first();
+      expect(sess).toBeNull();
+    });
+
+    it("(g) flag ON, immediate, topic ALREADY closed -> closed_at is not rewritten and no Telegram call", async () => {
+      // `markClosed` is unconditional, so without the state guard a second unregister would reset
+      // closed_at and restart the reaper's 30-day delete clock, keeping a dead topic alive.
+      const sessionId = "ses_t210_case_g";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg g", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61007, now });
+      await markClosed(env.DB, { sessionId, now: now - 29 * 24 * 60 * 60 * 1000 });
+      const before = await getBySession(env.DB, sessionId);
+
+      let telegramCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
+        });
+
+      const request = new Request("https://worker/sessions/unregister", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ sessionId, immediate: true }),
+      });
+
+      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      expect(res.status).toBe(200);
+
+      expect(telegramCalled).toBe(false);
+      const after = await getBySession(env.DB, sessionId);
+      expect(after?.closed_at).toBe(before?.closed_at);
     });
   });
 

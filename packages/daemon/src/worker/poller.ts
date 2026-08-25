@@ -485,8 +485,18 @@ export class Poller {
    * cron). A silently-swallowed failure there leaks that row permanently.
    *
    * Existing callers that ignore the return value keep their previous best-effort behaviour.
+   *
+   * `immediate` asks the worker to close the session's forum topic right now instead of leaving it
+   * for the daily close window (pigeon-xehy). Pass it ONLY from an interactive path (`/kill`,
+   * explicit session delete) where a human is waiting to see the topic shut. Janitorial callers —
+   * the hourly session reaper, dead-session cleanup, the outbox's compensating unregister — must
+   * leave it unset so their closes batch into the window instead of trickling unread topics into
+   * the sidebar around the clock.
    */
-  async unregisterSession(sessionId: string): Promise<WorkerResult> {
+  async unregisterSession(
+    sessionId: string,
+    opts: { immediate?: boolean } = {},
+  ): Promise<WorkerResult> {
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/sessions/unregister`, {
         method: "POST",
@@ -494,7 +504,9 @@ export class Poller {
           Authorization: `Bearer ${this.config.apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify(
+          opts.immediate ? { sessionId, immediate: true } : { sessionId },
+        ),
       }),
     );
     if (result.ok) {

@@ -642,7 +642,11 @@ const server = startServer(config, createApp(storage, {
     // /route 200 (workstation-boi9).
     storage.assignments.delete(sessionId);
     if (poller) {
-      await poller.unregisterSession(sessionId);
+      // Interactive close: this fires on an explicit session delete (`/kill`, plugin session
+      // teardown), where a human is watching, so the forum topic closes now rather than waiting
+      // for the daily close window. Every janitorial unregister deliberately omits the flag —
+      // see poller.unregisterSession and worker sessions.ts (pigeon-xehy).
+      await poller.unregisterSession(sessionId, { immediate: true });
     }
   },
 }));

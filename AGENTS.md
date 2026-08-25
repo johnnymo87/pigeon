@@ -262,7 +262,18 @@ Closing a forum topic makes Telegram post a service message into it, which marks
 
 The window is four hours rather than one tick **instead of** a durable "last run was cut short" flag: `closeOrphanedTopics` aborts the whole run on a Telegram 429, and a backlog can exceed the cap, so hours 13–15 are a stateless catch-up. On an ordinary day the 12:00 tick drains everything and the later ticks find zero orphans and post nothing, so the catch-up is invisible unless needed. Changing the schedule means editing `TOPIC_CLOSE_WINDOW_START_HOUR_UTC` / `TOPIC_CLOSE_WINDOW_HOURS` in `packages/worker/src/topic-reaper.ts` and redeploying — it is a constant, not a `wrangler.toml` var, because a var change requires a deploy anyway.
 
-The gate reads `ScheduledController.scheduledTime` (the tick's own timestamp), not `Date.now()`, so it cannot drift with however long the earlier cron jobs took. Topic closes triggered by ordinary session lifecycle — `/kill`, `POST /sessions/unregister`, the daemon's reaper — are **not** gated and still happen immediately; the window governs only the janitorial sweep.
+The gate reads `ScheduledController.scheduledTime` (the tick's own timestamp), not `Date.now()`, so it cannot drift with however long the earlier cron jobs took.
+
+**Gating only the cron was not enough (`pigeon-xehy`).** `POST /sessions/unregister` also closed a topic, immediately and ungated, and *three* non-interactive callers reach it: the daemon's hourly session reaper (`session-reaper.ts`), dead-session cleanup (`command-ingest.ts`), and the outbox's compensating unregister (`outbox-sender.ts`). Because the reaper fires every hour on a 7-day TTL, topics kept closing around the clock long after the window shipped — the window worked, it just never saw those topics. The symptom is indistinguishable from "the change didn't deploy", and it was diagnosed as such at first.
+
+So the unregister route now **defers by default**: it deletes the session, leaves the topic `state='open'`, and lets the windowed orphan-closer collect it (that state — open topic, absent session — is exactly what `listOrphaned` selects). An interactive close opts in with `immediate: true`, sent only from the daemon's `onSessionDelete` (i.e. `/kill` and explicit session teardown).
+
+Two things about that shape are deliberate:
+
+- **The gate lives at the worker choke point, not in each daemon caller.** Per-caller opt-out would mean three call sites, and missing one keeps half the symptom (the `pigeon-twdw` lesson). It also matters for deployment: the worker deploys centrally while daemons are per-machine, so a choke-point default fixes every machine on one deploy instead of waiting for the slowest daemon.
+- **Default-defer, not default-close.** Both version skews degrade harmlessly — an old daemon that never sends the flag just gets its `/kill` closes batched into the window (cosmetic, self-healing), and a new daemon against an old worker has the field ignored.
+
+The immediate path is additionally guarded on `topic.state === 'open'`, because `markClosed` is unconditional: re-closing an already-closed topic rewrote `closed_at` and restarted the reaper's 30-day delete clock, so a double unregister could keep a dead topic alive indefinitely.
 
 ### Session Reaper
 
