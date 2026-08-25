@@ -116,6 +116,38 @@ export class SessionEventsRepo {
     this.advanceRead(sessionId, Number(row.id), now);
   }
 
+  /**
+   * The highest id this session's surviving ledger rows carry, or 0 when it has
+   * none.
+   *
+   * PER-SESSION, and that is the point rather than an accident. The picker holds
+   * a map of sessions, each with its own lastEventId, so posting one row's id to
+   * a NEIGHBOURING session's path is at least as plausible a client bug as the
+   * timestamp mix-up this ceiling was written for. A global ceiling accepts it:
+   * post a busy session's id 1000 to a quiet session whose own max is 3 and the
+   * quiet session's watermark jumps to 1000, hiding every event it receives
+   * until the ledger issues its thousandth id. A per-session ceiling bounds the
+   * same mistake to ids this session actually issued, so the worst case
+   * over-clears only what it already had and the badge revives on the very next
+   * delivery.
+   *
+   * Refusing when the session has no surviving rows costs nothing: unreadBySession
+   * groups over session_events, so a fully-pruned session produces no row at all
+   * and renders as unknown rather than a count. There is no badge to clear, so a
+   * refusal cannot strand one.
+   *
+   * Deliberately NOT sqlite_sequence, which the schema keeps as a durable
+   * high-water mark so a recycled id cannot land below a surviving watermark.
+   * That artifact is global and would reintroduce exactly the neighbouring-session
+   * acceptance above.
+   */
+  maxEventIdForSession(sessionId: string): number {
+    const row = this.db
+      .prepare("SELECT MAX(id) AS id FROM session_events WHERE session_id = ?")
+      .get(sessionId) as { id: number | null } | undefined;
+    return row && row.id !== null ? Number(row.id) : 0;
+  }
+
   lastReadId(sessionId: string): number {
     const row = this.db
       .prepare("SELECT last_read_id AS id FROM session_reads WHERE session_id = ?")

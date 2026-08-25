@@ -2769,6 +2769,133 @@ describe("POST /sessions/{id}/read", () => {
     expect(res.status).toBe(400);
   });
 
+  // THE CLAMP (workstation-cqit). unreadBySession returns lastEventId AND
+  // lastEventAt from the same query and the picker holds both, so sending the
+  // TIMESTAMP where the id belongs is a plain field mix-up. Under a MAX()
+  // upsert that permanently hides every future event for the session, with no
+  // error and no way back short of manual SQL -- exactly the silent,
+  // unrecoverable class this feature is organised against. So the endpoint
+  // refuses any id the ledger cannot possibly have issued.
+  it("rejects a last_event_id above the ledger's max -- the timestamp mix-up", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 1_787_363_318_300 });
+    expect(res.status).toBe(400);
+    // The point of the guard: the watermark must be UNTOUCHED, not merely the
+    // response unhappy.
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  it("accepts exactly the ledger's max id (boundary, not off by one)", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    expect(res.status).toBe(200);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(3);
+  });
+
+  it("rejects max+1", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 4 });
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  // THE CEILING IS PER-SESSION, and this is the test that makes that choice
+  // falsifiable. The picker holds a map of sessions each with its own
+  // lastEventId, so posting one row's id to a NEIGHBOURING session's path is at
+  // least as plausible a client bug as the timestamp mix-up. A global ceiling
+  // would accept this silently: a busy session's id 1000 landing on a quiet
+  // session whose own max is 3 would hide everything that session receives until
+  // the ledger issues its thousandth id.
+  it("rejects an id issued to ANOTHER session -- the neighbouring-row mix-up", async () => {
+    const app = newApp();
+    // Order matters: sess-1 takes ids 1-2, the busy neighbour takes 3-7. Seeding
+    // the other way round hands sess-1 the HIGH ids and the test passes
+    // vacuously against its own premise.
+    seed("sess-1", 2);
+    seed("other", 5);
+    expect(storage!.sessionEvents.maxEventIdForSession("sess-1")).toBe(2);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 7 });
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  // Fully-pruned ledger: the ceiling collapses to 0, so a positive id is
+  // refused. Under-clear is the safe direction and self-heals as soon as
+  // anything is delivered again; it cannot hide messages.
+  it("refuses a positive id when the ledger is empty, and allows a no-op 0", async () => {
+    const app = newApp();
+    const rejected = await post(app, "/sessions/sess-1/read", { last_event_id: 1 });
+    expect(rejected.status).toBe(400);
+    const zero = await post(app, "/sessions/sess-1/read", { last_event_id: 0 });
+    expect(zero.status).toBe(200);
+    // NOT `lastReadId === 0` -- that returns 0 for a MISSING row too, so it
+    // would pass whether the write landed or was dropped. Assert the row exists.
+    const row = storage!.db
+      .prepare("SELECT last_read_id AS id FROM session_reads WHERE session_id = ?")
+      .get("sess-1") as { id: number } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.id).toBe(0);
+  });
+
+  // PRUNE x CEILING. Retention is the whole reason the ceiling shape was
+  // argued over, so it gets a test rather than a paragraph. After the session's
+  // rows age out its ceiling collapses to 0 and a held id is refused -- and that
+  // costs nothing, because unreadBySession groups over session_events, so a
+  // fully-pruned session is ABSENT from the map and renders as unknown rather
+  // than a count. There is no badge left to clear, so the refusal cannot strand
+  // one. Asserted here, not assumed.
+  it("refuses a held id once the session's rows are pruned, and that strands no badge", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    expect(storage!.sessionEvents.unreadBySession().has("sess-1")).toBe(true);
+
+    // sent_at 1..3, so a cutoff above them takes every row.
+    const removed = storage!.sessionEvents.pruneOlderThan(1_000);
+    expect(removed).toBe(3);
+
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    expect(res.status).toBe(400);
+
+    // The refusal is harmless precisely because there is nothing to clear.
+    expect(storage!.sessionEvents.unreadBySession().has("sess-1")).toBe(false);
+  });
+
+  // The clamp lives at the UNTRUSTED BOUNDARY, not in the repo, and this pins
+  // that layering rather than merely asserting the happy path.
+  //
+  // An earlier version of this test only checked that markAllRead still worked,
+  // which a repo-level clamp would ALSO satisfy -- so it could not fail for the
+  // reason its comment gave. Mutation testing caught that: moving the guard into
+  // advanceRead left this test green. It now asserts the property directly, by
+  // driving the repo past the ceiling and requiring the write to land.
+  //
+  // Internal callers derive their ids from the ledger itself and are trusted;
+  // validation belongs where the input arrives from outside.
+  it("does not clamp at the repo layer -- internal callers are trusted", async () => {
+    newApp();
+    seed("sess-1", 3);
+
+    // Absurd, far above the ledger's max. The ENDPOINT would refuse this; the
+    // repo must not, or the inbound-action clear and any future internal caller
+    // would be silently gated by client-input validation.
+    storage!.sessionEvents.advanceRead("sess-1", 999_999, 1_000);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(999_999);
+  });
+
+  // markAllRead -- the repo call the inbound-action clear uses -- keeps working
+  // with the guard in place. This drives the REPO, not the wired handler, so it
+  // is a unit test of that path and not an integration test of the clear.
+  it("does not interfere with the internal inbound-action clear", async () => {
+    newApp();
+    seed("sess-1", 3);
+    storage!.sessionEvents.markAllRead("sess-1", 1_000);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(3);
+  });
+
+
   // The ledger deliberately outlives the sessions row, so a read for a session
   // pigeon has already reaped must still be recorded rather than 404'd.
   it("records a read for a session that is not in the sessions table", async () => {
