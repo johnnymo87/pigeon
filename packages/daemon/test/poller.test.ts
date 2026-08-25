@@ -1233,3 +1233,33 @@ describe("Poller: inbound action clears unread", () => {
     expect(callbacks.onCommand).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
+  function capture() {
+    const bodies: unknown[] = [];
+    const fetchFn = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    return { bodies, poller };
+  }
+
+  it("omits `immediate` by default, so janitorial unregisters defer the topic close", async () => {
+    const { bodies, poller } = capture();
+
+    await poller.unregisterSession("sess-defer");
+
+    expect(bodies[0]).toEqual({ sessionId: "sess-defer" });
+  });
+
+  it("sends `immediate: true` when an interactive caller asks for it", async () => {
+    const { bodies, poller } = capture();
+
+    await poller.unregisterSession("sess-kill", { immediate: true });
+
+    expect(bodies[0]).toEqual({ sessionId: "sess-kill", immediate: true });
+  });
+});

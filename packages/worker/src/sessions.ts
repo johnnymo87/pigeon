@@ -129,6 +129,29 @@ async function unregisterSession(
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const sessionId = body.sessionId as string | undefined;
+  // Default-DEFER (pigeon-xehy). Closing a forum topic makes Telegram post a service message
+  // that marks the topic UNREAD, so closes are batched into a daily window
+  // (`shouldCloseOrphans`). This endpoint used to close unconditionally, which meant every
+  // NON-INTERACTIVE unregister — the daemon's hourly session reaper, dead-session cleanup, the
+  // outbox's compensating unregister — closed a topic off-window and defeated that batching.
+  //
+  // The gate lives HERE, at the single choke point, rather than in each daemon caller. Two
+  // reasons: (1) three separate daemon call sites would each have to opt in and any one missed
+  // keeps half the symptom, which is the pigeon-twdw lesson; (2) the daemon is deployed
+  // per-machine while the worker deploys centrally, so an opt-in flag would only take effect
+  // once every machine had been updated.
+  //
+  // Deferring is safe because the state left behind — topic `state='open'` with no `sessions`
+  // row — is exactly what `listOrphaned` selects, so the windowed orphan-closer collects it on
+  // its next in-window tick (at most ~1 day later, and the 30-day reap clock starts from that
+  // close).
+  //
+  // `immediate` is the opt-in for an INTERACTIVE close (`/kill`, explicit session delete), where
+  // a human is watching and expects the topic to shut immediately. Both version skews are safe:
+  // an old daemon that never sends the flag simply gets its `/kill` closes batched (cosmetic,
+  // self-healing), and a new daemon talking to an old worker sees the field ignored, i.e. today's
+  // behaviour.
+  const immediate = body.immediate === true;
 
   if (!sessionId) {
     return Response.json({ error: "sessionId required" }, { status: 400 });
@@ -147,9 +170,12 @@ async function unregisterSession(
   // whose `sessions` row is ABSENT, which is exactly the state this leaves behind. Running the
   // block first would instead 500 the request, leave the session row in place, and give the
   // daemon's session-reaper a call that fails identically on every retry.
-  if (topicsEnabled(env)) {
+  if (immediate && topicsEnabled(env)) {
     const topic = await getBySession(db, sessionId);
-    if (topic) {
+    // `state === "open"` guard: `markClosed` is unconditional, so re-closing an already-closed
+    // topic rewrites `closed_at` and restarts the 30-day reap clock, keeping a dead topic alive
+    // indefinitely if anything unregisters the same session twice.
+    if (topic && topic.state === "open") {
       // Mark closed in D1 before touching Telegram, so a failed/timed-out Telegram call still
       // leaves a row the reaper will collect.
       await markClosed(db, { sessionId });
