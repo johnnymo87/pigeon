@@ -2769,6 +2769,99 @@ describe("POST /sessions/{id}/read", () => {
     expect(res.status).toBe(400);
   });
 
+  // THE CLAMP (workstation-cqit). unreadBySession returns lastEventId AND
+  // lastEventAt from the same query and the picker holds both, so sending the
+  // TIMESTAMP where the id belongs is a plain field mix-up. Under a MAX()
+  // upsert that permanently hides every future event for the session, with no
+  // error and no way back short of manual SQL -- exactly the silent,
+  // unrecoverable class this feature is organised against. So the endpoint
+  // refuses any id the ledger cannot possibly have issued.
+  it("rejects a last_event_id above the ledger's max -- the timestamp mix-up", async () => {
+    const app = newApp();
+    seed();
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 1_787_363_318_300 });
+    expect(res.status).toBe(400);
+    // The point of the guard: the watermark must be UNTOUCHED, not merely the
+    // response unhappy.
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  it("accepts exactly the ledger's max id (boundary, not off by one)", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 3 });
+    expect(res.status).toBe(200);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(3);
+  });
+
+  it("rejects max+1", async () => {
+    const app = newApp();
+    seed("sess-1", 3);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 4 });
+    expect(res.status).toBe(400);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  // The ceiling is the GLOBAL max, deliberately, not this session's own max. A
+  // per-session ceiling is not monotonic: prune this session's rows and its max
+  // drops -- to nothing at all once fully pruned -- so a legitimate mark-read
+  // held from before the prune would be refused and the badge would never
+  // clear. The global max only rises while anything is being delivered, and an
+  // honest client read its id from this same database, so its value is always
+  // <= the global max. The race is only in the reject direction: a concurrent
+  // append can raise the ceiling, never lower it.
+  it("accepts an id issued to ANOTHER session, because the ceiling is global", async () => {
+    const app = newApp();
+    seed("other", 5);
+    const res = await post(app, "/sessions/sess-1/read", { last_event_id: 5 });
+    expect(res.status).toBe(200);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(5);
+  });
+
+  // Fully-pruned ledger: the ceiling collapses to 0, so a positive id is
+  // refused. Under-clear is the safe direction and self-heals as soon as
+  // anything is delivered again; it cannot hide messages.
+  it("refuses a positive id when the ledger is empty, and allows a no-op 0", async () => {
+    const app = newApp();
+    const rejected = await post(app, "/sessions/sess-1/read", { last_event_id: 1 });
+    expect(rejected.status).toBe(400);
+    const zero = await post(app, "/sessions/sess-1/read", { last_event_id: 0 });
+    expect(zero.status).toBe(200);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(0);
+  });
+
+  // The clamp lives at the UNTRUSTED BOUNDARY, not in the repo, and this pins
+  // that layering rather than merely asserting the happy path.
+  //
+  // An earlier version of this test only checked that markAllRead still worked,
+  // which a repo-level clamp would ALSO satisfy -- so it could not fail for the
+  // reason its comment gave. Mutation testing caught that: moving the guard into
+  // advanceRead left this test green. It now asserts the property directly, by
+  // driving the repo past the ceiling and requiring the write to land.
+  //
+  // Internal callers derive their ids from the ledger itself and are trusted;
+  // validation belongs where the input arrives from outside.
+  it("does not clamp at the repo layer -- internal callers are trusted", async () => {
+    newApp();
+    seed("sess-1", 3);
+
+    // Absurd, far above the ledger's max. The ENDPOINT would refuse this; the
+    // repo must not, or the inbound-action clear and any future internal caller
+    // would be silently gated by client-input validation.
+    storage!.sessionEvents.advanceRead("sess-1", 999_999, 1_000);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(999_999);
+  });
+
+  // The inbound-action clear (an internal caller) keeps working with the guard
+  // in place. Distinct from the layering test above: this one is the real path.
+  it("does not interfere with the internal inbound-action clear", async () => {
+    newApp();
+    seed("sess-1", 3);
+    storage!.sessionEvents.markAllRead("sess-1", 1_000);
+    expect(storage!.sessionEvents.lastReadId("sess-1")).toBe(3);
+  });
+
+
   // The ledger deliberately outlives the sessions row, so a read for a session
   // pigeon has already reaped must still be recorded rather than 404'd.
   it("records a read for a session that is not in the sessions table", async () => {

@@ -1183,6 +1183,34 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
 
+        // CLAMP against what the ledger could actually have issued.
+        //
+        // unreadBySession returns lastEventId AND lastEventAt from the same
+        // query, and the picker holds both, so sending the TIMESTAMP where the
+        // id belongs is a plain field mix-up -- and under the MAX() upsert
+        // below that would permanently hide every future event for this
+        // session, with no error, no log, and no way back short of manual SQL.
+        // A badge that simply never appears again is indistinguishable from
+        // "you have read everything", the exact silent-and-unrecoverable
+        // failure this feature exists to prevent.
+        //
+        // An honest client read its id from this same database, so its value
+        // is always <= the global max, and the race runs only in the reject
+        // direction: a concurrent append raises the ceiling, never lowers it.
+        // REJECT rather than silently capping, so a client bug surfaces as a
+        // badge that visibly refuses to clear instead of being absorbed.
+        const ceiling = storage.sessionEvents.maxEventId();
+        if (lastEventId > ceiling) {
+          return Response.json(
+            {
+              error: "last_event_id exceeds the ledger's maximum event id",
+              last_event_id: lastEventId,
+              max_event_id: ceiling,
+            },
+            { status: 400 },
+          );
+        }
+
         // Deliberately no 404 for an unknown session. The ledger outlives the
         // sessions row by design, so a read for a session the reaper has already
         // removed is still meaningful and must be recorded.

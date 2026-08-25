@@ -116,6 +116,27 @@ export class SessionEventsRepo {
     this.advanceRead(sessionId, Number(row.id), now);
   }
 
+  /**
+   * The highest id the ledger has ever issued that still survives, or 0 when it
+   * is empty.
+   *
+   * GLOBAL, not per-session, and that is the whole point. A per-session ceiling
+   * is not monotonic: prune a session's rows and its max drops, to nothing at
+   * all once fully pruned, so a legitimate mark-read held from before the prune
+   * would be refused and that badge would never clear again. The global max only
+   * rises while anything at all is being delivered.
+   *
+   * Note this is still not strictly monotonic -- pruning the newest rows would
+   * lower it -- but retention is anchored on sent_at with a 14-day horizon, so
+   * the rows near the maximum are exactly the ones pruning never takes.
+   */
+  maxEventId(): number {
+    const row = this.db
+      .prepare("SELECT MAX(id) AS id FROM session_events")
+      .get() as { id: number | null } | undefined;
+    return row && row.id !== null ? Number(row.id) : 0;
+  }
+
   lastReadId(sessionId: string): number {
     const row = this.db
       .prepare("SELECT last_read_id AS id FROM session_reads WHERE session_id = ?")
