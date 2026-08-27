@@ -793,10 +793,42 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // whitespace-hash count can never change a mirroring decision. What the reorder actually
         // buys is that the row is freed when its echo arrives instead of lingering to the TTL
         // sweep, and that a future caller of consume() cannot inherit a shape-dependent rule.
+        //
+        // payloadHasCloseTag is a BACKSTOP, not the primary test. injected_prompts is
+        // authoritative and hash-exact; the envelope catches the one case it misses --
+        // a record that expired (INJECTED_PROMPTS_TTL_MS, 15 min) before the echo
+        // arrived, where consume() returns false past the cutoff. How often that
+        // happens is UNQUANTIFIED and deliberately not asserted here: it depends on
+        // whether opencode creates the user-message row at prompt_async receipt or at
+        // turn dequeue, which is not knowable from this repo. The envelope boundary
+        // cannot be forged by payload content (envelope.ts rejects a close tag at both
+        // enqueue and render), so it is safe to trust.
+        //
+        // This also closes a latent mirror leak: such a turn previously posted to
+        // Telegram as a 🧑 human message. Pinned by the "neither clears nor mirrors an
+        // enveloped turn" test.
+        //
+        // Residual: a human who pastes a literal close tag into a prompt gets neither
+        // mirror nor clear. Self-heals on their next turn.
         const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
-        if (wasInjected || !text.trim()) {
+        if (wasInjected || !text.trim() || payloadHasCloseTag(text)) {
           return Response.json({ mirrored: false });
         }
+
+        // A human typed this into the TUI. Authoring a turn is evidence they read what
+        // preceded it, so advance the read watermark.
+        //
+        // PLACEMENT IS LOAD-BEARING, in both directions:
+        //  - BELOW the early-return above, or injected prompts would clear.
+        //  - ABOVE shouldEmitAncillaryFor, or a session with notify-policy
+        //    'none'/'errors-only' would never clear. Badge state and Telegram delivery
+        //    policy are unrelated concerns and must not be coupled.
+        // Both directions are pinned by tests in mirror-route.test.ts.
+        //
+        // The Telegram half of this behaviour is NOT here -- it lives at
+        // poller.dispatch (#125), which fires for every Telegram-originated command
+        // before its handler runs. Do not add a second Telegram clear here.
+        storage.sessionEvents.markAllRead(sessionId, now);
 
         // A session declared quiet (lgtm's automated reviews) must not mirror its
         // prompts. Without this, lgtm's own launch prompt -- a user-role message the
