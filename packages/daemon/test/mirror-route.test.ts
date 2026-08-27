@@ -477,7 +477,27 @@ describe("POST /mirror route", () => {
       const res = await post(app, "ses_lgtm", "hello");
 
       expect(await res.json()).toEqual({ mirrored: false, reason: "quiet_origin" });
-      expect(storage!.sessionEvents.lastReadId("ses_lgtm")).toBeGreaterThan(0);
+      // Equality, not toBeGreaterThan: a regression that over-clears past MAX(id)
+      // (e.g. advanceRead with a global ceiling) would satisfy "> 0" and pass.
+      expect(storage!.sessionEvents.lastReadId("ses_lgtm")).toBe(
+        storage!.sessionEvents.maxEventIdForSession("ses_lgtm"),
+      );
+    });
+
+    it("still consumes the injected row when the turn is also enveloped", async () => {
+      // The consume() call must stay ABOVE the early-return, so an injected row is
+      // freed by its own echo rather than lingering to the TTL sweep. Adding the
+      // envelope term to that return makes it newly possible to reorder them without
+      // any other test noticing.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_1", notify: true }, 1_000);
+      const text = '<swarm_message from="ses_x" kind="chat">do the thing</swarm_message>';
+      storage!.injectedPrompts.record("ses_1", hashPrompt(text), 1_000);
+      expect(storage!.injectedPrompts.has("ses_1", hashPrompt(text), 1_000)).toBe(true);
+
+      await post(app, "ses_1", text);
+
+      expect(storage!.injectedPrompts.has("ses_1", hashPrompt(text), 1_000)).toBe(false);
     });
   });
 });
