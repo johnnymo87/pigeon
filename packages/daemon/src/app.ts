@@ -793,10 +793,54 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // whitespace-hash count can never change a mirroring decision. What the reorder actually
         // buys is that the row is freed when its echo arrives instead of lingering to the TTL
         // sweep, and that a future caller of consume() cannot inherit a shape-dependent rule.
+        //
+        // payloadHasCloseTag is a BACKSTOP, not the primary test. injected_prompts is
+        // authoritative and hash-exact; the envelope catches the one case it misses --
+        // a record that expired (INJECTED_PROMPTS_TTL_MS, 15 min) before the echo
+        // arrived, where consume() returns false past the cutoff. How often that
+        // happens is UNQUANTIFIED and deliberately not asserted here: it depends on
+        // whether opencode creates the user-message row at prompt_async receipt or at
+        // turn dequeue, which is not knowable from this repo. The envelope boundary
+        // cannot be forged by payload content (envelope.ts rejects a close tag at both
+        // enqueue and render), so it is safe to trust.
+        //
+        // This also closes a latent mirror leak: such a turn previously posted to
+        // Telegram as a 🧑 human message. Pinned by the "neither clears nor mirrors an
+        // enveloped turn" test.
+        //
+        // Residual: a human who pastes a literal close tag into a prompt gets neither
+        // mirror nor clear. Self-heals on their next turn.
         const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
-        if (wasInjected || !text.trim()) {
+        if (wasInjected || !text.trim() || payloadHasCloseTag(text)) {
           return Response.json({ mirrored: false });
         }
+
+        // A user-role turn the daemon did not inject. Authoring a turn is evidence of
+        // having read what preceded it, so advance the read watermark.
+        //
+        // SAY WHAT THIS ACTUALLY ESTABLISHES, which is provenance, not presence.
+        // It is tempting to write "a human typed this into the TUI"; ancillary-gate.ts
+        // refutes that in terms, and it is the same trap that let lgtm's launch prompt
+        // mirror into Telegram: /mirror sees any user-role message absent from
+        // injected_prompts, and a session started outside the daemon (opencode-launch,
+        // `opencode run`, a peer driving the serve API) produces exactly that.
+        // Residual, accepted: such a turn clears a badge no human saw. It is bounded
+        // to sessions that ALREADY have unread events -- a launch prompt is normally a
+        // session's first event, where markAllRead no-ops on the empty ledger -- and it
+        // costs a bookmark, not content.
+        //
+        // PLACEMENT IS LOAD-BEARING, in both directions:
+        //  - BELOW the early-return above, or injected prompts would clear.
+        //  - ABOVE shouldEmitAncillaryFor, or a session with notify-policy
+        //    'none'/'errors-only' would never clear. Badge state and Telegram delivery
+        //    policy are unrelated concerns and must not be coupled.
+        // Both directions are pinned by tests in mirror-route.test.ts.
+        //
+        // The Telegram half of this behaviour is NOT here -- it lives at
+        // poller.dispatch (#125), which fires for every DISPATCHABLE command before its
+        // handler runs (unknown command types return earlier without clearing, so
+        // version skew does not clear). Do not add a second Telegram clear here.
+        storage.sessionEvents.markAllRead(sessionId, now);
 
         // A session declared quiet (lgtm's automated reviews) must not mirror its
         // prompts. Without this, lgtm's own launch prompt -- a user-role message the
@@ -1129,6 +1173,31 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const deleted = storage.pendingQuestions.delete(sessionId);
+
+        // Resolving a question is evidence of presence -- and for one resolved in the
+        // TUI this is the ONLY such signal: it creates no user text message, so
+        // /mirror never fires, and no Telegram command reaches poller.dispatch.
+        // Without this, a question notification's badge survives an unambiguous act at
+        // the keyboard.
+        //
+        // "Resolved", not "answered": the plugin posts here for question.replied AND
+        // question.rejected (opencode-plugin/src/index.ts:722), so dismissing a
+        // question also clears. That is intended -- dismissing is still presence.
+        // Known residual: opencode exposes HTTP question reply/reject routes, so an
+        // external caller could resolve a question with no human involved. Verified at
+        // time of writing that no pigeon tooling does this (none of the five swarm
+        // tools reference questions); the only repliers are the Telegram paths, which
+        // poller.dispatch already covers.
+        //
+        // A question resolved in Telegram therefore clears TWICE: once at
+        // poller.dispatch (#125), once here. Harmless -- but NOT because markAllRead is
+        // monotone. Monotonicity makes the pair order-insensitive; it says nothing
+        // about time, and markAllRead advances to MAX(id) AT CALL TIME, so anything
+        // delivered between the two calls is marked read unseen (the same residual
+        // documented at poller.ts:393-402). It is harmless because that window is one
+        // reply round-trip wide and the human demonstrably acted immediately before it.
+        storage.sessionEvents.markAllRead(sessionId, nowFn());
+
         return Response.json({ ok: true, cleared: deleted });
       }
 

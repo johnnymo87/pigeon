@@ -386,4 +386,118 @@ describe("POST /mirror route", () => {
       expect(await res.json()).toEqual({ mirrored: true });
     });
   });
+
+  describe("clearing the unread watermark on a human-authored turn", () => {
+    function post(app: ReturnType<typeof createApp>, sessionId: string, text: string) {
+      return app(
+        new Request("http://localhost/mirror", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId, messageId: "msg_1", text }),
+        }),
+      );
+    }
+
+    it("clears the watermark when a human types in the TUI", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_1", notify: true }, 1_000);
+      storage!.sessionEvents.append({
+        sessionId: "ses_1",
+        notificationId: "n1",
+        kind: "stop",
+        sentAt: 1_000,
+      });
+      expect(storage!.sessionEvents.lastReadId("ses_1")).toBe(0);
+
+      await post(app, "ses_1", "what about the retry path?");
+
+      expect(storage!.sessionEvents.lastReadId("ses_1")).toBe(
+        storage!.sessionEvents.maxEventIdForSession("ses_1"),
+      );
+    });
+
+    it("does NOT clear when the turn was an injected prompt", async () => {
+      // Placement guard: fails if markAllRead drifts ABOVE the early-return.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_1", notify: true }, 1_000);
+      storage!.sessionEvents.append({
+        sessionId: "ses_1",
+        notificationId: "n1",
+        kind: "stop",
+        sentAt: 1_000,
+      });
+      const text = "injected by a peer";
+      storage!.injectedPrompts.record("ses_1", hashPrompt(text), 1_000);
+
+      await post(app, "ses_1", text);
+
+      expect(storage!.sessionEvents.lastReadId("ses_1")).toBe(0);
+    });
+
+    it("neither clears nor mirrors an enveloped turn whose injected record expired", async () => {
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_1", notify: true }, 1_000);
+      storage!.sessionEvents.append({
+        sessionId: "ses_1",
+        notificationId: "n1",
+        kind: "stop",
+        sentAt: 1_000,
+      });
+      // No injected_prompts row at all: the TTL-expiry / hash-miss case.
+      const text = '<swarm_message from="ses_x" kind="chat">do the thing</swarm_message>';
+
+      const res = await post(app, "ses_1", text);
+
+      // Asserting BOTH pins the latent mirror-leak fix, not just the clearing.
+      expect(await res.json()).toEqual({ mirrored: false });
+      expect(storage!.sessionEvents.lastReadId("ses_1")).toBe(0);
+    });
+
+    it("clears for a quiet-origin session even though it does not mirror", async () => {
+      // PLACEMENT GUARD. Fails if markAllRead drifts BELOW shouldEmitAncillaryFor.
+      // Badge state and Telegram delivery policy are unrelated concerns.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_lgtm", notify: true }, 1_000);
+      storage!.sessionOrigins.record(
+        {
+          sessionId: "ses_lgtm",
+          origin: "lgtm",
+          notifyPolicy: "errors-only",
+          source: "declared",
+        },
+        1_000,
+      );
+      storage!.sessionEvents.append({
+        sessionId: "ses_lgtm",
+        notificationId: "n1",
+        kind: "stop",
+        sentAt: 1_000,
+      });
+
+      const res = await post(app, "ses_lgtm", "hello");
+
+      expect(await res.json()).toEqual({ mirrored: false, reason: "quiet_origin" });
+      // Equality, not toBeGreaterThan: a regression that over-clears past MAX(id)
+      // (e.g. advanceRead with a global ceiling) would satisfy "> 0" and pass.
+      expect(storage!.sessionEvents.lastReadId("ses_lgtm")).toBe(
+        storage!.sessionEvents.maxEventIdForSession("ses_lgtm"),
+      );
+    });
+
+    it("still consumes the injected row when the turn is also enveloped", async () => {
+      // The consume() call must stay ABOVE the early-return, so an injected row is
+      // freed by its own echo rather than lingering to the TTL sweep. Adding the
+      // envelope term to that return makes it newly possible to reorder them without
+      // any other test noticing.
+      const app = newApp();
+      storage!.sessions.upsert({ sessionId: "ses_1", notify: true }, 1_000);
+      const text = '<swarm_message from="ses_x" kind="chat">do the thing</swarm_message>';
+      storage!.injectedPrompts.record("ses_1", hashPrompt(text), 1_000);
+      expect(storage!.injectedPrompts.has("ses_1", hashPrompt(text), 1_000)).toBe(true);
+
+      await post(app, "ses_1", text);
+
+      expect(storage!.injectedPrompts.has("ses_1", hashPrompt(text), 1_000)).toBe(false);
+    });
+  });
 });
