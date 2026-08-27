@@ -1161,6 +1161,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const deleted = storage.pendingQuestions.delete(sessionId);
+
+        // Answering a question is evidence the human was present -- and for a
+        // question answered in the TUI this is the ONLY such signal: it creates no
+        // user text message, so /mirror never fires, and no Telegram command reaches
+        // poller.dispatch. Without this the badge for a question notification
+        // survives an unambiguous act of presence at the keyboard.
+        //
+        // A question answered in Telegram is already cleared at poller.dispatch
+        // (#125); this double-fire is harmless because markAllRead is monotone.
+        storage.sessionEvents.markAllRead(sessionId, nowFn());
+
         return Response.json({ ok: true, cleared: deleted });
       }
 

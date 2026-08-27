@@ -1314,6 +1314,54 @@ describe("createApp", () => {
     expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
   });
 
+  it("POST /question-answered clears the unread watermark", async () => {
+    // A question answered in the TUI creates NO user text message, so /mirror
+    // never fires and no Telegram command reaches poller.dispatch. This endpoint
+    // is the only signal that the human acted.
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    storage.sessionEvents.append({
+      sessionId: "sess-qa",
+      notificationId: "n1",
+      kind: "question",
+      sentAt: 1_000,
+    });
+    expect(storage.sessionEvents.lastReadId("sess-qa")).toBe(0);
+
+    const response = await app(new Request("http://localhost/question-answered", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qa" }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(storage.sessionEvents.lastReadId("sess-qa")).toBe(
+      storage.sessionEvents.maxEventIdForSession("sess-qa"),
+    );
+  });
+
+  it("POST /question-answered without a session_id is a 400 and clears nothing", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    storage.sessionEvents.append({
+      sessionId: "sess-qa",
+      notificationId: "n1",
+      kind: "question",
+      sentAt: 1_000,
+    });
+
+    const response = await app(new Request("http://localhost/question-answered", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    }));
+
+    expect(response.status).toBe(400);
+    expect(storage.sessionEvents.lastReadId("sess-qa")).toBe(0);
+  });
+
   describe("POST /question-asked quiet notification policy (pigeon-c501)", () => {
     it("quiet (errors-only) session asks a single question: delivers unthreaded with no dir", async () => {
       storage = openStorageDb(":memory:");
