@@ -16,6 +16,22 @@ import type BetterSqlite3 from "better-sqlite3";
  *     dead-session cleanup (in worker/command-ingest.ts) both delete the sessions
  *     row, and lgtm then re-awakens the same session id through /swarm/send. If the
  *     provenance went with it, every re-review would go loud again.
+ *
+ * SECOND CONSUMER, OUTSIDE THIS REPO. workstation's nvim session-switcher picker
+ * reads this table to hide automated sessions from its list
+ * (assets/opencode/plugins/oc-session-list-state.ts, `buildOriginMap`). Two things
+ * about that reader are worth knowing before changing anything here:
+ *
+ *  - Its suppression is NOT TTL-bounded. notify-policy.ts holds the invariant that
+ *    "all suppression is TTL-bounded; nothing is permanently silent", and that is
+ *    still true of NOTIFICATIONS. It is not true of picker visibility: the picker
+ *    keys on `origin` alone, so a session with a row stays hidden indefinitely.
+ *    The documented escape hatch is DELETE /session-origin, which un-hides it.
+ *
+ *  - It keys on `origin` against a small allowlist, NOT on the row existing and NOT
+ *    on notify_policy. So adding a row with a new `origin` will not hide anything
+ *    until that reader opts in -- deliberately, because it has no reveal mechanism
+ *    and hiding a session a human wanted is unrecoverable from inside the picker.
  */
 export function initSessionOriginSchema(db: BetterSqlite3.Database): void {
   db.exec(`
