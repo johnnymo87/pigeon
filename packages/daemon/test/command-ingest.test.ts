@@ -5286,12 +5286,12 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
         backendAuthToken: "tok",
       }, now);
 
-      // Stored question A
-      storage.pendingQuestions.store({
-        sessionId,
-        requestId: "req-meta-A",
-        questions: [{ question: "Question A", header: "A", options: [{ label: "OptA", description: "" }] }],
-      }, now);
+      // No live or resurrectable question exists in storage for req-meta-A,
+      // forcing command ingest to take the metadata-fallback branch.
+      const warns: string[] = [];
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
+      const logs: string[] = [];
+      const logSpy = vi.spyOn(console, "log").mockImplementation((m: unknown) => { logs.push(String(m)); });
 
       await ingestWorkerCommand(
         storage,
@@ -5307,7 +5307,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
             name: "mock-direct",
             async deliverCommand() { return { ok: false, error: "should not be called" }; },
             async deliverQuestionReply() {
-              // Mid-flight: new question B arrives
+              // Mid-flight: new question B arrives while waiting for deliverQuestionReply
               storage.pendingQuestions.store({
                 sessionId,
                 requestId: "req-B",
@@ -5316,6 +5316,66 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
               return { ok: true as const };
             },
           }),
+        },
+      );
+
+      warnSpy.mockRestore();
+      logSpy.mockRestore();
+
+      // Verify the test genuinely executed the metadata fallback path
+      expect(warns.some((w) => w.includes("question-reply via metadata fallback"))).toBe(true);
+      expect(logs.some((l) => l.includes("routing as question reply"))).toBe(false);
+
+      // Question B must survive!
+      const liveQuestion = storage.pendingQuestions.getBySessionId(sessionId, now + 200);
+      expect(liveQuestion).not.toBeNull();
+      expect(liveQuestion!.requestId).toBe("req-B");
+
+      storage.db.close();
+    });
+
+    it("unanswerable question drop: replacement question B arriving mid-flight survives dropUnanswerableQuestion of question A", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      const sessionId = "sess-race-unanswerable";
+
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId,
+        requestId: "req-unans-A",
+        questions: [{ question: "Question A", header: "A", options: [{ label: "OptA", description: "" }] }],
+      }, now);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-race-unans",
+          sessionId,
+          command: "q0",
+          chatId: "100",
+        }),
+        {
+          createAdapter: () => {
+            // Mid-flight: new question B arrives before adapter resolution fails
+            storage.pendingQuestions.store({
+              sessionId,
+              requestId: "req-B",
+              questions: [{ question: "Question B", header: "B", options: [{ label: "OptB", description: "" }] }],
+            }, now + 100);
+            return {
+              name: "mock-direct-no-reply",
+              async deliverCommand() { return { ok: false, error: "should not be called" }; },
+              // deliverQuestionReply omitted to trigger dropUnanswerableQuestion
+            };
+          },
         },
       );
 
