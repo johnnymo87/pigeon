@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 import { invalidateDaemonToken } from "../src/auth-token"
-import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, postMirror, _resetBreakerForTesting } from "../src/daemon-client"
+import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, notifyQuestionAnswered, postMirror, _resetBreakerForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
 
@@ -1059,6 +1059,56 @@ describe("daemon-client", () => {
 
       expect(mirrorRes).toBeNull()
       expect(requestLog).toHaveLength(0)
+    })
+  })
+
+  describe("notifyQuestionAnswered", () => {
+    test("sends session_id and request_id when requestId is provided", async () => {
+      const opts = {
+        sessionId: "ses_qa_1",
+        requestId: "req_qa_1",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      const res = await notifyQuestionAnswered(opts)
+      expect(res).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0]?.path).toBe("/question-answered")
+      expect(requestLog[0]?.body).toEqual({
+        session_id: "ses_qa_1",
+        request_id: "req_qa_1",
+      })
+    })
+
+    test("sends session_id only when requestId is omitted", async () => {
+      const opts = {
+        sessionId: "ses_qa_legacy",
+        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        log: mockLog,
+      }
+
+      const res = await notifyQuestionAnswered(opts)
+      expect(res).toEqual({ ok: true, notified: true })
+      expect(requestLog).toHaveLength(1)
+      expect(requestLog[0]?.path).toBe("/question-answered")
+      expect(requestLog[0]?.body).toEqual({
+        session_id: "ses_qa_legacy",
+      })
+    })
+
+    test("returns null and logs when daemon is unreachable", async () => {
+      let loggedError: unknown
+      const opts = {
+        sessionId: "ses_qa_err",
+        requestId: "req_qa_err",
+        daemonUrl: "http://127.0.0.1:99999",
+        log: (_msg: string, data?: unknown) => { loggedError = data },
+      }
+
+      const res = await notifyQuestionAnswered(opts)
+      expect(res).toBeNull()
+      expect(loggedError).toBeDefined()
     })
   })
 })

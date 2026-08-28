@@ -5099,4 +5099,232 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
       storage.db.close();
     });
   });
+
+  describe("keyed pending_questions delete and race protection (pigeon-m426.11)", () => {
+    it("single-question success: replacement question B arriving mid-flight survives deletion of question A", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      const sessionId = "sess-race-single";
+
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId,
+        requestId: "req-A",
+        questions: [{ question: "Question A", header: "A", options: [{ label: "OptA", description: "" }] }],
+      }, now);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-race-1",
+          sessionId,
+          command: "q0",
+          chatId: "100",
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              // Mid-flight: new question B arrives while waiting for deliverQuestionReply
+              storage.pendingQuestions.store({
+                sessionId,
+                requestId: "req-B",
+                questions: [{ question: "Question B", header: "B", options: [{ label: "OptB", description: "" }] }],
+              }, now + 100);
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // Question B must survive!
+      const liveQuestion = storage.pendingQuestions.getBySessionId(sessionId, now + 200);
+      expect(liveQuestion).not.toBeNull();
+      expect(liveQuestion!.requestId).toBe("req-B");
+
+      storage.db.close();
+    });
+
+    it("wizard completion success: replacement question B arriving mid-flight survives deletion of wizard A", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      const sessionId = "sess-race-wiz";
+
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      storage.pendingQuestions.store({
+        sessionId,
+        requestId: "req-wiz-A",
+        questions: [
+          { question: "Step 1", header: "S1", options: [{ label: "Opt1", description: "" }] },
+          { question: "Step 2", header: "S2", options: [{ label: "Opt2", description: "" }] },
+        ],
+        token: "tok-wiz",
+      }, now);
+
+      // Advance step 1
+      const record = storage.pendingQuestions.getBySessionId(sessionId, now)!;
+      storage.pendingQuestions.advanceStep(record, ["Opt1"]);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-race-wiz-final",
+          sessionId,
+          command: "cmd:tok-wiz:v1:q0",
+          chatId: "100",
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              // Mid-flight: new question B arrives
+              storage.pendingQuestions.store({
+                sessionId,
+                requestId: "req-B",
+                questions: [{ question: "Question B", header: "B", options: [{ label: "OptB", description: "" }] }],
+              }, now + 100);
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // Question B must survive!
+      const liveQuestion = storage.pendingQuestions.getBySessionId(sessionId, now + 200);
+      expect(liveQuestion).not.toBeNull();
+      expect(liveQuestion!.requestId).toBe("req-B");
+
+      storage.db.close();
+    });
+
+    it("resurrected question drop: replacement question B arriving mid-flight survives deletion of resurrected question A", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      const sessionId = "sess-race-res";
+
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Stored and expired
+      storage.pendingQuestions.store({
+        sessionId,
+        requestId: "req-res-A",
+        questions: [{ question: "Old Question A", header: "A", options: [{ label: "OptA", description: "" }] }],
+      }, now - 10_000);
+      storage.pendingQuestions.expire(sessionId, "req-res-A", now - 5_000);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-race-res",
+          sessionId,
+          command: "q0",
+          chatId: "100",
+          metadata: { questionRequestId: "req-res-A" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              // Mid-flight: new question B arrives
+              storage.pendingQuestions.store({
+                sessionId,
+                requestId: "req-B",
+                questions: [{ question: "Question B", header: "B", options: [{ label: "OptB", description: "" }] }],
+              }, now + 100);
+              // Fail terminally so dropResurrectedQuestionThatIsGone is called
+              return { ok: false as const, error: "OpenCode question reply failed: 404 question not found" };
+            },
+          }),
+        },
+      );
+
+      // Question B must survive!
+      const liveQuestion = storage.pendingQuestions.getBySessionId(sessionId, now + 200);
+      expect(liveQuestion).not.toBeNull();
+      expect(liveQuestion!.requestId).toBe("req-B");
+
+      storage.db.close();
+    });
+
+    it("metadata fallback success: replacement question B arriving mid-flight survives deletion of fallback question A", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      const sessionId = "sess-race-meta";
+
+      storage.sessions.upsert({
+        sessionId,
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      // Stored question A
+      storage.pendingQuestions.store({
+        sessionId,
+        requestId: "req-meta-A",
+        questions: [{ question: "Question A", header: "A", options: [{ label: "OptA", description: "" }] }],
+      }, now);
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-race-meta",
+          sessionId,
+          command: "my answer text",
+          chatId: "100",
+          metadata: { questionRequestId: "req-meta-A" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() { return { ok: false, error: "should not be called" }; },
+            async deliverQuestionReply() {
+              // Mid-flight: new question B arrives
+              storage.pendingQuestions.store({
+                sessionId,
+                requestId: "req-B",
+                questions: [{ question: "Question B", header: "B", options: [{ label: "OptB", description: "" }] }],
+              }, now + 100);
+              return { ok: true as const };
+            },
+          }),
+        },
+      );
+
+      // Question B must survive!
+      const liveQuestion = storage.pendingQuestions.getBySessionId(sessionId, now + 200);
+      expect(liveQuestion).not.toBeNull();
+      expect(liveQuestion!.requestId).toBe("req-B");
+
+      storage.db.close();
+    });
+  });
 });

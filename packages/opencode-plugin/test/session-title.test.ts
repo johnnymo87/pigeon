@@ -846,6 +846,55 @@ describe("Session Title Management", () => {
           )
         })
       })
+
+      test("question.replied and question.rejected pass requestID to notifyQuestionAnswered (pigeon-m426.11)", async () => {
+        const notifyQuestionAnsweredSpy = vi.spyOn(daemonClient, "notifyQuestionAnswered").mockResolvedValue({ ok: true })
+        const mockCtx = createMockCtx()
+        const hooks = await plugin(mockCtx)
+
+        // question.replied with requestID
+        await hooks.event!({
+          event: {
+            type: "question.replied",
+            properties: {
+              sessionID: "ses_qr_1",
+              requestID: "req_replied_123",
+              answers: [["Answer A"]],
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyQuestionAnsweredSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_qr_1",
+              requestId: "req_replied_123",
+            })
+          )
+        })
+
+        notifyQuestionAnsweredSpy.mockClear()
+
+        // question.rejected with requestID
+        await hooks.event!({
+          event: {
+            type: "question.rejected",
+            properties: {
+              sessionID: "ses_qr_2",
+              requestID: "req_rejected_456",
+            },
+          } as any,
+        })
+
+        await vi.waitFor(() => {
+          expect(notifyQuestionAnsweredSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sessionId: "ses_qr_2",
+              requestId: "req_rejected_456",
+            })
+          )
+        })
+      })
     })
   })
 })

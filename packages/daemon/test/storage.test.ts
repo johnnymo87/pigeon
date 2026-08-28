@@ -174,7 +174,7 @@ describe("storage schema and repositories", () => {
     expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_000 + 5 * 60 * 60 * 1000)).toBeNull();
 
     // Delete
-    expect(storage.pendingQuestions.delete("sess-pq")).toBe(true);
+    expect(storage.pendingQuestions.delete("sess-pq", "question_abc")).toBe(true);
     expect(storage.pendingQuestions.getBySessionId("sess-pq", 1_001)).toBeNull();
 
     // Delete orphaned
@@ -563,6 +563,73 @@ describe("storage schema and repositories", () => {
     it("expire returns false when session does not exist", () => {
       const storage = createStorage();
       expect(storage.pendingQuestions.expire("nonexistent", "req-1", 2_000)).toBe(false);
+      storage.db.close();
+    });
+
+    it("delete with matching (sessionId, requestId) deletes the row and returns true", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({
+        sessionId: "sess-del-test",
+        requestId: "req-del-test",
+        questions: [{ question: "Test?", header: "H", options: [] }],
+      }, 1_000);
+
+      expect(storage.pendingQuestions.getBySessionId("sess-del-test", 1_100)).not.toBeNull();
+
+      const result = storage.pendingQuestions.delete("sess-del-test", "req-del-test");
+      expect(result).toBe(true);
+      expect(storage.pendingQuestions.getBySessionId("sess-del-test", 1_100)).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-del-test")).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("delete with non-matching requestId is a no-op (returns false, row stays live)", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({
+        sessionId: "sess-del-test",
+        requestId: "req-del-live",
+        questions: [{ question: "Test?", header: "H", options: [] }],
+      }, 1_000);
+
+      const result = storage.pendingQuestions.delete("sess-del-test", "req-different");
+      expect(result).toBe(false);
+
+      // Row stays live
+      const liveRecord = storage.pendingQuestions.getBySessionId("sess-del-test", 1_100);
+      expect(liveRecord).not.toBeNull();
+      expect(liveRecord!.requestId).toBe("req-del-live");
+
+      storage.db.close();
+    });
+
+    it("delete returns false when session does not exist", () => {
+      const storage = createStorage();
+      expect(storage.pendingQuestions.delete("nonexistent", "req-1")).toBe(false);
+      storage.db.close();
+    });
+
+    it("deleteAnyBySessionId deletes the row regardless of requestId (unsafe back-compat fallback)", () => {
+      const storage = createStorage();
+      storage.pendingQuestions.store({
+        sessionId: "sess-del-any",
+        requestId: "req-any-live",
+        questions: [{ question: "Test?", header: "H", options: [] }],
+      }, 1_000);
+
+      expect(storage.pendingQuestions.getBySessionId("sess-del-any", 1_100)).not.toBeNull();
+
+      const result = storage.pendingQuestions.deleteAnyBySessionId("sess-del-any");
+      expect(result).toBe(true);
+      expect(storage.pendingQuestions.getBySessionId("sess-del-any", 1_100)).toBeNull();
+      expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-del-any")).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("deleteAnyBySessionId returns false when session does not exist", () => {
+      const storage = createStorage();
+      expect(storage.pendingQuestions.deleteAnyBySessionId("nonexistent")).toBe(false);
       storage.db.close();
     });
   });

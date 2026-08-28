@@ -721,12 +721,14 @@ const plugin: Plugin = async (ctx) => {
 
         if (eventType === "question.replied" || eventType === "question.rejected") {
           const sessionID = props?.sessionID as string | undefined
+          const requestID = props?.requestID as string | undefined
 
           if (!sessionID) return
 
           // Clear pending question in daemon (it may have been answered from the TUI)
           notifyQuestionAnswered({
             sessionId: sessionID,
+            requestId: requestID,
             daemonUrl,
             log,
           }).catch((err) => {

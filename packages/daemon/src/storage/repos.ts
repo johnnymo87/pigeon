@@ -421,7 +421,31 @@ export class PendingQuestionRepository {
     return row ? asPendingQuestion(row) : null;
   }
 
-  delete(sessionId: string): boolean {
+  /**
+   * Delete a pending question record matching both sessionId and requestId.
+   *
+   * Keyed on both sessionId and requestId so a late delete (after an await or
+   * delayed response) cannot destroy a newly arrived question that replaced
+   * the deleted one.
+   */
+  delete(sessionId: string, requestId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM pending_questions WHERE session_id = ? AND request_id = ?")
+      .run(sessionId, requestId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Unconditionally delete any pending question for the session, regardless of requestId.
+   *
+   * WARNING: HAZARDOUS. This can destroy a newly arrived live question that
+   * replaced the one the caller intended to delete.
+   *
+   * Single legitimate caller: POST /question-answered back-compat fallback when
+   * an older plugin version omits request_id from the payload. Exists solely to
+   * maintain backward compatibility across version skew during deployments.
+   */
+  deleteAnyBySessionId(sessionId: string): boolean {
     const result = this.db
       .prepare("DELETE FROM pending_questions WHERE session_id = ?")
       .run(sessionId);
