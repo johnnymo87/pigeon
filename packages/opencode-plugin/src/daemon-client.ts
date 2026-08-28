@@ -61,6 +61,7 @@ type NotifyQuestionAskedOpts = {
 
 type NotifyQuestionAnsweredOpts = {
   sessionId: string
+  requestId?: string
   daemonUrl?: string
   log: LogFn
 }
@@ -255,12 +256,17 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
 
   const url = getDaemonUrl(opts.daemonUrl)
 
+  const body: Record<string, string> = {
+    session_id: opts.sessionId,
+  }
+  if (opts.requestId) {
+    body.request_id = opts.requestId
+  }
+
   try {
     const res = await fetchDaemon(`${url}/question-answered`, {
       method: "POST",
-      body: JSON.stringify({
-        session_id: opts.sessionId,
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(1000),
     })
 

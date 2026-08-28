@@ -1289,29 +1289,81 @@ describe("createApp", () => {
     expect(payload.replyMarkup.inline_keyboard[0][0].callback_data).not.toContain(":v0:");
   });
 
-  it("POST /question-answered clears pending question", async () => {
+  it("POST /question-answered with matching request_id clears only the matching pending question", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });
 
     storage.pendingQuestions.store({
-      sessionId: "sess-qa",
+      sessionId: "sess-qa-matching",
       requestId: "question_xyz",
       questions: [{ question: "?", header: "H", options: [] }],
     }, 50_000);
 
-    expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeTruthy();
+    expect(storage.pendingQuestions.getBySessionId("sess-qa-matching", 50_001)).toBeTruthy();
 
     const response = await app(new Request("http://localhost/question-answered", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: "sess-qa" }),
+      body: JSON.stringify({ session_id: "sess-qa-matching", request_id: "question_xyz" }),
     }));
 
     expect(response.status).toBe(200);
     const json = await response.json() as Record<string, unknown>;
     expect(json.ok).toBe(true);
     expect(json.cleared).toBe(true);
-    expect(storage.pendingQuestions.getBySessionId("sess-qa", 50_001)).toBeNull();
+    expect(storage.pendingQuestions.getBySessionId("sess-qa-matching", 50_001)).toBeNull();
+  });
+
+  it("POST /question-answered with non-matching request_id does not clear a replacement question", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-qa-race",
+      requestId: "question_new_B",
+      questions: [{ question: "New Question B?", header: "H", options: [] }],
+    }, 50_000);
+
+    // Stale Q1 resolution arrives carrying request_id of old question_old_A
+    const response = await app(new Request("http://localhost/question-answered", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qa-race", request_id: "question_old_A" }),
+    }));
+
+    expect(response.status).toBe(200);
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.ok).toBe(true);
+    expect(json.cleared).toBe(false);
+    // Question B survives!
+    const liveQuestion = storage.pendingQuestions.getBySessionId("sess-qa-race", 50_001);
+    expect(liveQuestion).not.toBeNull();
+    expect(liveQuestion!.requestId).toBe("question_new_B");
+  });
+
+  it("POST /question-answered without request_id falls back to clearing any pending question (back-compat)", async () => {
+    storage = openStorageDb(":memory:");
+    const app = createApp(storage, { nowFn: () => 50_000 });
+
+    storage.pendingQuestions.store({
+      sessionId: "sess-qa-legacy",
+      requestId: "question_legacy",
+      questions: [{ question: "?", header: "H", options: [] }],
+    }, 50_000);
+
+    expect(storage.pendingQuestions.getBySessionId("sess-qa-legacy", 50_001)).toBeTruthy();
+
+    const response = await app(new Request("http://localhost/question-answered", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-qa-legacy" }),
+    }));
+
+    expect(response.status).toBe(200);
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.ok).toBe(true);
+    expect(json.cleared).toBe(true);
+    expect(storage.pendingQuestions.getBySessionId("sess-qa-legacy", 50_001)).toBeNull();
   });
 
   it("POST /question-answered clears the unread watermark", async () => {

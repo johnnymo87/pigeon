@@ -1172,7 +1172,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "session_id is required" }, { status: 400 });
         }
 
-        const deleted = storage.pendingQuestions.delete(sessionId);
+        const requestId = typeof body.request_id === "string" ? body.request_id : undefined;
+        let deleted: boolean;
+        if (requestId) {
+          deleted = storage.pendingQuestions.delete(sessionId, requestId);
+        } else {
+          console.warn(
+            `[app] /question-answered received without request_id for sessionId=${sessionId}; falling back to unkeyed delete (replacement hazard)`,
+          );
+          deleted = storage.pendingQuestions.deleteAnyBySessionId(sessionId);
+        }
 
         // Resolving a question is evidence of presence -- and for one resolved in the
         // TUI this is the ONLY such signal: it creates no user text message, so

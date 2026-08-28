@@ -370,7 +370,7 @@ export async function ingestWorkerCommand(
       if (result.ok) {
         console.log(`[command-ingest] wizard complete, all answers delivered commandId=${commandId}`);
         storage.inbox.markDone(commandId);
-        storage.pendingQuestions.delete(msg.sessionId);
+        storage.pendingQuestions.delete(msg.sessionId, pendingQuestion.requestId);
 
         const notificationId = `q:${msg.sessionId}:${pendingQuestion.requestId}`;
         const doneEdit = await tryEditNotification(
@@ -401,7 +401,7 @@ export async function ingestWorkerCommand(
 
       throwIfTransientQuestionReplyFailure(result, commandId);
       console.warn(`[command-ingest] wizard final delivery failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
-      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, result, options)) {
+      if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, pendingQuestion.requestId, result, options)) {
         return;
       }
       if (await dropUnreachableQuestionRegistration(storage, commandId, msg, pendingQuestion.requestId, result, options)) {
@@ -444,14 +444,14 @@ export async function ingestWorkerCommand(
     if (result.ok) {
       console.log(`[command-ingest] question reply delivered commandId=${commandId}`);
       storage.inbox.markDone(commandId);
-      storage.pendingQuestions.delete(msg.sessionId);
+      storage.pendingQuestions.delete(msg.sessionId, pendingQuestion.requestId);
       await warnMediaNotDelivered(msg, commandId, options);
       return;
     }
 
     throwIfTransientQuestionReplyFailure(result, commandId);
     console.warn(`[command-ingest] question reply failed commandId=${commandId} error=${result.error}${formatDeliveryMeta(result.meta)}`);
-    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, result, options)) {
+    if (await dropResurrectedQuestionThatIsGone(resurrected, storage, commandId, msg, pendingQuestion.requestId, result, options)) {
       return;
     }
     if (await dropUnreachableQuestionRegistration(storage, commandId, msg, pendingQuestion.requestId, result, options)) {
@@ -522,8 +522,8 @@ export async function ingestWorkerCommand(
       if (result.ok) {
         console.log(`[command-ingest] metadata fallback question reply delivered commandId=${commandId}`);
         storage.inbox.markDone(commandId);
-        // Clean up any stale pending question just in case
-        storage.pendingQuestions.delete(msg.sessionId);
+        // Clean up matching pending question; keyed delete ensures an unrelated live question survives
+        storage.pendingQuestions.delete(msg.sessionId, msg.metadata.questionRequestId);
         await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
@@ -938,11 +938,12 @@ async function dropResurrectedQuestionThatIsGone(
   storage: StorageDb,
   commandId: string,
   msg: ExecuteMessage,
+  requestId: string,
   result: CommandDeliveryResult,
   options: WorkerCommandIngestOptions,
 ): Promise<boolean> {
   if (!resurrected) return false;
-  storage.pendingQuestions.delete(msg.sessionId);
+  storage.pendingQuestions.delete(msg.sessionId, requestId);
   const isUnreachable = isUnreachableRegistrationFailure(result);
   console.warn(
     `[command-ingest] resurrected question is gone (${isUnreachable ? "unreachable" : "refused"}), dropping row sessionId=${msg.sessionId} commandId=${commandId}`,
@@ -1083,7 +1084,7 @@ async function dropUnanswerableQuestion(
   sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
   editNotification: WorkerCommandIngestOptions["editNotification"],
 ): Promise<void> {
-  storage.pendingQuestions.delete(msg.sessionId);
+  storage.pendingQuestions.delete(msg.sessionId, requestId);
   // Contained: an unguarded throw here escapes before dropCommand runs, so the
   // row is already deleted, the command is never acked, and the user is never
   // told. The retry then finds no pending question and a typed answer falls
