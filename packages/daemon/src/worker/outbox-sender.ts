@@ -156,7 +156,18 @@ export function chunkNotificationId(
  */
 export function commitDelivery(
   storage: StorageDb,
-  entry: { notificationId: string; sessionId: string; kind: string },
+  entry: {
+    notificationId: string;
+    sessionId: string;
+    kind: string;
+    // REQUIRED, not optional, deliberately. The only caller passes a full
+    // OutboxRecord, so optionality buys nothing -- and it would let a future
+    // narrowing of this parameter to {notificationId, sessionId, kind} compile
+    // clean AND pass the whole suite, silently dropping every anchor. Required
+    // fields make the compiler pin the thread-through.
+    anchorMsgId: string | null;
+    excerpt: string | null;
+  },
   now: number,
   chunks: number,
   log: (msg: string, fields?: Record<string, unknown>) => void,
@@ -167,6 +178,15 @@ export function commitDelivery(
       sessionId: entry.sessionId,
       notificationId: entry.notificationId,
       kind: entry.kind,
+      // COPIED from the outbox row, never looked up here. Reading
+      // sessions.last_human_msg_id at this point would be the whole bug this
+      // phase exists to avoid: delivery is retry-skewed, so a human turn landing
+      // between enqueue and delivery would move the anchor PAST the content this
+      // row notifies about -- and the row still counts unread, because
+      // markAllRead is MAX(id) over rows that already exist and cannot cover one
+      // not yet appended. Pinned by the "keeps the enqueue-time anchor" test.
+      anchorMsgId: entry.anchorMsgId,
+      excerpt: entry.excerpt,
       // Delivery clock, not entry.createdAt: the governor holds bursts, so an entry
       // created before a read and delivered after it must sort ABOVE the watermark.
       sentAt: now,

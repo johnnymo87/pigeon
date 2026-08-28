@@ -14,6 +14,7 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     pid: 5678,
     startTime: Date.now(),
     cwd: "/tmp",
+    lastHumanMsgId: null,
     label: null,
     title: null,
     notify: true,

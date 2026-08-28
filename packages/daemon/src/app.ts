@@ -10,7 +10,7 @@ import { payloadHasCloseTag } from "./swarm/envelope";
 import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
-import { clampPreservingSurrogates } from "./text";
+import { clampPreservingSurrogates, excerptOf } from "./text";
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
@@ -842,6 +842,23 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // version skew does not clear). Do not add a second Telegram clear here.
         storage.sessionEvents.markAllRead(sessionId, now);
 
+        // Same turn, same evidence, second use: this message id is the scroll
+        // anchor for every notification enqueued until the next human turn
+        // (phase 1b). It is recorded HERE rather than in the plugin because
+        // everything needed is already in scope and already classified -- the
+        // early-return above has established the turn is not daemon-injected --
+        // so the design's prescribed plugin change buys nothing.
+        //
+        // Note what this is NOT: /stop carries no message id at all, so there is
+        // no per-kind anchor to thread. Every kind reads this one value.
+        //
+        // Telegram replies never reach here -- sendPrompt records every injected
+        // prompt, so they classify as injected above. They still CLEAR (that half
+        // lives at poller.dispatch), so a Telegram-driven session keeps an anchor
+        // at its last TUI turn, possibly far back. Safe direction: re-read, never
+        // skip. Phase 2 decides whether very-stale beats NULL.
+        storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
+
         // A session declared quiet (lgtm's automated reviews) must not mirror its
         // prompts. Without this, lgtm's own launch prompt -- a user-role message the
         // daemon never injected and so never suppressed -- posts into Telegram AND
@@ -885,6 +902,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             kind: "mirror",
             payload: JSON.stringify(notificationPayload),
             token: "",
+            // This turn IS its own anchor. `mirror` is uncounted, so this row is
+            // never the badge's oldest-uncleared -- but it is still written, both
+            // for uniformity and because a mirror row DOES sit above the watermark
+            // (markAllRead ran above, before this row exists), so a phase-2 query
+            // that forgets the kind filter would otherwise find a null anchor.
+            anchorMsgId: messageId,
+            excerpt: excerptOf(text),
           },
           now,
         );
@@ -1000,6 +1024,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           kind: "stop",
           payload: JSON.stringify(notificationPayload),
           token,
+          anchorMsgId: session.lastHumanMsgId ?? null,
+          // Precedence MUST match what the notification actually renders, a few
+          // lines above: `message || summary || "Task completed"`. An excerpt that
+          // disagrees would make the drill-down show different text than the
+          // Telegram message it refers to.
+          excerpt: excerptOf(message || summary || "Task completed"),
         }, now);
 
         // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
@@ -1157,6 +1187,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           kind: "question",
           payload: JSON.stringify(notificationPayload),
           token,
+          anchorMsgId: session.lastHumanMsgId,
+          // Wizard mode sends an array; the first question is what step 1 renders.
+          excerpt: excerptOf(questions[0]?.question ?? null),
         }, now);
 
         return Response.json(

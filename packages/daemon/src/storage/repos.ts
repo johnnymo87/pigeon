@@ -29,6 +29,7 @@ function asSession(row: SqlRow): SessionRecord {
     cwd: (row.cwd as string | null) ?? null,
     label: (row.label as string | null) ?? null,
     title: (row.title as string | null) ?? null,
+    lastHumanMsgId: (row.last_human_msg_id as string | null) ?? null,
     notify: Number(row.notify) === 1,
     state: String(row.state),
     ptyPath: (row.pty_path as string | null) ?? null,
@@ -178,6 +179,43 @@ export class SessionRepository {
     const result = this.db
       .prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?")
       .run(title, now, sessionId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Remember the message id of the most recent HUMAN-AUTHORED user turn, for use
+   * as a scroll anchor. Phase 1b of unread navigation.
+   *
+   * MONOTONIC, deliberately, and this is not the same thing as "last write wins".
+   * The caller is /mirror, driven by independent async HTTP requests from the
+   * plugin, so an OLDER turn's request can land after a newer one's and would
+   * regress the anchor by a turn under a plain UPDATE. Message ids are ascending,
+   * sortable and fixed-width (`msg_` + 26 chars, with an embedded ms timestamp),
+   * so a lexicographic MAX gives newest-wins for free -- the same discipline as
+   * advanceRead, which the sole caller invokes one line away.
+   *
+   * Monotonicity has two known wedge cases, both accepted. The id's embedded
+   * timestamp field is 48 bits and wraps roughly every 2.2 years (last wrap
+   * 2026-08-14, next 2028-10), across which newer ids sort BELOW older ones; and
+   * opencode accepts client-minted ids, so a skewed client clock can mint a
+   * future id. Either pins the anchor at an OLD turn until the session row ages
+   * out. Both fail toward a too-early anchor -- the reader re-reads, and never
+   * skips unseen content -- which is the safe direction and the same one a NULL
+   * anchor takes.
+   *
+   * No-ops when the session row is absent. /mirror tolerates an unknown session
+   * (unlike /stop, which 404s), and a throw here would break both mirroring and
+   * phase 1a's badge clearing -- two live features -- for a bookmark.
+   */
+  setLastHumanMsgId(sessionId: string, messageId: string, now = Date.now()): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE sessions
+            SET last_human_msg_id = MAX(COALESCE(last_human_msg_id, ''), ?),
+                updated_at = ?
+          WHERE session_id = ?`,
+      )
+      .run(messageId, now, sessionId);
     return result.changes > 0;
   }
 

@@ -1,5 +1,5 @@
 import type BetterSqlite3 from "better-sqlite3";
-import { SESSION_TTL_MS } from "./schema";
+import { runAdditiveMigrations, SESSION_TTL_MS } from "./schema";
 
 /**
  * How long a delivered-event row is kept.
@@ -67,4 +67,20 @@ export function initSessionEventsSchema(db: BetterSqlite3.Database): void {
       updated_at   INTEGER NOT NULL
     );
   `);
+
+  // Phase 1b of unread navigation: the scroll target and a readable excerpt,
+  // copied from the outbox row at delivery time. Both nullable, no backfill --
+  // NULL means "do not scroll", which is the pre-feature behaviour.
+  //
+  // THESE MUST NOT MOVE INTO schema.ts's shared `additiveColumns` array, however
+  // tempting the consolidation looks. That array is applied by initSchema, which
+  // openStorageDb calls BEFORE this function (database.ts). On a fresh database
+  // `session_events` does not exist yet, and "no such table" is NOT matched by
+  // isDuplicateColumnError -- it is message-matched and fails safe by rethrowing
+  // -- so the daemon would crash on startup for every new database. Pinned by
+  // the "initialises a completely fresh database" test.
+  runAdditiveMigrations(db, [
+    "ALTER TABLE session_events ADD COLUMN anchor_msg_id TEXT DEFAULT NULL",
+    "ALTER TABLE session_events ADD COLUMN excerpt TEXT DEFAULT NULL",
+  ]);
 }
