@@ -18,6 +18,14 @@ export interface AppendInput {
   notificationId: string;
   kind: string;
   sentAt: number;
+  /**
+   * Phase 1b: the user message id a jump should scroll to, and a plain-text
+   * excerpt for the drill-down. Both NULL for rows written before the feature,
+   * and for notifications on sessions with no human turn yet. NULL means "do not
+   * scroll" -- the pre-feature behaviour of landing at the bottom.
+   */
+  anchorMsgId?: string | null;
+  excerpt?: string | null;
 }
 
 export interface UnreadRow {
@@ -33,10 +41,17 @@ export class SessionEventsRepo {
   append(input: AppendInput): number {
     const info = this.db
       .prepare(
-        `INSERT INTO session_events (session_id, notification_id, kind, sent_at)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO session_events (session_id, notification_id, kind, sent_at, anchor_msg_id, excerpt)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.sessionId, input.notificationId, input.kind, input.sentAt);
+      .run(
+        input.sessionId,
+        input.notificationId,
+        input.kind,
+        input.sentAt,
+        input.anchorMsgId ?? null,
+        input.excerpt ?? null,
+      );
     return Number(info.lastInsertRowid);
   }
 

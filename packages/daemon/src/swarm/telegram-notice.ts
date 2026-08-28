@@ -1,5 +1,6 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
+import { excerptOf } from "../text";
 import {
   displayName,
   formatSwarmNotification,
@@ -59,6 +60,10 @@ export function enqueueSwarmTelegramNotice(
         sessionId: record.toSession,
         requestId: `swarm-${record.msgId}`,
         kind: "swarm",
+        // A peer message is not presence, so the anchor is the RECIPIENT's own
+        // last human turn -- the design is explicit that peer turns never anchor.
+        anchorMsgId: target?.lastHumanMsgId ?? null,
+        excerpt: excerptOf(record.payload),
         payload: JSON.stringify({
           messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
           replyMarkup: undefined,
@@ -117,6 +122,11 @@ export function enqueueSwarmCancelNotice(
         sessionId: record.toSession,
         requestId: `swarm-cancel-${record.msgId}`,
         kind: "swarm",
+        anchorMsgId: target?.lastHumanMsgId ?? null,
+        // NO excerpt, deliberately. This notice says a message was RETRACTED;
+        // record.payload is the withdrawn content, so showing it in the
+        // drill-down would surface exactly what the reader is told to disregard.
+        excerpt: null,
         payload: JSON.stringify({
           messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
           replyMarkup: undefined,

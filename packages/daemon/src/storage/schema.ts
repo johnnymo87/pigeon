@@ -42,6 +42,19 @@ export const additiveColumns = [
   "ALTER TABLE outbox ADD COLUMN failed_reason TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN last_error TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+  // Phase 1b of unread navigation. The scroll target for a notification, and a
+  // readable excerpt for the drill-down.
+  //
+  // On `outbox` rather than only on `session_events` because the ledger row is
+  // appended at DELIVERY (commitDelivery), which is retry-skewed: a human turn
+  // landing between enqueue and delivery would otherwise move the anchor PAST
+  // the content the notification is about. Captured at enqueue, carried here.
+  //
+  // The matching session_events columns are deliberately NOT in this array --
+  // see initSessionEventsSchema for why putting them here crashes a fresh DB.
+  "ALTER TABLE sessions ADD COLUMN last_human_msg_id TEXT DEFAULT NULL",
+  "ALTER TABLE outbox ADD COLUMN anchor_msg_id TEXT DEFAULT NULL",
+  "ALTER TABLE outbox ADD COLUMN excerpt TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(

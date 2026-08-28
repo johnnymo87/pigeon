@@ -26,3 +26,27 @@ export function clampPreservingSurrogates(s: string, max: number): string {
   if (c >= 0xd800 && c <= 0xdbff) end--;
   return s.slice(0, end);
 }
+
+/**
+ * Maximum stored length of a notification excerpt (phase 1b of unread navigation).
+ *
+ * The excerpt exists so the drill-down can show something readable instead of a
+ * bare timestamp. It is captured PRE-FORMAT: by the time a payload reaches
+ * commitDelivery it is HTML with entities, escapes, a session prefix and chunk
+ * headers, so its first 150 characters are markup rather than content.
+ */
+export const EXCERPT_MAX_CHARS = 150;
+
+/**
+ * Plain-text excerpt of a notification, safe to store and re-render.
+ *
+ * Returns null for empty/whitespace input so "nothing worth showing" is a single
+ * representation (NULL) rather than two ("" and NULL) that every consumer would
+ * have to handle.
+ */
+export function excerptOf(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  return clampPreservingSurrogates(trimmed, EXCERPT_MAX_CHARS);
+}

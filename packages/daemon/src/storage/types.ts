@@ -6,6 +6,16 @@ export interface SessionRecord {
   cwd: string | null;
   label: string | null;
   title: string | null;
+  /**
+   * Message id of the most recent human-authored user turn (phase 1b of unread
+   * navigation), used as the scroll anchor for notifications enqueued until the
+   * next one. NULL when the session has had no such turn -- meaning "do not
+   * scroll", which is the pre-feature behaviour of landing at the bottom.
+   *
+   * Written only by /mirror, so it is really "last turn authored in the TUI":
+   * Telegram replies arrive as daemon-injected prompts and are excluded.
+   */
+  lastHumanMsgId: string | null;
   notify: boolean;
   state: string;
   ptyPath: string | null;

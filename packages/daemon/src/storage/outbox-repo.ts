@@ -7,6 +7,9 @@ export interface OutboxRecord {
   sessionId: string;
   requestId: string;
   kind: string;
+  /** Phase 1b: scroll anchor and drill-down excerpt, fixed at first enqueue. */
+  anchorMsgId: string | null;
+  excerpt: string | null;
   state: string;
   payload: string;
   token: string;
@@ -32,6 +35,14 @@ export interface UpsertOutboxInput {
   kind: string;
   payload: string;
   token: string;
+  /**
+   * Scroll anchor and drill-down excerpt for this notification (phase 1b of
+   * unread navigation). Captured at ENQUEUE and carried to commitDelivery,
+   * which copies them onto the session_events row. Optional: callers that have
+   * no anchor pass nothing and the ledger stores NULL, meaning "do not scroll".
+   */
+  anchorMsgId?: string | null;
+  excerpt?: string | null;
 }
 
 function asOutbox(row: SqlRow): OutboxRecord {
@@ -40,6 +51,8 @@ function asOutbox(row: SqlRow): OutboxRecord {
     sessionId: String(row.session_id),
     requestId: String(row.request_id),
     kind: String(row.kind),
+    anchorMsgId: row.anchor_msg_id === null || row.anchor_msg_id === undefined ? null : String(row.anchor_msg_id),
+    excerpt: row.excerpt === null || row.excerpt === undefined ? null : String(row.excerpt),
     state: String(row.state),
     payload: String(row.payload),
     token: String(row.token),
@@ -67,8 +80,17 @@ export class OutboxRepository {
       .prepare(
         `INSERT INTO outbox
            (notification_id, session_id, request_id, kind, state, payload, token,
-            attempts, retry_count, next_retry_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?)
+            attempts, retry_count, next_retry_at, created_at, updated_at,
+            anchor_msg_id, excerpt)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?, ?, ?)
+         -- The conflict arm resets DELIVERY STATE only. It does not touch
+         -- payload, and for the same reason it must never touch anchor_msg_id
+         -- or excerpt: a requeue re-sends the ORIGINAL content, so pairing it
+         -- with a newer anchor would point the reader PAST the very thing being
+         -- re-delivered. Swarm requeue reaches this for real -- it reuses the
+         -- same per-message notificationId and, unlike /stop and /question, has
+         -- no getByNotificationId pre-check. Pinned by the "never moves a stored
+         -- anchor when a failed row is requeued" test.
          ON CONFLICT(notification_id) DO UPDATE SET
            state = 'queued',
            attempts = 0,
@@ -89,6 +111,8 @@ export class OutboxRepository {
         input.token,
         now,
         now,
+        input.anchorMsgId ?? null,
+        input.excerpt ?? null,
       );
   }
 
