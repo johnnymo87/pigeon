@@ -160,8 +160,13 @@ export function commitDelivery(
     notificationId: string;
     sessionId: string;
     kind: string;
-    anchorMsgId?: string | null;
-    excerpt?: string | null;
+    // REQUIRED, not optional, deliberately. The only caller passes a full
+    // OutboxRecord, so optionality buys nothing -- and it would let a future
+    // narrowing of this parameter to {notificationId, sessionId, kind} compile
+    // clean AND pass the whole suite, silently dropping every anchor. Required
+    // fields make the compiler pin the thread-through.
+    anchorMsgId: string | null;
+    excerpt: string | null;
   },
   now: number,
   chunks: number,
@@ -180,8 +185,8 @@ export function commitDelivery(
       // row notifies about -- and the row still counts unread, because
       // markAllRead is MAX(id) over rows that already exist and cannot cover one
       // not yet appended. Pinned by the "keeps the enqueue-time anchor" test.
-      anchorMsgId: entry.anchorMsgId ?? null,
-      excerpt: entry.excerpt ?? null,
+      anchorMsgId: entry.anchorMsgId,
+      excerpt: entry.excerpt,
       // Delivery clock, not entry.createdAt: the governor holds bursts, so an entry
       // created before a read and delivered after it must sort ABOVE the watermark.
       sentAt: now,

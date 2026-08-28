@@ -2982,7 +2982,7 @@ describe("commitDelivery: the guard and the ledger row are one unit", () => {
   beforeEach(() => { storage = openStorageDb(":memory:"); });
   afterEach(() => { storage.db.close(); });
 
-  const entry = { notificationId: "notif-1", sessionId: "sess-1", kind: "stop" };
+  const entry = { notificationId: "notif-1", sessionId: "sess-1", kind: "stop" , anchorMsgId: null, excerpt: null };
   const noop = () => {};
 
   // This is the invariant the state != 'sent' guard exists to protect, and it is

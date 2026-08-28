@@ -192,8 +192,16 @@ export class SessionRepository {
    * regress the anchor by a turn under a plain UPDATE. Message ids are ascending,
    * sortable and fixed-width (`msg_` + 26 chars, with an embedded ms timestamp),
    * so a lexicographic MAX gives newest-wins for free -- the same discipline as
-   * advanceRead, which the sole caller invokes one line away. Forks mint later
-   * ids, so this cannot wedge.
+   * advanceRead, which the sole caller invokes one line away.
+   *
+   * Monotonicity has two known wedge cases, both accepted. The id's embedded
+   * timestamp field is 48 bits and wraps roughly every 2.2 years (last wrap
+   * 2026-08-14, next 2028-10), across which newer ids sort BELOW older ones; and
+   * opencode accepts client-minted ids, so a skewed client clock can mint a
+   * future id. Either pins the anchor at an OLD turn until the session row ages
+   * out. Both fail toward a too-early anchor -- the reader re-reads, and never
+   * skips unseen content -- which is the safe direction and the same one a NULL
+   * anchor takes.
    *
    * No-ops when the session row is absent. /mirror tolerates an unknown session
    * (unlike /stop, which 404s), and a throw here would break both mirroring and

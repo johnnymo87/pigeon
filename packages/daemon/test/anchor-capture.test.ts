@@ -163,6 +163,12 @@ describe("phase 1b: /mirror records the anchor", () => {
     const app = newApp();
     const res = await mirror(app, "s_unknown", "msg_01x", "hello");
     expect(res.status).toBe(200);
+    // Assert the NO-OP, not merely the status: an INSERT-based reimplementation
+    // would also return 200 while conjuring a session row from a mirror call.
+    const n = storage!.db
+      .prepare("SELECT COUNT(*) AS c FROM sessions WHERE session_id = ?")
+      .get("s_unknown") as { c: number };
+    expect(n.c).toBe(0);
   });
 
   // Pins the write's position ABOVE shouldEmitAncillaryFor: badge state and
@@ -311,6 +317,15 @@ describe("phase 1b: excerptOf", () => {
 
   // slice(0, 150) alone would split a surrogate pair and store a lone surrogate,
   // which survives JSON.stringify but cannot be encoded as UTF-8.
+  // The clamp protects the CUT; this protects the INTERIOR. Every caller's text
+  // arrives via JSON.parse, and a \\udXXX escape decodes to a lone surrogate.
+  it("strips an interior lone surrogate that no boundary clamp would touch", () => {
+    const e = excerptOf("before\ud800after")!;
+    expect(e.isWellFormed()).toBe(true);
+    expect(e).toContain("before");
+    expect(e).toContain("after");
+  });
+
   it("never stores a lone surrogate when an astral char straddles the boundary", () => {
     const e = excerptOf("a".repeat(149) + "\u{1F600}" + "tail")!;
     expect(e.isWellFormed()).toBe(true);

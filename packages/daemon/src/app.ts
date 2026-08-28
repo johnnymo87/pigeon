@@ -1187,7 +1187,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           kind: "question",
           payload: JSON.stringify(notificationPayload),
           token,
-          anchorMsgId: storage.sessions.get(sessionId)?.lastHumanMsgId ?? null,
+          anchorMsgId: session.lastHumanMsgId,
           // Wizard mode sends an array; the first question is what step 1 renders.
           excerpt: excerptOf(questions[0]?.question ?? null),
         }, now);

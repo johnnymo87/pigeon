@@ -23,6 +23,14 @@ export interface AppendInput {
    * excerpt for the drill-down. Both NULL for rows written before the feature,
    * and for notifications on sessions with no human turn yet. NULL means "do not
    * scroll" -- the pre-feature behaviour of landing at the bottom.
+   *
+   * OPTIONAL here while commitDelivery's `entry` makes them REQUIRED, and the
+   * asymmetry is deliberate. Requiring them here would force ~50 existing
+   * ledger-seeding call sites in tests to pass two nulls, for a risk the suite
+   * already covers: dropping either field from the append below is caught by the
+   * copy and interleaving tests. The narrowing that types CAN catch and tests
+   * cannot -- shrinking commitDelivery's parameter so the values never arrive --
+   * is pinned there instead, where it costs nothing.
    */
   anchorMsgId?: string | null;
   excerpt?: string | null;

@@ -87,10 +87,18 @@ export class OutboxRepository {
          -- payload, and for the same reason it must never touch anchor_msg_id
          -- or excerpt: a requeue re-sends the ORIGINAL content, so pairing it
          -- with a newer anchor would point the reader PAST the very thing being
-         -- re-delivered. Swarm requeue reaches this for real -- it reuses the
-         -- same per-message notificationId and, unlike /stop and /question, has
-         -- no getByNotificationId pre-check. Pinned by the "never moves a stored
-         -- anchor when a failed row is requeued" test.
+         -- re-delivered.
+         --
+         -- The reachable path is /mirror, not swarm: /mirror builds a
+         -- deterministic id (m:<session>:<message>) and has no
+         -- getByNotificationId pre-check, so a re-flush of the same message
+         -- after a failed first attempt lands here. Both swarm producers are
+         -- gated on a fresh insert (/swarm/send by an if-inserted guard,
+         -- /swarm/schedule by an if-not-inserted 409) and swarm requeue
+         -- redelivers the ENVELOPE without re-enqueueing a Telegram notice, so
+         -- swarm never re-upserts a w: id. An earlier version of this comment
+         -- claimed it did; that was wrong.
+         -- Pinned by the "never moves a stored anchor" test.
          ON CONFLICT(notification_id) DO UPDATE SET
            state = 'queued',
            attempts = 0,
