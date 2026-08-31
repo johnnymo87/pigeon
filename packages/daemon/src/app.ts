@@ -17,6 +17,7 @@ import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/te
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
+import { PULL_BACKEND_KIND } from "./adapters/goose-pull";
 
 interface LegacySession {
   session_id: string;
@@ -532,6 +533,121 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             handed_off_at: m.handedOffAt,
           })),
           has_more: page.hasMore,
+        });
+      }
+
+      // =====================================================================
+      // PULL-MODE INBOUND (SDD §13). A client that is not an addressable HTTP
+      // server collects its own mail here instead of being pushed at.
+      //
+      // Nothing in the swarm delivery state machine is touched by these three
+      // routes -- deliberately. An earlier design banked into `swarm_messages`
+      // and needed skips in the arbiter and in two places in the delivery
+      // watchdog to stop the push machinery treating a bank as a failed
+      // delivery. See storage/pull-inbox-schema.ts for why that was abandoned.
+      // =====================================================================
+
+      if (request.method === "POST" && url.pathname === "/pull/drain") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+
+        let limit: number | undefined;
+        if (body.limit !== undefined) {
+          const parsed = Number(body.limit);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            return Response.json({ error: "limit must be a positive integer" }, { status: 400 });
+          }
+          limit = parsed;
+        }
+
+        const session = storage.sessions.get(sessionId);
+        if (!session) {
+          // Loud, because the client cannot otherwise tell this from "no mail".
+          // For the motivating client this means its own /session-start failed,
+          // which is a visibility outage it is required to report.
+          return Response.json({ error: "Session not found" }, { status: 404 });
+        }
+
+        // REGISTRATION-DRIFT GUARD, and the reason it is a hard error rather
+        // than an empty list. /session-start rewrites the session row wholesale,
+        // so a client that stops sending backend_kind silently stops having an
+        // adapter selected: its replies go back to being dropped as unreachable
+        // while every drain returns a truthful, healthy zero. This turns that
+        // state into a failure at the one moment the client is listening.
+        if (session.backendKind !== PULL_BACKEND_KIND) {
+          return Response.json(
+            {
+              error:
+                `session ${sessionId} is registered with backend_kind=` +
+                `${session.backendKind ?? "null"}, not ${PULL_BACKEND_KIND}; ` +
+                `nothing is banking inbound for it`,
+              backend_kind: session.backendKind,
+            },
+            { status: 409 },
+          );
+        }
+
+        const now = nowFn();
+        // Counted BEFORE the claim, and documented as such: it includes the rows
+        // being returned. Counting after would report 0 on a full drain and read
+        // as "nothing was waiting".
+        const pendingTotal = storage.pullInbox.pendingCount(sessionId, now);
+        const claimed = storage.pullInbox.claim(sessionId, now, limit);
+
+        return Response.json({
+          ok: true,
+          session_id: sessionId,
+          pending_total: pendingTotal,
+          messages: claimed.map((m) => ({
+            msg_id: m.msgId,
+            source: m.source,
+            payload: m.payload,
+            question_request_id: m.questionRequestId,
+            created_at: m.createdAt,
+            claim_count: m.claimCount,
+            // A row claimed before but never acked. The client may already have
+            // acted on it; saying so lets it decide, rather than making the
+            // daemon guess on its behalf.
+            redelivered: m.claimCount > 1,
+          })),
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/pull/ack") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        const msgIds = body.msg_ids;
+        if (!Array.isArray(msgIds) || msgIds.some((id) => typeof id !== "string")) {
+          return Response.json({ error: "msg_ids must be an array of strings" }, { status: 400 });
+        }
+
+        // Every id is CAS'd against this session inside the repo, so an ack for
+        // a row belonging to somebody else is REJECTED AND NAMED rather than
+        // ignored -- the guard swarm's markVerified does not have, and the
+        // reason this endpoint is not simply that method exposed over HTTP.
+        const result = storage.pullInbox.ack(sessionId, msgIds as string[], nowFn());
+        return Response.json({ ok: true, acked: result.acked, rejected: result.rejected });
+      }
+
+      if (request.method === "GET" && url.pathname === "/pull/pending") {
+        const sessionId = url.searchParams.get("session");
+        if (!sessionId) return Response.json({ error: "session is required" }, { status: 400 });
+        const session = storage.sessions.get(sessionId);
+        // 200 with a flag, not 404. This is the cheap poll a wake gate runs; a
+        // caller that treated an unknown session as an error would be waking on
+        // the daemon's opinion of registration rather than on there being mail.
+        return Response.json({
+          ok: true,
+          session_id: sessionId,
+          session_known: Boolean(session),
+          backend_kind: session?.backendKind ?? null,
+          pending: session ? storage.pullInbox.pendingCount(sessionId, nowFn()) : 0,
         });
       }
 

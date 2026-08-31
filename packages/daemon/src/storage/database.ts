@@ -22,6 +22,8 @@ import { ServeInstanceRepo, SessionAssignmentRepo, SessionLeaseRepo, RoutingMeta
 import { initReassignmentSchema, ReassignmentEventRepo } from "../routing/reassignment-repo";
 import { initInjectedPromptsSchema } from "./injected-prompts-schema";
 import { InjectedPromptsRepository } from "./injected-prompts-repo";
+import { initPullInboxSchema } from "./pull-inbox-schema";
+import { PullInboxRepository } from "./pull-inbox-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -37,6 +39,8 @@ export interface StorageDb {
   /** Durable log of what was delivered to a topic, plus the read watermark. */
   sessionEvents: SessionEventsRepo;
   injectedPrompts: InjectedPromptsRepository;
+  /** Banked inbound for pull-mode backends (goose-pull). See pull-inbox-schema.ts. */
+  pullInbox: PullInboxRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
@@ -57,6 +61,7 @@ export function openStorageDb(path: string): StorageDb {
   initSessionOriginSchema(db);
   initSessionEventsSchema(db);
   initInjectedPromptsSchema(db);
+  initPullInboxSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
@@ -76,6 +81,7 @@ export function openStorageDb(path: string): StorageDb {
     sessionOrigins: new SessionOriginRepository(db),
     sessionEvents: new SessionEventsRepo(db),
     injectedPrompts: new InjectedPromptsRepository(db),
+    pullInbox: new PullInboxRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),

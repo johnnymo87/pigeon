@@ -28,6 +28,8 @@ import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand }
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { startSessionReaper } from "./session-reaper";
+import { isPullBackend } from "./adapters/goose-pull";
+import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
 import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
@@ -206,7 +208,21 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // via the session's per-serve backendEndpoint. When unroutable, omit the
           // client to preserve command-ingest's "no client -> delete dead session"
           // fallback.
-          const client = clientForSession(msg.sessionId);
+          // NOT for a pull-mode session, and this guard is load-bearing rather
+          // than tidy. `clientForSession` is a WRITE: it goes through
+          // `ensureRouted`, which PLACES the session -- minting an assignment
+          // row and a lease that bind a non-opencode session id to an arbitrary
+          // serve which has never heard of it. That happens on every inbound
+          // Telegram command, i.e. every time a human types in the session's
+          // topic, and it falsifies "an assignment exists" as a live-opencode
+          // -session discriminator (command-ingest relies on exactly that when
+          // deciding whether to delete a dead session).
+          //
+          // Omitting the client is safe here: it exists only for the revive
+          // fallback, which is reachable only from a connection error inside
+          // deliverViaAdapter, and a banking adapter never produces one.
+          const session = storage.sessions.get(msg.sessionId);
+          const client = isPullBackend(session) ? undefined : clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
             apiKey: config.workerApiKey,
@@ -443,6 +459,22 @@ setInterval(() => {
   const eventsCleaned = storage.sessionEvents.pruneOlderThan(now - SESSION_EVENTS_RETENTION_MS);
   if (eventsCleaned > 0) console.log(`[session-events] cleaned ${eventsCleaned} old rows`);
 }, 60 * 60 * 1000);
+
+// Pull-mode inbox maintenance (SDD §13). Every 5 minutes, not hourly: the
+// claimed-but-unacked alarm has a 30-minute threshold, and checking it hourly
+// would put up to 90 minutes between a client failing mid-drain and anyone
+// hearing about it. The queries are two indexed scans over a table that holds
+// only unread mail.
+const PULL_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  try {
+    runPullInboxMaintenance({ storage });
+  } catch (err) {
+    // Never let this kill the daemon: it is a monitor, and a monitor that takes
+    // the process down with it is worse than the silence it was watching for.
+    console.error("[pull-inbox] maintenance cycle failed", err);
+  }
+}, PULL_MAINTENANCE_INTERVAL_MS);
 
 // Reap stale Pigeon registry entries every hour. This must not delete opencode
 // session history; opencode-serve is restarted separately for process hygiene.

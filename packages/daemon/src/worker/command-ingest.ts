@@ -3,6 +3,7 @@ import type { SessionRecord } from "../storage/types";
 import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult } from "../adapters/types";
 import { DirectChannelAdapter } from "../adapters/direct-channel";
+import { GoosePullAdapter, bankedReplyMessage, isPullBackend } from "../adapters/goose-pull";
 import { NvimRpcAdapter } from "../adapters/nvim-rpc";
 import {
   type OpencodeDirectExecuteResult,
@@ -97,7 +98,19 @@ function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   return OpencodeDirectSource.TelegramReply;
 }
 
-function selectAdapter(session: SessionRecord, injectedPrompts?: InjectedPromptsRepository): CommandDeliveryAdapter | null {
+function selectAdapter(
+  session: SessionRecord,
+  injectedPrompts?: InjectedPromptsRepository,
+  storage?: StorageDb,
+): CommandDeliveryAdapter | null {
+  // PULL BACKENDS FIRST, and deliberately with no endpoint/token precondition:
+  // the whole point of a pull backend is that it has no address to hold. It is
+  // checked before the direct-channel branch so a client that somehow carried
+  // both cannot be pushed at by accident.
+  if (isPullBackend(session) && storage) {
+    return new GoosePullAdapter({ storage });
+  }
+
   if (
     session.backendKind === "opencode-plugin-direct"
     && session.backendEndpoint
@@ -353,7 +366,7 @@ export async function ingestWorkerCommand(
 
       const adapter = options.createAdapter
         ? options.createAdapter(session)
-        : selectAdapter(session, storage.injectedPrompts);
+        : selectAdapter(session, storage.injectedPrompts, storage);
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -395,6 +408,7 @@ export async function ingestWorkerCommand(
             commandId,
           );
         }
+        await notifyIfBanked(result, session, msg, commandId, options);
         await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
@@ -427,7 +441,7 @@ export async function ingestWorkerCommand(
 
     const adapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts);
+      : selectAdapter(session, storage.injectedPrompts, storage);
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -445,6 +459,7 @@ export async function ingestWorkerCommand(
       console.log(`[command-ingest] question reply delivered commandId=${commandId}`);
       storage.inbox.markDone(commandId);
       storage.pendingQuestions.delete(msg.sessionId, pendingQuestion.requestId);
+      await notifyIfBanked(result, session, msg, commandId, options);
       await warnMediaNotDelivered(msg, commandId, options);
       return;
     }
@@ -509,7 +524,7 @@ export async function ingestWorkerCommand(
 
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts);
+      : selectAdapter(session, storage.injectedPrompts, storage);
 
     if (fallbackAdapter?.deliverQuestionReply) {
       const answers: string[][] = [[msg.command.trim()]];
@@ -524,6 +539,7 @@ export async function ingestWorkerCommand(
         storage.inbox.markDone(commandId);
         // Clean up matching pending question; keyed delete ensures an unrelated live question survives
         storage.pendingQuestions.delete(msg.sessionId, msg.metadata.questionRequestId);
+        await notifyIfBanked(result, session, msg, commandId, options);
         await warnMediaNotDelivered(msg, commandId, options);
         return;
       }
@@ -570,7 +586,7 @@ export async function ingestWorkerCommand(
 
   const adapter = options.createAdapter
     ? options.createAdapter(session)
-    : selectAdapter(session, storage.injectedPrompts);
+    : selectAdapter(session, storage.injectedPrompts, storage);
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
@@ -730,6 +746,40 @@ async function tryEditNotification(
 }
 
 /** Best-effort user notification. Never throws; see dropCommand for the rationale. */
+/**
+ * Tell the human their message was BANKED, not delivered.
+ *
+ * Gated on the adapter's own `meta.banked` rather than on the session's backend
+ * kind, so the notice can only appear for a delivery that really was a bank --
+ * one fact, asserted by the code that performed it.
+ *
+ * WHY IT EXISTS. On success this path sends nothing, because Telegram has
+ * already toasted "Command sent" and a second confirmation would be noise. For a
+ * pull backend that toast is false by as much as ~68 hours (the motivating
+ * client runs Mon-Fri plus capped follow-ups, so the worst gap is Friday evening
+ * to Monday). Silence here would leave the human believing an unattended agent
+ * had just been told something it will not read until next week.
+ *
+ * Best-effort by construction: the message IS banked either way, and failing the
+ * command because a courtesy notice failed would trade a real delivery for a
+ * cosmetic one.
+ */
+async function notifyIfBanked(
+  result: CommandDeliveryResult,
+  session: SessionRecord,
+  msg: ExecuteMessage,
+  commandId: string,
+  options: WorkerCommandIngestOptions,
+): Promise<void> {
+  if (!result.ok || result.meta?.banked !== true) return;
+  await sendBestEffort(
+    options.sendTelegramReply,
+    msg.chatId,
+    bankedReplyMessage(session),
+    commandId,
+  );
+}
+
 async function sendBestEffort(
   sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
   chatId: string,
@@ -1176,6 +1226,7 @@ async function deliverViaAdapter(
   if (result.ok) {
     console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts}`);
     storage.inbox.markDone(commandId);
+    await notifyIfBanked(result, session, msg, commandId, options);
     return;
   }
 
