@@ -95,13 +95,52 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
     reply: QuestionReplyInput,
     context: CommandDeliveryContext,
   ): Promise<CommandDeliveryResult> {
+    const payload = renderAnswerPayload(reply.answers);
     return this.bank(session, {
       msgId: `pull:${context.commandId}`,
       source: "question-answer",
-      payload: renderAnswerPayload(reply.answers),
+      payload,
       questionRequestId: reply.questionRequestId,
+      answerKind: this.classifyAnswer(session.sessionId, reply),
       chatId: context.chatId,
     });
+  }
+
+  /**
+   * Is this actually an answer, or an unrelated message a pending question
+   * captured?
+   *
+   * MEASURED, NOT THEORISED, 2026-08-31 on a live daemon: while a question is
+   * pending, command-ingest routes EVERY plain message to that session into the
+   * question-reply path -- its own comment says "a live row hijacks EVERY plain
+   * message to the session". So an ordinary Telegram message sent inside the 4h
+   * TTL arrives here labelled as the answer to a question it never saw, and it
+   * consumes the pending row, so a later button press is refused as stale. The
+   * text is preserved either way; the LABEL is what lies, and a client that has
+   * been told to validate answers against still-open questions would believe it.
+   *
+   * The discriminator is the question's own option labels: a rendered button
+   * press resolves to one of them by construction (command-ingest maps an option
+   * token to `options[i].label`), and free text almost never collides with one.
+   * Reported rather than acted on -- refusing free text here would throw away
+   * genuinely typed answers, which are legitimate.
+   */
+  private classifyAnswer(
+    sessionId: string,
+    reply: QuestionReplyInput,
+  ): "option" | "free-text" {
+    // Including expired: the row survives its TTL precisely so a late answer can
+    // still be matched, and this classification wants the same evidence.
+    const pending = this.storage.pendingQuestions.getBySessionIdIncludingExpired(sessionId);
+    if (!pending || pending.requestId !== reply.questionRequestId) return "free-text";
+    const labels = new Set(
+      pending.questions.flatMap((q) => (q.options ?? []).map((o) => o.label)),
+    );
+    const values = reply.answers.flat();
+    // Every step must have resolved to a label. A wizard whose steps are half
+    // buttons and half typed text is not a button press, and calling it one
+    // would be the overclaim this method exists to prevent.
+    return values.length > 0 && values.every((a) => labels.has(a)) ? "option" : "free-text";
   }
 
   private bank(
@@ -111,6 +150,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
       source: "telegram-reply" | "question-answer";
       payload: string;
       questionRequestId?: string;
+      answerKind?: "option" | "free-text";
       chatId?: string | number;
     },
   ): CommandDeliveryResult {
@@ -138,6 +178,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
         source: input.source,
         payload,
         questionRequestId: input.questionRequestId ?? null,
+        answerKind: input.answerKind ?? null,
         chatId: input.chatId === undefined ? null : String(input.chatId),
       },
       this.nowFn(),

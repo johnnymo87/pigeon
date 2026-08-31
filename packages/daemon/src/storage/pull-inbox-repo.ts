@@ -8,12 +8,23 @@ import type BetterSqlite3 from "better-sqlite3";
  */
 export type PullInboxSource = "telegram-reply" | "question-answer";
 
+/**
+ * How much the `question-answer` label can be trusted.
+ *
+ * `option`    -- the payload matched one of the pending question's own option
+ *                labels, so this is the human pressing a button.
+ * `free-text` -- it did not. It may be a typed answer, or it may be an unrelated
+ *                message that a pending question captured (see the schema note).
+ */
+export type PullAnswerKind = "option" | "free-text";
+
 export interface PullInboxRecord {
   msgId: string;
   sessionId: string;
   source: PullInboxSource;
   payload: string;
   questionRequestId: string | null;
+  answerKind: PullAnswerKind | null;
   chatId: string | null;
   createdAt: number;
   expiresAt: number;
@@ -29,6 +40,7 @@ export interface BankPullMessageInput {
   source: PullInboxSource;
   payload: string;
   questionRequestId?: string | null;
+  answerKind?: PullAnswerKind | null;
   chatId?: string | null;
   ttlMs?: number;
 }
@@ -61,6 +73,7 @@ function asRecord(row: Row): PullInboxRecord {
     source: String(row.source) as PullInboxSource,
     payload: String(row.payload),
     questionRequestId: (row.question_request_id as string | null) ?? null,
+    answerKind: (row.answer_kind as PullAnswerKind | null) ?? null,
     chatId: (row.chat_id as string | null) ?? null,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
@@ -85,9 +98,9 @@ export class PullInboxRepository {
     const result = this.db
       .prepare(
         `INSERT INTO pull_inbox
-           (msg_id, session_id, source, payload, question_request_id, chat_id,
+           (msg_id, session_id, source, payload, question_request_id, answer_kind, chat_id,
             created_at, expires_at, claimed_at, claim_count, acked_at, unacked_alerted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -96,6 +109,7 @@ export class PullInboxRepository {
         input.source,
         input.payload,
         input.questionRequestId ?? null,
+        input.answerKind ?? null,
         input.chatId ?? null,
         now,
         now + (input.ttlMs ?? DEFAULT_PULL_TTL_MS),

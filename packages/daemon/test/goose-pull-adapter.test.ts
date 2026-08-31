@@ -78,6 +78,111 @@ describe("GoosePullAdapter", () => {
     expect(row!.payload).toContain("and rebase first");
   });
 
+  // MEASURED ON A LIVE DAEMON, 2026-08-31, and the reason this column exists.
+  // While a question is pending, command-ingest routes EVERY plain message to the
+  // session into the question-reply path. An unrelated Telegram message therefore
+  // arrives labelled as the answer to a question it never saw -- and consumes the
+  // pending row, so a later button press is refused as stale. The text survives;
+  // the label is what lies, to a client that has been told to trust it.
+  it("marks an answer that matches an option label as a button press", async () => {
+    const s = newDb();
+    s.pendingQuestions.store(
+      {
+        sessionId: "ses_lane",
+        requestId: "req-7",
+        questions: [
+          {
+            question: "Repin or wait?",
+            header: "h",
+            options: [
+              { label: "repin", description: "" },
+              { label: "wait", description: "" },
+            ],
+          },
+        ],
+        token: "t",
+      },
+      Date.now(),
+    );
+    const adapter = new GoosePullAdapter({ storage: s, nowFn: () => 2_000 });
+    await adapter.deliverQuestionReply(
+      session(s),
+      { questionRequestId: "req-7", answers: [["wait"]] },
+      { commandId: "cmd-b" },
+    );
+    expect(s.pullInbox.claim("ses_lane", 3_000)[0]!.answerKind).toBe("option");
+  });
+
+  it("marks text that matches no option as free text, not as a confirmed answer", async () => {
+    const s = newDb();
+    s.pendingQuestions.store(
+      {
+        sessionId: "ses_lane",
+        requestId: "req-7",
+        questions: [
+          {
+            question: "Repin or wait?",
+            header: "h",
+            options: [
+              { label: "repin", description: "" },
+              { label: "wait", description: "" },
+            ],
+          },
+        ],
+        token: "t",
+      },
+      Date.now(),
+    );
+    const adapter = new GoosePullAdapter({ storage: s, nowFn: () => 2_000 });
+    await adapter.deliverQuestionReply(
+      session(s),
+      { questionRequestId: "req-7", answers: [["actually, look at #4360 first"]] },
+      { commandId: "cmd-c" },
+    );
+    expect(s.pullInbox.claim("ses_lane", 3_000)[0]!.answerKind).toBe("free-text");
+  });
+
+  it("marks an answer as free text when there is no pending question at all", async () => {
+    const s = newDb();
+    const adapter = new GoosePullAdapter({ storage: s, nowFn: () => 2_000 });
+    await adapter.deliverQuestionReply(
+      session(s),
+      { questionRequestId: "req-gone", answers: [["wait"]] },
+      { commandId: "cmd-d" },
+    );
+    expect(s.pullInbox.claim("ses_lane", 3_000)[0]!.answerKind).toBe("free-text");
+  });
+
+  // The row that is pending is not necessarily the row being answered: questions
+  // are keyed on session_id with INSERT OR REPLACE, so a second question destroys
+  // the first while the first's card is still on screen. A late tap on that dead
+  // card whose text happens to match the LIVE question's options must not be
+  // certified as a button press for a question this row is not about. Mutation
+  // testing found this: an earlier version checked only that SOME question was
+  // pending, and every test still passed because none of them had a mismatched
+  // pending row.
+  it("does not certify an answer against a DIFFERENT pending question", async () => {
+    const s = newDb();
+    s.pendingQuestions.store(
+      {
+        sessionId: "ses_lane",
+        requestId: "req-NEW",
+        questions: [
+          { question: "q", header: "h", options: [{ label: "wait", description: "" }] },
+        ],
+        token: "t",
+      },
+      Date.now(),
+    );
+    const adapter = new GoosePullAdapter({ storage: s, nowFn: () => 2_000 });
+    await adapter.deliverQuestionReply(
+      session(s),
+      { questionRequestId: "req-OLD", answers: [["wait"]] },
+      { commandId: "cmd-e" },
+    );
+    expect(s.pullInbox.claim("ses_lane", 3_000)[0]!.answerKind).toBe("free-text");
+  });
+
   it("refuses to bank for a session that is not a pull backend", async () => {
     const s = newDb();
     s.sessions.upsert(

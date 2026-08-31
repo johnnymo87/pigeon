@@ -40,6 +40,19 @@ import type BetterSqlite3 from "better-sqlite3";
  * re-served by the next claim (at-least-once, and the claim count says so), which
  * is the strongest honest guarantee available across a process boundary.
  *
+ * `answer_kind` exists because of something MEASURED rather than predicted, on
+ * 2026-08-31, running the real path end to end. While a question is pending,
+ * command-ingest routes EVERY plain message to that session into the
+ * question-reply path -- it says so in its own comment ("a live row hijacks EVERY
+ * plain message to the session"). So an unrelated Telegram message sent during
+ * the 4h TTL is banked as a `question-answer`, carrying the request id of a
+ * question it was not answering, and it consumes the pending row so a later
+ * button tap is refused as stale. The text is never lost; the LABEL is wrong,
+ * and a client told to validate answers against open questions would believe it.
+ * So the adapter records whether the answer matched one of the question's own
+ * option labels, and the client is told which -- `option` is the human pressing
+ * a button, `free-text` may be an answer or may be an unrelated message.
+ *
  * `unacked_alerted_at` is DURABLE on purpose. Every dedupe in delivery-watchdog.ts
  * is an in-memory Set, so an alarm about a permanently stuck row re-fires on every
  * daemon restart -- and a permanently stuck row is precisely the population that
@@ -53,6 +66,7 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
       source TEXT NOT NULL,
       payload TEXT NOT NULL,
       question_request_id TEXT,
+      answer_kind TEXT,
       chat_id TEXT,
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,

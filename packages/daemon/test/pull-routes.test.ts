@@ -139,15 +139,19 @@ describe("pull routes", () => {
           source: "question-answer",
           payload: "wait",
           questionRequestId: "req-7",
+          answerKind: "option",
         },
         2_000,
       );
       const res = await post(app, "/pull/drain", { session_id: "ses_lane" });
       const body = (await res.json()) as {
-        messages: Array<{ source: string; question_request_id: string | null }>;
+        messages: Array<{ source: string; question_request_id: string | null; answer_kind: string | null }>;
       };
       expect(body.messages[0]!.source).toBe("question-answer");
       expect(body.messages[0]!.question_request_id).toBe("req-7");
+      // Carried through so the client can tell a button press from text that a
+      // pending question merely captured. Measured hazard, not a hypothetical.
+      expect(body.messages[0]!.answer_kind).toBe("option");
     });
   });
 

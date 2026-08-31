@@ -606,6 +606,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             source: m.source,
             payload: m.payload,
             question_request_id: m.questionRequestId,
+            // "option" means the human pressed one of the question's own buttons.
+            // "free-text" means it did not match any -- which may be a typed
+            // answer, or may be an unrelated message that a pending question
+            // captured (measured; see storage/pull-inbox-schema.ts). The client
+            // is told which rather than being left to trust the label.
+            answer_kind: m.answerKind,
             created_at: m.createdAt,
             claim_count: m.claimCount,
             // A row claimed before but never acked. The client may already have
