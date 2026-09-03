@@ -27,7 +27,9 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       expires_at INTEGER,
       cancelled_at INTEGER,
       ref TEXT,
-      nudge_count INTEGER NOT NULL DEFAULT 0
+      nudge_count INTEGER NOT NULL DEFAULT 0,
+      -- NULL means the transcript (opencode) family. See swarm/verify-family.ts.
+      verify_family TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -69,6 +71,15 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       // 4763 rows that were retroactively unknowable for want of a recorded
       // reason.
       "ALTER TABLE swarm_messages ADD COLUMN nudge_count INTEGER NOT NULL DEFAULT 0",
+      // How this row's delivery gets CONFIRMED, stamped at handoff by the code
+      // that performed it. NULL means "transcript" (the opencode machinery), so
+      // every pre-existing row keeps exactly the behaviour it has today and no
+      // backfill is needed. Deliberately NOT joined from `sessions.backend_kind`:
+      // that row is deleted on expiry and the value is mutable, while an
+      // unverified handed-off message is effectively immortal, so the join would
+      // silently flip a receipt row into the transcript path as it aged. See
+      // `swarm/verify-family.ts` for the full reasoning.
+      "ALTER TABLE swarm_messages ADD COLUMN verify_family TEXT",
     ];
 
     for (const statement of additiveColumns) {

@@ -421,7 +421,7 @@ function swarmRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageR
     kind: "chat", priority: "normal", replyTo: null, payload: "Hello receiver!",
     state: "queued", attempts: 0, nextRetryAt: null, createdAt: 1_000, updatedAt: 1_000,
     handedOffAt: null, verifiedAt: null, requeueCount: 0, nudgeCount: 0, abortedAt: null,
-    deliverAt: null, expiresAt: null, cancelledAt: null, ref: null, ...overrides,
+    deliverAt: null, expiresAt: null, cancelledAt: null, ref: null, verifyFamily: null, ...overrides,
   };
 }
 

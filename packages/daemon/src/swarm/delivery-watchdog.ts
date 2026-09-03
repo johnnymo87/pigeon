@@ -3,6 +3,7 @@ import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
 import { notifySenderOfFailure } from "./notify-sender";
+import { resolveVerifyFamily, type VerifyFamily } from "./verify-family";
 import {
   isWakeKind,
   isSuppressedFromRecovery,
@@ -85,6 +86,18 @@ export const DEFAULT_MAX_REQUEUES = 3;
 export const DEFAULT_MAX_NUDGES = 3;
 /** OVERDUE_ALERT_MS */
 export const DEFAULT_OVERDUE_ALERT_MS = 300_000;
+
+/**
+ * How long a receipt-family handoff may go unconfirmed before it is terminal.
+ *
+ * Measured from `handed_off_at`, not from selection, so it is an absolute claim
+ * about the delivery rather than a function of how often the watchdog runs.
+ * Generously longer than {@link DEFAULT_VERIFY_AFTER_MS} because for a receipt
+ * backend the prompt call IS the turn: a turn that legitimately runs for minutes
+ * is not evidence of anything wrong, and the honest signal is a receipt that
+ * never comes at all rather than one that is merely slow.
+ */
+export const DEFAULT_RECEIPT_GRACE_MS = 600_000;
 /** DIRECTORY_TIMEOUT_MS */
 export const DEFAULT_DIRECTORY_TIMEOUT_MS = 5_000;
 /** See `DeliveryWatchdogOptions.stallAlertMs`. */
@@ -121,6 +134,20 @@ export interface DeliveryWatchdogOptions {
    * wrong. This alarm is for "wedged", not "slow".
    */
   stallAlertMs?: number;
+  /** See {@link DEFAULT_RECEIPT_GRACE_MS}. */
+  receiptGraceMs?: number;
+  /**
+   * Whether a receipt for this message is still legitimately outstanding —
+   * i.e. THIS process is holding the call that would produce it.
+   *
+   * Defaults to "never pending", which is correct after a restart by
+   * construction: the in-memory map that would answer true is empty, and a
+   * handoff whose receipt is owed by a connection that no longer exists is
+   * exactly the orphan this terminal exists to catch. It matters when handoff is
+   * committed BEFORE the blocking prompt call, in which case every healthy long
+   * turn would otherwise age past the grace window and be declared failed.
+   */
+  isReceiptPending?: (msgId: string) => boolean;
 }
 
 export interface CycleSummary {
@@ -453,6 +480,8 @@ export class DeliveryWatchdog {
   private readonly maxRequeues: number;
   private readonly maxNudges: number;
   private readonly overdueAlertMs: number;
+  private readonly receiptGraceMs: number;
+  private readonly isReceiptPending: (msgId: string) => boolean;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
   // for this handoff episode. Pruned when the message verifies or goes
@@ -470,6 +499,10 @@ export class DeliveryWatchdog {
   private readonly lostWakeAlerted = new Set<string>();
   // Dedupe: msg_id -> the no-healthy-serve age alarm has already fired.
   private readonly ageAlarmed = new Set<string>();
+
+  // Dedupe for the unrecognised-family refusal. That row is never touched, so
+  // without this it would re-alert every cycle, forever.
+  private readonly unknownFamilyAlarmed = new Set<string>();
   // Dedupe: msg_id -> the overdue queued alarm has already fired.
   private readonly overdueAlerted = new Set<string>();
   // Dedupe: msg_id -> the silent-in-flight warn has already fired.
@@ -508,6 +541,8 @@ export class DeliveryWatchdog {
     this.maxRequeues = opts.maxRequeues ?? DEFAULT_MAX_REQUEUES;
     this.maxNudges = opts.maxNudges ?? DEFAULT_MAX_NUDGES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
+    this.receiptGraceMs = opts.receiptGraceMs ?? DEFAULT_RECEIPT_GRACE_MS;
+    this.isReceiptPending = opts.isReceiptPending ?? (() => false);
     this.directoryTimeoutMs =
       opts.directoryTimeoutMs ?? DEFAULT_DIRECTORY_TIMEOUT_MS;
     this.stallAlertMs = opts.stallAlertMs ?? DEFAULT_STALL_ALERT_MS;
@@ -798,18 +833,66 @@ export class DeliveryWatchdog {
 
     this.reconcileDedupe(new Set(rows.map((r) => r.msgId)));
 
-    const bySession = new Map<string, SwarmMessageRecord[]>();
+    // THE GATE. Everything below this point is opencode-specific -- transcript
+    // archaeology, anchor greps, and a 404 "second opinion" whose confirmed-gone
+    // terminal tells the sender the message was never written and is safe to
+    // resend. Running any of that against a backend with no transcript endpoint
+    // produces a false failure and, worse, an invitation to send a duplicate
+    // prompt. So a row is routed by the family stamped on it AT HANDOFF, and a
+    // family we do not recognise is refused rather than guessed at.
+    //
+    // Note this partitions on the ROW, never on a join to `sessions`: that row
+    // is deleted on expiry and its `backend_kind` is mutable, while an
+    // unverified handed-off message is effectively immortal, so a join would
+    // quietly reclassify a receipt row into this machinery as it aged. See
+    // `verify-family.ts`.
+    const partitioned = new Map<string, { family: VerifyFamily; rows: SwarmMessageRecord[] }>();
     for (const row of rows) {
       const target = row.toSession;
       if (!target) continue;
-      const list = bySession.get(target) ?? [];
-      list.push(row);
-      bySession.set(target, list);
+
+      const family = resolveVerifyFamily(row.verifyFamily);
+      if (family === null) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId: target,
+          reason: "unknown-verify-family",
+        });
+        if (!this.unknownFamilyAlarmed.has(row.msgId)) {
+          this.unknownFamilyAlarmed.add(row.msgId);
+          counts.alerted++;
+          await this.alert(
+            "error",
+            `delivery watchdog: msg ${row.msgId} to ${target} carries an ` +
+              `unrecognised verify_family=${JSON.stringify(row.verifyFamily)}, so it ` +
+              `is being left alone rather than verified. Guessing would either ` +
+              `strand the message or run opencode's transcript and 404 remedies ` +
+              `against a backend that has neither. This column is written only by ` +
+              `pigeon's own delivery code, so this means a bug or a rollback to a ` +
+              `daemon older than the backend that wrote it.`,
+          );
+        }
+        continue;
+      }
+
+      // Keyed by family AND session: a session id is unique per family in
+      // practice, but keying on both means a mixed pair can never be handed to
+      // one handler by accident.
+      const key = `${family}\u0000${target}`;
+      const entry = partitioned.get(key) ?? { family, rows: [] };
+      entry.rows.push(row);
+      partitioned.set(key, entry);
     }
 
-    for (const [sessionId, sessionRows] of bySession) {
+    for (const [key, { family, rows: sessionRows }] of partitioned) {
+      const sessionId = key.slice(key.indexOf("\u0000") + 1);
       try {
-        await this.processSession(sessionId, sessionRows, now, counts);
+        if (family === "receipt") {
+          await this.processReceiptSession(sessionId, sessionRows, now, counts);
+        } else {
+          await this.processSession(sessionId, sessionRows, now, counts);
+        }
       } catch (err) {
         // A single session's resolveClients/fetch/etc. blowing up must not
         // abort the whole cycle — every other session's rows still deserve
@@ -823,6 +906,113 @@ export class DeliveryWatchdog {
 
     this.log("cycle complete", { ...counts });
     return counts;
+  }
+
+  /**
+   * The receipt-family terminal.
+   *
+   * Deliberately tiny, and deliberately does NOT call `resolveClients`: for a
+   * backend that reports turn end itself there is no transcript to fetch, and
+   * the resolver's fallback to an arbitrary healthy opencode serve
+   * (`watchdog-client-resolver.ts`) is precisely the accident this gate exists
+   * to prevent.
+   *
+   * It also does not REQUEUE. A missing receipt cannot distinguish "the turn ran
+   * and the receipt was lost" from "the turn never ran", and re-injecting the
+   * payload on that ambiguity means a second copy of the prompt in the context
+   * of an agent that holds merge authority. The backend's own client can tell
+   * those apart -- it knows whether its connection dropped mid-turn -- so the
+   * decision belongs there, not here.
+   *
+   * What it will not do is stay silent. An alert-only handler would be WEAKER
+   * than the machinery it firewalls: every other terminal notifies the sender,
+   * and an unverified handed-off row is never reaped (`cleanupOlderThan` only
+   * collects verified ones), so the sender would wait on an immortal row for a
+   * turn nobody is going to confirm.
+   */
+  private async processReceiptSession(
+    sessionId: string,
+    rows: SwarmMessageRecord[],
+    now: number,
+    counts: CycleSummary,
+  ): Promise<void> {
+    for (const row of rows) {
+      if (this.isReceiptPending(row.msgId)) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "receipt-pending",
+        });
+        continue;
+      }
+
+      const age = now - (row.handedOffAt ?? now);
+      if (age < this.receiptGraceMs) {
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "receipt-within-grace",
+        });
+        continue;
+      }
+
+      const reason = `no turn-end receipt after ${humanDuration(age)}`;
+      let marked = false;
+      this.storage.db.transaction(() => {
+        if (!this.storage.swarm.markFailed(row.msgId, now)) return;
+        marked = true;
+
+        if (isSuppressedFromRecovery(row)) {
+          this.storage.alerts.enqueue({
+            source: "receipt-overdue",
+            refMsgId: row.msgId,
+            text: formatWakePayloadAlert(
+              row,
+              `${reason}; the payload was accepted by the backend but no turn was ` +
+                `confirmed to have run it`,
+              "delivery watchdog: wake handed off but never confirmed",
+            ),
+            severity: "error",
+            now,
+          });
+        }
+
+        if (row.fromSession !== row.toSession) {
+          // "unobserved", NOT "absent". We never looked at anything and cannot
+          // claim the payload is missing -- and for this backend class the
+          // payload is in fact persisted by the target even when no turn ran.
+          // "absent" would render "safe to resend", which is how a duplicate
+          // prompt reaches an unattended agent.
+          notifySenderOfFailure(this.storage, row, reason, now, "unobserved");
+        }
+      })();
+
+      if (!marked) {
+        // Either a receipt landed and verified the row during this cycle, or it
+        // left `handed_off` some other way. Both mean the terminal was wrong,
+        // and the guard on `markFailed` is what made that recoverable.
+        counts.skipped++;
+        this.log("skipped", {
+          msgId: row.msgId,
+          sessionId,
+          reason: "receipt-row-no-longer-failable",
+        });
+        continue;
+      }
+
+      counts.terminal++;
+      this.pruneDedupe(row.msgId);
+      await this.alert(
+        "error",
+        `delivery watchdog: msg ${row.msgId} to ${sessionId} was handed off ` +
+          `${humanDuration(age)} ago and never produced a turn-end receipt. ` +
+          `Not resent: a missing receipt cannot distinguish a lost receipt from a ` +
+          `turn that never started, and resending would risk a duplicate prompt.`,
+      );
+      this.log("terminal", { msgId: row.msgId, sessionId, reason });
+    }
   }
 
   private async processSession(

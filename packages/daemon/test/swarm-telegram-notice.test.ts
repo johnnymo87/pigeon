@@ -33,6 +33,7 @@ function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRe
     expiresAt: null,
     cancelledAt: null,
     ref: null,
+    verifyFamily: null,
     ...overrides,
   };
 }
