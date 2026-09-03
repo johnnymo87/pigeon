@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   GooseAcpClient,
+  ALLOWED_ACP_METHODS,
   DisconnectedDuringTurn,
   type AcpTransport,
   type AcpTransportFactory,
@@ -408,4 +409,82 @@ describe("GooseAcpClient", () => {
       expect(peer.countOf("session/prompt")).toBe(1);
     });
   });
+
+  /**
+   * The trust boundary, pinned.
+   *
+   * goose's `_goose/unstable/tools/call` executes a tool with the PreToolUse
+   * hook chain UNINVOKED -- and PostToolUse too, which is the hook that puts a
+   * merge in front of the human. So a tool run that way is both unrefusable and
+   * INVISIBLE, and invisibility is the failure this lane exists to fix.
+   *
+   * The `extensions:` allowlist does still bind there, so the surface is
+   * bounded -- but `shell` is inside the lane's allowlist, which is why bounded
+   * is not safe. This client therefore never acquires a tool-execution
+   * capability, and these tests make that a decision rather than a habit.
+   */
+  describe("trust boundary: the client never gains a tool-execution capability", () => {
+    it("sends only session-oriented methods across a full flow", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+      const sid = "sess-1";
+      const p = client.prompt(sid, "x");
+      peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+      await p;
+
+      const methods = peer.sent
+        .map((m) => m.method)
+        .filter((m): m is string => typeof m === "string");
+      expect(methods.length).toBeGreaterThan(0);
+      for (const m of methods) {
+        expect(ALLOWED_ACP_METHODS as readonly string[]).toContain(m);
+      }
+    });
+
+    it("refuses to send a tool-execution method even if called directly", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+      const before = peer.sent.length;
+
+      // Reaching past the public API on purpose: the guard must live in the
+      // send path, so that a FUTURE caller cannot acquire the capability by
+      // adding a method, only by editing the allowlist.
+      const callPrivate = (client as unknown as {
+        call: (m: string, p: unknown) => Promise<unknown>;
+      }).call.bind(client);
+
+      // Throws SYNCHRONOUSLY rather than rejecting: this is a programming
+      // error, not a runtime condition, and `call` is not an async function.
+      // Every real caller awaits it, so a sync throw still surfaces as a
+      // rejection to them.
+      expect(() => callPrivate("_goose/unstable/tools/call", { name: "shell" })).toThrow(
+        /disallowed method/,
+      );
+      expect(peer.sent.length).toBe(before);
+    });
+
+    it("pins the allowlist so growing it is a deliberate act", () => {
+      // If this fails, someone added a method. That is allowed -- but the
+      // question "does this give the client a way to run a tool with no hook
+      // and no visibility?" has to be answered by a human first.
+      expect([...ALLOWED_ACP_METHODS]).toEqual([
+        "initialize",
+        "session/new",
+        "session/prompt",
+        "_goose/unstable/session/steer",
+      ]);
+    });
+
+    it("has no method that looks like tool execution", () => {
+      for (const m of ALLOWED_ACP_METHODS) {
+        expect(m).not.toMatch(/tools?\//);
+        expect(m).not.toMatch(/call_tool/);
+      }
+    });
+  });
+
 });
