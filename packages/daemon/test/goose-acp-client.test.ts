@@ -288,6 +288,106 @@ describe("GooseAcpClient", () => {
       const answer = peer.sent.find((m) => m.id === "perm-2");
       expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
     });
+
+    /**
+     * The obligation measured against a real goose serve is "reply to the
+     * frame", not "reply correctly": a correct optionId, an unknown optionId,
+     * an empty `result: {}` and even a JSON-RPC error response all clear a
+     * pending request. What does NOT clear it is sending nothing -- and a turn
+     * parked on an unanswered request cannot be cancelled either, because
+     * goose only applies a recorded cancel after the turn's stream yields an
+     * event and the permission phase has no event source. So the wedge is
+     * unbounded, and the caller can cause it.
+     *
+     * These tests exist because the injected policy is CALLER code. A policy
+     * that throws is the one precondition for that wedge that lives on our
+     * side of the boundary rather than goose's.
+     */
+    it("still answers when the injected policy throws", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer, {
+        permissionPolicy: () => {
+          throw new Error("policy blew up");
+        },
+      });
+      await client.connect();
+      void client.prompt("sess-1", "x").catch(() => {});
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-throw",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: [{ optionId: "allow_once" }, { optionId: "reject_once" }] },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-throw");
+      expect(answer).toBeDefined();
+      // Falls back to the refusal it would have made with no policy at all.
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
+    });
+
+    it("answers with a bare result when the options are unusable and the policy throws", async () => {
+      // Nothing to refuse WITH: no options, and a policy that cannot supply
+      // one either. An empty result is measured to clear the request, so send
+      // that rather than nothing.
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer, {
+        permissionPolicy: () => {
+          throw new Error("policy blew up");
+        },
+      });
+      await client.connect();
+      void client.prompt("sess-1", "x").catch(() => {});
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-empty",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: [] },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-empty");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({});
+    });
+
+    it("answers every request even when one policy call throws", async () => {
+      // A throw must not poison the handler for later requests: a single lane
+      // turn can raise several permission requests in sequence.
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      let n = 0;
+      const client = makeClient(peer, {
+        permissionPolicy: () => {
+          n += 1;
+          if (n === 1) throw new Error("first one throws");
+          return "allow_once";
+        },
+      });
+      await client.connect();
+      void client.prompt("sess-1", "x").catch(() => {});
+      for (const id of ["perm-a", "perm-b"]) {
+        peer.emit({
+          jsonrpc: "2.0",
+          id,
+          method: "session/request_permission",
+          params: { sessionId: "sess-1", options: [{ optionId: "allow_once" }, { optionId: "reject_once" }] },
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+
+      expect(peer.sent.find((m) => m.id === "perm-a")!.result).toEqual({
+        outcome: { outcome: "selected", optionId: "reject_once" },
+      });
+      expect(peer.sent.find((m) => m.id === "perm-b")!.result).toEqual({
+        outcome: { outcome: "selected", optionId: "allow_once" },
+      });
+    });
   });
 
   describe("reconnect", () => {
