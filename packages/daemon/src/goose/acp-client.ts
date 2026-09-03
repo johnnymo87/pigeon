@@ -289,21 +289,74 @@ export class GooseAcpClient {
     // proof-of-life is how the opencode watchdog grew to 1650 lines.
   }
 
+  /**
+   * Answer a server->client request. This method must not be able to fail.
+   *
+   * A goose turn parked on an unanswered `session/request_permission` is
+   * UNBOUNDED: there is no server-side timeout, and it cannot be cancelled
+   * either, because goose only applies a recorded cancel once the turn's stream
+   * yields an event and the permission phase is the one phase with no event
+   * source. Measurement against a real serve also showed the obligation is
+   * weaker than it looks -- ANY reply clears the request: a correct optionId,
+   * an unknown optionId, a bare `result: {}`, even a JSON-RPC error. The rule
+   * is "reply to the frame", not "reply correctly".
+   *
+   * Which makes an unguarded throw the whole hazard, and the injected policy is
+   * CALLER code. A policy that throws would propagate out of the transport
+   * callback and send nothing at all -- a wedge introduced by our side of the
+   * boundary rather than by goose. So every step degrades instead of throwing:
+   * policy, then the refusal we would have made with no policy, then a bare
+   * result. Refusing is the right direction to fail in for an unattended agent.
+   */
   private answerServerRequest(msg: JsonRpcResponse): void {
     const params = (msg.params ?? {}) as unknown as PermissionParams;
     const options = Array.isArray(params.options) ? params.options : [];
-    const chosen = this.opts.permissionPolicy
-      ? this.opts.permissionPolicy(params)
-      : refuse(options);
-    const optionId = chosen ?? refuse(options);
+
+    let optionId: string | undefined;
+    try {
+      const chosen = this.opts.permissionPolicy
+        ? this.opts.permissionPolicy(params)
+        : refuse(options);
+      optionId = chosen ?? refuse(options);
+    } catch (err) {
+      // Deliberately falls back to the DEFAULT REFUSAL rather than to nothing:
+      // a policy that cannot decide must not become a policy that allows.
+      try {
+        optionId = refuse(options);
+      } catch {
+        optionId = undefined;
+      }
+      this.log("goose acp: permission policy threw, falling back to refusal", {
+        method: msg.method,
+        optionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     this.log("goose acp: answered server request", { method: msg.method, optionId });
-    this.transport?.send(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: optionId ? { outcome: { outcome: "selected", optionId } } : {},
-      }),
-    );
+    try {
+      this.transport?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: optionId ? { outcome: { outcome: "selected", optionId } } : {},
+        }),
+      );
+    } catch (err) {
+      // Last resort: a bare result is measured to clear the request. If even
+      // this throws the transport is gone, which onClose already handles as a
+      // disconnect -- and a disconnect at least ENDS the turn rather than
+      // parking it forever.
+      this.log("goose acp: failed to send permission answer, retrying bare", {
+        method: msg.method,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      try {
+        this.transport?.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }));
+      } catch {
+        this.log("goose acp: could not answer permission request at all", { method: msg.method });
+      }
+    }
   }
 
   private onClose(code: number, reason: string): void {
