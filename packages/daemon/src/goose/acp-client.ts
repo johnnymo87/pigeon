@@ -255,6 +255,15 @@ export class GooseAcpClient {
     const transport = this.transport;
     if (!transport) throw new Error("goose acp client is not connected");
     const id = String(++this.nextId);
+    // Enforced, not merely declared: see ALLOWED_ACP_METHODS for why a
+    // tool-execution method must never appear here.
+    if (!(ALLOWED_ACP_METHODS as readonly string[]).includes(method)) {
+      throw new Error(
+        `goose acp client refused to send disallowed method ${method} `
+          + `(see ALLOWED_ACP_METHODS -- adding a tool-execution method is a trust `
+          + `boundary decision, not a code change)`,
+      );
+    }
     return new Promise<JsonRpcResponse>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, sessionId: meta.sessionId, isTurn: meta.isTurn });
       transport.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
@@ -381,3 +390,43 @@ function refuse(options: PermissionParams["options"]): string | undefined {
   const rejectish = options.find((o) => /reject|deny|no/i.test(o.optionId ?? o.name ?? ""));
   return rejectish?.optionId ?? options[options.length - 1]?.optionId;
 }
+
+/**
+ * Every JSON-RPC method this client is permitted to send to goose.
+ *
+ * THIS IS A TRUST-BOUNDARY DECLARATION, not documentation, and it is pinned by
+ * a test that fails if the set grows.
+ *
+ * Measured on goose 1.48.0: the ACP endpoint `_goose/unstable/tools/call`
+ * dispatches straight to the extension manager with no mode check, no
+ * permission inspection, and NO `run_pre_tool_hooks` call at all. A tool
+ * executed that way runs with the hook chain not merely permissive but
+ * UNINVOKED. Confirmed by side effect against a serve whose deny hook was
+ * proven live by a control in the same session.
+ *
+ * Two consequences, and the second is the one that matters most here:
+ *
+ *  - `PreToolUse` deny rules do not see the call. The lane's own hook source is
+ *    explicit that those rules are "DRIFT PROTECTION, NOT ENFORCEMENT" against
+ *    the agent, so this is not a new adversarial hole — but it IS a path that
+ *    needs no evasion to take.
+ *  - `PostToolUse` does not fire either, and that hook is how a merge reaches
+ *    the human's visibility feed. An action taken through this endpoint is
+ *    therefore INVISIBLE, and visibility is the entire point of the lane. A
+ *    silent merge is worse for this project than a blocked one.
+ *
+ * The `extensions:` allowlist does still bind on that endpoint (verified: with
+ * `developer` disabled the call is refused), so the reachable surface is
+ * bounded — but `shell` is inside the lane's allowlist, which is exactly why
+ * bounded is not the same as safe.
+ *
+ * So this client stays on the session-oriented surface and never acquires a
+ * tool-execution capability. If a future change needs one, that is a trust
+ * boundary decision for a human, not a diff.
+ */
+export const ALLOWED_ACP_METHODS = [
+  "initialize",
+  "session/new",
+  "session/prompt",
+  "_goose/unstable/session/steer",
+] as const;
