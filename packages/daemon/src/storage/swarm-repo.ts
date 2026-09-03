@@ -1,5 +1,6 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { NUDGE_KIND } from "../swarm/delivery-policy";
+import type { VerifyFamily } from "../swarm/verify-family";
 
 type Row = Record<string, unknown>;
 
@@ -29,6 +30,14 @@ export interface SwarmMessageRecord {
   expiresAt: number | null;
   cancelledAt: number | null;
   ref: string | null;
+  /**
+   * How this row's delivery is confirmed, stamped at handoff. NULL means the
+   * transcript (opencode) family. Deliberately carried on the message rather
+   * than joined from the target session, whose row can be deleted and whose
+   * `backend_kind` can change while this row lives on. See
+   * `swarm/verify-family.ts`.
+   */
+  verifyFamily: string | null;
 }
 
 /** Cursor-based paging options for {@link SwarmRepository.getInbox}. */
@@ -85,6 +94,7 @@ function asRecord(row: Row): SwarmMessageRecord {
     expiresAt: (row.expires_at as number | null) ?? null,
     cancelledAt: (row.cancelled_at as number | null) ?? null,
     ref: (row.ref as string | null) ?? null,
+    verifyFamily: (row.verify_family as string | null) ?? null,
   };
 }
 
@@ -161,14 +171,25 @@ export class SwarmRepository {
     return rows.map((r) => r.to_session);
   }
 
-  markHandedOff(msgId: string, now = Date.now()): boolean {
+  /**
+   * Commits a successful handoff, stamping HOW this delivery will be confirmed.
+   *
+   * `family` is omitted by the opencode path, leaving NULL, which reads back as
+   * `transcript` — so every existing caller and every existing row keeps its
+   * current behaviour with no backfill. A receipt-family backend passes its
+   * family here, at the one moment the channel that did the work is known for
+   * certain. See `swarm/verify-family.ts` for why this is stamped rather than
+   * joined.
+   */
+  markHandedOff(msgId: string, now = Date.now(), family?: VerifyFamily): boolean {
     const result = this.db
       .prepare(
         `UPDATE swarm_messages
-         SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL
+         SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL,
+             verify_family = COALESCE(?, verify_family)
          WHERE msg_id = ? AND state = 'queued'`,
       )
-      .run(now, now, msgId);
+      .run(now, now, family ?? null, msgId);
     return result.changes > 0;
   }
 
@@ -177,14 +198,15 @@ export class SwarmRepository {
    * landed mid-flight (state was `cancelled`). Preserves `cancelled_at` as an
    * audit trail: `cancelled_at` set on a `handed_off` row means "cancel raced and lost".
    */
-  markHandedOffAfterCancel(msgId: string, now = Date.now()): boolean {
+  markHandedOffAfterCancel(msgId: string, now = Date.now(), family?: VerifyFamily): boolean {
     const result = this.db
       .prepare(
         `UPDATE swarm_messages
-         SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL
+         SET state = 'handed_off', handed_off_at = ?, updated_at = ?, next_retry_at = NULL,
+             verify_family = COALESCE(?, verify_family)
          WHERE msg_id = ? AND state = 'cancelled'`,
       )
-      .run(now, now, msgId);
+      .run(now, now, family ?? null, msgId);
     return result.changes > 0;
   }
 
@@ -288,19 +310,28 @@ export class SwarmRepository {
    * Confirms an assistant run actually started for a handed-off message.
    * Verified rows are never re-checked.
    *
+   * Guarded on `state = 'handed_off'` and returns whether it applied. Safe today
+   * with one caller, which selected the row by state anyway — added before the
+   * SECOND caller (a receipt sink) exists, because without the guard that caller
+   * would happily stamp `verified_at` on a cancelled or failed row, minting a
+   * record the evidence does not support. A `false` return after a watchdog
+   * terminal means the terminal won the race and the receipt lost; that is worth
+   * logging, not ignoring.
+   *
    * Deliberately does NOT bump `updated_at`: {@link cleanupOlderThan} anchors
    * retention on `updated_at`, and bumping it here would reset the retention
    * clock for messages that have already been sitting in `handed_off` for a
    * while, extending how long they linger before cleanup.
    */
-  markVerified(msgId: string, now = Date.now()): void {
-    this.db
+  markVerified(msgId: string, now = Date.now()): boolean {
+    const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET verified_at = ?
-         WHERE msg_id = ?`,
+         WHERE msg_id = ? AND state = 'handed_off'`,
       )
       .run(now, msgId);
+    return result.changes > 0;
   }
 
   /** Watchdog-initiated redelivery of a message whose handoff was never verified. */
@@ -429,12 +460,21 @@ export class SwarmRepository {
     return result.changes > 0;
   }
 
+  /**
+   * `verified_at IS NULL` is the mirror of {@link markVerified}'s state guard.
+   * The watchdog selects unverified rows and then awaits (alerts, fetches)
+   * before terminating; once a receipt sink can verify concurrently, that await
+   * is a window in which a row can verify and still be marked failed — telling
+   * the sender a turn that ran was never observed. A no-op today for the same
+   * reason the other guard is: there is only one writer, which is exactly why
+   * this is the cheap moment to close it.
+   */
   markFailed(msgId: string, now = Date.now()): boolean {
     const result = this.db
       .prepare(
         `UPDATE swarm_messages
          SET state = 'failed', updated_at = ?, next_retry_at = NULL
-         WHERE msg_id = ? AND state IN ('queued', 'handed_off')`,
+         WHERE msg_id = ? AND state IN ('queued', 'handed_off') AND verified_at IS NULL`,
       )
       .run(now, msgId);
     return result.changes > 0;
