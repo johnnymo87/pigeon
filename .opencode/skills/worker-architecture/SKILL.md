@@ -137,9 +137,49 @@ Lists or sets the model for a session.
 
 The override is applied on subsequent command deliveries -- `command-ingest.ts` reads it and passes it through the adapter as `metadata.model`. The plugin includes it in the `prompt_async` request body.
 
+### `/tag [args]`
+
+Tags opencode sessions for the `oc-tags` list-price chart. Parsing lives in `tag-command.ts`
+(`parseTagArgs`), which is a pure module so the grammar is testable without the webhook.
+
+- `/tag` (or `/tag top`, the oc-tags CLI's own name for it) -> `tag_top`: the untagged
+  backlog, ranked by dollars.
+- `/tag list` -> `tag_list`
+- `/tag <tag>` -> `tag_set` against the session the message replies to / whose topic it is in.
+- `/tag <session-id> <tag>` -> `tag_set` against that session.
+- `/tag dir <glob> <tag>` -> `tag_set_dir`. The glob must be an ABSOLUTE path: oc-tags
+  fnmatches the stored pattern against an absolute directory and never expands `~`, so a
+  `~`-rooted pattern would be written to tags.db and then match nothing. Rejected rather
+  than expanded, so pigeon does not acquire a second opinion about what `~` means.
+
+Two things about this command are unlike the others:
+
+- **Malformed input is answered with usage, never forwarded.** Most slash commands either
+  match their regex or fall through to the plain-message path (`/rename` is the other
+  exception -- bare `/rename` also answers with usage). For `/tag` that fallthrough would
+  inject a typo'd command as a *prompt* into a live session, so the `/tag` branch matches
+  greedily (`/^\/tag(?:\s+([\s\S]*))?$/`) and terminates. The usage reply is sent BEFORE
+  session resolution, so a typo answers even from a chat with no session attached.
+- **`tag_set` carries two session ids.** `commands.session_id` is the CONTEXT session
+  (routing to a machine, unread badge); the session being tagged is `targetSessionId` in
+  `metadata_json`. They differ whenever the backlog view is used as intended, which is to
+  tag some session other than the one you are chatting with. `poll.ts` deliberately does
+  NOT fall back to the context session when that metadata is absent — tagging the wrong
+  session silently is worse than the daemon rejecting an absent id out loud.
+
+  What this does not yet do is check that `targetSessionId` lives on the machine the
+  command routed to. `oc-tags set` accepts any id and upserts it, so tagging a session from
+  another machine's backlog succeeds, says so, and writes a dead row (`pigeon-15va`). Today
+  that stays legible only because oc-tags is installed on one machine.
+
+`/tag` still resolves a session (via `resolveReplySession`) even for the forms that do not
+act on one. That is not ceremony: oc-tags reads a single machine's `opencode.db`, so
+"whose backlog?" is a real question, and the session the message arrived in is the only
+answer the user actually chose.
+
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set"` (in `webhook.ts`)
+`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir"` (in `webhook.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt
@@ -150,6 +190,10 @@ The override is applied on subsequent command deliveries -- `command-ingest.ts` 
 - `mcp_disable`: disconnect an MCP server
 - `model_list`: list available models from allowed providers
 - `model_set`: set a per-session model override
+- `tag_top`: list untagged sessions ranked by list-price dollars
+- `tag_list`: list tags defined so far
+- `tag_set`: tag one session (`command` = tag, `metadata_json.targetSessionId` = session tagged)
+- `tag_set_dir`: tag a directory glob (`command` = tag, `metadata_json.pattern` = glob)
 
 ## Command Delivery (Lease-Based)
 

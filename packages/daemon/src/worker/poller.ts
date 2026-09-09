@@ -230,6 +230,56 @@ export interface ModelSetMessage {
   messageThreadId?: number;
 }
 
+/**
+ * /tag messages.
+ *
+ * `sessionId` is the CONTEXT session — the one whose reply or forum topic the
+ * message arrived in. It is what routes the command to a machine, and it is what
+ * the unread badge is cleared for. The session actually being tagged is
+ * `targetSessionId` on tag_set, which may differ: the backlog view invites
+ * tagging a session other than the one you are chatting with.
+ *
+ * oc-tags' data is per machine (it reads that machine's opencode.db), so the
+ * context session is also what decides WHICH machine's backlog is shown.
+ */
+export interface TagTopMessage {
+  commandId: string;
+  commandType: "tag_top";
+  sessionId: string;
+  chatId: string;
+  messageThreadId?: number;
+}
+
+export interface TagListMessage {
+  commandId: string;
+  commandType: "tag_list";
+  sessionId: string;
+  chatId: string;
+  messageThreadId?: number;
+}
+
+export interface TagSetMessage {
+  commandId: string;
+  commandType: "tag_set";
+  sessionId: string;
+  chatId: string;
+  targetSessionId: string;
+  tag: string;
+  messageThreadId?: number;
+}
+
+export interface TagSetDirMessage {
+  commandId: string;
+  commandType: "tag_set_dir";
+  sessionId: string;
+  chatId: string;
+  pattern: string;
+  tag: string;
+  messageThreadId?: number;
+}
+
+export type TagMessage = TagTopMessage | TagListMessage | TagSetMessage | TagSetDirMessage;
+
 export type WorkerMessage =
   | ExecuteMessage
   | LaunchMessage
@@ -240,7 +290,11 @@ export type WorkerMessage =
   | McpEnableMessage
   | McpDisableMessage
   | ModelListMessage
-  | ModelSetMessage;
+  | ModelSetMessage
+  | TagTopMessage
+  | TagListMessage
+  | TagSetMessage
+  | TagSetDirMessage;
 
 export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
@@ -253,6 +307,10 @@ export interface PollerCallbacks {
   onMcpDisable: (msg: McpDisableMessage) => Promise<void>;
   onModelList: (msg: ModelListMessage) => Promise<void>;
   onModelSet: (msg: ModelSetMessage) => Promise<void>;
+  onTagTop: (msg: TagTopMessage) => Promise<void>;
+  onTagList: (msg: TagListMessage) => Promise<void>;
+  onTagSet: (msg: TagSetMessage) => Promise<void>;
+  onTagSetDir: (msg: TagSetDirMessage) => Promise<void>;
   /**
    * Called for every inbound message that names a session, before it is dispatched.
    *
@@ -369,6 +427,7 @@ export class Poller {
   private static readonly KNOWN_COMMAND_TYPES = new Set([
     "execute", "launch", "kill", "interrupt", "compact",
     "mcp_list", "mcp_enable", "mcp_disable", "model_list", "model_set",
+    "tag_top", "tag_list", "tag_set", "tag_set_dir",
   ]);
 
   private isKnownCommandType(msg: WorkerMessage): boolean {
@@ -431,6 +490,14 @@ export class Poller {
         await this.callbacks.onModelList(msg);
       } else if (msg.commandType === "model_set") {
         await this.callbacks.onModelSet(msg);
+      } else if (msg.commandType === "tag_top") {
+        await this.callbacks.onTagTop(msg);
+      } else if (msg.commandType === "tag_list") {
+        await this.callbacks.onTagList(msg);
+      } else if (msg.commandType === "tag_set") {
+        await this.callbacks.onTagSet(msg);
+      } else if (msg.commandType === "tag_set_dir") {
+        await this.callbacks.onTagSetDir(msg);
       }
     } catch (err) {
       // Callback threw — skip ack so the lease expires and command retries

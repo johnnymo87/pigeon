@@ -1,6 +1,16 @@
 import { verifyApiKey, unauthorized } from "./auth";
 import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
 
+function parseMetadata(metadataJson: string | null | undefined): Record<string, string | undefined> {
+  if (!metadataJson) return {};
+  try {
+    const parsed = JSON.parse(metadataJson) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, string | undefined>) : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * GET /machines/:id/next
  *
@@ -51,6 +61,24 @@ export async function handlePollNext(
   } else if (result.commandType === "model_set") {
     body.sessionId = result.sessionId;
     body.model = result.command; // model code stored in command column
+  } else if (result.commandType === "tag_top" || result.commandType === "tag_list") {
+    body.sessionId = result.sessionId;
+  } else if (result.commandType === "tag_set" || result.commandType === "tag_set_dir") {
+    // sessionId is the CONTEXT session (routing + unread badge). What is being
+    // tagged travels in metadata_json, because for tag_set it may be a different
+    // session entirely -- that is the whole point of the backlog view.
+    body.sessionId = result.sessionId;
+    body.tag = result.command; // tag stored in command column
+    const meta = parseMetadata(result.metadataJson);
+    if (result.commandType === "tag_set") {
+      // No fallback to result.sessionId. Absent metadata means we do not know
+      // what to tag, and defaulting to the context session would silently tag
+      // the WRONG session; leaving it undefined makes the daemon's validator
+      // reject it out loud.
+      body.targetSessionId = meta.targetSessionId;
+    } else {
+      body.pattern = meta.pattern;
+    }
   } else {
     // "execute" -- regular command
     body.sessionId = result.sessionId;

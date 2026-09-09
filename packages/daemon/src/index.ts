@@ -26,6 +26,13 @@ import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
 import { ingestMcpListCommand, ingestMcpEnableCommand, ingestMcpDisableCommand } from "./worker/mcp-ingest";
 import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-ingest";
+import {
+  ingestTagListCommand,
+  ingestTagSetCommand,
+  ingestTagSetDirCommand,
+  ingestTagTopCommand,
+} from "./worker/tag-ingest";
+import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
@@ -159,11 +166,39 @@ async function sendTelegramMessage(
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status}`);
+      // The body, not just the status. Telegram answers an over-long message, a
+      // bad entity offset or invalid UTF-8 with an indistinguishable 400, and a
+      // command reply that vanishes between the worker's ack and the user's
+      // screen leaves a bare "400" as the only trace. That dead end is what made
+      // the surrogate-pair bug in the /tag backlog hard to find.
+      const detail = await res.text().catch(() => "");
+      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status} ${detail.slice(0, 500)}`);
     }
   } catch (err) {
     console.warn("[pigeon-daemon] sendTelegramMessage fetch error:", err);
   }
+}
+
+/**
+ * Builds the dependencies for a /tag command.
+ *
+ * Unlike every other slash command, /tag needs no opencode client: it talks to the
+ * oc-tags binary, not to a session. So it keeps working when the session's serve is
+ * unhealthy — which matters, because clearing the tagging backlog from a phone is
+ * exactly the kind of thing done while nothing else is running.
+ *
+ * The binary is resolved per command rather than once at startup, so installing
+ * oc-tags does not also require restarting the daemon.
+ */
+function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: number | null }) {
+  const bin = resolveOcTagsBin({ configured: config.ocTagsBin });
+  return {
+    commandId: msg.commandId,
+    chatId: msg.chatId,
+    machineId: config.machineId,
+    runOcTags: bin ? createOcTagsRunner(bin) : null,
+    sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+  };
 }
 
 /**
@@ -331,6 +366,18 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             storage, sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
             allowedProviders: config.allowedProviders,
           });
+        },
+        onTagTop: async (msg) => {
+          await ingestTagTopCommand(tagDeps(msg));
+        },
+        onTagList: async (msg) => {
+          await ingestTagListCommand(tagDeps(msg));
+        },
+        onTagSet: async (msg) => {
+          await ingestTagSetCommand({ ...tagDeps(msg), targetSessionId: msg.targetSessionId, tag: msg.tag });
+        },
+        onTagSetDir: async (msg) => {
+          await ingestTagSetDirCommand({ ...tagDeps(msg), pattern: msg.pattern, tag: msg.tag });
         },
       },
       { healthMonitor: workerHealthMonitor },

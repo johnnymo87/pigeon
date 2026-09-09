@@ -142,6 +142,50 @@ The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon sh
 
 The `/model` command sets a per-session model override stored in the daemon's SQLite `sessions` table. When a command is delivered, the override is read and passed through the adapter to the plugin, which includes it in the `prompt_async` request body. The override persists until the session ends or a new `/model` command changes it.
 
+### Session Tagging (`/tag`)
+
+`/tag` shells out to the **`oc-tags`** binary (workstation `pkgs/oc-tags`), which tags
+opencode sessions and charts list-price consumption per tag. Pigeon reimplements none of
+it: oc-tags owns tag precedence and owns the sidecar DB at `~/.local/share/oc-tags/tags.db`,
+and it opens `opencode.db` read-only. There must be exactly one implementation of
+precedence, so pigeon reads neither database.
+
+Three facts about oc-tags' model shape this command, and it is not obvious from the name:
+
+- **Every session always has a tag.** An untagged session falls back to a
+  directory-derived `auto:` tag (`auto:mono`, `auto:mono/some-worktree`). So `/tag` never
+  creates a tag from nothing — it *converts* a session from `auto:` to a manual tag. That
+  is why bare `/tag` is a **backlog view** rather than a prompt for a tag name.
+- **A directory glob covers past and future sessions at once**, so it is far higher
+  leverage than tagging one session. oc-tags emits prefix hints of its own, and the
+  backlog view renders them even though nobody asked for them.
+- **Roughly two thirds of the dollars sit in primary-root sessions** (`auto:mono`,
+  `auto:workstation`) whose directory carries no signal about what the work was. Those can
+  only be fixed per session — which is the whole reason this is worth having on a phone.
+
+Mechanics worth knowing before changing it:
+
+- **The binary is resolved explicitly, never assumed.** The daemon runs under systemd with
+  a minimal PATH that contains no nix profile directory, so a bare `oc-tags` would not
+  resolve. `oc-tags.ts` probes `PIGEON_OC_TAGS_BIN`, then PATH, then the well-known
+  profiles, and returns null if absent — which becomes one sentence naming the machine,
+  not a stack trace and not a silent no-op. oc-tags is installed on cloudbox and may not be
+  elsewhere. Resolution happens per command, so installing it does not require a restart.
+- **Arguments go to `execFile` as an array, with no shell**, and tags/globs are validated
+  on both sides of the wire before they get there. The residual hazard passing argv is not
+  shell metacharacters (inert) but *argument injection* — a tag named `--dir` — which the
+  validators reject by requiring a leading alphanumeric.
+- **Nothing here throws.** Every failure — not installed, spawn failure, non-zero exit —
+  becomes a Telegram message, because a throw skips the poller ack and the command is then
+  redelivered every lease expiry for 24h. Note the direction that failure takes: the retry
+  loop is *silent*, so the user sees the worker's ack and then nothing at all, which is far
+  harder to diagnose than a visible error.
+- **A malformed `/tag` is answered with usage, never forwarded.** Falling through to the
+  plain-message path would inject a typo'd command as a prompt into a live session.
+- **`tag_set` carries two session ids**: `commands.session_id` routes to a machine (and
+  clears the unread badge), while `metadata_json.targetSessionId` is the session being
+  tagged. They differ whenever the backlog view is used as intended.
+
 ### Telegram Forum Topics
 
 Pigeon supports operating in a Telegram forum supergroup (`TELEGRAM_TOPICS_ENABLED = "true"` in worker `wrangler.toml`). Each opencode session maps to a dedicated forum topic thread named after the session's TUI title. Inbound commands, outbound notifications, and media pass through thread-aware worker endpoints referencing `commands.message_thread_id` and the D1 `topics` table. For migration details, see [`docs/runbooks/telegram-forum-migration.md`](docs/runbooks/telegram-forum-migration.md).
@@ -180,6 +224,11 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/model` | *(reply to a session notification)* | Lists available models from allowed providers |
 | `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
 | `/rename <new title>` | *(reply to a session notification)* | Renames the session's forum topic to the given title. Worker-only — never reaches opencode |
+| `/tag` | *(reply to a session notification)* | Lists untagged sessions ranked by list-price dollars, each with a tap-to-copy `/tag <id>` |
+| `/tag list` | *(reply to a session notification)* | Lists tags defined so far, with session and directory counts |
+| `/tag <tag>` | *(reply to a session notification)* | Tags the replied-to session |
+| `/tag <session-id> <tag>` | *(reply to a session notification)* | Tags a specific session — the one you are replying to only routes the command |
+| `/tag dir <glob> <tag>` | *(reply to a session notification)* | Tags a directory pattern, retroactively and prospectively |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 

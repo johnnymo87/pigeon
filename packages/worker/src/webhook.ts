@@ -3,8 +3,9 @@ import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnab
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
+import { parseTagArgs, TAG_USAGE_TEXT } from "./tag-command";
 
-type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set";
+type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -1130,6 +1131,75 @@ export async function handleTelegramWebhook(
       } else {
         await sendTelegramMessage(env, modelChatId, `Listing models for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
       }
+      return OK();
+    }
+
+    // ─── /tag ────────────────────────────────────────────────────────────────
+    //
+    // Every form routes through resolveReplySession, exactly like /mcp and
+    // /model. That is not just convention: oc-tags reads the opencode.db of ONE
+    // machine, so "which machine's backlog" is a real question, and the session
+    // the message arrived in (via swipe-reply or forum topic) is the only
+    // answer pigeon has that the user actually chose.
+    //
+    // For the tag_set form the queued row therefore carries TWO session ids: the
+    // context session in session_id (routing, unread badge) and the session
+    // being tagged in metadata_json. They are usually the same, but the backlog
+    // view exists precisely to invite tagging some OTHER session from here.
+    const tagMatch = update.message.text.match(/^\/tag(?:\s+([\s\S]*))?$/);
+    if (tagMatch) {
+      const tagChatId = update.message.chat.id;
+      const parsed = parseTagArgs(tagMatch[1]);
+
+      // A malformed /tag must never fall through to the plain-message path: a
+      // typo silently becoming a prompt in a live session is a worse outcome
+      // than any parse error.
+      if (parsed.kind === "usage") {
+        await sendTelegramMessage(env, tagChatId, TAG_USAGE_TEXT, { messageThreadId: update.message.message_thread_id });
+        return OK();
+      }
+
+      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      if (!resolved) return OK();
+
+      let commandType: CommandType;
+      let command = "";
+      let metadataJson: string | null = null;
+      let ack: string;
+
+      if (parsed.kind === "top") {
+        commandType = "tag_top";
+        ack = `Listing untagged sessions on ${resolved.machineId}...`;
+      } else if (parsed.kind === "list") {
+        commandType = "tag_list";
+        ack = `Listing tags on ${resolved.machineId}...`;
+      } else if (parsed.kind === "setDir") {
+        commandType = "tag_set_dir";
+        command = parsed.tag;
+        metadataJson = JSON.stringify({ pattern: parsed.pattern });
+        // No backticks: the worker never sets parse_mode, so they would render literally.
+        ack = `Tagging ${parsed.pattern} as ${parsed.tag} on ${resolved.machineId}...`;
+      } else {
+        commandType = "tag_set";
+        command = parsed.tag;
+        const targetSessionId = parsed.targetSessionId ?? resolved.sessionId;
+        metadataJson = JSON.stringify({ targetSessionId });
+        ack = `Tagging session ${targetSessionId} as ${parsed.tag} on ${resolved.machineId}...`;
+      }
+
+      const commandId = await queueCommand(db, env, {
+        machineId: resolved.machineId,
+        sessionId: resolved.sessionId,
+        command,
+        chatId: String(tagChatId),
+        label: resolved.label,
+        commandType,
+        metadataJson,
+        messageThreadId: update.message.message_thread_id,
+      });
+      if (!commandId) return OK();
+
+      await sendTelegramMessage(env, tagChatId, ack, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
   }

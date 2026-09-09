@@ -117,6 +117,14 @@ Worker commands of type `"launch"` and `"kill"` are handled by dedicated ingest 
 - `compact-ingest.ts`: fetches session messages, extracts the model from the last user message, calls `summarize()`
 - `mcp-ingest.ts`: handles `mcp_list` (calls `mcpStatus()`), `mcp_enable` (calls `mcpConnect()`), `mcp_disable` (calls `mcpDisconnect()`)
 - `model-ingest.ts`: handles `model_list` (calls `listProviders()`, filters to allowed providers) and `model_set` (validates model, stores as `model_override` on session)
+- `tag-ingest.ts` + `oc-tags.ts`: handle `tag_top` / `tag_list` / `tag_set` / `tag_set_dir` by
+  shelling out to the `oc-tags` binary. **These are the only ingest modules that need no
+  `OpencodeClient`** -- they talk to a binary, not a session, so they keep working when the
+  session's serve is unhealthy. `oc-tags.ts` resolves the binary explicitly (PATH plus the
+  well-known nix profile locations, because systemd's PATH contains none of them) and returns
+  null when it is absent, which the ingest turns into one legible sentence rather than a
+  stack trace or a silent no-op. Arguments are passed as an argv array to `execFile` with no
+  shell, and tags/globs from chat are validated before they get there.
 
 All are dispatched by the Poller's command-type callbacks. Acking is handled by the Poller after successful dispatch.
 

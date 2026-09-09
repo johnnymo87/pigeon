@@ -165,3 +165,14 @@ describe("loadConfig", () => {
     expect(config.stuckAlertMs).toBe(900_000);
   });
 });
+
+describe("ocTagsBin", () => {
+  it("is undefined when PIGEON_OC_TAGS_BIN is unset or blank", () => {
+    expect(loadConfig({}).ocTagsBin).toBeUndefined();
+    expect(loadConfig({ PIGEON_OC_TAGS_BIN: "   " }).ocTagsBin).toBeUndefined();
+  });
+
+  it("is trimmed when set", () => {
+    expect(loadConfig({ PIGEON_OC_TAGS_BIN: " /opt/oc-tags " }).ocTagsBin).toBe("/opt/oc-tags");
+  });
+});
