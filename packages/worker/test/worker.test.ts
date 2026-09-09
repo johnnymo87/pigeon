@@ -4275,7 +4275,7 @@ describe("poll and ack endpoints", () => {
     expect(body.tag).toBe("billing");
   });
 
-  it("handlePollNext falls back to the context session when tag_set metadata is missing", async () => {
+  it("handlePollNext leaves targetSessionId undefined when tag_set metadata is missing", async () => {
     const now = Date.now();
     await env.DB.prepare(
       `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
@@ -4284,7 +4284,9 @@ describe("poll and ack endpoints", () => {
 
     const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-tag-set-2/next"), "machine-tag-set-2");
     const body = await res.json() as Record<string, unknown>;
-    expect(body.targetSessionId).toBe("sess-tag-ctx-2");
+    // Deliberately NOT the context session: tagging the wrong session silently
+    // is worse than the daemon rejecting an absent id out loud.
+    expect(body.targetSessionId).toBeUndefined();
   });
 
   it("handlePollNext returns tag and pattern for tag_set_dir", async () => {

@@ -71,7 +71,11 @@ export async function handlePollNext(
     body.tag = result.command; // tag stored in command column
     const meta = parseMetadata(result.metadataJson);
     if (result.commandType === "tag_set") {
-      body.targetSessionId = meta.targetSessionId ?? result.sessionId;
+      // No fallback to result.sessionId. Absent metadata means we do not know
+      // what to tag, and defaulting to the context session would silently tag
+      // the WRONG session; leaving it undefined makes the daemon's validator
+      // reject it out loud.
+      body.targetSessionId = meta.targetSessionId;
     } else {
       body.pattern = meta.pattern;
     }

@@ -154,15 +154,23 @@ Tags opencode sessions for the `oc-tags` list-price chart. Parsing lives in `tag
 
 Two things about this command are unlike the others:
 
-- **Malformed input is answered with usage, never forwarded.** Every other slash command
-  either matches its regex or falls through to the plain-message path. For `/tag` that
-  fallthrough would inject a typo'd command as a *prompt* into a live session, so the
-  `/tag` branch matches greedily (`/^\/tag(?:\s+([\s\S]*))?$/`) and terminates.
+- **Malformed input is answered with usage, never forwarded.** Most slash commands either
+  match their regex or fall through to the plain-message path (`/rename` is the other
+  exception -- bare `/rename` also answers with usage). For `/tag` that fallthrough would
+  inject a typo'd command as a *prompt* into a live session, so the `/tag` branch matches
+  greedily (`/^\/tag(?:\s+([\s\S]*))?$/`) and terminates. The usage reply is sent BEFORE
+  session resolution, so a typo answers even from a chat with no session attached.
 - **`tag_set` carries two session ids.** `commands.session_id` is the CONTEXT session
   (routing to a machine, unread badge); the session being tagged is `targetSessionId` in
   `metadata_json`. They differ whenever the backlog view is used as intended, which is to
-  tag some session other than the one you are chatting with. `poll.ts` falls back to the
-  context session when the metadata is absent.
+  tag some session other than the one you are chatting with. `poll.ts` deliberately does
+  NOT fall back to the context session when that metadata is absent — tagging the wrong
+  session silently is worse than the daemon rejecting an absent id out loud.
+
+  What this does not yet do is check that `targetSessionId` lives on the machine the
+  command routed to. `oc-tags set` accepts any id and upserts it, so tagging a session from
+  another machine's backlog succeeds, says so, and writes a dead row (`pigeon-15va`). Today
+  that stays legible only because oc-tags is installed on one machine.
 
 `/tag` still resolves a session (via `resolveReplySession`) even for the forms that do not
 act on one. That is not ceremony: oc-tags reads a single machine's `opencode.db`, so
@@ -171,7 +179,7 @@ answer the user actually chose.
 
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir"` (in `webhook.ts`)
+`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir"` (in `webhook.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt

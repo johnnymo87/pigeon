@@ -8,10 +8,16 @@
  * being handed to a subprocess.
  *
  * The validators are deliberately duplicated in the daemon
- * (packages/daemon/src/worker/tag-ingest.ts). The worker deploys centrally while
- * daemons are updated per machine, so the daemon — which is the side that
- * actually spawns a process — must not depend on a current worker having already
- * checked. Same reasoning as the isPlaceholderTitle duplication.
+ * (packages/daemon/src/worker/tag-ingest.ts), and NOT for the version-skew reason
+ * that duplication usually carries here: an old worker cannot emit tag_* at all,
+ * so the worker is always at least as new as the daemon for these types.
+ *
+ * The real reason is that the daemon reads a D1 row, not this function's return
+ * value. Anything holding the API key can write that row, and poll.ts turns
+ * corrupt metadata_json into {} — so a tag or pattern can arrive at the process
+ * spawner as undefined however careful this side was. The side that spawns
+ * validates its own input. What this copy buys is a good error message before the
+ * command is ever queued.
  */
 
 export type TagCommand =

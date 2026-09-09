@@ -22,9 +22,12 @@ import type { OcTagsRunner } from "./oc-tags";
 
 // ─── input validation ─────────────────────────────────────────────────────────
 //
-// Deliberately duplicated from packages/worker/src/tag-command.ts. The worker
-// deploys centrally while daemons are updated per machine, so the side that
-// actually spawns a process must not assume a current worker already checked.
+// Deliberately duplicated from packages/worker/src/tag-command.ts -- not for
+// version skew (an old worker cannot emit tag_* at all), but because this side
+// reads a D1 row rather than that function's return value. Anything holding the
+// API key can write that row, and poll.ts turns corrupt metadata_json into {},
+// so a field can arrive here undefined however careful the worker was. The side
+// that spawns a process validates its own input.
 
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
 // Matches the shape used elsewhere in the daemon (app.ts); ids may carry - and _.
@@ -95,31 +98,64 @@ export interface TopHint {
   pattern: string;
 }
 
-/** Column widths from oc-tags' printf: {dollars:>10}  {id:<32}  {title:<40}  {dir} */
-const ID_FIELD_WIDTH = 32;
-const TITLE_FIELD_WIDTH = 40;
+/** Separator between fields in oc-tags' printf: {dollars:>10}  {id:<32}  {title:<40}  {dir} */
 const FIELD_GAP = 2;
 
 const ROW_PREFIX_RE = /^\s*\$([\d,]+\.\d{2})\s+(\S+)/;
 const HINT_RE = /^Hint: (\d+) untagged roots share directory prefix '(.+)'\./;
 
 /**
+ * Reads the field widths off oc-tags' own header line.
+ *
+ * Taking the widths from the header rather than hardcoding 32/40 is what makes a
+ * width change upstream LOUD. Hardcoded widths keep matching the row prefix, so
+ * the session ids stay right while every title and directory silently shifts —
+ * plausible output pointing at the wrong work. No header, no rows.
+ */
+function parseHeaderWidths(line: string): { idWidth: number; titleWidth: number } | null {
+  const idStart = line.indexOf("session_id");
+  const titleStart = line.indexOf("title");
+  const dirStart = line.indexOf("directory");
+  if (idStart < 0 || titleStart <= idStart || dirStart <= titleStart) return null;
+  return {
+    idWidth: titleStart - idStart - FIELD_GAP,
+    titleWidth: dirStart - titleStart - FIELD_GAP,
+  };
+}
+
+/**
  * Parses the fixed-width table `oc-tags top` prints.
  *
- * Column offsets are derived from each line's own session-id position rather
- * than assumed, because the dollars field overflows its width past $10,000,000
- * and the id field is a MINIMUM width, not a truncation. An unrecognised line is
- * skipped: a format change upstream degrades to an empty backlog with a raw
- * fallback, never to invented rows.
+ * Two things here are load-bearing:
+ *
+ *  - **Columns are sliced by CODE POINT, not UTF-16 code unit.** Python pads with
+ *    `{s:<40}`, which counts code points, so a title containing an astral
+ *    character (an emoji) would otherwise be cut mid-surrogate — and a lone
+ *    surrogate makes the JSON body invalid UTF-8, so Telegram rejects the whole
+ *    backlog message with a 400 rather than mangling one line. Every column
+ *    after it shifts too.
+ *  - **Offsets are anchored on each row's own session id**, not on the header's
+ *    absolute positions, because the dollars field overflows its width past
+ *    $10,000,000 and the id field is a MINIMUM width, not a truncation.
+ *
+ * An unrecognised line is skipped and a missing header yields no rows at all, so
+ * a format change upstream degrades to the raw-output fallback, never to
+ * invented or misaligned rows.
  */
 export function parseTopOutput(stdout: string): { rows: TopRow[]; hints: TopHint[] } {
   const rows: TopRow[] = [];
   const hints: TopHint[] = [];
+  let widths: { idWidth: number; titleWidth: number } | null = null;
 
   for (const line of stdout.split("\n")) {
     const hint = line.match(HINT_RE);
     if (hint) {
       hints.push({ count: Number(hint[1]), pattern: hint[2]! });
+      continue;
+    }
+
+    if (!widths) {
+      widths = parseHeaderWidths(line);
       continue;
     }
 
@@ -130,15 +166,18 @@ export function parseTopOutput(stdout: string): { rows: TopRow[]; hints: TopHint
     if (!Number.isFinite(dollars)) continue;
 
     const sessionId = m[2]!;
+    // The prefix (spaces, "$", digits, the id) is ASCII, so its UTF-16 length is
+    // also its code-point length; everything past it must be counted in code points.
+    const chars = Array.from(line);
     const idStart = m[0].length - sessionId.length;
-    const titleStart = idStart + Math.max(ID_FIELD_WIDTH, sessionId.length) + FIELD_GAP;
-    const dirStart = titleStart + TITLE_FIELD_WIDTH + FIELD_GAP;
+    const titleStart = idStart + Math.max(widths.idWidth, sessionId.length) + FIELD_GAP;
+    const dirStart = titleStart + widths.titleWidth + FIELD_GAP;
 
     rows.push({
       dollars,
       sessionId,
-      title: line.slice(titleStart, titleStart + TITLE_FIELD_WIDTH).trim(),
-      directory: line.slice(dirStart).trim(),
+      title: chars.slice(titleStart, titleStart + widths.titleWidth).join("").trim(),
+      directory: chars.slice(dirStart).join("").trim(),
     });
   }
 

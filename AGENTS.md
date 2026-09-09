@@ -177,7 +177,9 @@ Mechanics worth knowing before changing it:
   validators reject by requiring a leading alphanumeric.
 - **Nothing here throws.** Every failure — not installed, spawn failure, non-zero exit —
   becomes a Telegram message, because a throw skips the poller ack and the command is then
-  redelivered every lease expiry for 24h, posting the same error over and over.
+  redelivered every lease expiry for 24h. Note the direction that failure takes: the retry
+  loop is *silent*, so the user sees the worker's ack and then nothing at all, which is far
+  harder to diagnose than a visible error.
 - **A malformed `/tag` is answered with usage, never forwarded.** Falling through to the
   plain-message path would inject a typo'd command as a prompt into a live session.
 - **`tag_set` carries two session ids**: `commands.session_id` routes to a machine (and

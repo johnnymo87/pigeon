@@ -166,7 +166,13 @@ async function sendTelegramMessage(
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status}`);
+      // The body, not just the status. Telegram answers an over-long message, a
+      // bad entity offset or invalid UTF-8 with an indistinguishable 400, and a
+      // command reply that vanishes between the worker's ack and the user's
+      // screen leaves a bare "400" as the only trace. That dead end is what made
+      // the surrogate-pair bug in the /tag backlog hard to find.
+      const detail = await res.text().catch(() => "");
+      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status} ${detail.slice(0, 500)}`);
     }
   } catch (err) {
     console.warn("[pigeon-daemon] sendTelegramMessage fetch error:", err);

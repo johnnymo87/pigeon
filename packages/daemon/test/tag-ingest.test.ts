@@ -23,6 +23,13 @@ const TOP_OUTPUT = [
   "  oc-tags set --dir '/home/dev/projects/mono/.worktrees/*' <tag>",
 ].join("\n");
 
+const EMOJI_TOP_OUTPUT = [
+  "   dollars  session_id                        title                                     directory",
+  "--------------------------------------------------------------------------------------------------------------",
+  "    $10.00  ses_aaaaaaaaaaaaaaaaaaaaaa0001    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🐛  /home/dev/projects/mono",
+  "     $9.00  ses_aaaaaaaaaaaaaaaaaaaaaa0002    😀😀😀yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy   /home/dev/projects/salmon-of-knowledge",
+].join("\n");
+
 function makeDeps(overrides: Partial<TagCommandDeps> = {}): TagCommandDeps {
   return {
     chatId: "12345",
@@ -86,6 +93,39 @@ describe("parseTopOutput", () => {
 
   it("returns nothing for unparseable output rather than inventing rows", () => {
     expect(parseTopOutput("something entirely different\n")).toEqual({ rows: [], hints: [] });
+  });
+
+  it("slices columns by code point, because oc-tags pads by code point", () => {
+    // Python's {s:<40} counts code points; a UTF-16 slice would cut an astral
+    // title mid-surrogate and shift every column after it.
+    const { rows } = parseTopOutput(EMOJI_TOP_OUTPUT);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.title).toBe("x".repeat(39) + "\u{1F41B}");
+    expect(rows[0]!.directory).toBe("/home/dev/projects/mono");
+    expect(rows[1]!.title).toBe("\u{1F600}".repeat(3) + "y".repeat(36));
+    expect(rows[1]!.directory).toBe("/home/dev/projects/salmon-of-knowledge");
+  });
+
+  it("takes the column widths from the header rather than hardcoding them", () => {
+    // A width change upstream must not silently yield plausible-but-wrong
+    // titles and directories against correct session ids.
+    const widened = EMOJI_TOP_OUTPUT.split("\n");
+    const rebuilt = [
+      `${"dollars".padStart(10)}  ${"session_id".padEnd(36)}  ${"title".padEnd(20)}  directory`,
+      "-".repeat(110),
+      `${"$10.00".padStart(10)}  ${"ses_wide0001".padEnd(36)}  ${"a title".padEnd(20)}  /home/dev/projects/mono`,
+    ].join("\n");
+    expect(widened.length).toBeGreaterThan(0);
+
+    const { rows } = parseTopOutput(rebuilt);
+    expect(rows).toEqual([
+      { dollars: 10, sessionId: "ses_wide0001", title: "a title", directory: "/home/dev/projects/mono" },
+    ]);
+  });
+
+  it("falls back to nothing when the header is missing or unrecognised", () => {
+    const noHeader = EMOJI_TOP_OUTPUT.split("\n").slice(2).join("\n");
+    expect(parseTopOutput(noHeader).rows).toEqual([]);
   });
 });
 
@@ -303,6 +343,17 @@ describe("malformed wire data", () => {
 });
 
 describe("rendering safety", () => {
+  it("renders an astral title without producing a lone surrogate", async () => {
+    const deps = makeDeps({
+      runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: EMOJI_TOP_OUTPUT, stderr: "" }),
+    });
+    await ingestTagTopCommand(deps);
+
+    const text = sentText(deps);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)).toBe(false);
+    expect(text).toContain("/home/dev/projects/mono".replace("/home/dev/projects/", ""));
+  });
+
   it("does not split a surrogate pair when truncating a directory", async () => {
     // 80 UTF-16 code units of astral emoji, well past the 60-unit directory cap.
     const emoji = "\u{1F600}".repeat(40);
