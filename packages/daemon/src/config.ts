@@ -26,6 +26,12 @@ export interface DaemonConfig {
   authToken?: string;
   serveLiveness: "self" | "http";
   allowedProviders?: string[];
+  /**
+   * Explicit path to the oc-tags binary. Optional: the daemon probes PATH and the
+   * well-known profile locations, which matters because systemd hands it a
+   * minimal PATH that contains none of them.
+   */
+  ocTagsBin?: string;
   watchdogIntervalMs: number;
   verifyAfterMs: number;
   stuckAlertMs: number;
@@ -95,6 +101,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     authToken: env.PIGEON_DAEMON_AUTH_TOKEN?.trim() || undefined,
     serveLiveness: env.PIGEON_SERVE_LIVENESS === "self" ? "self" : "http",
     allowedProviders: allowedProviders.length > 0 ? allowedProviders : undefined,
+    ocTagsBin: env.PIGEON_OC_TAGS_BIN?.trim() || undefined,
     watchdogIntervalMs: numOr(env.WATCHDOG_INTERVAL_MS, DEFAULT_WATCHDOG_INTERVAL_MS),
     verifyAfterMs: numOr(env.VERIFY_AFTER_MS, DEFAULT_VERIFY_AFTER_MS),
     stuckAlertMs: numOr(env.STUCK_ALERT_MS, DEFAULT_STUCK_ALERT_MS),

@@ -207,6 +207,7 @@ interface QueueRow {
   command_type?: string;
   directory?: string | null;
   media_json?: string | null;
+  metadata_json?: string | null;
   message_thread_id?: number | null;
 }
 
@@ -215,7 +216,7 @@ async function queryQueueBySession(sessionId: string): Promise<QueueRow[]> {
   const { results } = await env.DB.prepare(
     `SELECT command_id, machine_id, session_id, command, chat_id, status,
             0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
-            command_type, directory, media_json, message_thread_id
+            command_type, directory, media_json, metadata_json, message_thread_id
      FROM commands
      WHERE session_id = ?
      ORDER BY created_at ASC`,
@@ -4243,6 +4244,62 @@ describe("poll and ack endpoints", () => {
     expect(body.sessionId).toBe("sess-mcp-en-1");
     expect(body.serverName).toBe("my-server");
     expect(body.chatId).toBe("8248645256");
+  });
+
+  it("handlePollNext returns sessionId only for tag_top", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'tag_top', '', ?, 'pending', ?)`,
+    ).bind("tag-top-cmd-1", "machine-tag-top", "sess-tag-top-1", "8248645256", now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-tag-top/next"), "machine-tag-top");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("tag_top");
+    expect(body.sessionId).toBe("sess-tag-top-1");
+  });
+
+  it("handlePollNext returns tag and targetSessionId for tag_set", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, metadata_json, status, created_at)
+       VALUES (?, ?, ?, 'tag_set', ?, ?, ?, 'pending', ?)`,
+    ).bind("tag-set-cmd-1", "machine-tag-set", "sess-tag-ctx-1", "billing", "8248645256",
+           JSON.stringify({ targetSessionId: "ses_other" }), now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-tag-set/next"), "machine-tag-set");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("tag_set");
+    expect(body.sessionId).toBe("sess-tag-ctx-1");
+    expect(body.targetSessionId).toBe("ses_other");
+    expect(body.tag).toBe("billing");
+  });
+
+  it("handlePollNext falls back to the context session when tag_set metadata is missing", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, status, created_at)
+       VALUES (?, ?, ?, 'tag_set', ?, ?, 'pending', ?)`,
+    ).bind("tag-set-cmd-2", "machine-tag-set-2", "sess-tag-ctx-2", "billing", "8248645256", now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-tag-set-2/next"), "machine-tag-set-2");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.targetSessionId).toBe("sess-tag-ctx-2");
+  });
+
+  it("handlePollNext returns tag and pattern for tag_set_dir", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, metadata_json, status, created_at)
+       VALUES (?, ?, ?, 'tag_set_dir', ?, ?, ?, 'pending', ?)`,
+    ).bind("tag-dir-cmd-1", "machine-tag-dir", "sess-tag-ctx-3", "fbm", "8248645256",
+           JSON.stringify({ pattern: "/home/dev/projects/mono/.worktrees/*" }), now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-tag-dir/next"), "machine-tag-dir");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("tag_set_dir");
+    expect(body.tag).toBe("fbm");
+    expect(body.pattern).toBe("/home/dev/projects/mono/.worktrees/*");
   });
 
   it("handlePollNext returns sessionId and serverName for mcp_disable type", async () => {
@@ -11125,5 +11182,146 @@ describe("empty-command guard (W1)", () => {
     const rows = await commandsFor(GUARD_SESSION);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.command).toBe("do the thing");
+  });
+});
+
+// ─── /tag command ─────────────────────────────────────────────────────
+
+describe("/tag command", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  let tagSeq = 0;
+
+  async function tagContext(): Promise<{ sessionId: string; machineId: string; notifMsgId: number }> {
+    const now = Date.now();
+    const n = ++tagSeq;
+    const sessionId = `tag-ctx-${now}-${n}`;
+    const machineId = `tag-machine-${now}-${n}`;
+    const notifMsgId = 7_500_000 + (now % 1000) * 20 + n;
+
+    await registerSession(sessionId, machineId);
+    await insertMessageMapping({
+      chatId: String(CHAT_ID_NUM),
+      messageId: notifMsgId,
+      sessionId,
+      token: `tag-token-${now}-${n}`,
+    });
+    await touchMachine(env.DB, machineId, now);
+    return { sessionId, machineId, notifMsgId };
+  }
+
+  it("queues tag_top for a bare /tag", async () => {
+    const { sessionId, machineId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeTextReply("/tag", notifMsgId));
+    expect(res.status).toBe(200);
+
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_top");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.machine_id).toBe(machineId);
+  });
+
+  it("queues tag_list for /tag list", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag list", notifMsgId));
+
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_list");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("queues tag_set against the replied-to session for a bare tag", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag billing", notifMsgId));
+
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_set");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("billing");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ targetSessionId: sessionId });
+  });
+
+  it("keeps the context session for routing while tagging a different session", async () => {
+    const { sessionId, machineId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag ses_f966a4af3ffeIXwkQcs07oAfBL billing", notifMsgId));
+
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_set");
+    expect(rows).toHaveLength(1);
+    // Routing follows the session the message arrived in; the tag target is separate.
+    expect(rows[0]!.machine_id).toBe(machineId);
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ targetSessionId: "ses_f966a4af3ffeIXwkQcs07oAfBL" });
+    expect(rows[0]!.command).toBe("billing");
+  });
+
+  it("queues tag_set_dir for /tag dir", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag dir /home/dev/projects/mono/.worktrees/* fbm", notifMsgId));
+
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_set_dir");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("fbm");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ pattern: "/home/dev/projects/mono/.worktrees/*" });
+  });
+
+  it("answers malformed /tag with usage and never injects it as a prompt", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag one two three four", notifMsgId));
+
+    const rows = await queryQueueBySession(sessionId);
+    expect(rows.filter((r) => r.command_type === "execute")).toHaveLength(0);
+    expect(rows.filter((r) => (r.command_type ?? "").startsWith("tag_"))).toHaveLength(0);
+  });
+
+  it("refuses an auto: tag, which oc-tags reserves", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeTextReply("/tag auto:mono", notifMsgId));
+
+    const rows = await queryQueueBySession(sessionId);
+    expect(rows.filter((r) => (r.command_type ?? "").startsWith("tag_"))).toHaveLength(0);
+    expect(rows.filter((r) => r.command_type === "execute")).toHaveLength(0);
+  });
+
+  it("does not queue anything when there is no session to act on", async () => {
+    const { sessionId } = await tagContext();
+    mockTelegramSendMessage();
+
+    const res = await sendWebhook(makeCmdMessage("/tag"));
+
+    expect(res.status).toBe(200);
+    expect(await queryQueueBySession(sessionId)).toHaveLength(0);
+  });
+
+  it("accepts the autocompleted /tag@bot form", async () => {
+    const { sessionId, notifMsgId } = await tagContext();
+    mockTelegramSendMessage();
+
+    const botEnv = { ...env, TELEGRAM_BOT_USERNAME: "mohrbacher_01_bot" } as Env;
+    const res = await handleTelegramWebhook(
+      env.DB,
+      botEnv,
+      makeWebhookRequest(makeTextReply("/tag@mohrbacher_01_bot list", notifMsgId)),
+    );
+
+    expect(res.status).toBe(200);
+    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_list");
+    expect(rows).toHaveLength(1);
   });
 });

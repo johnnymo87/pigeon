@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage } from "../src/worker/poller";
+import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type TagMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -72,6 +72,10 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
     onMcpDisable: vi.fn().mockResolvedValue(undefined),
     onModelList: vi.fn().mockResolvedValue(undefined),
     onModelSet: vi.fn().mockResolvedValue(undefined),
+    onTagTop: vi.fn().mockResolvedValue(undefined),
+    onTagList: vi.fn().mockResolvedValue(undefined),
+    onTagSet: vi.fn().mockResolvedValue(undefined),
+    onTagSetDir: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -1261,5 +1265,64 @@ describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
     await poller.unregisterSession("sess-kill", { immediate: true });
 
     expect(bodies[0]).toEqual({ sessionId: "sess-kill", immediate: true });
+  });
+});
+
+describe("Poller dispatch — tag commands", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const cases: Array<[TagMessage, keyof PollerCallbacks]> = [
+    [{ commandId: "cmd-t1", commandType: "tag_top", sessionId: "sess-1", chatId: "chat-1" }, "onTagTop"],
+    [{ commandId: "cmd-t2", commandType: "tag_list", sessionId: "sess-1", chatId: "chat-1" }, "onTagList"],
+    [
+      { commandId: "cmd-t3", commandType: "tag_set", sessionId: "sess-1", chatId: "chat-1", targetSessionId: "sess-9", tag: "billing" },
+      "onTagSet",
+    ],
+    [
+      { commandId: "cmd-t4", commandType: "tag_set_dir", sessionId: "sess-1", chatId: "chat-1", pattern: "/home/dev/projects/mono/*", tag: "fbm" },
+      "onTagSetDir",
+    ],
+  ];
+
+  for (const [msg, callbackName] of cases) {
+    it(`dispatches ${msg.commandType} to ${callbackName}`, async () => {
+      const callbacks = makeCallbacks();
+      const fetchFn = makeFetch([() => json200(msg), () => ackOk()]);
+      const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(callbacks[callbackName]).toHaveBeenCalledWith(msg);
+      expect(callbacks.onCommand).not.toHaveBeenCalled();
+      poller.stop();
+    });
+  }
+
+  it("acks a tag command, so it is not redelivered every lease expiry", async () => {
+    const acked: string[] = [];
+    const callbacks = makeCallbacks();
+    const fetchFn = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/next")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(cases[0]![0]), { status: 200, headers: { "content-type": "application/json" } }),
+        );
+      }
+      acked.push(String(url));
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn as unknown as typeof fetch });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(acked.some((u) => u.includes("cmd-t1"))).toBe(true);
+    poller.stop();
   });
 });
