@@ -70,12 +70,10 @@ export class StopKeyMinter {
     const prefix = `s:${sessionId}:`
     const suffix = `.${next}`
     const room = MAX_NOTIFICATION_ID_LENGTH - prefix.length - suffix.length
-    const token = sanitizeSegment(dedupToken).slice(0, Math.max(room, 1))
+    // max(room, 0): clamping to 1 instead would push an already-maximal id to 129 chars,
+    // which the daemon rejects -- an empty token is the only correct answer there.
+    const token = sanitizeSegment(dedupToken).slice(0, Math.max(room, 0))
     return `${prefix}${token}${suffix}`
-  }
-
-  forget(sessionId: string): void {
-    this.counters.delete(sessionId)
   }
 }
 

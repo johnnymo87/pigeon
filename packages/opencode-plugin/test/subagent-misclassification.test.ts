@@ -256,8 +256,15 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: { type: "session.idle", properties: { sessionID: "ses_main" } } as any,
     })
-    expect(sendStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_main" })
+    // Assert on THIS turn's notification, not on any call left over from msg_a1:
+    // delivery is asynchronous now, so a bare "was called" would pass on stale history.
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: "ses_main",
+          notificationId: expect.stringContaining("msg_a2"),
+        }),
+      ),
     )
   })
 

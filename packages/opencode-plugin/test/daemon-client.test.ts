@@ -322,6 +322,7 @@ describe("daemon-client", () => {
       // given with errorKind
       const optsWithErrorKind = {
         sessionId: "test-session-abort",
+        notificationId: "s:test-session-abort:error.1",
         event: "Error",
         message: "Error: Aborted",
         label: "Test Session",
@@ -341,6 +342,7 @@ describe("daemon-client", () => {
       requestLog = []
       const optsWithoutErrorKind = {
         sessionId: "test-session-no-error-kind",
+        notificationId: "s:test-session-no-error-kind:error.1",
         event: "Error",
         message: "Error: Something broke",
         label: "Test Session",
@@ -583,8 +585,10 @@ describe("daemon-client", () => {
 
       const daemonUrl = `http://127.0.0.1:${serverPort}`
 
-      // when - question.asked fires (no session.idle preceded it)
-      // This is what the plugin handler should do:
+      // when - question.asked fires (no session.idle preceded it).
+      // This mirrors the ORDER of the daemon calls the plugin handler makes; the real
+      // handler routes both through queues rather than awaiting them in line, which
+      // `session-title.test.ts` and `registration-retry.test.ts` cover end to end.
       const currentMsgId = messageTail.getCurrentMessageId("sess-q")
       if (sessionManager.shouldNotify("sess-q", currentMsgId)) {
         sessionManager.setNotified("sess-q", currentMsgId!)
@@ -592,6 +596,7 @@ describe("daemon-client", () => {
         if (summary) {
           await sendStop({
             sessionId: "sess-q",
+            notificationId: "s:sess-q:flush.1",
             message: summary,
             label: "test",
             daemonUrl,
@@ -644,6 +649,7 @@ describe("daemon-client", () => {
         if (summary) {
           await sendStop({
             sessionId: "sess-q2",
+            notificationId: "s:sess-q2:flush.1",
             message: summary,
             label: "test",
             daemonUrl,
@@ -683,6 +689,7 @@ describe("daemon-client", () => {
         if (summary) {
           await sendStop({
             sessionId: "sess-q3",
+            notificationId: "s:sess-q3:flush.1",
             message: summary,
             label: "test",
             daemonUrl,

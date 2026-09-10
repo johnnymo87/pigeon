@@ -100,6 +100,26 @@ const plugin: Plugin = async (ctx) => {
       },
     })
 
+    /**
+     * The token footer, or "" -- never a throw, never an unbounded wait.
+     *
+     * It is fetched between `consume()` (which clears the accumulated text) and the
+     * enqueue, so a hang here would not merely lose a footer: it would lose the whole
+     * notification, text already consumed and nothing queued. `getFooter` reaches
+     * `client.config.providers()`, which has no timeout of its own.
+     */
+    const footerFor = async (sessionID: string): Promise<string> => {
+      try {
+        return await Promise.race([
+          tokenTracker.getFooter(sessionID, ctx.client, providerCache),
+          new Promise<string>((resolve) => setTimeout(() => resolve(""), 2000)),
+        ])
+      } catch (err) {
+        log("token footer failed (non-blocking):", serializeError(err))
+        return ""
+      }
+    }
+
     questionQueue.start((entry) =>
       sendQuestionAsked({
         sessionId: entry.sessionId,
@@ -516,7 +536,7 @@ const plugin: Plugin = async (ctx) => {
 
            log("DEBUG session.idle received", { sessionID })
 
-           // Ensure discovery + registration have settled before checking isRegistered
+           // Ensure discovery + registration have settled before we read session state
            await ensureRegistered(sessionID)
 
            log("DEBUG session.idle after awaitRegistration", {
@@ -544,7 +564,7 @@ const plugin: Plugin = async (ctx) => {
               // so a retry could otherwise carry files from a later turn.
               const files = [...messageTail.getFiles(sessionID)]
               const summary = messageTail.consume(sessionID) || "Task completed"
-              const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+              const tokenFooter = await footerFor(sessionID)
               const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
               log("enqueueing stop", { sessionID, summary: summary.slice(0, 100), hasTokenFooter: !!tokenFooter })
               stopQueue.enqueue({
@@ -714,28 +734,22 @@ const plugin: Plugin = async (ctx) => {
                const files = [...messageTail.getFiles(sessionID)]
                const summary = messageTail.consume(sessionID)
                if (summary || files.length > 0) {
-                 // Enqueue with the text we have NOW; append the footer only if it
-                 // arrives. The footer fetch has no timeout of its own and used to sit
-                 // between consume() and the send, so a hang there consumed the text
-                 // and then never sent it.
+                 // Detached from the question path on purpose: the question is already
+                 // queued above, so a slow footer here cannot delay it. The key is
+                 // minted now so it does not depend on how long the footer takes.
                  const body = summary || "Output files attached"
-                 const entry = {
-                   sessionId: sessionID,
-                   notificationId: stopKeys.mint(sessionID, currentMsgId ?? "question"),
-                   message: body,
-                   label,
-                   title: sessionManager.getTitle(sessionID),
-                   media: files.length > 0 ? files : undefined,
-                 }
+                 const notificationId = stopKeys.mint(sessionID, currentMsgId ?? "question")
                  void (async () => {
-                   try {
-                     const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
-                     if (tokenFooter) entry.message = `${body}\n\n${tokenFooter}`
-                   } catch (err) {
-                     log("token footer failed before question flush (non-blocking):", serializeError(err))
-                   }
+                   const tokenFooter = await footerFor(sessionID)
+                   stopQueue.enqueue({
+                     sessionId: sessionID,
+                     notificationId,
+                     message: tokenFooter ? `${body}\n\n${tokenFooter}` : body,
+                     label,
+                     title: sessionManager.getTitle(sessionID),
+                     media: files.length > 0 ? files : undefined,
+                   })
                  })()
-                 stopQueue.enqueue(entry)
                }
             }
 
