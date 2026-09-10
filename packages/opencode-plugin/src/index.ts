@@ -261,8 +261,8 @@ const plugin: Plugin = async (ctx) => {
     /**
      * Initiates background session registration with the daemon.
      *
-     * CRITICAL: MUST remain synchronous and return `void`. Do NOT make this
-     * function `async` or `await regPromise` inside it. It immediately records
+     * CRITICAL: MUST remain synchronous. Do NOT make this function `async` or
+     * `await regPromise` inside it. It immediately records
      * `regPromise` on `sessionManager` so downstream handlers calling
      * `awaitRegistration(sessionID)` wait on the HTTP request without blocking
      * the plugin's event dispatcher.
@@ -276,7 +276,7 @@ const plugin: Plugin = async (ctx) => {
       sessionID: string,
       envInfo: EnvironmentInfo,
       title?: string,
-    ): void => {
+    ): Promise<void> => {
       const regPromise = registerSession({
         sessionId: sessionID,
         cwd: ctx.directory,
@@ -302,6 +302,10 @@ const plugin: Plugin = async (ctx) => {
           log("registerSession error:", serializeError(err))
         })
       sessionManager.setRegistrationPromise(sessionID, regPromise)
+      // Returned as well as recorded: a caller repairing a 404 (see stopQueue below)
+      // may be acting for a session whose plugin-side entry is already gone, and
+      // `awaitRegistration` has nothing to wait on in that case.
+      return regPromise
     }
 
     /**
@@ -322,8 +326,7 @@ const plugin: Plugin = async (ctx) => {
         sessionId: entry.sessionId,
       })
       const envInfo = await envInfoP
-      doRegisterSession(entry.sessionId, envInfo, entry.title)
-      await sessionManager.awaitRegistration(entry.sessionId)
+      await doRegisterSession(entry.sessionId, envInfo, entry.title)
 
       return await sendStop({ ...entry, daemonUrl, log })
     })

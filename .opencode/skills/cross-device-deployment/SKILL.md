@@ -53,6 +53,14 @@ cd <project-path>/pigeon && npm install
 | **macbook** | `launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon` |
 | **chromebook** | `systemctl --user restart pigeon-daemon.service` |
 
+> **Daemon before serve, always.** The plugin (in the serve process) and the daemon share the
+> stop idempotency key (`pigeon-mavq`): the plugin sends `notification_id` on `POST /stop` and
+> the daemon uses it as the outbox key, which is what makes a retry a no-op instead of a second
+> Telegram message. A **new plugin against an old daemon** is the one skew that could duplicate,
+> since the old daemon ignores the field. The plugin defends itself — an ambiguous timeout stays
+> terminal until it has seen a daemon echo a key back — so the worst case is a dropped stop
+> rather than a duplicate in every topic. Restarting the daemon first removes even that.
+
 ### 3. Restart opencode-serve (only when you actually need it — see below)
 
 > **⚠️ `opencode-serve.service` no longer exists on devbox or cloudbox.** Both now run a
