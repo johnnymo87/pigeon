@@ -34,9 +34,22 @@ describe("StopKeyMinter", () => {
 
   test("counts per session", () => {
     const minter = new StopKeyMinter()
-    expect(minter.mint("ses_a", "msg_1")).toBe("s:ses_a:msg_1.1")
-    expect(minter.mint("ses_b", "msg_1")).toBe("s:ses_b:msg_1.1")
-    expect(minter.mint("ses_a", "msg_2")).toBe("s:ses_a:msg_2.2")
+    expect(minter.mint("ses_a", "msg_1")).toMatch(/^s:ses_a:msg_1\.[a-z0-9]+\.1$/)
+    expect(minter.mint("ses_b", "msg_1")).toMatch(/^s:ses_b:msg_1\.[a-z0-9]+\.1$/)
+    expect(minter.mint("ses_a", "msg_2")).toMatch(/^s:ses_a:msg_2\.[a-z0-9]+\.2$/)
+  })
+
+  test("two plugin instances never mint the same key for a repeating token", async () => {
+    // `error` and `retry<N>` are not unique per message, and the counter restarts at 1
+    // on every serve restart. Without a per-instance epoch, a session that errors,
+    // survives the nightly pool restart, and errors again re-mints the SAME key -- and
+    // the daemon (which keeps a sent outbox row for an hour) would report it already
+    // queued, silently losing the second error.
+    const first = new StopKeyMinter()
+    await new Promise((r) => setTimeout(r, 2))
+    const second = new StopKeyMinter()
+
+    expect(second.mint("ses_1", "error")).not.toBe(first.mint("ses_1", "error"))
   })
 
   test("sanitises a token that would fail daemon-side validation", () => {

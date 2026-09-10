@@ -125,17 +125,17 @@ function onTransportFailure(route: string, err: unknown, log?: LogFn): void {
 }
 
 /**
- * True when the error means "the daemon did not answer", which is the only thing the
- * breaker models.
+ * True when the daemon never answered, which is the only thing the breaker models.
  *
- * A `SyntaxError` from `res.json()` is deliberately NOT a transport failure: headers
- * arrived, so the daemon was reachable and fast -- the body was merely cut short (in
- * practice by our own AbortSignal). Treating it as unreachable is exactly what opened
- * the breaker in pigeon-mavq and silenced two unrelated sessions.
+ * Deliberately positional rather than error-shaped: anything thrown AFTER `fetch`
+ * resolved -- a `SyntaxError` from a truncated body, or the same abort landing on
+ * `res.json()` as a `TimeoutError` instead -- proves headers arrived, so the daemon was
+ * reachable and prompt. Classifying by error name got the observed case right and the
+ * sibling case wrong; the flag cannot be fooled by which of the two the runtime picks.
+ * Treating a cut-short body as unreachable is what opened the breaker in pigeon-mavq.
  */
-function isTransportFailure(err: unknown): boolean {
-  if (!(err instanceof Error)) return true
-  return err.name !== "SyntaxError"
+function isTransportFailure(responded: boolean): boolean {
+  return !responded
 }
 
 /**
@@ -175,6 +175,7 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
   if (!checkBreaker()) return null
 
   const url = getDaemonUrl(opts.daemonUrl)
+  let responded = false
 
    try {
        const res = await fetchDaemon(`${url}/session-start`, {
@@ -198,6 +199,7 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
         // breaker while the daemon had in fact registered the session (pigeon-mavq).
         signal: AbortSignal.timeout(3000),
       })
+     responded = true
 
      if (!res.ok) {
        const text = await res.text().catch(() => "")
@@ -210,7 +212,7 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
      onSuccess()
      return data
   } catch (err) {
-    if (isTransportFailure(err)) onTransportFailure("/session-start", err, opts.log)
+    if (isTransportFailure(responded)) onTransportFailure("/session-start", err, opts.log)
     opts.log("registerSession failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
     return null
   }
@@ -287,8 +289,13 @@ export async function sendStop(
       notified?: boolean
       notificationId?: string
     }
-    if (data.notificationId === opts.notificationId) {
-      daemonEchoesStopKey = true
+    // Both directions. An id that is present but NOT ours is positive evidence of a
+    // daemon that mints its own -- i.e. a ROLLBACK to a version that ignores the key --
+    // and leaving the flag stuck true there would start retrying ambiguous timeouts
+    // against a daemon that cannot dedupe them, producing the duplicates this flag
+    // exists to prevent.
+    if (data.notificationId !== undefined) {
+      daemonEchoesStopKey = data.notificationId === opts.notificationId
     }
     // ANY 2xx is delivered. Notably `{ok:true, notified:false}` -- a quiet session --
     // is a decision, not a failure; retrying it would burn the TTL and then warn.
@@ -315,6 +322,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
   if (!checkBreaker()) return null
 
   const url = getDaemonUrl(opts.daemonUrl)
+  let responded = false
 
   try {
     const res = await fetchDaemon(`${url}/question-asked`, {
@@ -328,6 +336,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
       }),
       signal: AbortSignal.timeout(1000),
     })
+    responded = true
 
     if (!res.ok) {
       const text = await res.text().catch(() => "")
@@ -340,7 +349,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
     onSuccess()
     return data
   } catch (err) {
-    if (isTransportFailure(err)) onTransportFailure("/question-asked", err, opts.log)
+    if (isTransportFailure(responded)) onTransportFailure("/question-asked", err, opts.log)
     opts.log("notifyQuestionAsked failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
     return null
   }
@@ -350,6 +359,7 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
   if (!checkBreaker()) return null
 
   const url = getDaemonUrl(opts.daemonUrl)
+  let responded = false
 
   const body: Record<string, string> = {
     session_id: opts.sessionId,
@@ -364,6 +374,7 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(1000),
     })
+    responded = true
 
     if (!res.ok) {
       onHttpError()
@@ -374,7 +385,7 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
     onSuccess()
     return data
   } catch (err) {
-    if (isTransportFailure(err)) onTransportFailure("/question-answered", err, opts.log)
+    if (isTransportFailure(responded)) onTransportFailure("/question-answered", err, opts.log)
     opts.log("notifyQuestionAnswered failed:", err instanceof Error ? { message: err.message } : String(err))
     return null
   }

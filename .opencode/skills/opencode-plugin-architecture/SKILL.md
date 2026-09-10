@@ -55,8 +55,11 @@ the gap.
   The skew window degrades to today's behaviour, never to duplicates.
 - **Retry (rate-limit) notifications are not queued** -- single attempt. A storm emits one per
   session every 30-60s and they are stale immediately; queueing them would evict real answers.
-- **Not gated on `isRegistered`.** A failed registration used to suppress every later
-  notification for the session (`shouldNotify` checked it too). Enqueue and repair daemon-side.
+- **Not gated on `isRegistered`** -- for stops and errors only. `question.asked` and
+  `session.status` still are, so `ensureRegistered`'s retry still matters. A failed registration
+  used to suppress every later notification for the session (`shouldNotify` checked it too).
+  Enqueue and repair daemon-side instead; note the repair itself goes through the breaker-gated
+  `registerSession`, so a failed re-registration retries rather than dropping.
 
 ## Circuit Breaker (what it may conclude)
 
@@ -75,10 +78,11 @@ Question notifications use a dedicated path that bypasses the circuit breaker to
   treats a response with no `deliveryState` and no `notified` as a failure, which is exactly
   what `/stop` returns for a quiet session. When `question.asked` fires, the question is enqueued immediately (synchronous) and delivered asynchronously with retries.
 - **`sendQuestionAsked`**: calls daemon `/question-asked` with a 3s timeout. Does not affect circuit breaker state -- success or failure is recorded only in the retry queue.
-- **Decoupled stop flush**: before enqueuing the question, any pending stop text is enqueued in
-  the stop queue (never awaited). The token footer is fetched *after* enqueueing and appended if
-  it arrives -- it has no timeout of its own, and it used to sit between `consume()` and the
-  send, so a hang there consumed the text and never sent it.
+- **Decoupled stop flush**: the question is enqueued FIRST, then any pending stop text is
+  enqueued from a detached closure that nothing awaits, so a slow footer cannot delay the
+  question. The footer fetch itself is bounded by `footerFor` (2s race, never throws) because it
+  sits between `consume()` -- which clears the text -- and the enqueue, so a hang there would
+  lose the whole notification rather than just its footer.
 - **Backward-compatible response**: the daemon returns `{ok: true, deliveryState: "accepted", notificationId}` (HTTP 202). The plugin handles both this format and the legacy `{notified: true}` (HTTP 200) shape.
 - **`notifyQuestionAsked` from daemon-client is no longer used for question events.** It remains available but the plugin routes question delivery through `sendQuestionAsked` instead.
 

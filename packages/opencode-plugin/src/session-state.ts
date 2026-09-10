@@ -57,6 +57,17 @@ export type Parentage = "main" | "subagent" | "unknown"
 
 type SessionEntry = {
   state: State
+  /**
+   * Whether the daemon has acknowledged this session.
+   *
+   * Separate from `state` on purpose. `state` is an ordinal whose top value is
+   * `Notified`, and `isRegistered` used to read `state >= Registered` -- so once
+   * notification stopped being gated on registration, the first `setNotified` on an
+   * UNREGISTERED session silently promoted it to "registered". That would disable the
+   * `ensureRegistered` retry for exactly the sessions that still need it, and let the
+   * question path (which is still gated) believe a never-registered session was fine.
+   */
+  registered: boolean
   parentID: string | undefined
   parentage: Parentage
   lastNotifiedMessageId: string | undefined
@@ -99,6 +110,7 @@ export class SessionManager {
 
     this.sessions.set(sessionID, {
       state: State.Created,
+      registered: false,
       parentID,
       parentage,
       lastNotifiedMessageId: undefined,
@@ -195,6 +207,7 @@ export class SessionManager {
   onRegistered(sessionID: string): void {
     const entry = this.sessions.get(sessionID)
     if (!entry) return
+    entry.registered = true
     entry.state = State.Registered
     entry.lastSeenAt = Date.now()
   }
@@ -230,7 +243,7 @@ export class SessionManager {
   isRegistered(sessionID: string): boolean {
     const entry = this.sessions.get(sessionID)
     if (!entry) return false
-    return entry.state >= State.Registered
+    return entry.registered
   }
 
   /**

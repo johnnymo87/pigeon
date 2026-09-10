@@ -173,6 +173,38 @@ describe("sendStop", () => {
       )
     }, 10_000)
 
+    test("a daemon that goes BACK to minting its own id revokes the proof", async () => {
+      // Rollback: the pool keeps running while the daemon is downgraded. A flag that
+      // only ever latched true would start retrying ambiguous timeouts against a daemon
+      // that cannot dedupe them -- the duplicates the flag exists to prevent.
+      server = await createTestServer((req, res) => {
+        res.writeHead(202, { "content-type": "application/json" })
+        res.end(JSON.stringify({ ok: true, notificationId: "s:ses_1:msg_1.0" }))
+      })
+      expect(await sendStop(opts(server.port))).toBe("success")
+
+      server.close()
+      server = await createTestServer((req, res) => {
+        res.writeHead(202, { "content-type": "application/json" })
+        // Old daemon: mints its own, ignoring ours.
+        res.end(JSON.stringify({ ok: true, notificationId: "s:ses_1:1789079999999" }))
+      })
+      expect(await sendStop(opts(server.port, { notificationId: "s:ses_1:msg_2.0" }))).toBe(
+        "success",
+      )
+
+      server.close()
+      server = await createTestServer((req, res) => {
+        setTimeout(() => {
+          res.writeHead(202)
+          res.end("{}")
+        }, 4000)
+      })
+      expect(await sendStop(opts(server.port, { notificationId: "s:ses_1:msg_3.0" }))).toBe(
+        "terminal",
+      )
+    }, 20_000)
+
     test("a daemon echoing a DIFFERENT id does not count as proof", async () => {
       server = await createTestServer((req, res) => {
         res.writeHead(202, { "content-type": "application/json" })

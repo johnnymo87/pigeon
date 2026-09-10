@@ -296,7 +296,7 @@ const plugin: Plugin = async (ctx) => {
       sessionID: string,
       envInfo: EnvironmentInfo,
       title?: string,
-    ): Promise<void> => {
+    ): Promise<boolean> => {
       const regPromise = registerSession({
         sessionId: sessionID,
         cwd: ctx.directory,
@@ -316,15 +316,19 @@ const plugin: Plugin = async (ctx) => {
           log("registerSession result", { sessionID, result })
           if (result?.ok) {
             sessionManager.onRegistered(sessionID)
+            return true
           }
+          return false
         })
         .catch((err) => {
           log("registerSession error:", serializeError(err))
+          return false
         })
-      sessionManager.setRegistrationPromise(sessionID, regPromise)
-      // Returned as well as recorded: a caller repairing a 404 (see stopQueue below)
-      // may be acting for a session whose plugin-side entry is already gone, and
-      // `awaitRegistration` has nothing to wait on in that case.
+      sessionManager.setRegistrationPromise(sessionID, regPromise.then(() => undefined))
+      // The OUTCOME is returned, not just the promise. A caller repairing a 404 (see
+      // stopQueue below) may be acting for a session whose plugin-side entry is gone,
+      // so `awaitRegistration` has nothing to wait on -- and, more importantly, a
+      // registration that merely FAILED must not be mistaken for one that succeeded.
       return regPromise
     }
 
@@ -335,8 +339,13 @@ const plugin: Plugin = async (ctx) => {
      * dead session: the daemon's reaper deletes a row after 7 days idle while the
      * plugin still believes it is registered, so `ensureRegistered` never re-registers
      * and the answer to a long-idle session's next prompt would be dropped forever.
-     * Re-register from the entry's own fields and try once more; a second 404 is
-     * terminal, since repeating it cannot produce a different answer.
+     * Re-register from the entry's own fields and try once more.
+     *
+     * Only a 404 that survives a SUCCESSFUL re-registration is terminal. The
+     * registration itself goes through `registerSession`, which is still breaker-gated
+     * -- so if the breaker is open (or the daemon is still down) the repair does not
+     * happen at all, and treating that as terminal would drop the notification for
+     * exactly the reason this whole change exists to eliminate. That case retries.
      */
     stopQueue.start(async (entry) => {
       const outcome = await sendStop({ ...entry, daemonUrl, log })
@@ -346,7 +355,13 @@ const plugin: Plugin = async (ctx) => {
         sessionId: entry.sessionId,
       })
       const envInfo = await envInfoP
-      await doRegisterSession(entry.sessionId, envInfo, entry.title)
+      const registered = await doRegisterSession(entry.sessionId, envInfo, entry.title)
+      if (!registered) {
+        log("re-registration failed; will retry the stop rather than drop it", {
+          sessionId: entry.sessionId,
+        })
+        return "retry"
+      }
 
       return await sendStop({ ...entry, daemonUrl, log })
     })
@@ -405,10 +420,13 @@ const plugin: Plugin = async (ctx) => {
      *
      * A failed registration (daemon timeout, transient 5xx) used to leave a
      * session known-but-unregistered forever: `lateDiscoverSession` returns
-     * early on `isKnown`, so nothing retried. Every notification path below is
-     * gated on `isRegistered`, so the session then went permanently silent --
-     * and invisibly so, because the daemon may well have recorded the session
-     * before the client's 1s timeout fired.
+     * early on `isKnown`, so nothing retried. The session then went permanently
+     * silent -- and invisibly so, because the daemon may well have recorded the
+     * session before the client's 1s timeout fired.
+     *
+     * Stops and errors no longer depend on this succeeding (they enqueue either way
+     * and repair a 404 daemon-side), but `question.asked` and `session.status` still
+     * gate on `isRegistered`, so this retry is what keeps a question answerable.
      *
      * Retrying here, at the notification sites, is self-limiting: these events
      * are human-paced, and the daemon client's circuit breaker bounds the cost

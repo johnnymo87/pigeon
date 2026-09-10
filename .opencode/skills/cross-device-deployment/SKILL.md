@@ -60,6 +60,11 @@ cd <project-path>/pigeon && npm install
 > since the old daemon ignores the field. The plugin defends itself — an ambiguous timeout stays
 > terminal until it has seen a daemon echo a key back — so the worst case is a dropped stop
 > rather than a duplicate in every topic. Restarting the daemon first removes even that.
+>
+> **Rolling the daemon BACK is the mirror case**, and the plugin handles it the same way: a
+> response carrying a `notificationId` that is not the one we sent is positive evidence of a
+> daemon that mints its own, and it revokes the flag. No pool restart is required after a
+> rollback, but a restart is still the fastest way to a known state.
 
 ### 3. Restart opencode-serve (only when you actually need it — see below)
 

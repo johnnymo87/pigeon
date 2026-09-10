@@ -143,6 +143,23 @@ describe("registration retry after a failed registration", () => {
     )
   })
 
+  test("a 404 whose re-registration ALSO fails is retried, not dropped", async () => {
+    // The repair path runs through registerSession, which is still breaker-gated. If
+    // the breaker is open (or the daemon is still down) the repair cannot happen, and
+    // calling that terminal would drop the notification for precisely the reason this
+    // change exists to eliminate.
+    registerSessionSpy = vi.spyOn(daemonClient, "registerSession").mockResolvedValue(null)
+    sendStopSpy.mockResolvedValue("unregistered")
+
+    const hooks = await plugin(createMockCtx())
+    await createSessionThenIdle(hooks)
+
+    // Still queued and still trying: more than the one attempt plus one repair.
+    await vi.waitFor(() => expect(sendStopSpy.mock.calls.length).toBeGreaterThan(2), {
+      timeout: 4000,
+    })
+  }, 10_000)
+
   test("a stop for a session the daemon has forgotten re-registers and retries once", async () => {
     registerSessionSpy = vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
     sendStopSpy.mockResolvedValueOnce("unregistered").mockResolvedValue("success")

@@ -62,13 +62,24 @@ function sanitizeSegment(value: string): string {
  */
 export class StopKeyMinter {
   private counters: Map<string, number> = new Map()
+  /**
+   * Makes a key unique across plugin instances, not just within one.
+   *
+   * The counter is in memory and restarts at 1, while `dedupToken` is not always a
+   * message id -- `error` and `retry<N>` repeat. So a session that errors, survives a
+   * pool restart, and errors again would re-mint `s:<ses>:error.1`, and the daemon's
+   * outbox (which keeps a sent row for an hour) would answer "already queued" and the
+   * plugin would mark a DIFFERENT error delivered. The nightly pool restart makes that
+   * window real rather than theoretical.
+   */
+  private readonly epoch: string = Date.now().toString(36)
 
   mint(sessionId: string, dedupToken: string): string {
     const next = (this.counters.get(sessionId) ?? 0) + 1
     this.counters.set(sessionId, next)
 
     const prefix = `s:${sessionId}:`
-    const suffix = `.${next}`
+    const suffix = `.${this.epoch}.${next}`
     const room = MAX_NOTIFICATION_ID_LENGTH - prefix.length - suffix.length
     // max(room, 0): clamping to 1 instead would push an already-maximal id to 129 chars,
     // which the daemon rejects -- an empty token is the only correct answer there.
