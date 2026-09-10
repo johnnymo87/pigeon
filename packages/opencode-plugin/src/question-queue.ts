@@ -1,3 +1,5 @@
+import { DeliveryQueue, type DeliveryOutcome } from "./delivery-queue"
+
 type LogFn = (message: string, data?: unknown) => void
 
 export type QuestionEntry = {
@@ -28,20 +30,18 @@ type DaemonResponse = {
 
 export type Sender = (entry: QuestionEntry) => Promise<DaemonResponse>
 
-type QueueItem = {
-  entry: QuestionEntry
-  enqueuedAt: number
-  nextAttemptAt: number
-  attempts: number
-}
-
 const MAX_SIZE = 20
-const TICK_INTERVAL_MS = 500
 const DEFAULT_MAX_RETRY_MS = 2 * 60 * 1000 // 2 minutes
 
-// Exponential backoff schedule (ms)
-const BACKOFF_SCHEDULE = [500, 1000, 2000, 4000, 8000, 15000, 30000]
-
+/**
+ * Whether the daemon accepted a QUESTION.
+ *
+ * Note how much this classifier assumes: with no `deliveryState` it demands
+ * `notified === true`. That is right for /question-asked, which always delivers, and
+ * wrong for /stop, which answers `{ok:true, notified:false}` for every quiet session.
+ * This is why the shared queue takes its classifier from the caller rather than owning
+ * one -- a shared classifier would retry correctly-quieted stops until they expired.
+ */
 function isSuccess(result: DaemonResponse): boolean {
   if (result === null || result === undefined) return false
 
@@ -58,27 +58,26 @@ function isSuccess(result: DaemonResponse): boolean {
   return result.notified === true
 }
 
-function getBackoffMs(attempts: number): number {
-  const index = Math.min(attempts, BACKOFF_SCHEDULE.length - 1)
-  const base = BACKOFF_SCHEDULE[index] ?? BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.length - 1] ?? 30000
-  // Add 0-50% jitter
-  const jitter = base * Math.random() * 0.5
-  return base + jitter
-}
-
+/**
+ * Question delivery, on the shared DeliveryQueue.
+ *
+ * Kept as its own class rather than an inline instantiation because the (sessionId,
+ * requestId) pair is the question subsystem's vocabulary and appears in `has()` and in
+ * `onExpired`, which callers depend on.
+ */
 export class QuestionDeliveryQueue {
-  private items: Map<string, QueueItem> = new Map()
-  private insertionOrder: string[] = []
-  private maxRetryMs: number
-  private onExpired?: (sessionId: string, requestId: string) => void
-  private log: LogFn
-  private timer: ReturnType<typeof setInterval> | null = null
-  private sender: Sender | null = null
+  private queue: DeliveryQueue<QuestionEntry>
 
   constructor(opts?: QuestionQueueOptions) {
-    this.maxRetryMs = opts?.maxRetryMs ?? DEFAULT_MAX_RETRY_MS
-    this.onExpired = opts?.onExpired
-    this.log = opts?.log ?? ((msg, data) => console.log("[QuestionQueue]", msg, data))
+    this.queue = new DeliveryQueue<QuestionEntry>({
+      name: "question-queue",
+      key: (entry) => this.key(entry.sessionId, entry.requestId),
+      describe: (entry) => ({ sessionId: entry.sessionId, requestId: entry.requestId }),
+      maxSize: MAX_SIZE,
+      maxRetryMs: opts?.maxRetryMs ?? DEFAULT_MAX_RETRY_MS,
+      onExpired: (entry) => opts?.onExpired?.(entry.sessionId, entry.requestId),
+      log: opts?.log,
+    })
   }
 
   private key(sessionId: string, requestId: string): string {
@@ -86,111 +85,25 @@ export class QuestionDeliveryQueue {
   }
 
   enqueue(entry: QuestionEntry): void {
-    const k = this.key(entry.sessionId, entry.requestId)
-
-    // Dedup: if already queued, skip
-    if (this.items.has(k)) {
-      return
-    }
-
-    // Evict oldest if at capacity
-    if (this.items.size >= MAX_SIZE) {
-      const oldestKey = this.insertionOrder.shift()
-      if (oldestKey !== undefined) {
-        this.items.delete(oldestKey)
-      }
-    }
-
-    const now = Date.now()
-    this.items.set(k, {
-      entry,
-      enqueuedAt: now,
-      nextAttemptAt: now, // attempt immediately on next tick
-      attempts: 0,
-    })
-    this.insertionOrder.push(k)
+    this.queue.enqueue(entry)
   }
 
   start(sender: Sender): void {
-    this.sender = sender
-    this.timer = setInterval(() => {
-      void this.tick()
-    }, TICK_INTERVAL_MS)
+    this.queue.start(async (entry): Promise<DeliveryOutcome> => {
+      const result = await sender(entry)
+      return isSuccess(result) ? "success" : "retry"
+    })
   }
 
   stop(): void {
-    if (this.timer !== null) {
-      clearInterval(this.timer)
-      this.timer = null
-    }
+    this.queue.stop()
   }
 
   size(): number {
-    return this.items.size
+    return this.queue.size()
   }
 
   has(sessionId: string, requestId: string): boolean {
-    return this.items.has(this.key(sessionId, requestId))
-  }
-
-  private async tick(): Promise<void> {
-    if (this.sender === null) return
-
-    const now = Date.now()
-    const toProcess = Array.from(this.items.entries()).filter(
-      ([, item]) => now >= item.nextAttemptAt
-    )
-
-    for (const [k, item] of toProcess) {
-      const age = now - item.enqueuedAt
-
-      // Check expiry
-      if (age >= this.maxRetryMs) {
-        this.log("question-queue: entry expired", {
-          sessionId: item.entry.sessionId,
-          requestId: item.entry.requestId,
-          age,
-        })
-        this.items.delete(k)
-        this.insertionOrder = this.insertionOrder.filter((x) => x !== k)
-        this.onExpired?.(item.entry.sessionId, item.entry.requestId)
-        continue
-      }
-
-      // Attempt delivery
-      try {
-        const result = await this.sender(item.entry)
-        if (isSuccess(result)) {
-          this.log("question-queue: delivered", {
-            sessionId: item.entry.sessionId,
-            requestId: item.entry.requestId,
-          })
-          this.items.delete(k)
-          this.insertionOrder = this.insertionOrder.filter((x) => x !== k)
-        } else {
-          // Schedule retry
-          const backoffMs = getBackoffMs(item.attempts)
-          item.attempts++
-          item.nextAttemptAt = Date.now() + backoffMs
-          this.log("question-queue: delivery failed, scheduling retry", {
-            sessionId: item.entry.sessionId,
-            requestId: item.entry.requestId,
-            attempts: item.attempts,
-            backoffMs,
-          })
-        }
-      } catch (err) {
-        // Treat exceptions as failures
-        const backoffMs = getBackoffMs(item.attempts)
-        item.attempts++
-        item.nextAttemptAt = Date.now() + backoffMs
-        this.log("question-queue: sender threw, scheduling retry", {
-          sessionId: item.entry.sessionId,
-          requestId: item.entry.requestId,
-          attempts: item.attempts,
-          err,
-        })
-      }
-    }
+    return this.queue.hasKey(this.key(sessionId, requestId))
   }
 }
