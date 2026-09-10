@@ -178,7 +178,7 @@ describe("daemon-client", () => {
       // given - server that delays response
       server?.close()
       server = await createTestServer(async (req) => {
-        await sleep(2000) // Delay longer than 1000ms timeout
+        await sleep(4000) // Delay longer than the 3000ms registration timeout
         return Response.json({ ok: true })
       })
       serverPort = server.port
@@ -443,31 +443,27 @@ describe("daemon-client", () => {
   })
 
   describe("circuit breaker", () => {
-    test("should skip calls after failure for 30s", async () => {
-      // given - server that fails
-      server?.close()
-      server = await createTestServer(async (req) => {
-        return new Response("Error", { status: 500 })
-      })
-      serverPort = server.port
-
+    test("should skip calls after a TRANSPORT failure for 30s", async () => {
+      // given - a healthy server, and a dead port to fail against.
+      // The failure must be a transport failure: an HTTP status, whatever it is,
+      // proves the daemon is reachable and is deliberately not a breaker signal.
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 
-      // when - first call fails
+      // when - first call fails to connect
       const result1 = await registerSession(opts)
       expect(result1).toBeNull()
 
-      // when - second call should be skipped (circuit open)
+      // when - second call, against the HEALTHY daemon, is skipped (circuit open)
       requestLog = []
-      const result2 = await registerSession(opts)
+      const result2 = await registerSession({ ...opts, daemonUrl: `http://127.0.0.1:${serverPort}` })
 
       // then - no request made (circuit breaker blocked it)
       expect(result2).toBeNull()
@@ -475,29 +471,17 @@ describe("daemon-client", () => {
     })
 
     test("should transition to half-open after timeout", async () => {
-      // given - server that initially fails
-      let shouldFail = true
-      server?.close()
-      server = await createTestServer(async (req) => {
-        if (shouldFail) {
-          return new Response("Error", { status: 500 })
-        }
-        const body = await req.json()
-        return Response.json({ ok: true, notified: true })
-      })
-      serverPort = server.port
-
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 
-      // when - first call fails, opening circuit
+      // when - first call fails to connect, opening circuit
       await registerSession(opts)
 
       // Simulate time passing (we can't actually wait 30s in tests)
@@ -545,20 +529,14 @@ describe("daemon-client", () => {
       // the backoff should double (capped at 60s).
       // Due to time constraints, we verify the failure path.
 
-      // given - server that fails
-      server?.close()
-      server = await createTestServer(async (req) => {
-        return new Response("Error", { status: 500 })
-      })
-      serverPort = server.port
-
+      // given - a dead port, so the failures are transport failures
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 

@@ -104,12 +104,50 @@ function onSuccess(): void {
   breakerBackoff = 30_000
 }
 
-function onFailure(): void {
+/**
+ * Open the breaker. ONLY call this for a transport failure -- see `isTransportFailure`.
+ *
+ * `route` and `reason` are logged because the trip used to be invisible: diagnosing
+ * pigeon-mavq meant correlating a `registerSession failed` line against a
+ * `blocked by circuit breaker` line for a different session 19 seconds later.
+ */
+function onTransportFailure(route: string, err: unknown, log?: LogFn): void {
   if (breakerState === BreakerState.HalfOpen) {
     breakerBackoff = Math.min(breakerBackoff * 2, 60_000)
   }
   breakerState = BreakerState.Open
   breakerOpenUntil = Date.now() + breakerBackoff
+  log?.("breaker opened", {
+    route,
+    reason: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    openUntil: breakerOpenUntil,
+  })
+}
+
+/**
+ * True when the error means "the daemon did not answer", which is the only thing the
+ * breaker models.
+ *
+ * A `SyntaxError` from `res.json()` is deliberately NOT a transport failure: headers
+ * arrived, so the daemon was reachable and fast -- the body was merely cut short (in
+ * practice by our own AbortSignal). Treating it as unreachable is exactly what opened
+ * the breaker in pigeon-mavq and silenced two unrelated sessions.
+ */
+function isTransportFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return true
+  return err.name !== "SyntaxError"
+}
+
+/**
+ * Record a failure that came back as an HTTP response.
+ *
+ * Intentionally a no-op on the breaker. Any status -- 404 for a reaped session, 500
+ * from a bug -- proves the daemon is reachable and answering promptly, which is the
+ * only question the breaker exists to answer. Before this, one session's 404 opened
+ * the breaker for every session sharing the serve process.
+ */
+function onHttpError(): void {
+  // no breaker effect by design; callers log the status themselves
 }
 
 function daemonHeaders(): Record<string, string> {
@@ -155,13 +193,16 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
           backend_endpoint: opts.backendEndpoint,
           backend_auth_token: opts.backendAuthToken,
         }),
-        signal: AbortSignal.timeout(1000),
+        // 3s, not 1s: the daemon is local but shares a machine with a serve pool, and a
+        // 1s abort produced *phantom* failures (headers back, body cut) that opened the
+        // breaker while the daemon had in fact registered the session (pigeon-mavq).
+        signal: AbortSignal.timeout(3000),
       })
 
      if (!res.ok) {
        const text = await res.text().catch(() => "")
        opts.log("daemon returned error", { status: res.status, body: text })
-       onFailure()
+       onHttpError()
        return null
      }
 
@@ -169,7 +210,7 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
      onSuccess()
      return data
   } catch (err) {
-    onFailure()
+    if (isTransportFailure(err)) onTransportFailure("/session-start", err, opts.log)
     opts.log("registerSession failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
     return null
   }
@@ -201,7 +242,7 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
      if (!res.ok) {
        const text = await res.text().catch(() => "")
        opts.log("notifyStop daemon returned error", { sessionId: opts.sessionId, status: res.status, body: text })
-       onFailure()
+       onHttpError()
        return null
      }
 
@@ -210,7 +251,7 @@ export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
      onSuccess()
      return data
   } catch (err) {
-    onFailure()
+    if (isTransportFailure(err)) onTransportFailure("/stop", err, opts.log)
     opts.log("notifyStop failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
     return null
   }
@@ -237,7 +278,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
     if (!res.ok) {
       const text = await res.text().catch(() => "")
       opts.log("daemon returned error for question-asked", { status: res.status, body: text })
-      onFailure()
+      onHttpError()
       return null
     }
 
@@ -245,7 +286,7 @@ export async function notifyQuestionAsked(opts: NotifyQuestionAskedOpts): Promis
     onSuccess()
     return data
   } catch (err) {
-    onFailure()
+    if (isTransportFailure(err)) onTransportFailure("/question-asked", err, opts.log)
     opts.log("notifyQuestionAsked failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
     return null
   }
@@ -271,7 +312,7 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
     })
 
     if (!res.ok) {
-      onFailure()
+      onHttpError()
       return null
     }
 
@@ -279,7 +320,7 @@ export async function notifyQuestionAnswered(opts: NotifyQuestionAnsweredOpts): 
     onSuccess()
     return data
   } catch (err) {
-    onFailure()
+    if (isTransportFailure(err)) onTransportFailure("/question-answered", err, opts.log)
     opts.log("notifyQuestionAnswered failed:", err instanceof Error ? { message: err.message } : String(err))
     return null
   }
