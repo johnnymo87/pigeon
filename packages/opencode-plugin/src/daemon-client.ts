@@ -216,44 +216,98 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
   }
 }
 
-export async function notifyStop(opts: NotifyStopOpts): Promise<DaemonResult> {
-  if (!checkBreaker()) {
-    opts.log("notifyStop blocked by circuit breaker", { sessionId: opts.sessionId, breakerState, breakerOpenUntil })
-    return null
-  }
+/**
+ * Outcome of one stop delivery attempt.
+ *
+ * `unregistered` is separate from `terminal` because it is the one failure the caller
+ * can actually repair: the daemon's session reaper deletes a row after 7 days idle
+ * while the plugin still believes it is registered, so `ensureRegistered` never
+ * re-registers and the answer to a long-idle session's prompt would be dropped
+ * forever. The caller re-registers and hands it back.
+ */
+export type StopOutcome = "success" | "retry" | "unregistered" | "terminal"
 
+/**
+ * Whether this daemon has proved it honours a client-supplied notification id.
+ *
+ * Deploy skew matters here in one direction only. Against an OLD daemon our id is
+ * ignored and a fresh one is minted per request, so retrying a POST that timed out
+ * *after* being processed posts to Telegram twice. A duplicate in every topic is worse
+ * than the status quo, so until a response echoes the exact id we sent, an ambiguous
+ * timeout stays terminal -- which is precisely today's behaviour, no worse.
+ *
+ * Sticky and process-global: one echo from one session proves it for the daemon, and
+ * the plugin talks to exactly one daemon.
+ */
+let daemonEchoesStopKey = false
+
+export async function sendStop(
+  opts: NotifyStopOpts & { notificationId: string },
+): Promise<StopOutcome> {
   const url = getDaemonUrl(opts.daemonUrl)
 
-   try {
-     const res = await fetchDaemon(`${url}/stop`, {
-       method: "POST",
-          body: JSON.stringify({
-            session_id: opts.sessionId,
-            event: opts.event ?? "Stop",
-            message: opts.message,
-            label: opts.label,
-            ...(opts.title ? { title: opts.title } : {}),
-            ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
-            ...(opts.errorKind ? { error_kind: opts.errorKind } : {}),
-          }),
-       signal: AbortSignal.timeout(3000),
-     })
+  try {
+    const res = await fetchDaemon(`${url}/stop`, {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: opts.sessionId,
+        event: opts.event ?? "Stop",
+        message: opts.message,
+        label: opts.label,
+        notification_id: opts.notificationId,
+        ...(opts.title ? { title: opts.title } : {}),
+        ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
+        ...(opts.errorKind ? { error_kind: opts.errorKind } : {}),
+      }),
+      signal: AbortSignal.timeout(3000),
+    })
 
-     if (!res.ok) {
-       const text = await res.text().catch(() => "")
-       opts.log("notifyStop daemon returned error", { sessionId: opts.sessionId, status: res.status, body: text })
-       onHttpError()
-       return null
-     }
+    if (res.status === 404) {
+      opts.log("sendStop: session unknown to daemon", { sessionId: opts.sessionId })
+      return "unregistered"
+    }
 
-     const data = (await res.json()) as { ok: boolean; deliveryState?: string; notified?: boolean }
-     opts.log("notifyStop daemon response", { sessionId: opts.sessionId, ...data })
-     onSuccess()
-     return data
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      // 5xx is the daemon having a bad moment; 4xx means it understood us and said no,
+      // and repeating the identical request cannot change that answer.
+      const outcome: StopOutcome = res.status >= 500 ? "retry" : "terminal"
+      opts.log("sendStop: daemon returned error", {
+        sessionId: opts.sessionId,
+        status: res.status,
+        body: text,
+        outcome,
+      })
+      return outcome
+    }
+
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean
+      deliveryState?: string
+      notified?: boolean
+      notificationId?: string
+    }
+    if (data.notificationId === opts.notificationId) {
+      daemonEchoesStopKey = true
+    }
+    // ANY 2xx is delivered. Notably `{ok:true, notified:false}` -- a quiet session --
+    // is a decision, not a failure; retrying it would burn the TTL and then warn.
+    opts.log("sendStop: daemon response", { sessionId: opts.sessionId, ...data })
+    return "success"
   } catch (err) {
-    if (isTransportFailure(err)) onTransportFailure("/stop", err, opts.log)
-    opts.log("notifyStop failed:", err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err))
-    return null
+    const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")
+    if (timedOut && !daemonEchoesStopKey) {
+      opts.log("sendStop: timeout against a daemon that has not echoed our key; not retrying", {
+        sessionId: opts.sessionId,
+        notificationId: opts.notificationId,
+      })
+      return "terminal"
+    }
+    opts.log(
+      "sendStop failed:",
+      err instanceof Error ? { message: err.message, name: err.name } : String(err),
+    )
+    return "retry"
   }
 }
 
@@ -386,4 +440,8 @@ export function _resetBreakerForTesting(): void {
   breakerState = BreakerState.Closed
   breakerOpenUntil = 0
   breakerBackoff = 30_000
+}
+
+export function _resetStopSkewForTesting(): void {
+  daemonEchoesStopKey = false
 }

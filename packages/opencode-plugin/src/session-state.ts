@@ -233,10 +233,20 @@ export class SessionManager {
     return entry.state >= State.Registered
   }
 
+  /**
+   * Whether this message still owes a notification.
+   *
+   * Purely a DEDUP question, deliberately not a registration one. Registration used to
+   * be checked here as well, which made a failed registration silently suppress every
+   * subsequent notification for the session -- the same fail-closed direction that
+   * `isMainSession` exists to avoid, hidden one layer down. Delivery now enqueues
+   * regardless and repairs an unknown session daemon-side (404 -> re-register ->
+   * retry), so the only thing this must answer is "have we already notified for this
+   * message?".
+   */
   shouldNotify(sessionID: string, currentMessageId: string | undefined): boolean {
     const entry = this.sessions.get(sessionID)
     if (!entry) return false
-    if (!this.isRegistered(sessionID)) return false
     if (currentMessageId === undefined) return false
     if (currentMessageId === entry.lastNotifiedMessageId) return false
     return true

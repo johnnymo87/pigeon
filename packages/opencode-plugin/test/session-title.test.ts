@@ -549,15 +549,15 @@ describe("Session Title Management", () => {
     })
 
     describe("Notification title wiring tests", () => {
-      let notifyStopSpy: any
+      let sendStopSpy: any
       let sendQuestionAskedSpy: any
 
       beforeEach(() => {
-        notifyStopSpy = vi.spyOn(daemonClient, "notifyStop").mockResolvedValue({ ok: true, deliveryState: "accepted" })
+        sendStopSpy = vi.spyOn(daemonClient, "sendStop").mockResolvedValue("success")
         sendQuestionAskedSpy = vi.spyOn(daemonClient, "sendQuestionAsked").mockResolvedValue({ ok: true, deliveryState: "accepted" })
       })
 
-      test("session.idle passes live title to notifyStop", async () => {
+      test("session.idle passes live title to the stop queue", async () => {
         const mockCtx = createMockCtx()
         const hooks = await plugin(mockCtx)
 
@@ -586,7 +586,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_idle_title",
               title: "Live Idle Title",
@@ -599,7 +599,7 @@ describe("Session Title Management", () => {
         // finish as an error. Asserted on the call argument rather than via
         // objectContaining({ event: undefined }), which requires the key to be
         // PRESENT and so fails on the correct (key-absent) implementation.
-        expect(notifyStopSpy.mock.calls.at(-1)![0]).not.toHaveProperty("event")
+        expect(sendStopSpy.mock.calls.at(-1)![0]).not.toHaveProperty("event")
       })
 
       test("question.asked passes live title to sendQuestionAsked", async () => {
@@ -681,7 +681,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_q_file",
               media: [
@@ -696,7 +696,7 @@ describe("Session Title Management", () => {
         })
       })
 
-      test("session.error passes event: 'Error' and prepends turn narration to notifyStop", async () => {
+      test("session.error passes event: 'Error' and prepends turn narration to the stop queue", async () => {
         const mockCtx = createMockCtx()
         const hooks = await plugin(mockCtx)
 
@@ -740,7 +740,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_err_1",
               event: "Error",
@@ -772,7 +772,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_err_2",
               event: "Error",
@@ -781,12 +781,12 @@ describe("Session Title Management", () => {
             })
           )
         })
-        // Explicitly assert errorKind is undefined on the notifyStop call arg.
+        // Explicitly assert errorKind is undefined on the stop entry.
         // Wire omission of error_kind in HTTP body is pinned in daemon-client.test.ts.
-        expect(notifyStopSpy.mock.calls[0][0].errorKind).toBeUndefined()
+        expect(sendStopSpy.mock.calls[0][0].errorKind).toBeUndefined()
       })
 
-      test("session.error with abort error passes errorKind: 'aborted' to notifyStop", async () => {
+      test("session.error with abort error passes errorKind: 'aborted' to the stop queue", async () => {
         const mockCtx = createMockCtx()
         const hooks = await plugin(mockCtx)
 
@@ -808,7 +808,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_err_abort_1",
               event: "Error",
@@ -836,7 +836,7 @@ describe("Session Title Management", () => {
         })
 
         await vi.waitFor(() => {
-          expect(notifyStopSpy).toHaveBeenCalledWith(
+          expect(sendStopSpy).toHaveBeenCalledWith(
             expect.objectContaining({
               sessionId: "ses_err_abort_2",
               event: "Error",

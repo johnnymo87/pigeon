@@ -111,9 +111,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
    * fix by dropping the session on the error path, this test is what stops them.
    */
   test("FAIL-OPEN: a session whose session.get failed STILL sends stop notifications", async () => {
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const hooks = await plugin(createMockCtx())
@@ -129,8 +129,10 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
       event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
     })
 
-    expect(notifyStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_sub" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_sub" })
+      )
     )
   })
 
@@ -138,9 +140,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const ctx = createMockCtx()
@@ -158,13 +160,13 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await new Promise((r) => setTimeout(r, 800))
 
     expect(postMirrorSpy).not.toHaveBeenCalled()
-    expect(notifyStopSpy).not.toHaveBeenCalled()
+    expect(sendStopSpy).not.toHaveBeenCalled()
   })
 
   test("session.updated carrying a parentID DEMOTES a session that was assumed main", async () => {
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
@@ -182,12 +184,12 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
     })
-    expect(notifyStopSpy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(sendStopSpy).toHaveBeenCalledTimes(1))
 
     // The truth arrives for free on session.updated.
     await sessionUpdated(hooks, "ses_sub", "ses_parent")
 
-    notifyStopSpy.mockClear()
+    sendStopSpy.mockClear()
     await hooks.event!({
       event: {
         type: "message.updated",
@@ -200,7 +202,7 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await typePromptInto(hooks, "ses_sub", "another brief")
     await new Promise((r) => setTimeout(r, 900))
 
-    expect(notifyStopSpy).not.toHaveBeenCalled()
+    expect(sendStopSpy).not.toHaveBeenCalled()
     expect(postMirrorSpy).not.toHaveBeenCalled()
   })
 
@@ -215,9 +217,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const hooks = await plugin(createMockCtx())
@@ -236,7 +238,7 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
 
     // session.updated reports no parentID -- which proves nothing either way.
     await sessionUpdated(hooks, "ses_main", undefined)
-    notifyStopSpy.mockClear()
+    sendStopSpy.mockClear()
 
     await typePromptInto(hooks, "ses_main", "a genuine typed prompt")
     await new Promise((r) => setTimeout(r, 900))
@@ -254,7 +256,7 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: { type: "session.idle", properties: { sessionID: "ses_main" } } as any,
     })
-    expect(notifyStopSpy).toHaveBeenCalledWith(
+    expect(sendStopSpy).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: "ses_main" })
     )
   })
@@ -294,9 +296,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
 
   test("a session confirmed as main is never demoted by a later update that omits parentID", async () => {
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
 
     const hooks = await plugin(createMockCtx())
 
@@ -320,8 +322,10 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
       event: { type: "session.idle", properties: { sessionID: "ses_real_main" } } as any,
     })
 
-    expect(notifyStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_real_main" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_real_main" })
+      )
     )
   })
 
@@ -330,7 +334,7 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
       .spyOn(daemonClient, "registerSession")
       .mockResolvedValueOnce(null)
       .mockResolvedValue({ ok: true })
-    vi.spyOn(daemonClient, "notifyStop").mockResolvedValue({ ok: true })
+    vi.spyOn(daemonClient, "sendStop").mockResolvedValue("success")
 
     const hooks = await plugin(createMockCtx())
 
