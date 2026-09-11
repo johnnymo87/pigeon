@@ -90,18 +90,6 @@ export function resolveOcTagsBin(opts: ResolveOcTagsBinOptions = {}): string | n
 }
 
 /**
- * Builds a runner that executes oc-tags with an argv ARRAY and no shell.
- *
- * Tag names and directory globs arrive from a chat message. Passing argv rather
- * than composing a command string means shell metacharacters in them are inert;
- * the remaining hazard is argument injection via a leading "-", which the input
- * validators reject.
- *
- * A non-zero exit resolves rather than rejects: oc-tags reports user errors as
- * exit 1 plus a line on stderr, and those belong in the Telegram reply. Only a
- * failure to run at all (ENOENT, timeout) rejects.
- */
-/**
  * Turns a runner REJECTION into a line that names a reason.
  *
  * This exists because the naked `err.message` does not. execFile reports its
@@ -126,6 +114,18 @@ export function describeOcTagsFailure(err: unknown): string {
   return err.message;
 }
 
+/**
+ * Builds a runner that executes oc-tags with an argv ARRAY and no shell.
+ *
+ * Tag names and directory globs arrive from a chat message. Passing argv rather
+ * than composing a command string means shell metacharacters in them are inert;
+ * the remaining hazard is argument injection via a leading "-", which the input
+ * validators reject.
+ *
+ * A non-zero exit resolves rather than rejects: oc-tags reports user errors as
+ * exit 1 plus a line on stderr, and those belong in the Telegram reply. Only a
+ * failure to run at all (ENOENT, timeout) rejects.
+ */
 export function createOcTagsRunner(bin: string): OcTagsRunner {
   return (args: string[]) =>
     new Promise<OcTagsResult>((resolve, reject) => {

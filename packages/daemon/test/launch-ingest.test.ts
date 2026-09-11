@@ -541,6 +541,22 @@ describe("ingestLaunchCommand", () => {
       expect(lastReply(input)).toContain("invalid tag");
     });
 
+    it("never spawns for a non-string tag off the wire", async () => {
+      // metadata_json is JSON from a D1 row; TypeScript's `tag?: string` is a
+      // claim about it, not a guarantee. isValidTag's typeof guard is what
+      // keeps a number or an object away from the process spawner.
+      for (const bogus of [5, {}, [], true]) {
+        const runOcTags = vi.fn();
+        const input = makeInput({ tag: bogus as unknown as string, runOcTags });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(input.opencodeClient.sendPrompt).toHaveBeenCalled();
+        expect(lastReply(input)).toContain("invalid tag");
+      }
+    });
+
     it("does not tag when the launch itself failed", async () => {
       const runOcTags = vi.fn();
       const input = makeInput({

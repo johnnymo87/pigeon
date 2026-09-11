@@ -94,7 +94,14 @@ describe("parseLaunchMessage", () => {
   it("answers usage for near-miss flag spellings instead of eating them as prompt", () => {
     // -t / --tag=x / --Tag are typos; the em dash is what iOS smart punctuation
     // makes of "--". A real prompt never begins with a dash-like character.
-    for (const bad of ["-t fbm do it", "--tag=fbm do it", "--Tag fbm do it", "—tag fbm do it", "–tag fbm do it", "--taag fbm do it"]) {
+    // The fullwidth hyphen and the soft hyphen are in here because enumerating
+    // a few dashes by hand let them through as PROMPT -- the silent-eat this
+    // guard exists to prevent.
+    for (const bad of [
+      "-t fbm do it", "--tag=fbm do it", "--Tag fbm do it", "—tag fbm do it",
+      "–tag fbm do it", "--taag fbm do it", "\uff0dtag fbm do it", "\u00adtag fbm do it",
+      "\ufe63tag fbm do it",
+    ]) {
       expect(parseLaunchMessage(`/launch devbox pigeon ${bad}`), bad).toEqual({ kind: "usage" });
     }
   });

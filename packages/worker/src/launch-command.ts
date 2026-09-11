@@ -38,16 +38,23 @@ export const LAUNCH_USAGE_TEXT = [
   "--tag records what the session is FOR, for oc-tags cost attribution;",
   "it must come immediately after <dir>, and is one word of letters, digits,",
   '. _ - : / that may not start with "auto:".',
+  "The prompt itself may not start with a dash.",
 ].join("\n");
 
 const TAG_FLAG = "--tag";
 
 /**
- * Hyphen-minus plus the Unicode dashes a phone keyboard substitutes for it:
- * U+2010..U+2015 (hyphen through horizontal bar, which includes the en and em
- * dashes iOS smart punctuation produces from `--`) and U+2212 (minus sign).
+ * Every Unicode dash punctuation (\p{Pd} — which covers hyphen-minus, the en and
+ * em dashes iOS smart punctuation makes of `--`, and the fullwidth and small
+ * forms), plus the minus sign and the soft hyphen, which are not in that
+ * category. Enumerating a few by hand let U+FF0D and friends through as PROMPT,
+ * which is the silent-eat this guard exists to prevent.
+ *
+ * It also matches CJK wave dashes, and it means a prompt that genuinely starts
+ * with a dash (a markdown list, "-1 is returned by foo") is answered with usage.
+ * That is loud and the usage text says so, which is the right side to err on.
  */
-const DASH_LED_RE = /^[-\u2010-\u2015\u2212]/;
+const DASH_LED_RE = /^[\p{Pd}\u2212\u00ad]/u;
 
 export function parseLaunchMessage(text: string): LaunchCommand | null {
   if (typeof text !== "string") return null;

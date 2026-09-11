@@ -248,8 +248,8 @@ creation**: every session always has exactly one tag. Five things about it are l
   path, where the typo would be injected into a live session as a prompt. That includes the flag in
   the wrong position, which used to read as `--tag is not recently seen` or a session in
   `~/projects/--tag`.
-- **The tag is applied AFTER the session is created and prompted**, and can never cost or delay a
-  launch. That is safe because oc-tags attribution is retroactive: `report`/`top` join costs against
+- **The tag is applied AFTER the session is created and prompted**, and can never cost a launch.
+  (It can delay the *confirmation* and the poller ack by up to the 20s oc-tags timeout.) That is safe because oc-tags attribution is retroactive: `report`/`top` join costs against
   `tags.db` at read time, so a tag written a second late still covers every dollar the session ever
   spends. The tag branch has its own `try`/`catch` — a throw would skip the poller ack, and a
   redelivered `launch` is a *duplicate session*.

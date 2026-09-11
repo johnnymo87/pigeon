@@ -2211,7 +2211,7 @@ describe("/launch command", () => {
         message_id: ++webhookUpdateCounter,
         chat: { id: CHAT_ID_NUM },
         from: { id: CHAT_ID_NUM },
-        text: `/launch ${machineId} pigeon --tag launch-tag fix the failing test`,
+        text: `/launch ${machineId} pigeon --tag cost-probe fix the failing test`,
       },
     });
 
@@ -2219,9 +2219,11 @@ describe("/launch command", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.command).toBe("fix the failing test");
     expect(rows[0]!.directory).toBe("pigeon");
-    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ tag: "launch-tag" });
-    // The ack names the tag, so a wrong tag is visible before the session replies.
-    expect(captured?.text).toContain("launch-tag");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ tag: "cost-probe" });
+    // The ack names the tag, so a wrong tag is visible before the session
+    // replies. The tag is deliberately not a substring of the machine id, which
+    // would make this assertion pass with the ack's tag note deleted.
+    expect(captured?.text).toContain(", tag cost-probe");
   });
 
   it("queues no metadata for an untagged /launch", async () => {

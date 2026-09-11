@@ -113,7 +113,7 @@ outcome is a line in the one Telegram confirmation:
 | Case | Reply line |
 |---|---|
 | success | `🏷 Tagged session 'ses_x' as 'fbm'` — oc-tags' own line, because oc-tags lowercases (`--tag FBM` charts as `fbm`) and a line we composed ourselves would name a tag the chart never shows |
-| invalid tag (tampered row / regex drift) | `🏷 Tag not applied: invalid tag` — no spawn |
+| invalid tag (tampered row / regex drift) | `🏷 Tag not applied: invalid tag <tag>` — no spawn |
 | oc-tags not installed | `🏷 Tag not applied: oc-tags is not installed on <machine>.` |
 | timeout / killed child | `🏷 Tag not applied: oc-tags timed out after 20s.` |
 | spawn failure (ENOENT/EACCES) | `🏷 Tag not applied: spawn /nix/.../oc-tags ENOENT` |
@@ -124,8 +124,15 @@ timeout kill as `{code: null, killed: true, signal: "SIGTERM"}` with the message
 `Command failed: <argv>` — the word "timeout" appears nowhere in it, so the naked
 `err.message` (which is what `tag-ingest`'s `runOrExplain` prints today) reads as
 a generic failure. The classifier therefore lives in `oc-tags.ts`
-(`describeOcTagsFailure`) and both call sites use it, so the same failure is not
-worded two ways.
+(`describeOcTagsFailure`), and `/tag`'s `runOrExplain` was switched to it in the
+same change, so the same failure is not worded two ways.
+
+"Never costs a launch" is exact about the launch and loose about what follows
+it: the tag runs before the confirmation is sent and before the poller acks, so a
+hung oc-tags delays both by up to the runner's timeout, and holds that daemon's
+poll loop for the same 20s. The lease is 60s and the preceding HTTP calls are
+bounded at 30s each, so the worst case is arithmetic worth stating rather than a
+realistic operating point — but it is why the timeout is bounded at all.
 
 The timeout is the runner's shared 20s, sized for `oc-tags top`. Measured on
 cloudbox, `set` against a 9.2 GB `opencode.db` with 12,355 sessions takes ~100 ms,

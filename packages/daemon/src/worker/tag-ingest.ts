@@ -1,6 +1,6 @@
 import os from "node:os";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
-import type { OcTagsRunner } from "./oc-tags";
+import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
 
 /**
  * /tag — session tagging from Telegram, backed by the oc-tags binary.
@@ -217,7 +217,7 @@ function formatDollars(dollars: number): string {
  * rejects the WHOLE message with a 400 — so one emoji in a session title would
  * drop the entire backlog rather than mangle one line.
  */
-function truncate(s: string, max: number): string {
+export function truncate(s: string, max: number): string {
   if (typeof s !== "string") return "";
   if (s.length <= max) return s;
   let end = max - 1;
@@ -260,7 +260,9 @@ async function runOrExplain(deps: TagCommandDeps, args: string[], what: string):
   try {
     result = await deps.runOcTags(args);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    // describeOcTagsFailure, not err.message: execFile renders its own timeout
+    // kill as "Command failed: <argv>", which names no reason at all.
+    const message = describeOcTagsFailure(err);
     console.error(`[tag-ingest] oc-tags ${what} failed to run commandId=${deps.commandId}: ${message}`);
     await deps.sendTelegramReply(deps.chatId, `Failed to run oc-tags: ${message}`);
     return null;

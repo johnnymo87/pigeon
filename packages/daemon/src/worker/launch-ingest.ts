@@ -4,7 +4,7 @@ import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 import type { OpencodeClient } from "../opencode-client";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
-import { isValidTag } from "./tag-ingest";
+import { isValidTag, truncate } from "./tag-ingest";
 import type { LaunchMessage } from "./poller";
 
 /** Path of the log file shared with the home.base.nix shell wrapper. */
@@ -57,11 +57,18 @@ export interface LaunchCommandInput {
   spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe" | Array<"ignore" | "inherit" | "pipe" | number>; detached?: boolean }) => ChildProcess;
 }
 
-/** Last non-empty line, which for a Python traceback is the only useful one. */
+/**
+ * Last non-empty line, which for a Python traceback is the only useful one.
+ *
+ * Truncated with tag-ingest's surrogate-safe helper rather than slice(): a lone
+ * surrogate makes the JSON body invalid UTF-8 and Telegram rejects the WHOLE
+ * message with a 400 — and on this path that message is the one carrying the
+ * session id.
+ */
 function lastLine(...candidates: Array<string | undefined>): string {
   for (const candidate of candidates) {
     const lines = (candidate ?? "").split("\n").map((l) => l.trim()).filter((l) => l !== "");
-    if (lines.length > 0) return lines[lines.length - 1]!.slice(0, 300);
+    if (lines.length > 0) return truncate(lines[lines.length - 1]!, 300);
   }
   return "";
 }
@@ -93,7 +100,7 @@ async function applyTag(
   machineLabel: string,
 ): Promise<string> {
   if (!isValidTag(tag)) {
-    return `Tag not applied: invalid tag ${String(tag).slice(0, 64)}`;
+    return `Tag not applied: invalid tag ${truncate(String(tag), 64)}`;
   }
   if (!runOcTags) {
     return `Tag not applied: oc-tags is not installed${machineLabel}.`;
