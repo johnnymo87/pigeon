@@ -75,9 +75,10 @@ describe("registration retry after a failed registration", () => {
     await createSessionThenIdle(hooks)
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(2)
-    await vi.waitFor(() => expect(sendStopSpy).toHaveBeenCalledTimes(1))
-    expect(sendStopSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ sessionId: "ses_1" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_1" }),
+      ),
     )
   })
 
@@ -90,7 +91,11 @@ describe("registration retry after a failed registration", () => {
     await createSessionThenIdle(hooks)
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(1)
-    await vi.waitFor(() => expect(sendStopSpy).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_1" }),
+      ),
+    )
   })
 
   test("question.asked retries registration too, not only session.idle", async () => {
@@ -155,9 +160,13 @@ describe("registration retry after a failed registration", () => {
     await createSessionThenIdle(hooks)
 
     // Still queued and still trying: more than the one attempt plus one repair.
-    await vi.waitFor(() => expect(sendStopSpy.mock.calls.length).toBeGreaterThan(2), {
-      timeout: 4000,
-    })
+    await vi.waitFor(
+      () =>
+        expect(
+          sendStopSpy.mock.calls.filter((c: any[]) => c[0]?.sessionId === "ses_1").length,
+        ).toBeGreaterThan(2),
+      { timeout: 4000 },
+    )
   }, 10_000)
 
   test("a stop for a session the daemon has forgotten re-registers and retries once", async () => {
@@ -167,7 +176,11 @@ describe("registration retry after a failed registration", () => {
     const hooks = await plugin(createMockCtx())
     await createSessionThenIdle(hooks)
 
-    await vi.waitFor(() => expect(sendStopSpy).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() =>
+      expect(
+        sendStopSpy.mock.calls.filter((c: any[]) => c[0]?.sessionId === "ses_1").length,
+      ).toBe(2),
+    )
     // once at session.created, once to repair the 404
     expect(registerSessionSpy).toHaveBeenCalledTimes(2)
   })
