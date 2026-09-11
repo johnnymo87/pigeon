@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 import { invalidateDaemonToken } from "../src/auth-token"
-import { registerSession, notifyStop, notifyQuestionAsked, sendQuestionAsked, notifyQuestionAnswered, postMirror, _resetBreakerForTesting } from "../src/daemon-client"
+import { registerSession, sendStop, notifyQuestionAsked, sendQuestionAsked, notifyQuestionAnswered, postMirror, _resetBreakerForTesting, _resetStopSkewForTesting } from "../src/daemon-client"
 import { SessionManager } from "../src/session-state"
 import { MessageTail } from "../src/message-tail"
 
@@ -178,7 +178,7 @@ describe("daemon-client", () => {
       // given - server that delays response
       server?.close()
       server = await createTestServer(async (req) => {
-        await sleep(2000) // Delay longer than 1000ms timeout
+        await sleep(4000) // Delay longer than the 3000ms registration timeout
         return Response.json({ ok: true })
       })
       serverPort = server.port
@@ -251,11 +251,12 @@ describe("daemon-client", () => {
      })
   })
 
-  describe("notifyStop", () => {
+  describe("sendStop", () => {
     test("should send correct request body with message field", async () => {
       // given
       const opts = {
         sessionId: "test-session-456",
+        notificationId: "s:test-session-456:t.1",
         message: "Session completed successfully",
         label: "Test Session",
         daemonUrl: `http://127.0.0.1:${serverPort}`,
@@ -263,14 +264,15 @@ describe("daemon-client", () => {
       }
 
       // when
-      const result = await notifyStop(opts)
+      const result = await sendStop(opts)
 
       // then
-      expect(result).toEqual({ ok: true, notified: true })
+      expect(result).toBe("success")
       expect(requestLog).toHaveLength(1)
       expect(requestLog[0].path).toBe("/stop")
       expect(requestLog[0].body).toEqual({
         session_id: "test-session-456",
+        notification_id: "s:test-session-456:t.1",
         event: "Stop",
         message: "Session completed successfully",
         label: "Test Session",
@@ -282,6 +284,7 @@ describe("daemon-client", () => {
       // given with title
       const optsWithTitle = {
         sessionId: "test-session-title",
+        notificationId: "s:test-session-title:t.1",
         message: "Done",
         label: "Test Session",
         title: "Fix flaky auth test",
@@ -290,7 +293,7 @@ describe("daemon-client", () => {
       }
 
       // when
-      await notifyStop(optsWithTitle)
+      await sendStop(optsWithTitle)
 
       // then
       expect(requestLog).toHaveLength(1)
@@ -300,6 +303,7 @@ describe("daemon-client", () => {
       requestLog = []
       const optsWithoutTitle = {
         sessionId: "test-session-no-title",
+        notificationId: "s:test-session-no-title:t.1",
         message: "Done",
         label: "Test Session",
         daemonUrl: `http://127.0.0.1:${serverPort}`,
@@ -307,7 +311,7 @@ describe("daemon-client", () => {
       }
 
       // when
-      await notifyStop(optsWithoutTitle)
+      await sendStop(optsWithoutTitle)
 
       // then
       expect(requestLog).toHaveLength(1)
@@ -318,6 +322,7 @@ describe("daemon-client", () => {
       // given with errorKind
       const optsWithErrorKind = {
         sessionId: "test-session-abort",
+        notificationId: "s:test-session-abort:error.1",
         event: "Error",
         message: "Error: Aborted",
         label: "Test Session",
@@ -327,7 +332,7 @@ describe("daemon-client", () => {
       }
 
       // when
-      await notifyStop(optsWithErrorKind)
+      await sendStop(optsWithErrorKind)
 
       // then
       expect(requestLog).toHaveLength(1)
@@ -337,6 +342,7 @@ describe("daemon-client", () => {
       requestLog = []
       const optsWithoutErrorKind = {
         sessionId: "test-session-no-error-kind",
+        notificationId: "s:test-session-no-error-kind:error.1",
         event: "Error",
         message: "Error: Something broke",
         label: "Test Session",
@@ -345,7 +351,7 @@ describe("daemon-client", () => {
       }
 
       // when
-      await notifyStop(optsWithoutErrorKind)
+      await sendStop(optsWithoutErrorKind)
 
       // then
       expect(requestLog).toHaveLength(1)
@@ -356,6 +362,7 @@ describe("daemon-client", () => {
       // given - invalid URL
       const opts = {
         sessionId: "test-session",
+        notificationId: "s:test-session:t.1",
         message: "Done",
         label: "Test",
         daemonUrl: "http://127.0.0.1:99999",
@@ -363,16 +370,17 @@ describe("daemon-client", () => {
       }
 
       // when
-      const result = await notifyStop(opts)
+      const result = await sendStop(opts)
 
-      // then
-      expect(result).toBeNull()
+      // then - a daemon that cannot be reached is retried, never dropped
+      expect(result).toBe("retry")
     })
 
     test("should include media array in POST body when provided", async () => {
       // given
       const opts = {
         sessionId: "test-session-media",
+        notificationId: "s:test-session-media:t.1",
         message: "Task completed with image",
         label: "Test Session",
         media: [
@@ -384,14 +392,15 @@ describe("daemon-client", () => {
       }
 
       // when
-      const result = await notifyStop(opts)
+      const result = await sendStop(opts)
 
       // then
-      expect(result).toEqual({ ok: true, notified: true })
+      expect(result).toBe("success")
       expect(requestLog).toHaveLength(1)
       expect(requestLog[0].path).toBe("/stop")
       expect(requestLog[0].body).toEqual({
         session_id: "test-session-media",
+        notification_id: "s:test-session-media:t.1",
         event: "Stop",
         message: "Task completed with image",
         label: "Test Session",
@@ -406,6 +415,7 @@ describe("daemon-client", () => {
       // given - no media field
       const opts = {
         sessionId: "test-session-no-media",
+        notificationId: "s:test-session-no-media:t.1",
         message: "Task completed",
         label: "Test Session",
         daemonUrl: `http://127.0.0.1:${serverPort}`,
@@ -413,10 +423,10 @@ describe("daemon-client", () => {
       }
 
       // when
-      const result = await notifyStop(opts)
+      const result = await sendStop(opts)
 
       // then
-      expect(result).toEqual({ ok: true, notified: true })
+      expect(result).toBe("success")
       expect(requestLog).toHaveLength(1)
       expect(requestLog[0].body).not.toHaveProperty("media")
     })
@@ -425,6 +435,7 @@ describe("daemon-client", () => {
       // given - empty media array
       const opts = {
         sessionId: "test-session-empty-media",
+        notificationId: "s:test-session-empty-media:t.1",
         message: "Task completed",
         label: "Test Session",
         media: [],
@@ -433,41 +444,37 @@ describe("daemon-client", () => {
       }
 
       // when
-      const result = await notifyStop(opts)
+      const result = await sendStop(opts)
 
       // then
-      expect(result).toEqual({ ok: true, notified: true })
+      expect(result).toBe("success")
       expect(requestLog).toHaveLength(1)
       expect(requestLog[0].body).not.toHaveProperty("media")
     })
   })
 
   describe("circuit breaker", () => {
-    test("should skip calls after failure for 30s", async () => {
-      // given - server that fails
-      server?.close()
-      server = await createTestServer(async (req) => {
-        return new Response("Error", { status: 500 })
-      })
-      serverPort = server.port
-
+    test("should skip calls after a TRANSPORT failure for 30s", async () => {
+      // given - a healthy server, and a dead port to fail against.
+      // The failure must be a transport failure: an HTTP status, whatever it is,
+      // proves the daemon is reachable and is deliberately not a breaker signal.
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 
-      // when - first call fails
+      // when - first call fails to connect
       const result1 = await registerSession(opts)
       expect(result1).toBeNull()
 
-      // when - second call should be skipped (circuit open)
+      // when - second call, against the HEALTHY daemon, is skipped (circuit open)
       requestLog = []
-      const result2 = await registerSession(opts)
+      const result2 = await registerSession({ ...opts, daemonUrl: `http://127.0.0.1:${serverPort}` })
 
       // then - no request made (circuit breaker blocked it)
       expect(result2).toBeNull()
@@ -475,29 +482,17 @@ describe("daemon-client", () => {
     })
 
     test("should transition to half-open after timeout", async () => {
-      // given - server that initially fails
-      let shouldFail = true
-      server?.close()
-      server = await createTestServer(async (req) => {
-        if (shouldFail) {
-          return new Response("Error", { status: 500 })
-        }
-        const body = await req.json()
-        return Response.json({ ok: true, notified: true })
-      })
-      serverPort = server.port
-
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 
-      // when - first call fails, opening circuit
+      // when - first call fails to connect, opening circuit
       await registerSession(opts)
 
       // Simulate time passing (we can't actually wait 30s in tests)
@@ -545,20 +540,14 @@ describe("daemon-client", () => {
       // the backoff should double (capped at 60s).
       // Due to time constraints, we verify the failure path.
 
-      // given - server that fails
-      server?.close()
-      server = await createTestServer(async (req) => {
-        return new Response("Error", { status: 500 })
-      })
-      serverPort = server.port
-
+      // given - a dead port, so the failures are transport failures
       const opts = {
         sessionId: "test-session",
         cwd: "/home/user",
         label: "Test",
         pid: 1,
         ppid: 0,
-        daemonUrl: `http://127.0.0.1:${serverPort}`,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       }
 
@@ -596,15 +585,18 @@ describe("daemon-client", () => {
 
       const daemonUrl = `http://127.0.0.1:${serverPort}`
 
-      // when - question.asked fires (no session.idle preceded it)
-      // This is what the plugin handler should do:
+      // when - question.asked fires (no session.idle preceded it).
+      // This mirrors the ORDER of the daemon calls the plugin handler makes; the real
+      // handler routes both through queues rather than awaiting them in line, which
+      // `session-title.test.ts` and `registration-retry.test.ts` cover end to end.
       const currentMsgId = messageTail.getCurrentMessageId("sess-q")
       if (sessionManager.shouldNotify("sess-q", currentMsgId)) {
         sessionManager.setNotified("sess-q", currentMsgId!)
         const summary = messageTail.getSummary("sess-q")
         if (summary) {
-          await notifyStop({
+          await sendStop({
             sessionId: "sess-q",
+            notificationId: "s:sess-q:flush.1",
             message: summary,
             label: "test",
             daemonUrl,
@@ -655,8 +647,9 @@ describe("daemon-client", () => {
         sessionManager.setNotified("sess-q2", currentMsgId!)
         const summary = messageTail.getSummary("sess-q2")
         if (summary) {
-          await notifyStop({
+          await sendStop({
             sessionId: "sess-q2",
+            notificationId: "s:sess-q2:flush.1",
             message: summary,
             label: "test",
             daemonUrl,
@@ -694,8 +687,9 @@ describe("daemon-client", () => {
         sessionManager.setNotified("sess-q3", currentMsgId!)
         const summary = messageTail.getSummary("sess-q3")
         if (summary) {
-          await notifyStop({
+          await sendStop({
             sessionId: "sess-q3",
+            notificationId: "s:sess-q3:flush.1",
             message: summary,
             label: "test",
             daemonUrl,
@@ -757,16 +751,18 @@ describe("daemon-client", () => {
       // given - trip the breaker by failing against an unreachable port
       const unreachableOpts = {
         sessionId: "trip-breaker",
-        message: "done",
+        cwd: "/home/dev",
         label: "test",
+        pid: 1,
+        ppid: 0,
         daemonUrl: "http://127.0.0.1:1", // unreachable
         log: mockLog,
       }
-      await notifyStop(unreachableOpts) // trips the breaker
+      await registerSession(unreachableOpts) // trips the breaker
       requestLog = []
 
-      // verify breaker is open: a normal notifyStop should be blocked
-      const blockedResult = await notifyStop({ ...unreachableOpts, daemonUrl: `http://127.0.0.1:${serverPort}` })
+      // verify breaker is open: a breaker-gated route should be blocked
+      const blockedResult = await registerSession({ ...unreachableOpts, daemonUrl: `http://127.0.0.1:${serverPort}` })
       expect(blockedResult).toBeNull()
       expect(requestLog).toHaveLength(0) // breaker blocked the request
 
@@ -840,12 +836,14 @@ describe("daemon-client", () => {
         })
       ).rejects.toThrow()
 
-      // then - breaker should still be closed (notifyStop should work normally)
+      // then - breaker should still be closed (a gated route works normally)
       requestLog = []
-      const result = await notifyStop({
+      const result = await registerSession({
         sessionId: "sess-check",
-        message: "done",
+        cwd: "/home/dev",
         label: "test",
+        pid: 1,
+        ppid: 0,
         daemonUrl: `http://127.0.0.1:${serverPort}`,
         log: mockLog,
       })
@@ -1003,16 +1001,18 @@ describe("daemon-client", () => {
       expect(mirrorRes).toBeNull()
 
       requestLog = []
-      const stopRes = await notifyStop({
+      const regRes = await registerSession({
         sessionId: "ses_1",
-        message: "Stop msg",
+        cwd: "/home/dev",
         label: "Test",
+        pid: 1,
+        ppid: 0,
         daemonUrl: `http://127.0.0.1:${serverPort}`,
         log: mockLog,
       })
-      expect(stopRes).toEqual({ ok: true, notified: true })
+      expect(regRes).toEqual({ ok: true, notified: true })
       expect(requestLog).toHaveLength(1)
-      expect(requestLog[0].path).toBe("/stop")
+      expect(requestLog[0].path).toBe("/session-start")
     })
 
     test("does not trip circuit breaker on network error", async () => {
@@ -1027,24 +1027,28 @@ describe("daemon-client", () => {
       expect(mirrorRes).toBeNull()
 
       requestLog = []
-      const stopRes = await notifyStop({
+      const regRes = await registerSession({
         sessionId: "ses_1",
-        message: "Stop msg",
+        cwd: "/home/dev",
         label: "Test",
+        pid: 1,
+        ppid: 0,
         daemonUrl: `http://127.0.0.1:${serverPort}`,
         log: mockLog,
       })
-      expect(stopRes).toEqual({ ok: true, notified: true })
+      expect(regRes).toEqual({ ok: true, notified: true })
       expect(requestLog).toHaveLength(1)
     })
 
     test("respects circuit breaker when breaker is already open", async () => {
       _resetBreakerForTesting()
-      await notifyStop({
+      await registerSession({
         sessionId: "ses_1",
-        message: "Stop msg",
+        cwd: "/home/dev",
         label: "Test",
-        daemonUrl: "http://127.0.0.1:99999",
+        pid: 1,
+        ppid: 0,
+        daemonUrl: "http://127.0.0.1:9",
         log: mockLog,
       })
 

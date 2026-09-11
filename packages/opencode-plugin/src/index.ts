@@ -4,8 +4,9 @@ import {
   ResultErrorCode,
   type ExecuteCommandEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
-import { registerSession, notifyStop, notifyQuestionAnswered, sendQuestionAsked, postMirror } from "./daemon-client"
+import { registerSession, notifyQuestionAnswered, sendQuestionAsked, sendStop, postMirror } from "./daemon-client"
 import { QuestionDeliveryQueue } from "./question-queue"
+import { StopDeliveryQueue, StopKeyMinter } from "./stop-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
 import { startDirectChannelServer } from "./direct-channel"
 import { MessageTail } from "./message-tail"
@@ -73,6 +74,52 @@ const plugin: Plugin = async (ctx) => {
         log("WARN: question delivery permanently failed", { sessionId, requestId })
       },
     })
+    /**
+     * Stop/error notifications go through a retry queue for the same reason questions
+     * do: the POST to the daemon is the one hop that was neither breaker-free nor
+     * durable, so a stop that landed while the breaker was open was dropped outright
+     * and nothing ever retried it (pigeon-mavq). Past the daemon's front door the
+     * outbox already guarantees delivery.
+     */
+    const stopKeys = new StopKeyMinter()
+    const stopQueue = new StopDeliveryQueue({
+      log,
+      onExpired: (entry, info) => {
+        log("WARN: stop delivery permanently failed", {
+          sessionId: entry.sessionId,
+          notificationId: entry.notificationId,
+          event: entry.event ?? "Stop",
+          ...info,
+        })
+      },
+      onEvicted: (entry) => {
+        log("WARN: stop dropped, queue at capacity", {
+          sessionId: entry.sessionId,
+          notificationId: entry.notificationId,
+        })
+      },
+    })
+
+    /**
+     * The token footer, or "" -- never a throw, never an unbounded wait.
+     *
+     * It is fetched between `consume()` (which clears the accumulated text) and the
+     * enqueue, so a hang here would not merely lose a footer: it would lose the whole
+     * notification, text already consumed and nothing queued. `getFooter` reaches
+     * `client.config.providers()`, which has no timeout of its own.
+     */
+    const footerFor = async (sessionID: string): Promise<string> => {
+      try {
+        return await Promise.race([
+          tokenTracker.getFooter(sessionID, ctx.client, providerCache),
+          new Promise<string>((resolve) => setTimeout(() => resolve(""), 2000)),
+        ])
+      } catch (err) {
+        log("token footer failed (non-blocking):", serializeError(err))
+        return ""
+      }
+    }
+
     questionQueue.start((entry) =>
       sendQuestionAsked({
         sessionId: entry.sessionId,
@@ -234,8 +281,8 @@ const plugin: Plugin = async (ctx) => {
     /**
      * Initiates background session registration with the daemon.
      *
-     * CRITICAL: MUST remain synchronous and return `void`. Do NOT make this
-     * function `async` or `await regPromise` inside it. It immediately records
+     * CRITICAL: MUST remain synchronous. Do NOT make this function `async` or
+     * `await regPromise` inside it. It immediately records
      * `regPromise` on `sessionManager` so downstream handlers calling
      * `awaitRegistration(sessionID)` wait on the HTTP request without blocking
      * the plugin's event dispatcher.
@@ -249,7 +296,7 @@ const plugin: Plugin = async (ctx) => {
       sessionID: string,
       envInfo: EnvironmentInfo,
       title?: string,
-    ): void => {
+    ): Promise<boolean> => {
       const regPromise = registerSession({
         sessionId: sessionID,
         cwd: ctx.directory,
@@ -269,13 +316,55 @@ const plugin: Plugin = async (ctx) => {
           log("registerSession result", { sessionID, result })
           if (result?.ok) {
             sessionManager.onRegistered(sessionID)
+            return true
           }
+          return false
         })
         .catch((err) => {
           log("registerSession error:", serializeError(err))
+          return false
         })
-      sessionManager.setRegistrationPromise(sessionID, regPromise)
+      sessionManager.setRegistrationPromise(sessionID, regPromise.then(() => undefined))
+      // The OUTCOME is returned, not just the promise. A caller repairing a 404 (see
+      // stopQueue below) may be acting for a session whose plugin-side entry is gone,
+      // so `awaitRegistration` has nothing to wait on -- and, more importantly, a
+      // registration that merely FAILED must not be mistaken for one that succeeded.
+      return regPromise
     }
+
+    /**
+     * Deliver one queued stop, repairing the one failure a retry alone cannot fix.
+     *
+     * A 404 means the daemon does not know this session. That is not necessarily a
+     * dead session: the daemon's reaper deletes a row after 7 days idle while the
+     * plugin still believes it is registered, so `ensureRegistered` never re-registers
+     * and the answer to a long-idle session's next prompt would be dropped forever.
+     * Re-register from the entry's own fields and try once more.
+     *
+     * Only a 404 that survives a SUCCESSFUL re-registration is terminal. The
+     * registration itself goes through `registerSession`, which is still breaker-gated
+     * -- so if the breaker is open (or the daemon is still down) the repair does not
+     * happen at all, and treating that as terminal would drop the notification for
+     * exactly the reason this whole change exists to eliminate. That case retries.
+     */
+    stopQueue.start(async (entry) => {
+      const outcome = await sendStop({ ...entry, daemonUrl, log })
+      if (outcome !== "unregistered") return outcome
+
+      log("stop delivery hit an unknown session; re-registering", {
+        sessionId: entry.sessionId,
+      })
+      const envInfo = await envInfoP
+      const registered = await doRegisterSession(entry.sessionId, envInfo, entry.title)
+      if (!registered) {
+        log("re-registration failed; will retry the stop rather than drop it", {
+          sessionId: entry.sessionId,
+        })
+        return "retry"
+      }
+
+      return await sendStop({ ...entry, daemonUrl, log })
+    })
 
     // Late session discovery: if we miss session.created (plugin loaded after session exists),
     // register the session when we first see its ID in any event.
@@ -331,10 +420,13 @@ const plugin: Plugin = async (ctx) => {
      *
      * A failed registration (daemon timeout, transient 5xx) used to leave a
      * session known-but-unregistered forever: `lateDiscoverSession` returns
-     * early on `isKnown`, so nothing retried. Every notification path below is
-     * gated on `isRegistered`, so the session then went permanently silent --
-     * and invisibly so, because the daemon may well have recorded the session
-     * before the client's 1s timeout fired.
+     * early on `isKnown`, so nothing retried. The session then went permanently
+     * silent -- and invisibly so, because the daemon may well have recorded the
+     * session before the client's 1s timeout fired.
+     *
+     * Stops and errors no longer depend on this succeeding (they enqueue either way
+     * and repair a 404 daemon-side), but `question.asked` and `session.status` still
+     * gate on `isRegistered`, so this retry is what keeps a question answerable.
      *
      * Retrying here, at the notification sites, is self-limiting: these events
      * are human-paced, and the daemon client's circuit breaker bounds the cost
@@ -462,7 +554,7 @@ const plugin: Plugin = async (ctx) => {
 
            log("DEBUG session.idle received", { sessionID })
 
-           // Ensure discovery + registration have settled before checking isRegistered
+           // Ensure discovery + registration have settled before we read session state
            await ensureRegistered(sessionID)
 
            log("DEBUG session.idle after awaitRegistration", {
@@ -472,35 +564,35 @@ const plugin: Plugin = async (ctx) => {
              currentMsgId: messageTail.getCurrentMessageId(sessionID),
            })
 
-           if (
-             sessionManager.isMainSession(sessionID) &&
-             sessionManager.isRegistered(sessionID)
-           ) {
+           // Deliberately NOT gated on isRegistered. A registration that failed (the
+           // daemon was restarting, the breaker was open) used to make the session
+           // return here and lose the notification entirely. The queue's sender
+           // re-registers on a 404, so enqueueing is strictly safer than dropping.
+           if (sessionManager.isMainSession(sessionID)) {
              const currentMsgId = messageTail.getCurrentMessageId(sessionID)
              if (!sessionManager.shouldNotify(sessionID, currentMsgId)) {
                log("DEBUG session.idle shouldNotify=false; returning", { sessionID, currentMsgId })
                return
              }
 
-              // Set dedup guard SYNCHRONOUSLY before async notifyStop
+              // Set dedup guard SYNCHRONOUSLY before the async work below
               sessionManager.setNotified(sessionID, currentMsgId!)
 
-              const files = messageTail.getFiles(sessionID)
+              // Copy: getFiles returns the live array that tool attachments push into,
+              // so a retry could otherwise carry files from a later turn.
+              const files = [...messageTail.getFiles(sessionID)]
               const summary = messageTail.consume(sessionID) || "Task completed"
-              const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
+              const tokenFooter = await footerFor(sessionID)
               const messageWithFooter = tokenFooter ? `${summary}\n\n${tokenFooter}` : summary
-              log("sending notifyStop", { sessionID, summary: summary.slice(0, 100), hasTokenFooter: !!tokenFooter })
-              notifyStop({
+              log("enqueueing stop", { sessionID, summary: summary.slice(0, 100), hasTokenFooter: !!tokenFooter })
+              stopQueue.enqueue({
                 sessionId: sessionID,
+                notificationId: stopKeys.mint(sessionID, currentMsgId ?? "idle"),
                 message: messageWithFooter,
                 label,
                 title: sessionManager.getTitle(sessionID),
                 media: files.length > 0 ? files : undefined,
-                daemonUrl,
-                log,
-              }).catch((err) => {
-                 log("notifyStop error:", serializeError(err))
-               })
+              })
            }
 
            return
@@ -567,10 +659,7 @@ const plugin: Plugin = async (ctx) => {
           if (sessionID) {
             await ensureRegistered(sessionID)
 
-            if (
-              sessionManager.isMainSession(sessionID) &&
-              sessionManager.isRegistered(sessionID)
-            ) {
+            if (sessionManager.isMainSession(sessionID)) {
               const errorMarker = `error:${sessionID}`
               if (!sessionManager.shouldNotify(sessionID, errorMarker)) {
                 sessionManager.onDeleted(sessionID)
@@ -593,18 +682,18 @@ const plugin: Plugin = async (ctx) => {
 
               const errorKind = isAbortError(error) ? "aborted" : undefined
 
-              notifyStop({
+              // Enqueued BEFORE onDeleted below wipes this session's plugin state --
+              // the entry carries everything the delivery (and a re-registration)
+              // needs, so it survives the teardown that follows.
+              stopQueue.enqueue({
                 sessionId: sessionID,
+                notificationId: stopKeys.mint(sessionID, "error"),
                 event: "Error",
                 message: body,
                 label,
                 title: sessionManager.getTitle(sessionID),
                 errorKind,
-                daemonUrl,
-                log,
-              }).catch((err) => {
-                 log("notifyStop error:", serializeError(err))
-               })
+              })
             }
 
             sessionManager.onDeleted(sessionID)
@@ -659,29 +748,27 @@ const plugin: Plugin = async (ctx) => {
             const currentMsgId = messageTail.getCurrentMessageId(sessionID)
             if (sessionManager.shouldNotify(sessionID, currentMsgId)) {
               sessionManager.setNotified(sessionID, currentMsgId!)
-              const files = messageTail.getFiles(sessionID)
-              const summary = messageTail.consume(sessionID)
-              if (summary || files.length > 0) {
-                // Fully detach: don't await the footer fetch inside the handler
-                void (async () => {
-                  try {
-                    const tokenFooter = await tokenTracker.getFooter(sessionID, ctx.client, providerCache)
-                    const body = summary || "Output files attached"
-                    const messageWithFooter = tokenFooter ? `${body}\n\n${tokenFooter}` : body
-                    await notifyStop({
-                      sessionId: sessionID,
-                      message: messageWithFooter,
-                      label,
-                      title: sessionManager.getTitle(sessionID),
-                      media: files.length > 0 ? files : undefined,
-                      daemonUrl,
-                      log,
-                    })
-                  } catch (err) {
-                    log("stop flush before question failed (non-blocking):", serializeError(err))
-                  }
-                })()
-              }
+               // Copy: getFiles returns the live array tool attachments push into.
+               const files = [...messageTail.getFiles(sessionID)]
+               const summary = messageTail.consume(sessionID)
+               if (summary || files.length > 0) {
+                 // Detached from the question path on purpose: the question is already
+                 // queued above, so a slow footer here cannot delay it. The key is
+                 // minted now so it does not depend on how long the footer takes.
+                 const body = summary || "Output files attached"
+                 const notificationId = stopKeys.mint(sessionID, currentMsgId ?? "question")
+                 void (async () => {
+                   const tokenFooter = await footerFor(sessionID)
+                   stopQueue.enqueue({
+                     sessionId: sessionID,
+                     notificationId,
+                     message: tokenFooter ? `${body}\n\n${tokenFooter}` : body,
+                     label,
+                     title: sessionManager.getTitle(sessionID),
+                     media: files.length > 0 ? files : undefined,
+                   })
+                 })()
+               }
             }
 
           return
@@ -704,8 +791,13 @@ const plugin: Plugin = async (ctx) => {
           const nextAt = status.next ? new Date(status.next).toLocaleTimeString() : "unknown"
           log("session retry detected", { sessionID, attempt: status.attempt, message: status.message, next: nextAt })
 
-          notifyStop({
+          // Single attempt, deliberately NOT queued. A rate-limit storm emits one of
+          // these per session every 30-60s, so queueing them would let a daemon outage
+          // fill the queue with notices that are stale by the next attempt anyway --
+          // evicting the actual answers the queue exists to protect.
+          sendStop({
             sessionId: sessionID,
+            notificationId: stopKeys.mint(sessionID, `retry${status.attempt ?? 0}`),
             event: "Retry",
             message: `${retryMsg}\nNext attempt at ${nextAt}`,
             label,

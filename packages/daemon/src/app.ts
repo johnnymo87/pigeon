@@ -230,6 +230,43 @@ function parseTitle(val: unknown): string | undefined {
   return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);
 }
 
+const MAX_NOTIFICATION_ID_LENGTH = 128;
+const NOTIFICATION_ID_CHARSET = /^[A-Za-z0-9_:.-]+$/;
+
+/**
+ * Validate a CLIENT-supplied stop notification id.
+ *
+ * The id becomes the outbox PRIMARY KEY, so it must be scoped to the session that sent
+ * it. A key naming a different session would hit that session's row on the pre-check,
+ * come back "already queued", and the caller would mark its own notification delivered
+ * -- losing it silently. Requiring the `s:<sessionId>:` prefix makes cross-session
+ * collision unrepresentable rather than merely unlikely.
+ *
+ * Returns undefined (server mints its own id) rather than rejecting the request: the
+ * plugin treats 4xx as terminal and would DROP the notification, so a validation bug
+ * here would recreate the exact failure this key exists to fix. Fail toward delivery.
+ */
+function parseStopNotificationId(val: unknown, sessionId: string): string | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (typeof val !== "string" || val === "") {
+    console.warn(`[stop] ignoring non-string notification_id sessionId=${sessionId}`);
+    return undefined;
+  }
+  const prefix = `s:${sessionId}:`;
+  if (
+    !val.startsWith(prefix) ||
+    val.length <= prefix.length ||
+    val.length > MAX_NOTIFICATION_ID_LENGTH ||
+    !NOTIFICATION_ID_CHARSET.test(val)
+  ) {
+    console.warn(
+      `[stop] ignoring invalid notification_id sessionId=${sessionId} notificationId=${val.slice(0, MAX_NOTIFICATION_ID_LENGTH)}`,
+    );
+    return undefined;
+  }
+  return val;
+}
+
 interface AppOptions {
   nowFn?: () => number;
   notifier?: StopNotifier;
@@ -930,6 +967,28 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "Session not found" }, { status: 404 });
         }
 
+        // Idempotency FIRST, before any side effect. A retry carries the payload it was
+        // enqueued with, so re-running touch/setTitle/policy below would let a stale
+        // payload move session state (and would re-read a policy that may have flipped
+        // since the first attempt). Answering a retry is a pure read.
+        const clientNotificationId = parseStopNotificationId(body.notification_id, sessionId);
+        if (clientNotificationId) {
+          const already = storage.outbox.getByNotificationId(clientNotificationId);
+          if (already) {
+            console.log(
+              `[stop] already queued sessionId=${sessionId} notificationId=${clientNotificationId}`,
+            );
+            return Response.json(
+              {
+                ok: true,
+                deliveryState: already.state === "sent" ? "sent" : "queued",
+                notificationId: clientNotificationId,
+              },
+              { status: already.state === "sent" ? 200 : 202 },
+            );
+          }
+        }
+
         storage.sessions.touch(sessionId, nowFn());
 
         if (!session.notify) {
@@ -974,17 +1033,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const now = nowFn();
-        const notificationId = `s:${sessionId}:${now}`;
-
-        // Check if already queued (idempotent within same timestamp)
-        const existing = storage.outbox.getByNotificationId(notificationId);
-        if (existing) {
-          console.log(`[stop] already queued sessionId=${sessionId} notificationId=${notificationId}`);
-          return Response.json(
-            { ok: true, deliveryState: existing.state === "sent" ? "sent" : "queued", notificationId },
-            { status: existing.state === "sent" ? 200 : 202 },
-          );
-        }
+        // Server-minted fallback. It dedupes with nothing (the timestamp differs on every
+        // request), which is exactly why a client key exists -- keep this only for a
+        // plugin too old to send one, or one whose key failed validation.
+        const notificationId = clientNotificationId ?? `s:${sessionId}:${now}`;
 
         // Generate token for reply routing
         const token = generateToken();

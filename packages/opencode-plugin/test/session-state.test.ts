@@ -219,9 +219,13 @@ describe("SessionManager", () => {
        expect(manager.shouldNotify("unknown", "msg-1")).toBe(false)
      })
 
-     test("shouldNotify returns false for unregistered session", () => {
+     test("shouldNotify does NOT gate on registration", () => {
+       // A failed registration used to suppress every later notification for the
+       // session, silently. Delivery repairs an unknown session daemon-side instead
+       // (404 -> re-register -> retry), so this predicate answers only 'already
+       // notified for this message?'.
        manager.onSessionCreated("session-1")
-       expect(manager.shouldNotify("session-1", "msg-1")).toBe(false)
+       expect(manager.shouldNotify("session-1", "msg-1")).toBe(true)
      })
 
      test("shouldNotify returns false for undefined messageId", () => {

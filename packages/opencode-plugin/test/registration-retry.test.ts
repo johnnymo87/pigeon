@@ -12,11 +12,12 @@ import type { PluginInput } from "@opencode-ai/plugin"
  */
 describe("registration retry after a failed registration", () => {
   let registerSessionSpy: any
-  let notifyStopSpy: any
+  let sendStopSpy: any
 
   beforeEach(() => {
     daemonClient._resetBreakerForTesting()
-    notifyStopSpy = vi.spyOn(daemonClient, "notifyStop").mockResolvedValue({ ok: true })
+    daemonClient._resetStopSkewForTesting()
+    sendStopSpy = vi.spyOn(daemonClient, "sendStop").mockResolvedValue("success")
   })
 
   afterEach(() => {
@@ -74,9 +75,10 @@ describe("registration retry after a failed registration", () => {
     await createSessionThenIdle(hooks)
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(2)
-    expect(notifyStopSpy).toHaveBeenCalledTimes(1)
-    expect(notifyStopSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ sessionId: "ses_1" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_1" }),
+      ),
     )
   })
 
@@ -89,7 +91,11 @@ describe("registration retry after a failed registration", () => {
     await createSessionThenIdle(hooks)
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(1)
-    expect(notifyStopSpy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_1" }),
+      ),
+    )
   })
 
   test("question.asked retries registration too, not only session.idle", async () => {
@@ -125,13 +131,57 @@ describe("registration retry after a failed registration", () => {
     await vi.waitFor(() => expect(sendQuestionAskedSpy).toHaveBeenCalled())
   })
 
-  test("a retry that also fails stays silent rather than notifying", async () => {
+  test("a session whose registration never succeeds still gets its stop delivered", async () => {
+    // This used to return early and drop the notification: isRegistered was false, so
+    // every idle silently skipped the send. The daemon may well know the session
+    // anyway (the registration POST can time out AFTER being processed), and if it
+    // does not, the queue's sender re-registers on the 404. Enqueueing is strictly
+    // safer than dropping.
     registerSessionSpy = vi.spyOn(daemonClient, "registerSession").mockResolvedValue(null)
 
     const hooks = await plugin(createMockCtx())
     await createSessionThenIdle(hooks)
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(2)
-    expect(notifyStopSpy).not.toHaveBeenCalled()
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "ses_1" })),
+    )
+  })
+
+  test("a 404 whose re-registration ALSO fails is retried, not dropped", async () => {
+    // The repair path runs through registerSession, which is still breaker-gated. If
+    // the breaker is open (or the daemon is still down) the repair cannot happen, and
+    // calling that terminal would drop the notification for precisely the reason this
+    // change exists to eliminate.
+    registerSessionSpy = vi.spyOn(daemonClient, "registerSession").mockResolvedValue(null)
+    sendStopSpy.mockResolvedValue("unregistered")
+
+    const hooks = await plugin(createMockCtx())
+    await createSessionThenIdle(hooks)
+
+    // Still queued and still trying: more than the one attempt plus one repair.
+    await vi.waitFor(
+      () =>
+        expect(
+          sendStopSpy.mock.calls.filter((c: any[]) => c[0]?.sessionId === "ses_1").length,
+        ).toBeGreaterThan(2),
+      { timeout: 4000 },
+    )
+  }, 10_000)
+
+  test("a stop for a session the daemon has forgotten re-registers and retries once", async () => {
+    registerSessionSpy = vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
+    sendStopSpy.mockResolvedValueOnce("unregistered").mockResolvedValue("success")
+
+    const hooks = await plugin(createMockCtx())
+    await createSessionThenIdle(hooks)
+
+    await vi.waitFor(() =>
+      expect(
+        sendStopSpy.mock.calls.filter((c: any[]) => c[0]?.sessionId === "ses_1").length,
+      ).toBe(2),
+    )
+    // once at session.created, once to repair the 404
+    expect(registerSessionSpy).toHaveBeenCalledTimes(2)
   })
 })

@@ -96,7 +96,7 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
 
     // ses_sub is a subagent. The plugin cannot tell, because session.get threw --
     // so it must not risk posting what may be a full task brief.
-    await typePromptInto(hooks, "ses_sub", "You are a subagent. Full task brief follows...")
+    await typePromptInto(hooks, "ses_sub_t0", "You are a subagent. Full task brief follows...")
 
     // Well past the 500ms mirror debounce.
     await new Promise((r) => setTimeout(r, 900))
@@ -111,9 +111,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
    * fix by dropping the session on the error path, this test is what stops them.
    */
   test("FAIL-OPEN: a session whose session.get failed STILL sends stop notifications", async () => {
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const hooks = await plugin(createMockCtx())
@@ -121,16 +121,18 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a1", sessionID: "ses_sub", role: "assistant" } },
+        properties: { info: { id: "msg_a1", sessionID: "ses_sub_t1", role: "assistant" } },
       } as any,
     })
 
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_sub_t1" } } as any,
     })
 
-    expect(notifyStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_sub" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_sub_t1" })
+      )
     )
   })
 
@@ -138,33 +140,37 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const ctx = createMockCtx()
     ;(ctx.client.session.get as any) = vi
       .fn()
-      .mockResolvedValue({ data: { id: "ses_sub", parentID: "ses_parent", title: "sub" } })
+      .mockResolvedValue({ data: { id: "ses_sub_t2", parentID: "ses_parent", title: "sub" } })
 
     const hooks = await plugin(ctx)
 
-    await typePromptInto(hooks, "ses_sub", "You are a subagent. Full task brief follows...")
+    await typePromptInto(hooks, "ses_sub_t2", "You are a subagent. Full task brief follows...")
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_sub_t2" } } as any,
     })
 
     await new Promise((r) => setTimeout(r, 800))
 
     expect(postMirrorSpy).not.toHaveBeenCalled()
-    expect(notifyStopSpy).not.toHaveBeenCalled()
+    // Scoped to THIS session: stop delivery is asynchronous now, and an earlier test's
+    // queue can still be ticking, so a bare not.toHaveBeenCalled() is not about us.
+    expect(sendStopSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "ses_sub_t2" }),
+    )
   })
 
   test("session.updated carrying a parentID DEMOTES a session that was assumed main", async () => {
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
@@ -176,31 +182,37 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a1", sessionID: "ses_sub", role: "assistant" } },
+        properties: { info: { id: "msg_a1", sessionID: "ses_sub_t3", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_sub_t3" } } as any,
     })
-    expect(notifyStopSpy).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_sub_t3" }),
+      ),
+    )
 
     // The truth arrives for free on session.updated.
-    await sessionUpdated(hooks, "ses_sub", "ses_parent")
+    await sessionUpdated(hooks, "ses_sub_t3", "ses_parent")
 
-    notifyStopSpy.mockClear()
+    sendStopSpy.mockClear()
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a2", sessionID: "ses_sub", role: "assistant" } },
+        properties: { info: { id: "msg_a2", sessionID: "ses_sub_t3", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_sub_t3" } } as any,
     })
-    await typePromptInto(hooks, "ses_sub", "another brief")
+    await typePromptInto(hooks, "ses_sub_t3", "another brief")
     await new Promise((r) => setTimeout(r, 900))
 
-    expect(notifyStopSpy).not.toHaveBeenCalled()
+    expect(sendStopSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "ses_sub_t3" }),
+    )
     expect(postMirrorSpy).not.toHaveBeenCalled()
   })
 
@@ -215,9 +227,9 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     const postMirrorSpy = vi
       .spyOn(daemonClient, "postMirror")
       .mockResolvedValue({ mirrored: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
 
     const hooks = await plugin(createMockCtx())
@@ -227,18 +239,18 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a1", sessionID: "ses_main", role: "assistant" } },
+        properties: { info: { id: "msg_a1", sessionID: "ses_main_t4", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_main" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_main_t4" } } as any,
     })
 
     // session.updated reports no parentID -- which proves nothing either way.
-    await sessionUpdated(hooks, "ses_main", undefined)
-    notifyStopSpy.mockClear()
+    await sessionUpdated(hooks, "ses_main_t4", undefined)
+    sendStopSpy.mockClear()
 
-    await typePromptInto(hooks, "ses_main", "a genuine typed prompt")
+    await typePromptInto(hooks, "ses_main_t4", "a genuine typed prompt")
     await new Promise((r) => setTimeout(r, 900))
 
     // Still unconfirmed: no mirror.
@@ -248,14 +260,21 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a2", sessionID: "ses_main", role: "assistant" } },
+        properties: { info: { id: "msg_a2", sessionID: "ses_main_t4", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_main" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_main_t4" } } as any,
     })
-    expect(notifyStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_main" })
+    // Assert on THIS turn's notification, not on any call left over from msg_a1:
+    // delivery is asynchronous now, so a bare "was called" would pass on stale history.
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: "ses_main_t4",
+          notificationId: expect.stringContaining("msg_a2"),
+        }),
+      ),
     )
   })
 
@@ -280,48 +299,50 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
     await hooks.event!({
       event: {
         type: "session.created",
-        properties: { info: { id: "ses_real_main", title: "Real main" } },
+        properties: { info: { id: "ses_real_main_t5", title: "Real main" } },
       } as any,
     })
 
-    await typePromptInto(hooks, "ses_real_main", "a genuine human-typed prompt")
+    await typePromptInto(hooks, "ses_real_main_t5", "a genuine human-typed prompt")
 
     await vi.waitFor(() => expect(postMirrorSpy).toHaveBeenCalled(), { timeout: 3000 })
     expect(postMirrorSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_real_main" })
+      expect.objectContaining({ sessionId: "ses_real_main_t5" })
     )
   })
 
   test("a session confirmed as main is never demoted by a later update that omits parentID", async () => {
     vi.spyOn(daemonClient, "registerSession").mockResolvedValue({ ok: true })
-    const notifyStopSpy = vi
-      .spyOn(daemonClient, "notifyStop")
-      .mockResolvedValue({ ok: true })
+    const sendStopSpy = vi
+      .spyOn(daemonClient, "sendStop")
+      .mockResolvedValue("success")
 
     const hooks = await plugin(createMockCtx())
 
     await hooks.event!({
       event: {
         type: "session.created",
-        properties: { info: { id: "ses_real_main", title: "Real main" } },
+        properties: { info: { id: "ses_real_main_t6", title: "Real main" } },
       } as any,
     })
 
     // Monotonicity: confirmed knowledge must survive a payload that contradicts it.
-    await sessionUpdated(hooks, "ses_real_main", "ses_someone_else")
+    await sessionUpdated(hooks, "ses_real_main_t6", "ses_someone_else")
 
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a1", sessionID: "ses_real_main", role: "assistant" } },
+        properties: { info: { id: "msg_a1", sessionID: "ses_real_main_t6", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_real_main" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_real_main_t6" } } as any,
     })
 
-    expect(notifyStopSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "ses_real_main" })
+    await vi.waitFor(() =>
+      expect(sendStopSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "ses_real_main_t6" })
+      )
     )
   })
 
@@ -330,18 +351,18 @@ describe("pigeon-kq6h: subagent misclassified when session.get fails", () => {
       .spyOn(daemonClient, "registerSession")
       .mockResolvedValueOnce(null)
       .mockResolvedValue({ ok: true })
-    vi.spyOn(daemonClient, "notifyStop").mockResolvedValue({ ok: true })
+    vi.spyOn(daemonClient, "sendStop").mockResolvedValue("success")
 
     const hooks = await plugin(createMockCtx())
 
     await hooks.event!({
       event: {
         type: "message.updated",
-        properties: { info: { id: "msg_a1", sessionID: "ses_sub", role: "assistant" } },
+        properties: { info: { id: "msg_a1", sessionID: "ses_sub_t7", role: "assistant" } },
       } as any,
     })
     await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: "ses_sub" } } as any,
+      event: { type: "session.idle", properties: { sessionID: "ses_sub_t7" } } as any,
     })
 
     expect(registerSessionSpy).toHaveBeenCalledTimes(2)
