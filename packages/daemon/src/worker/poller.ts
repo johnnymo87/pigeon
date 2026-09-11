@@ -160,6 +160,13 @@ export interface LaunchMessage {
   directory: string;
   prompt: string;
   chatId: string;
+  /**
+   * Optional oc-tags tag from `/launch ... --tag <tag> ...`, carried in the
+   * command row's metadata_json. Absent on an ordinary launch, and absent from
+   * anything an OLD worker sends -- so the daemon must treat undefined as "no
+   * tag asked for", never as an invalid one.
+   */
+  tag?: string;
   messageThreadId?: number;
 }
 

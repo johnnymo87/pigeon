@@ -47,6 +47,13 @@ export async function handlePollNext(
   if (result.commandType === "launch") {
     body.directory = result.directory;
     body.prompt = result.command;
+    // The optional /launch --tag travels in metadata_json; the command column is
+    // the prompt. Left undefined when absent (the ordinary untagged launch, and
+    // also corrupt metadata, which parseMetadata turns into {}) — an empty
+    // string would fail the daemon's tag validator and put a spurious
+    // "Tag not applied" line on every launch.
+    const tag = parseMetadata(result.metadataJson).tag;
+    if (tag) body.tag = tag;
   } else if (result.commandType === "kill") {
     body.sessionId = result.sessionId;
   } else if (result.commandType === "interrupt") {

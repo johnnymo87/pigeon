@@ -2094,6 +2094,19 @@ function makeLaunchMessage(
   };
 }
 
+// queryQueueByMachine drops metadata_json; /launch carries the tag there.
+async function queryQueueByMachineWithMetadata(machineId: string): Promise<QueueRow[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT command_id, machine_id, session_id, command, chat_id, status,
+            0 as attempts, created_at, NULL as sent_at, NULL as next_retry_at, acked_at, NULL as last_error,
+            command_type, directory, media_json, metadata_json, message_thread_id
+     FROM commands
+     WHERE machine_id = ?
+     ORDER BY created_at ASC`,
+  ).bind(machineId).all<QueueRow>();
+  return results;
+}
+
 describe("/launch command", () => {
   beforeEach(() => {
     fetchMock.activate();
@@ -2170,6 +2183,123 @@ describe("/launch command", () => {
     const launchRow = launchRows[launchRows.length - 1]!;
     expect(launchRow.command).toBe("implement a login page with JWT auth");
     expect(launchRow.directory).toBe("/tmp/proj");
+  });
+
+  it("carries --tag in metadata_json and keeps the prompt in command", async () => {
+    const now = Date.now();
+    const machineId = `launch-tagged-${now}`;
+    await touchMachine(env.DB, machineId, now);
+
+    let captured: any;
+    // Leftover interceptors from earlier tests would otherwise match first.
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        captured = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+
+    await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/launch ${machineId} pigeon --tag launch-tag fix the failing test`,
+      },
+    });
+
+    const rows = (await queryQueueByMachineWithMetadata(machineId)).filter((r) => r.command_type === "launch");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("fix the failing test");
+    expect(rows[0]!.directory).toBe("pigeon");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ tag: "launch-tag" });
+    // The ack names the tag, so a wrong tag is visible before the session replies.
+    expect(captured?.text).toContain("launch-tag");
+  });
+
+  it("queues no metadata for an untagged /launch", async () => {
+    const now = Date.now();
+    const machineId = `launch-untagged-${now}`;
+    await touchMachine(env.DB, machineId, now);
+    mockTelegramSendMessage();
+
+    await sendWebhook(makeLaunchMessage(machineId, "pigeon", "fix the failing test"));
+
+    const rows = (await queryQueueByMachineWithMetadata(machineId)).filter((r) => r.command_type === "launch");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.metadata_json).toBeNull();
+  });
+
+  it("answers usage for an invalid tag and queues nothing", async () => {
+    const now = Date.now();
+    const machineId = `launch-badtag-${now}`;
+    await touchMachine(env.DB, machineId, now);
+
+    let captured: any;
+    // Leftover interceptors from earlier tests would otherwise match first.
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        captured = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+
+    await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: `/launch ${machineId} pigeon --tag auto:pigeon fix the failing test`,
+      },
+    });
+
+    expect(captured?.text).toContain("--tag");
+    const rows = (await queryQueueByMachineWithMetadata(machineId)).filter((r) => r.command_type === "launch");
+    expect(rows).toHaveLength(0);
+  });
+
+  it("answers usage for a malformed /launch instead of injecting it as a prompt", async () => {
+    let captured: any;
+    // Leftover interceptors from earlier tests would otherwise match first.
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        captured = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+
+    const res = await sendWebhook({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        text: "/launch devbox",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(captured?.text).toContain("/launch <machine> <dir>");
   });
 
   it("does not fall through to regular session resolution for /launch", async () => {
@@ -4025,6 +4155,35 @@ describe("poll and ack endpoints", () => {
     // launch type should NOT have command or sessionId
     expect(body.command).toBeUndefined();
     expect(body.sessionId).toBeUndefined();
+  });
+
+  it("handlePollNext returns the tag for a launch carrying one", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, directory, metadata_json, status, created_at)
+       VALUES (?, ?, NULL, 'launch', ?, ?, ?, ?, 'pending', ?)`,
+    ).bind("launch-cmd-tag-1", "machine-launch-tag", "run all tests", "8248645256", "/home/dev/project",
+           JSON.stringify({ tag: "launch-tag" }), now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-launch-tag/next"), "machine-launch-tag");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("launch");
+    expect(body.prompt).toBe("run all tests");
+    expect(body.tag).toBe("launch-tag");
+  });
+
+  it("handlePollNext leaves the launch tag undefined when there is no metadata", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, directory, status, created_at)
+       VALUES (?, ?, NULL, 'launch', ?, ?, ?, 'pending', ?)`,
+    ).bind("launch-cmd-tag-2", "machine-launch-untagged", "run all tests", "8248645256", "/home/dev/project", now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-launch-untagged/next"), "machine-launch-untagged");
+    const body = await res.json() as Record<string, unknown>;
+    // Undefined, not "": an empty-string tag would fail the daemon's validator
+    // and put a spurious "Tag not applied" line on every ordinary launch.
+    expect(body.tag).toBeUndefined();
   });
 
   it("handlePollNext returns command JSON for kill type", async () => {

@@ -4,6 +4,7 @@ import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } fr
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
 import { parseTagArgs, TAG_USAGE_TEXT } from "./tag-command";
+import { LAUNCH_USAGE_TEXT, parseLaunchMessage } from "./launch-command";
 
 type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir";
 
@@ -827,12 +828,20 @@ export async function handleTelegramWebhook(
     }
     update.message.text = cmdNorm.text;
 
-    const launchMatch = update.message.text.match(/^\/launch\s+(\S+)\s+(\S+)\s+(.+)$/s);
-    if (launchMatch) {
-      const machineId = launchMatch[1]!;
-      const directory = launchMatch[2]!;
-      const prompt = launchMatch[3]!;
+    const parsedLaunch = parseLaunchMessage(update.message.text);
+    if (parsedLaunch) {
       const launchChatId = update.message.chat.id;
+
+      // A malformed /launch must never fall through to the plain-message path:
+      // the typo would be injected into a live session as a prompt. This is the
+      // same rule /tag carries, and it also catches the likely --tag mistakes
+      // (flag in the machine/dir position, `-t`, `--tag=x`, an iOS em dash).
+      if (parsedLaunch.kind === "usage") {
+        await sendTelegramMessage(env, launchChatId, LAUNCH_USAGE_TEXT, { messageThreadId: update.message.message_thread_id });
+        return OK();
+      }
+
+      const { machineId, directory, prompt, tag } = parsedLaunch;
 
       // NOTE: No per-user machine authorization — assumes single-tenant deployment.
       // If multi-tenant is needed, validate machineId against an allowlist.
@@ -852,11 +861,17 @@ export async function handleTelegramWebhook(
         label: null,
         commandType: "launch",
         directory,
+        // The tag rides metadata_json so the command column stays the prompt.
+        metadataJson: tag ? JSON.stringify({ tag }) : null,
         messageThreadId: update.message.message_thread_id,
       });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}...`, { messageThreadId: update.message.message_thread_id });
+      // The tag is named here so a wrong one is visible immediately, but this
+      // ack promises only that the command was QUEUED -- whether the tag was
+      // applied is the daemon's confirmation to make.
+      const tagNote = tag ? `, tag ${tag}` : "";
+      await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}${tagNote}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }
 

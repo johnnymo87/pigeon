@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createOcTagsRunner, resolveOcTagsBin } from "../src/worker/oc-tags";
+import { createOcTagsRunner, describeOcTagsFailure, resolveOcTagsBin } from "../src/worker/oc-tags";
 
 function executableSet(paths: string[]): (p: string) => boolean {
   const set = new Set(paths);
@@ -98,5 +98,48 @@ describe("createOcTagsRunner", () => {
   it("rejects when the binary does not exist", async () => {
     const run = createOcTagsRunner("/nonexistent/oc-tags");
     await expect(run(["ls"])).rejects.toThrow();
+  });
+});
+
+describe("describeOcTagsFailure", () => {
+  it("names a timeout, which execFile reports without that word anywhere in it", async () => {
+    // execFile's timeout kill is {code: null, killed: true, signal: "SIGTERM"}
+    // and its message is "Command failed: <argv>" -- so the naked message says
+    // nothing about why, which is exactly the failure the CLI version of this
+    // feature shipped with. Synthesized rather than provoked: the runner's
+    // timeout is 20s and a test must not wait for it.
+    const err = Object.assign(new Error("Command failed: /nix/store/x/bin/oc-tags set fbm ses_x"), {
+      code: null,
+      killed: true,
+      signal: "SIGTERM",
+    });
+    expect(describeOcTagsFailure(err)).toMatch(/timed out after 20s/);
+  });
+
+  it("distinguishes an external kill from a timeout", async () => {
+    // A signal WITHOUT killed=true is something else killing oc-tags (an OOM,
+    // a stray pkill). Calling that a timeout would send an operator looking at
+    // the wrong thing. Provoked for real, since it needs no waiting.
+    const run = createOcTagsRunner("/bin/sh");
+    const err = await run(["-c", "kill -TERM $$; sleep 5"]).then(
+      () => { throw new Error("expected a rejection"); },
+      (e: unknown) => e,
+    );
+    const described = describeOcTagsFailure(err);
+    expect(described).toContain("SIGTERM");
+    expect(described).not.toMatch(/timed out/);
+  });
+
+  it("passes an ENOENT message through, since it already names the path", async () => {
+    const run = createOcTagsRunner("/nonexistent/oc-tags");
+    const err = await run(["ls"]).then(
+      () => { throw new Error("expected a rejection"); },
+      (e: unknown) => e,
+    );
+    expect(describeOcTagsFailure(err)).toContain("ENOENT");
+  });
+
+  it("falls back to a string for a non-Error rejection", () => {
+    expect(describeOcTagsFailure("weird")).toBe("weird");
   });
 });
