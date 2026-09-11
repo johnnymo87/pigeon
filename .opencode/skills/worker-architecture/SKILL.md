@@ -88,15 +88,20 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 
 ## Telegram Commands
 
-### `/launch <machine> <directory> <prompt>`
+### `/launch <machine> <directory> [--tag <tag>] <prompt>`
 
 Starts a headless OpenCode session on a remote machine.
 
-1. Worker parses machine, directory, and prompt from the message text.
+1. Worker parses machine, directory, optional `--tag`, and prompt via `launch-command.ts`.
+   `--tag` is recognised ONLY as the first token of the prompt tail; a malformed
+   `/launch` is answered with `LAUNCH_USAGE_TEXT` and never falls through to the
+   plain-message path, where the typo would become a prompt in a live session.
 2. Checks if the machine has polled recently (within 30s); replies "machine offline" if not.
-3. Queues a `"launch"` type command in D1.
-4. Daemon picks it up on next poll. Poll response: `{ commandType: "launch", commandId, directory, prompt, chatId }`
-5. Daemon's `launch-ingest.ts` creates a session via `OpencodeClient.createSession()`, sends the prompt, and replies to Telegram with the session ID.
+3. Queues a `"launch"` type command in D1. The tag rides `metadata_json`; `command` stays the prompt.
+4. Daemon picks it up on next poll. Poll response: `{ commandType: "launch", commandId, directory, prompt, tag?, chatId }`
+5. Daemon's `launch-ingest.ts` creates a session via `OpencodeClient.createSession()`, sends the prompt, then
+   (last, best-effort) runs `oc-tags set <tag> <session-id>`, and replies to Telegram with the
+   session ID plus a `🏷` line naming either oc-tags' own confirmation or a failure REASON.
 6. The pigeon plugin in opencode-serve detects the new session and registers it with the worker via `/sessions/register`.
 
 ### `/kill <session-id>`

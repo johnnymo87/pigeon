@@ -190,13 +190,17 @@ async function sendTelegramMessage(
  * The binary is resolved per command rather than once at startup, so installing
  * oc-tags does not also require restarting the daemon.
  */
-function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: number | null }) {
+function resolveRunOcTags() {
   const bin = resolveOcTagsBin({ configured: config.ocTagsBin });
+  return bin ? createOcTagsRunner(bin) : null;
+}
+
+function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: number | null }) {
   return {
     commandId: msg.commandId,
     chatId: msg.chatId,
     machineId: config.machineId,
-    runOcTags: bin ? createOcTagsRunner(bin) : null,
+    runOcTags: resolveRunOcTags(),
     sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
   };
 }
@@ -269,6 +273,11 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // the owner. Unconfigured pool => clientForSession returns the
             // serve-0 client, i.e. today's behavior.
             resolveOwnerClient: clientForSession,
+            // /launch --tag: bookkeeping applied AFTER the session is prompted,
+            // and resolved per command so installing oc-tags does not also
+            // require restarting the daemon.
+            ...(msg.tag !== undefined ? { tag: msg.tag } : {}),
+            runOcTags: resolveRunOcTags(),
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },

@@ -409,4 +409,187 @@ describe("ingestLaunchCommand", () => {
       expect(spawn).not.toHaveBeenCalled();
     });
   });
+
+  // ─── --tag ────────────────────────────────────────────────────────────────
+  //
+  // No test here spawns a real oc-tags: runOcTags is injected, so nothing
+  // touches ~/.local/share/oc-tags/tags.db.
+  describe("tagging", () => {
+    function lastReply(input: LaunchCommandInput): string {
+      const calls = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1]![1] as string;
+    }
+
+    it("runs oc-tags set with the tag FIRST and the session id second", async () => {
+      // Reversed, oc-tags cheerfully tags a session named "fbm" and reports success.
+      const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged session 'sess-123' as 'fbm'\n", stderr: "" });
+      const input = makeInput({ tag: "fbm", runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-123"]);
+    });
+
+    it("tags only after the session is created and the prompt is sent", async () => {
+      const order: string[] = [];
+      const opencodeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn(async () => { order.push("create"); return { id: "sess-123" }; }),
+        sendPrompt: vi.fn(async () => { order.push("prompt"); }),
+      } as unknown as OpencodeClient;
+      const runOcTags = vi.fn(async () => { order.push("tag"); return { code: 0, stdout: "ok", stderr: "" }; });
+
+      await ingestLaunchCommand(makeInput({ tag: "fbm", runOcTags, opencodeClient }));
+
+      // Safe because oc-tags attribution is retroactive: report/top join costs
+      // against tags.db at read time, so a tag written a second late still
+      // covers every dollar the session ever spends.
+      expect(order).toEqual(["create", "prompt", "tag"]);
+    });
+
+    it("reports oc-tags' own confirmation line, not one we composed", async () => {
+      // oc-tags lowercases, so --tag FBM charts as fbm; a line of our own would
+      // name a tag the chart never shows.
+      const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged session 'sess-123' as 'fbm'\n", stderr: "" });
+      const input = makeInput({ tag: "FBM", runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toContain("Tagged session 'sess-123' as 'fbm'");
+    });
+
+    it("says nothing about tags when no tag was given", async () => {
+      const runOcTags = vi.fn();
+      const input = makeInput({ runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(lastReply(input)).not.toContain("Tag");
+    });
+
+    it("launches normally when a tag is given but oc-tags is not installed", async () => {
+      const input = makeInput({ tag: "fbm", runOcTags: null });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.opencodeClient.sendPrompt).toHaveBeenCalled();
+      expect(lastReply(input)).toContain("sess-123");
+      expect(lastReply(input)).toContain("not installed");
+    });
+
+    it("names the reason when oc-tags exits non-zero, using the LAST line of stderr", async () => {
+      // A locked tags.db raises OperationalError, which escapes cmd_set's
+      // `except ValueError` and prints a 20-line traceback. Only its last line
+      // says anything.
+      const stderr = [
+        "Traceback (most recent call last):",
+        '  File "/nix/store/x/bin/.oc-tags-wrapped", line 1200, in <module>',
+        "    sys.exit(main())",
+        "sqlite3.OperationalError: database is locked",
+      ].join("\n");
+      const runOcTags = vi.fn().mockResolvedValue({ code: 1, stdout: "", stderr });
+      const input = makeInput({ tag: "fbm", runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      const reply = lastReply(input);
+      expect(reply).toContain("sess-123");
+      expect(reply).toContain("database is locked");
+      expect(reply).not.toContain("Traceback");
+    });
+
+    it("names the reason when oc-tags fails to run at all", async () => {
+      const runOcTags = vi.fn().mockRejectedValue(
+        Object.assign(new Error("Command failed: oc-tags set fbm sess-123"), { code: null, killed: true, signal: "SIGTERM" }),
+      );
+      const input = makeInput({ tag: "fbm", runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toMatch(/timed out/);
+    });
+
+    it("never throws out of the tag branch, however the runner misbehaves", async () => {
+      // A throw here would skip the poller ack, and a redelivered launch is a
+      // DUPLICATE session -- far worse than a missing tag row.
+      const runners = [
+        vi.fn().mockRejectedValue(new Error("boom")),
+        vi.fn(() => { throw new Error("sync boom"); }),
+        vi.fn().mockResolvedValue(undefined),
+        vi.fn().mockResolvedValue({ code: 0 }),
+      ];
+      for (const runOcTags of runners) {
+        const input = makeInput({ tag: "fbm", runOcTags: runOcTags as unknown as LaunchCommandInput["runOcTags"] });
+        await expect(ingestLaunchCommand(input)).resolves.toBeUndefined();
+        expect(lastReply(input)).toContain("sess-123");
+      }
+    });
+
+    it("launches anyway when the tag is invalid, and says so", async () => {
+      // Only reachable through a tampered D1 row or regex drift between the two
+      // validator copies. Whoever can write that row can already queue any
+      // launch, so refusing buys nothing -- and "tagging never costs a launch"
+      // is the governing rule.
+      const runOcTags = vi.fn();
+      const input = makeInput({ tag: "auto:pigeon", runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(input.opencodeClient.sendPrompt).toHaveBeenCalled();
+      expect(lastReply(input)).toContain("invalid tag");
+    });
+
+    it("never spawns for a non-string tag off the wire", async () => {
+      // metadata_json is JSON from a D1 row; TypeScript's `tag?: string` is a
+      // claim about it, not a guarantee. isValidTag's typeof guard is what
+      // keeps a number or an object away from the process spawner.
+      for (const bogus of [5, {}, [], true]) {
+        const runOcTags = vi.fn();
+        const input = makeInput({ tag: bogus as unknown as string, runOcTags });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(input.opencodeClient.sendPrompt).toHaveBeenCalled();
+        expect(lastReply(input)).toContain("invalid tag");
+      }
+    });
+
+    it("does not tag when the launch itself failed", async () => {
+      const runOcTags = vi.fn();
+      const input = makeInput({
+        tag: "fbm",
+        runOcTags,
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockRejectedValue(new Error("createSession failed: 500")),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(lastReply(input)).toContain("Failed to launch session");
+    });
+
+    it("does not tag when opencode serve is down, since no session exists", async () => {
+      const runOcTags = vi.fn();
+      const input = makeInput({
+        tag: "fbm",
+        runOcTags,
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(false),
+          createSession: vi.fn(),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+    });
+  });
 });

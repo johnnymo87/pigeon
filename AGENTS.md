@@ -215,6 +215,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 |---------|---------|--------------|
 | *(plain message)* | `fix the failing test in src/auth.ts` | Executes in the current opencode TUI session via the plugin |
 | `/launch <machine> <dir> <prompt>` | `/launch devbox pigeon "say hello"` | Starts a headless opencode session on the specified machine |
+| `/launch <machine> <dir> --tag <tag> <prompt>` | `/launch devbox pigeon --tag launch-tag "say hello"` | Same, and tags the new session for oc-tags cost attribution |
 | `/kill` | *(reply to a session notification)* | Terminates the session (resolved from replied-to message) |
 | `/interrupt` | *(reply to a session notification)* | Interrupts in-flight processing without destroying the session (like Ctrl-C) |
 | `/compact` | *(reply to a session notification)* | Summarizes (compacts) the session's conversation to reduce context |
@@ -231,6 +232,36 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/tag dir <glob> <tag>` | *(reply to a session notification)* | Tags a directory pattern, retroactively and prospectively |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
+
+**`/launch --tag <tag>`** records what a session was launched to *do*, so oc-tags attributes its
+list-price dollars to that work instead of the directory-derived `auto:` fallback (`auto:pigeon`)
+that says nothing — which is where roughly two thirds of the dollars sit. It is an **override, not a
+creation**: every session always has exactly one tag. Five things about it are load-bearing:
+
+- **The flag is positional.** It is recognised only as the *first* token of the prompt tail, right
+  after `<dir>`. A `--tag` later in the prompt is ordinary prose. A `#tag` sigil was rejected for
+  this surface: a prompt legitimately starting `#4231 is failing, fix it` would have `4231` eaten as
+  a tag and the prompt silently shortened. The residual hole is a prompt whose *first* token is the
+  literal `--tag`, which is the same mechanism at a far lower base rate; near-miss spellings
+  (`-t`, `--tag=x`, an iOS em dash) are answered with usage rather than eaten.
+- **A malformed `/launch` now answers with usage** instead of falling through to the plain-message
+  path, where the typo would be injected into a live session as a prompt. That includes the flag in
+  the wrong position, which used to read as `--tag is not recently seen` or a session in
+  `~/projects/--tag`.
+- **The tag is applied AFTER the session is created and prompted**, and can never cost a launch.
+  (It can delay the *confirmation* and the poller ack by up to the 20s oc-tags timeout.) That is safe because oc-tags attribution is retroactive: `report`/`top` join costs against
+  `tags.db` at read time, so a tag written a second late still covers every dollar the session ever
+  spends. The tag branch has its own `try`/`catch` — a throw would skip the poller ack, and a
+  redelivered `launch` is a *duplicate session*.
+- **Every failure names a reason in the Telegram reply**, because nobody reads stderr from a phone:
+  not installed, `oc-tags timed out after 20s` (execFile's timeout kill prints nothing else), or the
+  *last* line of stderr (a locked `tags.db` prints a 20-line traceback). Success prints oc-tags' own
+  confirmation line, since oc-tags lowercases and a line of pigeon's own could name a tag the chart
+  never shows.
+- **The `🏷` line in the daemon's confirmation is the only authoritative word on the tag.** The
+  worker's `Launching on …` ack is sent before any daemon has seen the command. Deploy daemons
+  before the worker: an old daemon ignores the tag and launches untagged (no `🏷` line), while an
+  old worker cannot emit the flag at all.
 
 **The `@BotName` suffix.** In a group, Telegram's autocomplete sends `/kill@mohrbacher_01_bot` rather than `/kill`. Every command above accepts either form. The suffix attaches to the **command token**, not the subcommand — Telegram emits `/mcp@mohrbacher_01_bot list`, never `/mcp list@...`. Three things follow from how this is matched (worker `parseTelegramCommand`):
 

@@ -90,6 +90,31 @@ export function resolveOcTagsBin(opts: ResolveOcTagsBinOptions = {}): string | n
 }
 
 /**
+ * Turns a runner REJECTION into a line that names a reason.
+ *
+ * This exists because the naked `err.message` does not. execFile reports its
+ * timeout kill as `{code: null, killed: true, signal: "SIGTERM"}` with the
+ * message `Command failed: <argv>` — the word "timeout" appears nowhere, so a
+ * hung oc-tags reads as a generic failure. The CLI version of this feature
+ * shipped with exactly that hole (workstation #491) and it had to be fixed after
+ * review.
+ *
+ * `killed` is what separates OUR timeout from something else killing oc-tags (an
+ * OOM, a stray pkill): execFile sets it only when execFile itself did the
+ * killing. Reporting an external kill as a timeout would send an operator
+ * looking at the wrong thing.
+ */
+export function describeOcTagsFailure(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+  if (e.killed) return `oc-tags timed out after ${Math.round(RUN_TIMEOUT_MS / 1000)}s`;
+  // ENOENT/EACCES messages already name the path and the errno, so they stand
+  // on their own; a signal without `killed` needs saying out loud.
+  if (e.signal) return `oc-tags was killed (${e.signal})`;
+  return err.message;
+}
+
+/**
  * Builds a runner that executes oc-tags with an argv ARRAY and no shell.
  *
  * Tag names and directory globs arrive from a chat message. Passing argv rather
