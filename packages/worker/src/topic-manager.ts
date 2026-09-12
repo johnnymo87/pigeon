@@ -22,7 +22,10 @@ export type ResolveTopicResult =
   // finalize CAS for it — i.e. exactly one caller per topic ever sees it. Callers use it to
   // clear Telegram's auto-pin of the first message posted into a new topic (pigeon-ud6s).
   | { ok: true; messageThreadId: number; created?: boolean }
-  | { ok: true; messageThreadId: null; created?: boolean }
+  // `reason` names WHY no topic was resolved, so the caller can report the fallback instead of
+  // only logging it. These three paths write no intended_thread_id, which is exactly why the
+  // messages column pair cannot see them (pigeon-t5bd).
+  | { ok: true; messageThreadId: null; created?: boolean; reason?: string }
   | { ok: false; kind: "rate_limited"; retryAfter: number };
 
 export interface ResolveTopicOptions {
@@ -226,7 +229,7 @@ export async function resolveTopic(
         reason: "create_failed",
         details: getTelegramErrorDetails(createRes),
       });
-      return { ok: true, messageThreadId: null };
+      return { ok: true, messageThreadId: null, reason: "create_failed" };
     }
 
     const threadId = createRes.result.message_thread_id;
@@ -269,7 +272,7 @@ export async function resolveTopic(
       sessionId: opts.sessionId,
       reason: "finalize_lost_no_winner",
     });
-    return { ok: true, messageThreadId: null };
+    return { ok: true, messageThreadId: null, reason: "finalize_lost_no_winner" };
   }
 
   // 2. Reserve
@@ -328,5 +331,5 @@ export async function resolveTopic(
     sessionId: opts.sessionId,
     reason: "poll_exhausted",
   });
-  return { ok: true, messageThreadId: null };
+  return { ok: true, messageThreadId: null, reason: "poll_exhausted" };
 }

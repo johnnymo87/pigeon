@@ -21,7 +21,12 @@ import {
   SWEEP_ID_CHUNK,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
-import { isAllowedChatId, generateToken, handleSendNotification } from "../src/notifications";
+import {
+  isAllowedChatId,
+  generateToken,
+  handleSendNotification,
+  alertRelocation,
+} from "../src/notifications";
 import {
   topicsEnabled,
   topicName,
@@ -7187,7 +7192,7 @@ describe("topics module and topicName", () => {
       });
 
       expect(pollCount).toBe(5);
-      expect(res).toEqual({ ok: true, messageThreadId: null });
+      expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted" });
     });
 
     // pigeon-bit4 / S2: reachable without an isolate race -- finalize's CAS also returns false
@@ -7228,7 +7233,7 @@ describe("topics module and topicName", () => {
           tgClient: mockTgClient,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: null });
+        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "finalize_lost_no_winner" });
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -7266,7 +7271,7 @@ describe("topics module and topicName", () => {
           pollAttempts: 2,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: null });
+        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted" });
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -7295,7 +7300,7 @@ describe("topics module and topicName", () => {
         botToken,
       });
 
-      expect(res1).toEqual({ ok: true, messageThreadId: null });
+      expect(res1).toEqual({ ok: true, messageThreadId: null, reason: "create_failed" });
       // Reservation row was conditional-deleted
       expect(await getBySession(env.DB, sessionId)).toBeNull();
 
@@ -12239,5 +12244,208 @@ describe("per-call Telegram timing (pigeon-malt)", () => {
     logTelegramCall("sendMessage", TELEGRAM_SLOW_CALL_MS, "ok");
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(logSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Relocation alert (pigeon-t5bd) ──────────────────────────────────────
+
+describe("relocation alert (pigeon-t5bd)", () => {
+  const topicChatId = String(CHAT_ID_NUM);
+  const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    try {
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    } catch {}
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+    vi.restoreAllMocks();
+  });
+
+  function interceptSend(handler: (body: any) => unknown) {
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        const body = JSON.parse(opts.body as string);
+        return {
+          statusCode: 200,
+          data: JSON.stringify(handler(body)),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+  }
+
+  async function notify(sessionId: string) {
+    return handleSendNotification(
+      env.DB,
+      testEnv,
+      new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "body",
+          title: "t",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      }),
+    );
+  }
+
+  it("alerts when a permanent 4xx relocates the notification to General", async () => {
+    const sessionId = "ses_t5bd_send_failed";
+    await registerSession(sessionId, "devbox", "pigeon");
+    const now = Date.now();
+    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "x", now });
+    await finalize(env.DB, { sessionId, messageThreadId: 771, now });
+
+    const sent: any[] = [];
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" };
+    });
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7710 } };
+    });
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7711 } };
+    });
+
+    const res = await notify(sessionId);
+    expect(res.status).toBe(200);
+
+    const alert = sent.find((b) => String(b.text).includes("not its topic"));
+    expect(alert).toBeDefined();
+    expect(alert.text).toContain(sessionId);
+    expect(alert.text).toContain("send_failed");
+    // The alert is a DM to the operator, never threaded into the forum it is reporting on.
+    expect(alert.message_thread_id).toBeUndefined();
+  });
+
+  it("alerts on poll_exhausted, the path the intended/actual columns CANNOT see", async () => {
+    const sessionId = "ses_t5bd_poll_exhausted";
+    await registerSession(sessionId, "devbox", "pigeon");
+    // A live reservation held by someone else, never finalized: resolveTopic polls, gives up,
+    // and returns messageThreadId null -> the notification goes to General with NO intended id.
+    await reserve(env.DB, {
+      sessionId,
+      machineId: "devbox",
+      chatId: topicChatId,
+      name: "x",
+      now: Date.now(),
+    });
+
+    const sent: any[] = [];
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7720 } };
+    });
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7721 } };
+    });
+
+    const res = await notify(sessionId);
+    expect(res.status).toBe(200);
+
+    const alert = sent.find((b) => String(b.text).includes("not its topic"));
+    expect(alert).toBeDefined();
+    expect(alert.text).toContain("poll_exhausted");
+
+    // And prove the column pair is blind to it, which is why the alert cannot be built on them.
+    const row = await env.DB.prepare(
+      "SELECT intended_thread_id, actual_thread_id FROM messages WHERE session_id = ?",
+    ).bind(sessionId).first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
+    expect(row?.intended_thread_id).toBeNull();
+  });
+
+  it("does not alert for a normal threaded send", async () => {
+    const sessionId = "ses_t5bd_happy";
+    await registerSession(sessionId, "devbox", "pigeon");
+    const now = Date.now();
+    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "x", now });
+    await finalize(env.DB, { sessionId, messageThreadId: 773, now });
+
+    const sent: any[] = [];
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7730 } };
+    });
+
+    expect((await notify(sessionId)).status).toBe(200);
+    expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
+  });
+
+  it("does not alert when the caller deliberately asked for an unthreaded send", async () => {
+    const sessionId = "ses_t5bd_unthreaded";
+    await registerSession(sessionId, "devbox", "pigeon");
+
+    const sent: any[] = [];
+    interceptSend((b) => {
+      sent.push(b);
+      return { ok: true, result: { message_id: 7740 } };
+    });
+
+    const res = await handleSendNotification(
+      env.DB,
+      testEnv,
+      new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "quiet question",
+          threaded: false,
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
+  });
+
+  it("a failing alert never fails the notification it is reporting on", async () => {
+    const sessionId = "ses_t5bd_alert_throws";
+    await registerSession(sessionId, "devbox", "pigeon");
+    await reserve(env.DB, {
+      sessionId,
+      machineId: "devbox",
+      chatId: topicChatId,
+      name: "x",
+      now: Date.now(),
+    });
+
+    interceptSend(() => ({ ok: true, result: { message_id: 7750 } }));
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .replyWithError(new Error("alert transport died"));
+
+    const res = await notify(sessionId);
+    expect(res.status).toBe(200);
+  });
+
+  it("says so loudly when there is nowhere to send the alert", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const noChatEnv = { ...testEnv, ALLOWED_CHAT_IDS: "" } as Env;
+
+    const sent = await alertRelocation(noChatEnv, createTelegramClient("tok"), {
+      sessionId: "ses_t5bd_nowhere",
+      chatId: topicChatId,
+      messageId: 1,
+      reason: "poll_exhausted",
+    });
+
+    expect(sent).toBe(false);
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes("relocation alert"))).toBe(true);
   });
 });

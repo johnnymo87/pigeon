@@ -117,6 +117,83 @@ const json = (body: unknown, status = 200) =>
  * Check if a chatId is in the ALLOWED_CHAT_IDS env var.
  * If no allowlist is configured, deny all.
  */
+/**
+ * Tells the operator, at the moment it happens, that a notification went to the group's
+ * General thread instead of its session topic.
+ *
+ * pigeon-bit4 made this *queryable* (messages.intended_thread_id / actual_thread_id) and
+ * *logged* (a console.warn at each of five fallback sites). Neither is a consumer: nobody
+ * runs the query, the rows are deleted as soon as the session is unregistered — which for
+ * an automated session means on `/kill`, not after any TTL — and Workers Logs is a sink
+ * nobody tails. This is the push.
+ *
+ * It is emitted at event time rather than from the hourly cron on purpose. An aggregate
+ * would have to be built on the column pair, and the column pair is blind to exactly the
+ * failure that matters most: the three `topic-manager.ts` paths (`create_failed`,
+ * `finalize_lost_no_winner`, `poll_exhausted`) never resolve a thread id, so they record
+ * NULL/NULL and are indistinguishable from a deliberately unthreaded send. `poll_exhausted`
+ * in particular is the per-session, transient, silent case that arises under precisely the
+ * Telegram latency that produced the pigeon-bit4 incident. An hourly count would have slept
+ * through it. Working from the reason instead of the columns covers all five paths and needs
+ * no window, no watermark, and no new state.
+ *
+ * Destination is the first entry of ALLOWED_CHAT_IDS, matching `checkSessionHighWaterAlert`.
+ * In production that is a private chat with the bot, so the alert does not land in the very
+ * General thread it is complaining about — but note that it is positional: reordering that
+ * variable silently redirects operator alerts into the group.
+ *
+ * Best-effort by construction. The notification has already been delivered by the time this
+ * runs, so nothing here may change its outcome; every failure is caught and logged.
+ */
+export async function alertRelocation(
+  env: Env,
+  tg: TelegramClient,
+  opts: {
+    sessionId: string;
+    chatId: string | number;
+    messageId: number;
+    reason: string;
+    label?: string | null;
+  },
+): Promise<boolean> {
+  const allowed = (env.ALLOWED_CHAT_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+  const destination = allowed[0];
+
+  if (!destination) {
+    // Mirrors the high-water alert: a misconfigured destination must not be the quiet
+    // failure, because that is the same shape of bug this alert exists to surface.
+    console.error("[worker] relocation alert suppressed: ALLOWED_CHAT_IDS is empty", {
+      sessionId: opts.sessionId,
+      reason: opts.reason,
+    });
+    return false;
+  }
+
+  const text =
+    `⚠️ Notification went to General, not its topic\n` +
+    `session: ${opts.sessionId}${opts.label ? ` (${opts.label})` : ""}\n` +
+    `reason: ${opts.reason}\n` +
+    `chat: ${opts.chatId} · message: ${opts.messageId}`;
+
+  try {
+    const res = await tg.sendMessage({ chatId: destination, text });
+    if (res.ok) {
+      return true;
+    }
+    console.error("[worker] relocation alert failed", { sessionId: opts.sessionId, res });
+    return false;
+  } catch (err) {
+    console.error("[worker] relocation alert threw", {
+      sessionId: opts.sessionId,
+      error: String(err),
+    });
+    return false;
+  }
+}
+
 export function isAllowedChatId(chatId: string | number, env: Env): boolean {
   const raw = env.ALLOWED_CHAT_IDS;
   if (!raw) return false;
@@ -325,6 +402,10 @@ export async function handleSendNotification(
     // mutated by the recreate and relocation paths. The pair is recorded on the message row
     // (pigeon-bit4) so a relocation is queryable after the fact instead of invisible.
     let intendedThreadId: number | undefined;
+    // Why this notification ended up in General, when it did. Set on all five fallback paths —
+    // including the three that never produce an intendedThreadId and are therefore invisible to
+    // the intended/actual column pair (pigeon-t5bd).
+    let relocationReason: string | undefined;
 
     if (topicsEnabled(env) && threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
@@ -348,6 +429,8 @@ export async function handleSendNotification(
         messageThreadId = topicRes.messageThreadId;
         intendedThreadId = topicRes.messageThreadId;
         topicJustCreated = topicRes.created === true;
+      } else if (topicRes.ok) {
+        relocationReason = topicRes.reason ?? "no_topic";
       }
     }
 
@@ -403,6 +486,7 @@ export async function handleSendNotification(
           messageThreadId,
           reason: "recreate_failed",
         });
+        relocationReason = "recreate_failed";
       }
       messageThreadId = recreatedThreadId;
       topicJustCreated =
@@ -442,6 +526,7 @@ export async function handleSendNotification(
         reason: "send_failed",
         details: getTelegramErrorDetails(telegramResult),
       });
+      relocationReason = "send_failed";
       messageThreadId = undefined;
       telegramResult = await tg.sendMessage({
         chatId,
@@ -518,6 +603,18 @@ export async function handleSendNotification(
       intendedThreadId,
       actualThreadId: messageThreadId,
     });
+
+    // Fires only when topics are on and the caller wanted threading, so a deliberate
+    // unthreaded send (a quiet session's question, pigeon-c501) is never reported.
+    if (relocationReason !== undefined && messageThreadId === undefined) {
+      await alertRelocation(env, tg, {
+        sessionId,
+        chatId,
+        messageId,
+        reason: relocationReason,
+        label: session.label,
+      });
+    }
 
     // Send media as replies to the text message
     if (media && media.length > 0) {
