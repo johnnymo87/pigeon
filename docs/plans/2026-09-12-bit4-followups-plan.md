@@ -5,7 +5,8 @@ Adjacent and deliberately out of this batch: `pigeon-nb6a` (P2), `pigeon-g6o9`, 
 **Predecessor:** `pigeon-bit4`, shipped in #142; plan
 `docs/plans/2026-09-12-topic-fallback-visibility-plan.md`, corrected in #143.
 **Scope:** `packages/worker` for malt/t5bd/qpel; `packages/daemon` for jahv.
-**Status:** scoped, pre-implementation. Not yet reviewed by `adversarial-reviewer-fable`.
+**Status:** steps 1 and 2 built; steps 3 and 4 decided and closed without a behaviour change.
+Reviewed twice by `adversarial-reviewer-fable` (design, then diff) and once by `oracle-fable`.
 
 ## Why these four, and why in this order
 
@@ -18,10 +19,13 @@ Ordered by confidence and by what unblocks what:
 
 | # | Bead | Package | Why here |
 |---|---|---|---|
-| 1 | `pigeon-malt` | worker | Blocks `g6o9` and `jw53`. Zero behaviour change, zero hazard. |
-| 2 | `pigeon-t5bd` | worker | Gives the bit4 columns a consumer before the rows reap. |
-| 3 | `pigeon-jahv` | daemon | Correctness tail bit4 introduced; needs a judgement call. |
-| 4 | `pigeon-qpel` | worker | P4. Possibly *document only* — decide, do not default to building. |
+| 1 | `pigeon-malt` | worker | Blocks `g6o9` and `jw53`. Zero behaviour change, zero hazard. **Built.** |
+| 2 | `pigeon-t5bd` | worker | Gives the bit4 columns a consumer before the rows reap. **Built, in a different shape than planned.** |
+| 3 | `pigeon-jahv` | daemon | Correctness tail bit4 introduced; needs a judgement call. **Closed — premise was wrong; measured instead.** |
+| 4 | `pigeon-qpel` | worker | P4. Possibly *document only* — decide, do not default to building. **Closed as documented.** |
+
+Two of the four turned out not to need code, and the one that did need code needed a different
+design than the plan specified. That is the intended yield of the review steps, not a detour.
 
 ## Step 1 — `pigeon-malt`: per-call Telegram timing
 
@@ -45,13 +49,28 @@ Open questions for implementation:
 reap with their sessions (~7d), so a relocation nobody asks about inside a week leaves no trace.
 Same signal-without-a-consumer shape as `pigeon-8l7` — which is the whole reason `nb6a` exists.
 
-Cheapest shape: fold the count into the worker's existing hourly cron and `console.warn` when
-non-zero. **Carry the undercount caveat into whatever surfaces it**: the three `topic-manager.ts`
-paths never produce an intended id, so they write NULL/NULL and are indistinguishable from a
-deliberately unthreaded send. Their `console.warn` is the only signal for those.
+**Built differently from this, after review. The cron aggregate was the wrong answer twice over.**
 
-Decide explicitly whether this belongs here or inside `nb6a`'s alerting work. Two half-consumers
-would be worse than one.
+First, it adds no consumer: bit4 already emits a per-event `console.warn` at every fallback site,
+to the same sink, with more detail. An hourly count to Workers Logs is a second, lossier copy of a
+signal that is already pushed.
+
+Second, and decisively, **it would have been blind to the case that matters**. The undercount
+caveat is not a footnote — the three `topic-manager.ts` paths (`create_failed`,
+`finalize_lost_no_winner`, `poll_exhausted`) never resolve a thread id, so they record NULL/NULL.
+`poll_exhausted` is the per-session, transient, silent fallback that happens under exactly the
+Telegram latency that caused the incident. An aggregate over the column pair fires on chat-wide
+breakage, which is obvious anyway, and sleeps through that one.
+
+So the shipped shape is an **event-time Telegram message** to the first `ALLOWED_CHAT_IDS` entry
+(the operator's own chat, the destination `checkSessionHighWaterAlert` already uses), driven off a
+new `reason` returned by `resolveTopic` rather than off the columns. That covers all five paths
+with no window, no watermark and no new state. It is deliberately not throttled: relocations
+should be near zero, and if they are not, the volume is itself the alarm.
+
+This did **not** fold into `nb6a`. A relocation is not a terminal drop, and Telegram is provably
+reachable when one happens (the General send succeeded), so `nb6a`'s argument for a non-Telegram
+surface does not apply.
 
 ## Step 3 — `pigeon-jahv`: bound the undefined-`error_code` retry
 
@@ -61,13 +80,29 @@ so **no attempt is ever charged**. If an unparseable-200 condition persists, the
 5–120s to the 24h cap: ~700 sends, each of which Telegram may have processed, all into the correct
 topic. Pre-bit4 the same condition cost two copies and stopped.
 
-Candidate fix: charge an attempt on the undefined-code branch specifically, so it terminates on the
-normal attempt budget rather than the age cap, leaving 5xx retries untouched.
+**Closed without the behaviour change, on an `oracle-fable` consult that corrected the premise.**
 
-**This one deserves an `oracle-fable` consult before implementation.** It is a genuine trade
-between duplicate volume and delivery probability, it changes daemon retry semantics rather than
-adding an observation, and the likelihood of the triggering condition is unmeasured. Do not build
-it on the strength of the arithmetic alone.
+The paragraph above is wrong where it says pre-bit4 "cost two copies and stopped". An unparseable
+200 is a response-transport artefact and has nothing to do with `message_thread_id`, so a
+*persistent* one would have hit the General send too and retried identically. Pre-bit4 the same
+condition was worth roughly 1,400 copies, half of them misfiled; post-bit4 it is ~720, all in the
+right topic. **bit4 halved this tail rather than creating it.** Do not re-derive the ~700 figure
+later and file it as a bit4 regression.
+
+The trigger also turns out to be implausible as a persistent condition: it requires HTTP 200 with
+a body that yields no `error_code`, which in practice means headers delivered and the body
+truncated mid-stream. That is a per-request blip. A systemic version of it would hit every send on
+every session — an outage, not a one-row storm.
+
+Charging an attempt was rejected on its own merits too: the daemon would have to key on the
+*absence* of `details.error_code` in a 502 body (fragile against any future `TgResult` kind), and
+it would mix an ambiguous-outcome count into the shared attempt budget, which review has already
+rejected once elsewhere.
+
+What shipped instead is a `console.warn` in `parseTgResponse` for exactly that shape, so the base
+rate stops being unmeasured. **If that line ever shows the same notification twice in a row,
+reopen `pigeon-jahv`** and build a separate ambiguous-outcome counter — not a charge against
+`attempts`.
 
 ## Step 4 — `pigeon-qpel`: decide, do not default to building
 
@@ -76,9 +111,11 @@ final `reply_markup`-bearing chunk in General). Arguably correct — delivering 
 dropping it — which is why it is P4. bit4 made it *visible*: the S2 warn fires and the two rows for
 one notification id disagree on `actual_thread_id`.
 
-The honest default is to leave it filed and closed-as-documented unless the fix is genuinely
-cheap. If it is built, the shape is: decide relocation once for the whole notification before
-sending chunk 0, not per chunk.
+**Closed as documented.** Delivering the remaining chunks to General beats dropping them, bit4
+already made the tear visible (the `send_failed` warn fires, the chunk rows disagree on
+`actual_thread_id`), and the relocation alert added in step 2 now pushes it to a human as well. If
+it is ever built, the shape is: decide relocation once for the whole notification before sending
+chunk 0, not per chunk.
 
 ## Facts carried forward (verified, do not re-derive)
 
@@ -97,6 +134,14 @@ sending chunk 0, not per chunk.
 - The worker test suite is **order-dependent** (`pigeon-dpi6`): interceptors leak between tests.
   Four bit4 tests deliberately leave one interceptor unconsumed as the assertion that no second
   send happened — do not "clean those up".
+- **A single-shot undici interceptor cannot prove a negative here.** An unwanted extra send finds
+  no mock, undici rejects, the caller's `try/catch` swallows it, and the assertion passes for the
+  wrong reason. Two of this batch's own tests shipped that way and were caught in review: persist
+  the interceptor and assert the send *count*. Confirm by mutation, not by reading.
+- `messages` rows are deleted when their session unregisters (`sessions.ts:161`) — on `/kill`
+  immediately, via the daemon's 7-day reaper, or via the worker's 14-day stale sweep. So the table
+  is not a 39-day history: **any rate derived from the whole table is biased low**, because older
+  days are survivors only. Over the last 7 days it is 293 rows/day, peaking at 617.
 
 ## Verification bar
 
