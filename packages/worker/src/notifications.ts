@@ -1,5 +1,5 @@
 import { verifyApiKey, unauthorized } from "./auth";
-import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
+import { createTelegramClient, getTelegramErrorDetails, TelegramClient, TgResult } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { withD1, StorageError } from "./d1";
@@ -32,6 +32,39 @@ interface MessageRow {
   token: string;
   notification_id: string | null;
   created_at: number;
+}
+
+/**
+ * Is a failed topic send PERMANENT — i.e. is the topic itself unusable, such that retrying into
+ * it can only fail again?
+ *
+ * Only a permanent failure justifies relocating a notification to General. A transient one
+ * (5xx, or an outcome we cannot classify) must surface as a 502 so the daemon's outbox retries
+ * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
+ * General and was never seen (pigeon-bit4).
+ *
+ * `errorCode === undefined` means a 200 whose body did not parse (telegram.ts parseTgResponse),
+ * which most likely means Telegram PROCESSED the send. Treating it as transient risks a
+ * duplicate in the correct topic; treating it as permanent guarantees a misfiled copy. The
+ * duplicate is the better-placed risk.
+ */
+function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
+  if (result.ok) return false;
+  switch (result.kind) {
+    case "rate_limited":
+      // Never reached (callers exclude it first), but 429 is explicitly transient.
+      return false;
+    case "error":
+      return (
+        typeof result.errorCode === "number" &&
+        result.errorCode >= 400 &&
+        result.errorCode < 500
+      );
+    default:
+      // thread_not_found reaching the fallback means the recreate-and-retry above already
+      // failed; topic_not_modified cannot come from sendMessage. Both are 4xx-class.
+      return true;
+  }
 }
 
 const json = (body: unknown, status = 200) =>
@@ -324,14 +357,19 @@ export async function handleSendNotification(
       });
     }
 
-    // Non-429 topic failure fallback to General.
-    // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
-    // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
-    // Never drop a notification. 429 errors must NOT fall back here.
+    // PERMANENT topic failure -> fall back to General.
+    // If the topic itself is unusable (rights revoked, forum mode off, chat is not a forum),
+    // retrying can only fail again, so General is better than dropping the notification.
+    //
+    // A TRANSIENT failure (5xx, or an unclassifiable outcome) deliberately does NOT fall back:
+    // it returns 502 below and the daemon's outbox retries into the correct topic. Relocating
+    // on a transient error silently moved a user's answer to General, where it was never seen
+    // (pigeon-bit4). 429 is handled separately and must not reach here either.
     if (
       !telegramResult.ok &&
       telegramResult.kind !== "rate_limited" &&
-      messageThreadId !== undefined
+      messageThreadId !== undefined &&
+      isPermanentTopicFailure(telegramResult)
     ) {
       // Clear the thread for everything downstream: if the topic would not take the text
       // it will not take the attachments either, so the media loop must follow to General.

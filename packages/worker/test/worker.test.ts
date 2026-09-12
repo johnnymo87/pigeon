@@ -8284,6 +8284,102 @@ describe("topics module and topicName", () => {
       expect(sentThreadIds).toEqual([500, undefined]);
     });
 
+    // pigeon-bit4: a 5xx from Telegram is transient, so relocating the message to General
+    // discards the topic permanently for a condition that would have cleared on the next
+    // attempt. The outbox retries a 502, and it retries into the RIGHT topic.
+    it("5xx topic sendMessage failure -> returns 502 for outbox retry and does NOT fall back to General", async () => {
+      const sessionId = "ses_bit4_5xx_no_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · 5xx", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 520, now });
+
+      const sentThreadIds: Array<number | undefined> = [];
+
+      // Two interceptors registered, but only ONE must be consumed. A second send is the bug.
+      for (let i = 0; i < 2; i++) {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply((opts: any) => {
+            const body = JSON.parse(opts.body as string);
+            sentThreadIds.push(body.message_thread_id);
+            return {
+              statusCode: 502,
+              data: JSON.stringify({ ok: false, error_code: 502, description: "Bad Gateway" }),
+              responseOptions: { headers: { "Content-Type": "application/json" } },
+            };
+          });
+      }
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification that must not be relocated",
+          title: "5xx",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(502);
+      expect(sentThreadIds).toEqual([520]);
+    });
+
+    // A 200 whose body does not parse yields kind:"error" with NO errorCode. That most likely
+    // means Telegram processed the send, so a relocation would guarantee a misfiled copy while
+    // a retry only risks a duplicate in the correct topic.
+    it("undefined errorCode on a topic send -> returns 502 and does NOT fall back to General", async () => {
+      const sessionId = "ses_bit4_undef_no_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · undef", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 521, now });
+
+      const sentThreadIds: Array<number | undefined> = [];
+
+      for (let i = 0; i < 2; i++) {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply((opts: any) => {
+            const body = JSON.parse(opts.body as string);
+            sentThreadIds.push(body.message_thread_id);
+            // HTTP 200 with an unparseable body -> errorCode stays undefined.
+            return {
+              statusCode: 200,
+              data: "<html>not json</html>",
+              responseOptions: { headers: { "Content-Type": "text/html" } },
+            };
+          });
+      }
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Ambiguous outcome must not be relocated",
+          title: "undef",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(502);
+      expect(sentThreadIds).toEqual([521]);
+    });
+
     it("429 topic sendMessage failure -> returns 429 with retryAfter and does NOT fall back to General", async () => {
       const sessionId = "ses_t28_429_send_no_fallback";
       await registerSession(sessionId, "devbox", "pigeon");
