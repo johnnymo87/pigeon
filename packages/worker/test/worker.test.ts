@@ -85,6 +85,8 @@ import {
   reopenForumTopic,
   deleteForumTopic,
   unpinAllForumTopicMessages,
+  logTelegramCall,
+  TELEGRAM_SLOW_CALL_MS,
 } from "../src/telegram";
 import { withD1, StorageError } from "../src/d1";
 
@@ -12140,5 +12142,102 @@ describe("/tag command", () => {
     expect(res.status).toBe(200);
     const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_list");
     expect(rows).toHaveLength(1);
+  });
+});
+
+// ─── Per-call Telegram latency (pigeon-malt) ─────────────────────────────
+
+describe("per-call Telegram timing (pigeon-malt)", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+  });
+
+  afterEach(() => {
+    try {
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    } catch {}
+    fetchMock.deactivate();
+    vi.restoreAllMocks();
+  });
+
+  it("logs one line per call naming the method and a numeric elapsedMs", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    await sendMessage("tok", { chatId: 1, text: "hi" });
+
+    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
+    expect(calls).toHaveLength(1);
+    const payload = calls[0][1] as { method: string; elapsedMs: number; outcome: string };
+    expect(payload.method).toBe("sendMessage");
+    expect(typeof payload.elapsedMs).toBe("number");
+    expect(payload.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(payload.outcome).toBe("ok");
+  });
+
+  it("never puts the bot token (or the URL carrying it) in the log payload", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/getFile/ })
+      .reply(200, JSON.stringify({ ok: true, result: { file_path: "p" } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    await getFile("SUPERSECRETTOKEN", { fileId: "f" });
+
+    const serialized = JSON.stringify(logSpy.mock.calls);
+    expect(serialized).not.toContain("SUPERSECRETTOKEN");
+    expect(serialized).not.toContain("api.telegram.org");
+  });
+
+  it("records the outcome kind for a failed call, not just ok/not-ok", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(400, JSON.stringify({ ok: false, error_code: 400, description: "message thread not found" }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    await sendMessage("tok", { chatId: 1, text: "hi", messageThreadId: 9 });
+
+    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
+    expect(calls).toHaveLength(1);
+    expect((calls[0][1] as { outcome: string }).outcome).toBe("thread_not_found");
+  });
+
+  it("still times and logs a call that THROWS, and rethrows unchanged", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const boom = new Error("connection reset");
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .replyWithError(boom);
+
+    await expect(sendMessage("tok", { chatId: 1, text: "hi" })).rejects.toThrow("connection reset");
+
+    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
+    expect(calls).toHaveLength(1);
+    expect((calls[0][1] as { outcome: string }).outcome).toBe("threw");
+  });
+
+  it("escalates to console.warn once a call crosses the slow threshold", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    logTelegramCall("sendMessage", TELEGRAM_SLOW_CALL_MS - 1, "ok");
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledTimes(0);
+
+    logTelegramCall("sendMessage", TELEGRAM_SLOW_CALL_MS, "ok");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy).toHaveBeenCalledTimes(1);
   });
 });

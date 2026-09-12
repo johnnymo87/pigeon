@@ -110,6 +110,75 @@ export function getTelegramErrorDetails(result: TgResult<unknown>): unknown {
   );
 }
 
+/**
+ * A Telegram call at or above this many milliseconds is logged at `warn` rather than `log`.
+ *
+ * Not a timeout and not a behaviour change — nothing is aborted at this boundary. It exists
+ * only so the slow tail is filterable by log level, since Workers Logs cannot filter on a
+ * numeric field. 5s is far above any healthy call and well below the 43.6s stall in the
+ * pigeon-bit4 incident.
+ */
+export const TELEGRAM_SLOW_CALL_MS = 5_000;
+
+/**
+ * Records how long one Telegram API call took.
+ *
+ * Deliberately logs EVERY call, not only slow ones. A threshold-only log records no healthy
+ * baseline, and the two beads that depend on this one (pigeon-g6o9, pigeon-jw53) both need a
+ * distribution to size a timeout against — a stream of outliers with nothing to compare them
+ * to is what we already have. Volume is small: ~100 `messages` rows/day (96 in the last 24h,
+ * 4,242 rows spanning 39 days) plus topic, callback and getFile traffic, so a few hundred log
+ * lines a day at `head_sampling_rate = 1`.
+ *
+ * The method name is logged; the URL is not, because it carries the bot token.
+ */
+export function logTelegramCall(method: string, elapsedMs: number, outcome: string): void {
+  const payload = { method, elapsedMs, outcome };
+  if (elapsedMs >= TELEGRAM_SLOW_CALL_MS) {
+    console.warn("[worker] slow telegram call", payload);
+  } else {
+    console.log("[worker] telegram call", payload);
+  }
+}
+
+/**
+ * The single place a Telegram HTTP call is made, so the timing above cannot be bypassed.
+ *
+ * Every exported method routes through here. That is the point: a per-method wrapper would
+ * have to be remembered at each of the twelve call sites, and the thirteenth would silently
+ * go unmeasured.
+ *
+ * Two things about the measurement are easy to misread:
+ *
+ * - **The clock is in a `finally`, so a call that THROWS is timed too.** An indefinite stall
+ *   that ends in a transport error is precisely the case this exists to catch; timing only
+ *   the success path would have missed the pigeon-bit4 episode's worst readings entirely.
+ * - **`elapsedMs` covers reading and parsing the body, not just the headers.** A response
+ *   whose headers arrive promptly and whose body then stalls is a real failure mode here
+ *   (it is what opened the circuit breaker in pigeon-mavq), so the number is deliberately
+ *   time-to-parsed-result rather than time-to-first-byte. Anything sizing a timeout off it
+ *   is therefore sizing against the whole call, which is the correct thing to abort.
+ *
+ * `Date.now()` is pinned to the last I/O in Workers, so it advances across a `fetch` but not
+ * across pure computation. That makes it valid here and useless for timing CPU work.
+ */
+async function callTelegram<T>(
+  botToken: string,
+  method: string,
+  init: RequestInit,
+): Promise<TgResult<T>> {
+  const startedAt = Date.now();
+  let outcome = "threw";
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, init);
+    const parsed = await parseTgResponse<T>(res);
+    outcome = parsed.ok ? "ok" : parsed.kind;
+    return parsed;
+  } finally {
+    logTelegramCall(method, Date.now() - startedAt, outcome);
+  }
+}
+
 async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
   const data = (await res.json().catch(() => null)) as {
     ok?: boolean;
@@ -180,13 +249,11 @@ export async function sendMessage(
     payload.message_thread_id = options.messageThreadId;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+  return callTelegram<{ message_id: number }>(botToken, "sendMessage", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  return parseTgResponse<{ message_id: number }>(res);
 }
 
 export async function editMessageText(
@@ -205,13 +272,11 @@ export async function editMessageText(
     payload.reply_markup = options.replyMarkup;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+  return callTelegram<{ message_id?: number } | boolean>(botToken, "editMessageText", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  return parseTgResponse<{ message_id?: number } | boolean>(res);
 }
 
 export async function sendPhoto(
@@ -228,12 +293,10 @@ export async function sendPhoto(
     form.append("reply_to_message_id", String(options.replyToMessageId));
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+  return callTelegram<{ message_id: number }>(botToken, "sendPhoto", {
     method: "POST",
     body: form,
   });
-
-  return parseTgResponse<{ message_id: number }>(res);
 }
 
 export async function sendDocument(
@@ -250,12 +313,10 @@ export async function sendDocument(
     form.append("reply_to_message_id", String(options.replyToMessageId));
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+  return callTelegram<{ message_id: number }>(botToken, "sendDocument", {
     method: "POST",
     body: form,
   });
-
-  return parseTgResponse<{ message_id: number }>(res);
 }
 
 export async function answerCallbackQuery(
@@ -269,26 +330,22 @@ export async function answerCallbackQuery(
     payload.text = options.text;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+  return callTelegram<boolean>(botToken, "answerCallbackQuery", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  return parseTgResponse<boolean>(res);
 }
 
 export async function getFile(
   botToken: string,
   options: GetFileOptions,
 ): Promise<TgResult<{ file_path: string }>> {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/getFile`, {
+  return callTelegram<{ file_path: string }>(botToken, "getFile", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ file_id: options.fileId }),
   });
-
-  return parseTgResponse<{ file_path: string }>(res);
 }
 
 export async function createForumTopic(
@@ -306,13 +363,11 @@ export async function createForumTopic(
     payload.icon_custom_emoji_id = options.iconCustomEmojiId;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/createForumTopic`, {
+  return callTelegram<ForumTopic>(botToken, "createForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  return parseTgResponse<ForumTopic>(res);
 }
 
 export async function editForumTopic(
@@ -330,20 +385,18 @@ export async function editForumTopic(
     payload.icon_custom_emoji_id = options.iconCustomEmojiId;
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/editForumTopic`, {
+  return callTelegram<boolean>(botToken, "editForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  return parseTgResponse<boolean>(res);
 }
 
 export async function closeForumTopic(
   botToken: string,
   options: CloseForumTopicOptions,
 ): Promise<TgResult<boolean>> {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/closeForumTopic`, {
+  return callTelegram<boolean>(botToken, "closeForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -351,15 +404,13 @@ export async function closeForumTopic(
       message_thread_id: options.messageThreadId,
     }),
   });
-
-  return parseTgResponse<boolean>(res);
 }
 
 export async function reopenForumTopic(
   botToken: string,
   options: ReopenForumTopicOptions,
 ): Promise<TgResult<boolean>> {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/reopenForumTopic`, {
+  return callTelegram<boolean>(botToken, "reopenForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -367,15 +418,13 @@ export async function reopenForumTopic(
       message_thread_id: options.messageThreadId,
     }),
   });
-
-  return parseTgResponse<boolean>(res);
 }
 
 export async function deleteForumTopic(
   botToken: string,
   options: DeleteForumTopicOptions,
 ): Promise<TgResult<boolean>> {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteForumTopic`, {
+  return callTelegram<boolean>(botToken, "deleteForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -383,8 +432,6 @@ export async function deleteForumTopic(
       message_thread_id: options.messageThreadId,
     }),
   });
-
-  return parseTgResponse<boolean>(res);
 }
 
 /**
@@ -399,19 +446,14 @@ export async function unpinAllForumTopicMessages(
   botToken: string,
   options: UnpinAllForumTopicMessagesOptions,
 ): Promise<TgResult<boolean>> {
-  const res = await fetch(
-    `https://api.telegram.org/bot${botToken}/unpinAllForumTopicMessages`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: options.chatId,
-        message_thread_id: options.messageThreadId,
-      }),
-    },
-  );
-
-  return parseTgResponse<boolean>(res);
+  return callTelegram<boolean>(botToken, "unpinAllForumTopicMessages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: options.chatId,
+      message_thread_id: options.messageThreadId,
+    }),
+  });
 }
 
 export function createTelegramClient(botToken: string) {
