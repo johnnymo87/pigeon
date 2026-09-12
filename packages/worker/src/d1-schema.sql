@@ -35,7 +35,13 @@ CREATE TABLE IF NOT EXISTS messages (
   token           TEXT NOT NULL,
   notification_id TEXT,
   -- Where the notification was MEANT to go vs where it actually went (pigeon-bit4).
-  -- intended IS NOT NULL AND actual IS NULL == the message was relocated to General.
+  -- intended IS NOT NULL AND actual IS NULL == a send that failed into its topic and was
+  --   relocated to General.
+  -- both non-null but DIFFERENT == the topic was recreated mid-send.
+  -- NOT a complete relocation count: when resolveTopic itself fails to produce a topic
+  --   (creation failed, poll exhausted, lost CAS) there is no intended id to record and the
+  --   row is NULL/NULL, indistinguishable from threaded:false. The console.warn at those
+  --   three sites in topic-manager.ts is the only signal for them.
   intended_thread_id INTEGER,
   actual_thread_id   INTEGER,
   created_at      INTEGER NOT NULL,

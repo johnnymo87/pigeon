@@ -83,6 +83,9 @@ async function recordThreadPlacement(
     actualThreadId: number | undefined;
   },
 ): Promise<void> {
+  // Nothing to record: no topic was ever intended (topics disabled, threaded:false) and none
+  // was used. The row already holds NULL/NULL, so skip the write entirely.
+  if (opts.intendedThreadId === undefined && opts.actualThreadId === undefined) return;
   try {
     await db
       .prepare(
@@ -395,7 +398,7 @@ export async function handleSendNotification(
       if (recreatedThreadId === undefined) {
         // The topic could not be recreated, so this notification is about to go to General
         // under a different code path than the relocation below (pigeon-bit4: was silent).
-        console.warn("[worker] notification relocated to General", {
+        console.warn("[worker] relocating notification to General", {
           sessionId,
           messageThreadId,
           reason: "recreate_failed",
@@ -433,7 +436,7 @@ export async function handleSendNotification(
     ) {
       // Clear the thread for everything downstream: if the topic would not take the text
       // it will not take the attachments either, so the media loop must follow to General.
-      console.warn("[worker] notification relocated to General", {
+      console.warn("[worker] relocating notification to General", {
         sessionId,
         messageThreadId,
         reason: "send_failed",

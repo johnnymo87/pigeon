@@ -7188,6 +7188,55 @@ describe("topics module and topicName", () => {
       expect(res).toEqual({ ok: true, messageThreadId: null });
     });
 
+    // pigeon-bit4 / S2: reachable without an isolate race -- finalize's CAS also returns false
+    // when the reservation row has been DELETED, so a rival that cleaned up rather than
+    // finalizing leaves this caller with a created topic it cannot claim and no winner to
+    // defer to. That path sent to General in silence.
+    it("lost finalize CAS with no winner row warns that the notification will go to General", async () => {
+      const sessionId = "ses_bit4_warn_no_winner";
+      const botToken = "fake-bot-token";
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/deleteForumTopic`, method: "POST" })
+        .reply(200, { ok: true, result: true });
+
+      const mockTgClient = {
+        ...createTelegramClient(botToken),
+        createForumTopic: async () => {
+          // A rival deletes the reservation instead of finalizing it, so the CAS below
+          // matches zero rows AND the re-read finds nothing.
+          await deleteBySession(env.DB, sessionId);
+          return {
+            ok: true as const,
+            result: { message_thread_id: 606, name: "pigeon · no winner", icon_color: 7322096 },
+          };
+        },
+      };
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "no winner",
+          botToken,
+          tgClient: mockTgClient,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: null });
+        const warn = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
+        );
+        expect(warn).toBeDefined();
+        expect(warn![1]).toMatchObject({ sessionId, reason: "finalize_lost_no_winner" });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     // pigeon-bit4 / S2: poll exhaustion is a plausible cause of a misfiled notification under
     // exactly the kind of load that produced the incident, and it returned null in silence.
     it("poll exhaustion warns that the notification will go to General", async () => {
@@ -8372,6 +8421,11 @@ describe("topics module and topicName", () => {
 
       expect(res.status).toBe(502);
       expect(sentThreadIds).toEqual([520]);
+      // Pin the error_code that reaches the daemon. delivery-policy rule 6 keys on
+      // details.error_code === 400 and would answer a retryable 502 with strip_entities,
+      // charging an attempt and terminal-dropping the message after ~10 of them.
+      const body520 = (await res.json()) as { details?: { error_code?: number } };
+      expect(body520.details?.error_code).toBe(502);
     });
 
     // A 200 whose body does not parse yields kind:"error" with NO errorCode. That most likely
@@ -8420,6 +8474,128 @@ describe("topics module and topicName", () => {
 
       expect(res.status).toBe(502);
       expect(sentThreadIds).toEqual([521]);
+      // Must NOT be 400: see the comment on the 5xx case above.
+      const body521 = (await res.json()) as { details?: { error_code?: number } };
+      expect(body521.details?.error_code).toBeUndefined();
+    });
+
+    // The incident-shaped 5xx: a gateway error arrives as HTML or an empty body, not as JSON
+    // with an error_code, so it takes a different branch of parseTgResponse (res.status rather
+    // than data.error_code). That is the shape actually observed during the slow episode.
+    it("non-JSON gateway 502 on a topic send -> returns 502 and does NOT fall back to General", async () => {
+      const sessionId = "ses_bit4_5xx_html_no_fallback";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · html", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 522, now });
+
+      const sentThreadIds: Array<number | undefined> = [];
+      for (let i = 0; i < 2; i++) {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply((opts: any) => {
+            const body = JSON.parse(opts.body as string);
+            sentThreadIds.push(body.message_thread_id);
+            return {
+              statusCode: 502,
+              data: "<html><body>Bad Gateway</body></html>",
+              responseOptions: { headers: { "Content-Type": "text/html" } },
+            };
+          });
+      }
+
+      const res = await handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: topicChatId,
+            text: "gateway error",
+            title: "html",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(502);
+      expect(sentThreadIds).toEqual([522]);
+      const body = (await res.json()) as { details?: { error_code?: number } };
+      expect(body.details?.error_code).toBe(502);
+    });
+
+    // The recreate path rewrites messageThreadId, so the relocation guard below it runs against
+    // a DIFFERENT thread id than the one resolveTopic first returned. A 5xx on that retry must
+    // still retry rather than relocate.
+    it("5xx after a successful topic recreate -> returns 502 and does NOT fall back to General", async () => {
+      const sessionId = "ses_bit4_recreate_then_5xx";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recreate5xx", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 523, now });
+
+      const sentThreadIds: Array<number | undefined> = [];
+
+      // 1st send -> thread not found.
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          sentThreadIds.push(JSON.parse(opts.body as string).message_thread_id);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+      // Recreate succeeds with a NEW thread id.
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, { ok: true, result: { message_thread_id: 620, name: "pigeon · recreate5xx", icon_color: 7322096 } }, {
+          headers: { "Content-Type": "application/json" },
+        });
+      // Retry into the new thread -> 5xx. Must NOT relocate.
+      for (let i = 0; i < 2; i++) {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply((opts: any) => {
+            sentThreadIds.push(JSON.parse(opts.body as string).message_thread_id);
+            return {
+              statusCode: 502,
+              data: JSON.stringify({ ok: false, error_code: 502, description: "Bad Gateway" }),
+              responseOptions: { headers: { "Content-Type": "application/json" } },
+            };
+          });
+      }
+
+      const res = await handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: topicChatId,
+            text: "recreated then 5xx",
+            title: "recreate5xx",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(502);
+      // Second send used the RECREATED thread, and there was no third (General) send.
+      expect(sentThreadIds).toEqual([523, 620]);
     });
 
     // pigeon-bit4 / S2: every path that silently sends to General instead of the session's
@@ -8467,7 +8643,7 @@ describe("topics module and topicName", () => {
         expect(res.status).toBe(200);
 
         const relocateWarn = warnSpy.mock.calls.find(
-          (c) => typeof c[0] === "string" && c[0].includes("relocated to General"),
+          (c) => typeof c[0] === "string" && c[0].includes("relocating notification to General"),
         );
         expect(relocateWarn).toBeDefined();
         expect(relocateWarn![1]).toMatchObject({
@@ -8537,7 +8713,7 @@ describe("topics module and topicName", () => {
         expect(
           warns.some(
             (c) =>
-              (c[0] as string).includes("relocated to General") &&
+              (c[0] as string).includes("relocating notification to General") &&
               (c[1] as Record<string, unknown>)?.reason === "recreate_failed",
           ),
         ).toBe(true);
@@ -8701,9 +8877,22 @@ describe("topics module and topicName", () => {
       const sessionId = "ses_bit4_cols_missing";
       await registerSession(sessionId, "devbox", "pigeon");
 
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      await env.DB.prepare("ALTER TABLE messages DROP COLUMN intended_thread_id").run();
+      // Must be a THREADED send: with no thread on either side there is no placement to
+      // record, recordThreadPlacement returns early, and this test would pass vacuously.
+      const nowMissing = Date.now();
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · missing",
+        now: nowMissing,
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: 542, now: nowMissing });
+
+      let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
       try {
+        warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        await env.DB.prepare("ALTER TABLE messages DROP COLUMN intended_thread_id").run();
         fetchMock
           .get("https://api.telegram.org")
           .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
@@ -8713,7 +8902,7 @@ describe("topics module and topicName", () => {
 
         const res = await handleSendNotification(
           env.DB,
-          { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env,
+          testEnv,
           new Request("https://worker/notifications/send", {
             method: "POST",
             headers: authHeaders,
@@ -8721,6 +8910,9 @@ describe("topics module and topicName", () => {
               sessionId,
               chatId: topicChatId,
               text: "no columns",
+              title: "missing",
+              dir: "pigeon",
+              threaded: true,
             }),
           }),
         );
@@ -8737,8 +8929,12 @@ describe("topics module and topicName", () => {
           ),
         ).toBe(true);
       } finally {
-        await env.DB.prepare("ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER").run();
-        warnSpy.mockRestore();
+        // Restore before anything else: the DB is shared across the whole file
+        // (isolatedStorage: false), so a missing column would leak into later tests.
+        await env.DB.prepare(
+          "ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER",
+        ).run().catch(() => {});
+        warnSpy?.mockRestore();
       }
     });
 
