@@ -114,9 +114,9 @@ export function getTelegramErrorDetails(result: TgResult<unknown>): unknown {
  * A Telegram call at or above this many milliseconds is logged at `warn` rather than `log`.
  *
  * Not a timeout and not a behaviour change — nothing is aborted at this boundary. It exists
- * only so the slow tail is filterable by log level, since Workers Logs cannot filter on a
- * numeric field. 5s is far above any healthy call and well below the 43.6s stall in the
- * pigeon-bit4 incident.
+ * only so the slow tail is filterable by log level, which is a coarser but more dependable
+ * filter than a numeric predicate over a structured field. 5s is far above any healthy call
+ * and well below the 43.6s stall in the pigeon-bit4 incident.
  */
 export const TELEGRAM_SLOW_CALL_MS = 5_000;
 
@@ -126,9 +126,13 @@ export const TELEGRAM_SLOW_CALL_MS = 5_000;
  * Deliberately logs EVERY call, not only slow ones. A threshold-only log records no healthy
  * baseline, and the two beads that depend on this one (pigeon-g6o9, pigeon-jw53) both need a
  * distribution to size a timeout against — a stream of outliers with nothing to compare them
- * to is what we already have. Volume is small: ~100 `messages` rows/day (96 in the last 24h,
- * 4,242 rows spanning 39 days) plus topic, callback and getFile traffic, so a few hundred log
- * lines a day at `head_sampling_rate = 1`.
+ * to is what we already have.
+ *
+ * Volume is small. `messages` rows over the last 7 days: 2,054, a mean of 293/day, peaking at
+ * 617 on 2026-09-10. (Do not size this from the all-time table: rows are deleted when their
+ * session is unregistered, so older days are survivors only and the long-run mean reads far
+ * too low.) Add topic, wizard-edit, callback and getFile traffic and the realistic peak is
+ * roughly a thousand log lines a day at `head_sampling_rate = 1`.
  *
  * The method name is logged; the URL is not, because it carries the bot token.
  */
@@ -146,7 +150,9 @@ export function logTelegramCall(method: string, elapsedMs: number, outcome: stri
  *
  * Every exported method routes through here. That is the point: a per-method wrapper would
  * have to be remembered at each of the twelve call sites, and the thirteenth would silently
- * go unmeasured.
+ * go unmeasured. Note the one call this does NOT cover: the media download in `webhook.ts`
+ * hits `api.telegram.org/file/bot.../<path>`, which is a file fetch rather than a Bot API
+ * method and does not go through here.
  *
  * Two things about the measurement are easy to misread:
  *
@@ -171,7 +177,7 @@ async function callTelegram<T>(
   let outcome = "threw";
   try {
     const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, init);
-    const parsed = await parseTgResponse<T>(res);
+    const parsed = await parseTgResponse<T>(res, method);
     outcome = parsed.ok ? "ok" : parsed.kind;
     return parsed;
   } finally {
@@ -179,7 +185,7 @@ async function callTelegram<T>(
   }
 }
 
-async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
+async function parseTgResponse<T>(res: Response, method?: string): Promise<TgResult<T>> {
   const data = (await res.json().catch(() => null)) as {
     ok?: boolean;
     result?: T;
@@ -220,6 +226,24 @@ async function parseTgResponse<T>(res: Response): Promise<TgResult<T>> {
       kind: "topic_not_modified",
       response: data ?? undefined,
     };
+  }
+
+  if (errorCode === undefined && res.status === 200) {
+    // The one shape that reaches the daemon as a 502 with no Telegram code: HTTP 200, headers
+    // delivered, body unparseable or truncated. Telegram has therefore already committed the
+    // send, so every retry of it is a guaranteed duplicate -- but the retry is still correct,
+    // because the alternative (treating it as permanent) is what misfiled a notification in
+    // pigeon-bit4.
+    //
+    // This warn exists to MEASURE that, not to change it (pigeon-jahv). The concern was that a
+    // persistent occurrence could retry ~720 times in the 24h age cap. Nothing has ever been
+    // observed doing it, and a systemic body-truncation fault would hit every send rather than
+    // one row. If this line ever shows the same notification twice in a row, the bead to
+    // reopen is pigeon-jahv.
+    console.warn("[worker] telegram unparseable 200 (send may have succeeded)", {
+      method,
+      hasBody: data !== null,
+    });
   }
 
   return {

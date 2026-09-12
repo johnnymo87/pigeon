@@ -486,7 +486,13 @@ export async function handleSendNotification(
           messageThreadId,
           reason: "recreate_failed",
         });
-        relocationReason = "recreate_failed";
+        // Keep the inner reason: "the topic could not be recreated" and "recreating it timed
+        // out waiting for a peer" are different failures wearing the same name.
+        const innerReason =
+          retryTopicRes.ok && retryTopicRes.messageThreadId === null
+            ? retryTopicRes.reason
+            : undefined;
+        relocationReason = innerReason ? `recreate_failed:${innerReason}` : "recreate_failed";
       }
       messageThreadId = recreatedThreadId;
       topicJustCreated =

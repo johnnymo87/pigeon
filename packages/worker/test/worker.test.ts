@@ -12251,7 +12251,14 @@ describe("per-call Telegram timing (pigeon-malt)", () => {
 
 describe("relocation alert (pigeon-t5bd)", () => {
   const topicChatId = String(CHAT_ID_NUM);
-  const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+  // The alert destination must differ from the chat being notified, or every assertion about
+  // WHERE the alert went is a tautology -- in the default test env they are the same id.
+  const alertChatId = "555000111";
+  const testEnv = {
+    ...env,
+    TELEGRAM_TOPICS_ENABLED: "true",
+    ALLOWED_CHAT_IDS: `${alertChatId},${topicChatId}`,
+  } as Env;
 
   beforeEach(() => {
     fetchMock.activate();
@@ -12266,8 +12273,13 @@ describe("relocation alert (pigeon-t5bd)", () => {
     vi.restoreAllMocks();
   });
 
-  function interceptSend(handler: (body: any) => unknown) {
-    fetchMock
+  // Persisting matters for the negative tests. With a single-shot interceptor, a spurious
+  // alert would find no mock, undici would reject, alertRelocation would swallow the error,
+  // and "expect no alert" would pass for the wrong reason -- i.e. it would still pass if the
+  // guard were deleted. Persisting means a spurious second send is CAPTURED, so the count
+  // assertion can see it.
+  function interceptSend(handler: (body: any) => unknown, persist = false) {
+    const i = fetchMock
       .get("https://api.telegram.org")
       .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
       .reply((opts: any) => {
@@ -12278,6 +12290,7 @@ describe("relocation alert (pigeon-t5bd)", () => {
           responseOptions: { headers: { "Content-Type": "application/json" } },
         };
       });
+    if (persist) i.persist();
   }
 
   async function notify(sessionId: string) {
@@ -12327,8 +12340,11 @@ describe("relocation alert (pigeon-t5bd)", () => {
     expect(alert).toBeDefined();
     expect(alert.text).toContain(sessionId);
     expect(alert.text).toContain("send_failed");
-    // The alert is a DM to the operator, never threaded into the forum it is reporting on.
+    // The alert goes to the operator's own chat, never into the forum it is reporting on.
+    expect(String(alert.chat_id)).toBe(alertChatId);
     expect(alert.message_thread_id).toBeUndefined();
+    // ...and the notification itself still went to the forum chat.
+    expect(String(sent[0].chat_id)).toBe(topicChatId);
   });
 
   it("alerts on poll_exhausted, the path the intended/actual columns CANNOT see", async () => {
@@ -12379,9 +12395,10 @@ describe("relocation alert (pigeon-t5bd)", () => {
     interceptSend((b) => {
       sent.push(b);
       return { ok: true, result: { message_id: 7730 } };
-    });
+    }, true);
 
     expect((await notify(sessionId)).status).toBe(200);
+    expect(sent).toHaveLength(1);
     expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
   });
 
@@ -12393,7 +12410,7 @@ describe("relocation alert (pigeon-t5bd)", () => {
     interceptSend((b) => {
       sent.push(b);
       return { ok: true, result: { message_id: 7740 } };
-    });
+    }, true);
 
     const res = await handleSendNotification(
       env.DB,
@@ -12410,6 +12427,7 @@ describe("relocation alert (pigeon-t5bd)", () => {
       }),
     );
     expect(res.status).toBe(200);
+    expect(sent).toHaveLength(1);
     expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
   });
 
@@ -12447,5 +12465,50 @@ describe("relocation alert (pigeon-t5bd)", () => {
 
     expect(sent).toBe(false);
     expect(errSpy.mock.calls.some((c) => String(c[0]).includes("relocation alert"))).toBe(true);
+  });
+});
+
+// ─── Unparseable 200 base rate (pigeon-jahv) ─────────────────────────────
+
+describe("unparseable 200 measurement (pigeon-jahv)", () => {
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    try {
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    } catch {}
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+    vi.restoreAllMocks();
+  });
+
+  it("warns when Telegram returns 200 with a body that yields no error_code", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, "<html>truncated", { headers: { "Content-Type": "text/html" } });
+
+    const res = await sendMessage("tok", { chatId: 1, text: "hi" });
+    expect(res.ok).toBe(false);
+
+    const hit = warnSpy.mock.calls.find((c) => String(c[0]).includes("unparseable 200"));
+    expect(hit).toBeDefined();
+    expect(hit![1]).toMatchObject({ method: "sendMessage" });
+  });
+
+  it("does not warn for an ordinary Telegram error that carries a code", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request" }), {
+        headers: { "Content-Type": "application/json" },
+      });
+
+    await sendMessage("tok", { chatId: 1, text: "hi" });
+    expect(warnSpy.mock.calls.find((c) => String(c[0]).includes("unparseable 200"))).toBeUndefined();
   });
 });
