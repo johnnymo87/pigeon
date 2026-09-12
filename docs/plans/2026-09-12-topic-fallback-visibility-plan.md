@@ -2,9 +2,12 @@
 
 **Beads:** `pigeon-bit4` (P1, this plan). `pigeon-kyhf` folds into it — see §Cause.
 **Scope:** `packages/worker` (deploys centrally, no per-machine restart).
-**Status:** plan, pre-implementation. Two `adversarial-reviewer-fable` rounds; round 2 returned
-SHIP WITH NAMED EDITS and a reorder. Every named edit is folded in and marked. **Do not restore the
-original ordering** — it led with the least-established change.
+**Status:** S1-S3 implemented in PR #142 (branch `bit4-topic-fallback`). The two prod `ALTER`s are
+applied. Remaining: merge, deploy, then the S4 verification query. S5 deliberately not built.
+Three `adversarial-reviewer-fable` rounds — two on this plan (round 2: SHIP WITH NAMED EDITS and a
+reorder) and one on the built diff (SHIP WITH NAMED EDITS; see §Implementation notes). Every named
+edit is folded in. **Do not restore the original ordering** — it led with the least-established
+change.
 **TDD:** failing test first, every step.
 
 ## The incident
@@ -263,3 +266,29 @@ Token and chat id: `/run/secrets/telegram_bot_token`, `/run/secrets/telegram_cha
 `/nix/store/23991vk4j7h9wqg7d1y5gvlyn9c0cywr-sqlite-3.53.3-bin/bin/sqlite3` and open the daemon DB
 **read-only** (`"file:/home/dev/projects/pigeon/packages/daemon/data/pigeon-daemon.db?mode=ro"`) —
 it has ~15 concurrent writers.
+
+## Implementation notes (what the build changed about the plan)
+
+Three things the plan got wrong or left out, found while building and in the review of the diff.
+
+**The lost-CAS warn site is deterministically testable.** The plan (and the S2 commit message)
+said it needed an isolate-level race and would be inspection-only. It does not: `finalize`'s CAS
+also returns false when the reservation row has been **deleted**, so an injected `tgClient` whose
+`createForumTopic` deletes the row reaches the branch in a plain unit test. All six sites have
+tests. Treat "needs a race" as a claim to check, not a reason to skip.
+
+**The media wrappers threw the error away.** `sendTelegramPhoto` / `sendTelegramDocument` collapsed
+every failure to a bare `{ ok: false }`, so the warn S2 added to that loop had nothing to report.
+Both now carry the Telegram detail through. A logging change is worth nothing if the thing it logs
+was discarded one frame down.
+
+**Two 502 shapes, not one.** A Telegram gateway error arrives as HTML or an empty body and takes
+the `res.status` branch of `parseTgResponse`, not the `data.error_code` branch. The first test
+covered only the JSON shape — i.e. not the shape the incident actually produced. Both are tested,
+and both now assert `details.error_code`, which is what keeps a future change from routing a 502
+into the daemon's `strip_entities` rule.
+
+Also from the review, and now enforced in `d1-schema.sql`: the `(intended, actual)` pair is **not**
+a complete relocation count. The three `topic-manager.ts` paths never produce an intended id, so
+they record NULL/NULL and are indistinguishable from `threaded:false`. Their `console.warn` is the
+only signal for them, and the S4 query undercounts by exactly that set.
