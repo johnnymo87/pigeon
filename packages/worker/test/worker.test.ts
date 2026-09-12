@@ -107,6 +107,8 @@ const d1SchemaStatements = [
     session_id      TEXT NOT NULL,
     token           TEXT NOT NULL,
     notification_id TEXT,
+    intended_thread_id INTEGER,
+    actual_thread_id   INTEGER,
     created_at      INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
   )`,
@@ -3451,6 +3453,8 @@ describe("d1-ops", () => {
       session_id      TEXT NOT NULL,
       token           TEXT NOT NULL,
       notification_id TEXT,
+      intended_thread_id INTEGER,
+      actual_thread_id   INTEGER,
       created_at      INTEGER NOT NULL,
       PRIMARY KEY (chat_id, message_id)
     )`,
@@ -8587,6 +8591,153 @@ describe("topics module and topicName", () => {
           ),
         ).toBe(true);
       } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // pigeon-bit4 / S3: one column cannot express this. message_thread_id IS NULL is already
+    // five-way ambiguous (relocated / threaded:false / topics off / no topic resolved / media
+    // row), so placement is recorded as the pair (intended, actual).
+    it("records intended and actual thread ids as equal on a normal threaded send", async () => {
+      const sessionId = "ses_bit4_cols_threaded";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · cols", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 540, now });
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, { ok: true, result: { message_id: 9401 } }, {
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const res = await handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: topicChatId,
+            text: "threaded",
+            title: "cols",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const row = await env.DB.prepare(
+        "SELECT intended_thread_id, actual_thread_id FROM messages WHERE message_id = ?",
+      )
+        .bind(9401)
+        .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
+      expect(row).toMatchObject({ intended_thread_id: 540, actual_thread_id: 540 });
+    });
+
+    it("records intended set and actual null when a notification is relocated to General", async () => {
+      const sessionId = "ses_bit4_cols_relocated";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reloc", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 541, now });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }, {
+            headers: { "Content-Type": "application/json" },
+          });
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: true, result: { message_id: 9402 } }, {
+            headers: { "Content-Type": "application/json" },
+          });
+
+        const res = await handleSendNotification(
+          env.DB,
+          testEnv,
+          new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              sessionId,
+              chatId: topicChatId,
+              text: "relocated",
+              title: "reloc",
+              dir: "pigeon",
+              threaded: true,
+            }),
+          }),
+        );
+        expect(res.status).toBe(200);
+
+        const row = await env.DB.prepare(
+          "SELECT intended_thread_id, actual_thread_id FROM messages WHERE message_id = ?",
+        )
+          .bind(9402)
+          .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
+        // This pair -- intended non-null, actual null -- IS the definition of a relocation,
+        // and is the query that will finally give us a relocation rate.
+        expect(row).toMatchObject({ intended_thread_id: 541, actual_thread_id: null });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // The columns are added to prod by a manual ALTER. If the code ships first, or the ALTER
+    // is rolled back, the write MUST degrade to a warn. An INSERT that referenced a missing
+    // column would throw AFTER Telegram already accepted the message -> 503 -> the daemon
+    // retries a message that was in fact delivered, every 5-120s for 24h.
+    it("still inserts the message row, and warns, when the placement columns do not exist", async () => {
+      const sessionId = "ses_bit4_cols_missing";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await env.DB.prepare("ALTER TABLE messages DROP COLUMN intended_thread_id").run();
+      try {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: true, result: { message_id: 9403 } }, {
+            headers: { "Content-Type": "application/json" },
+          });
+
+        const res = await handleSendNotification(
+          env.DB,
+          { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env,
+          new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              sessionId,
+              chatId: topicChatId,
+              text: "no columns",
+            }),
+          }),
+        );
+
+        // The notification is delivered and acknowledged; only the bookkeeping is lost.
+        expect(res.status).toBe(200);
+        const row = await env.DB.prepare("SELECT session_id FROM messages WHERE message_id = ?")
+          .bind(9403)
+          .first<{ session_id: string }>();
+        expect(row?.session_id).toBe(sessionId);
+        expect(
+          warnSpy.mock.calls.some(
+            (c) => typeof c[0] === "string" && c[0].includes("thread placement not recorded"),
+          ),
+        ).toBe(true);
+      } finally {
+        await env.DB.prepare("ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER").run();
         warnSpy.mockRestore();
       }
     });

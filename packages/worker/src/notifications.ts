@@ -67,6 +67,43 @@ function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
   }
 }
 
+/**
+ * Record where a notification was meant to go and where it actually went.
+ *
+ * Separate from the INSERT and never allowed to throw: see the call site. A failure here
+ * costs one row of forensics, while a failure in the INSERT costs a duplicate storm.
+ */
+async function recordThreadPlacement(
+  db: D1Database,
+  opts: {
+    chatId: string | number;
+    messageId: number;
+    sessionId: string;
+    intendedThreadId: number | undefined;
+    actualThreadId: number | undefined;
+  },
+): Promise<void> {
+  try {
+    await db
+      .prepare(
+        "UPDATE messages SET intended_thread_id = ?, actual_thread_id = ? WHERE chat_id = ? AND message_id = ?",
+      )
+      .bind(
+        opts.intendedThreadId ?? null,
+        opts.actualThreadId ?? null,
+        String(opts.chatId),
+        opts.messageId,
+      )
+      .run();
+  } catch (err) {
+    console.warn("[worker] thread placement not recorded", {
+      sessionId: opts.sessionId,
+      messageId: opts.messageId,
+      error: String(err),
+    });
+  }
+}
+
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
@@ -159,6 +196,14 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
   return null;
 }
 
+/**
+ * Media send outcome. The failure arm carries the Telegram error: collapsing it to a bare
+ * `{ ok: false }` is what made a dropped attachment unexplainable (pigeon-bit4).
+ */
+type MediaSendResult =
+  | { ok: true; result: { message_id: number } }
+  | { ok: false; details: unknown };
+
 async function sendTelegramPhoto(
   tg: TelegramClient,
   chatId: string | number,
@@ -166,7 +211,7 @@ async function sendTelegramPhoto(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
-): Promise<{ ok: boolean; result?: { message_id: number } }> {
+): Promise<MediaSendResult> {
   const res = await tg.sendPhoto({
     chatId,
     photo: photoBlob,
@@ -177,7 +222,7 @@ async function sendTelegramPhoto(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false };
+  return { ok: false, details: getTelegramErrorDetails(res) };
 }
 
 async function sendTelegramDocument(
@@ -187,7 +232,7 @@ async function sendTelegramDocument(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
-): Promise<{ ok: boolean; result?: { message_id: number } }> {
+): Promise<MediaSendResult> {
   const res = await tg.sendDocument({
     chatId,
     document: documentBlob,
@@ -198,7 +243,7 @@ async function sendTelegramDocument(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false };
+  return { ok: false, details: getTelegramErrorDetails(res) };
 }
 
 /**
@@ -273,6 +318,10 @@ export async function handleSendNotification(
     // whether THIS request created the topic so the pin can be cleared after the send that
     // caused it (pigeon-ud6s).
     let topicJustCreated = false;
+    // What resolveTopic asked for, kept separate from messageThreadId because that variable is
+    // mutated by the recreate and relocation paths. The pair is recorded on the message row
+    // (pigeon-bit4) so a relocation is queryable after the fact instead of invisible.
+    let intendedThreadId: number | undefined;
 
     if (topicsEnabled(env) && threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
@@ -294,6 +343,7 @@ export async function handleSendNotification(
 
       if (topicRes.ok && topicRes.messageThreadId !== null) {
         messageThreadId = topicRes.messageThreadId;
+        intendedThreadId = topicRes.messageThreadId;
         topicJustCreated = topicRes.created === true;
       }
     }
@@ -454,6 +504,18 @@ export async function handleSendNotification(
         .run(),
     );
 
+    // Best-effort, and deliberately NOT part of the INSERT above. The INSERT runs after
+    // Telegram has already accepted the message, so a missing column there would throw ->
+    // withD1 -> 503 -> the daemon retries a message that WAS delivered, every 5-120s for 24h.
+    // As a separate UPDATE the worst case is a null column and one warn.
+    await recordThreadPlacement(db, {
+      chatId,
+      messageId,
+      sessionId,
+      intendedThreadId,
+      actualThreadId: messageThreadId,
+    });
+
     // Send media as replies to the text message
     if (media && media.length > 0) {
       for (const item of media) {
@@ -475,13 +537,22 @@ export async function handleSendNotification(
               )
               .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
               .run();
+            // Media follows the text's placement, so a relocated notification's attachments
+            // are queryable as relocated too.
+            await recordThreadPlacement(db, {
+              chatId,
+              messageId: mediaResult.result.message_id,
+              sessionId,
+              intendedThreadId,
+              actualThreadId: messageThreadId,
+            });
           } else if (!mediaResult.ok) {
             // Best-effort, but no longer silent (pigeon-bit4).
             console.warn("[worker] media attachment not delivered", {
               sessionId,
               messageThreadId,
               filename: item.filename,
-              details: getTelegramErrorDetails(mediaResult),
+              details: mediaResult.details,
             });
           }
         } catch (err) {

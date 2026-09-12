@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS messages (
   session_id      TEXT NOT NULL,
   token           TEXT NOT NULL,
   notification_id TEXT,
+  -- Where the notification was MEANT to go vs where it actually went (pigeon-bit4).
+  -- intended IS NOT NULL AND actual IS NULL == the message was relocated to General.
+  intended_thread_id INTEGER,
+  actual_thread_id   INTEGER,
   created_at      INTEGER NOT NULL,
   PRIMARY KEY (chat_id, message_id)
 );
