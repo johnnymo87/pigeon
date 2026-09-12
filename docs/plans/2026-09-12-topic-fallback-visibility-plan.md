@@ -214,3 +214,52 @@ plus a real conflict with the topic reaper.
 This file is the durable artifact; the Workers Logs table and the probe results are quoted here
 because both sources expire. A resuming session needs only: this plan, `bd show pigeon-bit4`, and a
 worktree. Start at **S1**.
+
+## Appendix — how the evidence above was obtained
+
+Recorded because a fresh session cannot reconstruct these, and because **both sources expire**
+(Workers Logs ~2026-09-18; `messages` rows reap with their sessions, ~7d).
+
+**Workers Logs.** `[observability] enabled = true, head_sampling_rate = 1` in `wrangler.toml:22-24`.
+`wrangler` has no historical query (only live `tail`), so go at the API directly. The token is on
+cloudbox at `/run/secrets/cloudflare_api_token` (needs `sudo cat`); account
+`3b6b247e124787ccf95772b6432fefe4`:
+
+```bash
+curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/observability/telemetry/query" \
+  -H "Authorization: Bearer $CF" -H 'content-type: application/json' \
+  -d '{"queryId":"q","timeframe":{"from":<ms>,"to":<ms>},
+       "parameters":{"datasets":["cloudflare-workers"],
+         "filters":[{"key":"$metadata.message","operation":"includes",
+                     "value":"notifications/send","type":"string"}]},
+       "limit":50,"view":"events"}'
+```
+
+Read `$workers.wallTimeMs`, `.cpuTimeMs`, `.outcome`, and `event.response.status` off each event.
+
+**Two traps in that API, both hit while gathering the table above.** A *wide* timeframe is
+server-sampled — a 7-day query returned 20 events and claimed one slow invocation, while a 20-minute
+query over the same data returned all 17 and eight slow ones. And a `$workers.wallTimeMs` `gt` filter
+silently failed to match events that a narrow unfiltered query proves are there. **Query narrow
+windows and filter client-side**; do not compute a rate from a wide window.
+
+**Which thread a message actually landed in.** There is no read-a-message-by-id call in the Bot API.
+Reply to it and read the echo:
+
+```bash
+curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" -H 'content-type: application/json' \
+  -d '{"chat_id":"<chat>","reply_to_message_id":<id>,"allow_sending_without_reply":false,"text":"probe"}'
+```
+
+The response carries `result.reply_to_message.message_thread_id` (**null means General**), plus
+`.date` and `.text`, which is how the misfiled message was identified. `allow_sending_without_reply:false`
+matters — without it a deleted target silently posts a normal message and you learn nothing.
+**Delete the probe afterwards** (`deleteMessage`), and prefer `copyMessage` into the correct thread
+if the point is to give a human back a message they never saw.
+
+Token and chat id: `/run/secrets/telegram_bot_token`, `/run/secrets/telegram_chat_id`.
+
+**Local sqlite.** No `sqlite3` on PATH on cloudbox; use
+`/nix/store/23991vk4j7h9wqg7d1y5gvlyn9c0cywr-sqlite-3.53.3-bin/bin/sqlite3` and open the daemon DB
+**read-only** (`"file:/home/dev/projects/pigeon/packages/daemon/data/pigeon-daemon.db?mode=ro"`) —
+it has ~15 concurrent writers.
