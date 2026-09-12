@@ -1,5 +1,5 @@
 import { verifyApiKey, unauthorized } from "./auth";
-import { createTelegramClient, getTelegramErrorDetails, TelegramClient } from "./telegram";
+import { createTelegramClient, getTelegramErrorDetails, TelegramClient, TgResult } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { withD1, StorageError } from "./d1";
@@ -32,6 +32,79 @@ interface MessageRow {
   token: string;
   notification_id: string | null;
   created_at: number;
+}
+
+/**
+ * Is a failed topic send PERMANENT — i.e. is the topic itself unusable, such that retrying into
+ * it can only fail again?
+ *
+ * Only a permanent failure justifies relocating a notification to General. A transient one
+ * (5xx, or an outcome we cannot classify) must surface as a 502 so the daemon's outbox retries
+ * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
+ * General and was never seen (pigeon-bit4).
+ *
+ * `errorCode === undefined` means a 200 whose body did not parse (telegram.ts parseTgResponse),
+ * which most likely means Telegram PROCESSED the send. Treating it as transient risks a
+ * duplicate in the correct topic; treating it as permanent guarantees a misfiled copy. The
+ * duplicate is the better-placed risk.
+ */
+function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
+  if (result.ok) return false;
+  switch (result.kind) {
+    case "rate_limited":
+      // Never reached (callers exclude it first), but 429 is explicitly transient.
+      return false;
+    case "error":
+      return (
+        typeof result.errorCode === "number" &&
+        result.errorCode >= 400 &&
+        result.errorCode < 500
+      );
+    default:
+      // thread_not_found reaching the fallback means the recreate-and-retry above already
+      // failed; topic_not_modified cannot come from sendMessage. Both are 4xx-class.
+      return true;
+  }
+}
+
+/**
+ * Record where a notification was meant to go and where it actually went.
+ *
+ * Separate from the INSERT and never allowed to throw: see the call site. A failure here
+ * costs one row of forensics, while a failure in the INSERT costs a duplicate storm.
+ */
+async function recordThreadPlacement(
+  db: D1Database,
+  opts: {
+    chatId: string | number;
+    messageId: number;
+    sessionId: string;
+    intendedThreadId: number | undefined;
+    actualThreadId: number | undefined;
+  },
+): Promise<void> {
+  // Nothing to record: no topic was ever intended (topics disabled, threaded:false) and none
+  // was used. The row already holds NULL/NULL, so skip the write entirely.
+  if (opts.intendedThreadId === undefined && opts.actualThreadId === undefined) return;
+  try {
+    await db
+      .prepare(
+        "UPDATE messages SET intended_thread_id = ?, actual_thread_id = ? WHERE chat_id = ? AND message_id = ?",
+      )
+      .bind(
+        opts.intendedThreadId ?? null,
+        opts.actualThreadId ?? null,
+        String(opts.chatId),
+        opts.messageId,
+      )
+      .run();
+  } catch (err) {
+    console.warn("[worker] thread placement not recorded", {
+      sessionId: opts.sessionId,
+      messageId: opts.messageId,
+      error: String(err),
+    });
+  }
 }
 
 const json = (body: unknown, status = 200) =>
@@ -126,6 +199,14 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
   return null;
 }
 
+/**
+ * Media send outcome. The failure arm carries the Telegram error: collapsing it to a bare
+ * `{ ok: false }` is what made a dropped attachment unexplainable (pigeon-bit4).
+ */
+type MediaSendResult =
+  | { ok: true; result: { message_id: number } }
+  | { ok: false; details: unknown };
+
 async function sendTelegramPhoto(
   tg: TelegramClient,
   chatId: string | number,
@@ -133,7 +214,7 @@ async function sendTelegramPhoto(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
-): Promise<{ ok: boolean; result?: { message_id: number } }> {
+): Promise<MediaSendResult> {
   const res = await tg.sendPhoto({
     chatId,
     photo: photoBlob,
@@ -144,7 +225,7 @@ async function sendTelegramPhoto(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false };
+  return { ok: false, details: getTelegramErrorDetails(res) };
 }
 
 async function sendTelegramDocument(
@@ -154,7 +235,7 @@ async function sendTelegramDocument(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
-): Promise<{ ok: boolean; result?: { message_id: number } }> {
+): Promise<MediaSendResult> {
   const res = await tg.sendDocument({
     chatId,
     document: documentBlob,
@@ -165,7 +246,7 @@ async function sendTelegramDocument(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false };
+  return { ok: false, details: getTelegramErrorDetails(res) };
 }
 
 /**
@@ -240,6 +321,10 @@ export async function handleSendNotification(
     // whether THIS request created the topic so the pin can be cleared after the send that
     // caused it (pigeon-ud6s).
     let topicJustCreated = false;
+    // What resolveTopic asked for, kept separate from messageThreadId because that variable is
+    // mutated by the recreate and relocation paths. The pair is recorded on the message row
+    // (pigeon-bit4) so a relocation is queryable after the fact instead of invisible.
+    let intendedThreadId: number | undefined;
 
     if (topicsEnabled(env) && threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
@@ -261,6 +346,7 @@ export async function handleSendNotification(
 
       if (topicRes.ok && topicRes.messageThreadId !== null) {
         messageThreadId = topicRes.messageThreadId;
+        intendedThreadId = topicRes.messageThreadId;
         topicJustCreated = topicRes.created === true;
       }
     }
@@ -305,10 +391,20 @@ export async function handleSendNotification(
       // The media loop below reads messageThreadId; leaving it pointing at the deleted
       // thread silently dropped every attachment (sendPhoto fails, the item is skipped
       // with no retry and no log).
-      messageThreadId =
+      const recreatedThreadId =
         retryTopicRes.ok && retryTopicRes.messageThreadId !== null
           ? retryTopicRes.messageThreadId
           : undefined;
+      if (recreatedThreadId === undefined) {
+        // The topic could not be recreated, so this notification is about to go to General
+        // under a different code path than the relocation below (pigeon-bit4: was silent).
+        console.warn("[worker] relocating notification to General", {
+          sessionId,
+          messageThreadId,
+          reason: "recreate_failed",
+        });
+      }
+      messageThreadId = recreatedThreadId;
       topicJustCreated =
         retryTopicRes.ok &&
         retryTopicRes.messageThreadId !== null &&
@@ -324,17 +420,28 @@ export async function handleSendNotification(
       });
     }
 
-    // Non-429 topic failure fallback to General.
-    // If sending to a topic failed with a non-429 error (e.g. rights revoked, forum mode off,
-    // chat is not a forum, topic closed), fall back to General (send without messageThreadId).
-    // Never drop a notification. 429 errors must NOT fall back here.
+    // PERMANENT topic failure -> fall back to General.
+    // If the topic itself is unusable (rights revoked, forum mode off, chat is not a forum),
+    // retrying can only fail again, so General is better than dropping the notification.
+    //
+    // A TRANSIENT failure (5xx, or an unclassifiable outcome) deliberately does NOT fall back:
+    // it returns 502 below and the daemon's outbox retries into the correct topic. Relocating
+    // on a transient error silently moved a user's answer to General, where it was never seen
+    // (pigeon-bit4). 429 is handled separately and must not reach here either.
     if (
       !telegramResult.ok &&
       telegramResult.kind !== "rate_limited" &&
-      messageThreadId !== undefined
+      messageThreadId !== undefined &&
+      isPermanentTopicFailure(telegramResult)
     ) {
       // Clear the thread for everything downstream: if the topic would not take the text
       // it will not take the attachments either, so the media loop must follow to General.
+      console.warn("[worker] relocating notification to General", {
+        sessionId,
+        messageThreadId,
+        reason: "send_failed",
+        details: getTelegramErrorDetails(telegramResult),
+      });
       messageThreadId = undefined;
       telegramResult = await tg.sendMessage({
         chatId,
@@ -400,6 +507,18 @@ export async function handleSendNotification(
         .run(),
     );
 
+    // Best-effort, and deliberately NOT part of the INSERT above. The INSERT runs after
+    // Telegram has already accepted the message, so a missing column there would throw ->
+    // withD1 -> 503 -> the daemon retries a message that WAS delivered, every 5-120s for 24h.
+    // As a separate UPDATE the worst case is a null column and one warn.
+    await recordThreadPlacement(db, {
+      chatId,
+      messageId,
+      sessionId,
+      intendedThreadId,
+      actualThreadId: messageThreadId,
+    });
+
     // Send media as replies to the text message
     if (media && media.length > 0) {
       for (const item of media) {
@@ -421,8 +540,31 @@ export async function handleSendNotification(
               )
               .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
               .run();
+            // Media follows the text's placement, so a relocated notification's attachments
+            // are queryable as relocated too.
+            await recordThreadPlacement(db, {
+              chatId,
+              messageId: mediaResult.result.message_id,
+              sessionId,
+              intendedThreadId,
+              actualThreadId: messageThreadId,
+            });
+          } else if (!mediaResult.ok) {
+            // Best-effort, but no longer silent (pigeon-bit4).
+            console.warn("[worker] media attachment not delivered", {
+              sessionId,
+              messageThreadId,
+              filename: item.filename,
+              details: mediaResult.details,
+            });
           }
-        } catch {
+        } catch (err) {
+          console.warn("[worker] media attachment not delivered", {
+            sessionId,
+            messageThreadId,
+            filename: item.filename,
+            error: String(err),
+          });
           continue; // Best-effort: text already sent
         }
       }
