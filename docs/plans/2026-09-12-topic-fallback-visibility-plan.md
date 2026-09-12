@@ -142,9 +142,17 @@ skew the suite cannot catch.
 
 `AbortSignal.timeout` on **`sendMessage` only**, with the value taken from the observed tail
 (episode max 65.7s) plus margin — **90s**, not the 20s the first draft proposed. At 20s it would
-have aborted seven sends in fifteen minutes that went on to succeed, turning correct-but-slow
-deliveries into duplicates. At 90s it never fires on the observed mode and exists only to stop an
-indefinite hang.
+have aborted working deliveries, turning correct-but-slow sends into duplicates. At 90s it never
+fires on the observed mode and exists only to stop an indefinite hang.
+
+Be precise about that case, because the first version of this paragraph overstated it as "seven
+sends that went on to succeed". Seven invocations exceeded 20s; **three were probed and confirmed
+correct**, two landed in General, and two were never probed. So 20s would have broken at least
+three working deliveries — while *improving* the outcome for 20746, which a timeout would have
+retried into its topic. The evidence cuts both ways; it just cuts harder against 20s. Note also
+that `wallTimeMs` covers a whole invocation (up to two `sendMessage` calls plus D1, sometimes
+`createForumTopic`), so 65.7s is an **upper bound** on any single `sendMessage`, not its measured
+latency.
 
 Scoped to `sendMessage` deliberately: `sendPhoto`/`sendDocument` stream up to 50MB from R2, and a
 `createForumTopic` timeout feeds `runCreatorFlow` → `:224` → General silently *and* can orphan a
@@ -155,9 +163,23 @@ Two things it must carry:
 - **A `timeout` arm in `getTelegramErrorDetails`.** Today that function synthesizes
   `error_code: 400` for any kind that is not `error`/`rate_limited` (`telegram.ts:97-111`). A new
   `kind:"timeout"` would therefore produce a 502 whose body says 400 → daemon rule 6
-  (`delivery-policy.ts:183-190`) → `strip_entities`, which stops always have (`app.ts:926`). Every
-  timeout would permanently strip formatting *and* charge an attempt (`outbox-sender.ts:641,652`),
-  so ten stalls would terminal-drop the message. Omit the code, or use 504.
+  (`delivery-policy.ts:183-190`) → `strip_entities`, which stops always have (`app.ts:926`). Omit
+  the code, or use 504.
+
+  **Correction (post-merge, from an adversarial review of the record).** An earlier draft of this
+  bullet said every timeout would "terminal-drop the message" after ten stalls. It would not.
+  `strip_entities` charges one attempt *and deletes the entities from the stored payload*
+  (`outbox-sender.ts:632-637`), so `payloadHasEntities` (`:483`) is false on the next pass, rule 6
+  stops matching, and the row retries as a transport failure with `countAttempt=false` until the
+  24h age cap. The real consequence is a **permanently format-stripped message** — still worth
+  guarding against, but not a drop. `worker-health.ts:218-226` has stated this in prose the whole
+  time; the plan and the code comment contradicted each other for a week and nobody reconciled them.
+
+- **A case in `isPermanentTopicFailure`** — missed entirely by the original plan. That `switch` has
+  a `default: return true`, so a new `kind:"timeout"` is classified as a *permanent* failure and
+  relocated to General, reintroducing on every timeout the exact bug this plan fixed. Either add
+  the case, or let the timeout throw and ride the existing boundary catch to a 500, adding no new
+  kind at all — which is the safer shape.
 - **An injectable `timeoutMs`.** `AbortSignal.timeout` is native in the workerd pool and vitest fake
   timers will not drive it; a test would either hang for the real duration or pass vacuously.
 
@@ -179,6 +201,19 @@ actual null; **columns missing → the row still inserts and a warn fires**. The
 
 **S4 — deploy + verify.** `npm run --workspace @pigeon/worker deploy`; confirm both columns populate;
 query `intended IS NOT NULL AND actual IS NULL` for the first real relocation rate we have ever had.
+
+The prod `ALTER`s were applied by hand on 2026-09-12, ahead of the deploy. `d1-schema.sql` carries
+the columns only inside `CREATE TABLE IF NOT EXISTS` and there is no migration runner here, so
+**any existing database needs them applied manually**:
+
+```bash
+npx wrangler d1 execute pigeon-router --remote --command "ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER;"
+npx wrangler d1 execute pigeon-router --remote --command "ALTER TABLE messages ADD COLUMN actual_thread_id INTEGER;"
+```
+
+What S4 actually proved was thin, and the closing record should not be read as more: two
+notifications, one topic, happy path. It proves the columns are written on success. The
+**relocation** write is covered by tests only, never yet by production.
 
 **S5 — the 90s backstop (D4), optional.** Only with the `getTelegramErrorDetails` arm, the injectable
 timeout, and a `console.warn` naming the `notificationId` on fire.
