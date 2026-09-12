@@ -338,10 +338,20 @@ export async function handleSendNotification(
       // The media loop below reads messageThreadId; leaving it pointing at the deleted
       // thread silently dropped every attachment (sendPhoto fails, the item is skipped
       // with no retry and no log).
-      messageThreadId =
+      const recreatedThreadId =
         retryTopicRes.ok && retryTopicRes.messageThreadId !== null
           ? retryTopicRes.messageThreadId
           : undefined;
+      if (recreatedThreadId === undefined) {
+        // The topic could not be recreated, so this notification is about to go to General
+        // under a different code path than the relocation below (pigeon-bit4: was silent).
+        console.warn("[worker] notification relocated to General", {
+          sessionId,
+          messageThreadId,
+          reason: "recreate_failed",
+        });
+      }
+      messageThreadId = recreatedThreadId;
       topicJustCreated =
         retryTopicRes.ok &&
         retryTopicRes.messageThreadId !== null &&
@@ -373,6 +383,12 @@ export async function handleSendNotification(
     ) {
       // Clear the thread for everything downstream: if the topic would not take the text
       // it will not take the attachments either, so the media loop must follow to General.
+      console.warn("[worker] notification relocated to General", {
+        sessionId,
+        messageThreadId,
+        reason: "send_failed",
+        details: getTelegramErrorDetails(telegramResult),
+      });
       messageThreadId = undefined;
       telegramResult = await tg.sendMessage({
         chatId,
@@ -459,8 +475,22 @@ export async function handleSendNotification(
               )
               .bind(String(chatId), mediaResult.result.message_id, sessionId, token, null, Date.now())
               .run();
+          } else if (!mediaResult.ok) {
+            // Best-effort, but no longer silent (pigeon-bit4).
+            console.warn("[worker] media attachment not delivered", {
+              sessionId,
+              messageThreadId,
+              filename: item.filename,
+              details: getTelegramErrorDetails(mediaResult),
+            });
           }
-        } catch {
+        } catch (err) {
+          console.warn("[worker] media attachment not delivered", {
+            sessionId,
+            messageThreadId,
+            filename: item.filename,
+            error: String(err),
+          });
           continue; // Best-effort: text already sent
         }
       }

@@ -7184,6 +7184,44 @@ describe("topics module and topicName", () => {
       expect(res).toEqual({ ok: true, messageThreadId: null });
     });
 
+    // pigeon-bit4 / S2: poll exhaustion is a plausible cause of a misfiled notification under
+    // exactly the kind of load that produced the incident, and it returned null in silence.
+    it("poll exhaustion warns that the notification will go to General", async () => {
+      const sessionId = "ses_bit4_warn_poll_exhausted";
+      const botToken = "fake-bot-token";
+
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · exhausted",
+        now: Date.now(),
+      });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const res = await resolveTopic(env.DB, {
+          sessionId,
+          machineId: "devbox",
+          chatId: topicChatId,
+          dir: "pigeon",
+          title: "exhausted",
+          botToken,
+          delayFn: async () => {},
+          pollAttempts: 2,
+        });
+
+        expect(res).toEqual({ ok: true, messageThreadId: null });
+        const warn = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
+        );
+        expect(warn).toBeDefined();
+        expect(warn![1]).toMatchObject({ sessionId, reason: "poll_exhausted" });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("create rejects (non-429) -> reservation row gone -> next resolveTopic wins and creates", async () => {
       const sessionId = "ses_topic_create_rejects";
       const botToken = "fake-bot-token";
@@ -8378,6 +8416,179 @@ describe("topics module and topicName", () => {
 
       expect(res.status).toBe(502);
       expect(sentThreadIds).toEqual([521]);
+    });
+
+    // pigeon-bit4 / S2: every path that silently sends to General instead of the session's
+    // topic must say so in the log. The incident was undiagnosable for exactly this reason --
+    // the relocation left no trace anywhere.
+    it("permanent 4xx relocation to General emits a console.warn naming the session and thread", async () => {
+      const sessionId = "ses_bit4_warn_relocate";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · warn", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 530, now });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }, {
+            headers: { "Content-Type": "application/json" },
+          });
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: true, result: { message_id: 9301 } }, {
+            headers: { "Content-Type": "application/json" },
+          });
+
+        const res = await handleSendNotification(
+          env.DB,
+          testEnv,
+          new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              sessionId,
+              chatId: topicChatId,
+              text: "relocated",
+              title: "warn",
+              dir: "pigeon",
+              threaded: true,
+            }),
+          }),
+        );
+        expect(res.status).toBe(200);
+
+        const relocateWarn = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("relocated to General"),
+        );
+        expect(relocateWarn).toBeDefined();
+        expect(relocateWarn![1]).toMatchObject({
+          sessionId,
+          messageThreadId: 530,
+          reason: "send_failed",
+        });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("recreate-failed relocation to General emits a console.warn", async () => {
+      const sessionId = "ses_bit4_warn_recreate";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recreate", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 531, now });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        // 1st send -> thread not found, triggering the recreate path.
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: false, error_code: 400, description: "Bad Request: message thread not found" }, {
+            headers: { "Content-Type": "application/json" },
+          });
+        // createForumTopic fails non-429 -> resolveTopic returns null -> General.
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+          .reply(200, { ok: false, error_code: 400, description: "Bad Request: not enough rights" }, {
+            headers: { "Content-Type": "application/json" },
+          });
+        // Retry send, now unthreaded -> succeeds.
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: true, result: { message_id: 9302 } }, {
+            headers: { "Content-Type": "application/json" },
+          });
+
+        const res = await handleSendNotification(
+          env.DB,
+          testEnv,
+          new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              sessionId,
+              chatId: topicChatId,
+              text: "recreate then general",
+              title: "recreate",
+              dir: "pigeon",
+              threaded: true,
+            }),
+          }),
+        );
+        expect(res.status).toBe(200);
+
+        const warns = warnSpy.mock.calls.filter((c) => typeof c[0] === "string");
+        expect(
+          warns.some((c) => (c[0] as string).includes("topic creation failed")),
+        ).toBe(true);
+        expect(
+          warns.some(
+            (c) =>
+              (c[0] as string).includes("relocated to General") &&
+              (c[1] as Record<string, unknown>)?.reason === "recreate_failed",
+          ),
+        ).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("media attachment failure emits a console.warn instead of being silently skipped", async () => {
+      const sessionId = "ses_bit4_warn_media";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+          .reply(200, { ok: true, result: { message_id: 9303 } }, {
+            headers: { "Content-Type": "application/json" },
+          });
+        // sendPhoto fails -> today the loop swallows it with `continue`.
+        fetchMock
+          .get("https://api.telegram.org")
+          .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
+          .reply(200, { ok: false, error_code: 400, description: "Bad Request: PHOTO_INVALID_DIMENSIONS" }, {
+            headers: { "Content-Type": "application/json" },
+          });
+
+        const mediaKey = `outbound/${Date.now()}-bit4/photo.png`;
+        await env.MEDIA.put(mediaKey, new Uint8Array([1, 2, 3]));
+
+        const res = await handleSendNotification(
+          env.DB,
+          { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env,
+          new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              sessionId,
+              chatId: topicChatId,
+              text: "with media",
+              media: [{ key: mediaKey, mime: "image/png", filename: "photo.png" }],
+            }),
+          }),
+        );
+        expect(res.status).toBe(200);
+
+        expect(
+          warnSpy.mock.calls.some(
+            (c) => typeof c[0] === "string" && c[0].includes("media attachment not delivered"),
+          ),
+        ).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     it("429 topic sendMessage failure -> returns 429 with retryAfter and does NOT fall back to General", async () => {
