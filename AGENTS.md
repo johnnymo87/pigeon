@@ -317,7 +317,9 @@ Four things are deliberately never mirrored: subagent sessions, parts marked `sy
 
 Both remaining leaks fail toward silence rather than duplicates (an unconsumed count suppresses an identical TUI prompt for ≤15 min; an undiscovered session drops its mirror). That direction is deliberate — a missing post is a gap, a duplicate post is noise in every topic on the machine.
 
-**Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7%` footer showing the cumulative context-window usage reported by the latest assistant message and its percentage of the model's context window. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved.
+**Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7% · 🧠 claude-opus-5` footer showing the cumulative context-window usage reported by the latest assistant message, its percentage of the model's context window, and the model that produced it. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved. The model id comes off the same snapshot as the counts, so it is the model that actually answered rather than the session's configured default (they differ after a mid-turn `/model` override).
+
+**No swipe-reply hint.** Notifications used to end with `↩️ Swipe-reply to respond` (and questions with `↩️ Swipe-reply for custom answer`). Both are gone — swipe-reply itself is unchanged and remains the primary answer path, including the custom-answer path for a question whose `custom !== false`. Nothing reads `QuestionInfoData.custom` for rendering any more.
 
 **Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
 

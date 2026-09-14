@@ -265,7 +265,7 @@ describe("TokenTracker.getFooter", () => {
       modelID: "claude-sonnet-4-5",
     })
     const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
-    expect(footer).toBe("📊 12.3K tokens · 6%")
+    expect(footer).toBe("📊 12.3K tokens · 6% · 🧠 claude-sonnet-4-5")
   })
 
   test("returns tokens-only when model unknown", async () => {
@@ -280,7 +280,7 @@ describe("TokenTracker.getFooter", () => {
       modelID: "claude-sonnet-4-5",
     })
     const footer = await t.getFooter("s1", makeFakeClient(undefined), cache)
-    expect(footer).toBe("📊 12.3K tokens")
+    expect(footer).toBe("📊 12.3K tokens · 🧠 claude-sonnet-4-5")
   })
 
   test("returns tokens-only when provider fetch throws", async () => {
@@ -298,7 +298,7 @@ describe("TokenTracker.getFooter", () => {
       modelID: "claude-sonnet-4-5",
     })
     const footer = await t.getFooter("s1", failing, cache)
-    expect(footer).toBe("📊 12.3K tokens")
+    expect(footer).toBe("📊 12.3K tokens · 🧠 claude-sonnet-4-5")
   })
 
   test("rounds percent to nearest integer", async () => {
@@ -314,7 +314,7 @@ describe("TokenTracker.getFooter", () => {
     })
     // 7001 / 200000 = 3.5005% → rounds to 4
     const footer = await t.getFooter("s1", makeFakeClient(200_000), cache)
-    expect(footer).toBe("📊 7.0K tokens · 4%")
+    expect(footer).toBe("📊 7.0K tokens · 4% · 🧠 claude-sonnet-4-5")
   })
 
   test("returns empty string when snapshot total is NaN", async () => {
