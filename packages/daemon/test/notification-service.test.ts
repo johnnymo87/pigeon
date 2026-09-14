@@ -66,6 +66,8 @@ describe("formatTelegramNotification", () => {
     // Footer contains cwd, sessionId
     expect(result.footer.text).toContain("projects/pigeon");
     expect(result.footer.text).toContain("sess-abc123");
+    // No swipe-reply hint: swipe-reply still works, the trailing line was noise.
+    expect(result.footer.text).not.toContain("Swipe-reply");
     // Footer should have code entities for cwd and sessionId
     const codeEntities = result.footer.entities.filter(e => e.type === "code");
     expect(codeEntities.length).toBeGreaterThanOrEqual(2);
@@ -361,24 +363,19 @@ describe("formatQuestionWizardStep", () => {
     expect(allButtons.every((b: { callback_data: string }) => !b.callback_data.includes("cancel"))).toBe(true);
   });
 
-  it("includes swipe-reply hint when custom is enabled", () => {
-    const result = formatQuestionWizardStep({
+  it("never emits a swipe-reply hint, custom or not", () => {
+    const enabled = formatQuestionWizardStep({
       label: "test", questions, currentStep: 0,
       cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
     });
-    expect(result.message.text).toContain("Swipe-reply for custom answer");
-    // "Swipe-reply for custom answer" should be italic
-    const italicEntity = result.message.entities.find(e => e.type === "italic");
-    expect(italicEntity).toBeDefined();
-  });
+    expect(enabled.message.text).not.toContain("Swipe-reply");
 
-  it("hides swipe-reply hint when custom=false", () => {
     const qs = [{ ...questions[0]!, custom: false }, questions[1]!];
-    const result = formatQuestionWizardStep({
+    const disabled = formatQuestionWizardStep({
       label: "test", questions: qs, currentStep: 0,
       cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
     });
-    expect(result.message.text).not.toContain("Swipe-reply");
+    expect(disabled.message.text).not.toContain("Swipe-reply");
   });
 });
 
@@ -409,7 +406,7 @@ describe("formatQuestionNotification", () => {
     expect(result.message.text).toContain("projects/pigeon");
     expect(result.message.text).toContain("devbox");
     expect(result.message.text).toContain("sess-q1");
-    expect(result.message.text).toContain("Swipe-reply for custom answer");
+    expect(result.message.text).not.toContain("Swipe-reply");
 
     // "Question" should be bold
     const boldEntity = result.message.entities.find(e => e.type === "bold");
@@ -418,10 +415,6 @@ describe("formatQuestionNotification", () => {
     // sessionId and cwd should be code entities
     const codeEntities = result.message.entities.filter(e => e.type === "code");
     expect(codeEntities.length).toBeGreaterThanOrEqual(2);
-
-    // "Swipe-reply for custom answer" should be italic
-    const italicEntity = result.message.entities.find(e => e.type === "italic");
-    expect(italicEntity).toBeDefined();
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(1);
     expect(result.replyMarkup.inline_keyboard[0]).toHaveLength(2);
@@ -499,7 +492,7 @@ describe("formatQuestionNotification", () => {
     expect(result.message.text).toContain("Q2 text");
   });
 
-  it("shows swipe-reply hint when any question in multi-question allows custom", () => {
+  it("omits the swipe-reply hint even when a question allows custom answers", () => {
     const result = formatQuestionNotification({
       label: "test",
       questions: [
@@ -511,10 +504,10 @@ describe("formatQuestionNotification", () => {
       sessionId: "sess-multicustom",
     });
 
-    expect(result.message.text).toContain("Swipe-reply");
+    expect(result.message.text).not.toContain("Swipe-reply");
   });
 
-  it("hides swipe-reply hint when custom=false", () => {
+  it("omits the swipe-reply hint when custom=false", () => {
     const result = formatQuestionNotification({
       label: "test",
       questions: [{
@@ -597,7 +590,7 @@ describe("formatSwarmNotification", () => {
 
     expect(result.footer.text).toContain("ses_target999");
     expect(result.footer.text).toContain("msg_foot777");
-    expect(result.footer.text).toContain("Swipe-reply to respond");
+    expect(result.footer.text).not.toContain("Swipe-reply");
 
     const codeEntities = result.footer.entities.filter((e: { type: string }) => e.type === "code");
     expect(codeEntities.length).toBeGreaterThanOrEqual(2);

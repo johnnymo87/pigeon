@@ -101,10 +101,7 @@ export function formatTelegramNotification(input: NotificationInput): {
   footerBuilder
     .newline()
     .append("🆔 ")
-    .appendCode(input.sessionId)
-    .newline(2)
-    .append("↩️ ")
-    .appendItalic("Swipe-reply to respond");
+    .appendCode(input.sessionId);
 
   return {
     header: headerBuilder.build(),
@@ -172,10 +169,7 @@ export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
     .append("🆔 ")
     .appendCode(input.toSessionId)
     .append(" · ")
-    .appendCode(input.msgId)
-    .newline(2)
-    .append("↩️ ")
-    .appendItalic("Swipe-reply to respond");
+    .appendCode(input.msgId);
 
   return {
     header: headerBuilder.build(),
@@ -265,11 +259,6 @@ export function formatQuestionNotification(input: {
   }
   b.newline().append("🆔 ").appendCode(input.sessionId);
 
-  const hasCustom = input.questions.some(q => q.custom !== false);
-  if (hasCustom) {
-    b.newline(2).append("↩️ ").appendItalic("Swipe-reply for custom answer");
-  }
-
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   if (input.questions.length === 1 && firstQuestion && firstQuestion.options.length > 0) {
     const options = firstQuestion.options;
@@ -328,11 +317,6 @@ export function formatQuestionWizardStep(input: {
     b.append(` · 🖥 ${input.machineId}`);
   }
   b.newline().append("🆔 ").appendCode(input.sessionId);
-
-  const hasCustom = currentQuestion.custom !== false;
-  if (hasCustom) {
-    b.newline(2).append("↩️ ").appendItalic("Swipe-reply for custom answer");
-  }
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   const options = currentQuestion.options;

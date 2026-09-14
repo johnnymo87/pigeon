@@ -62,12 +62,16 @@ export class TokenTracker {
     if (!snap || !Number.isFinite(snap.total) || snap.total <= 0) return ""
 
     const tokens = formatTokenCount(snap.total)
+    // The model is carried on the same snapshot that produced the counts, so it
+    // is exactly the model that answered — not the session's configured default,
+    // which can differ after a /model override mid-turn.
+    const model = `🧠 ${snap.modelID}`
     const limit = await cache.getContextLimit(client, snap.providerID, snap.modelID)
     if (limit === undefined) {
-      return `📊 ${tokens} tokens`
+      return `📊 ${tokens} tokens · ${model}`
     }
     const percent = Math.round((snap.total / limit) * 100)
-    return `📊 ${tokens} tokens · ${percent}%`
+    return `📊 ${tokens} tokens · ${percent}% · ${model}`
   }
 }
 
