@@ -5388,3 +5388,95 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
     });
   });
 });
+
+/**
+ * A second backend (goose) reaches these code paths with error strings that mean
+ * something completely different than they do for the opencode plugin. The two
+ * tests below pin the ONLY thing standing between a transient goose socket error
+ * and the destruction of the human's session mapping.
+ *
+ * Both hazards were verified in the live code before these tests were written:
+ * with an opencodeClient, a connection-shaped error revives, gets sessionGone and
+ * deletes at command-ingest.ts:1218; WITHOUT one it deletes outright at :1283.
+ * Omitting the client therefore makes the problem worse rather than better, which
+ * is why the fix is a per-adapter failure policy rather than a missing client.
+ */
+describe("adapter failurePolicy (multi-backend safety)", () => {
+  it("does NOT delete the session when a surface-policy adapter reports a connection-shaped error", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-goose-hiccup",
+      notify: true,
+      backendKind: "goose",
+      backendEndpoint: "http://127.0.0.1:3400/acp",
+      backendAuthToken: "tok",
+    }, 1_000);
+    storage.assignments.upsert({ sessionId: "sess-goose-hiccup", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
+
+    const unregistered: string[] = [];
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-goose-hiccup", sessionId: "sess-goose-hiccup", command: "hi", chatId: "12" }),
+      {
+        createAdapter: () => ({
+          name: "goose-acp",
+          failurePolicy: "surface",
+          async deliverCommand() {
+            // The exact string that classifyDeliveryFailure treats as
+            // definitely-not-delivered for the opencode plugin.
+            return { ok: false, error: "fetch failed: ECONNREFUSED" };
+          },
+        }),
+        unregisterSession: async (sessionId) => { unregistered.push(sessionId); },
+        sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+      },
+    );
+
+    // The whole point: the session survives a transient backend error.
+    expect(storage.sessions.get("sess-goose-hiccup")).not.toBeNull();
+    expect(storage.assignments.get("sess-goose-hiccup")).not.toBeNull();
+    expect(unregistered).toEqual([]);
+    // The human is still told, rather than the command vanishing.
+    expect(replies.join(" ")).toMatch(/rejected|not.*deliver|fail/i);
+    // And the command is closed out rather than left dangling.
+    expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+    storage.db.close();
+  });
+
+  it("still deletes for a default-policy adapter, so opencode behaviour is unchanged", async () => {
+    const storage = openStorageDb(":memory:");
+    storage.sessions.upsert({
+      sessionId: "sess-default-policy",
+      notify: true,
+      backendKind: "opencode-plugin-direct",
+      backendProtocolVersion: 1,
+      backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+      backendAuthToken: "tok",
+    }, 1_000);
+
+    const unregistered: string[] = [];
+
+    await ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-default-policy", sessionId: "sess-default-policy", command: "hi", chatId: "12" }),
+      {
+        // No failurePolicy field at all -- the existing three adapters.
+        createAdapter: () => ({
+          name: "mock-direct",
+          async deliverCommand() {
+            return { ok: false, error: "fetch failed: ECONNREFUSED" };
+          },
+        }),
+        unregisterSession: async (sessionId) => { unregistered.push(sessionId); },
+      },
+    );
+
+    expect(storage.sessions.get("sess-default-policy")).toBeNull();
+    expect(unregistered).toEqual(["sess-default-policy"]);
+
+    storage.db.close();
+  });
+});

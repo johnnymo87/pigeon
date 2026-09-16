@@ -1162,7 +1162,14 @@ async function deliverViaAdapter(
   // of falling through to the revive fallback (which bypasses the plugin dedup
   // and would duplicate). definitely_not_delivered / terminal failures skip this
   // loop — retrying a dead/​rejecting plugin can't help.
+  // A `surface` adapter is excluded from this loop as well as from the revive
+  // block below. Both read meaning into an error STRING that only the opencode
+  // plugin's errors actually carry, and re-delivering here would mean issuing a
+  // second prompt into a backend that may still be running the first one.
+  const classifyFailures = adapter.failurePolicy !== "surface";
+
   while (
+    classifyFailures &&
     !result.ok &&
     classifyDeliveryFailure(result) === "ambiguous" &&
     now() - startedAt < budgetMs
@@ -1181,7 +1188,7 @@ async function deliverViaAdapter(
 
   console.warn(`[command-ingest] delivery failed commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts} error=${result.error}${formatDeliveryMeta(result.meta)}`);
 
-  if (isConnectionError(result)) {
+  if (classifyFailures && isConnectionError(result)) {
     // The plugin endpoint did not confirm delivery (connection refused, or a
     // timeout where the plugin was alive but busy). We cannot tell whether the
     // prompt was injected, so to guarantee at-least-once delivery we revive via
