@@ -6,9 +6,14 @@ import type { AcpTransport, AcpTransportFactory } from "./acp-client.js";
  * every delivery decision lives in `acp-client.ts` where it is testable without
  * a socket, a serve, or a model.
  *
- * Not unit-tested, by design -- there is nothing here to assert that would not
- * just be asserting node's WebSocket. It is exercised end to end against a real
- * `goose serve` by `scripts/goose-acp-probe.ts`.
+ * Mostly not unit-tested, by design -- there is little here to assert that would
+ * not just be asserting node's WebSocket, and it is exercised end to end against
+ * a real `goose serve` by `scripts/goose-acp-probe.ts`. The exception is
+ * `withToken`, which is real logic and IS tested: see goose-ws-transport.test.ts.
+ *
+ * That probe is not a safety net, and this file is the proof. It runs its serve
+ * with `--dangerously-unauthenticated`, so it accepted a credential scheme goose
+ * rejects (see `withToken`) for as long as this file has existed.
  */
 /**
  * Authenticates by QUERY PARAMETER, not by header, and the distinction is not
