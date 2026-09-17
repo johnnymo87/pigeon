@@ -72,6 +72,13 @@ export interface TagCommandDeps {
   /** null means oc-tags is not installed on this machine. */
   runOcTags: OcTagsRunner | null;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  /**
+   * Called once a tag has actually been written, so a cached copy (the
+   * notification footer's) can be dropped. Never called on a rejected or failed
+   * command, and a throw here is swallowed: the tag is already set, and a
+   * missing reply would leave the command unacked and redelivered for 24h.
+   */
+  onTagged?: () => void;
 }
 
 export interface TagSetCommandDeps extends TagCommandDeps {
@@ -345,6 +352,14 @@ export async function ingestTagListCommand(deps: TagCommandDeps): Promise<void> 
   await deps.sendTelegramReply(deps.chatId, msg.text, msg.entities);
 }
 
+function announceTagged(deps: TagCommandDeps): void {
+  try {
+    deps.onTagged?.();
+  } catch (err) {
+    console.warn(`[tag-ingest] onTagged threw commandId=${deps.commandId}:`, err);
+  }
+}
+
 // ─── /tag <session-id> <tag> ──────────────────────────────────────────────────
 
 export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void> {
@@ -366,6 +381,7 @@ export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void
   const stdout = await runOrExplain(deps, ["set", tag, targetSessionId], "set");
   if (stdout === null) return;
 
+  announceTagged(deps);
   console.log(`[tag-ingest] set commandId=${deps.commandId} session=${targetSessionId} tag=${tag}`);
   await deps.sendTelegramReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${targetSessionId} as ${tag}`, 500)}`);
 }
@@ -393,6 +409,7 @@ export async function ingestTagSetDirCommand(deps: TagSetDirCommandDeps): Promis
   const stdout = await runOrExplain(deps, ["set", "--dir", pattern, tag], "set --dir");
   if (stdout === null) return;
 
+  announceTagged(deps);
   console.log(`[tag-ingest] set --dir commandId=${deps.commandId} pattern=${pattern} tag=${tag}`);
   await deps.sendTelegramReply(
     deps.chatId,

@@ -125,14 +125,19 @@ export function describeOcTagsFailure(err: unknown): string {
  * A non-zero exit resolves rather than rejects: oc-tags reports user errors as
  * exit 1 plus a line on stderr, and those belong in the Telegram reply. Only a
  * failure to run at all (ENOENT, timeout) rejects.
+ *
+ * `timeoutMs` defaults to the 20s a `/tag` command needs. A caller that only
+ * runs `which` should pass something far shorter: `which` never reads the
+ * message table, so a slow one means a contended DB, and the notification it
+ * decorates should not wait 20s for a decoration.
  */
-export function createOcTagsRunner(bin: string): OcTagsRunner {
+export function createOcTagsRunner(bin: string, timeoutMs: number = RUN_TIMEOUT_MS): OcTagsRunner {
   return (args: string[]) =>
     new Promise<OcTagsResult>((resolve, reject) => {
       execFile(
         bin,
         args,
-        { timeout: RUN_TIMEOUT_MS, maxBuffer: MAX_BUFFER_BYTES, encoding: "utf8", shell: false },
+        { timeout: timeoutMs, maxBuffer: MAX_BUFFER_BYTES, encoding: "utf8", shell: false },
         (err, stdout, stderr) => {
           if (err) {
             const exitCode = (err as { code?: unknown }).code;

@@ -267,8 +267,19 @@ function parseStopNotificationId(val: unknown, sessionId: string): string | unde
   return val;
 }
 
+/**
+ * The slice of SessionTagResolver the app needs. Structural so tests can pass a
+ * literal, and so the notification path cannot accidentally await a refresh:
+ * `get` is synchronous by type.
+ */
+export interface TagLookup {
+  get(sessionId: string): string | null;
+  warm(sessionId: string): void;
+}
+
 interface AppOptions {
   nowFn?: () => number;
+  tagLookup?: TagLookup;
   notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
@@ -615,6 +626,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+
+        // Warm the tag cache off the request path. Resolving a tag costs a
+        // subprocess, and every notification route reads the cache
+        // synchronously — so a session whose tag is fetched at start has it by
+        // the time its first stop arrives, and one that misses simply renders
+        // without the line.
+        opts.tagLookup?.warm(sessionId);
 
         const prevEndpoint = existing?.backendEndpoint;
         const prevAuthToken = existing?.backendAuthToken;
@@ -1050,6 +1068,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Format notification for the outbox
         const notification = formatTelegramNotification({
           event,
+          tag: opts.tagLookup?.get(sessionId) ?? null,
           label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
           summary: message || summary || "Task completed",
           cwd: session.cwd,
@@ -1196,6 +1215,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           const notification = formatQuestionWizardStep({
             label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
             questions,
+            tag: opts.tagLookup?.get(sessionId) ?? null,
             currentStep: 0,
             cwd: session.cwd,
             token,
@@ -1216,6 +1236,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           const notification = formatQuestionNotification({
             label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
             questions,
+            tag: opts.tagLookup?.get(sessionId) ?? null,
             cwd: session.cwd,
             token,
             machineId: opts.machineId,

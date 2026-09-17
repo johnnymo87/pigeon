@@ -319,6 +319,16 @@ Both remaining leaks fail toward silence rather than duplicates (an unconsumed c
 
 **Token usage footer:** Stop notifications include a compact `📊 12.3K tokens · 7% · 🧠 claude-opus-5` footer showing the cumulative context-window usage reported by the latest assistant message, its percentage of the model's context window, and the model that produced it. Sourced from `message.updated` events; matches what the OpenCode TUI sidebar displays. The percent is omitted when the model's context limit cannot be resolved. The model id comes off the same snapshot as the counts, so it is the model that actually answered rather than the session's configured default (they differ after a mid-turn `/model` override).
 
+**Tag in the footer:** the `📂 cwd · 🖥 machine` line carries `· 🏷 <tag>` when the session has a **manual** oc-tags tag. Stop and question notifications only — the swarm feed's four call sites across three modules were judged not worth threading a lookup through for a dispatch notice. The wizard step is included deliberately: it edits the question's own message in place, so a tag on one and not the other would read as the tag changing.
+
+Three things shape `daemon/src/tag-resolver.ts` and are easy to undo by accident:
+
+- **`get()` is synchronous and answers only from cache.** Notifications are formatted inside request handlers, and `POST /question-asked` is awaited by the plugin under a 3s timeout. A subprocess on that path is a latency risk for a decorative line, so refreshes run beside it (`warm()` on `/session-start`, and a fire-and-forget refresh on a stale read). A session whose tag is not cached yet renders without the line. Making `get` async is how this feature starts costing questions.
+- **Only `manual` renders.** Every session always has a tag, but an untagged one resolves to `auto:<dir>` — which says nothing the cwd on that same line does not already say. `oc-tags which` reports the source; pigeon filters on it.
+- **Pigeon implements no precedence.** The tag comes from `oc-tags which <session>` (session tag > longest matching dir glob > `auto:`), for the same reason `/tag` shells out: a second implementation drifts, and the tag beside a session would end up disagreeing with the tag its dollars are charted under. A stale entry is served while its refresh runs (the tag changes rarely; blanking it would flicker), and `/tag` invalidates on success — per session for `/tag <tag>`, wholesale for `/tag dir`, which is retroactive and names no session.
+
+Failure is always silence: no binary, non-zero exit, timeout, unparseable output all cache a null and omit the line, with one warning per session rather than one per notification.
+
 **No swipe-reply hint.** Notifications used to end with `↩️ Swipe-reply to respond` (and questions with `↩️ Swipe-reply for custom answer`). Both are gone — swipe-reply itself is unchanged and remains the primary answer path, including the custom-answer path for a question whose `custom !== false`. Nothing reads `QuestionInfoData.custom` for rendering any more.
 
 **Question notification reliability:** When the plugin receives a `question.asked` event, it enqueues the question in an in-memory retry queue that bypasses the circuit breaker and calls `sendQuestionAsked` with a 3s timeout.
