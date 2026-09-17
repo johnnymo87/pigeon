@@ -21,6 +21,29 @@ interface NotificationInput {
   token: string;
   machineId?: string;
   sessionId: string;
+  /**
+   * The session's effective oc-tags tag, or null/undefined for none.
+   *
+   * Only a MANUAL tag reaches here. Every session always has a tag, but an
+   * untagged one falls back to `auto:<dir>`, which says nothing the cwd on
+   * this same line does not already say. See SessionTagResolver.
+   */
+  tag?: string | null;
+}
+
+/**
+ * ` · 🏷 <tag>`, or nothing. Shared so the renderers cannot drift.
+ *
+ * Capped because oc-tags itself sets no length limit — pigeon's own `/tag`
+ * validator does, but a tag written from a terminal does not go through it, and
+ * a question notification is not split or truncated anywhere.
+ */
+const MAX_TAG_CHARS = 64;
+
+function appendTag(b: TgMessageBuilder, tag: string | null | undefined): void {
+  const t = tag?.trim();
+  if (!t) return;
+  b.append(` · 🏷 ${t.length > MAX_TAG_CHARS ? `${t.slice(0, MAX_TAG_CHARS - 1)}…` : t}`);
 }
 
 export function displayName(input: {
@@ -98,6 +121,7 @@ export function formatTelegramNotification(input: NotificationInput): {
   if (input.machineId) {
     footerBuilder.append(` · 🖥 ${input.machineId}`);
   }
+  appendTag(footerBuilder, input.tag);
   footerBuilder
     .newline()
     .append("🆔 ")
@@ -212,6 +236,7 @@ export function formatQuestionNotification(input: {
   token: string;
   sessionId: string;
   machineId?: string;
+  tag?: string | null;
 }): {
   message: TgMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
@@ -257,6 +282,7 @@ export function formatQuestionNotification(input: {
   if (input.machineId) {
     b.append(` · 🖥 ${input.machineId}`);
   }
+  appendTag(b, input.tag);
   b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
@@ -284,6 +310,7 @@ export function formatQuestionWizardStep(input: {
   version: number;
   sessionId: string;
   machineId?: string;
+  tag?: string | null;
 }): {
   message: TgMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
@@ -316,6 +343,7 @@ export function formatQuestionWizardStep(input: {
   if (input.machineId) {
     b.append(` · 🖥 ${input.machineId}`);
   }
+  appendTag(b, input.tag);
   b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];

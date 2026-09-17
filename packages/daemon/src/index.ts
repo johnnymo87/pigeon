@@ -33,6 +33,7 @@ import {
   ingestTagTopCommand,
 } from "./worker/tag-ingest";
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
+import { SessionTagResolver } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
@@ -195,6 +196,26 @@ function resolveRunOcTags() {
   return bin ? createOcTagsRunner(bin) : null;
 }
 
+/**
+ * Caches each session's oc-tags tag for the notification footer.
+ *
+ * Its runner resolves the binary per call, for the same reason `/tag` does:
+ * installing oc-tags should not also require restarting the daemon. A machine
+ * without it throws here on every refresh, which the resolver turns into one
+ * warning and a cached null — the footer simply omits the line.
+ *
+ * The 3s timeout is deliberately far below the 20s a `/tag` command gets:
+ * `oc-tags which` never reads the message table, so a slow one means a
+ * contended DB, and a notification should not wait on a decoration.
+ */
+const tagResolver = new SessionTagResolver({
+  runner: async (args) => {
+    const bin = resolveOcTagsBin({ configured: config.ocTagsBin });
+    if (!bin) throw new Error("oc-tags is not installed on this machine");
+    return createOcTagsRunner(bin, 3_000)(args);
+  },
+});
+
 function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: number | null }) {
   return {
     commandId: msg.commandId,
@@ -253,6 +274,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             machineId: config.machineId,
             ...(client ? { opencodeClient: client } : {}),
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            tagLookup: tagResolver,
             unregisterSession: async (sessionId) => { if (poller) await poller.unregisterSession(sessionId); },
           });
         },
@@ -278,6 +300,10 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // require restarting the daemon.
             ...(msg.tag !== undefined ? { tag: msg.tag } : {}),
             runOcTags: resolveRunOcTags(),
+            // The session registers (and warms its tag cache) before the tag is
+            // written, so without this its FIRST notification would show no tag
+            // right after Telegram said the tag had been applied.
+            onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
@@ -383,10 +409,25 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestTagListCommand(tagDeps(msg));
         },
         onTagSet: async (msg) => {
-          await ingestTagSetCommand({ ...tagDeps(msg), targetSessionId: msg.targetSessionId, tag: msg.tag });
+          await ingestTagSetCommand({
+            ...tagDeps(msg),
+            targetSessionId: msg.targetSessionId,
+            tag: msg.tag,
+            // Without this the footer keeps showing the old tag (or nothing)
+            // until the cache entry ages out, which reads as the command having
+            // failed.
+            onTagged: () => tagResolver.refreshNow(msg.targetSessionId),
+          });
         },
         onTagSetDir: async (msg) => {
-          await ingestTagSetDirCommand({ ...tagDeps(msg), pattern: msg.pattern, tag: msg.tag });
+          await ingestTagSetDirCommand({
+            ...tagDeps(msg),
+            pattern: msg.pattern,
+            tag: msg.tag,
+            // A directory glob is retroactive and names no session, so there is
+            // no smaller set to invalidate than everything.
+            onTagged: () => tagResolver.clear(),
+          });
         },
       },
       { healthMonitor: workerHealthMonitor },
@@ -683,6 +724,7 @@ if (deliveryWatchdog) {
 
 const server = startServer(config, createApp(storage, {
   notifier,
+  tagLookup: tagResolver,
   chatId: config.telegramChatId,
   machineId: config.machineId,
   router: ingressRouter,

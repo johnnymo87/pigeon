@@ -39,6 +39,12 @@ export interface WorkerCommandIngestOptions {
   editNotification?: (notificationId: string, text: string, replyMarkup: unknown, entities?: unknown[]) => Promise<{ ok: boolean }>;
   /** Machine ID for formatting wizard steps */
   machineId?: string;
+  /**
+   * Reads the cached oc-tags tag. Threaded here so a wizard STEP carries the
+   * same footer as the question that opened it — the step edits that message in
+   * place, so a tag on one and not the other would read as the tag changing.
+   */
+  tagLookup?: { get(sessionId: string): string | null };
   /** OpenCode client for plugin-free fallback delivery on plugin death. */
   opencodeClient?: ReviveAndDeliverDeps["opencodeClient"];
   /** Send a reply to Telegram (used for revive-on-reply error notifications). */
@@ -308,6 +314,7 @@ export async function ingestWorkerCommand(
         const { message, replyMarkup } = formatQuestionWizardStep({
           label,
           questions: pendingQuestion.questions,
+          tag: options.tagLookup?.get(msg.sessionId) ?? null,
           currentStep: updated.currentStep,
           cwd: session.cwd,
           token: pendingQuestion.token ?? "",

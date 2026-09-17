@@ -447,6 +447,40 @@ describe("ingestLaunchCommand", () => {
       expect(order).toEqual(["create", "prompt", "tag"]);
     });
 
+    it("announces the tag so a cache warmed before it can be refetched", async () => {
+      // The session registers (and warms its tag cache) before the tag is
+      // written, so without this its first notification shows no tag right
+      // after Telegram said the tag was applied.
+      const onTagged = vi.fn();
+      const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged\n", stderr: "" });
+
+      await ingestLaunchCommand(makeInput({ tag: "fbm", runOcTags, onTagged }));
+
+      expect(onTagged).toHaveBeenCalledWith("sess-123");
+    });
+
+    it("does not announce a tag oc-tags refused", async () => {
+      const onTagged = vi.fn();
+      const runOcTags = vi.fn().mockResolvedValue({ code: 1, stdout: "", stderr: "Error: nope\n" });
+
+      await ingestLaunchCommand(makeInput({ tag: "fbm", runOcTags, onTagged }));
+
+      expect(onTagged).not.toHaveBeenCalled();
+    });
+
+    it("still confirms the launch when the announcement throws", async () => {
+      const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged\n", stderr: "" });
+      const input = makeInput({
+        tag: "fbm",
+        runOcTags,
+        onTagged: () => { throw new Error("boom"); },
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toContain("sess-123");
+    });
+
     it("reports oc-tags' own confirmation line, not one we composed", async () => {
       // oc-tags lowercases, so --tag FBM charts as fbm; a line of our own would
       // name a tag the chart never shows.

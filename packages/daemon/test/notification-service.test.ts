@@ -75,6 +75,48 @@ describe("formatTelegramNotification", () => {
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
+  it("renders the oc-tags tag on the cwd line when the session has one", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "l",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok",
+      machineId: "cloudbox",
+      sessionId: "sess-abc123",
+      tag: "billing",
+    });
+    expect(result.footer.text).toContain("🏷 billing");
+    // Same line as cwd and machine: three facts about WHERE the work happened.
+    expect(result.footer.text.split("\n")[0]).toContain("🏷 billing");
+  });
+
+  it("caps an absurdly long tag rather than letting it eat the message", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "l",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok",
+      sessionId: "sess-abc123",
+      tag: "x".repeat(400),
+    });
+    expect(result.footer.text).toContain("…");
+    expect(result.footer.text.length).toBeLessThan(200);
+  });
+
+  it("omits the tag line entirely when there is no tag", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "l",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok",
+      sessionId: "sess-abc123",
+    });
+    expect(result.footer.text).not.toContain("🏷");
+  });
+
   it("maps each event to its distinct emoji and omits event word from header", () => {
     const cases = [
       { event: "Stop", expectedEmoji: "✅" },
@@ -363,6 +405,15 @@ describe("formatQuestionWizardStep", () => {
     expect(allButtons.every((b: { callback_data: string }) => !b.callback_data.includes("cancel"))).toBe(true);
   });
 
+  it("renders the tag when one is supplied", () => {
+    const result = formatQuestionWizardStep({
+      label: "test", questions, currentStep: 0,
+      cwd: "/tmp", token: "tok-wiz", version: 0, sessionId: "s1",
+      tag: "billing",
+    });
+    expect(result.message.text).toContain("🏷 billing");
+  });
+
   it("never emits a swipe-reply hint, custom or not", () => {
     const enabled = formatQuestionWizardStep({
       label: "test", questions, currentStep: 0,
@@ -380,6 +431,18 @@ describe("formatQuestionWizardStep", () => {
 });
 
 describe("formatQuestionNotification", () => {
+  it("renders the tag when one is supplied", () => {
+    const result = formatQuestionNotification({
+      label: "test",
+      questions: [{ question: "Q?", header: "H", options: [] }],
+      cwd: "/tmp",
+      token: "tok",
+      sessionId: "sess-tag",
+      tag: "billing",
+    });
+    expect(result.message.text).toContain("🏷 billing");
+  });
+
   it("formats single question with option buttons", () => {
     const result = formatQuestionNotification({
       label: "pigeon",

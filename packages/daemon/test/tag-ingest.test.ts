@@ -268,6 +268,40 @@ describe("ingestTagSetCommand", () => {
     await ingestTagSetCommand({ ...deps, targetSessionId: "ses_abcd1234", tag: "billing" });
     expect(sentText(deps)).toContain("auto:");
   });
+
+  it("announces the change so a cached tag can be invalidated", async () => {
+    const onTagged = vi.fn();
+    const deps = makeDeps({
+      runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged\n", stderr: "" }),
+    });
+    await ingestTagSetCommand({ ...deps, targetSessionId: "ses_abcd1234", tag: "billing", onTagged });
+    expect(onTagged).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not announce a change that did not happen", async () => {
+    const onTagged = vi.fn();
+    const deps = makeDeps({
+      runOcTags: vi.fn().mockResolvedValue({ code: 1, stdout: "", stderr: "Error: nope\n" }),
+    });
+    await ingestTagSetCommand({ ...deps, targetSessionId: "ses_abcd1234", tag: "billing", onTagged });
+    expect(onTagged).not.toHaveBeenCalled();
+  });
+
+  it("survives a throwing invalidation callback", async () => {
+    // The tag IS set at this point; a cache bookkeeping failure must not turn a
+    // successful command into a silent one (no reply means the poller never
+    // acks, and the command is redelivered every lease expiry for 24h).
+    const deps = makeDeps({
+      runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged\n", stderr: "" }),
+    });
+    await ingestTagSetCommand({
+      ...deps,
+      targetSessionId: "ses_abcd1234",
+      tag: "billing",
+      onTagged: () => { throw new Error("boom"); },
+    });
+    expect(sentText(deps)).toContain("Tagged");
+  });
 });
 
 describe("ingestTagSetDirCommand", () => {

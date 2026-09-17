@@ -52,6 +52,12 @@ export interface LaunchCommandInput {
   tag?: string;
   /** null (or absent) means oc-tags is not installed on this machine. */
   runOcTags?: OcTagsRunner | null;
+  /**
+   * Called once `--tag` has actually been applied, so a cached tag for this
+   * session can be refetched. A throw is swallowed — the tag is written either
+   * way, and this must not cost the confirmation message.
+   */
+  onTagged?: (sessionId: string) => void;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
   /** Injected for tests; defaults to node child_process.spawn. */
   spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe" | Array<"ignore" | "inherit" | "pipe" | number>; detached?: boolean }) => ChildProcess;
@@ -98,6 +104,7 @@ async function applyTag(
   sessionId: string,
   runOcTags: OcTagsRunner | null | undefined,
   machineLabel: string,
+  onTagged?: (sessionId: string) => void,
 ): Promise<string> {
   if (!isValidTag(tag)) {
     return `Tag not applied: invalid tag ${truncate(String(tag), 64)}`;
@@ -113,6 +120,15 @@ async function applyTag(
     const result = await runOcTags(["set", tag, sessionId]);
     if (result.code !== 0) {
       return `Tag not applied: ${lastLine(result.stderr, result.stdout) || `oc-tags exited ${result.code}`}`;
+    }
+    // The session already registered, so a tag cache may hold the pre-tag
+    // answer. Without this the confirmation below says `🏷 Tagged ...` and the
+    // session's first notification arrives with no tag on it, which reads as
+    // the tag not having taken.
+    try {
+      onTagged?.(sessionId);
+    } catch (err) {
+      console.warn(`[launch-ingest] onTagged threw session=${sessionId}:`, err);
     }
     // oc-tags' OWN confirmation line: it lowercases, so `--tag FBM` is charted
     // as `fbm`, and a line composed here would name a tag the chart never shows.
@@ -198,7 +214,7 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     // There is no race to win by tagging earlier, only a launch to risk.
     const tagLine = input.tag === undefined
       ? null
-      : await applyTag(input.tag, session.id, input.runOcTags, machineLabel);
+      : await applyTag(input.tag, session.id, input.runOcTags, machineLabel, input.onTagged);
     if (tagLine) {
       console.log(`[launch-ingest] tag commandId=${input.commandId} session=${session.id} tag=${input.tag}: ${tagLine}`);
     }

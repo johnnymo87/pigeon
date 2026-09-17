@@ -10576,8 +10576,20 @@ describe("topics module and topicName", () => {
     });
 
     /** Epoch ms for a given UTC hour on a fixed date. */
+    /**
+     * Today's date at a given UTC hour.
+     *
+     * Deliberately NOT a fixed calendar date. These tests pin `scheduledTime`,
+     * but the reaper's own `now` is the real clock, so a hardcoded date drifts
+     * away from it: rows these tests marked closed sat exactly 30 days behind
+     * `Date.now()` on 2026-09-17, became reapable, and the reap half then
+     * consumed the tick before the orphan-closer ran — failing (e) on that day
+     * and no other. Anchoring to today keeps every seeded row the same
+     * distance from real now on every day the suite runs.
+     */
     function atUtcHour(hour: number): number {
-      return Date.UTC(2026, 7, 18, hour, 0, 0);
+      const today = new Date();
+      return Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), hour, 0, 0);
     }
 
     /** An open, finalized topic whose session row is absent => an orphan. */
