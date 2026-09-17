@@ -300,6 +300,10 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // require restarting the daemon.
             ...(msg.tag !== undefined ? { tag: msg.tag } : {}),
             runOcTags: resolveRunOcTags(),
+            // The session registers (and warms its tag cache) before the tag is
+            // written, so without this its FIRST notification would show no tag
+            // right after Telegram said the tag had been applied.
+            onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
           });
         },
@@ -412,7 +416,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // Without this the footer keeps showing the old tag (or nothing)
             // until the cache entry ages out, which reads as the command having
             // failed.
-            onTagged: () => tagResolver.forget(msg.targetSessionId),
+            onTagged: () => tagResolver.refreshNow(msg.targetSessionId),
           });
         },
         onTagSetDir: async (msg) => {

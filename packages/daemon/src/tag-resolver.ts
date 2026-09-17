@@ -50,6 +50,13 @@ export class SessionTagResolver {
   private readonly cache = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly warned = new Set<string>();
+  /**
+   * Bumped by every invalidation. A refresh captures it on entry and discards
+   * its own result if it changed, so a lookup that started before `oc-tags set`
+   * committed cannot write the pre-tag answer back over the invalidation that
+   * followed it.
+   */
+  private generation = 0;
   private readonly runner: OcTagsRunner | null;
   private readonly nowFn: () => number;
   private readonly ttlMs: number;
@@ -85,14 +92,30 @@ export class SessionTagResolver {
     return entry?.tag ?? null;
   }
 
-  /** Fire-and-forget warm-up. Safe to call on session start. */
+  /**
+   * Fire-and-forget warm-up for a session that has just started.
+   *
+   * Deliberately does NOT cache a negative. A session created by `/launch --tag`
+   * or by `opencode-launch` is tagged AFTER it is created and prompted, so a
+   * warm-up racing that window sees an untagged session — and caching that
+   * answer would hide the tag from the session's first notification, which is
+   * the one a user reads right after being told `🏷 Tagged ...`. A positive is
+   * cached normally; a negative just leaves the miss for a later read.
+   */
   warm(sessionId: string): void {
-    void this.refresh(sessionId);
+    void this.refresh(sessionId, { cacheNegative: false });
   }
 
   forget(sessionId: string): void {
+    this.generation += 1;
     this.cache.delete(sessionId);
     this.warned.delete(sessionId);
+  }
+
+  /** Drop the cached answer and immediately fetch the new one. */
+  refreshNow(sessionId: string): void {
+    this.forget(sessionId);
+    void this.refresh(sessionId);
   }
 
   /**
@@ -103,6 +126,7 @@ export class SessionTagResolver {
    * invalidate.
    */
   clear(): void {
+    this.generation += 1;
     this.cache.clear();
     this.warned.clear();
   }
@@ -117,34 +141,35 @@ export class SessionTagResolver {
    * line is decoration, and a rejection here would surface as an unhandled
    * rejection on a fire-and-forget path.
    */
-  async refresh(sessionId: string): Promise<void> {
+  async refresh(sessionId: string, opts: { cacheNegative?: boolean } = {}): Promise<void> {
     if (!this.runner) return;
     if (!SESSION_ID_RE.test(sessionId)) return;
 
     const existing = this.inFlight.get(sessionId);
     if (existing) return existing;
 
-    const task = this.run(sessionId).finally(() => {
+    const task = this.run(sessionId, opts.cacheNegative ?? true).finally(() => {
       this.inFlight.delete(sessionId);
     });
     this.inFlight.set(sessionId, task);
     return task;
   }
 
-  private async run(sessionId: string): Promise<void> {
+  private async run(sessionId: string, cacheNegative: boolean): Promise<void> {
     const runner = this.runner;
     if (!runner) return;
+    const generation = this.generation;
     try {
       const res = await runner(["which", sessionId]);
       if (res.code !== 0) {
         this.warnOnce(sessionId, `oc-tags which exited ${res.code}: ${lastLine(res.stderr)}`);
-        this.store(sessionId, null);
+        this.store(sessionId, null, generation, cacheNegative);
         return;
       }
-      this.store(sessionId, parseWhich(res.stdout));
+      this.store(sessionId, parseWhich(res.stdout), generation, cacheNegative);
     } catch (err) {
       this.warnOnce(sessionId, `oc-tags which failed: ${err instanceof Error ? err.message : String(err)}`);
-      this.store(sessionId, null);
+      this.store(sessionId, null, generation, cacheNegative);
     }
   }
 
@@ -157,16 +182,25 @@ export class SessionTagResolver {
     this.log(`[tag-resolver] ${sessionId}: ${message}`);
   }
 
-  private store(sessionId: string, tag: string | null): void {
+  private store(sessionId: string, tag: string | null, generation: number, cacheNegative: boolean): void {
+    // Something invalidated while this lookup was in flight, so its answer is
+    // known-stale rather than merely old: drop it.
+    if (generation !== this.generation) return;
+    if (tag === null && !cacheNegative) return;
     const ttl = tag === null ? this.negativeTtlMs : this.ttlMs;
     // Re-insert rather than update so Map iteration order is insertion order,
     // which is what makes the eviction below evict the oldest.
     this.cache.delete(sessionId);
     this.cache.set(sessionId, { tag, expiresAt: this.nowFn() + ttl });
+    // FIFO by write, not LRU: a read does not reorder. Evicting a hot session
+    // needs 512 other writes inside its 10m TTL, and costs one tagless line
+    // plus one spawn — not worth an access-order structure.
     while (this.cache.size > this.maxEntries) {
       const oldest = this.cache.keys().next();
       if (oldest.done) break;
       this.cache.delete(oldest.value);
+      // Keep `warned` from being the thing that grows without bound instead.
+      this.warned.delete(oldest.value);
     }
   }
 }

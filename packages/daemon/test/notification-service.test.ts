@@ -91,6 +91,20 @@ describe("formatTelegramNotification", () => {
     expect(result.footer.text.split("\n")[0]).toContain("🏷 billing");
   });
 
+  it("caps an absurdly long tag rather than letting it eat the message", () => {
+    const result = formatTelegramNotification({
+      event: "Stop",
+      label: "l",
+      summary: "Done",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok",
+      sessionId: "sess-abc123",
+      tag: "x".repeat(400),
+    });
+    expect(result.footer.text).toContain("…");
+    expect(result.footer.text.length).toBeLessThan(200);
+  });
+
   it("omits the tag line entirely when there is no tag", () => {
     const result = formatTelegramNotification({
       event: "Stop",

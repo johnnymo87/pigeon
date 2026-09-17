@@ -31,11 +31,19 @@ interface NotificationInput {
   tag?: string | null;
 }
 
-/** ` · 🏷 <tag>`, or nothing. Shared so the four renderers cannot drift. */
+/**
+ * ` · 🏷 <tag>`, or nothing. Shared so the renderers cannot drift.
+ *
+ * Capped because oc-tags itself sets no length limit — pigeon's own `/tag`
+ * validator does, but a tag written from a terminal does not go through it, and
+ * a question notification is not split or truncated anywhere.
+ */
+const MAX_TAG_CHARS = 64;
+
 function appendTag(b: TgMessageBuilder, tag: string | null | undefined): void {
   const t = tag?.trim();
   if (!t) return;
-  b.append(` · 🏷 ${t}`);
+  b.append(` · 🏷 ${t.length > MAX_TAG_CHARS ? `${t.slice(0, MAX_TAG_CHARS - 1)}…` : t}`);
 }
 
 export function displayName(input: {

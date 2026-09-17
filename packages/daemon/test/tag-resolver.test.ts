@@ -170,6 +170,85 @@ describe("SessionTagResolver", () => {
     expect(resolver.get("--tags-db")).toBeNull();
   });
 
+  it("does not cache a miss found by warm()", async () => {
+    // /launch --tag and opencode-launch both tag AFTER creating and prompting
+    // the session, so the warm-up at session start races that window. Caching
+    // its negative would hide the tag from the session's FIRST notification —
+    // the one read right after Telegram said the tag was applied.
+    const calls: string[][] = [];
+    const resolver = new SessionTagResolver({
+      runner: makeRunner([ok("auto:pigeon\tauto\tses_a\n"), ok("billing\tmanual\tses_a\n")], calls),
+    });
+    resolver.warm("ses_a");
+    await resolver.drain();
+    expect(resolver.get("ses_a")).toBeNull();
+    await resolver.drain();
+    expect(calls.length).toBe(2);
+    expect(resolver.get("ses_a")).toBe("billing");
+  });
+
+  it("caches a positive found by warm()", async () => {
+    const calls: string[][] = [];
+    const resolver = new SessionTagResolver({
+      runner: makeRunner([ok("billing\tmanual\tses_a\n")], calls),
+    });
+    resolver.warm("ses_a");
+    await resolver.drain();
+    expect(resolver.get("ses_a")).toBe("billing");
+    await resolver.drain();
+    expect(calls.length).toBe(1);
+  });
+
+  it("discards an in-flight answer that an invalidation has overtaken", async () => {
+    // The lookup began before `oc-tags set` committed, so its answer predates
+    // the tag it would overwrite. Landing it would put the old tag back for a
+    // full TTL, right after the user was told the new one was applied.
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let first = true;
+    const resolver = new SessionTagResolver({
+      runner: async () => {
+        if (first) {
+          first = false;
+          await gate;
+          return ok("old\tmanual\tses_a\n");
+        }
+        return ok("new\tmanual\tses_a\n");
+      },
+    });
+    const stale = resolver.refresh("ses_a");
+    resolver.forget("ses_a");
+    release();
+    await stale;
+    expect(resolver.get("ses_a")).toBeNull();
+  });
+
+  it("refreshNow drops the cached answer and fetches the new one", async () => {
+    const resolver = new SessionTagResolver({
+      runner: makeRunner([ok("old\tmanual\tses_a\n"), ok("new\tmanual\tses_a\n")]),
+    });
+    await resolver.refresh("ses_a");
+    expect(resolver.get("ses_a")).toBe("old");
+    resolver.refreshNow("ses_a");
+    await resolver.drain();
+    expect(resolver.get("ses_a")).toBe("new");
+  });
+
+  it("clear() also invalidates a refresh already in flight", async () => {
+    // `/tag dir` is retroactive, so it can change the answer a running lookup
+    // is about to return.
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const resolver = new SessionTagResolver({
+      runner: async () => { await gate; return ok("old\tmanual\tses_a\n"); },
+    });
+    const stale = resolver.refresh("ses_a");
+    resolver.clear();
+    release();
+    await stale;
+    expect(resolver.get("ses_a")).toBeNull();
+  });
+
   it("logs a failure at most once per session", async () => {
     const warn = vi.fn();
     let now = 1000;
