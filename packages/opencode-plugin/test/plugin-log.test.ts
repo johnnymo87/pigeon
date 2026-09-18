@@ -30,6 +30,13 @@ function clientReturning(ret: unknown) {
 }
 
 describe("createLog", () => {
+  it("uses the exact service string people grep for", () => {
+    // Pinned as a literal: every other assertion compares against the exported
+    // constant, so renaming it would otherwise pass while breaking the searches
+    // this whole change exists to enable.
+    expect(PIGEON_LOG_SERVICE).toBe("opencode-pigeon")
+  })
+
   it("sends the NESTED v1 body shape the runtime client actually accepts", () => {
     const { client, log } = clientReturning({ data: true })
     createLog(client)("hello")
@@ -90,6 +97,9 @@ describe("createLog", () => {
     await flush()
     expect(fallback).toHaveBeenCalledTimes(1)
     expect(fallback.mock.calls[0][0]).toContain("hello")
+    // Pin the reason too: stringifying the error object as "[object Object]"
+    // would satisfy a message-only assertion while losing the diagnosis.
+    expect(fallback.mock.calls[0][0]).toContain("BadRequest")
   })
 
   it("reports a rejected promise to the fallback sink", async () => {

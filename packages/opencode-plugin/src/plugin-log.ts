@@ -1,12 +1,16 @@
+import type { Plugin } from "@opencode-ai/plugin"
 import { serializeError } from "./utils"
 
 export const PIGEON_LOG_SERVICE = "opencode-pigeon"
 
 export type LogSink = (line: string) => void
 
-export type LogClient = {
-  app: { log: (args: unknown) => unknown }
-}
+// Derived from the real plugin client, NOT hand-rolled as `unknown`. A loose
+// signature would compile a payload with a typo'd or v2-flat shape, which is the
+// exact drift this module exists to make loud -- and CI runs tsc, so that check
+// is worth keeping at compile time rather than deferring it to stderr.
+type PluginClient = Parameters<Plugin>[0]["client"]
+export type LogClient = { app: { log: PluginClient["app"]["log"] } }
 
 export type CreateLogOptions = {
   level?: "debug" | "info" | "warn" | "error"
