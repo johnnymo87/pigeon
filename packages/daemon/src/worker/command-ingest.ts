@@ -1,5 +1,8 @@
 import type { StorageDb } from "../storage/database";
 import type { SessionRecord } from "../storage/types";
+import { GooseAcpAdapter } from "../goose/adapter.js";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind.js";
+import type { GooseSessionRunner } from "../goose/session-runner.js";
 import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult } from "../adapters/types";
 import { DirectChannelAdapter } from "../adapters/direct-channel";
@@ -19,6 +22,12 @@ import { reviveAndDeliver, type ReviveAndDeliverDeps } from "./revive-and-delive
 export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
   createAdapter?: (session: SessionRecord) => CommandDeliveryAdapter | null;
+  /**
+   * Resolves the long-lived runner for a goose session. Absent when goose is not
+   * configured, which is what makes a goose session correctly unroutable rather
+   * than half-routable on a daemon that has no goose to talk to.
+   */
+  gooseRunnerFor?: (session: SessionRecord) => GooseSessionRunner;
   /**
    * Legacy test injection for direct-channel execution.
    * If provided AND session matches direct-channel, wraps the function in an adapter.
@@ -103,13 +112,31 @@ function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   return OpencodeDirectSource.TelegramReply;
 }
 
-function selectAdapter(session: SessionRecord, injectedPrompts?: InjectedPromptsRepository): CommandDeliveryAdapter | null {
+/**
+ * Exported for tests. Adapter selection is a dispatch decision with destructive
+ * consequences when it goes wrong -- a goose session routed onto the opencode
+ * adapters is deleted by the first socket blip -- so it is pinned directly
+ * rather than inferred from the behaviour of whatever it happened to return.
+ */
+export function selectAdapter(
+  session: SessionRecord,
+  injectedPrompts?: InjectedPromptsRepository,
+  gooseRunnerFor?: (session: SessionRecord) => GooseSessionRunner,
+): CommandDeliveryAdapter | null {
   if (
     session.backendKind === "opencode-plugin-direct"
     && session.backendEndpoint
     && session.backendAuthToken
   ) {
     return new DirectChannelAdapter({ injectedPrompts });
+  }
+
+  // A goose session is only routable when the daemon was given a runner factory
+  // (i.e. goose is configured). Falling through to `null` otherwise is the right
+  // failure: the no-adapter path below tells the human the session cannot be
+  // reached, rather than silently trying the opencode machinery on it.
+  if (session.backendKind === GOOSE_BACKEND_KIND && gooseRunnerFor) {
+    return new GooseAcpAdapter({ runnerFor: gooseRunnerFor });
   }
 
   if (session.nvimSocket && session.ptyPath) {
@@ -360,7 +387,7 @@ export async function ingestWorkerCommand(
 
       const adapter = options.createAdapter
         ? options.createAdapter(session)
-        : selectAdapter(session, storage.injectedPrompts);
+        : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -434,7 +461,7 @@ export async function ingestWorkerCommand(
 
     const adapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts);
+      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -516,7 +543,7 @@ export async function ingestWorkerCommand(
 
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts);
+      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
 
     if (fallbackAdapter?.deliverQuestionReply) {
       const answers: string[][] = [[msg.command.trim()]];
@@ -577,7 +604,7 @@ export async function ingestWorkerCommand(
 
   const adapter = options.createAdapter
     ? options.createAdapter(session)
-    : selectAdapter(session, storage.injectedPrompts);
+    : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
