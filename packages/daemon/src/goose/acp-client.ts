@@ -206,8 +206,20 @@ export class GooseAcpClient {
     const transport = await this.opts.transportFactory(this.opts.url);
     this.transport = transport;
     this.closed = false;
-    transport.onMessage((data) => this.onMessage(data));
-    transport.onClose((code, reason) => this.onClose(code, reason));
+    // Both callbacks are fenced on transport identity. A socket we have replaced
+    // can still fire -- a half-open one sits in CLOSING until the kernel gives up
+    // on the unacked close frame, which is minutes -- and an unfenced listener
+    // would then reject the CURRENT connection's turn as DisconnectedDuringTurn
+    // and clear its run ids, telling the human a healthy turn was lost. The
+    // zombie has nothing to say about the connection that replaced it.
+    transport.onMessage((data) => {
+      if (this.transport !== transport) return;
+      this.onMessage(data);
+    });
+    transport.onClose((code, reason) => {
+      if (this.transport !== transport) return;
+      this.onClose(code, reason);
+    });
     await this.call("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
