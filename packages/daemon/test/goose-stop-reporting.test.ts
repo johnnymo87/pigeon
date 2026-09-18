@@ -38,6 +38,11 @@ class StubClient {
   async steer(): Promise<unknown> {
     return { kind: "steered" };
   }
+  /** A dead socket: the liveness probe never answers. */
+  pingImpl: (() => Promise<void>) | undefined = () => new Promise(() => {});
+  async ping(): Promise<void> {
+    if (this.pingImpl) return this.pingImpl();
+  }
   activeRunId(): string | undefined {
     return undefined;
   }
@@ -166,6 +171,7 @@ describe("a stalled goose turn, through the real /stop route", () => {
 
     await runner.deliver("c1", "build everything");
     await vi.advanceTimersByTimeAsync(61_000);
+    await vi.advanceTimersByTimeAsync(11_000); // the liveness probe's deadline
 
     const afterStall = storage.outbox.getReady(Date.now() + 1, 10);
     expect(afterStall.length).toBe(1);
@@ -187,6 +193,7 @@ describe("a stalled goose turn, through the real /stop route", () => {
 
     await runner.deliver("c1", "doomed");
     await vi.advanceTimersByTimeAsync(61_000);
+    await vi.advanceTimersByTimeAsync(11_000);
     expect(storage.outbox.getReady(Date.now() + 1, 10).length).toBe(1);
 
     // The rejection our own close() caused. One failure, one notice.

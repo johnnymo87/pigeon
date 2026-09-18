@@ -45,6 +45,8 @@ export interface RunnerClient {
   connect(): Promise<void>;
   /** True once the socket has closed, so the runner knows to reconnect. */
   isClosed(): boolean;
+  /** Round-trips a cheap request; never settles on a dead socket. */
+  ping(): Promise<void>;
   prompt(sessionId: string, text: string): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
@@ -112,10 +114,15 @@ const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
  * past anything the human is likely to be running and still short of the hours a
  * wedged session would otherwise sit there.
  *
- * A false positive is not free -- see `abandonTurn` for what it costs and how
- * the late-receipt path limits it. The interactive case does not wait for this
- * at all: a human who sends anything to a wedged session trips the 10s steer
- * bound instead, which is far better evidence (a steer answers in ~1ms).
+ * Expiry does NOT mean the turn is abandoned. It means the socket gets asked
+ * whether it is alive (see `checkStalled`), and only a socket that fails to
+ * answer ends the turn. That is what makes this threshold a question of how
+ * often to pester a working turn rather than a guess that costs the human their
+ * answer when it is wrong.
+ *
+ * The interactive case does not wait for this at all: a human who sends anything
+ * to a wedged session trips the 10s steer bound instead, which is evidence of
+ * the same kind and arrives immediately.
  */
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -409,10 +416,46 @@ export class GooseSessionRunner {
         this.armIdleTimer(turn);
         return;
       }
-      void this.abandonTurn(turn, `no activity for ${Math.round(idleFor / 60_000)} minutes`);
+      void this.checkStalled(turn, idleFor);
     }, timeout);
     // Never the reason the process stays alive.
     turn.idleTimer.unref?.();
+  }
+
+  /**
+   * Decides whether a silent turn is dead or merely slow, by asking the socket.
+   *
+   * Silence alone cannot tell those apart, and the cost of guessing is
+   * asymmetric but bad in both directions: abandoning a live turn loses the
+   * human's answer outright, because abandoning means closing the socket the
+   * answer would have come back on. A live probe replaces the guess with
+   * evidence, so the timeout only has to be long enough to avoid pestering a
+   * working turn -- not long enough to be SURE.
+   *
+   * If the socket answers, the turn is working and gets another full timeout.
+   */
+  private async checkStalled(turn: Turn, idleFor: number): Promise<void> {
+    if (turn.abandoned || this.turn !== turn) return;
+
+    try {
+      await withDeadline(this.opts.client.ping(), NON_TURN_TIMEOUT_MS, "liveness ping");
+    } catch (err) {
+      await this.abandonTurn(
+        turn,
+        `no activity for ${Math.round(idleFor / 60_000)} minutes and the connection did not answer a liveness check`,
+      );
+      return;
+    }
+
+    this.log("goose runner: turn is quiet but the socket is alive; still waiting", {
+      sessionId: this.sessionId,
+      commandId: turn.commandId,
+      idleMinutes: Math.round(idleFor / 60_000),
+    });
+    // Treat the successful probe as activity: otherwise every subsequent tick
+    // would re-probe immediately, once per timer interval, for the whole turn.
+    turn.lastActivityAt = Date.now();
+    this.armIdleTimer(turn);
   }
 
   /**
@@ -423,10 +466,14 @@ export class GooseSessionRunner {
    * not touch its pending map, and a half-open socket may never deliver a close
    * event at all -- which is the exact case this exists for.
    *
-   * The notice carries a DISTINCT notification id. `/stop` dedups on that id, so
-   * posting under the turn's normal one would claim it, and a late real answer
-   * would then be swallowed as "already queued" -- turning a false positive from
-   * a spurious warning into a lost answer.
+   * Only reached when a liveness probe has already failed, so the socket is
+   * known dead and the turn's result was never going to arrive over it. Closing
+   * therefore costs nothing that was not already lost.
+   *
+   * The notice still carries a DISTINCT notification id. `/stop` dedups on that
+   * id, so posting under the turn's normal one would claim it and silently eat
+   * any later report for the same command -- and the late-receipt path in
+   * `finishTurn` depends on that id being free.
    */
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
     if (turn.abandoned || this.turn !== turn) return;
