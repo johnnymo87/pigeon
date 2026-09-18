@@ -408,6 +408,47 @@ describe("GooseAcpClient", () => {
       // have persisted it, so a blind replay is how you get a duplicate.
       expect(peer.countOf("session/prompt")).toBe(1);
     });
+
+    /**
+     * The zombie-transport hazard.
+     *
+     * `connect()` reassigns `this.transport`, but a listener registered on the
+     * OLD transport still points at `this.onClose`. A socket we closed can sit
+     * in CLOSING until the kernel gives up on the unacked close frame -- minutes
+     * later -- and when it finally fires, the old listener rejects the NEW
+     * connection's turn as `DisconnectedDuringTurn` and clears its run ids. The
+     * human is told a perfectly healthy turn was lost.
+     *
+     * Latent today (reachable via the handshake-timeout path, which closes and
+     * lets the next deliver reconnect). The idle watchdog makes
+     * close-then-reconnect the DESIGNED path, so it has to be fixed here first.
+     */
+    it("ignores a late close from a transport it already replaced", async () => {
+      const first = new FakePeer();
+      const second = new FakePeer();
+      autoHandshake(first);
+      autoHandshake(second);
+
+      let next = first;
+      const client = makeClient(first, { transportFactory: () => next });
+      await client.connect();
+
+      // The socket wedges; we close it and reconnect onto a fresh one.
+      client.close();
+      next = second;
+      await client.connect();
+
+      const live = client.prompt("sess-1", "on the new socket");
+      expect(second.countOf("session/prompt")).toBe(1);
+
+      // The zombie finally gives up, long after it stopped being ours.
+      first.drop(1006);
+
+      // The live turn must be untouched: still pending, still able to answer.
+      second.reply(second.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+      await expect(live).resolves.toMatchObject({ kind: "receipt", stopReason: "end_turn" });
+      expect(client.isClosed()).toBe(false);
+    });
   });
 
   /**

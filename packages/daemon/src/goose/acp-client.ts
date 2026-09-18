@@ -206,13 +206,51 @@ export class GooseAcpClient {
     const transport = await this.opts.transportFactory(this.opts.url);
     this.transport = transport;
     this.closed = false;
-    transport.onMessage((data) => this.onMessage(data));
-    transport.onClose((code, reason) => this.onClose(code, reason));
+    // Both callbacks are fenced on transport identity. A socket we have replaced
+    // can still fire -- a half-open one sits in CLOSING until the kernel gives up
+    // on the unacked close frame, which is minutes -- and an unfenced listener
+    // would then reject the CURRENT connection's turn as DisconnectedDuringTurn
+    // and clear its run ids, telling the human a healthy turn was lost. The
+    // zombie has nothing to say about the connection that replaced it.
+    transport.onMessage((data) => {
+      if (this.transport !== transport) return;
+      this.onMessage(data);
+    });
+    transport.onClose((code, reason) => {
+      if (this.transport !== transport) return;
+      this.onClose(code, reason);
+    });
     await this.call("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
     this.log("goose acp connected", { url: this.opts.url });
+  }
+
+  /**
+   * Round-trips a cheap request to prove the socket is still alive.
+   *
+   * Silence on a turn cannot distinguish a dead socket from a tool call that is
+   * simply taking a long time, and guessing wrong in either direction is
+   * expensive: abandon a live turn and the human loses the answer, keep faith in
+   * a dead one and the session is wedged forever. This asks.
+   *
+   * `initialize` is the probe because it is already on the allowlist, is
+   * side-effect free, and -- measured against goose 1.48.0 -- answers in ~1ms
+   * mid-turn without disturbing the run in flight (the turn still completed with
+   * stopReason end_turn afterwards). The RESULT is ignored entirely; an error
+   * reply would prove liveness just as well as a success. Only the round trip
+   * matters.
+   *
+   * Callers must impose their own deadline: there is deliberately no timeout in
+   * this client (see fact 1 in the header), and on a dead socket this never
+   * settles at all, which is precisely the signal being looked for.
+   */
+  async ping(): Promise<void> {
+    await this.call("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    });
   }
 
   /** Opens a new session and returns its id. */

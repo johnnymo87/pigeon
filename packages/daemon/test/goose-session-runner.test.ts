@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { GooseSessionRunner, GooseRunnerRegistry } from "../src/goose/session-runner.js";
 import type { SessionRecord } from "../src/storage/types.js";
 
@@ -47,6 +47,13 @@ class FakeClient {
   }
   isClosed(): boolean {
     return this.closed;
+  }
+  /** Answers by default; tests set pingImpl to model a dead socket. */
+  pingImpl: (() => Promise<void>) | undefined;
+  pings = 0;
+  async ping(): Promise<void> {
+    this.pings++;
+    if (this.pingImpl) return this.pingImpl();
   }
   close(): void {
     this.closed = true;
@@ -420,4 +427,243 @@ describe("GooseSessionRunner defects found in review", () => {
     expect(res.ok).toBe(false);
     expect(res.meta?.mode).toBe("steer-timeout");
   }, 20_000);
+});
+
+/**
+ * The half-open socket.
+ *
+ * A websocket that dies with no close event (NAT idle drop, serve SIGKILL with
+ * no FIN) leaves the turn's promise pending forever. `isBusy()` is a presence
+ * check, so the session wedges permanently: every later message takes the steer
+ * branch and steers a run id that is stale or absent.
+ *
+ * The inherited plan was "close the socket and let onClose reject the turn".
+ * That does not work -- GooseAcpClient.close() does not touch its pending map,
+ * and a half-open socket may never deliver a close event at all. The runner has
+ * to settle its own turn.
+ */
+describe("GooseSessionRunner idle watchdog", () => {
+  const IDLE = 30 * 60 * 1000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("abandons a turn that has gone completely silent, and unwedges the session", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    // The socket is dead: it will not answer the liveness probe either.
+    client.pingImpl = () => new Promise(() => {});
+
+    await runner.deliver("c1", "build the thing");
+    expect(runner.isBusy()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(11_000); // the probe's own 10s deadline
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.event).toBe("Error");
+    expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+    // The session must be usable again -- that is the whole point.
+    expect(runner.isBusy()).toBe(false);
+    // And the socket is dropped so the next delivery reconnects.
+    expect(client.closed).toBe(true);
+  });
+
+  it("does not abandon a turn that is quietly working", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "long build");
+
+    // A tool call that emits nothing for 25 minutes, then reports.
+    await vi.advanceTimersByTimeAsync(25 * 60 * 1000);
+    expect(stops).toHaveLength(0);
+    expect(runner.isBusy()).toBe(true);
+
+    // Tool chatter is liveness even though it contributes no transcript text.
+    runner.onUpdate({ sessionUpdate: "tool_call_update", status: "completed" });
+    await vi.advanceTimersByTimeAsync(25 * 60 * 1000);
+
+    expect(stops).toHaveLength(0);
+    expect(runner.isBusy()).toBe(true);
+  });
+
+  /**
+   * The false-positive path, and the reason the stall notice needs its own
+   * notification id. /stop dedups on notification_id: if the stall notice
+   * claimed the turn's normal id, a late REAL answer would be swallowed as
+   * "already queued" and the human would lose it entirely.
+   */
+  it("still reports a real answer that arrives after the turn was abandoned", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    client.pingImpl = () => new Promise(() => {});
+    await runner.deliver("c1", "slow but alive");
+
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(stops).toHaveLength(1);
+    const stalledId = stops[0]!.notification_id as string;
+
+    // goose was fine all along and finally answers.
+    client.finishTurn("end_turn");
+    await vi.runAllTimersAsync();
+    await runner.settled();
+
+    expect(stops).toHaveLength(2);
+    expect(stops[1]!.event).toBe("Stop");
+    // Distinct ids, or /stop's idempotency would have eaten the real answer.
+    expect(stops[1]!.notification_id).not.toBe(stalledId);
+  });
+
+  it("stays quiet when the abandoned turn merely errors out later", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    client.pingImpl = () => new Promise(() => {});
+    await runner.deliver("c1", "doomed");
+
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(stops).toHaveLength(1);
+
+    // This rejection is the expected consequence of our own close(). Reporting
+    // it would be a second failure notice for one failure.
+    client.failTurn(new Error("connection closed (code 1006)"));
+    await vi.runAllTimersAsync();
+    await runner.settled();
+
+    expect(stops).toHaveLength(1);
+  });
+
+  /**
+   * The event-driven half. A wedged session plus a human who sends anything
+   * hits the steer branch, which is already bounded at 10s -- and steer is a
+   * ~1ms call, so 10s of silence there is dead-socket evidence at least as good
+   * as 30 minutes of turn silence. It just did not unwedge anything.
+   */
+  it("unwedges on a steer that never answers, so the human's resend works", async () => {
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "first");
+
+    // A truly dead socket: neither the steer nor the liveness probe answers.
+    client.steerImpl = () => new Promise(() => {});
+    client.pingImpl = () => new Promise(() => {});
+    const outcome = await runner.deliver("c2", "are you there?");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.meta?.mode).toBe("steer-timeout");
+    // Unwedged: the stuck turn was abandoned and reported.
+    expect(runner.isBusy()).toBe(false);
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+  }, 30_000);
+
+  it("declines without abandoning when the steer is slow but the socket is alive", async () => {
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "first");
+
+    // The steer hangs, but the connection answers a liveness check -- so the
+    // turn is still real and must NOT be thrown away. Same rule as the watchdog:
+    // silence is not evidence, and abandoning a live turn costs the answer.
+    client.steerImpl = () => new Promise(() => {});
+    const outcome = await runner.deliver("c2", "are you there?");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.meta?.mode).toBe("steer-timeout");
+    expect(runner.isBusy()).toBe(true);
+    expect(stops).toHaveLength(0);
+    expect(client.closed).toBe(false);
+  }, 30_000);
+
+  it("bounds the steer on the busy path too", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+
+    // goose rejected the prompt as busy, and the follow-up steer hangs.
+    client.steerImpl = () => new Promise(() => {});
+    client.finishBusy("run_9");
+    await runner.settled();
+
+    // Bounded rather than hanging forever: the turn is settled and the human is
+    // told their message did not land.
+    expect(stops).toHaveLength(1);
+    expect(runner.isBusy()).toBe(false);
+    expect(String(stops[0]!.message)).toMatch(/NOT delivered|not delivered/i);
+  }, 20_000);
+});
+
+/**
+ * Silence is not evidence. Asking is.
+ *
+ * A turn that emits nothing and a socket that is dead look identical from the
+ * outside, and the cost of confusing them is asymmetric but bad both ways: keep
+ * faith in a dead socket and the session wedges forever; abandon a live turn and
+ * the human loses the answer outright, because abandoning MEANS closing the
+ * socket the answer would have come back on.
+ *
+ * Measured against goose 1.48.0: a second `initialize` mid-turn answers in ~1ms
+ * and the in-flight turn still completes with stopReason end_turn, so the probe
+ * is both cheap and non-disruptive.
+ */
+describe("GooseSessionRunner liveness probing", () => {
+  const IDLE = 30 * 60 * 1000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps waiting on a silent turn whose socket still answers", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "a very long build");
+
+    // Two full idle periods of total silence -- but the socket is fine.
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+
+    expect(client.pings).toBeGreaterThanOrEqual(1);
+    expect(stops).toHaveLength(0);
+    expect(runner.isBusy()).toBe(true);
+    expect(client.closed).toBe(false);
+  });
+
+  it("gives up once the socket stops answering", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "build");
+
+    // Alive through the first check.
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    expect(stops).toHaveLength(0);
+
+    // Then the socket dies.
+    client.pingImpl = () => new Promise(() => {});
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+    expect(String(stops[0]!.message)).toContain("liveness check");
+    expect(runner.isBusy()).toBe(false);
+  });
+
+  it("does not re-probe on every tick once a probe has succeeded", async () => {
+    vi.useFakeTimers();
+    const { runner, client } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "quiet work");
+
+    await vi.advanceTimersByTimeAsync(IDLE * 3);
+    // Exactly one probe per idle period -- not one per timer tick, and not zero,
+    // which a <= assertion would have accepted while the watchdog did nothing.
+    expect(client.pings).toBe(3);
+  });
 });

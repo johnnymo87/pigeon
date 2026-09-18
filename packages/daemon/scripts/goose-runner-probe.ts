@@ -172,6 +172,93 @@ async function main(): Promise<void> {
     `stops=${stops.length} msg=${JSON.stringify(String(recovered.message ?? "").slice(0, 60))}`,
   );
 
+  // --- 8. the idle watchdog, against a REAL turn on a REAL socket.
+  //
+  // A genuinely half-open socket needs packet-dropping and root, so what is
+  // driven here is the half that is reachable: the watchdog fires against a real
+  // in-flight goose turn, reports, and unwedges the runner -- and the real turn
+  // then lands as a SECOND notification rather than being swallowed. That last
+  // part is the one that matters, because it is what a false positive costs.
+  console.log("\n6. the liveness probe tells a quiet turn from a dead socket");
+  // This is the check the first version of this section got WRONG, and the
+  // reason it is worth having: with a 1.5s idle timeout and no liveness probe,
+  // the watchdog abandoned a perfectly healthy turn, closed the socket, and the
+  // real answer never arrived at all -- a total loss that every unit test missed
+  // because their fake client's close() was a no-op. Silence is not evidence.
+  const stalls: Array<Record<string, unknown>> = [];
+  const impatient = new GooseSessionRunner({
+    session,
+    client,
+    postStop: async (body) => { stalls.push(body); },
+    touch: () => {},
+    log: () => {},
+    // Aggressively short: goose takes seconds to answer even a trivial prompt,
+    // so this expires repeatedly INSIDE a live run. Nothing may be abandoned.
+    turnIdleTimeoutMs: 1_000,
+  });
+  const quietStart = Date.now();
+  await impatient.deliver("probe-5", "Count slowly to twenty, one number per line, with a sentence about each.");
+  await impatient.settled();
+  const elapsed = Date.now() - quietStart;
+
+  check(
+    "a healthy turn survived repeated idle expiries",
+    stalls.length === 1 && stalls[0]?.event === "Stop",
+    `stalls=${stalls.length} events=${stalls.map((s) => s.event).join(",")}`,
+  );
+  check(
+    "and it was the real answer, not a stall notice",
+    !String(stalls[0]?.notification_id ?? "").endsWith(":stalled")
+      && String(stalls[0]?.message ?? "").length > 50,
+    `id=${stalls[0]?.notification_id} len=${String(stalls[0]?.message ?? "").length}`,
+  );
+  check("the turn actually ran long enough to expire the timer", elapsed > 2_000, `${elapsed}ms`);
+  check("the runner ended clean", impatient.isBusy() === false);
+
+  // The other half -- a socket that dies mid-turn -- and an honest note about
+  // which half of it is reachable from here.
+  //
+  // A GRACEFUL close (this one) fires onClose, which rejects the pending turn
+  // and reports it immediately: that path predates the watchdog and is what the
+  // checks below pin. A genuinely HALF-OPEN socket emits no close event at all,
+  // and producing one requires dropping packets with iptables as root, so it is
+  // not driven here -- it is covered by unit tests whose liveness probe hangs.
+  // The distinction matters: if this section ever starts reporting a STALL
+  // rather than a failure, something has broken in onClose.
+  console.log("\n7. a socket that dies mid-turn is reported, not left hanging");
+  const deadStalls: Array<Record<string, unknown>> = [];
+  const onDead = new GooseSessionRunner({
+    session,
+    client,
+    postStop: async (body) => { deadStalls.push(body); },
+    touch: () => {},
+    log: () => {},
+    turnIdleTimeoutMs: 1_000,
+  });
+  await onDead.deliver("probe-6", "Count slowly to forty with a sentence about each.");
+  // Kill the transport underneath the runner without settling its turn: the
+  // pending prompt stays outstanding and the liveness probe can never answer.
+  await new Promise((r) => setTimeout(r, 1_000));
+  client.close();
+  await new Promise((r) => setTimeout(r, 15_000));
+
+  check(
+    "the lost turn was reported to the human",
+    deadStalls.length === 1,
+    `n=${deadStalls.length}`,
+  );
+  check(
+    "as a turn failure via onClose, NOT as a watchdog stall",
+    String(deadStalls[0]?.error_kind) === "goose-turn-failed",
+    String(deadStalls[0]?.error_kind),
+  );
+  check(
+    "naming the disconnect so the human knows the prompt may be orphaned",
+    String(deadStalls[0]?.message ?? "").includes("connection closed"),
+    String(deadStalls[0]?.message ?? "").slice(0, 90),
+  );
+  check("and the runner is no longer wedged", onDead.isBusy() === false);
+
   client.close();
   console.log(failures === 0 ? "\nALL LIVE CHECKS PASSED" : `\n${failures} LIVE CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

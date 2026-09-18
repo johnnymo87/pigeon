@@ -53,6 +53,10 @@ export interface InboxRecord {
   payload: string;
   status: string;
   updatedAt: number;
+  /** Redeliveries seen so far. 0 on the first arrival; bounded by MAX_REDELIVERIES. */
+  retryCount: number;
+  /** Why the last delivery threw, so the give-up message can name the cause. */
+  lastError: string | null;
 }
 
 export interface QuestionOptionData {
