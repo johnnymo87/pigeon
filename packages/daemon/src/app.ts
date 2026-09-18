@@ -866,6 +866,36 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Residual: a human who pastes a literal close tag into a prompt gets neither
         // mirror nor clear. Self-heals on their next turn.
         const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
+
+        // ANCHOR EVERY USER TURN, injected or not, ABOVE the early return below.
+        //
+        // This used to sit under that return, next to markAllRead, on the reasoning
+        // that an injected prompt is not evidence a human was present. That reasoning
+        // is sound and it is about the WRONG QUESTION. Presence decides whether to
+        // CLEAR a badge; an anchor answers "where does this turn begin", and an
+        // injected turn begins somewhere just as surely as a typed one.
+        //
+        // The cost of conflating them was measured on the live daemon: opencode-launch
+        // records its own launch prompt as injected, sendPrompt records every Telegram
+        // reply, and swarm messages carry an envelope -- so a headless worker's every
+        // turn was excluded and it could never be jumped to at all. 155 of 239 sessions
+        // with unread had no anchor, and the largest single group were sessions whose
+        // only turns arrived by exactly these routes.
+        //
+        // PLACEMENT IS LOAD-BEARING, and now in the opposite direction from the clear:
+        //  - ABOVE the early return, or injected turns get no anchor (the bug).
+        //  - markAllRead must STAY BELOW it. Hoisting the two together would mark a
+        //    badge read that no human saw, and the watermark is a MAX() upsert, so it
+        //    cannot be walked back. Pinned by the two "still does/does NOT clear" tests.
+        //
+        // Whitespace-only turns are still excluded, for a different reason than before:
+        // a blank turn has no renderable box, so an anchor on it cannot be scrolled to,
+        // and recording it would replace a usable older anchor with one that resolves
+        // to nothing -- landing the reader at the bottom, the failure this removes.
+        if (text.trim()) {
+          storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
+        }
+
         if (wasInjected || !text.trim() || payloadHasCloseTag(text)) {
           return Response.json({ mirrored: false });
         }
@@ -896,23 +926,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // handler runs (unknown command types return earlier without clearing, so
         // version skew does not clear). Do not add a second Telegram clear here.
         storage.sessionEvents.markAllRead(sessionId, now);
-
-        // Same turn, same evidence, second use: this message id is the scroll
-        // anchor for every notification enqueued until the next human turn
-        // (phase 1b). It is recorded HERE rather than in the plugin because
-        // everything needed is already in scope and already classified -- the
-        // early-return above has established the turn is not daemon-injected --
-        // so the design's prescribed plugin change buys nothing.
-        //
-        // Note what this is NOT: /stop carries no message id at all, so there is
-        // no per-kind anchor to thread. Every kind reads this one value.
-        //
-        // Telegram replies never reach here -- sendPrompt records every injected
-        // prompt, so they classify as injected above. They still CLEAR (that half
-        // lives at poller.dispatch), so a Telegram-driven session keeps an anchor
-        // at its last TUI turn, possibly far back. Safe direction: re-read, never
-        // skip. Phase 2 decides whether very-stale beats NULL.
-        storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
 
         // A session declared quiet (lgtm's automated reviews) must not mirror its
         // prompts. Without this, lgtm's own launch prompt -- a user-role message the

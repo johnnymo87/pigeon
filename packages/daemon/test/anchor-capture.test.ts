@@ -103,6 +103,13 @@ describe("phase 1b: /mirror records the anchor", () => {
     return row?.a ?? null;
   }
 
+  function readWatermark(sessionId: string): number | null {
+    const row = storage!.db
+      .prepare("SELECT last_read_id AS r FROM session_reads WHERE session_id = ?")
+      .get(sessionId) as { r: number | null } | undefined;
+    return row?.r ?? null;
+  }
+
   function addSession(sessionId: string) {
     storage!.sessions.upsert({ sessionId, notify: true }, 1_000);
   }
@@ -114,23 +121,65 @@ describe("phase 1b: /mirror records the anchor", () => {
     expect(anchorOf("s1")).toBe("msg_01human");
   });
 
-  // Must return before the anchor write. An injected prompt is not presence.
-  it("records nothing for a daemon-injected turn", async () => {
+  // INVERTED 2026-09-16. These two used to assert that an injected turn records
+  // NOTHING, on the reasoning that "an injected prompt is not presence". That is
+  // true and irrelevant: presence decides whether to CLEAR the badge, which still
+  // happens below the early return. An anchor answers a different question --
+  // where does this turn begin -- and an injected turn begins somewhere just as
+  // surely as a typed one.
+  //
+  // Measured consequence of the old rule: opencode-launch records its own launch
+  // prompt as injected, Telegram replies are recorded by sendPrompt, and swarm
+  // messages carry an envelope -- so for a headless worker EVERY turn it ever
+  // receives was excluded, and it could never be jumped to. 155 of 239 sessions
+  // with unread had no anchor at all.
+  it("records the anchor for a daemon-injected turn", async () => {
     const app = newApp();
     addSession("s1");
     const text = "injected by the daemon";
     storage!.injectedPrompts.record("s1", hashPrompt(text));
     await mirror(app, "s1", "msg_01injected", text);
-    expect(anchorOf("s1")).toBeNull();
+    expect(anchorOf("s1")).toBe("msg_01injected");
   });
 
-  it("records nothing for an enveloped swarm turn", async () => {
+  it("records the anchor for an enveloped swarm turn", async () => {
     const app = newApp();
     addSession("s1");
     await mirror(app, "s1", "msg_01swarm", '<swarm_message from="peer">hi</swarm_message>');
-    expect(anchorOf("s1")).toBeNull();
+    expect(anchorOf("s1")).toBe("msg_01swarm");
   });
 
+  // The clearing half must NOT move with it. These two are the regression guard:
+  // if a future edit hoists markAllRead along with the anchor write, an injected
+  // turn would silently mark a badge read that no human ever saw, and the
+  // watermark is a MAX() upsert so it cannot be walked back.
+  it("still does NOT clear the badge for a daemon-injected turn", async () => {
+    const app = newApp();
+    addSession("s1");
+    const text = "injected by the daemon";
+    storage!.injectedPrompts.record("s1", hashPrompt(text));
+    storage!.sessionEvents.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1_000 });
+    await mirror(app, "s1", "msg_01injected", text);
+    const unread = storage!.db
+      .prepare("SELECT COUNT(*) AS c FROM session_events WHERE session_id = ?")
+      .get("s1") as { c: number };
+    expect(unread.c).toBe(1);
+    expect(readWatermark("s1")).toBeNull();
+  });
+
+  it("still DOES clear the badge for a turn the daemon did not inject", async () => {
+    const app = newApp();
+    addSession("s1");
+    storage!.sessionEvents.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1_000 });
+    await mirror(app, "s1", "msg_01human", "a real question");
+    expect(readWatermark("s1")).not.toBeNull();
+  });
+
+  // Still excluded, and now for a DIFFERENT reason than the others. A blank turn
+  // has no renderable message box, so an anchor pointing at it cannot be scrolled
+  // to -- recording it would replace a usable older anchor with one that resolves
+  // to nothing, leaving the viewport at the bottom. That is the too-late direction
+  // the anchor design exists to avoid.
   it("records nothing for a whitespace-only turn", async () => {
     const app = newApp();
     addSession("s1");
