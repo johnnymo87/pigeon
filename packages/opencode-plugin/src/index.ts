@@ -19,6 +19,7 @@ import { createSwarmScheduleTool, SWARM_SCHEDULE_TOOL_NAME } from "./swarm-sched
 import { createSwarmScheduledTool, SWARM_SCHEDULED_TOOL_NAME } from "./swarm-scheduled-tool"
 import { resolveServeAuthHeader } from "./serve-auth"
 import { errorMessage, serializeError, isAbortError } from "./utils"
+import { createLog } from "./plugin-log"
 
 const plugin: Plugin = async (ctx) => {
   try {
@@ -29,20 +30,10 @@ const plugin: Plugin = async (ctx) => {
     const sdkClientConfig = (ctx.client as any)._client?.getConfig?.()
     const internalFetch: typeof fetch = sdkClientConfig?.fetch ?? globalThis.fetch
 
-    // SDK-native logging wrapper
-    const log = (message: string, data?: unknown): void => {
-      try {
-        const serializedData = data ? serializeError(data) : undefined
-        ctx.client.app.log({
-          body: {
-            service: "opencode-pigeon",
-            level: "info",
-            message,
-            extra: serializedData ? { data: serializedData } : undefined,
-          },
-        })
-      } catch {}
-    }
+    // SDK-native logging wrapper. See plugin-log.ts for why `service` has to
+    // travel in `extra` (the server discards the top-level field) and why the
+    // SDK's returned result must be inspected rather than dropped.
+    const log = createLog(ctx.client)
 
     const sessionManager = new SessionManager()
 
@@ -832,19 +823,7 @@ const plugin: Plugin = async (ctx) => {
       },
     }
   } catch (err) {
-    const errorLog = (message: string, data?: unknown): void => {
-      try {
-        const serializedData = data ? serializeError(data) : undefined
-        ctx.client.app.log({
-          body: {
-            service: "opencode-pigeon",
-            level: "error",
-            message,
-            extra: serializedData ? { data: serializedData } : undefined,
-          },
-        })
-      } catch {}
-    }
+    const errorLog = createLog(ctx.client, { level: "error" })
     errorLog("plugin initialization error:", serializeError(err))
     throw err
   }
