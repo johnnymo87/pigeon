@@ -5658,7 +5658,7 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
     storage.db.close();
   });
 
-  it("does not count a command that succeeds on a later attempt", async () => {
+  it("stops counting once a command finally succeeds", async () => {
     const storage = openStorageDb(":memory:");
     gooseSession(storage, "sess-flap");
     let calls = 0;
@@ -5682,6 +5682,11 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
     await ingestWorkerCommand(storage, msg, opts);
 
     expect(storage.inbox.get("cmd-flap")?.status).toBe("done");
+    // Two redeliveries were counted and the third try landed, well inside the
+    // cap -- a flapping backend must not burn the budget of a command it then
+    // delivers successfully.
+    expect(storage.inbox.get("cmd-flap")?.retryCount).toBe(2);
+    expect(calls).toBe(3);
     storage.db.close();
   });
 

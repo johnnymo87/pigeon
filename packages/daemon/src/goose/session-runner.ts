@@ -95,9 +95,17 @@ interface Turn {
    * Set when the watchdog gave up on this turn and already told the human.
    *
    * Changes what a LATE settlement means, asymmetrically: a late error is the
-   * expected consequence of our own close() and is logged only, but a late
-   * receipt means goose was alive the whole time and the human still wants the
-   * answer, so it is reported normally.
+   * expected consequence of our own close() and is logged only, while a late
+   * receipt is reported normally.
+   *
+   * Be clear about that second branch: it is defence, not a live path. A turn is
+   * only abandoned after a liveness probe has already failed, so the socket is
+   * dead and no receipt is coming. Even on a live socket it would not arrive --
+   * verified on node 22.22.2 that a WebSocket whose readyState has left OPEN
+   * delivers no further message events, per the WHATWG step that drops them. It
+   * is kept because the cost of being wrong here is a silently swallowed answer,
+   * and because the distinct `:stalled` notification id that makes it possible is
+   * worth having regardless. Nothing should be built on it firing.
    */
   abandoned: boolean;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -214,6 +222,12 @@ export class GooseSessionRunner {
     // competing one. goose would reject a second prompt as busy anyway; steering
     // is what the human actually means by sending a message mid-turn.
     if (this.turn) {
+      // Captured, not re-read after the awaits below. The watchdog can settle
+      // and clear this turn while the steer is in flight, and TypeScript's
+      // narrowing does not survive an await even though the field can change
+      // under it -- so re-reading `this.turn` in the catch could hand `undefined`
+      // to abandonTurn and turn a bounded steer timeout into a thrown TypeError.
+      const steeringTurn = this.turn;
       const runId = this.runId();
       if (!runId) {
         // The turn is starting but has not yet announced its run id. Nothing has
@@ -234,10 +248,20 @@ export class GooseSessionRunner {
         )) as { kind?: string };
       } catch (err) {
         // A steer answers in about a millisecond, so ten seconds of silence on
-        // one is strong evidence the socket is dead -- better evidence than the
-        // watchdog's thirty minutes, and available the moment a human touches a
-        // wedged session. So this unwedges too, rather than only declining.
-        await this.abandonTurn(this.turn, "a steer went unanswered for 10s");
+        // one is good evidence the socket is dead -- and it arrives the moment a
+        // human touches a wedged session, rather than after the watchdog's thirty
+        // minutes. But the same rule applies here as in checkStalled: silence is
+        // not proof, and abandoning a live turn costs the human their answer. So
+        // confirm with a liveness probe before giving up, and merely decline if
+        // the socket answers.
+        try {
+          await withDeadline(this.opts.client.ping(), NON_TURN_TIMEOUT_MS, "liveness ping");
+          this.log("goose runner: steer timed out but the socket is alive", {
+            sessionId: this.sessionId,
+          });
+        } catch {
+          await this.abandonTurn(steeringTurn, "a steer and a liveness check both went unanswered");
+        }
         // Deliberately ok:false rather than a throw. A throw would redeliver and
         // could steer twice; more importantly the alternative to bounding this at
         // all is a frozen poller, which costs every other session on the machine.
@@ -447,6 +471,10 @@ export class GooseSessionRunner {
       return;
     }
 
+    // The turn can finish while the probe is in flight. Re-arming then would
+    // leave a timer nothing can clear, because clearTurn no longer reaches it.
+    if (turn.abandoned || this.turn !== turn) return;
+
     this.log("goose runner: turn is quiet but the socket is alive; still waiting", {
       sessionId: this.sessionId,
       commandId: turn.commandId,
@@ -504,8 +532,9 @@ export class GooseSessionRunner {
         message:
           (partial === "" ? "" : `${partial}\n\n`)
           + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
-          + "goose cannot be interrupted, so if that turn is still running it will finish on goose's side "
-          + "and its result may not appear here. The session history is intact -- send a message to pick it up.",
+          + "goose cannot be interrupted, so if that turn is still running it will finish on goose's side -- "
+          + "but its result will NOT appear here, because the connection it would have come back on is gone. "
+          + "The session history is intact, so send a message to pick it up.",
         event: "Error",
         error_kind: "goose-turn-stalled",
       });

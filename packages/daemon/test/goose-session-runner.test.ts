@@ -550,7 +550,9 @@ describe("GooseSessionRunner idle watchdog", () => {
     client.setRunId("20260918_1", "run_1");
     await runner.deliver("c1", "first");
 
+    // A truly dead socket: neither the steer nor the liveness probe answers.
     client.steerImpl = () => new Promise(() => {});
+    client.pingImpl = () => new Promise(() => {});
     const outcome = await runner.deliver("c2", "are you there?");
 
     expect(outcome.ok).toBe(false);
@@ -559,7 +561,25 @@ describe("GooseSessionRunner idle watchdog", () => {
     expect(runner.isBusy()).toBe(false);
     expect(stops).toHaveLength(1);
     expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
-  }, 20_000);
+  }, 30_000);
+
+  it("declines without abandoning when the steer is slow but the socket is alive", async () => {
+    const { runner, client, stops } = makeRunner();
+    client.setRunId("20260918_1", "run_1");
+    await runner.deliver("c1", "first");
+
+    // The steer hangs, but the connection answers a liveness check -- so the
+    // turn is still real and must NOT be thrown away. Same rule as the watchdog:
+    // silence is not evidence, and abandoning a live turn costs the answer.
+    client.steerImpl = () => new Promise(() => {});
+    const outcome = await runner.deliver("c2", "are you there?");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.meta?.mode).toBe("steer-timeout");
+    expect(runner.isBusy()).toBe(true);
+    expect(stops).toHaveLength(0);
+    expect(client.closed).toBe(false);
+  }, 30_000);
 
   it("bounds the steer on the busy path too", async () => {
     const { runner, client, stops } = makeRunner();
@@ -642,7 +662,8 @@ describe("GooseSessionRunner liveness probing", () => {
     await runner.deliver("c1", "quiet work");
 
     await vi.advanceTimersByTimeAsync(IDLE * 3);
-    // Three idle periods, three probes -- not one per timer tick.
-    expect(client.pings).toBeLessThanOrEqual(3);
+    // Exactly one probe per idle period -- not one per timer tick, and not zero,
+    // which a <= assertion would have accepted while the watchdog did nothing.
+    expect(client.pings).toBe(3);
   });
 });
