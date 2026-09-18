@@ -5,6 +5,7 @@
  * callbacks, and acks via POST /commands/:id/ack after successful dispatch.
  */
 
+import { BACKENDS_HEADER } from "./backends";
 import type { WorkerHealthObserver } from "./worker-health";
 
 export interface SendNotificationInput {
@@ -141,6 +142,18 @@ export interface PollerConfig {
   chatId?: string;
   /** Default 5000 ms */
   pollIntervalMs?: number;
+  /**
+   * What this daemon can launch, as rendered by `advertisedBackends`. Sent on
+   * every poll so the worker can refuse a command this daemon cannot serve
+   * rather than letting it be silently mishandled; see `backends.ts` for why
+   * the wire needs this at all.
+   *
+   * Optional ONLY so existing callers and tests need not be rewritten. Omitting
+   * it makes this daemon indistinguishable from a pre-gate one, which the
+   * worker reads as opencode-only -- safe, but it forfeits the gate, so
+   * production wiring always sets it.
+   */
+  backends?: string;
 }
 
 export interface ExecuteMessage {
@@ -167,6 +180,20 @@ export interface LaunchMessage {
    * tag asked for", never as an invalid one.
    */
   tag?: string;
+  /**
+   * Which agent backend to launch, from `/launch --backend <backend>`. Absent
+   * means opencode, both because that is the historical behaviour and because
+   * an OLD worker cannot send this field at all -- so undefined must read as
+   * "the ordinary launch", never as invalid.
+   *
+   * The worker gates on this before it ever reaches the daemon (see
+   * `backends.ts`), so in a correctly-deployed pair an unservable value cannot
+   * arrive. The daemon checks it ANYWAY: the gate lives on the other side of a
+   * boundary with no shared schema, and the failure it prevents -- launching
+   * the WRONG backend while telling the human the right one started -- is
+   * silent, so it is worth two independent checks.
+   */
+  backend?: string;
   messageThreadId?: number;
 }
 
@@ -403,7 +430,14 @@ export class Poller {
   async poll(): Promise<WorkerMessage | null> {
     const url = `${this.config.workerUrl}/machines/${encodeURIComponent(this.config.machineId)}/next`;
     const response = await this.fetchFn(url, {
-      headers: { Authorization: `Bearer ${this.config.apiKey}` },
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        // Advertise what this daemon can launch. Omitted entirely when not
+        // configured, which the worker reads as a pre-gate daemon; sending an
+        // empty value instead would be read as "I can serve nothing" and
+        // refuse everything.
+        ...(this.config.backends ? { [BACKENDS_HEADER]: this.config.backends } : {}),
+      },
     });
 
     if (response.status === 204) {
