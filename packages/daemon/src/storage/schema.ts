@@ -55,6 +55,17 @@ export const additiveColumns = [
   "ALTER TABLE sessions ADD COLUMN last_human_msg_id TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN anchor_msg_id TEXT DEFAULT NULL",
   "ALTER TABLE outbox ADD COLUMN excerpt TEXT DEFAULT NULL",
+  // Bounding redelivery. A command that throws out of ingest is deliberately
+  // NOT acked, so the worker's 60s lease lapses and it comes back -- forever,
+  // until the worker's 24h cleanup. `retry_count` is what ends that loop.
+  //
+  // `last_error` exists because the cause is otherwise unreportable: it lived in
+  // a throw from the PREVIOUS delivery and is gone by the time the next one
+  // starts, so without persisting it the give-up message can only say "gave up",
+  // never "ENOTFOUND" -- which is the one thing that tells the human it was a
+  // typo in a hostname.
+  "ALTER TABLE inbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE inbox ADD COLUMN last_error TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(
@@ -135,7 +146,9 @@ export function initSchema(db: BetterSqlite3.Database): void {
       received_at INTEGER NOT NULL,
       payload TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'received',
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT DEFAULT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_inbox_status_updated ON inbox(status, updated_at);

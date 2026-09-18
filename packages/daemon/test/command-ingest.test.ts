@@ -5589,3 +5589,147 @@ describe("goose sessions in the delivery machinery", () => {
     expect(adapter?.name).toBe("goose-acp");
   });
 });
+
+/**
+ * Bounding redelivery.
+ *
+ * A throw out of ingest is deliberately not acked (poller.ts skips the ack), so
+ * the worker's 60s lease lapses and the command comes back. Nothing bounded that
+ * loop: a black-holed host or a typo'd hostname retried every 60s until the
+ * worker's 24h cleanup, and the human was told nothing the whole time.
+ *
+ * The cap lives at the retry-unfinished branch rather than in deliverViaAdapter
+ * because deliverViaAdapter never throws on its own -- every one of its branches
+ * ends in markDone or dropCommand. The throws that actually consume redeliveries
+ * come from three different places (an adapter throwing THROUGH it, the
+ * question-reply path, and the media fetch), and this is the one point upstream
+ * of all of them.
+ */
+describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
+  function gooseSession(storage: ReturnType<typeof openStorageDb>, sessionId: string) {
+    storage.sessions.upsert({
+      sessionId,
+      notify: true,
+      backendKind: "goose-acp",
+      backendEndpoint: "ws://nonexistent.invalid:38910/acp",
+      backendAuthToken: "tok",
+    }, 1_000);
+  }
+
+  it("gives up after the cap and tells the human what went wrong", async () => {
+    const storage = openStorageDb(":memory:");
+    gooseSession(storage, "sess-cap");
+    const replies: string[] = [];
+
+    const opts = {
+      createAdapter: () => ({
+        name: "goose-acp",
+        failurePolicy: "surface" as const,
+        async deliverCommand(): Promise<never> {
+          throw new Error("goose serve unreachable at ws://nonexistent.invalid:38910/acp: ENOTFOUND");
+        },
+      }),
+      sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+    };
+    const msg = makeMsg({
+      commandId: "cmd-cap",
+      sessionId: "sess-cap",
+      command: "please deploy the thing",
+      chatId: "12",
+    });
+
+    // First delivery plus MAX_REDELIVERIES redeliveries all throw, so the poller
+    // keeps re-leasing. The last one must NOT throw: it gives up instead.
+    for (let i = 0; i < 6; i++) {
+      await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow(/ENOTFOUND/);
+    }
+    await expect(ingestWorkerCommand(storage, msg, opts)).resolves.toBeUndefined();
+
+    // Acked, so the worker stops redelivering it.
+    expect(storage.inbox.get("cmd-cap")?.status).toBe("done");
+
+    expect(replies).toHaveLength(1);
+    // The cause is the whole point of persisting last_error: "gave up" alone
+    // would not tell the human this was a typo in a hostname.
+    expect(replies[0]).toContain("ENOTFOUND");
+    // And an excerpt, so they know WHICH message was lost.
+    expect(replies[0]).toContain("please deploy the thing");
+
+    storage.db.close();
+  });
+
+  it("does not count a command that succeeds on a later attempt", async () => {
+    const storage = openStorageDb(":memory:");
+    gooseSession(storage, "sess-flap");
+    let calls = 0;
+
+    const opts = {
+      createAdapter: () => ({
+        name: "goose-acp",
+        failurePolicy: "surface" as const,
+        async deliverCommand() {
+          calls++;
+          if (calls < 3) throw new Error("goose serve unreachable: ECONNREFUSED");
+          return { ok: true };
+        },
+      }),
+      sendTelegramReply: async () => {},
+    };
+    const msg = makeMsg({ commandId: "cmd-flap", sessionId: "sess-flap", command: "hi", chatId: "12" });
+
+    await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow();
+    await expect(ingestWorkerCommand(storage, msg, opts)).rejects.toThrow();
+    await ingestWorkerCommand(storage, msg, opts);
+
+    expect(storage.inbox.get("cmd-flap")?.status).toBe("done");
+    storage.db.close();
+  });
+
+  it("records the cause of a throw without counting it as a redelivery", async () => {
+    const storage = openStorageDb(":memory:");
+    gooseSession(storage, "sess-rec");
+
+    await expect(ingestWorkerCommand(
+      storage,
+      makeMsg({ commandId: "cmd-rec", sessionId: "sess-rec", command: "hi", chatId: "12" }),
+      {
+        createAdapter: () => ({
+          name: "goose-acp",
+          failurePolicy: "surface" as const,
+          async deliverCommand(): Promise<never> { throw new Error("boom-the-cause"); },
+        }),
+        sendTelegramReply: async () => {},
+      },
+    )).rejects.toThrow();
+
+    const row = storage.inbox.get("cmd-rec");
+    expect(row?.lastError).toContain("boom-the-cause");
+    // The FIRST delivery is not a redelivery, so nothing has been counted yet.
+    expect(row?.retryCount).toBe(0);
+
+    storage.db.close();
+  });
+
+  it("still dedups a command that already finished, without counting it", async () => {
+    const storage = openStorageDb(":memory:");
+    gooseSession(storage, "sess-dedup");
+    let calls = 0;
+
+    const opts = {
+      createAdapter: () => ({
+        name: "goose-acp",
+        failurePolicy: "surface" as const,
+        async deliverCommand() { calls++; return { ok: true }; },
+      }),
+      sendTelegramReply: async () => {},
+    };
+    const msg = makeMsg({ commandId: "cmd-dd", sessionId: "sess-dedup", command: "hi", chatId: "12" });
+
+    await ingestWorkerCommand(storage, msg, opts);
+    await ingestWorkerCommand(storage, msg, opts);
+
+    expect(calls).toBe(1);
+    expect(storage.inbox.get("cmd-dd")?.retryCount).toBe(0);
+    storage.db.close();
+  });
+});

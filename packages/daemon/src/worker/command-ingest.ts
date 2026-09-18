@@ -147,12 +147,51 @@ export function selectAdapter(
 }
 
 /**
+ * How many times a command may come BACK before we stop trying.
+ *
+ * A throw out of ingest is deliberately not acked, so the worker's 60s lease
+ * lapses and redelivers. Six tries at ~60s is about five minutes, which is both
+ * longer than any real serve restart and about as long as a human will sit in
+ * front of Telegram wondering whether their message went anywhere.
+ */
+export const MAX_REDELIVERIES = 5;
+
+/** How much of the undelivered command to quote back when giving up. */
+const GIVE_UP_EXCERPT_CHARS = 200;
+
+/**
  * Ingest an execute command from the Poller.
  *
  * Returns normally (Poller acks) for permanent failures.
  * Throws for transient failures (Poller skips ack, command retries).
+ *
+ * The wrapper records WHY a delivery threw. The cause is otherwise unreportable:
+ * it lives in the throw, and by the time the redelivery arrives to decide
+ * whether to give up, the exception is long gone. One site here covers every
+ * throw path below -- the adapter throwing through deliverViaAdapter, the
+ * question-reply staleness path, and the media fetch.
  */
 export async function ingestWorkerCommand(
+  storage: StorageDb,
+  msg: ExecuteMessage,
+  options: WorkerCommandIngestOptions = {},
+): Promise<void> {
+  try {
+    await ingestWorkerCommandInner(storage, msg, options);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    try {
+      storage.inbox.recordFailure(msg.commandId, detail);
+    } catch (recordErr) {
+      // Losing the reason is bad; losing the retry is worse. The throw below is
+      // what makes the poller skip the ack, so it must survive a storage hiccup.
+      console.warn(`[command-ingest] could not record failure for commandId=${msg.commandId}:`, recordErr);
+    }
+    throw err;
+  }
+}
+
+async function ingestWorkerCommandInner(
   storage: StorageDb,
   msg: ExecuteMessage,
   options: WorkerCommandIngestOptions = {},
@@ -170,7 +209,34 @@ export async function ingestWorkerCommand(
       console.log(`[command-ingest] dedup commandId=${commandId}`);
       return;
     }
-    console.log(`[command-ingest] retry unfinished commandId=${commandId}`);
+    // This is the one point upstream of every throw path, so it is where the
+    // loop is bounded. Counting here rather than per-path also means a command
+    // that crash-loops the daemon BEFORE reaching an adapter is still bounded --
+    // a poison message is exactly what a cap is for, and trying to tell it apart
+    // from a transient outage would need state we would not trust anyway.
+    const redeliveries = storage.inbox.bumpRetry(commandId);
+    console.log(
+      `[command-ingest] retry unfinished commandId=${commandId} redelivery=${redeliveries}/${MAX_REDELIVERIES}`,
+    );
+
+    if (redeliveries > MAX_REDELIVERIES) {
+      const cause = existing.lastError ?? "no further detail was recorded";
+      const excerpt = msg.command.trim().slice(0, GIVE_UP_EXCERPT_CHARS);
+      const ellipsis = msg.command.trim().length > GIVE_UP_EXCERPT_CHARS ? "..." : "";
+      console.warn(
+        `[command-ingest] giving up commandId=${commandId} after ${redeliveries} redeliveries: ${cause}`,
+      );
+      await dropCommand(
+        storage,
+        commandId,
+        msg.chatId,
+        `Gave up delivering your message after ${redeliveries} attempts (~${redeliveries} min).\n\n`
+          + `Last error: ${cause}\n\n`
+          + `Your message was: ${excerpt}${ellipsis}`,
+        options.sendTelegramReply,
+      );
+      return;
+    }
   }
 
   const session = storage.sessions.get(msg.sessionId);
@@ -1156,8 +1222,9 @@ function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, com
   // Pigeon-m426.4: Throw ONLY for "ambiguous" (timeout/abort). "definitely_not_delivered"
   // (dead port / connection refused) stops throwing, allowing bounded drop and row expiry.
   // Note: A recycled port held by a listener that accepts but never completes HTTP yields
-  // "abort" -> ambiguous -> throws -> unbounded 60s re-lease loop by design until inbox
-  // attempt counting is added.
+  // "abort" -> ambiguous -> throws -> a 60s re-lease loop. That loop is now bounded:
+  // MAX_REDELIVERIES counts redeliveries on the inbox row upstream of this throw and
+  // gives up with this error quoted back to the human.
   if (classifyDeliveryFailure({ error: result.error }) !== "ambiguous") return;
   const error = result.error ?? "Question reply delivery failed with a connection error";
   console.warn(`[command-ingest] transient question reply failure commandId=${commandId} error=${error}${formatDeliveryMeta(result.meta)}`);

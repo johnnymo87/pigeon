@@ -36,11 +36,11 @@ import { withToken } from "./ws-transport.js";
  * statement).
  *
  * WHAT THIS DOES NOT DO, stated plainly because the honest scope is narrow: it
- * removes the 401 from the retry loop. It does NOT bound retries in general. A
- * host that black-holes packets, a DNS typo, or a TLS mismatch all still look
- * transient and still retry until the command expires. Capping that is the
- * adapter's job and needs an attempt counter that `CommandDeliveryContext` does
- * not currently carry.
+ * removes the 401 from the retry loop, and nothing more. A host that black-holes
+ * packets, a DNS typo, or a TLS mismatch all still look transient and still get
+ * retried. Bounding THAT is not this module's job and never was -- it is done
+ * upstream by MAX_REDELIVERIES in command-ingest, which counts redeliveries on
+ * the inbox row and gives up with the last error quoted back to the human.
  *
  * Deliberately NOT a health check. It answers "are you there, are you goose, and
  * do you accept this credential" — nothing about whether a turn can run. A

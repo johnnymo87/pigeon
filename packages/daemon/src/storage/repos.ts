@@ -73,6 +73,8 @@ function asInbox(row: SqlRow): InboxRecord {
     payload: String(row.payload),
     status: String(row.status),
     updatedAt: Number(row.updated_at),
+    retryCount: Number(row.retry_count ?? 0),
+    lastError: row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
   };
 }
 
@@ -373,6 +375,39 @@ export class InboxRepository {
       .prepare("SELECT * FROM inbox WHERE command_id = ?")
       .get(commandId) as SqlRow | null;
     return row ? asInbox(row) : null;
+  }
+
+  /**
+   * Counts one redelivery and returns the new total.
+   *
+   * Returns the count rather than making the caller re-read, because the caller
+   * is deciding whether to give up and a separate read could race another
+   * delivery of the same command.
+   *
+   * Returns 0 for a row that no longer exists: the caller is on the delivery
+   * path, and a row cleaned up underneath it is not worth a throw.
+   */
+  bumpRetry(commandId: string, now = Date.now()): number {
+    const row = this.db
+      .prepare(
+        `UPDATE inbox SET retry_count = retry_count + 1, updated_at = ?
+         WHERE command_id = ?
+         RETURNING retry_count`,
+      )
+      .get(now, commandId) as { retry_count?: number } | undefined;
+    return Number(row?.retry_count ?? 0);
+  }
+
+  /**
+   * Remembers why a delivery threw, so a later give-up can name the cause.
+   *
+   * Deliberately does not touch retry_count: the failure and the redelivery are
+   * separate events, and counting both would halve the effective cap.
+   */
+  recordFailure(commandId: string, error: string, now = Date.now()): void {
+    this.db
+      .prepare("UPDATE inbox SET last_error = ?, updated_at = ? WHERE command_id = ?")
+      .run(error.slice(0, 2_000), now, commandId);
   }
 
   markDone(commandId: string, now = Date.now()): boolean {

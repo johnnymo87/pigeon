@@ -143,6 +143,32 @@ describe("storage schema and repositories", () => {
     storage.db.close();
   });
 
+  it("counts redeliveries and remembers why the last one failed", () => {
+    const storage = createStorage();
+
+    storage.inbox.persist({ commandId: "cmd-r", payload: "{}" }, 1_000);
+    expect(storage.inbox.get("cmd-r")?.retryCount).toBe(0);
+    expect(storage.inbox.get("cmd-r")?.lastError).toBeNull();
+
+    // The counter is what ends the loop, so it must be the count that is
+    // returned -- a caller that had to re-read the row could race itself.
+    expect(storage.inbox.bumpRetry("cmd-r", 2_000)).toBe(1);
+    expect(storage.inbox.bumpRetry("cmd-r", 3_000)).toBe(2);
+    expect(storage.inbox.get("cmd-r")?.retryCount).toBe(2);
+
+    storage.inbox.recordFailure("cmd-r", "goose serve unreachable: ENOTFOUND", 4_000);
+    expect(storage.inbox.get("cmd-r")?.lastError).toBe("goose serve unreachable: ENOTFOUND");
+    // Recording a failure must not itself count as a redelivery.
+    expect(storage.inbox.get("cmd-r")?.retryCount).toBe(2);
+
+    // A vanished row (cleaned up under us) must not throw -- the caller is on
+    // the delivery path and a storage race is not worth killing a command over.
+    expect(storage.inbox.bumpRetry("gone", 5_000)).toBe(0);
+    expect(() => storage.inbox.recordFailure("gone", "x", 5_000)).not.toThrow();
+
+    storage.db.close();
+  });
+
   it("stores, retrieves, deletes, and expires pending questions", () => {
     const storage = createStorage();
 

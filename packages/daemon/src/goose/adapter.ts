@@ -104,10 +104,9 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
         };
       case "unreachable":
         // Nothing was sent, so a throw is safe and is the retry: the poller skips
-        // the ack, the 60s lease lapses, and the command comes back.
-        // KNOWN GAP, inherited deliberately: nothing caps that loop, so a
-        // black-holed host retries until the command expires. Capping needs an
-        // attempt counter the delivery context does not carry yet.
+        // the ack, the 60s lease lapses, and the command comes back. That loop is
+        // bounded upstream by MAX_REDELIVERIES in command-ingest, which gives up
+        // and reports this error text to the human -- so write it for them.
         throw new Error(`goose serve unreachable at ${endpoint}: ${reach.cause}`);
       case "ok":
         break;
