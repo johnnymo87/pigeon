@@ -76,18 +76,48 @@ export interface GooseSessionRunnerOptions {
   log?: (msg: string, fields?: Record<string, unknown>) => void;
   /** Transcript buffer cap. A runaway turn must not be able to exhaust memory. */
   maxTranscriptBytes?: number;
+  /** Silence after which a turn is presumed dead. Defaults to 30 minutes. */
+  turnIdleTimeoutMs?: number;
 }
 
 interface Turn {
   commandId: string;
   startedAt: number;
+  /** Last time ANY frame arrived for this turn. The watchdog's only input. */
+  lastActivityAt: number;
   text: string[];
   bytes: number;
   truncated: boolean;
   settled: Promise<void>;
+  /**
+   * Set when the watchdog gave up on this turn and already told the human.
+   *
+   * Changes what a LATE settlement means, asymmetrically: a late error is the
+   * expected consequence of our own close() and is logged only, but a late
+   * receipt means goose was alive the whole time and the human still wants the
+   * answer, so it is reported normally.
+   */
+  abandoned: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
+
+/**
+ * How long a turn may emit NOTHING before pigeon stops believing in it.
+ *
+ * Silence is a weak signal and this threshold is chosen to respect that. goose
+ * emits `tool_call` when a tool starts and `tool_call_update` when it ends, so a
+ * twenty-minute build is twenty minutes of legitimate silence. Thirty minutes is
+ * past anything the human is likely to be running and still short of the hours a
+ * wedged session would otherwise sit there.
+ *
+ * A false positive is not free -- see `abandonTurn` for what it costs and how
+ * the late-receipt path limits it. The interactive case does not wait for this
+ * at all: a human who sends anything to a wedged session trips the 10s steer
+ * bound instead, which is far better evidence (a steer answers in ~1ms).
+ */
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
  * Deadline for every await on the delivery path that is NOT the turn itself.
@@ -122,6 +152,8 @@ async function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise
 export class GooseSessionRunner {
   private readonly opts: GooseSessionRunnerOptions;
   private turn: Turn | undefined;
+  /** The most recent turn's continuation. See settled(). */
+  private lastSettled: Promise<void> = Promise.resolve();
   private connected = false;
   private connecting: Promise<void> | undefined;
 
@@ -137,9 +169,17 @@ export class GooseSessionRunner {
     return this.turn !== undefined;
   }
 
-  /** Resolves when the in-flight turn (if any) has been fully reported. */
+  /**
+   * Resolves when the most recent turn has been fully reported.
+   *
+   * Tracks the last turn's continuation rather than `this.turn`, because a turn
+   * the watchdog abandoned is cleared from `this.turn` while its continuation is
+   * still outstanding -- and that continuation can still produce a notification
+   * (a late receipt is reported; see finishTurn). Reading `this.turn` here would
+   * resolve immediately and report "done" for work still in flight.
+   */
   async settled(): Promise<void> {
-    await this.turn?.settled;
+    await this.lastSettled;
   }
 
   private log(msg: string, fields?: Record<string, unknown>): void {
@@ -186,6 +226,11 @@ export class GooseSessionRunner {
           "steer",
         )) as { kind?: string };
       } catch (err) {
+        // A steer answers in about a millisecond, so ten seconds of silence on
+        // one is strong evidence the socket is dead -- better evidence than the
+        // watchdog's thirty minutes, and available the moment a human touches a
+        // wedged session. So this unwedges too, rather than only declining.
+        await this.abandonTurn(this.turn, "a steer went unanswered for 10s");
         // Deliberately ok:false rather than a throw. A throw would redeliver and
         // could steer twice; more importantly the alternative to bounding this at
         // all is a frozen poller, which costs every other session on the machine.
@@ -221,15 +266,19 @@ export class GooseSessionRunner {
     const turn: Turn = {
       commandId,
       startedAt: Date.now(),
+      lastActivityAt: Date.now(),
       text: [],
       bytes: 0,
       truncated: false,
       settled: Promise.resolve(),
+      abandoned: false,
+      idleTimer: undefined,
     };
     this.turn = turn;
     this.opts.touch(this.sessionId);
+    this.armIdleTimer(turn);
 
-    turn.settled = this.opts.client
+    this.lastSettled = turn.settled = this.opts.client
       .prompt(this.sessionId, text)
       .then(
         (outcome) => this.onPromptOutcome(turn, text, outcome),
@@ -270,9 +319,15 @@ export class GooseSessionRunner {
         runId,
       });
       try {
-        const steered = (await this.opts.client.steer(this.sessionId, runId ?? "", text)) as {
-          kind?: string;
-        };
+        // Bounded for the same reason as the other steer call site. This one is
+        // in the detached continuation so it cannot freeze the poller, but an
+        // unbounded await here leaves `this.turn` set forever -- the same wedge
+        // through a different door.
+        const steered = (await withDeadline(
+          this.opts.client.steer(this.sessionId, runId ?? "", text),
+          NON_TURN_TIMEOUT_MS,
+          "steer",
+        )) as { kind?: string };
         if (steered?.kind === "steered") {
           // The message is now inside the run that was already going. That run
           // reports its own completion, so this turn is over as a bookkeeping
@@ -305,6 +360,14 @@ export class GooseSessionRunner {
   onUpdate(update: Record<string, unknown>): void {
     const turn = this.turn;
     if (!turn) return;
+
+    // Liveness is stamped for EVERY frame, above the transcript filter below.
+    // During a long tool call the only frames are tool_call/tool_call_update,
+    // which contribute no transcript text at all -- so filtering first would
+    // make a working turn look silent to the watchdog, which is precisely the
+    // false positive that costs the human their answer.
+    turn.lastActivityAt = Date.now();
+
     if (update.sessionUpdate !== "agent_message_chunk") return;
 
     const text = (update.content as { text?: unknown } | undefined)?.text;
@@ -324,7 +387,87 @@ export class GooseSessionRunner {
   }
 
   private clearTurn(): void {
+    if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
+  }
+
+  /**
+   * Arms (or re-arms) the silence timer for `turn`.
+   *
+   * Re-arms for the REMAINING time rather than firing on a fixed schedule, so a
+   * frame that arrives at minute 29 buys another full timeout instead of being
+   * rounded away by a coarse sweep. One timer per turn: no turn means no timer,
+   * which is why there is no lifecycle to tear down anywhere else.
+   */
+  private armIdleTimer(turn: Turn): void {
+    const timeout = this.opts.turnIdleTimeoutMs ?? DEFAULT_TURN_IDLE_TIMEOUT_MS;
+    if (turn.idleTimer) clearTimeout(turn.idleTimer);
+    turn.idleTimer = setTimeout(() => {
+      const idleFor = Date.now() - turn.lastActivityAt;
+      if (idleFor < timeout) {
+        // Something arrived while we were waiting. Wait out the remainder.
+        this.armIdleTimer(turn);
+        return;
+      }
+      void this.abandonTurn(turn, `no activity for ${Math.round(idleFor / 60_000)} minutes`);
+    }, timeout);
+    // Never the reason the process stays alive.
+    turn.idleTimer.unref?.();
+  }
+
+  /**
+   * Gives up on a turn that is not talking to us, and unwedges the session.
+   *
+   * The runner must settle its OWN turn here. Closing the socket is not enough
+   * and the inherited plan was wrong about this: `GooseAcpClient.close()` does
+   * not touch its pending map, and a half-open socket may never deliver a close
+   * event at all -- which is the exact case this exists for.
+   *
+   * The notice carries a DISTINCT notification id. `/stop` dedups on that id, so
+   * posting under the turn's normal one would claim it, and a late real answer
+   * would then be swallowed as "already queued" -- turning a false positive from
+   * a spurious warning into a lost answer.
+   */
+  private async abandonTurn(turn: Turn, reason: string): Promise<void> {
+    if (turn.abandoned || this.turn !== turn) return;
+    turn.abandoned = true;
+    this.clearTurn();
+
+    this.log("goose runner: abandoning a stalled turn", {
+      sessionId: this.sessionId,
+      commandId: turn.commandId,
+      reason,
+    });
+
+    // Drop the socket so the next delivery reconnects onto a live one. Safe to
+    // do before reporting: the transport callbacks are fenced on identity, so
+    // this socket's eventual close cannot disturb the connection that replaces it.
+    try {
+      this.opts.client.close();
+    } catch {
+      /* best effort */
+    }
+    this.connected = false;
+
+    try {
+      const partial = turn.text.join("");
+      await this.opts.postStop({
+        session_id: this.sessionId,
+        notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,
+        message:
+          (partial === "" ? "" : `${partial}\n\n`)
+          + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
+          + "goose cannot be interrupted, so if that turn is still running it will finish on goose's side "
+          + "and its result may not appear here. The session history is intact -- send a message to pick it up.",
+        event: "Error",
+        error_kind: "goose-turn-stalled",
+      });
+    } catch (reportErr) {
+      this.log("goose runner: could not report a stalled turn", {
+        sessionId: this.sessionId,
+        error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+      });
+    }
   }
 
   /**
@@ -336,6 +479,30 @@ export class GooseSessionRunner {
     err: unknown,
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
+
+    // A turn the watchdog already gave up on, settling late. The two cases mean
+    // opposite things and are treated as such.
+    if (turn.abandoned) {
+      if (err !== undefined) {
+        // Almost certainly the rejection caused by our own close(). The human
+        // has already been told the turn stalled; a second failure notice for
+        // one failure is noise.
+        this.log("goose runner: abandoned turn failed as expected", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      // goose was alive the whole time and has answered. The watchdog was wrong,
+      // and the human still wants this -- so it is reported normally, under the
+      // turn's own notification id, which the stall notice deliberately did not
+      // take.
+      this.log("goose runner: abandoned turn answered after all", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+    }
 
     try {
       const stopReason = receipt?.stopReason;
@@ -415,6 +582,10 @@ export class GooseSessionRunner {
   }
 
   close(): void {
+    // The timer is unref'd, so it cannot hold the process open -- but a runner
+    // dropped from the registry should not leave one running against a turn
+    // nobody is listening for either.
+    if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     try {
       this.opts.client.close();
     } catch {
