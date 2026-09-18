@@ -136,6 +136,21 @@ export interface GooseAcpClientOptions {
   permissionPolicy?: PermissionPolicy;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
   onTurnLost?: (err: DisconnectedDuringTurn) => void;
+  /**
+   * Called for every `session/update` notification, which is goose's ONLY
+   * streaming surface: assistant text (`agent_message_chunk`), tool activity
+   * (`tool_call`, `tool_call_update`), token usage, and the run id.
+   *
+   * Deliberately NOT delivery evidence — the receipt is still `prompt()`'s
+   * return value, for the reason the fall-through in `onMessage` gives. This is
+   * for showing the human what is happening and for liveness.
+   *
+   * Runs inside the transport's message callback, so it MUST NOT throw; this
+   * client guards it anyway, because the guard is cheap and the failure it
+   * prevents (an exception escaping into a socket handler, surfacing as an
+   * unhandled rejection, killing the process for every session) is not.
+   */
+  onSessionUpdate?: (sessionId: string, update: Record<string, unknown>) => void;
 }
 
 interface Pending {
@@ -293,9 +308,52 @@ export class GooseAcpClient {
       }
       return;
     }
-    // Notification: progress only. Deliberately not surfaced as delivery
-    // evidence -- the receipt is the return value, and treating chunks as
-    // proof-of-life is how the opencode watchdog grew to 1650 lines.
+    // Notification. Still NOT delivery evidence -- the receipt is the return
+    // value, and treating chunks as proof-of-life is how the opencode watchdog
+    // grew to 1650 lines. But `session/update` is the only streaming surface
+    // goose has, so it is forwarded to a subscriber that wants it for OUTPUT
+    // and for liveness, which are different claims from "the turn landed".
+    if (msg.method === "session/update") {
+      this.onSessionUpdate(msg.params ?? {});
+    }
+  }
+
+  /**
+   * The run id of the session's in-flight turn, if one has been observed.
+   *
+   * Measured on goose 1.48.0: `session_info_update` carries this in
+   * `_meta.goose.activeRunId` as soon as a turn starts. That matters because the
+   * only other way to learn it is to regex it out of a "session already has
+   * active run" REJECTION -- which requires issuing a competing `session/prompt`
+   * first, i.e. doing the very thing the id is needed to avoid.
+   */
+  activeRunId(sessionId: string): string | undefined {
+    return this.runIds.get(sessionId);
+  }
+
+  private onSessionUpdate(params: Record<string, unknown>): void {
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+    const update = (params.update ?? {}) as Record<string, unknown>;
+    if (!sessionId) return;
+
+    if (update.sessionUpdate === "session_info_update") {
+      const runId = (update._meta as { goose?: { activeRunId?: unknown } } | undefined)?.goose
+        ?.activeRunId;
+      if (typeof runId === "string" && runId !== "") {
+        this.runIds.set(sessionId, runId);
+      }
+    }
+
+    // The subscriber is caller code on the socket's callback stack. A throw here
+    // would escape the transport entirely; see the option's doc comment.
+    try {
+      this.opts.onSessionUpdate?.(sessionId, update);
+    } catch (err) {
+      this.log("goose acp: session/update subscriber threw", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**

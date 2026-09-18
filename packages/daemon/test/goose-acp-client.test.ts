@@ -488,3 +488,96 @@ describe("GooseAcpClient", () => {
   });
 
 });
+
+/**
+ * Notifications were previously dropped on the floor (the `onMessage` fall-through
+ * said "progress only"), which is correct for DELIVERY EVIDENCE and wrong for
+ * everything else: `session/update` is the only streaming surface goose has, and
+ * it is also the only place the active run id appears before a turn is contended.
+ *
+ * Shapes here are transcribed from frames captured off a real goose 1.48.0 serve
+ * on 2026-09-18, not invented.
+ */
+describe("GooseAcpClient session/update notifications", () => {
+  it("hands session/update frames to the subscriber, with the session id", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const seen: Array<{ sessionId: string; update: Record<string, unknown> }> = [];
+    const c = makeClient(peer, { onSessionUpdate: (sessionId: string, update: Record<string, unknown>) => seen.push({ sessionId, update }) });
+    await c.connect();
+
+    peer.emit({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "sess-1",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "banana" } },
+      },
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.sessionId).toBe("sess-1");
+    expect(seen[0]!.update.sessionUpdate).toBe("agent_message_chunk");
+    expect((seen[0]!.update.content as { text: string }).text).toBe("banana");
+  });
+
+  it("learns the active run id from session_info_update, without needing a busy rejection", async () => {
+    // Measured: goose emits this as soon as a turn starts. Learning the run id
+    // here is what lets a second message STEER the running turn. The old route
+    // -- regexing it out of a busy error -- requires first issuing a competing
+    // prompt, which is the thing we are trying to avoid doing.
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const c = makeClient(peer);
+    await c.connect();
+
+    expect(c.activeRunId("sess-1")).toBeUndefined();
+    peer.emit({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { goose: { activeRunId: "run_ba3ce8fe-ab81-43f6-b1b8-d2d7d55479f6" } },
+        },
+      },
+    });
+    expect(c.activeRunId("sess-1")).toBe("run_ba3ce8fe-ab81-43f6-b1b8-d2d7d55479f6");
+  });
+
+  it("does not let a throwing subscriber escape into the transport callback", async () => {
+    // The subscriber is CALLER code running inside the socket's message handler.
+    // An exception there would propagate out of the transport and, on the real
+    // ws transport, surface as an unhandled rejection -- which on Node kills the
+    // daemon for every session, not just this one.
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const c = makeClient(peer, {
+      onSessionUpdate: () => {
+        throw new Error("subscriber blew up");
+      },
+    });
+    await c.connect();
+
+    expect(() =>
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk" } },
+      }),
+    ).not.toThrow();
+    // and the client still works afterwards
+    expect(c.activeRunId("sess-1")).toBeUndefined();
+  });
+
+  it("still ignores notifications it has no subscriber for", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const c = makeClient(peer);
+    await c.connect();
+    expect(() =>
+      peer.emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: {} } }),
+    ).not.toThrow();
+  });
+});

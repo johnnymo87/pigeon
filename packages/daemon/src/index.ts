@@ -1,4 +1,5 @@
 import { createApp } from "./app";
+import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
 import {
   TelegramNotificationService,
@@ -35,6 +36,11 @@ import {
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
 import { SessionTagResolver } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
+import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
+import { gooseControlVerdict } from "./goose/control-guard.js";
+import { GooseAcpClient } from "./goose/acp-client.js";
+import { webSocketTransport } from "./goose/ws-transport.js";
+import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
@@ -145,6 +151,116 @@ const clientFactory = ingressRouter
 // Resolve the owning-serve client for a session; falls back to the legacy single client when routing is unconfigured.
 const clientForSession = (sessionId: string): OpencodeClient | undefined =>
   clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
+
+/**
+ * The app's own request handler, bound once it exists.
+ *
+ * Late-bound on purpose: the goose runners are constructed here but the app is
+ * built at the bottom of this file, and the runners need to call the app's /stop
+ * route rather than reimplement it. A function reference resolved at call time
+ * is the smallest thing that bridges that ordering.
+ */
+let appHandler: ((request: Request) => Promise<Response>) | undefined;
+
+/**
+ * Long-lived goose turn runners, one per session.
+ *
+ * Absent when no goose endpoint is configured, and that absence is load-bearing:
+ * `selectAdapter` hands back no adapter without it, so a goose session on a
+ * daemon with no goose is cleanly unroutable instead of being dropped into the
+ * opencode machinery that deletes sessions on connection errors.
+ */
+const gooseRunners = config.gooseAcpUrl
+  ? new GooseRunnerRegistry({
+      createRunner: (session) =>
+        new GooseSessionRunner({
+          session,
+          client: new GooseAcpClient({
+            url: session.backendEndpoint ?? config.gooseAcpUrl!,
+            transportFactory: webSocketTransport(session.backendAuthToken ?? config.gooseAcpToken),
+            // Approved by the human for the daily-driver MVP on the stated basis
+            // that their opencode config already allows every tool, so this
+            // surrenders no gate they currently hold. It is NOT a claim that
+            // unattended auto-approval is safe in general: an unanswered
+            // permission request parks a goose turn forever, and there is no
+            // cancel to recover with, so the alternative is a session that
+            // wedges rather than one that asks.
+            permissionPolicy: (params) => params.options[0]?.optionId,
+            log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
+            onSessionUpdate: (sessionId, update) =>
+              gooseRunners?.peek(sessionId)?.onUpdate(update),
+          }),
+          postStop: async (body) => {
+            // Reuses the daemon's own /stop route rather than reimplementing
+            // notification idempotency, notify policy, formatting, splitting,
+            // the scroll anchor and last_seen touching -- all of which live
+            // between reading that body and enqueueing the outbox row.
+            if (!appHandler) throw new Error("daemon app is not ready to accept /stop yet");
+            const res = await appHandler(
+              new Request(`http://127.0.0.1:${config.port}/stop`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+              }),
+            );
+            if (!res.ok) {
+              const detail = await res.text().catch(() => "");
+              throw new Error(`/stop returned ${res.status} ${detail.slice(0, 200)}`);
+            }
+          },
+          touch: (sessionId) => storage.sessions.touch(sessionId, Date.now()),
+          log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
+        }),
+    })
+  : undefined;
+
+/** True for sessions this daemon speaks to over goose's ACP rather than opencode. */
+const isGooseSession = (sessionId: string): boolean =>
+  storage.sessions.get(sessionId)?.backendKind === GOOSE_BACKEND_KIND;
+
+/**
+ * Intercepts a control command aimed at a goose session BEFORE it can reach
+ * `clientForSession`. Returns true when the command was handled here.
+ *
+ * See src/goose/control-guard.ts for why reaching the router at all is harmful
+ * and why /interrupt answers the way it does.
+ */
+async function handleGooseControl(
+  command: "kill" | "interrupt" | "compact" | "mcp" | "model",
+  msg: { sessionId: string; commandId: string; chatId: string; messageThreadId?: number | null },
+): Promise<boolean> {
+  const verdict = gooseControlVerdict(command, msg.sessionId, {
+    backendKindOf: (id) => storage.sessions.get(id)?.backendKind,
+    gooseBackendKind: GOOSE_BACKEND_KIND,
+  });
+  if (verdict.kind === "not-goose") return false;
+
+  const send = createTelegramReplySender(sendTelegramMessage, msg);
+  const reply = (text: string) => send(msg.chatId, text);
+  if (verdict.kind === "kill") {
+    // goose has no cancel, so a /kill cannot stop an in-flight turn server-side.
+    // What it CAN do honestly is drop pigeon's side of the session, which is
+    // what the human is asking for: stop routing this to me.
+    gooseRunners?.drop(msg.sessionId);
+    storage.sessions.delete(msg.sessionId);
+    storage.assignments.delete(msg.sessionId);
+    if (poller) {
+      try {
+        await poller.unregisterSession(msg.sessionId);
+      } catch (err) {
+        console.warn(`[index] onKill: goose session unregister failed for ${msg.sessionId}:`, err);
+      }
+    }
+    await reply(
+      "Session closed. Note that goose has no cancel, so a turn already running "
+      + "will finish on the goose side; pigeon has stopped tracking it.",
+    );
+    return true;
+  }
+
+  await reply(verdict.reply);
+  return true;
+}
 
 async function sendTelegramMessage(
   chatId: string,
@@ -266,7 +382,16 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // via the session's per-serve backendEndpoint. When unroutable, omit the
           // client to preserve command-ingest's "no client -> delete dead session"
           // fallback.
-          const client = clientForSession(msg.sessionId);
+          // A goose session must NOT be resolved through the opencode router:
+          // ensureRouted/placeSession would mint a session_assignment and a LIVE
+          // LEASE for it, and live leases are counted against activeTurnCap, so
+          // a goose id would narrow placement for real opencode sessions.
+          // Omitting the client is safe here BECAUSE the goose adapter declares
+          // failurePolicy:"surface", which gates out the whole connection-error
+          // block -- including the no-client "delete dead session" fallback.
+          const client = isGooseSession(msg.sessionId)
+            ? undefined
+            : clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
             apiKey: config.workerApiKey,
@@ -276,6 +401,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
             tagLookup: tagResolver,
             unregisterSession: async (sessionId) => { if (poller) await poller.unregisterSession(sessionId); },
+            ...(gooseRunners ? { gooseRunnerFor: (s: SessionRecord) => gooseRunners.get(s) } : {}),
           });
         },
         onLaunch: async (msg) => {
@@ -308,6 +434,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onKill: async (msg) => {
+          if (await handleGooseControl("kill", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) {
             console.warn(`[index] onKill: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
@@ -323,6 +450,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onInterrupt: async (msg) => {
+          if (await handleGooseControl("interrupt", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) {
             console.warn(`[index] onInterrupt: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
@@ -338,6 +466,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onCompact: async (msg) => {
+          if (await handleGooseControl("compact", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) {
             console.warn(`[index] onCompact: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
@@ -353,6 +482,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onMcpList: async (msg) => {
+          if (await handleGooseControl("mcp", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) { console.warn(`[index] onMcpList: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
@@ -363,6 +493,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onMcpEnable: async (msg) => {
+          if (await handleGooseControl("mcp", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) { console.warn(`[index] onMcpEnable: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
@@ -373,6 +504,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onMcpDisable: async (msg) => {
+          if (await handleGooseControl("mcp", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) { console.warn(`[index] onMcpDisable: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           const directory = storage.sessions.get(msg.sessionId)?.cwd ?? undefined;
@@ -383,6 +515,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onModelList: async (msg) => {
+          if (await handleGooseControl("model", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) { console.warn(`[index] onModelList: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           await ingestModelListCommand({
@@ -393,6 +526,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onModelSet: async (msg) => {
+          if (await handleGooseControl("model", msg)) return;
           const client = clientForSession(msg.sessionId);
           if (!client) { console.warn(`[index] onModelSet: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`); return; }
           await ingestModelSetCommand({
@@ -722,7 +856,7 @@ if (deliveryWatchdog) {
   console.log("[pigeon-daemon] delivery watchdog NOT started (no opencodeUrl in config)");
 }
 
-const server = startServer(config, createApp(storage, {
+const app = createApp(storage, {
   notifier,
   tagLookup: tagResolver,
   chatId: config.telegramChatId,
@@ -739,6 +873,10 @@ const server = startServer(config, createApp(storage, {
     // Drop the routing assignment so a deleted session can't yield a prospective
     // /route 200 (workstation-boi9).
     storage.assignments.delete(sessionId);
+    // A goose session's runner holds a websocket; dropping the row without
+    // dropping the runner would leak the socket and leave a turn reporting into
+    // a session that no longer exists.
+    gooseRunners?.drop(sessionId);
     if (poller) {
       // Interactive close: this fires on an explicit session delete (`/kill`, plugin session
       // teardown), where a human is watching, so the forum topic closes now rather than waiting
@@ -747,7 +885,10 @@ const server = startServer(config, createApp(storage, {
       await poller.unregisterSession(sessionId, { immediate: true });
     }
   },
-}));
+});
+appHandler = app;
+
+const server = startServer(config, app);
 
 console.log(`[pigeon-daemon] listening on http://127.0.0.1:${server.port}`);
 console.log(`[pigeon-daemon] auth: ${config.authToken ? "enabled" : "disabled"}`);
@@ -818,6 +959,30 @@ async function shutdown(signal: string): Promise<void> {
       console.error("[pigeon-daemon] error while draining swarm arbiter", err);
     }
   }
+
+  // Goose turns outlive this process. There is no cancel on goose's ACP surface
+  // and a turn survives a client disconnect, so a turn in flight right now WILL
+  // finish -- but its receipt arrives on a socket that is about to close, so
+  // nobody will ever report it. Telling the human beats their message appearing
+  // to vanish, which is indistinguishable from a bug in the adapter.
+  const busy = gooseRunners?.busySessionIds() ?? [];
+  if (busy.length > 0 && config.telegramChatId) {
+    console.warn(`[pigeon-daemon] ${busy.length} goose turn(s) in flight at shutdown: ${busy.join(", ")}`);
+    for (const sessionId of busy) {
+      try {
+        await sendTelegramMessage(
+          config.telegramChatId,
+          `pigeon is restarting while a goose turn was running on ${sessionId}. `
+            + `goose cannot be interrupted, so the turn will finish on its side, but its `
+            + `result will not be reported here. Send /status or ask again once it is done.`,
+          { messageThreadId: undefined },
+        );
+      } catch (err) {
+        console.warn(`[pigeon-daemon] could not warn about in-flight goose turn ${sessionId}:`, err);
+      }
+    }
+  }
+  gooseRunners?.closeAll();
 
   process.exit(0);
 }

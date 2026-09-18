@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "child_process";
 import { describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
-import { formatDeliveryMeta, ingestWorkerCommand } from "../src/worker/command-ingest";
+import { formatDeliveryMeta, ingestWorkerCommand, selectAdapter } from "../src/worker/command-ingest";
 import {
   OPENCODE_DIRECT_PROTOCOL_VERSION,
   OpencodeDirectMessageType,
@@ -5478,5 +5478,114 @@ describe("adapter failurePolicy (multi-backend safety)", () => {
     expect(unregistered).toEqual(["sess-default-policy"]);
 
     storage.db.close();
+  });
+});
+
+/**
+ * These do not test goose. They test that a goose session is WIRED INTO the
+ * delivery machinery in the one way that keeps it safe.
+ *
+ * `failurePolicy: "surface"` is a capability, and a capability nobody holds is
+ * not a guard rail. Nothing fails at compile time or at run time if the goose
+ * adapter stops setting it -- the session would silently start taking the
+ * opencode path, where a socket blip is read as a dead plugin and the session
+ * row, its routing assignment and its Telegram topic are DELETED. The point of
+ * these tests is to make that regression loud.
+ */
+describe("goose sessions in the delivery machinery", () => {
+  const gooseSession = (storage: ReturnType<typeof openStorageDb>) =>
+    storage.sessions.upsert(
+      {
+        sessionId: "goose-1",
+        notify: true,
+        backendKind: "goose-acp",
+        backendProtocolVersion: 1,
+        backendEndpoint: "ws://127.0.0.1:38910/acp",
+        backendAuthToken: "tok",
+      },
+      1_000,
+    );
+
+  it("selects the goose adapter, and it declares failurePolicy surface", () => {
+    // Asserted on production's own dispatch function, not on a stand-in, and
+    // with no socket: the failure being guarded against is a future edit that
+    // drops the field, which a behavioural test would not localise.
+    const adapter = selectAdapter(
+      {
+        sessionId: "goose-1",
+        backendKind: "goose-acp",
+        backendEndpoint: "ws://127.0.0.1:38910/acp",
+        backendAuthToken: "tok",
+      } as never,
+      undefined,
+      () => ({ deliver: async () => ({ ok: true }) }) as never,
+    );
+
+    expect(adapter?.name).toBe("goose-acp");
+    expect(adapter?.failurePolicy).toBe("surface");
+  });
+
+  it("does NOT delete the session when delivery fails with a connection-shaped error", async () => {
+    // The exact hazard. "fetch failed" from a goose socket means a blip; on the
+    // opencode path the identical string means the plugin is gone and the
+    // session is destroyed. Deleting the human's session mapping because a
+    // websocket hiccuped is not a recoverable mistake.
+    const storage = openStorageDb(":memory:");
+    gooseSession(storage);
+    const unregistered: string[] = [];
+    const replies: string[] = [];
+
+    await ingestWorkerCommand(storage, makeMsg({ commandId: "g-2", sessionId: "goose-1" }), {
+      // A stand-in for the goose adapter carrying the SAME failurePolicy the
+      // real one declares (pinned by the test above). What is under test here is
+      // the machinery's reaction to it, so the adapter is kept inert -- no
+      // preflight, no socket.
+      createAdapter: () =>
+        ({
+          name: "goose-acp",
+          failurePolicy: "surface" as const,
+          deliverCommand: async () => ({ ok: false, error: "fetch failed: econnrefused" }),
+        }) as CommandDeliveryAdapter,
+      unregisterSession: async (id: string) => {
+        unregistered.push(id);
+      },
+      sendTelegramReply: async (_chat: string, text: string) => {
+        replies.push(text);
+      },
+    });
+
+    expect(storage.sessions.get("goose-1")).not.toBeNull();
+    expect(unregistered).toEqual([]);
+    expect(replies.join(" ")).toContain("fetch failed");
+    expect(storage.inbox.get("g-2")?.status).toBe("done");
+  });
+
+  it("is unroutable, rather than routed into opencode, when goose is not configured", () => {
+    // No runner factory => goose is not set up on this daemon. Falling through
+    // to the opencode adapters would be the worst outcome, because those are the
+    // ones that delete a session on a connection error.
+    const adapter = selectAdapter(
+      { sessionId: "goose-1", backendKind: "goose-acp", backendEndpoint: "ws://x/acp" } as never,
+      undefined,
+      undefined,
+    );
+    expect(adapter).toBeNull();
+  });
+
+  it("does not mistake a goose session for an nvim one on the way past", () => {
+    // selectAdapter falls through to an nvim check that keys on unrelated
+    // columns. A goose session that happened to carry them must still be goose.
+    const adapter = selectAdapter(
+      {
+        sessionId: "goose-1",
+        backendKind: "goose-acp",
+        backendEndpoint: "ws://x/acp",
+        nvimSocket: "/tmp/nvim.sock",
+        ptyPath: "/dev/pts/3",
+      } as never,
+      undefined,
+      () => ({ deliver: async () => ({ ok: true }) }) as never,
+    );
+    expect(adapter?.name).toBe("goose-acp");
   });
 });

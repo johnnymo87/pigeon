@@ -37,6 +37,14 @@ export interface DaemonConfig {
   stuckAlertMs: number;
   stuckAbortSilenceMs: number;
   maxRequeues: number;
+  /**
+   * The goose `serve` ACP endpoint, e.g. `ws://127.0.0.1:3400/acp`. Absent means
+   * goose is not configured on this machine, which makes goose sessions
+   * correctly unroutable rather than half-routable.
+   */
+  gooseAcpUrl?: string;
+  /** Matches the serve's `GOOSE_SERVER__SECRET_KEY`. Absent is valid only for a serve run unauthenticated. */
+  gooseAcpToken?: string;
 }
 
 const DEFAULT_PORT = 4731;
@@ -106,6 +114,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     verifyAfterMs: numOr(env.VERIFY_AFTER_MS, DEFAULT_VERIFY_AFTER_MS),
     stuckAlertMs: numOr(env.STUCK_ALERT_MS, DEFAULT_STUCK_ALERT_MS),
     stuckAbortSilenceMs: numOr(env.STUCK_ABORT_SILENCE_MS, DEFAULT_STUCK_ABORT_SILENCE_MS),
+    gooseAcpUrl: env.PIGEON_GOOSE_ACP_URL?.trim() || undefined,
+    gooseAcpToken: env.PIGEON_GOOSE_ACP_TOKEN?.trim() || undefined,
     maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
   };
 }

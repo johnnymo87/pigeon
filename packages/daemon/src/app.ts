@@ -1,4 +1,5 @@
 import type { StorageDb } from "./storage/database";
+import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
@@ -768,6 +769,53 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const cleared = storage.sessionOrigins.clear(sessionId);
         return Response.json({ ok: true, session_id: sessionId, cleared });
+      }
+
+      /**
+       * Registers a goose session with pigeon.
+       *
+       * This exists because goose has no pigeon plugin. An opencode session
+       * registers ITSELF by POSTing /sessions from inside the editor; goose
+       * cannot, so something has to create the row on its behalf, and until
+       * `/launch --backend goose` can carry a backend through the worker this is
+       * that something. `/launch` will replace the CALLER, not this route.
+       *
+       * `notify` is forced true rather than defaulted: a goose session exists
+       * only to be driven from Telegram, and with notify=false the /stop route
+       * returns early and the human never hears the turn finish -- which looks
+       * exactly like a broken adapter.
+       */
+      if (request.method === "POST" && url.pathname === "/goose/sessions") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+        const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+        if (!sessionId || !endpoint) {
+          return Response.json(
+            { error: "session_id and endpoint are required" },
+            { status: 400 },
+          );
+        }
+        const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : null;
+        const label = typeof body.label === "string" && body.label ? body.label : null;
+        const token = typeof body.auth_token === "string" && body.auth_token ? body.auth_token : null;
+
+        storage.sessions.upsert(
+          {
+            sessionId,
+            cwd,
+            label,
+            notify: true,
+            backendKind: GOOSE_BACKEND_KIND,
+            backendProtocolVersion: 1,
+            backendEndpoint: endpoint,
+            backendAuthToken: token,
+          },
+          nowFn(),
+        );
+        if (onSessionStart) {
+          await onSessionStart(sessionId, true, label);
+        }
+        return Response.json({ ok: true, session_id: sessionId, backend: GOOSE_BACKEND_KIND });
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {
