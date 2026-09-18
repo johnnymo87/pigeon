@@ -148,9 +148,31 @@ const clientFactory = ingressRouter
       storage.injectedPrompts,
     )
   : undefined;
-// Resolve the owning-serve client for a session; falls back to the legacy single client when routing is unconfigured.
-const clientForSession = (sessionId: string): OpencodeClient | undefined =>
-  clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
+/**
+ * Resolve the owning-serve client for a session; falls back to the legacy single
+ * client when routing is unconfigured.
+ *
+ * A goose session resolves to `undefined` HERE, at the choke point, rather than
+ * at each call site. `forSession` -> `ensureRouted` -> `placeSession` does not
+ * decline an id it has never seen: it writes a `session_assignment` row AND
+ * acquires a live lease, and live leases are counted against `activeTurnCap`,
+ * so a goose id would narrow placement for real opencode sessions -- damage to
+ * OTHER sessions, which is what makes it hard to attribute afterwards.
+ *
+ * Guarding the nine control handlers individually was the first attempt and it
+ * was not enough: this function is ALSO handed whole to the swarm arbiter
+ * (below) and to `/launch`'s owner resolution, so a `/swarm/send` aimed at a
+ * goose id would still have minted the lease. One guard here covers every
+ * present and future caller.
+ *
+ * The handlers still ask `handleGooseControl` first, because returning
+ * `undefined` here only makes them log "not routable" and go quiet, and a
+ * silent non-answer is exactly what the honest replies exist to avoid.
+ */
+const clientForSession = (sessionId: string): OpencodeClient | undefined => {
+  if (isGooseSession(sessionId)) return undefined;
+  return clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
+};
 
 /**
  * The app's own request handler, bound once it exists.
@@ -199,7 +221,17 @@ const gooseRunners = config.gooseAcpUrl
             const res = await appHandler(
               new Request(`http://127.0.0.1:${config.port}/stop`, {
                 method: "POST",
-                headers: { "content-type": "application/json" },
+                headers: {
+                  "content-type": "application/json",
+                  // Auth is ENABLED on the live daemon, and `/stop` is not on the
+                  // anonymous allowlist (only GET /health and GET /outbox/stats
+                  // are). Without this header every goose turn would finish, get
+                  // a 401 here, and be swallowed by the catch in finishTurn -- so
+                  // the human would hear nothing, forever, with the only trace a
+                  // log line. Found in review; the probe could not see it because
+                  // it fakes postStop.
+                  ...(config.authToken ? { authorization: `Bearer ${config.authToken}` } : {}),
+                },
                 body: JSON.stringify(body),
               }),
             );
@@ -382,16 +414,12 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // via the session's per-serve backendEndpoint. When unroutable, omit the
           // client to preserve command-ingest's "no client -> delete dead session"
           // fallback.
-          // A goose session must NOT be resolved through the opencode router:
-          // ensureRouted/placeSession would mint a session_assignment and a LIVE
-          // LEASE for it, and live leases are counted against activeTurnCap, so
-          // a goose id would narrow placement for real opencode sessions.
-          // Omitting the client is safe here BECAUSE the goose adapter declares
-          // failurePolicy:"surface", which gates out the whole connection-error
-          // block -- including the no-client "delete dead session" fallback.
-          const client = isGooseSession(msg.sessionId)
-            ? undefined
-            : clientForSession(msg.sessionId);
+          // Returns undefined for a goose session (see clientForSession), which
+          // is safe ONLY because the goose adapter declares
+          // failurePolicy:"surface": that gates out the whole connection-error
+          // block, including the no-client branch that would otherwise DELETE
+          // the session unconditionally.
+          const client = clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
             apiKey: config.workerApiKey,
@@ -680,7 +708,13 @@ setInterval(() => {
 if (poller) {
   startSessionReaper({
     storage,
-    unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
+    unregisterSession: async (sessionId) => {
+      // A reaped goose session's runner still holds a websocket. Dropping the
+      // row without the runner leaks the socket and leaves any turn reporting
+      // into a session that no longer exists.
+      gooseRunners?.drop(sessionId);
+      return poller.unregisterSession(sessionId);
+    },
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
 }

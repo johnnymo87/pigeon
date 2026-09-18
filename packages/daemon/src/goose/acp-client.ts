@@ -174,6 +174,16 @@ const NO_ACTIVE_RUN = /no active run to steer/i;
 export class GooseAcpClient {
   private readonly opts: GooseAcpClientOptions;
   private transport: AcpTransport | undefined;
+  /**
+   * Set when the socket has closed under us.
+   *
+   * Load-bearing, because a closed WebSocket's `send()` DOES NOT THROW (verified
+   * on node 22.22.2: readyState 3, silent no-op). Without this flag a caller
+   * that believed it was still connected would write frames into a void and wait
+   * forever for a reply that cannot arrive -- and since delivery is serial, one
+   * such wait freezes command delivery for every session on the machine.
+   */
+  private closed = false;
   private nextId = 0;
   private pending = new Map<string, Pending>();
   /** Last run id observed for a session, learned from a busy rejection. */
@@ -187,9 +197,15 @@ export class GooseAcpClient {
     this.opts.log?.(msg, fields);
   }
 
+  /** True once the socket has closed; the caller should discard this client. */
+  isClosed(): boolean {
+    return this.closed;
+  }
+
   async connect(): Promise<void> {
     const transport = await this.opts.transportFactory(this.opts.url);
     this.transport = transport;
+    this.closed = false;
     transport.onMessage((data) => this.onMessage(data));
     transport.onClose((code, reason) => this.onClose(code, reason));
     await this.call("initialize", {
@@ -259,6 +275,7 @@ export class GooseAcpClient {
   }
 
   close(): void {
+    this.closed = true;
     this.transport?.close();
   }
 
@@ -269,6 +286,8 @@ export class GooseAcpClient {
   ): Promise<JsonRpcResponse> {
     const transport = this.transport;
     if (!transport) throw new Error("goose acp client is not connected");
+    // Fail loudly rather than writing into a closed socket, which is silent.
+    if (this.closed) throw new GooseProtocolError(-1, "goose acp connection is closed");
     const id = String(++this.nextId);
     // Enforced, not merely declared: see ALLOWED_ACP_METHODS for why a
     // tool-execution method must never appear here.
@@ -428,6 +447,7 @@ export class GooseAcpClient {
 
   private onClose(code: number, reason: string): void {
     this.log("goose acp closed", { code, reason, outstanding: this.pending.size });
+    this.closed = true;
     const entries = [...this.pending.entries()];
     this.pending.clear();
     for (const [, p] of entries) {
@@ -439,6 +459,14 @@ export class GooseAcpClient {
         p.reject(new GooseProtocolError(-1, `connection closed (code ${code}) before reply`));
       }
     }
+    // AFTER the rejections above, which read runIds to name the lost run in the
+    // error -- clearing first silently stripped that id and made a disconnect
+    // quiet again, which an existing test caught.
+    //
+    // Cleared at all because a run id learned on a dead connection is worse than
+    // no run id: it would send a later message to STEER a run nobody can reach,
+    // and a steer waits for a reply that cannot come.
+    this.runIds.clear();
   }
 }
 

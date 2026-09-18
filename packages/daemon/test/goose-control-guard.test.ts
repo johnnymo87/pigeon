@@ -50,40 +50,42 @@ describe("gooseControlVerdict", () => {
 });
 
 /**
- * A source-level check, which is unusual enough to justify.
+ * A source-level check on the wiring, which is unusual enough to justify.
  *
- * The hazard is not a wrong answer from a function — it is a handler in index.ts
- * that forgets to ask. `clientForSession` mints a session_assignment AND a live
- * lease for any unknown id, and live leases are counted against activeTurnCap,
- * so one unguarded handler silently narrows placement for real opencode
- * sessions. No behavioural test of THIS module can see that omission, and the
- * count has already been got wrong once: an earlier survey said six sites when
- * there are nine.
+ * The hazard is not a wrong answer from a function -- it is a CALLER that
+ * forgets to ask. `clientForSession` mints a session_assignment and a live lease
+ * for any unknown id, and live leases count against activeTurnCap, so one
+ * unguarded caller silently narrows placement for real opencode sessions.
  *
- * So the test reads the wiring file and asserts every `clientForSession` call is
- * preceded by a guard. It fails loudly when someone adds a tenth handler, which
- * is exactly when a human needs to be told this file exists.
+ * The first version of this guard sat in the nine control handlers, and a review
+ * found that insufficient: `clientForSession` is ALSO passed whole to the swarm
+ * arbiter and to /launch's owner resolution, so a /swarm/send aimed at a goose id
+ * would still have minted the lease. The guard therefore moved INTO
+ * `clientForSession` itself, and what is worth pinning is that it stays there --
+ * a behavioural test cannot see a guard that was moved back out to a subset of
+ * callers.
  */
 describe("index.ts control-path wiring", () => {
   const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 
-  it("guards every session-scoped clientForSession call site", () => {
-    const lines = src.split("\n");
-    const callSites: number[] = [];
-    lines.forEach((line, i) => {
-      if (line.includes("clientForSession(msg.sessionId)")) callSites.push(i);
-    });
+  it("guards goose sessions inside clientForSession itself, not at its call sites", () => {
+    // The choke point: every caller, present and future, is covered by this.
+    const decl = src.slice(src.indexOf("const clientForSession = ("));
+    const body = decl.slice(0, decl.indexOf("\n};"));
+    expect(body).toMatch(/if \(isGooseSession\(sessionId\)\) return undefined;/);
+    // And the guard must come before any routing call, not after it.
+    expect(body.indexOf("isGooseSession")).toBeLessThan(body.indexOf("clientFactory"));
+  });
 
-    // If this number changes, a handler was added or removed: check the new one
-    // guards itself before updating the expectation.
-    expect(callSites.length).toBe(9);
-
-    const unguarded = callSites.filter((i) => {
-      const window = lines.slice(Math.max(0, i - 12), i + 1).join("\n");
-      return !/handleGooseControl\(|isGooseSession\(/.test(window);
-    });
-
-    expect(unguarded.map((i) => `${i + 1}: ${lines[i]!.trim()}`)).toEqual([]);
+  it("still asks the control guard first, so a goose session gets an answer rather than silence", () => {
+    // clientForSession returning undefined only makes a handler log "not
+    // routable" and go quiet. The honest replies are the point.
+    for (const handler of ["onKill", "onInterrupt", "onCompact", "onMcpList", "onMcpEnable", "onMcpDisable", "onModelList", "onModelSet"]) {
+      const at = src.indexOf(`${handler}: async (msg) => {`);
+      expect(at, `${handler} not found`).toBeGreaterThan(-1);
+      const head = src.slice(at, at + 400);
+      expect(head, `${handler} does not consult handleGooseControl`).toMatch(/handleGooseControl\(/);
+    }
   });
 
   it("keeps the goose registry out of the picture entirely when goose is unconfigured", () => {

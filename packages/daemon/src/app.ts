@@ -795,6 +795,21 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             { status: 400 },
           );
         }
+        // Refuse to convert an existing session of another kind. `upsert` would
+        // happily rewrite backend_kind/endpoint/token in place, leaving the old
+        // routing assignment behind and silently repointing a live opencode
+        // session at a goose socket. A typo'd session_id should be an error, not
+        // a hijack.
+        const existing = storage.sessions.get(sessionId);
+        if (existing && existing.backendKind !== GOOSE_BACKEND_KIND) {
+          return Response.json(
+            {
+              error: `session ${sessionId} already exists with backend_kind=${existing.backendKind ?? "null"}; refusing to convert it`,
+            },
+            { status: 409 },
+          );
+        }
+
         const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : null;
         const label = typeof body.label === "string" && body.label ? body.label : null;
         const token = typeof body.auth_token === "string" && body.auth_token ? body.auth_token : null;

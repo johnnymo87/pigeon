@@ -43,6 +43,8 @@ import type { SessionRecord } from "../storage/types.js";
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
   connect(): Promise<void>;
+  /** True once the socket has closed, so the runner knows to reconnect. */
+  isClosed(): boolean;
   prompt(sessionId: string, text: string): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
@@ -86,6 +88,36 @@ interface Turn {
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
+
+/**
+ * Deadline for every await on the delivery path that is NOT the turn itself.
+ *
+ * The contract in adapters/types.ts requires it: "Bound every await inside
+ * deliverCommand. The poller dispatches serially, so one unbounded await freezes
+ * command delivery for EVERY session on the machine, including another session's
+ * /interrupt." The ACP client has no per-request timeout by design -- a TURN may
+ * legitimately take minutes -- so the bound belongs here, where a handshake and
+ * a steer are distinguishable from a turn.
+ *
+ * A half-open socket (NAT idle drop, serve SIGKILL with no FIN) emits no close
+ * event, so this is the only thing that ends such a wait.
+ */
+const NON_TURN_TIMEOUT_MS = 10_000;
+
+/** Rejects if `p` has not settled within `ms`. Does not cancel `p`. */
+async function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`goose ${what} did not answer within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export class GooseSessionRunner {
   private readonly opts: GooseSessionRunnerOptions;
@@ -146,9 +178,23 @@ export class GooseSessionRunner {
           meta: { mode: "no-run-id-yet" },
         };
       }
-      const outcome = (await this.opts.client.steer(this.sessionId, runId, text)) as {
-        kind?: string;
-      };
+      let outcome: { kind?: string };
+      try {
+        outcome = (await withDeadline(
+          this.opts.client.steer(this.sessionId, runId, text),
+          NON_TURN_TIMEOUT_MS,
+          "steer",
+        )) as { kind?: string };
+      } catch (err) {
+        // Deliberately ok:false rather than a throw. A throw would redeliver and
+        // could steer twice; more importantly the alternative to bounding this at
+        // all is a frozen poller, which costs every other session on the machine.
+        return {
+          ok: false,
+          error: `goose did not acknowledge the steer: ${err instanceof Error ? err.message : String(err)}`,
+          meta: { mode: "steer-timeout" },
+        };
+      }
       if (outcome?.kind === "steered") {
         this.opts.touch(this.sessionId);
         return { ok: true, meta: { mode: "steered", runId } };
@@ -186,7 +232,7 @@ export class GooseSessionRunner {
     turn.settled = this.opts.client
       .prompt(this.sessionId, text)
       .then(
-        (receipt) => this.finishTurn(turn, receipt as { stopReason?: string }, undefined),
+        (outcome) => this.onPromptOutcome(turn, text, outcome),
         (err: unknown) => this.finishTurn(turn, undefined, err),
       )
       .catch((err: unknown) => {
@@ -199,6 +245,60 @@ export class GooseSessionRunner {
       });
 
     return { ok: true, meta: { mode: "prompt", commandId } };
+  }
+
+  /**
+   * Handles what `prompt()` actually returned, which is NOT always a receipt.
+   *
+   * `prompt()` resolves with `{kind:"busy", runId}` when the session already had
+   * a run -- and goose does NOT persist a prompt it rejected as busy, so the
+   * human's message has not been delivered at all. Treating that as a finished
+   * turn (which an earlier version did, by casting it to a receipt) reported a
+   * cheerful "finished with no message" while silently dropping what they typed.
+   *
+   * It is reachable on the ordinary path: pigeon restarts, a turn is still
+   * running on goose's side, and the next message opens a fresh connection that
+   * knows nothing about it. Steering is the correct recovery, and it is safe
+   * precisely because nothing was persisted.
+   */
+  private async onPromptOutcome(turn: Turn, text: string, outcome: unknown): Promise<void> {
+    const kind = (outcome as { kind?: string } | undefined)?.kind;
+    if (kind === "busy") {
+      const runId = (outcome as { runId?: string }).runId;
+      this.log("goose rejected the prompt as busy; steering the live turn instead", {
+        sessionId: this.sessionId,
+        runId,
+      });
+      try {
+        const steered = (await this.opts.client.steer(this.sessionId, runId ?? "", text)) as {
+          kind?: string;
+        };
+        if (steered?.kind === "steered") {
+          // The message is now inside the run that was already going. That run
+          // reports its own completion, so this turn is over as a bookkeeping
+          // matter and must not also report.
+          if (this.turn === turn) this.clearTurn();
+          return;
+        }
+      } catch (err) {
+        this.log("goose steer after busy failed", {
+          sessionId: this.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      // Could not steer and did not prompt: the message is genuinely lost, so
+      // say so rather than reporting an empty success.
+      await this.finishTurn(
+        turn,
+        undefined,
+        new Error(
+          "goose was already running a turn and pigeon could not add this message to it. "
+            + "It was NOT delivered -- please send it again once the current turn finishes.",
+        ),
+      );
+      return;
+    }
+    await this.finishTurn(turn, outcome as { stopReason?: string }, undefined);
   }
 
   /** Feeds a `session/update` frame in. Must not throw: called from a socket callback. */
@@ -277,13 +377,35 @@ export class GooseSessionRunner {
   }
 
   private async ensureConnected(): Promise<void> {
+    // A socket that closed under us leaves `connected` true, and sending into a
+    // closed WebSocket is a SILENT no-op -- so without this the first blip would
+    // wedge the session permanently (and, via an unanswerable steer, freeze
+    // delivery for every session). Reconnecting is cheap and safe: a fresh
+    // connection can prompt an existing goose session id and still has its
+    // history, measured on 1.48.0.
+    if (this.connected && this.opts.client.isClosed()) {
+      this.log("goose connection closed underneath us, reconnecting", {
+        sessionId: this.sessionId,
+      });
+      this.connected = false;
+    }
     if (this.connected) return;
     // Collapse concurrent first-commands onto one handshake.
     if (!this.connecting) {
-      this.connecting = this.opts.client
-        .connect()
+      this.connecting = withDeadline(this.opts.client.connect(), NON_TURN_TIMEOUT_MS, "handshake")
         .then(() => {
           this.connected = true;
+        })
+        .catch((err: unknown) => {
+          // A handshake that timed out may have left a socket half-open. Close it
+          // so a later attempt starts clean rather than inheriting a wedge, and
+          // rethrow: nothing was sent, so the caller's throw is safe.
+          try {
+            this.opts.client.close();
+          } catch {
+            /* best effort */
+          }
+          throw err;
         })
         .finally(() => {
           this.connecting = undefined;

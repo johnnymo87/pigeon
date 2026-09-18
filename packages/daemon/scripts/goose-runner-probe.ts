@@ -154,6 +154,24 @@ async function main(): Promise<void> {
   check("did not throw (a throw would retry a bad token every 60s)", threw === false);
   check("returned ok:false", outcome.ok === false, String(outcome.error).slice(0, 80));
 
+  // --- 7. a REAL socket drop must be survivable, not a permanent wedge.
+  // This is the one a fake transport cannot honestly test: a closed WebSocket's
+  // send() does not throw, so the bug it guards against is silent by nature.
+  console.log("\n5. survive a real socket drop (reconnect, not wedge)");
+  client.close();
+  check("client reports itself closed", client.isClosed() === true);
+  const afterDrop = await adapter.deliverCommand(session, "Say exactly: recovered.", {
+    commandId: "probe-4",
+  });
+  check("delivery after a real drop succeeded", afterDrop.ok === true, JSON.stringify(afterDrop.meta ?? afterDrop.error));
+  await runner.settled();
+  const recovered = stops[stops.length - 1] ?? {};
+  check(
+    "the reconnected turn reported a real transcript",
+    stops.length === 2 && String(recovered.message ?? "").length > 0,
+    `stops=${stops.length} msg=${JSON.stringify(String(recovered.message ?? "").slice(0, 60))}`,
+  );
+
   client.close();
   console.log(failures === 0 ? "\nALL LIVE CHECKS PASSED" : `\n${failures} LIVE CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

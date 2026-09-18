@@ -20,7 +20,12 @@ class FakeClient {
   steerOutcome: unknown = { kind: "steered", runId: "run_1", messageId: "m1" };
   connectImpl: () => Promise<void> = async () => {
     this.connected = true;
+    this.closed = false;
   };
+  /** Simulate the socket dropping under us without anyone calling close(). */
+  dropSocket(): void {
+    this.closed = true;
+  }
   private runIds = new Map<string, string>();
 
   async connect(): Promise<void> {
@@ -31,12 +36,17 @@ class FakeClient {
     this.prompts.push(text);
     return new Promise((resolve, reject) => this.turns.push({ text, resolve, reject }));
   }
+  steerImpl: (() => Promise<unknown>) | undefined;
   async steer(_sessionId: string, runId: string, text: string): Promise<unknown> {
     this.steers.push({ runId, text });
+    if (this.steerImpl) return this.steerImpl();
     return this.steerOutcome;
   }
   activeRunId(sessionId: string): string | undefined {
     return this.runIds.get(sessionId);
+  }
+  isClosed(): boolean {
+    return this.closed;
   }
   close(): void {
     this.closed = true;
@@ -51,6 +61,10 @@ class FakeClient {
   }
   failTurn(err: Error): void {
     this.turns.shift()?.reject(err);
+  }
+  /** goose rejected the prompt because a run was already in flight. */
+  finishBusy(runId: string): void {
+    this.turns.shift()?.resolve({ kind: "busy", runId });
   }
   get liveTurns(): number {
     return this.turns.length;
@@ -325,4 +339,85 @@ describe("GooseRunnerRegistry", () => {
     reg.drop("a");
     expect(reg.size).toBe(0);
   });
+});
+
+
+/**
+ * Every test here covers a defect found by pre-PR adversarial review rather than
+ * by the test suite or the live probe -- all three sat at seams the tests stub
+ * (the transport's lifecycle, and `postStop`). They are grouped so that is
+ * visible: this is the class of bug this module is most exposed to.
+ */
+describe("GooseSessionRunner defects found in review", () => {
+  it("reconnects after the socket closed underneath it", async () => {
+    // A closed WebSocket's send() does NOT throw (verified on node 22.22.2:
+    // readyState 3, silent no-op). Without noticing the close, the runner would
+    // write the prompt into a void, report ok, and wait forever for a receipt --
+    // wedging the session permanently.
+    const { runner, client } = makeRunner();
+    await runner.deliver("c1", "first");
+    client.finishTurn();
+    await runner.settled();
+    expect(client.connectCalls).toBe(1);
+
+    client.dropSocket();
+    await runner.deliver("c2", "second");
+
+    expect(client.connectCalls).toBe(2);
+    expect(client.prompts).toEqual(["first", "second"]);
+  });
+
+  it("steers instead of reporting an empty success when the prompt is rejected as busy", async () => {
+    // goose does not persist a prompt it rejected as busy, so the message was
+    // never delivered. An earlier version cast the busy outcome to a receipt and
+    // cheerfully reported "finished with no message" while dropping what the
+    // human typed. Reachable on the ordinary path: pigeon restarts while a turn
+    // is still running on goose's side.
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "please do this");
+    client.finishBusy("run_live");
+    await runner.settled();
+
+    expect(client.steers).toEqual([{ runId: "run_live", text: "please do this" }]);
+    // The live run reports its own completion; this one must not double-report.
+    expect(stops).toHaveLength(0);
+    expect(runner.isBusy()).toBe(false);
+  });
+
+  it("tells the human their message was lost when a busy prompt cannot be steered either", async () => {
+    const { runner, client, stops } = makeRunner();
+    client.steerOutcome = { kind: "no-active-run" };
+    await runner.deliver("c1", "please do this");
+    client.finishBusy("run_live");
+    await runner.settled();
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.event).toBe("Error");
+    expect(String(stops[0]!.message)).toMatch(/NOT delivered/);
+  });
+
+  it("does not wait forever on a handshake that never answers", async () => {
+    // The poller is serial, so an unbounded await here freezes command delivery
+    // for every session on the machine -- including another session's commands.
+    const { runner, client } = makeRunner({ });
+    client.connectImpl = () => new Promise<void>(() => {});
+    const started = Date.now();
+    await expect(runner.deliver("c1", "x")).rejects.toThrow(/did not answer/);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(client.prompts).toEqual([]);
+    // and the half-open socket was closed rather than left to wedge a retry
+    expect(client.closed).toBe(true);
+  }, 20_000);
+
+  it("does not wait forever on a steer that never answers", async () => {
+    const { runner, client } = makeRunner();
+    await runner.deliver("c1", "first");
+    client.setRunId("20260918_1", "run_abc");
+    client.steerImpl = () => new Promise(() => {});
+
+    const res = await runner.deliver("c2", "second");
+
+    expect(res.ok).toBe(false);
+    expect(res.meta?.mode).toBe("steer-timeout");
+  }, 20_000);
 });
