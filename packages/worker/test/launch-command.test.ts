@@ -222,6 +222,29 @@ describe("parseLaunchMessage --backend", () => {
     }
   });
 
+  /**
+   * A deliberate behaviour change, pinned so it is a decision rather than an
+   * accident. Before the flag loop, `--tag x` consumed exactly one flag and
+   * everything after it was prompt -- so a prompt beginning with a dash was
+   * accepted THERE while being refused in the no-flag form. Now the same rule
+   * applies in both places.
+   *
+   * The alternative -- a position where dash-led tokens mean prose -- is
+   * exactly the inconsistency that lets a mistyped second flag be eaten
+   * silently, which is the failure this parser is built to prevent.
+   */
+  it("applies the no-dash-led-prompt rule after a flag too, not only before one", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --tag fbm -1 is returned by foo")).toMatchObject({ kind: "usage" });
+    // ...and the no-flag form is unchanged, as it always did this.
+    expect(parseLaunchMessage("/launch devbox pigeon -1 is returned by foo")).toMatchObject({ kind: "usage" });
+  });
+
+  it("still accepts a dash INSIDE the prompt, just not at its start", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --tag fbm return -1 from foo")).toMatchObject({
+      kind: "launch", tag: "fbm", prompt: "return -1 from foo",
+    });
+  });
+
   it("names --backend in the usage text", () => {
     expect(LAUNCH_USAGE_TEXT).toContain("--backend");
     expect(LAUNCH_USAGE_TEXT).toContain("goose");

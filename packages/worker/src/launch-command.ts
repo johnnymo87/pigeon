@@ -1,22 +1,30 @@
 /**
- * Parsing for the /launch command, including the optional `--tag`.
+ * Parsing for the /launch command, including the optional `--tag` and
+ * `--backend`.
  *
- * `/launch <machine> <dir> [--tag <tag>] <prompt>`
+ * `/launch <machine> <dir> [--tag <tag>] [--backend <backend>] <prompt>`
  *
- * The prompt is free text and greedy, which is what makes an optional argument
- * here delicate rather than trivial: any sigil the flag uses is a sigil a real
+ * The prompt is free text and greedy, which is what makes optional arguments
+ * here delicate rather than trivial: any sigil a flag uses is a sigil a real
  * prompt might legitimately start with, and eating it would silently shorten the
- * prompt. Three consequences shape this parser:
+ * prompt. Four consequences shape this parser:
  *
- *  - `--tag` is recognised ONLY as the first token of the prompt tail. A `--tag`
- *    anywhere later is ordinary prose (`add --tag to the CLI`).
+ *  - Flags are recognised ONLY while they are the LEADING tokens of the prompt
+ *    tail, consumed one at a time until a non-flag token is reached. A `--tag`
+ *    after the prompt has begun is ordinary prose (`add --tag to the CLI`).
  *  - A `#tag` sigil was rejected outright: `#4231 is failing, fix it` is an
  *    ordinary prompt here and `4231` is a valid tag, so it would be eaten
  *    silently. `#` therefore means nothing to this parser.
- *  - Any first tail token that STARTS with a dash-like character but is not
- *    exactly `--tag` is answered with usage, never treated as prompt. That covers
- *    `-t`, `--tag=fbm`, `--Tag`, and the em dash iOS smart punctuation makes of
- *    `--`. A real prompt does not begin with a dash; a typo'd flag does.
+ *  - Any leading tail token that STARTS with a dash-like character but is not
+ *    exactly a known flag is answered with usage, never treated as prompt. That
+ *    covers `-t`, `--tag=fbm`, `--Tag`, `-b`, `--Backend`, and the em dash iOS
+ *    smart punctuation makes of `--`. A real prompt does not begin with a dash;
+ *    a typo'd flag does.
+ *  - That rule now applies AFTER a flag too, which is a deliberate change: a
+ *    prompt beginning with a dash was previously accepted in `--tag x -1 is
+ *    returned` and is now usage. It matches what the no-flag form has always
+ *    done, and the alternative -- a second flag position where dashes mean
+ *    prose -- is the inconsistency that makes silent eating possible.
  *
  * A malformed /launch returns { kind: "usage" } rather than null. Returning null
  * would let webhook.ts fall through to the plain-message path, where the typo

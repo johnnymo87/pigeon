@@ -47,6 +47,7 @@ function harness(over: Partial<GooseLaunchInput> = {}) {
     onSessionStart: async (sessionId, notify) => { started.push({ sessionId, notify }); },
     sendTelegramReply: async (_chat, text) => { replies.push(text); },
     mintPigeonId: () => "gse_fixed",
+    mintTimeoutMs: 5_000,
     ...over,
   };
 
@@ -116,15 +117,80 @@ describe("ingestGooseLaunchCommand", () => {
     h.storage.db.close();
   });
 
-  describe("before the mint, a throw is the retry", () => {
-    it("throws when goose is unreachable, so the command is redelivered", async () => {
+  /**
+   * A LAUNCH never throws, and that is a different answer from the one the
+   * delivery adapter gives for the same failures.
+   *
+   * The adapter throws on an unreachable serve so the command is redelivered,
+   * because there the command is the human's message to a live session and
+   * losing it is expensive. Two things make that wrong here.
+   *
+   * First, the retry is neither bounded nor visible on this path.
+   * MAX_REDELIVERIES lives in ingestWorkerCommand, which only the `execute`
+   * path enters; onLaunch calls this module directly. So a throw buys a retry
+   * every 60s for up to 24h, with NOTHING said to the human -- and the most
+   * common failure of all is "goose serve was not running".
+   *
+   * Second, a lost launch costs the human one retyped line, where a lost
+   * message costs them what they wrote. The opencode launch path already
+   * answers this way: unhealthy serve, say so, ack.
+   */
+  describe("before the mint: report and ack, never throw", () => {
+    it("reports an unreachable serve rather than retrying silently for 24h", async () => {
       const h = harness({
         reachability: async (): Promise<Reachability> => ({ kind: "unreachable", cause: "ECONNREFUSED" }),
       });
-      // Nothing has been created, so redelivery cannot duplicate anything, and
-      // a transient outage should not cost the human their launch.
-      await expect(ingestGooseLaunchCommand(h.input)).rejects.toThrow(/unreachable/i);
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.replies.join("\n")).toMatch(/ECONNREFUSED/);
       expect(h.mintedCount()).toBe(0);
+      h.storage.db.close();
+    });
+
+    it("reports a client that cannot connect, rather than throwing", async () => {
+      const h = harness({
+        createMintClient: () => ({
+          connect: async () => { throw new Error("handshake refused"); },
+          newSession: async () => "unused",
+          close: () => {},
+        }),
+      });
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.replies.join("\n")).toMatch(/handshake refused/);
+      h.storage.db.close();
+    });
+
+    /**
+     * goose has no per-request timeout by design, and a socket that opens and
+     * then never answers emits no close event. The poller dispatches SERIALLY,
+     * so an unbounded await here freezes command delivery for EVERY session on
+     * the machine -- including another session's /interrupt -- until the daemon
+     * is restarted. The runner bounds exactly these calls for exactly this
+     * reason; so must this path.
+     */
+    it("bounds a mint that never answers, instead of freezing the poller", async () => {
+      const h = harness({
+        mintTimeoutMs: 40,
+        createMintClient: () => ({
+          connect: async () => {},
+          newSession: () => new Promise<string>(() => { /* never settles */ }),
+          close: () => {},
+        }),
+      });
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.replies.join("\n")).toMatch(/did not answer/i);
+      h.storage.db.close();
+    });
+
+    it("closes the client even when the mint fails, so the socket is not leaked", async () => {
+      const h = harness({
+        createMintClient: () => ({
+          connect: async () => {},
+          newSession: async () => { throw new Error("nope"); },
+          close: () => { h.closed.push("mint-client"); },
+        }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(h.closed).toEqual(["mint-client"]);
       h.storage.db.close();
     });
 
