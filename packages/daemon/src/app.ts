@@ -1,5 +1,6 @@
 import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
+import { registerGooseSession } from "./goose/register-session.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import type { StopNotifier } from "./notification-service";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
@@ -33,6 +34,7 @@ interface LegacySession {
   backend_kind: string | null;
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
+  backend_session_id: string | null;
   created_at: number;
   updated_at: number;
   last_seen: number;
@@ -54,6 +56,7 @@ function toLegacySession(session: {
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
   backendAuthToken: string | null;
+  backendSessionId: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -73,6 +76,13 @@ function toLegacySession(session: {
     backend_kind: session.backendKind,
     backend_protocol_version: session.backendProtocolVersion,
     backend_endpoint: session.backendEndpoint,
+    // Exposed so the pigeon-id <-> goose-id mapping is discoverable after the
+    // registration response has scrolled away. Without it the only way to learn
+    // which goose session a pigeon id refers to is to open the sqlite file,
+    // which is a poor answer when the reason you are asking is that something
+    // has gone wrong. NULL for opencode sessions and for legacy goose rows,
+    // where the two ids are the same thing.
+    backend_session_id: session.backendSessionId,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     last_seen: session.lastSeen,
@@ -624,6 +634,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               ?? existing?.backendProtocolVersion,
             backendEndpoint,
             backendAuthToken,
+            // backendSessionId is deliberately absent: the upsert COALESCEs it,
+            // so omitting it preserves whatever is stored. Nothing POSTs this
+            // field; it is set when the session is registered as a goose one.
           },
           nowFn(),
         );
@@ -795,42 +808,33 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             { status: 400 },
           );
         }
-        // Refuse to convert an existing session of another kind. `upsert` would
-        // happily rewrite backend_kind/endpoint/token in place, leaving the old
-        // routing assignment behind and silently repointing a live opencode
-        // session at a goose socket. A typo'd session_id should be an error, not
-        // a hijack.
-        const existing = storage.sessions.get(sessionId);
-        if (existing && existing.backendKind !== GOOSE_BACKEND_KIND) {
-          return Response.json(
-            {
-              error: `session ${sessionId} already exists with backend_kind=${existing.backendKind ?? "null"}; refusing to convert it`,
-            },
-            { status: 409 },
-          );
-        }
-
         const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : null;
         const label = typeof body.label === "string" && body.label ? body.label : null;
         const token = typeof body.auth_token === "string" && body.auth_token ? body.auth_token : null;
 
-        storage.sessions.upsert(
-          {
-            sessionId,
-            cwd,
-            label,
-            notify: true,
-            backendKind: GOOSE_BACKEND_KIND,
-            backendProtocolVersion: 1,
-            backendEndpoint: endpoint,
-            backendAuthToken: token,
-          },
+        // `session_id` in the body is GOOSE's id for the session -- the caller
+        // read it off goose and has no other name for it. pigeon mints its own
+        // and returns that, which is what every later request must use.
+        const registered = registerGooseSession(
+          storage.sessions,
+          { backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
           nowFn(),
         );
-        if (onSessionStart) {
-          await onSessionStart(sessionId, true, label);
+        if (!registered.ok) {
+          return Response.json({ error: registered.conflict }, { status: 409 });
         }
-        return Response.json({ ok: true, session_id: sessionId, backend: GOOSE_BACKEND_KIND });
+        if (onSessionStart) {
+          await onSessionStart(registered.sessionId, true, label);
+        }
+        return Response.json({
+          ok: true,
+          session_id: registered.sessionId,
+          // Echoed so a caller holding only goose's id can correlate the two --
+          // and so the change of meaning of `session_id` is visible in the
+          // response rather than silent.
+          backend_session_id: sessionId,
+          backend: GOOSE_BACKEND_KIND,
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {

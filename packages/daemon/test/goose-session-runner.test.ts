@@ -32,17 +32,33 @@ class FakeClient {
     this.connectCalls++;
     await this.connectImpl();
   }
-  prompt(_sessionId: string, text: string): Promise<unknown> {
+  /**
+   * Session ids this fake was actually CALLED with, per ACP method.
+   *
+   * These used to be discarded as `_sessionId`, which meant the fake asserted
+   * nothing about the one thing the caller has to get right: goose knows the
+   * session by its own id (`YYYYMMDD_N`), pigeon knows it by a `gse_` id it
+   * mints itself, and sending pigeon's id to goose fails at runtime while every
+   * test stays green. Recorded so the tests below can tell the two apart.
+   */
+  promptSessionIds: string[] = [];
+  steerSessionIds: string[] = [];
+  activeRunIdSessionIds: string[] = [];
+
+  prompt(sessionId: string, text: string): Promise<unknown> {
+    this.promptSessionIds.push(sessionId);
     this.prompts.push(text);
     return new Promise((resolve, reject) => this.turns.push({ text, resolve, reject }));
   }
   steerImpl: (() => Promise<unknown>) | undefined;
-  async steer(_sessionId: string, runId: string, text: string): Promise<unknown> {
+  async steer(sessionId: string, runId: string, text: string): Promise<unknown> {
+    this.steerSessionIds.push(sessionId);
     this.steers.push({ runId, text });
     if (this.steerImpl) return this.steerImpl();
     return this.steerOutcome;
   }
   activeRunId(sessionId: string): string | undefined {
+    this.activeRunIdSessionIds.push(sessionId);
     return this.runIds.get(sessionId);
   }
   isClosed(): boolean {
@@ -313,6 +329,70 @@ describe("GooseSessionRunner failure containment", () => {
   });
 });
 
+/**
+ * Two ids, and which one goes where.
+ *
+ * goose mints `YYYYMMDD_N` — a per-machine counter, NOT globally unique, so two
+ * machines both produce `20260920_1` as their first session of a day. The
+ * worker's D1 keys sessions globally, so pigeon mints its own `gse_` id and
+ * keeps goose's in `backendSessionId`. Everything pigeon-facing (notifications,
+ * touch, /stop bodies) must use the pigeon id; the four ACP calls must use
+ * goose's, because that is the only name goose answers to.
+ *
+ * Getting this backwards fails only against a real goose, which is why it is
+ * pinned here rather than left to the live probe.
+ */
+describe("pigeon id vs goose backend id", () => {
+  it("prompts goose by its OWN session id, not pigeon's", async () => {
+    const { runner, client } = makeRunner({
+      session: session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }),
+    });
+    await runner.deliver("c1", "hello");
+    expect(client.promptSessionIds).toEqual(["20260920_1"]);
+  });
+
+  it("reports to pigeon under the PIGEON id while prompting goose under goose's", async () => {
+    const { runner, client, stops, touches } = makeRunner({
+      session: session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }),
+    });
+    await runner.deliver("c1", "hello");
+    client.finishTurn();
+    await runner.settled();
+
+    expect(client.promptSessionIds).toEqual(["20260920_1"]);
+    // The /stop body and its notification id are pigeon's namespace: the worker
+    // looks the session up in D1 by this, and D1 has never heard of `20260920_1`.
+    expect(stops[0]!.session_id).toBe("gse_abc");
+    expect(String(stops[0]!.notification_id)).toContain("gse_abc");
+    expect(String(stops[0]!.notification_id)).not.toContain("20260920_1");
+    expect(touches).toEqual(["gse_abc"]);
+  });
+
+  it("steers goose by goose's id", async () => {
+    const { runner, client } = makeRunner({
+      session: session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }),
+    });
+    await runner.deliver("c1", "first");
+    client.setRunId("20260920_1", "run_7");
+    await runner.deliver("c2", "steer me");
+    expect(client.steerSessionIds).toEqual(["20260920_1"]);
+    expect(client.activeRunIdSessionIds).toContain("20260920_1");
+  });
+
+  /**
+   * Every goose session registered before this column existed has NULL there,
+   * and for those pigeon's id IS goose's id. Without the fallback the first
+   * prompt to any pre-existing session would go to goose as `undefined`.
+   */
+  it("falls back to the pigeon id when no backend id is stored (legacy rows)", async () => {
+    const { runner, client } = makeRunner({
+      session: session({ sessionId: "20260918_1", backendSessionId: null }),
+    });
+    await runner.deliver("c1", "hello");
+    expect(client.promptSessionIds).toEqual(["20260918_1"]);
+  });
+});
+
 describe("GooseRunnerRegistry", () => {
   it("returns the same runner for a session, so turn state is not split", async () => {
     const made: string[] = [];
@@ -345,6 +425,47 @@ describe("GooseRunnerRegistry", () => {
     expect(reg.size).toBe(1);
     reg.drop("a");
     expect(reg.size).toBe(0);
+  });
+
+  /**
+   * Inbound `session/update` notifications arrive off the socket carrying
+   * GOOSE's id, so they cannot be routed through the pigeon-id map. The second
+   * map exists only for that, and the risk of a second map is that the two fall
+   * out of step -- a drop that clears one and not the other leaves a runner
+   * reachable by backend id forever, still holding a socket.
+   */
+  it("finds a runner by the backend id inbound updates carry", () => {
+    const reg = new GooseRunnerRegistry({ createRunner: () => ({ close: () => {} }) as never });
+    const r = reg.get(session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }));
+    expect(reg.peekByBackendId("20260920_1")).toBe(r);
+    // The pigeon id is NOT a backend id; conflating them is the whole bug.
+    expect(reg.peekByBackendId("gse_abc")).toBeUndefined();
+    expect(reg.peek("gse_abc")).toBe(r);
+  });
+
+  it("clears BOTH maps on drop, so no runner survives by backend id", () => {
+    let closed = 0;
+    const reg = new GooseRunnerRegistry({ createRunner: () => ({ close: () => { closed++; } }) as never });
+    reg.get(session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }));
+    reg.drop("gse_abc");
+    expect(reg.size).toBe(0);
+    expect(reg.peekByBackendId("20260920_1")).toBeUndefined();
+    expect(closed).toBe(1);
+  });
+
+  it("clears BOTH maps on closeAll", () => {
+    const reg = new GooseRunnerRegistry({ createRunner: () => ({ close: () => {} }) as never });
+    reg.get(session({ sessionId: "gse_abc", backendSessionId: "20260920_1" }));
+    reg.closeAll();
+    expect(reg.peekByBackendId("20260920_1")).toBeUndefined();
+    expect(reg.size).toBe(0);
+  });
+
+  /** Legacy rows have no backend id, and must still be routable by their own. */
+  it("indexes a legacy row under its own id", () => {
+    const reg = new GooseRunnerRegistry({ createRunner: () => ({ close: () => {} }) as never });
+    const r = reg.get(session({ sessionId: "20260918_1", backendSessionId: null }));
+    expect(reg.peekByBackendId("20260918_1")).toBe(r);
   });
 });
 

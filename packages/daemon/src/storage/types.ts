@@ -24,6 +24,28 @@ export interface SessionRecord {
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
   backendAuthToken: string | null;
+  /**
+   * The id the BACKEND knows this session by, when that differs from pigeon's.
+   *
+   * Exists because goose's `session/new` returns `YYYYMMDD_N` -- a per-serve
+   * counter (measured on goose 1.48.0: `20260919_1`..`_7`, persisting across a
+   * serve restart). That is unique on one machine and NOT unique across
+   * machines: every machine mints `20260920_1` as its first session of a day.
+   * The worker's D1 keys sessions GLOBALLY (`session_id TEXT PRIMARY KEY`) and
+   * its registration upsert overwrites `machine_id` on conflict, so two machines
+   * launching goose on the same day would silently repoint each other's routing
+   * -- and the reaper's unregister, which deletes by session id with no machine
+   * filter, would destroy the other's live session.
+   *
+   * So pigeon mints its own globally-unique `gse_<uuid>` and keeps the backend's
+   * name for it here. opencode needs none of this: its ids are already random.
+   *
+   * NULL for every session registered before this column existed, and for those
+   * pigeon's id IS the backend's id -- read it through `backendSessionIdOf`
+   * rather than directly, or the first prompt to a pre-existing goose session
+   * goes out as `undefined`.
+   */
+  backendSessionId: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -107,6 +129,23 @@ export interface UpsertSessionInput {
   backendProtocolVersion?: number | null;
   backendEndpoint?: string | null;
   backendAuthToken?: string | null;
+  backendSessionId?: string | null;
+}
+
+/**
+ * The id to address the BACKEND with for this session.
+ *
+ * The `?? sessionId` fallback is what lets the column be added without a
+ * backfill: a row written before it existed has NULL, and for those two ids
+ * were the same thing. Every ACP call must go through this rather than reading
+ * the field, because reading it directly is correct for new rows and silently
+ * wrong for old ones.
+ */
+export function backendSessionIdOf(session: {
+  sessionId: string;
+  backendSessionId?: string | null;
+}): string {
+  return session.backendSessionId ?? session.sessionId;
 }
 
 export interface MintSessionTokenInput {

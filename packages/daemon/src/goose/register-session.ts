@@ -1,0 +1,119 @@
+import { randomUUID } from "crypto";
+import { GOOSE_BACKEND_KIND } from "./backend-kind.js";
+import type { SessionRecord, UpsertSessionInput } from "../storage/types.js";
+
+/**
+ * Creating pigeon's row for a goose session, in one place.
+ *
+ * Two callers need this and must not drift: the `/goose/sessions` route (a human
+ * registering a session they started themselves) and the `/launch --backend
+ * goose` path (the daemon registering one it just minted). The route's own
+ * comment asked for this extraction before a second caller existed; this is it.
+ *
+ * What must not be re-decided per caller:
+ *
+ *  - **pigeon mints the id, goose does not.** goose names sessions
+ *    `YYYYMMDD_N`, a per-machine counter, so every machine produces
+ *    `20260920_1` as its first session of a day -- and the worker keys sessions
+ *    globally, upserting `machine_id` on conflict and deleting by bare
+ *    `session_id` on unregister. Two machines would silently repoint and then
+ *    destroy each other's live sessions. See SessionRecord.backendSessionId.
+ *  - **`notify` is forced true, not defaulted.** A goose session exists only to
+ *    be driven from Telegram, and with notify=false the `/stop` route returns
+ *    early, so the human never hears a turn finish -- indistinguishable from a
+ *    broken adapter.
+ *  - **Registering the same goose session twice reuses one row.** The caller
+ *    knows only goose's id, so without the backend-id lookup a re-registration
+ *    would mint a second pigeon session for one goose session.
+ */
+
+export interface RegisterGooseSessionInput {
+  /** The id GOOSE knows the session by, e.g. `20260920_1`. */
+  backendSessionId: string;
+  endpoint: string;
+  cwd?: string | null;
+  label?: string | null;
+  authToken?: string | null;
+}
+
+export interface GooseSessionStore {
+  get(sessionId: string): SessionRecord | null;
+  getByBackendSessionId(backendSessionId: string): SessionRecord | null;
+  upsert(input: UpsertSessionInput, now: number): void;
+}
+
+export type RegisterGooseSessionResult =
+  | { ok: true; sessionId: string; reused: boolean }
+  | { ok: false; conflict: string };
+
+/**
+ * @param mintId Injected so tests can pin the id; defaults to a random one.
+ */
+export function registerGooseSession(
+  sessions: GooseSessionStore,
+  input: RegisterGooseSessionInput,
+  now: number,
+  mintId: () => string = () => `gse_${randomUUID()}`,
+): RegisterGooseSessionResult {
+  // Refuse to convert an existing session of another kind. Historically this
+  // mattered because pigeon's id WAS goose's id and the upsert would rewrite
+  // backend_kind/endpoint in place, silently repointing a live opencode session
+  // at a goose socket. pigeon now mints its own id so that particular hijack is
+  // gone -- but a caller passing an opencode session id still means a typo, and
+  // answering it with a cheerful new session would hide that.
+  const atPrimaryKey = sessions.get(input.backendSessionId);
+  if (atPrimaryKey && atPrimaryKey.backendKind !== GOOSE_BACKEND_KIND) {
+    return {
+      ok: false,
+      conflict: `session ${input.backendSessionId} already exists with backend_kind=${atPrimaryKey.backendKind ?? "null"}; refusing to convert it`,
+    };
+  }
+
+  // Refuse PIGEON's own id in the backend-id position.
+  //
+  // This is the likeliest typo of all, because the route's REQUEST `session_id`
+  // means goose's id while its RESPONSE `session_id` means pigeon's -- so
+  // feeding a response back in lands exactly here. Left unguarded it would
+  // adopt the row and overwrite its real backend id with pigeon's, and the
+  // damage is DEFERRED rather than immediate: the live runner keeps working off
+  // its in-memory map, and the session only dies at the next daemon restart,
+  // when goose begins answering "Session not found" forever. A row whose
+  // backend id is NULL is the legacy case and genuinely is its own backend id,
+  // so that one is still adoptable.
+  if (
+    atPrimaryKey
+    && atPrimaryKey.backendSessionId !== null
+    && atPrimaryKey.backendSessionId !== input.backendSessionId
+  ) {
+    return {
+      ok: false,
+      conflict: `${input.backendSessionId} is pigeon's id for a session goose knows as ${atPrimaryKey.backendSessionId}; pass goose's id, not pigeon's`,
+    };
+  }
+
+  // Idempotence. Two shapes of existing row can match: one registered since
+  // pigeon started minting ids (found by backend id) and a legacy one whose
+  // pigeon id IS goose's id (found by primary key, with backendKind already
+  // goose -- the other-kind case was refused above).
+  const existing = sessions.getByBackendSessionId(input.backendSessionId) ?? atPrimaryKey;
+  const sessionId = existing?.sessionId ?? mintId();
+
+  sessions.upsert(
+    {
+      sessionId,
+      cwd: input.cwd ?? null,
+      label: input.label ?? null,
+      notify: true,
+      backendKind: GOOSE_BACKEND_KIND,
+      backendProtocolVersion: 1,
+      backendEndpoint: input.endpoint,
+      backendAuthToken: input.authToken ?? null,
+      // Written even when it equals sessionId (the legacy-row case), so a row
+      // touched by this function is never ambiguous afterwards.
+      backendSessionId: input.backendSessionId,
+    },
+    now,
+  );
+
+  return { ok: true, sessionId, reused: existing !== null && existing !== undefined };
+}
