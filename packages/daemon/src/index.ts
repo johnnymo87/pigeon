@@ -41,6 +41,7 @@ import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
 import { GooseAcpClient } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
+import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
 import { startSessionReaper } from "./session-reaper";
 import type { TgEntity } from "./telegram-message";
@@ -252,6 +253,19 @@ const gooseRunners = config.gooseAcpUrl
     })
   : undefined;
 
+/**
+ * Whether this daemon can CREATE a goose session, as opposed to drive one.
+ *
+ * A single constant on purpose. It feeds both the capability advertised on
+ * every poll and the guard the launch handler checks, and those two are the
+ * halves of one claim: advertise without the guard and the worker hands over a
+ * command this daemon refuses; guard without advertising and the worker refuses
+ * before the daemon is ever asked. Two literals here drifted apart once
+ * already -- they were `false` in both places, deliberately, for exactly as
+ * long as the launch path did not exist.
+ */
+const canLaunchGoose = Boolean(gooseRunners && config.gooseAcpUrl);
+
 /** True for sessions this daemon speaks to over goose's ACP rather than opencode. */
 const isGooseSession = (sessionId: string): boolean =>
   storage.sessions.get(sessionId)?.backendKind === GOOSE_BACKEND_KIND;
@@ -405,18 +419,16 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         // advertisement cannot drift from what this daemon will actually do.
         // Configuration, never health -- see backends.ts.
         //
-        // `goose: false` is NOT an oversight. This capability means "I can
-        // LAUNCH this backend", and a `gooseRunners` registry means only that
-        // an existing goose session can be DRIVEN -- the launch path (mint a
-        // session id, register the row, send the first prompt) does not exist
-        // yet. Advertising goose here would make the worker hand over a command
-        // this daemon would then have to refuse, turning an immediate, clear
-        // refusal into "Launching..." followed by a failure five seconds later.
-        // Flip this to Boolean(gooseRunners) in the same commit that adds the
-        // launch path, not before.
+        // Read from the SAME constant the launch handler branches on, so the
+        // advertisement cannot claim a backend this daemon would then refuse.
+        // This capability means "I can LAUNCH this": until the launch path
+        // existed it was hardcoded false even where goose was configured,
+        // because a runner registry only means an existing session can be
+        // DRIVEN. The launch path exists now, so the honest answer is the
+        // configuration.
         backends: advertisedBackends({
           opencode: Boolean(opencodeClient),
-          goose: false,
+          goose: canLaunchGoose,
         }),
       },
       {
@@ -464,20 +476,48 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // the command was consumed and destroyed with the human hearing
           // nothing at all.
           // Same capabilities as the advertisement above, so what this daemon
-          // claims and what it does cannot disagree -- including `goose: false`
-          // until the goose launch path exists.
+          // claims and what it does cannot disagree.
           const servable = checkLaunchServable(msg.backend, {
             opencode: Boolean(opencodeClient),
-            goose: false,
+            goose: canLaunchGoose,
           });
           if (!servable.ok) {
             console.warn(`[pigeon-daemon] refusing launch commandId=${msg.commandId} backend=${msg.backend ?? "opencode"}: ${servable.message}`);
             await reply(msg.chatId, servable.message);
             return;
           }
-          // Unreachable today: checkLaunchServable has already refused every
-          // backend this daemon cannot launch, and the only one it can is
-          // opencode, which requires this client.
+
+          if (servable.backend === "goose" && gooseRunners && config.gooseAcpUrl) {
+            await ingestGooseLaunchCommand({
+              commandId: msg.commandId,
+              directory: msg.directory,
+              prompt: msg.prompt,
+              chatId: msg.chatId,
+              machineId: config.machineId,
+              acpUrl: config.gooseAcpUrl,
+              ...(config.gooseAcpToken ? { acpToken: config.gooseAcpToken } : {}),
+              sessions: storage.sessions,
+              runnerFor: (session) => gooseRunners.get(session),
+              // A short-lived client purely to open the session: the runner is
+              // per-session and builds its own, so there is none to borrow
+              // before the session exists.
+              createMintClient: (url, token) =>
+                new GooseAcpClient({
+                  url,
+                  transportFactory: webSocketTransport(token),
+                  log: (m, f) => console.log(`[goose-launch] ${m}`, f ?? ""),
+                }),
+              onSessionStart: async (sessionId) => {
+                if (poller) await poller.registerSession(sessionId);
+              },
+              sendTelegramReply: reply,
+            });
+            return;
+          }
+
+          // Unreachable for a correctly-wired daemon: checkLaunchServable has
+          // already refused every backend this daemon cannot launch, and the
+          // branches above handle the ones it can.
           //
           // THROWS rather than returns, and the difference is the whole point.
           // A clean return reads as success to the poller, which then acks --

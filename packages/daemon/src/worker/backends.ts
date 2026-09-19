@@ -42,9 +42,11 @@ export const NO_BACKENDS_SENTINEL = "none";
  *
  * The distinction is load-bearing and easy to get wrong. A `GooseRunnerRegistry`
  * means an EXISTING goose session can be driven; it says nothing about whether
- * this daemon can create one. Until the goose launch path exists, the wiring
- * passes `goose: false` even on a machine where `PIGEON_GOOSE_ACP_URL` is set,
- * and that is correct rather than an oversight.
+ * this daemon can create one. For as long as no goose launch path existed, the
+ * wiring passed `goose: false` even where `PIGEON_GOOSE_ACP_URL` was set, and
+ * that was correct rather than an oversight. The launch path exists now, so
+ * index.ts derives both this and its own launch guard from a single
+ * `canLaunchGoose` constant -- two literals here drifted apart once already.
  */
 export interface BackendCapabilities {
   /** An `opencodeClient` exists, so an opencode session can be created. */
