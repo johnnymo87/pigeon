@@ -180,6 +180,42 @@ describe("Poller.poll()", () => {
     );
   });
 
+  /**
+   * The capability header, byte-exact. The worker parses this same literal in
+   * `packages/worker/test/backend-gate-seam.test.ts`; keeping the string pinned
+   * on BOTH sides means a rename fails a suite instead of silently disabling
+   * the gate, and a gate that never matches looks exactly like one that always
+   * passes.
+   */
+  it("advertises its backends under the pinned header name", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(noContent()) as unknown as typeof fetch;
+    const poller = new Poller({ ...BASE_CONFIG, backends: "opencode,goose" }, makeCallbacks(), { fetchFn });
+
+    await poller.poll();
+
+    expect(fetchFn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Pigeon-Backends": "opencode,goose" }),
+      }),
+    );
+  });
+
+  /**
+   * Omitted entirely rather than sent empty. An absent header is what the
+   * worker reads as a pre-gate daemon; an empty one would mean "I can serve
+   * nothing" and refuse every command this daemon has.
+   */
+  it("omits the header entirely when no backends are configured", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(noContent()) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    await poller.poll();
+
+    const init = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![1] as RequestInit;
+    expect(Object.keys(init.headers as Record<string, string>)).not.toContain("X-Pigeon-Backends");
+  });
+
   it("returns null on 204", async () => {
     const fetchFn = vi.fn().mockResolvedValue(noContent()) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });

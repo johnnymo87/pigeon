@@ -13,6 +13,7 @@ import { OUTBOX_RETENTION_MS, FAILED_RETENTION_MS } from "./storage/schema";
 import { SWARM_RETENTION_MS } from "./storage/swarm-schema";
 import { SESSION_EVENTS_RETENTION_MS } from "./storage/session-events-schema";
 import { Poller } from "./worker/poller";
+import { advertisedBackends, checkLaunchServable } from "./worker/backends";
 import { WorkerHealthMonitor } from "./worker/worker-health";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
@@ -395,6 +396,23 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         apiKey: config.workerApiKey,
         machineId: config.machineId,
         chatId: config.telegramChatId,
+        // Derived from the SAME values the launch handler checks below, so the
+        // advertisement cannot drift from what this daemon will actually do.
+        // Configuration, never health -- see backends.ts.
+        //
+        // `goose: false` is NOT an oversight. This capability means "I can
+        // LAUNCH this backend", and a `gooseRunners` registry means only that
+        // an existing goose session can be DRIVEN -- the launch path (mint a
+        // session id, register the row, send the first prompt) does not exist
+        // yet. Advertising goose here would make the worker hand over a command
+        // this daemon would then have to refuse, turning an immediate, clear
+        // refusal into "Launching..." followed by a failure five seconds later.
+        // Flip this to Boolean(gooseRunners) in the same commit that adds the
+        // launch path, not before.
+        backends: advertisedBackends({
+          opencode: Boolean(opencodeClient),
+          goose: false,
+        }),
       },
       {
         // Any inbound action on a session means the user is looking at it, so the
@@ -433,10 +451,40 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onLaunch: async (msg) => {
-          if (!opencodeClient) {
-            console.warn("[pigeon-daemon] received launch command but no opencodeClient is configured");
+          const reply = createTelegramReplySender(sendTelegramMessage, msg);
+
+          // Deliberately redundant with the worker's capability gate; see
+          // checkLaunchServable. Previously the no-opencodeClient case warned
+          // and RETURNED, which the poller reads as success and then acks -- so
+          // the command was consumed and destroyed with the human hearing
+          // nothing at all.
+          // Same capabilities as the advertisement above, so what this daemon
+          // claims and what it does cannot disagree -- including `goose: false`
+          // until the goose launch path exists.
+          const servable = checkLaunchServable(msg.backend, {
+            opencode: Boolean(opencodeClient),
+            goose: false,
+          });
+          if (!servable.ok) {
+            console.warn(`[pigeon-daemon] refusing launch commandId=${msg.commandId} backend=${msg.backend ?? "opencode"}: ${servable.message}`);
+            await reply(msg.chatId, servable.message);
             return;
           }
+          // Unreachable today: checkLaunchServable has already refused every
+          // backend this daemon cannot launch, and the only one it can is
+          // opencode, which requires this client.
+          //
+          // THROWS rather than returns, and the difference is the whole point.
+          // A clean return reads as success to the poller, which then acks --
+          // destroying the command with the human hearing nothing, which is the
+          // bug this commit exists to remove. Throwing makes the poller skip
+          // the ack, so the command retries and the failure is visible. If a
+          // new servable backend is ever added to checkLaunchServable without a
+          // branch here, this is what says so.
+          if (servable.backend !== "opencode" || !opencodeClient) {
+            throw new Error(`onLaunch has no branch for servable backend ${servable.backend}`);
+          }
+
           await ingestLaunchCommand({
             commandId: msg.commandId,
             directory: msg.directory,
@@ -458,7 +506,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // written, so without this its FIRST notification would show no tag
             // right after Telegram said the tag had been applied.
             onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendTelegramReply: reply,
           });
         },
         onKill: async (msg) => {
