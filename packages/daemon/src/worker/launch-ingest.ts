@@ -11,7 +11,7 @@ import type { LaunchMessage } from "./poller";
 const AUTO_ATTACH_LOG_PATH = "/tmp/oc-auto-attach.log";
 
 /** Treat a bare word (no slashes, no ~) as ~/projects/<word> (or ~/Code/<word> on macOS). */
-function expandShorthand(dir: string): string {
+export function expandShorthand(dir: string): string {
   if (!dir.includes("/") && !dir.startsWith("~")) {
     const isDarwin = os.platform() === "darwin";
     return isDarwin ? `~/Code/${dir}` : `~/projects/${dir}`;
@@ -20,7 +20,7 @@ function expandShorthand(dir: string): string {
 }
 
 /** Resolve leading `~` or `~/` to the user's home directory. */
-function resolveHome(dir: string): string {
+export function resolveHome(dir: string): string {
   if (dir === "~") return os.homedir();
   if (dir.startsWith("~/")) return os.homedir() + dir.slice(1);
   return dir;

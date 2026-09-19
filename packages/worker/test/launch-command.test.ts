@@ -119,3 +119,111 @@ describe("parseLaunchMessage", () => {
     expect(LAUNCH_USAGE_TEXT).toContain("/launch");
   });
 });
+
+/**
+ * `--backend`, and the flag loop it forces.
+ *
+ * `--tag` used to be recognised in one shot as "the first token of the tail".
+ * A second flag turns that into a loop, and a loop is where a greedy prompt gets
+ * dangerous: every token consumed as a flag is a token silently removed from
+ * what the human asked for. So the loop stops at the first token that is not a
+ * dash-led flag, and anything dash-led that is not exactly a known flag is
+ * answered with usage rather than guessed at.
+ */
+describe("parseLaunchMessage --backend", () => {
+  it("parses --backend on its own", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --backend goose fix the test")).toEqual({
+      kind: "launch",
+      machineId: "devbox",
+      directory: "pigeon",
+      backend: "goose",
+      prompt: "fix the test",
+    });
+  });
+
+  it("accepts the explicit default without making it special", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --backend opencode do it")).toEqual({
+      kind: "launch",
+      machineId: "devbox",
+      directory: "pigeon",
+      backend: "opencode",
+      prompt: "do it",
+    });
+  });
+
+  it("omits backend entirely when not asked for, so the wire shape is unchanged", () => {
+    // A launch with no --backend must serialise exactly as it did before this
+    // flag existed: poll.ts only puts `backend` on the wire when metadata
+    // carries it, and a pre-gate daemon must keep seeing the old body.
+    const parsed = parseLaunchMessage("/launch devbox pigeon do it");
+    expect(parsed).not.toHaveProperty("backend");
+  });
+
+  it("normalises case, so --backend GOOSE is not an unknown backend", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --backend GOOSE do it")).toMatchObject({
+      kind: "launch",
+      backend: "goose",
+    });
+  });
+
+  it("answers usage for a backend nothing can serve", () => {
+    // Refused HERE rather than at the daemon: the worker knows the closed set,
+    // and a typo'd backend should cost a usage message, not a queued command
+    // that fails a poll later.
+    expect(parseLaunchMessage("/launch devbox pigeon --backend gooose do it")).toMatchObject({ kind: "usage" });
+    expect(parseLaunchMessage("/launch devbox pigeon --backend claude do it")).toMatchObject({ kind: "usage" });
+  });
+
+  it("answers usage for --backend with no value or no prompt", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --backend")).toMatchObject({ kind: "usage" });
+    expect(parseLaunchMessage("/launch devbox pigeon --backend goose")).toMatchObject({ kind: "usage" });
+    expect(parseLaunchMessage("/launch devbox pigeon --backend goose   ")).toMatchObject({ kind: "usage" });
+  });
+
+  it("takes both flags, in either order", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --tag fbm --backend opencode do it")).toMatchObject({
+      kind: "launch", tag: "fbm", backend: "opencode", prompt: "do it",
+    });
+    expect(parseLaunchMessage("/launch devbox pigeon --backend opencode --tag fbm do it")).toMatchObject({
+      kind: "launch", tag: "fbm", backend: "opencode", prompt: "do it",
+    });
+  });
+
+  /**
+   * `--tag` drives oc-tags, which is opencode-only cost attribution. Accepting
+   * it alongside `--backend goose` and then ignoring it would tell the human
+   * their session was tagged when no tag exists anywhere.
+   */
+  it("refuses --tag with --backend goose, rather than accepting and ignoring it", () => {
+    const parsed = parseLaunchMessage("/launch devbox pigeon --tag fbm --backend goose do it");
+    expect(parsed?.kind).toBe("usage");
+    // A bare usage dump would not say WHY, and the human would read the
+    // combination as a syntax error and retry it.
+    expect(parsed?.kind === "usage" && parsed.reason).toMatch(/tag/i);
+  });
+
+  it("refuses a repeated flag instead of silently taking one of them", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --backend goose --backend opencode do it")).toMatchObject({ kind: "usage" });
+    expect(parseLaunchMessage("/launch devbox pigeon --tag a --tag b do it")).toMatchObject({ kind: "usage" });
+  });
+
+  it("does not treat --backend later in the prompt as a flag", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon explain the --backend flag")).toEqual({
+      kind: "launch",
+      machineId: "devbox",
+      directory: "pigeon",
+      prompt: "explain the --backend flag",
+    });
+  });
+
+  it("still answers usage for near-miss spellings of the new flag", () => {
+    for (const bad of ["--backend=goose do it", "--Backend goose do it", "—backend goose do it", "-b goose do it"]) {
+      expect(parseLaunchMessage(`/launch devbox pigeon ${bad}`), bad).toMatchObject({ kind: "usage" });
+    }
+  });
+
+  it("names --backend in the usage text", () => {
+    expect(LAUNCH_USAGE_TEXT).toContain("--backend");
+    expect(LAUNCH_USAGE_TEXT).toContain("goose");
+  });
+});

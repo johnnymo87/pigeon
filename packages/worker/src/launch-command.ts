@@ -26,22 +26,41 @@
 import { isValidTag, looksLikeSessionId } from "./tag-command";
 
 export type LaunchCommand =
-  | { kind: "launch"; machineId: string; directory: string; tag?: string; prompt: string }
-  | { kind: "usage" };
+  | { kind: "launch"; machineId: string; directory: string; tag?: string; backend?: string; prompt: string }
+  /**
+   * `reason` names the specific thing that was wrong, when there is one worth
+   * naming. Usage alone reads as "you mistyped it", which is misleading for a
+   * combination that is spelled correctly and simply not allowed -- the human
+   * retries it verbatim.
+   */
+  | { kind: "usage"; reason?: string };
 
 export const LAUNCH_USAGE_TEXT = [
   "Usage:",
   "/launch <machine> <dir> <prompt>",
-  "/launch <machine> <dir> --tag <tag> <prompt>",
+  "/launch <machine> <dir> [--tag <tag>] [--backend <backend>] <prompt>",
   "",
   "<dir> may be a bare project name (pigeon), a ~ path, or an absolute path.",
   "--tag records what the session is FOR, for oc-tags cost attribution;",
-  "it must come immediately after <dir>, and is one word of letters, digits,",
-  '. _ - : / that may not start with "auto:".',
+  "it is one word of letters, digits, . _ - : / that may not start with",
+  '"auto:", and it is opencode-only.',
+  "--backend picks the agent: opencode (default) or goose.",
+  "Flags come after <dir> and before the prompt, in any order.",
   "The prompt itself may not start with a dash.",
 ].join("\n");
 
 const TAG_FLAG = "--tag";
+const BACKEND_FLAG = "--backend";
+
+/**
+ * The closed set of backends, refused HERE rather than at the daemon.
+ *
+ * The worker knows every backend that exists, so a typo costs a usage message
+ * instead of a queued command that a poll refuses minutes later. This is not
+ * the same check as the capability gate in poll.ts: that one asks whether a
+ * PARTICULAR machine can serve a real backend, which this cannot know.
+ */
+const KNOWN_BACKENDS = new Set(["opencode", "goose"]);
 
 /**
  * Every Unicode dash punctuation (\p{Pd} — which covers hyphen-minus, the en and
@@ -80,23 +99,73 @@ export function parseLaunchMessage(text: string): LaunchCommand | null {
   const tail = parts[3]!;
   if (tail.trim() === "") return { kind: "usage" };
 
-  const firstToken = tail.match(/^\S+/)![0];
-  if (!DASH_LED_RE.test(firstToken)) {
-    return { kind: "launch", machineId, directory, prompt: tail };
-  }
-  if (firstToken !== TAG_FLAG) {
-    return { kind: "usage" };
+  // Flags are consumed from the FRONT of the tail, one at a time, and the loop
+  // stops at the first token that is not dash-led -- that token begins the
+  // prompt. Every iteration consumes exactly a flag and its value, so a prompt
+  // can never be partially eaten: either a leading token is a known flag with a
+  // value, or parsing stops (or fails loudly).
+  let rest = tail;
+  let tag: string | undefined;
+  let backend: string | undefined;
+
+  for (;;) {
+    const token = rest.match(/^\S+/)?.[0];
+    if (token === undefined) return { kind: "usage" };
+    // Not a flag: the prompt starts here, and `rest` is all of it.
+    if (!DASH_LED_RE.test(token)) break;
+
+    // Dash-led but not exactly a known flag. Answered with usage rather than
+    // treated as prompt, which covers `-t`, `--tag=fbm`, `--Backend`, and the
+    // em dash iOS smart punctuation makes of `--`. A real prompt does not begin
+    // with a dash; a typo'd flag does.
+    if (token !== TAG_FLAG && token !== BACKEND_FLAG) return { kind: "usage" };
+
+    const after = rest.slice(token.length).match(/^\s+(\S+)(\s+[\s\S]+)?$/);
+    // A flag with no value, or with a value but no prompt after it.
+    if (!after || after[2] === undefined) return { kind: "usage" };
+    const value = after[1]!;
+
+    if (token === TAG_FLAG) {
+      // Repeats are refused rather than last-wins: both spellings were typed on
+      // purpose, so there is no way to tell which one was meant.
+      if (tag !== undefined) return { kind: "usage", reason: `${TAG_FLAG} was given twice.` };
+      // looksLikeSessionId mirrors /tag: a session id in the tag position is a
+      // half-typed command, not a tag named "ses_...".
+      if (!isValidTag(value) || looksLikeSessionId(value)) return { kind: "usage" };
+      tag = value;
+    } else {
+      if (backend !== undefined) return { kind: "usage", reason: `${BACKEND_FLAG} was given twice.` };
+      const normalised = value.toLowerCase();
+      if (!KNOWN_BACKENDS.has(normalised)) {
+        return { kind: "usage", reason: `Unknown backend "${value}".` };
+      }
+      backend = normalised;
+    }
+
+    rest = after[2].replace(/^\s+/, "");
   }
 
-  const tagged = tail.slice(TAG_FLAG.length).match(/^\s+(\S+)\s+([\s\S]+)$/);
-  if (!tagged) return { kind: "usage" };
-
-  const tag = tagged[1]!;
-  const prompt = tagged[2]!;
-  // looksLikeSessionId mirrors /tag: a session id in the tag position is a
-  // half-typed command, not a tag named "ses_...".
-  if (!isValidTag(tag) || looksLikeSessionId(tag)) return { kind: "usage" };
+  const prompt = rest;
   if (prompt.trim() === "") return { kind: "usage" };
 
-  return { kind: "launch", machineId, directory, tag, prompt };
+  // `--tag` drives oc-tags, which attributes opencode spend. Accepting it for a
+  // goose launch and then ignoring it would report a tag that exists nowhere;
+  // refusing it here is the only place that can say so before anything runs.
+  if (tag !== undefined && backend === "goose") {
+    return {
+      kind: "usage",
+      reason: `${TAG_FLAG} is opencode-only (it drives oc-tags), so it cannot be combined with ${BACKEND_FLAG} goose.`,
+    };
+  }
+
+  return {
+    kind: "launch",
+    machineId,
+    directory,
+    ...(tag !== undefined ? { tag } : {}),
+    // Omitted rather than defaulted, so a launch that did not ask for a backend
+    // serialises exactly as it did before this flag existed.
+    ...(backend !== undefined ? { backend } : {}),
+    prompt,
+  };
 }
