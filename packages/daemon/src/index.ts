@@ -210,8 +210,13 @@ const gooseRunners = config.gooseAcpUrl
             // wedges rather than one that asks.
             permissionPolicy: (params) => params.options[0]?.optionId,
             log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
-            onSessionUpdate: (sessionId, update) =>
-              gooseRunners?.peek(sessionId)?.onUpdate(update),
+            // `sessionId` here is GOOSE's, off the socket -- not pigeon's, which
+            // is what `peek` takes. They differ for every session launched
+            // through pigeon (see SessionRecord.backendSessionId), so peeking by
+            // the wrong one silently routes no updates at all: the turn would
+            // run to completion with the human seeing none of it.
+            onSessionUpdate: (backendSessionId, update) =>
+              gooseRunners?.peekByBackendId(backendSessionId)?.onUpdate(update),
           }),
           postStop: async (body) => {
             // Reuses the daemon's own /stop route rather than reimplementing

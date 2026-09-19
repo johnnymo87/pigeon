@@ -37,6 +37,7 @@ function asSession(row: SqlRow): SessionRecord {
     backendKind: (row.backend_kind as string | null) ?? null,
     backendProtocolVersion: (row.backend_protocol_version as number | null) ?? null,
     backendEndpoint: (row.backend_endpoint as string | null) ?? null,
+    backendSessionId: (row.backend_session_id as string | null) ?? null,
     backendAuthToken: (row.backend_auth_token as string | null) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
@@ -88,8 +89,8 @@ export class SessionRepository {
       `INSERT INTO sessions (
          session_id, ppid, pid, start_time, cwd, label, title, notify, state,
          pty_path, nvim_socket, backend_kind, backend_protocol_version,
-         backend_endpoint, backend_auth_token, created_at, updated_at, last_seen, expires_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         backend_endpoint, backend_auth_token, backend_session_id, created_at, updated_at, last_seen, expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          ppid = excluded.ppid,
          pid = excluded.pid,
@@ -105,6 +106,7 @@ export class SessionRepository {
          backend_protocol_version = excluded.backend_protocol_version,
          backend_endpoint = excluded.backend_endpoint,
          backend_auth_token = excluded.backend_auth_token,
+         backend_session_id = excluded.backend_session_id,
          updated_at = excluded.updated_at,
          last_seen = excluded.last_seen,
          expires_at = excluded.expires_at`,
@@ -124,6 +126,7 @@ export class SessionRepository {
       input.backendProtocolVersion ?? null,
       input.backendEndpoint ?? null,
       input.backendAuthToken ?? null,
+      input.backendSessionId ?? null,
       now,
       now,
       now,
@@ -133,6 +136,26 @@ export class SessionRepository {
 
   get(sessionId: string): SessionRecord | null {
     const row = this.db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as SqlRow | null;
+    return row ? asSession(row) : null;
+  }
+
+  /**
+   * Finds a session by the id its BACKEND knows it by.
+   *
+   * Exists so registering the same goose session twice reuses one pigeon row
+   * rather than minting a second: the caller of `/goose/sessions` knows only
+   * goose's id, and without this a re-registration would create a duplicate
+   * session that the human would then have to notice and clean up.
+   *
+   * Deliberately does NOT fall back to matching `session_id`. A legacy row has
+   * NULL here and is found by `get`; making this method also match the primary
+   * key would let a pigeon id be mistaken for a backend id, which is the exact
+   * conflation the column exists to end.
+   */
+  getByBackendSessionId(backendSessionId: string): SessionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM sessions WHERE backend_session_id = ?")
+      .get(backendSessionId) as SqlRow | null;
     return row ? asSession(row) : null;
   }
 

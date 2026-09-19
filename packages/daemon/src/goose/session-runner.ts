@@ -38,6 +38,7 @@
  *    history, so reconnecting is cheap and a daemon restart does not orphan a
  *    session.
  */
+import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
@@ -176,8 +177,26 @@ export class GooseSessionRunner {
     this.opts = opts;
   }
 
+  /**
+   * PIGEON's id for this session, and the one almost everything here wants:
+   * storage, `touch`, `/stop` bodies, notification ids, logs.
+   */
   get sessionId(): string {
     return this.opts.session.sessionId;
+  }
+
+  /**
+   * GOOSE's id for this session -- the only name goose answers to.
+   *
+   * Used at exactly the four ACP call sites (prompt, both steers, activeRunId)
+   * and nowhere else. The two differ because goose names sessions with a
+   * per-machine counter (`YYYYMMDD_N`) that collides across machines, so pigeon
+   * mints its own; see SessionRecord.backendSessionId for what that collision
+   * would cost. Sending pigeon's id to goose fails only against a real goose,
+   * so the tests record which id each fake was called with.
+   */
+  private get backendSessionId(): string {
+    return backendSessionIdOf(this.opts.session);
   }
 
   isBusy(): boolean {
@@ -242,7 +261,7 @@ export class GooseSessionRunner {
       let outcome: { kind?: string };
       try {
         outcome = (await withDeadline(
-          this.opts.client.steer(this.sessionId, runId, text),
+          this.opts.client.steer(this.backendSessionId, runId, text),
           NON_TURN_TIMEOUT_MS,
           "steer",
         )) as { kind?: string };
@@ -310,7 +329,7 @@ export class GooseSessionRunner {
     this.armIdleTimer(turn);
 
     this.lastSettled = turn.settled = this.opts.client
-      .prompt(this.sessionId, text)
+      .prompt(this.backendSessionId, text)
       .then(
         (outcome) => this.onPromptOutcome(turn, text, outcome),
         (err: unknown) => this.finishTurn(turn, undefined, err),
@@ -355,7 +374,7 @@ export class GooseSessionRunner {
         // unbounded await here leaves `this.turn` set forever -- the same wedge
         // through a different door.
         const steered = (await withDeadline(
-          this.opts.client.steer(this.sessionId, runId ?? "", text),
+          this.opts.client.steer(this.backendSessionId, runId ?? "", text),
           NON_TURN_TIMEOUT_MS,
           "steer",
         )) as { kind?: string };
@@ -414,7 +433,7 @@ export class GooseSessionRunner {
   }
 
   private runId(): string | undefined {
-    return this.opts.client.activeRunId(this.sessionId);
+    return this.opts.client.activeRunId(this.backendSessionId);
   }
 
   private clearTurn(): void {
@@ -689,6 +708,16 @@ export interface GooseRunnerRegistryOptions {
  */
 export class GooseRunnerRegistry {
   private readonly runners = new Map<string, GooseSessionRunner>();
+  /**
+   * The same runners, keyed by the id GOOSE knows them by.
+   *
+   * Needed because inbound `session/update` notifications come off the socket
+   * carrying goose's id, which is not pigeon's (see
+   * SessionRecord.backendSessionId). Kept in lockstep with `runners` --
+   * every insertion and every removal touches both, or a dropped session stays
+   * reachable here holding a live socket.
+   */
+  private readonly byBackendId = new Map<string, GooseSessionRunner>();
 
   constructor(private readonly opts: GooseRunnerRegistryOptions) {}
 
@@ -697,6 +726,7 @@ export class GooseRunnerRegistry {
     if (!runner) {
       runner = this.opts.createRunner(session);
       this.runners.set(session.sessionId, runner);
+      this.byBackendId.set(backendSessionIdOf(session), runner);
     }
     return runner;
   }
@@ -704,6 +734,15 @@ export class GooseRunnerRegistry {
   /** The live runner for a session, without creating one. */
   peek(sessionId: string): GooseSessionRunner | undefined {
     return this.runners.get(sessionId);
+  }
+
+  /**
+   * The live runner for a session named by the BACKEND's id, for routing
+   * inbound updates. Never creates one: an update for a session this daemon is
+   * not running is not a reason to start running it.
+   */
+  peekByBackendId(backendSessionId: string): GooseSessionRunner | undefined {
+    return this.byBackendId.get(backendSessionId);
   }
 
   get size(): number {
@@ -714,12 +753,22 @@ export class GooseRunnerRegistry {
   drop(sessionId: string): void {
     const runner = this.runners.get(sessionId);
     this.runners.delete(sessionId);
+    // By identity rather than by looking the backend id up on the runner: the
+    // session record this registry was handed is not re-read here, and a runner
+    // that has been dropped must not remain reachable by ANY key. Both maps
+    // hold the same few entries, so the scan is free.
+    if (runner) {
+      for (const [backendId, r] of this.byBackendId) {
+        if (r === runner) this.byBackendId.delete(backendId);
+      }
+    }
     runner?.close();
   }
 
   closeAll(): void {
     for (const runner of this.runners.values()) runner.close();
     this.runners.clear();
+    this.byBackendId.clear();
   }
 
   /** Sessions with a turn in flight — used to warn the human on shutdown. */

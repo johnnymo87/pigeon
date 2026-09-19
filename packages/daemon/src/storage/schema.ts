@@ -66,6 +66,12 @@ export const additiveColumns = [
   // typo in a hostname.
   "ALTER TABLE inbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE inbox ADD COLUMN last_error TEXT DEFAULT NULL",
+  // goose names its sessions `YYYYMMDD_N`, a per-machine counter, so two
+  // machines both mint `20260920_1` on the same day -- and the worker keys
+  // sessions globally. pigeon therefore mints its own id and keeps the
+  // backend's here. NULL means "same as session_id", which is what every row
+  // written before this column meant. See SessionRecord.backendSessionId.
+  "ALTER TABLE sessions ADD COLUMN backend_session_id TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(

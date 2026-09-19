@@ -25,6 +25,7 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     backendProtocolVersion: null,
     backendEndpoint: null,
     backendAuthToken: null,
+    backendSessionId: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     lastSeen: Date.now(),
