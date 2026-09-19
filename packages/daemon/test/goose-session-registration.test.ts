@@ -153,6 +153,62 @@ describe("registerGooseSession", () => {
     expect(storage.sessions.get("20260918_1")?.backendSessionId).toBe("20260918_1");
   });
 
+  /**
+   * Handing this function PIGEON's id is the most likely typo there is, because
+   * the route's request `session_id` means goose's id while its response
+   * `session_id` means pigeon's -- so anyone round-tripping the response back
+   * into the route hits exactly this.
+   *
+   * It must not be adopted. Adopting overwrites the row's real backend id with
+   * pigeon's own, and the damage is DEFERRED: the live runner keeps working
+   * from its in-memory map, and the session only dies at the next daemon
+   * restart, when goose starts answering "Session not found" forever.
+   */
+  it("refuses a pigeon id in the backend-id position instead of clobbering the real one", () => {
+    storage = openStorageDb(":memory:");
+    const created = registerGooseSession(
+      storage.sessions,
+      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      1_000,
+      () => "gse_fixed",
+    );
+    expect(created).toMatchObject({ ok: true, sessionId: "gse_fixed" });
+
+    const res = registerGooseSession(
+      storage.sessions,
+      { backendSessionId: "gse_fixed", endpoint: "ws://b/acp" },
+      2_000,
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.conflict).toContain("20260920_1");
+    // The real backend id survives, which is the whole point.
+    expect(storage.sessions.get("gse_fixed")?.backendSessionId).toBe("20260920_1");
+  });
+
+  /**
+   * The column is sticky by construction (COALESCE in the upsert), not by every
+   * caller remembering to carry it. Nulling it wedges a live goose session --
+   * the runner falls back to pigeon's id, which goose does not know -- and the
+   * failure is invisible until the next restart. `/launch --backend goose` is
+   * about to add a third writer, so this needs to hold without its cooperation.
+   */
+  it("keeps the backend id when an unrelated upsert omits it", () => {
+    storage = openStorageDb(":memory:");
+    registerGooseSession(
+      storage.sessions,
+      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      1_000,
+      () => "gse_fixed",
+    );
+
+    // A writer that knows nothing about goose -- e.g. the plugin's /sessions
+    // registration, or anything added later.
+    storage.sessions.upsert({ sessionId: "gse_fixed", title: "renamed" }, 2_000);
+
+    expect(storage.sessions.get("gse_fixed")?.backendSessionId).toBe("20260920_1");
+  });
+
   it("does not match a pigeon id against the backend-id column", () => {
     storage = openStorageDb(":memory:");
     registerGooseSession(

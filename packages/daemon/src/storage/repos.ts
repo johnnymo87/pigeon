@@ -106,7 +106,15 @@ export class SessionRepository {
          backend_protocol_version = excluded.backend_protocol_version,
          backend_endpoint = excluded.backend_endpoint,
          backend_auth_token = excluded.backend_auth_token,
-         backend_session_id = excluded.backend_session_id,
+         -- COALESCE rather than a bare overwrite, so this column is STICKY:
+         -- an upsert that does not mention it keeps what is there. Every other
+         -- column here takes excluded unconditionally, which means any writer
+         -- omitting a field nulls it -- and nulling THIS one silently wedges a
+         -- live goose session, because the runner then falls back to pigeon's
+         -- id and goose has never heard of it. Structure rather than a
+         -- convention each future caller has to remember, and nulling it is
+         -- never something a caller wants.
+         backend_session_id = COALESCE(excluded.backend_session_id, sessions.backend_session_id),
          updated_at = excluded.updated_at,
          last_seen = excluded.last_seen,
          expires_at = excluded.expires_at`,

@@ -753,10 +753,12 @@ export class GooseRunnerRegistry {
   drop(sessionId: string): void {
     const runner = this.runners.get(sessionId);
     this.runners.delete(sessionId);
-    // By identity rather than by looking the backend id up on the runner: the
-    // session record this registry was handed is not re-read here, and a runner
-    // that has been dropped must not remain reachable by ANY key. Both maps
-    // hold the same few entries, so the scan is free.
+    // By identity rather than by deriving the backend id and deleting that key.
+    // Deriving it would re-read the session record the runner was built with,
+    // which is the one thing guaranteed to be stale if the row was ever
+    // re-registered -- and a key computed from a stale record deletes nothing,
+    // leaving a dropped runner reachable with a live socket. A scan cannot miss.
+    // Both maps hold the same few entries, so it is free.
     if (runner) {
       for (const [backendId, r] of this.byBackendId) {
         if (r === runner) this.byBackendId.delete(backendId);

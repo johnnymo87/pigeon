@@ -61,11 +61,33 @@ export function registerGooseSession(
   // at a goose socket. pigeon now mints its own id so that particular hijack is
   // gone -- but a caller passing an opencode session id still means a typo, and
   // answering it with a cheerful new session would hide that.
-  const collidesWithOtherKind = sessions.get(input.backendSessionId);
-  if (collidesWithOtherKind && collidesWithOtherKind.backendKind !== GOOSE_BACKEND_KIND) {
+  const atPrimaryKey = sessions.get(input.backendSessionId);
+  if (atPrimaryKey && atPrimaryKey.backendKind !== GOOSE_BACKEND_KIND) {
     return {
       ok: false,
-      conflict: `session ${input.backendSessionId} already exists with backend_kind=${collidesWithOtherKind.backendKind ?? "null"}; refusing to convert it`,
+      conflict: `session ${input.backendSessionId} already exists with backend_kind=${atPrimaryKey.backendKind ?? "null"}; refusing to convert it`,
+    };
+  }
+
+  // Refuse PIGEON's own id in the backend-id position.
+  //
+  // This is the likeliest typo of all, because the route's REQUEST `session_id`
+  // means goose's id while its RESPONSE `session_id` means pigeon's -- so
+  // feeding a response back in lands exactly here. Left unguarded it would
+  // adopt the row and overwrite its real backend id with pigeon's, and the
+  // damage is DEFERRED rather than immediate: the live runner keeps working off
+  // its in-memory map, and the session only dies at the next daemon restart,
+  // when goose begins answering "Session not found" forever. A row whose
+  // backend id is NULL is the legacy case and genuinely is its own backend id,
+  // so that one is still adoptable.
+  if (
+    atPrimaryKey
+    && atPrimaryKey.backendSessionId !== null
+    && atPrimaryKey.backendSessionId !== input.backendSessionId
+  ) {
+    return {
+      ok: false,
+      conflict: `${input.backendSessionId} is pigeon's id for a session goose knows as ${atPrimaryKey.backendSessionId}; pass goose's id, not pigeon's`,
     };
   }
 
@@ -73,8 +95,7 @@ export function registerGooseSession(
   // pigeon started minting ids (found by backend id) and a legacy one whose
   // pigeon id IS goose's id (found by primary key, with backendKind already
   // goose -- the other-kind case was refused above).
-  const existing =
-    sessions.getByBackendSessionId(input.backendSessionId) ?? collidesWithOtherKind;
+  const existing = sessions.getByBackendSessionId(input.backendSessionId) ?? atPrimaryKey;
   const sessionId = existing?.sessionId ?? mintId();
 
   sessions.upsert(

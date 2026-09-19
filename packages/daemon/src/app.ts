@@ -34,6 +34,7 @@ interface LegacySession {
   backend_kind: string | null;
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
+  backend_session_id: string | null;
   created_at: number;
   updated_at: number;
   last_seen: number;
@@ -55,6 +56,7 @@ function toLegacySession(session: {
   backendProtocolVersion: number | null;
   backendEndpoint: string | null;
   backendAuthToken: string | null;
+  backendSessionId: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -74,6 +76,13 @@ function toLegacySession(session: {
     backend_kind: session.backendKind,
     backend_protocol_version: session.backendProtocolVersion,
     backend_endpoint: session.backendEndpoint,
+    // Exposed so the pigeon-id <-> goose-id mapping is discoverable after the
+    // registration response has scrolled away. Without it the only way to learn
+    // which goose session a pigeon id refers to is to open the sqlite file,
+    // which is a poor answer when the reason you are asking is that something
+    // has gone wrong. NULL for opencode sessions and for legacy goose rows,
+    // where the two ids are the same thing.
+    backend_session_id: session.backendSessionId,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     last_seen: session.lastSeen,
@@ -625,12 +634,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               ?? existing?.backendProtocolVersion,
             backendEndpoint,
             backendAuthToken,
-            // Carried rather than re-supplied. The upsert overwrites every
-            // column from `excluded`, so omitting this would NULL it -- and a
-            // goose session whose backend id is nulled falls back to pigeon's
-            // `gse_` id, which goose has never heard of, wedging the session on
-            // its next prompt. Nothing POSTs this field; it is set at launch.
-            backendSessionId: existing?.backendSessionId ?? null,
+            // backendSessionId is deliberately absent: the upsert COALESCEs it,
+            // so omitting it preserves whatever is stored. Nothing POSTs this
+            // field; it is set when the session is registered as a goose one.
           },
           nowFn(),
         );
