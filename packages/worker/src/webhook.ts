@@ -837,11 +837,17 @@ export async function handleTelegramWebhook(
       // same rule /tag carries, and it also catches the likely --tag mistakes
       // (flag in the machine/dir position, `-t`, `--tag=x`, an iOS em dash).
       if (parsedLaunch.kind === "usage") {
-        await sendTelegramMessage(env, launchChatId, LAUNCH_USAGE_TEXT, { messageThreadId: update.message.message_thread_id });
+        // The reason leads, when there is one. A correctly-spelled combination
+        // that is simply not allowed (--tag with --backend goose) reads as a
+        // syntax error without it, and the human retries it verbatim.
+        const text = parsedLaunch.reason
+          ? `${parsedLaunch.reason}\n\n${LAUNCH_USAGE_TEXT}`
+          : LAUNCH_USAGE_TEXT;
+        await sendTelegramMessage(env, launchChatId, text, { messageThreadId: update.message.message_thread_id });
         return OK();
       }
 
-      const { machineId, directory, prompt, tag } = parsedLaunch;
+      const { machineId, directory, prompt, tag, backend } = parsedLaunch;
 
       // NOTE: No per-user machine authorization — assumes single-tenant deployment.
       // If multi-tenant is needed, validate machineId against an allowlist.
@@ -861,8 +867,14 @@ export async function handleTelegramWebhook(
         label: null,
         commandType: "launch",
         directory,
-        // The tag rides metadata_json so the command column stays the prompt.
-        metadataJson: tag ? JSON.stringify({ tag }) : null,
+        // The tag and the backend ride metadata_json so the command column
+        // stays the prompt. Absent keys rather than nulls: poll.ts puts
+        // `backend` on the wire only when metadata carries it, which is what
+        // keeps an ordinary launch byte-identical for a pre-gate daemon.
+        metadataJson:
+          tag || backend
+            ? JSON.stringify({ ...(tag ? { tag } : {}), ...(backend ? { backend } : {}) })
+            : null,
         messageThreadId: update.message.message_thread_id,
       });
       if (!commandId) return OK();
