@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import {
   GooseAcpClient,
   ALLOWED_ACP_METHODS,
+  DEFAULT_SESSION_EXTENSIONS,
+  DEFAULT_SERVE_FLOOR,
   DisconnectedDuringTurn,
   type AcpTransport,
   type AcpTransportFactory,
@@ -61,13 +63,39 @@ class FakePeer implements AcpTransport {
   }
 }
 
-/** Answers initialize/session-new so tests can get to the interesting part. */
-function autoHandshake(peer: FakePeer): void {
+/**
+ * Answers initialize/session-new so tests can get to the interesting part.
+ *
+ * `session/new` reports `_meta.extensionResults` because THE REAL SERVE DOES:
+ * measured against goose 1.48.0, a session/new response carries
+ * `{ extensionResults: [{name, success}], workingDir }`
+ * (acp/response_builder.rs:80-94). A fake that omitted it would be asserting
+ * that the field is optional, and every caller of `newSession` would then be
+ * tested against a serve that does not exist.
+ *
+ * The default answer is `["developer"]` because that is what a bare
+ * `goose serve` actually returned for the default (empty) request -- arm B of
+ * scripts/li6-extension-surface-probe.ts.
+ */
+function autoHandshake(
+  peer: FakePeer,
+  extensionNames: string[] = ["developer"],
+  extraResults: Array<Record<string, unknown>> = [],
+): void {
   peer.onRequest = (msg, p) => {
     if (msg.method === "initialize") {
       p.reply(msg.id, { protocolVersion: 1, agentCapabilities: {} });
     } else if (msg.method === "session/new") {
-      p.reply(msg.id, { sessionId: "sess-1" });
+      p.reply(msg.id, {
+        sessionId: "sess-1",
+        _meta: {
+          extensionResults: [
+            ...extensionNames.map((name) => ({ name, success: true })),
+            ...extraResults,
+          ],
+          workingDir: "/tmp/x",
+        },
+      });
     }
   };
 }
@@ -620,5 +648,179 @@ describe("GooseAcpClient session/update notifications", () => {
     expect(() =>
       peer.emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: {} } }),
     ).not.toThrow();
+  });
+
+
+});
+
+describe("R9: session/new is a containment decision, not a transport detail", () => {
+  // Bead eng-agent-platform-li6. goose 1.48.0 acp/server.rs:581-611: a
+  // session/new carrying neither recipe_extensions nor goose_extensions falls
+  // back to get_enabled_extensions_with_config -- the HOST's config.yaml. On
+  // the machine this runs on that meant every pigeon session was handed
+  // summon (the `delegate` tool), Extension Manager, and scheduler.
+  //
+  // MEASURED on a live serve before the fix (scripts/li6-extension-surface-probe.ts):
+  //   no _meta            -> 9 extensions incl. summon, Extension Manager, scheduler
+  //   enabledExtensions:[] -> 1 extension: developer
+  //   enabledExtensions:[analyze] -> 2: analyze, developer
+  // The third arm is what proves the field is read rather than coincidentally
+  // narrow, and these tests encode that contract.
+
+  it("always sends _meta.enabledExtensions, because ABSENT is the dangerous value", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const client = makeClient(peer);
+    await client.connect();
+    await client.newSession("/tmp/x");
+
+    const sent = peer.lastOf("session/new")!;
+    const meta = (sent.params as any)._meta;
+    // Not merely "some meta": the key must be present, because goose keys off
+    // presence. `undefined` and `null` both take the host-config branch.
+    expect(meta).toBeDefined();
+    expect(meta.enabledExtensions).toBeDefined();
+    expect(meta.enabledExtensions).not.toBeNull();
+  });
+
+  it("defaults to the empty set -- the floor and nothing else", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const client = makeClient(peer);
+    await client.connect();
+    await client.newSession("/tmp/x");
+
+    expect(((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions).toEqual([]);
+  });
+
+  it("does NOT restate the floor, because restating it can WIDEN", async () => {
+    // Under `goose serve --builtins X`, from_requested puts X in `explicit`
+    // and leaves `defaults` EMPTY (v1.48.0 acp/server.rs:301) -- developer is
+    // then not in the floor at all. A client that "helpfully" restates
+    // ["developer"] would re-add shell/edit/write to a session the operator
+    // had deliberately narrowed. [] is the only request that can never widen.
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const client = makeClient(peer);
+    await client.connect();
+    await client.newSession("/tmp/x");
+
+    const ext = ((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions;
+    expect(ext).not.toContainEqual(expect.objectContaining({ name: "developer" }));
+  });
+
+  it("passes a caller's explicit set through unchanged", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze"]);
+    const client = makeClient(peer, {
+      sessionExtensions: [{ type: "platform", name: "analyze" }],
+    });
+    await client.connect();
+    await client.newSession("/tmp/x");
+
+    expect(((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions).toEqual([
+      { type: "platform", name: "analyze" },
+    ]);
+  });
+
+  it("rejects a session that loaded an extension nobody asked for", async () => {
+    // The request is a request. This is the check that it was honoured --
+    // without it, a serve on a different version, or one started with
+    // --builtins summon, silently reintroduces exactly this bead's bug and
+    // nothing anywhere fails.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "summon"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/summon/);
+  });
+
+  it("names every surplus extension, not just the first", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "summon", "scheduler"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/scheduler.*summon|summon.*scheduler/);
+  });
+
+  it("matches goose's DISPLAY names against requested config keys", async () => {
+    // extensionResults says "Extension Manager"; config and the wire say
+    // "extensionmanager". MEASURED -- arm A of the live probe returned
+    // exactly that string. A naive set comparison would both miss this
+    // extension as surplus AND throw spuriously when a caller legitimately
+    // asks for it, so normalisation is load-bearing in both directions.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "Extension Manager"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/Extension Manager/);
+  });
+
+  it("accepts a requested extension reported under its display name", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "Extension Manager"]);
+    const client = makeClient(peer, {
+      sessionExtensions: [{ type: "builtin", name: "extensionmanager" }],
+    });
+    await client.connect();
+
+    // Asked for, so allowed -- the check is "unrequested", not "dangerous".
+    await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
+  });
+
+  it("treats a surplus extension that FAILED to load as surplus anyway", async () => {
+    // It was attempted. Whether it happened to fail this time says nothing
+    // about the next serve restart.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer"], [{ name: "summon", success: false, error: "boom" }]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/summon/);
+  });
+
+  it("refuses a session it cannot verify at all", async () => {
+    // No extensionResults -> the response cannot answer the question. A serve
+    // that does not report is not thereby trustworthy; failing closed here is
+    // the difference between "verified narrow" and "assumed narrow".
+    const peer = new FakePeer();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "initialize") p.reply(msg.id, { protocolVersion: 1 });
+      else if (msg.method === "session/new") p.reply(msg.id, { sessionId: "sess-1" });
+    };
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/could not be verified|extensionResults/i);
+  });
+
+  it("allows the floor itself through", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer"]);
+    const client = makeClient(peer);
+    await client.connect();
+    await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
+  });
+
+  it("honours a serveFloor the operator has widened via --builtins", async () => {
+    // The floor is set by the serve's systemd unit, in another repo. The
+    // client cannot see those flags; it can only be TOLD what to expect. If
+    // the two disagree the session is refused, which is the loud failure that
+    // cross-repo drift otherwise does not get.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["github"]);
+    const client = makeClient(peer, { serveFloor: ["github"] });
+    await client.connect();
+    await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
+  });
+
+  it("pins the wire shape, so widening it is a deliberate act", () => {
+    // Mirrors the ALLOWED_ACP_METHODS pin. If this fails someone changed what
+    // every goose session is allowed to load, and that is a human decision.
+    expect(DEFAULT_SESSION_EXTENSIONS).toEqual([]);
+    expect(DEFAULT_SERVE_FLOOR).toEqual(["developer"]);
   });
 });
