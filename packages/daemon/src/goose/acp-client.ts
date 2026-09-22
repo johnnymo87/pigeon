@@ -128,10 +128,16 @@ export interface PermissionParams {
  * An extension to load into a session, in goose's `session/new` wire shape
  * (v1.48.0 goose-sdk-types/src/custom_requests.rs:326, serde `tag = "type"`).
  *
- * `availableTools` is goose's per-extension tool ALLOWLIST; omitting it allows
- * every tool the extension ships. It is not used by pigeon today and is
- * surfaced only so that narrowing below whole-extension granularity does not
- * require changing this type later.
+ * `available_tools` is goose's per-extension tool ALLOWLIST -- snake_case on
+ * the wire, because serde's `rename_all = "camelCase"` applies to the variant
+ * TAG and not to variant fields. It is not used by pigeon today and is surfaced
+ * only so that narrowing below whole-extension granularity does not require
+ * changing this type later.
+ *
+ * Note the empty array does NOT mean "no tools": goose `unwrap_or_default`s it
+ * and an empty allowlist permits everything (v1.48.0
+ * acp/server/extensions.rs:312,332). Omit it or list tools; never pass `[]`
+ * expecting a deny.
  */
 export type GooseExtensionSpec =
   | { type: "builtin"; name: string; available_tools?: string[] }
@@ -161,11 +167,17 @@ export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [];
 export const DEFAULT_SERVE_FLOOR = ["developer"];
 
 /**
- * goose reports extensions by DISPLAY name ("Extension Manager") while configs
- * and the wire use keys ("extensionmanager"). MEASURED: a live serve returned
- * exactly "Extension Manager" in `extensionResults`. Comparing the two forms
- * raw would both miss surplus and reject legitimate requests, so both sides of
- * every comparison go through this.
+ * goose reports each extension's `name()`, which for ONE extension differs from
+ * the key used by config and by the wire: `extensionmanager` reports itself as
+ * "Extension Manager" (v1.48.0 platform_extensions/ext_manager.rs:20). Every
+ * other extension reports something key-shaped -- `tom` is "tom", not "Top Of
+ * Mind" -- so this is a single special case rather than a general display-name
+ * convention, and a caller should still request extensions by KEY.
+ *
+ * MEASURED: a live serve returned exactly "Extension Manager" in
+ * `extensionResults`. Comparing the two forms raw would both miss surplus and
+ * reject a legitimate request, so both sides of every comparison go through
+ * this.
  */
 function normaliseExtensionName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");

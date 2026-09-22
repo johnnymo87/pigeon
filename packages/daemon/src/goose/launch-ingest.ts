@@ -155,8 +155,18 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
     await withDeadline(client.connect(), timeoutMs, "connect");
     backendSessionId = await withDeadline(client.newSession(directory), timeoutMs, "session/new");
   } catch (err) {
-    // Still before the mint, so nothing was created -- but reporting rather
-    // than throwing, because a throw on this path is an unbounded silent retry.
+    // Still before the mint, so no PIGEON session was created -- but reporting
+    // rather than throwing, because a throw on this path is an unbounded silent
+    // retry.
+    //
+    // A GOOSE session may nonetheless exist here. `newSession` refuses a
+    // session whose extension set it cannot verify, and that refusal happens
+    // after goose has already committed the session; goose only cleans up after
+    // its OWN errors, not after a client rejecting a successful response. The
+    // orphan is inert -- nothing ever prompts it, so no turn runs -- and the
+    // goose session id is in the thrown message below, which is what makes it
+    // findable rather than merely leaked.
+    // Not retried, so this cannot accumulate.
     try { client.close(); } catch { /* closing a dead socket is not a failure */ }
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`[goose-launch] commandId=${input.commandId} could not start a session:`, err);
