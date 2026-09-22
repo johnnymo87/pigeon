@@ -124,9 +124,95 @@ export interface PermissionParams {
   toolCall?: unknown;
 }
 
+/**
+ * An extension to load into a session, in goose's `session/new` wire shape
+ * (v1.48.0 goose-sdk-types/src/custom_requests.rs:326, serde `tag = "type"`).
+ *
+ * `available_tools` is goose's per-extension tool ALLOWLIST -- snake_case on
+ * the wire, because serde's `rename_all = "camelCase"` applies to the variant
+ * TAG and not to variant fields. It is not used by pigeon today and is surfaced
+ * only so that narrowing below whole-extension granularity does not require
+ * changing this type later.
+ *
+ * Note the empty array does NOT mean "no tools": goose `unwrap_or_default`s it
+ * and an empty allowlist permits everything (v1.48.0
+ * acp/server/extensions.rs:312,332). Omit it or list tools; never pass `[]`
+ * expecting a deny.
+ */
+export type GooseExtensionSpec =
+  | { type: "builtin"; name: string; available_tools?: string[] }
+  | { type: "platform"; name: string; available_tools?: string[] };
+
+/**
+ * The extensions a session gets beyond the serve's floor: NONE.
+ *
+ * Not a restatement of the floor, deliberately. Under `goose serve --builtins X`
+ * goose puts X in `explicit` and leaves `defaults` EMPTY (v1.48.0
+ * acp/server.rs:301), so `developer` is then not in the floor at all -- and a
+ * client that "helpfully" restated it would re-add shell/edit/write to a
+ * session the operator had deliberately narrowed. `[]` is the only request that
+ * can never widen one.
+ */
+export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [];
+
+/**
+ * What a bare `goose serve` loads unconditionally, and therefore what the
+ * verification below must not mistake for surplus.
+ *
+ * This is a claim about the SERVE PROCESS, which lives in a systemd unit in
+ * another repo -- the client cannot read its flags, only be told what to
+ * expect. That is on purpose: if the two ever disagree, session/new fails
+ * loudly instead of silently widening.
+ */
+export const DEFAULT_SERVE_FLOOR = ["developer"];
+
+/**
+ * goose reports each extension's `name()`, which for ONE extension differs from
+ * the key used by config and by the wire: `extensionmanager` reports itself as
+ * "Extension Manager" (v1.48.0 platform_extensions/ext_manager.rs:20). Every
+ * other extension reports something key-shaped -- `tom` is "tom", not "Top Of
+ * Mind" -- so this is a single special case rather than a general display-name
+ * convention, and a caller should still request extensions by KEY.
+ *
+ * MEASURED: a live serve returned exactly "Extension Manager" in
+ * `extensionResults`. Comparing the two forms raw would both miss surplus and
+ * reject a legitimate request, so both sides of every comparison go through
+ * this.
+ */
+function normaliseExtensionName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 export interface GooseAcpClientOptions {
   url: string;
   transportFactory: AcpTransportFactory;
+  /**
+   * Extensions to load beyond the serve's floor. Defaults to NONE.
+   *
+   * Session creation is a containment decision, not a transport detail: goose
+   * 1.48.0 (acp/server.rs:581-611) treats a `session/new` with no recipe and no
+   * `_meta.enabledExtensions` as permission to load the HOST's entire
+   * config.yaml -- which on the machine this was written for meant handing
+   * every session `summon` (the `delegate` tool, whose subagents get no hook
+   * policy at all), `Extension Manager` (which can enable further extensions at
+   * runtime), and `scheduler`. Bead eng-agent-platform-li6.
+   *
+   * So this defaults closed, for the same reason `permissionPolicy` does. A
+   * floor-only default is not pigeon choosing a policy; it is the ABSENCE of a
+   * widening decision. Every widening is authored by a caller who can be asked
+   * why.
+   *
+   * Note this cannot narrow below the floor -- extensions are additive under
+   * ACP and nothing a client sends subtracts (bead eng-agent-platform-jio).
+   * Floor-only still ships `shell`, `edit` and `write`; it closes the policy
+   * escape and the self-widening, not the session's teeth.
+   */
+  sessionExtensions?: GooseExtensionSpec[];
+  /**
+   * What the serve loads unconditionally, so the post-create check can tell
+   * surplus from floor. Override when the serve runs with `--builtins`.
+   */
+  serveFloor?: string[];
   /**
    * Defaults to REFUSING. The lane's whole safety model is about what the agent
    * may do unattended, so a client that silently allowed anything a serve asked
@@ -253,14 +339,85 @@ export class GooseAcpClient {
     });
   }
 
-  /** Opens a new session and returns its id. */
+  /**
+   * Opens a new session and returns its id.
+   *
+   * Sends `_meta.enabledExtensions` ALWAYS, including when it is empty, because
+   * absent is the dangerous value: goose keys off presence, and both `undefined`
+   * and `null` select the fall-back-to-host-config branch
+   * (v1.48.0 acp/server/new_session.rs:327, acp/server.rs:599-607).
+   *
+   * Then VERIFIES what actually loaded rather than trusting that the request was
+   * honoured. A serve on another version, or one started with `--builtins
+   * summon`, would otherwise reintroduce li6 silently -- the request would look
+   * right in the diff and the session would be wide open. The response carries
+   * `_meta.extensionResults` for exactly this (acp/response_builder.rs:80-94).
+   *
+   * `mcpServers` stays in the params because ACP's schema declares it, but goose
+   * IGNORES it whenever `_meta.enabledExtensions` is present: `add_mcp_servers`
+   * is reached only from the else branch (acp/server.rs:607). MCP servers would
+   * travel as `enabledExtensions` entries of `type: "mcp"`. It is left empty and
+   * deliberately not exposed as an option, so nothing can come to depend on a
+   * parameter that silently does nothing.
+   */
   async newSession(cwd: string): Promise<string> {
-    const res = await this.call("session/new", { cwd, mcpServers: [] });
+    const requested = this.opts.sessionExtensions ?? DEFAULT_SESSION_EXTENSIONS;
+    const res = await this.call("session/new", {
+      cwd,
+      mcpServers: [],
+      _meta: { enabledExtensions: requested },
+    });
     const sid = res.result?.sessionId;
     if (typeof sid !== "string") {
       throw new GooseProtocolError(-1, "session/new returned no sessionId");
     }
+    this.assertNoSurplusExtensions(sid, requested, res.result);
     return sid;
+  }
+
+  /**
+   * Refuses a session that loaded anything beyond floor + what was asked for.
+   *
+   * Throws rather than warns. The session does exist on the serve at this point
+   * and is left behind, but it is never prompted and so never runs a turn --
+   * an inert row in goose's session list is a much smaller problem than a live
+   * session holding `delegate`.
+   *
+   * A `success: false` surplus still counts. It was ATTEMPTED; that it failed
+   * this time says nothing about the next serve restart.
+   */
+  private assertNoSurplusExtensions(
+    sessionId: string,
+    requested: GooseExtensionSpec[],
+    result: Record<string, any> | undefined,
+  ): void {
+    const reported = result?._meta?.extensionResults;
+    if (!Array.isArray(reported)) {
+      // Fail closed. A serve that does not report cannot be shown to be narrow,
+      // and "assumed narrow" is the state this bead exists to end.
+      throw new GooseProtocolError(
+        -1,
+        `session/new (${sessionId}) returned no _meta.extensionResults, so the session's ` +
+          `extension set could not be verified; refusing it rather than assuming it is contained`,
+      );
+    }
+    const allowed = new Set(
+      [...(this.opts.serveFloor ?? DEFAULT_SERVE_FLOOR), ...requested.map((e) => e.name)].map(
+        normaliseExtensionName,
+      ),
+    );
+    const surplus = reported
+      .map((r) => String(r?.name ?? ""))
+      .filter((name) => name && !allowed.has(normaliseExtensionName(name)))
+      .sort();
+    if (surplus.length > 0) {
+      throw new GooseProtocolError(
+        -1,
+        `session/new (${sessionId}) loaded ${surplus.length} extension(s) that were not requested ` +
+          `and are not in the declared serve floor: ${surplus.join(", ")}. ` +
+          `The serve is wider than this client believes -- check its --builtins flag and version.`,
+      );
+    }
   }
 
   /**
