@@ -950,7 +950,7 @@ export async function handleTelegramWebhook(
       const tagNote = tag
         ? `, tag ${tag}`
         : inheritFromSessionId
-          ? `, will inherit tag from ${inheritFromSessionId} unless --tag given`
+          ? `, will inherit ${inheritFromSessionId}'s session tag if it has one`
           : "";
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}${tagNote}...`, { messageThreadId: update.message.message_thread_id });
       return OK();

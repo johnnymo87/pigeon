@@ -660,6 +660,19 @@ describe("ingestLaunchCommand", () => {
       expect(reply).toContain(`🏷 Tagged session 'sess-123' as 'billing' (inherited from ${PARENT})`);
     });
 
+    it("names the root session as the source when the context session is a subagent", async () => {
+      const ROOT = "ses_root01XyZ";
+      const input = makeInput({
+        inheritFromSessionId: PARENT,
+        runOcTagsWhich: whichOut(`billing\tmanual\t${ROOT}\tsession\n`),
+        runOcTags: setRunner(),
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toContain(`(inherited from ${ROOT})`);
+    });
+
     it("runs which only after the session is created and prompted", async () => {
       const order: string[] = [];
       const opencodeClient = {

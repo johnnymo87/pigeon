@@ -2402,7 +2402,7 @@ describe("/launch command", () => {
       const row = await launchRow(machineId);
       expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
       expect(sent).toHaveLength(1);
-      expect(sent[0].text).toContain(`, will inherit tag from ${ctx.sessionId} unless --tag given`);
+      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one`);
     });
 
     it("treats the topic's ForumTopicCreated service reply as topic context, not a swipe-reply", async () => {
@@ -2434,7 +2434,7 @@ describe("/launch command", () => {
 
       expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
       expect(sent).toHaveLength(1);
-      expect(sent[0].text).toContain(`will inherit tag from ${ctx.sessionId}`);
+      expect(sent[0].text).toContain(`will inherit ${ctx.sessionId}'s session tag`);
     });
 
     it("a /launch in General (no reply, no topic) sends only the ack and queues no metadata", async () => {

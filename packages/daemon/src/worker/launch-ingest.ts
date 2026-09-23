@@ -166,7 +166,7 @@ async function applyTag(
  * redeliver the launch.
  *
  * Returns the line for the confirmation, or null when there was nothing to
- * report. The worker has already told the human "will inherit tag from X", so
+ * report. The worker has already told the human "will inherit X's session tag", so
  * every outcome that is not an inheritance says why.
  */
 async function inheritTag(
@@ -206,13 +206,16 @@ async function inheritTag(
       return `Tag not inherited from ${parent}: oc-tags is too old to tell a session tag from a directory tag`;
     }
     if (which.kind !== "session") {
-      return `No tag inherited: ${parent} has no session tag (${which.tag} comes from ${which.kind === "dir" ? "a directory glob" : "the auto: fallback"})`;
+      return `No tag inherited: ${parent} has no session tag`;
     }
 
+    // Tags live on ROOT sessions; when the context session is a subagent the
+    // tag actually came from its root, so name that.
+    const source = which.rootSessionId && which.rootSessionId !== parent ? which.rootSessionId : parent;
     const line = await applyTag(which.tag, sessionId, input.runOcTags, machineLabel, input.onTagged);
     return line.startsWith("Tag not applied")
-      ? `${line} (inheriting from ${parent})`
-      : `${line} (inherited from ${parent})`;
+      ? `${line} (inheriting from ${source})`
+      : `${line} (inherited from ${source})`;
   } catch (err) {
     console.warn(`[launch-ingest] tag inheritance failed session=${sessionId} parent=${String(parent)}:`, err);
     return `Tag not inherited: ${err instanceof Error ? err.message : String(err)}`;
