@@ -335,6 +335,22 @@ describe("Poller start/stop", () => {
     poller.stop();
   });
 
+  it("passes a launch's inheritFromSessionId through to onLaunch", async () => {
+    const msg = makeLaunchMsg({ inheritFromSessionId: "ses_parent01" });
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onLaunch).toHaveBeenCalledWith(expect.objectContaining({ inheritFromSessionId: "ses_parent01" }));
+    poller.stop();
+  });
+
   it("dispatches kill commands to onKill callback", async () => {
     const msg = makeKillMsg();
     const callbacks = makeCallbacks();

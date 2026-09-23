@@ -2327,6 +2327,190 @@ describe("/launch command", () => {
     // fetchMock should have consumed exactly the one mock (not recently seen)
     // If it tried a second sendMessage it would throw (no more mocks).
   });
+
+  describe("tag inheritance candidate", () => {
+    const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    let seq = 0;
+
+    /** Capture every sendMessage body; persistent so an extra send is counted, not thrown. */
+    function captureSends(): any[] {
+      const sent: any[] = [];
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          sent.push(typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .persist();
+      return sent;
+    }
+
+    /** A session on `sessionMachine` with a forum topic and a notification mapping. */
+    async function seedContext(sessionMachine: string) {
+      seq += 1;
+      const now = Date.now();
+      const sessionId = `ses_inherit${now}x${seq}`;
+      const threadId = 7_700_000 + seq * 10 + (now % 7);
+      const notifMsgId = 7_800_000 + seq * 10 + (now % 7);
+      await registerSession(sessionId, sessionMachine);
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: notifMsgId,
+        sessionId,
+        token: `inherit-token-${now}-${seq}`,
+      });
+      await reserve(env.DB, { sessionId, machineId: sessionMachine, chatId: String(CHAT_ID_NUM), name: "ctx", now });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, name: "ctx", now });
+      return { sessionId, threadId, notifMsgId };
+    }
+
+    function launchUpdate(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          text,
+          ...extra,
+        },
+      };
+    }
+
+    async function launchRow(machineId: string): Promise<QueueRow> {
+      const rows = (await queryQueueByMachineWithMetadata(machineId)).filter((r) => r.command_type === "launch");
+      expect(rows).toHaveLength(1);
+      return rows[0]!;
+    }
+
+    it("sets inheritFromSessionId for a /launch in the session's topic and says so in the ack", async () => {
+      const machineId = `inh-topic-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon follow up`, { message_thread_id: ctx.threadId }),
+      ));
+
+      const row = await launchRow(machineId);
+      expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one`);
+    });
+
+    it("treats the topic's ForumTopicCreated service reply as topic context, not a swipe-reply", async () => {
+      const machineId = `inh-svc-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon follow up`, {
+          message_thread_id: ctx.threadId,
+          reply_to_message: { message_id: ctx.threadId },
+        }),
+      ));
+
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
+    });
+
+    it("sets inheritFromSessionId for a /launch swipe-replying to the session's notification", async () => {
+      const machineId = `inh-reply-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      const sent = captureSends();
+
+      // Default env (topics off): the swipe-reply alone supplies the context.
+      await sendWebhook(launchUpdate(`/launch ${machineId} pigeon follow up`, {
+        reply_to_message: { message_id: ctx.notifMsgId },
+      }));
+
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toContain(`will inherit ${ctx.sessionId}'s session tag`);
+    });
+
+    it("a /launch in General (no reply, no topic) sends only the ack and queues no metadata", async () => {
+      const machineId = `inh-general-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      await seedContext(machineId); // a session exists on the machine, but the /launch is not about it
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon fresh work`),
+      ));
+
+      expect((await launchRow(machineId)).metadata_json).toBeNull();
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(`Launching on ${machineId} in pigeon...`);
+    });
+
+    it("a swipe-reply to an unmapped message is silent and queues no metadata", async () => {
+      const machineId = `inh-unmapped-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const sent = captureSends();
+
+      await sendWebhook(launchUpdate(`/launch ${machineId} pigeon fresh work`, {
+        reply_to_message: { message_id: 7_999_999 },
+      }));
+
+      expect((await launchRow(machineId)).metadata_json).toBeNull();
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(`Launching on ${machineId} in pigeon...`);
+    });
+
+    it("does not set the key when the context session is on another machine", async () => {
+      const now = Date.now();
+      const machineId = `inh-target-${now}`;
+      await touchMachine(env.DB, machineId, now);
+      const ctx = await seedContext(`inh-other-${now}`);
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon follow up`, { message_thread_id: ctx.threadId }),
+      ));
+
+      expect((await launchRow(machineId)).metadata_json).toBeNull();
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).not.toContain("inherit");
+    });
+
+    it("does not set the key for a goose launch", async () => {
+      const machineId = `inh-goose-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon --backend goose follow up`, { message_thread_id: ctx.threadId }),
+      ));
+
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ backend: "goose" });
+      expect(sent[0].text).not.toContain("inherit");
+    });
+
+    it("does not set the key when --tag is given", async () => {
+      const machineId = `inh-explicit-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon --tag other-work follow up`, { message_thread_id: ctx.threadId }),
+      ));
+
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ tag: "other-work" });
+      expect(sent[0].text).toContain(", tag other-work");
+      expect(sent[0].text).not.toContain("inherit");
+    });
+  });
 });
 
 // ─── Media Endpoints ──────────────────────────────────────────────────
@@ -4196,6 +4380,22 @@ describe("poll and ack endpoints", () => {
     const body = await res.json() as Record<string, unknown>;
     // Undefined, not "": an empty-string tag would fail the daemon's validator
     // and put a spurious "Tag not applied" line on every ordinary launch.
+    expect(body.tag).toBeUndefined();
+    expect("inheritFromSessionId" in body).toBe(false);
+  });
+
+  it("handlePollNext forwards inheritFromSessionId for a launch carrying one", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, directory, metadata_json, status, created_at)
+       VALUES (?, ?, NULL, 'launch', ?, ?, ?, ?, 'pending', ?)`,
+    ).bind("launch-cmd-inherit-1", "machine-launch-inherit", "run all tests", "8248645256", "/home/dev/project",
+           JSON.stringify({ inheritFromSessionId: "ses_parent123" }), now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-launch-inherit/next"), "machine-launch-inherit");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("launch");
+    expect(body.inheritFromSessionId).toBe("ses_parent123");
     expect(body.tag).toBeUndefined();
   });
 

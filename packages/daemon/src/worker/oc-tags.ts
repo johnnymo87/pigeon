@@ -104,10 +104,10 @@ export function resolveOcTagsBin(opts: ResolveOcTagsBinOptions = {}): string | n
  * killing. Reporting an external kill as a timeout would send an operator
  * looking at the wrong thing.
  */
-export function describeOcTagsFailure(err: unknown): string {
+export function describeOcTagsFailure(err: unknown, timeoutMs: number = RUN_TIMEOUT_MS): string {
   if (!(err instanceof Error)) return String(err);
   const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
-  if (e.killed) return `oc-tags timed out after ${Math.round(RUN_TIMEOUT_MS / 1000)}s`;
+  if (e.killed) return `oc-tags timed out after ${Math.round(timeoutMs / 1000)}s`;
   // ENOENT/EACCES messages already name the path and the errno, so they stand
   // on their own; a signal without `killed` needs saying out loud.
   if (e.signal) return `oc-tags was killed (${e.signal})`;

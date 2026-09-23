@@ -194,6 +194,14 @@ export interface LaunchMessage {
    * silent, so it is worth two independent checks.
    */
   backend?: string;
+  /**
+   * Tag-inheritance candidate: the session whose forum topic the `/launch` was
+   * typed in, or whose notification it swipe-replied to. Set by the worker only
+   * when there is no `--tag`, the backend is not goose, and that session is on
+   * this machine. Absent from an OLD worker, in which case the new session just
+   * stays on its `auto:` fallback, as before.
+   */
+  inheritFromSessionId?: string;
   messageThreadId?: number;
 }
 

@@ -626,4 +626,196 @@ describe("ingestLaunchCommand", () => {
       expect(runOcTags).not.toHaveBeenCalled();
     });
   });
+
+  // ─── tag inheritance (inheritFromSessionId) ───────────────────────────────
+  describe("tag inheritance", () => {
+    const PARENT = "ses_parent01AbC";
+
+    function lastReply(input: LaunchCommandInput): string {
+      const calls = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1]![1] as string;
+    }
+
+    function whichOut(stdout: string) {
+      return vi.fn().mockResolvedValue({ code: 0, stdout, stderr: "" });
+    }
+
+    function setRunner() {
+      return vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged session 'sess-123' as 'billing'\n", stderr: "" });
+    }
+
+    it("copies the parent's tag when oc-tags says it is an explicit session tag", async () => {
+      const runOcTagsWhich = whichOut(`billing\tmanual\t${PARENT}\tsession\n`);
+      const runOcTags = setRunner();
+      const onTagged = vi.fn();
+      const input = makeInput({ inheritFromSessionId: PARENT, runOcTagsWhich, runOcTags, onTagged });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTagsWhich).toHaveBeenCalledWith(["which", PARENT]);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "billing", "sess-123"]);
+      expect(onTagged).toHaveBeenCalledWith("sess-123");
+      const reply = lastReply(input);
+      expect(reply).toContain("sess-123");
+      expect(reply).toContain(`🏷 Tagged session 'sess-123' as 'billing' (inherited from ${PARENT})`);
+    });
+
+    it("names the root session as the source when the context session is a subagent", async () => {
+      const ROOT = "ses_root01XyZ";
+      const input = makeInput({
+        inheritFromSessionId: PARENT,
+        runOcTagsWhich: whichOut(`billing\tmanual\t${ROOT}\tsession\n`),
+        runOcTags: setRunner(),
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toContain(`(inherited from ${ROOT})`);
+    });
+
+    it("runs which only after the session is created and prompted", async () => {
+      const order: string[] = [];
+      const opencodeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn(async () => { order.push("create"); return { id: "sess-123" }; }),
+        sendPrompt: vi.fn(async () => { order.push("prompt"); }),
+      } as unknown as OpencodeClient;
+      const runOcTagsWhich = vi.fn(async () => { order.push("which"); return { code: 0, stdout: `b\tmanual\t${PARENT}\tsession\n`, stderr: "" }; });
+
+      await ingestLaunchCommand(makeInput({ inheritFromSessionId: PARENT, runOcTagsWhich, runOcTags: setRunner(), opencodeClient }));
+
+      expect(order).toEqual(["create", "prompt", "which"]);
+    });
+
+    it.each([
+      ["a directory glob", `mono\tmanual\t${PARENT}\tdir\n`],
+      ["the auto: fallback", `auto:pigeon\tauto\t${PARENT}\tauto\n`],
+    ])("does not inherit a tag that comes from %s", async (_label, stdout) => {
+      const runOcTags = setRunner();
+      const input = makeInput({ inheritFromSessionId: PARENT, runOcTagsWhich: whichOut(stdout), runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(lastReply(input)).toContain("sess-123");
+      expect(lastReply(input)).toContain(`No tag inherited: ${PARENT} has no session tag`);
+    });
+
+    it("does not inherit from an older oc-tags that prints only three columns", async () => {
+      // Column 2 says `manual` for a session tag AND a directory glob; without
+      // column 4 there is no way to tell them apart, so nothing is copied.
+      const runOcTags = setRunner();
+      const input = makeInput({
+        inheritFromSessionId: PARENT,
+        runOcTagsWhich: whichOut(`billing\tmanual\t${PARENT}\n`),
+        runOcTags,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(lastReply(input)).toContain("too old");
+    });
+
+    it("never runs which for an invalid session id", async () => {
+      for (const bogus of ["-rf", "--help", "", "ses x", 5 as unknown as string]) {
+        const runOcTagsWhich = vi.fn();
+        const runOcTags = vi.fn();
+        const input = makeInput({ inheritFromSessionId: bogus, runOcTagsWhich, runOcTags });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTagsWhich).not.toHaveBeenCalled();
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(input.opencodeClient.sendPrompt).toHaveBeenCalled();
+        expect(lastReply(input)).toContain("sess-123");
+        expect(lastReply(input)).toContain("Tag not inherited: invalid session id");
+      }
+    });
+
+    it("reports a which timeout without throwing, and applies no tag", async () => {
+      // The runner REJECTS on timeout; a throw out of ingestLaunchCommand would
+      // skip the ack and redeliver the launch as a duplicate session.
+      const runOcTagsWhich = vi.fn().mockRejectedValue(
+        Object.assign(new Error(`Command failed: oc-tags which ${PARENT}`), { code: null, killed: true, signal: "SIGTERM" }),
+      );
+      const runOcTags = setRunner();
+      const input = makeInput({ inheritFromSessionId: PARENT, runOcTagsWhich, runOcTags });
+
+      await expect(ingestLaunchCommand(input)).resolves.toBeUndefined();
+
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(lastReply(input)).toContain("sess-123");
+      expect(lastReply(input)).toContain("timed out after 3s");
+    });
+
+    it("never throws, however the which runner misbehaves", async () => {
+      const runners = [
+        vi.fn().mockRejectedValue(new Error("boom")),
+        vi.fn(() => { throw new Error("sync boom"); }),
+        vi.fn().mockResolvedValue(undefined),
+        vi.fn().mockResolvedValue({ code: 0 }),
+        vi.fn().mockResolvedValue({ code: 2, stdout: "", stderr: "Error: no such session\n" }),
+      ];
+      for (const runOcTagsWhich of runners) {
+        const runOcTags = setRunner();
+        const input = makeInput({
+          inheritFromSessionId: PARENT,
+          runOcTagsWhich: runOcTagsWhich as unknown as LaunchCommandInput["runOcTagsWhich"],
+          runOcTags,
+        });
+        await expect(ingestLaunchCommand(input)).resolves.toBeUndefined();
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(lastReply(input)).toContain("sess-123");
+        expect(lastReply(input)).toContain("Tag not inherited");
+      }
+    });
+
+    it("an explicit tag wins: which is never run", async () => {
+      const runOcTagsWhich = vi.fn();
+      const runOcTags = setRunner();
+      const input = makeInput({ tag: "fbm", inheritFromSessionId: PARENT, runOcTagsWhich, runOcTags });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTagsWhich).not.toHaveBeenCalled();
+      expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-123"]);
+      expect(lastReply(input)).not.toContain("inherit");
+    });
+
+    it("says nothing about inheritance when no candidate was sent (old worker, General /launch)", async () => {
+      const runOcTagsWhich = vi.fn();
+      const input = makeInput({ runOcTagsWhich, runOcTags: setRunner() });
+
+      await ingestLaunchCommand(input);
+
+      expect(runOcTagsWhich).not.toHaveBeenCalled();
+      expect(lastReply(input)).not.toContain("🏷");
+    });
+
+    it("says why when oc-tags is not installed", async () => {
+      const input = makeInput({ inheritFromSessionId: PARENT, runOcTagsWhich: null, runOcTags: null });
+
+      await ingestLaunchCommand(input);
+
+      expect(lastReply(input)).toContain("sess-123");
+      expect(lastReply(input)).toContain("Tag not inherited: oc-tags is not installed");
+    });
+
+    it("names the parent when the set of an inherited tag fails", async () => {
+      const runOcTags = vi.fn().mockResolvedValue({ code: 1, stdout: "", stderr: "sqlite3.OperationalError: database is locked\n" });
+      const onTagged = vi.fn();
+      const input = makeInput({
+        inheritFromSessionId: PARENT,
+        runOcTagsWhich: whichOut(`billing\tmanual\t${PARENT}\tsession\n`),
+        runOcTags,
+        onTagged,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(onTagged).not.toHaveBeenCalled();
+      expect(lastReply(input)).toContain(`Tag not applied: sqlite3.OperationalError: database is locked (inheriting from ${PARENT})`);
+    });
+  });
 });

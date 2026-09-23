@@ -4,8 +4,16 @@ import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 import type { OpencodeClient } from "../opencode-client";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
-import { isValidTag, truncate } from "./tag-ingest";
+import { isValidSessionId, isValidTag, truncate } from "./tag-ingest";
+import { parseWhichLine } from "../tag-resolver";
 import type { LaunchMessage } from "./poller";
+
+/**
+ * Budget for the `oc-tags which` behind tag inheritance. Same as the footer
+ * resolver's: `which` never reads the message table, so a slow one means a
+ * contended DB, and the launch confirmation should not wait 20s on it.
+ */
+export const INHERIT_WHICH_TIMEOUT_MS = 3_000;
 
 /** Path of the log file shared with the home.base.nix shell wrapper. */
 const AUTO_ATTACH_LOG_PATH = "/tmp/oc-auto-attach.log";
@@ -50,8 +58,21 @@ export interface LaunchCommandInput {
    * about what the session was launched to do.
    */
   tag?: string;
+  /**
+   * The session this /launch was sent in the context of (its forum topic or a
+   * swipe-reply to its notification), set by the worker only when no `--tag`
+   * was given and that session is on this machine. If oc-tags says its tag is
+   * an explicit SESSION tag, the new session gets a copy. A directory-glob or
+   * `auto:` tag is never inherited. Absent from an old worker.
+   */
+  inheritFromSessionId?: string;
   /** null (or absent) means oc-tags is not installed on this machine. */
   runOcTags?: OcTagsRunner | null;
+  /**
+   * Runner for the inheritance `oc-tags which`, with the short
+   * INHERIT_WHICH_TIMEOUT_MS budget. Absent: falls back to runOcTags.
+   */
+  runOcTagsWhich?: OcTagsRunner | null;
   /**
    * Called once `--tag` has actually been applied, so a cached tag for this
    * session can be refetched. A throw is swallowed — the tag is written either
@@ -138,6 +159,69 @@ async function applyTag(
   }
 }
 
+/**
+ * Copies the context session's explicit tag onto the new session, and NEVER
+ * throws or rejects — for the same duplicate-session reason as applyTag: the
+ * runner rejects on timeout, and a throw here would skip the poller's ack and
+ * redeliver the launch.
+ *
+ * Returns the line for the confirmation, or null when there was nothing to
+ * report. The worker has already told the human "will inherit X's session tag", so
+ * every outcome that is not an inheritance says why.
+ */
+async function inheritTag(
+  input: LaunchCommandInput,
+  sessionId: string,
+  machineLabel: string,
+): Promise<string | null> {
+  const parent = input.inheritFromSessionId;
+  try {
+    if (parent === undefined) return null;
+    if (!isValidSessionId(parent)) {
+      return `Tag not inherited: invalid session id ${truncate(String(parent), 64)}`;
+    }
+    const runWhich = input.runOcTagsWhich !== undefined ? input.runOcTagsWhich : input.runOcTags;
+    if (!runWhich) {
+      return `Tag not inherited: oc-tags is not installed${machineLabel}.`;
+    }
+
+    let result;
+    try {
+      result = await runWhich(["which", parent]);
+    } catch (err) {
+      return `Tag not inherited from ${parent}: ${describeOcTagsFailure(err, INHERIT_WHICH_TIMEOUT_MS)}`;
+    }
+    if (!result || result.code !== 0) {
+      const reason = result ? lastLine(result.stderr, result.stdout) || `oc-tags exited ${result.code}` : "no result";
+      return `Tag not inherited from ${parent}: ${reason}`;
+    }
+
+    const which = parseWhichLine(String(result.stdout ?? ""));
+    if (!which) {
+      return `Tag not inherited from ${parent}: could not read oc-tags which output`;
+    }
+    if (which.kind === undefined) {
+      // A pre-column-4 oc-tags says `manual` for a session tag AND a directory
+      // glob alike; guessing would copy a place onto a piece of work.
+      return `Tag not inherited from ${parent}: oc-tags is too old to tell a session tag from a directory tag`;
+    }
+    if (which.kind !== "session") {
+      return `No tag inherited: ${parent} has no session tag`;
+    }
+
+    // Tags live on ROOT sessions; when the context session is a subagent the
+    // tag actually came from its root, so name that.
+    const source = which.rootSessionId && which.rootSessionId !== parent ? which.rootSessionId : parent;
+    const line = await applyTag(which.tag, sessionId, input.runOcTags, machineLabel, input.onTagged);
+    return line.startsWith("Tag not applied")
+      ? `${line} (inheriting from ${source})`
+      : `${line} (inherited from ${source})`;
+  } catch (err) {
+    console.warn(`[launch-ingest] tag inheritance failed session=${sessionId} parent=${String(parent)}:`, err);
+    return `Tag not inherited: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
   const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const directory = resolveHome(expandShorthand(input.directory));
@@ -212,11 +296,14 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     // arguments and session_tag.created_at is written but never read), so a tag
     // written a second late still covers every dollar this session ever spends.
     // There is no race to win by tagging earlier, only a launch to risk.
+    //
+    // An explicit --tag wins outright: the inheritance lookup is not even run.
     const tagLine = input.tag === undefined
-      ? null
+      ? await inheritTag(input, session.id, machineLabel)
       : await applyTag(input.tag, session.id, input.runOcTags, machineLabel, input.onTagged);
     if (tagLine) {
-      console.log(`[launch-ingest] tag commandId=${input.commandId} session=${session.id} tag=${input.tag}: ${tagLine}`);
+      const what = input.tag === undefined ? `inherit=${input.inheritFromSessionId}` : `tag=${input.tag}`;
+      console.log(`[launch-ingest] tag commandId=${input.commandId} session=${session.id} ${what}: ${tagLine}`);
     }
 
     const builder = new TgMessageBuilder()
