@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { SessionTagResolver } from "../src/tag-resolver";
+import { SessionTagResolver, parseWhich, parseWhichLine } from "../src/tag-resolver";
 import type { OcTagsResult } from "../src/worker/oc-tags";
 
 function makeRunner(results: Array<OcTagsResult | Error>, calls: string[][] = []) {
@@ -262,5 +262,33 @@ describe("SessionTagResolver", () => {
     now += 10;
     await resolver.refresh("ses_a");
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("parseWhichLine / parseWhich", () => {
+  it("reads column 4 (kind) when oc-tags prints it", () => {
+    expect(parseWhichLine("billing\tmanual\tses_a\tsession\n")).toEqual({
+      tag: "billing", source: "manual", rootSessionId: "ses_a", kind: "session",
+    });
+    expect(parseWhichLine("mono\tmanual\tses_a\tdir\n")?.kind).toBe("dir");
+    expect(parseWhichLine("auto:pigeon\tauto\tses_a\tauto\n")?.kind).toBe("auto");
+  });
+
+  it("leaves kind undefined for an older, 3-column oc-tags", () => {
+    const parsed = parseWhichLine("billing\tmanual\tses_a\n");
+    expect(parsed).toEqual({ tag: "billing", source: "manual", rootSessionId: "ses_a" });
+    expect(parsed && "kind" in parsed).toBe(false);
+  });
+
+  it("rejects empty output and lines with fewer than three columns", () => {
+    expect(parseWhichLine("")).toBeNull();
+    expect(parseWhichLine("billing\tmanual\n")).toBeNull();
+  });
+
+  it("parseWhich (the footer's view) is unchanged by column 4: manual renders, auto does not", () => {
+    expect(parseWhich("billing\tmanual\tses_a\n")).toBe("billing");
+    expect(parseWhich("billing\tmanual\tses_a\tsession\n")).toBe("billing");
+    expect(parseWhich("mono\tmanual\tses_a\tdir\n")).toBe("mono");
+    expect(parseWhich("auto:pigeon\tauto\tses_a\tauto\n")).toBeNull();
   });
 });

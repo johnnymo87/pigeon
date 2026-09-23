@@ -205,22 +205,51 @@ export class SessionTagResolver {
   }
 }
 
+export interface WhichLine {
+  tag: string;
+  /** `manual` (a session tag OR a directory glob) or `auto`. */
+  source: string;
+  rootSessionId: string;
+  /**
+   * `session`, `dir` or `auto` — which rule produced the tag. Column 4, added
+   * after the first three, so an older oc-tags omits it and this is undefined.
+   * Callers that need to tell a session tag from a directory glob must treat
+   * undefined as "unknown", never as `session`.
+   */
+  kind?: string;
+}
+
 /**
- * `oc-tags which` prints `tag\tsource\troot_session_id` on one line.
- *
- * Only `manual` renders. Every session always has a tag, and an untagged one
- * falls back to `auto:<dir>` — which says nothing the footer's own cwd line
- * does not already say, so showing it would be noise on every notification.
+ * Parse `oc-tags which`: `tag\tsource\troot_session_id[\tkind]` on one line.
+ * null when the line is missing, has fewer than three columns, or has no tag.
  */
-function parseWhich(stdout: string): string | null {
+export function parseWhichLine(stdout: string): WhichLine | null {
   const line = stdout.split("\n", 1)[0]?.trim();
   if (!line) return null;
   const parts = line.split("\t");
   if (parts.length < 3) return null;
   const tag = parts[0]!.trim();
-  const source = parts[1]!.trim();
-  if (!tag || source !== "manual") return null;
-  return tag;
+  if (!tag) return null;
+  const kind = parts[3]?.trim();
+  return {
+    tag,
+    source: parts[1]!.trim(),
+    rootSessionId: parts[2]!.trim(),
+    ...(kind ? { kind } : {}),
+  };
+}
+
+/**
+ * The footer's view of `oc-tags which`: the tag, or null.
+ *
+ * Only `manual` renders. Every session always has a tag, and an untagged one
+ * falls back to `auto:<dir>` — which says nothing the footer's own cwd line
+ * does not already say, so showing it would be noise on every notification.
+ */
+export function parseWhich(stdout: string): string | null {
+  const parsed = parseWhichLine(stdout);
+  if (!parsed || parsed.source !== "manual") return null;
+  return parsed.tag;
 }
 
 function lastLine(stderr: string): string {

@@ -22,7 +22,7 @@ import { DeliveryWatchdog } from "./swarm/delivery-watchdog";
 import { makeWatchdogResolveClients } from "./swarm/watchdog-client-resolver";
 import { SessionDirectoryRegistry } from "./swarm/registry";
 import { ingestWorkerCommand } from "./worker/command-ingest";
-import { ingestLaunchCommand } from "./worker/launch-ingest";
+import { ingestLaunchCommand, INHERIT_WHICH_TIMEOUT_MS } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
 import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
@@ -359,9 +359,9 @@ async function sendTelegramMessage(
  * The binary is resolved per command rather than once at startup, so installing
  * oc-tags does not also require restarting the daemon.
  */
-function resolveRunOcTags() {
+function resolveRunOcTags(timeoutMs?: number) {
   const bin = resolveOcTagsBin({ configured: config.ocTagsBin });
-  return bin ? createOcTagsRunner(bin) : null;
+  return bin ? createOcTagsRunner(bin, timeoutMs) : null;
 }
 
 /**
@@ -546,7 +546,12 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // and resolved per command so installing oc-tags does not also
             // require restarting the daemon.
             ...(msg.tag !== undefined ? { tag: msg.tag } : {}),
+            // Tag inheritance from the /launch's topic or swipe-reply session.
+            // Its `oc-tags which` gets the short budget; the `set` that may
+            // follow uses the ordinary runner.
+            ...(msg.inheritFromSessionId !== undefined ? { inheritFromSessionId: msg.inheritFromSessionId } : {}),
             runOcTags: resolveRunOcTags(),
+            runOcTagsWhich: resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS),
             // The session registers (and warms its tag cache) before the tag is
             // written, so without this its FIRST notification would show no tag
             // right after Telegram said the tag had been applied.
