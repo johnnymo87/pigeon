@@ -73,13 +73,15 @@ class FakePeer implements AcpTransport {
  * that the field is optional, and every caller of `newSession` would then be
  * tested against a serve that does not exist.
  *
- * The default answer is `["developer"]` because that is what a bare
- * `goose serve` actually returned for the default (empty) request -- arm B of
- * scripts/li6-extension-surface-probe.ts.
+ * The default answer is the four default extensions because that is what a
+ * bare `goose serve` 1.48.0 actually returned for the default request -- arm 2
+ * of eng-agent-platform experiments/2026-09-22-goose-extension-probe.mjs.
  */
+const DEFAULT_LOADED = ["analyze", "developer", "skills", "todo"];
+
 function autoHandshake(
   peer: FakePeer,
-  extensionNames: string[] = ["developer"],
+  extensionNames: string[] = DEFAULT_LOADED,
   extraResults: Array<Record<string, unknown>> = [],
 ): void {
   peer.onRequest = (msg, p) => {
@@ -683,30 +685,25 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
     expect(meta.enabledExtensions).not.toBeNull();
   });
 
-  it("defaults to the empty set -- the floor and nothing else", async () => {
+  it("defaults to developer, analyze, todo and skills -- developer named explicitly", async () => {
+    // Decided 2026-09-23 (eng-agent-platform
+    // docs/plans/2026-09-22-goose-extension-defaults-design.md, 5-7.1).
+    // developer is REQUESTED rather than assumed from the serve's floor: with no
+    // --with-builtin, goose loads its default developer only if config.yaml does
+    // not disable it (v1.48.0 acp/server.rs:568-577), while an explicit request
+    // loads it unconditionally. Assuming it made a shell-less session possible.
     const peer = new FakePeer();
     autoHandshake(peer);
     const client = makeClient(peer);
     await client.connect();
     await client.newSession("/tmp/x");
 
-    expect(((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions).toEqual([]);
-  });
-
-  it("does NOT restate the floor, because restating it can WIDEN", async () => {
-    // Under `goose serve --builtins X`, from_requested puts X in `explicit`
-    // and leaves `defaults` EMPTY (v1.48.0 acp/server.rs:301) -- developer is
-    // then not in the floor at all. A client that "helpfully" restates
-    // ["developer"] would re-add shell/edit/write to a session the operator
-    // had deliberately narrowed. [] is the only request that can never widen.
-    const peer = new FakePeer();
-    autoHandshake(peer);
-    const client = makeClient(peer);
-    await client.connect();
-    await client.newSession("/tmp/x");
-
-    const ext = ((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions;
-    expect(ext).not.toContainEqual(expect.objectContaining({ name: "developer" }));
+    expect(((peer.lastOf("session/new")!.params as any)._meta).enabledExtensions).toEqual([
+      { type: "platform", name: "developer" },
+      { type: "platform", name: "analyze" },
+      { type: "platform", name: "todo" },
+      { type: "platform", name: "skills" },
+    ]);
   });
 
   it("passes a caller's explicit set through unchanged", async () => {
@@ -726,7 +723,7 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
   it("rejects a session that loaded an extension nobody asked for", async () => {
     // The request is a request. This is the check that it was honoured --
     // without it, a serve on a different version, or one started with
-    // --builtins summon, silently reintroduces exactly this bead's bug and
+    // --with-builtin summon, silently reintroduces exactly this bead's bug and
     // nothing anywhere fails.
     const peer = new FakePeer();
     autoHandshake(peer, ["developer", "summon"]);
@@ -797,22 +794,22 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
     await expect(client.newSession("/tmp/x")).rejects.toThrow(/could not be verified|extensionResults/i);
   });
 
-  it("allows the floor itself through", async () => {
+  it("allows the floor itself through when nothing more is requested", async () => {
     const peer = new FakePeer();
     autoHandshake(peer, ["developer"]);
-    const client = makeClient(peer);
+    const client = makeClient(peer, { sessionExtensions: [] });
     await client.connect();
     await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
   });
 
-  it("honours a serveFloor the operator has widened via --builtins", async () => {
+  it("honours a serveFloor the operator has widened via --with-builtin", async () => {
     // The floor is set by the serve's systemd unit, in another repo. The
     // client cannot see those flags; it can only be TOLD what to expect. If
     // the two disagree the session is refused, which is the loud failure that
     // cross-repo drift otherwise does not get.
     const peer = new FakePeer();
     autoHandshake(peer, ["github"]);
-    const client = makeClient(peer, { serveFloor: ["github"] });
+    const client = makeClient(peer, { serveFloor: ["github"], sessionExtensions: [] });
     await client.connect();
     await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
   });
@@ -820,7 +817,57 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
   it("pins the wire shape, so widening it is a deliberate act", () => {
     // Mirrors the ALLOWED_ACP_METHODS pin. If this fails someone changed what
     // every goose session is allowed to load, and that is a human decision.
-    expect(DEFAULT_SESSION_EXTENSIONS).toEqual([]);
+    expect(DEFAULT_SESSION_EXTENSIONS).toEqual([
+      { type: "platform", name: "developer" },
+      { type: "platform", name: "analyze" },
+      { type: "platform", name: "todo" },
+      { type: "platform", name: "skills" },
+    ]);
     expect(DEFAULT_SERVE_FLOOR).toEqual(["developer"]);
+  });
+
+  it("refuses a session MISSING a requested extension -- the shell-less session", async () => {
+    // goose skips its default developer when config.yaml says enabled:false.
+    // A session with analyze/todo/skills but no shell is accepted-then-dead:
+    // it handshakes fine and fails on the first real command.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["analyze", "skills", "todo"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*developer/i);
+  });
+
+  it("refuses a session missing a FLOOR extension it was told to expect", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer"]);
+    const client = makeClient(peer, { serveFloor: ["developer", "github"], sessionExtensions: [] });
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*github/i);
+  });
+
+  it("refuses a session where a requested extension reported success:false", async () => {
+    // Reported, but did not load. For the floor that is the same dead session
+    // as not reported at all.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["analyze", "skills", "todo"], [
+      { name: "developer", success: false, error: "boom" },
+    ]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/developer/);
+  });
+
+  it("names surplus and missing together in one refusal", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "skills", "summon"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    const err = await client.newSession("/tmp/x").catch((e: Error) => e);
+    expect(String(err)).toMatch(/summon/);
+    expect(String(err)).toMatch(/todo/);
   });
 });

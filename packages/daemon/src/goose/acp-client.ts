@@ -144,16 +144,35 @@ export type GooseExtensionSpec =
   | { type: "platform"; name: string; available_tools?: string[] };
 
 /**
- * The extensions a session gets beyond the serve's floor: NONE.
+ * The extensions every session requests: developer, analyze, todo, skills.
  *
- * Not a restatement of the floor, deliberately. Under `goose serve --builtins X`
- * goose puts X in `explicit` and leaves `defaults` EMPTY (v1.48.0
- * acp/server.rs:301), so `developer` is then not in the floor at all -- and a
- * client that "helpfully" restated it would re-add shell/edit/write to a
- * session the operator had deliberately narrowed. `[]` is the only request that
- * can never widen one.
+ * Decided 2026-09-23 -- eng-agent-platform
+ * docs/plans/2026-09-22-goose-extension-defaults-design.md (5-7.1, 9), bead
+ * eng-agent-platform-8jk. That doc judges each goose 1.48.0 extension; the short
+ * version is that these four neither widen the session, act outside it, nor
+ * read more than `shell` already can, while summon (`delegate`), orchestrator,
+ * scheduler, Extension Manager and code_execution each fail at least one of
+ * those tests.
+ *
+ * `developer` is REQUESTED, not left to the serve's floor. With no
+ * `--with-builtin`, goose loads its default developer only if config.yaml does
+ * not say `enabled: false` (v1.48.0 acp/server.rs:568-577); an explicit request
+ * loads it unconditionally. Relying on the default made a session with no shell
+ * possible after an ordinary `goose configure`.
+ *
+ * This REVERSES the earlier rule of sending `[]` ("restating the floor can
+ * widen"). That rule protected a serve deliberately narrowed with
+ * `--with-builtin`, which the chosen design never does: the serve runs bare and
+ * this list is the single place the default lives. If someone does narrow the
+ * serve, they must change this list too -- the exact-match check below will not
+ * notice a restated developer, because it was asked for.
  */
-export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [];
+export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [
+  { type: "platform", name: "developer" },
+  { type: "platform", name: "analyze" },
+  { type: "platform", name: "todo" },
+  { type: "platform", name: "skills" },
+];
 
 /**
  * What a bare `goose serve` loads unconditionally, and therefore what the
@@ -187,7 +206,7 @@ export interface GooseAcpClientOptions {
   url: string;
   transportFactory: AcpTransportFactory;
   /**
-   * Extensions to load beyond the serve's floor. Defaults to NONE.
+   * Extensions to request. Defaults to DEFAULT_SESSION_EXTENSIONS.
    *
    * Session creation is a containment decision, not a transport detail: goose
    * 1.48.0 (acp/server.rs:581-611) treats a `session/new` with no recipe and no
@@ -197,10 +216,8 @@ export interface GooseAcpClientOptions {
    * policy at all), `Extension Manager` (which can enable further extensions at
    * runtime), and `scheduler`. Bead eng-agent-platform-li6.
    *
-   * So this defaults closed, for the same reason `permissionPolicy` does. A
-   * floor-only default is not pigeon choosing a policy; it is the ABSENCE of a
-   * widening decision. Every widening is authored by a caller who can be asked
-   * why.
+   * So pigeon always names the set itself, and a caller that wants something
+   * different must say so.
    *
    * Note this cannot narrow below the floor -- extensions are additive under
    * ACP and nothing a client sends subtracts (bead eng-agent-platform-jio).
@@ -210,7 +227,7 @@ export interface GooseAcpClientOptions {
   sessionExtensions?: GooseExtensionSpec[];
   /**
    * What the serve loads unconditionally, so the post-create check can tell
-   * surplus from floor. Override when the serve runs with `--builtins`.
+   * surplus from floor. Override when the serve runs with `--with-builtin`.
    */
   serveFloor?: string[];
   /**
@@ -348,7 +365,7 @@ export class GooseAcpClient {
    * (v1.48.0 acp/server/new_session.rs:327, acp/server.rs:599-607).
    *
    * Then VERIFIES what actually loaded rather than trusting that the request was
-   * honoured. A serve on another version, or one started with `--builtins
+   * honoured. A serve on another version, or one started with `--with-builtin
    * summon`, would otherwise reintroduce li6 silently -- the request would look
    * right in the diff and the session would be wide open. The response carries
    * `_meta.extensionResults` for exactly this (acp/response_builder.rs:80-94).
@@ -371,22 +388,25 @@ export class GooseAcpClient {
     if (typeof sid !== "string") {
       throw new GooseProtocolError(-1, "session/new returned no sessionId");
     }
-    this.assertNoSurplusExtensions(sid, requested, res.result);
+    this.assertExactExtensions(sid, requested, res.result);
     return sid;
   }
 
   /**
-   * Refuses a session that loaded anything beyond floor + what was asked for.
+   * Refuses a session whose loaded set is not EXACTLY floor + requested.
+   *
+   * Surplus: something loaded that nobody asked for -- the li6 bug. A
+   * `success: false` surplus still counts; it was ATTEMPTED, and that it failed
+   * this time says nothing about the next serve restart.
+   *
+   * Missing: something expected did not load, or reported `success: false`.
+   * Without this a session with no `developer` is accepted and dies on its first
+   * real command (bead eng-agent-platform-8jk).
    *
    * Throws rather than warns. The session does exist on the serve at this point
-   * and is left behind, but it is never prompted and so never runs a turn --
-   * an inert row in goose's session list is a much smaller problem than a live
-   * session holding `delegate`.
-   *
-   * A `success: false` surplus still counts. It was ATTEMPTED; that it failed
-   * this time says nothing about the next serve restart.
+   * and is left behind, but it is never prompted and so never runs a turn.
    */
-  private assertNoSurplusExtensions(
+  private assertExactExtensions(
     sessionId: string,
     requested: GooseExtensionSpec[],
     result: Record<string, any> | undefined,
@@ -401,23 +421,43 @@ export class GooseAcpClient {
           `extension set could not be verified; refusing it rather than assuming it is contained`,
       );
     }
-    const allowed = new Set(
-      [...(this.opts.serveFloor ?? DEFAULT_SERVE_FLOOR), ...requested.map((e) => e.name)].map(
-        normaliseExtensionName,
-      ),
+    const expectedNames = [
+      ...(this.opts.serveFloor ?? DEFAULT_SERVE_FLOOR),
+      ...requested.map((e) => e.name),
+    ];
+    const expected = new Set(expectedNames.map(normaliseExtensionName));
+    const loaded = new Set(
+      reported
+        .filter((r) => r?.success !== false)
+        .map((r) => normaliseExtensionName(String(r?.name ?? ""))),
     );
     const surplus = reported
       .map((r) => String(r?.name ?? ""))
-      .filter((name) => name && !allowed.has(normaliseExtensionName(name)))
+      .filter((name) => name && !expected.has(normaliseExtensionName(name)))
       .sort();
+    const missing = [...new Set(expectedNames)]
+      .filter((name) => !loaded.has(normaliseExtensionName(name)))
+      .sort();
+    if (surplus.length === 0 && missing.length === 0) return;
+
+    const parts: string[] = [];
     if (surplus.length > 0) {
-      throw new GooseProtocolError(
-        -1,
-        `session/new (${sessionId}) loaded ${surplus.length} extension(s) that were not requested ` +
-          `and are not in the declared serve floor: ${surplus.join(", ")}. ` +
-          `The serve is wider than this client believes -- check its --builtins flag and version.`,
+      parts.push(
+        `loaded ${surplus.length} extension(s) that were not requested and are not in the ` +
+          `declared serve floor: ${surplus.join(", ")}`,
       );
     }
+    if (missing.length > 0) {
+      parts.push(
+        `is missing ${missing.length} expected extension(s) (not loaded, or success:false): ` +
+          `${missing.join(", ")}`,
+      );
+    }
+    throw new GooseProtocolError(
+      -1,
+      `session/new (${sessionId}) ${parts.join("; and ")}. The serve does not match what this ` +
+        `client expects -- check its --with-builtin flags, ~/.config/goose/config.yaml, and version.`,
+    );
   }
 
   /**
