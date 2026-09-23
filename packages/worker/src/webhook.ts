@@ -724,16 +724,21 @@ async function queueCommand(
   return commandId;
 }
 
+type ContextLookup =
+  | { kind: "none"; triedReply: boolean }
+  | { kind: "no_row"; sessionId: string }
+  | { kind: "found"; sessionId: string; machineId: string; label: string | null };
+
 /**
- * Resolve a session from a reply-to-message or topic membership.
- * Used by /kill, /interrupt, /compact, /mcp, /model commands.
- * Returns session info or sends an error to Telegram and returns null.
+ * Which session, if any, a message is "about": its swipe-reply target, else the
+ * forum topic it was sent in. Sends nothing and checks no machine liveness --
+ * callers decide what a miss means.
  */
-async function resolveReplySession(
+async function lookupContextSession(
   db: D1Database,
   env: Env,
   message: TelegramMessage,
-): Promise<{ sessionId: string; machineId: string; label: string | null } | null> {
+): Promise<ContextLookup> {
   const chatId = message.chat.id;
   const messageThreadId = message.message_thread_id;
 
@@ -753,7 +758,49 @@ async function resolveReplySession(
     if (topic) sessionId = topic.session_id;
   }
 
-  if (!sessionId) {
+  if (!sessionId) return { kind: "none", triedReply };
+
+  const session = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first<{ machine_id: string; label: string | null }>();
+
+  if (!session) return { kind: "no_row", sessionId };
+  return { kind: "found", sessionId, machineId: session.machine_id, label: session.label };
+}
+
+/**
+ * The session a message was sent in the context of (swipe-reply, then forum
+ * topic), or null. SILENT: no Telegram replies and no isMachineRecent check, so
+ * a caller for whom context is optional -- /launch's tag inheritance -- behaves
+ * exactly as before when there is none (e.g. a /launch typed in General).
+ */
+export async function findContextSession(
+  db: D1Database,
+  env: Env,
+  message: TelegramMessage,
+): Promise<{ sessionId: string; machineId: string } | null> {
+  const found = await lookupContextSession(db, env, message);
+  return found.kind === "found" ? { sessionId: found.sessionId, machineId: found.machineId } : null;
+}
+
+/**
+ * Resolve a session from a reply-to-message or topic membership.
+ * Used by /kill, /interrupt, /compact, /mcp, /model commands.
+ * Returns session info or sends an error to Telegram and returns null.
+ */
+async function resolveReplySession(
+  db: D1Database,
+  env: Env,
+  message: TelegramMessage,
+): Promise<{ sessionId: string; machineId: string; label: string | null } | null> {
+  const chatId = message.chat.id;
+  const messageThreadId = message.message_thread_id;
+
+  const lookup = await lookupContextSession(db, env, message);
+
+  if (lookup.kind === "none") {
+    const triedReply = lookup.triedReply;
     // topic-aware message only when the flag is on AND we are in a topic
     const text =
       topicsEnabled(env) && messageThreadId !== undefined
@@ -765,23 +812,18 @@ async function resolveReplySession(
     return null;
   }
 
-  const session = await db
-    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
-    .bind(sessionId)
-    .first<{ machine_id: string; label: string | null }>();
-
-  if (!session) {
-    await sendTelegramMessage(env, chatId, `Session \`${sessionId}\` not found.`, { messageThreadId });
+  if (lookup.kind === "no_row") {
+    await sendTelegramMessage(env, chatId, `Session \`${lookup.sessionId}\` not found.`, { messageThreadId });
     return null;
   }
 
-  const isRecent = await isMachineRecent(db, session.machine_id);
+  const isRecent = await isMachineRecent(db, lookup.machineId);
   if (!isRecent) {
-    await sendTelegramMessage(env, chatId, `${session.machine_id} is not recently seen.`, { messageThreadId });
+    await sendTelegramMessage(env, chatId, `${lookup.machineId} is not recently seen.`, { messageThreadId });
     return null;
   }
 
-  return { sessionId, machineId: session.machine_id, label: session.label };
+  return { sessionId: lookup.sessionId, machineId: lookup.machineId, label: lookup.label };
 }
 
 /**
@@ -859,6 +901,23 @@ export async function handleTelegramWebhook(
         return OK();
       }
 
+      // Tag inheritance: a /launch typed in a session's topic, or swipe-replying
+      // to its notification, asks the daemon to copy THAT session's explicit
+      // tag onto the new one. Only a candidate here -- the daemon decides,
+      // because only oc-tags knows whether the tag is an explicit session tag.
+      // Skipped when --tag was given (it wins), for goose (oc-tags attributes
+      // opencode spend only), and when the context session lives on another
+      // machine (tags.db is per host, so the lookup would find nothing). The
+      // lookup is silent: a /launch in General has no context and behaves
+      // exactly as it did before.
+      let inheritFromSessionId: string | undefined;
+      if (!tag && backend !== "goose") {
+        const context = await findContextSession(db, env, update.message as TelegramMessage);
+        if (context && context.machineId === machineId) {
+          inheritFromSessionId = context.sessionId;
+        }
+      }
+
       const commandId = await queueCommand(db, env, {
         machineId,
         sessionId: null,
@@ -872,8 +931,12 @@ export async function handleTelegramWebhook(
         // `backend` on the wire only when metadata carries it, which is what
         // keeps an ordinary launch byte-identical for a pre-gate daemon.
         metadataJson:
-          tag || backend
-            ? JSON.stringify({ ...(tag ? { tag } : {}), ...(backend ? { backend } : {}) })
+          tag || backend || inheritFromSessionId
+            ? JSON.stringify({
+                ...(tag ? { tag } : {}),
+                ...(backend ? { backend } : {}),
+                ...(inheritFromSessionId ? { inheritFromSessionId } : {}),
+              })
             : null,
         messageThreadId: update.message.message_thread_id,
       });
@@ -881,8 +944,14 @@ export async function handleTelegramWebhook(
 
       // The tag is named here so a wrong one is visible immediately, but this
       // ack promises only that the command was QUEUED -- whether the tag was
-      // applied is the daemon's confirmation to make.
-      const tagNote = tag ? `, tag ${tag}` : "";
+      // applied is the daemon's confirmation to make. Likewise an inheritance
+      // is announced BEFORE the daemon acts, so a launch typed in the wrong
+      // topic can be caught.
+      const tagNote = tag
+        ? `, tag ${tag}`
+        : inheritFromSessionId
+          ? `, will inherit tag from ${inheritFromSessionId} unless --tag given`
+          : "";
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}${tagNote}...`, { messageThreadId: update.message.message_thread_id });
       return OK();
     }

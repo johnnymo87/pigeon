@@ -256,8 +256,13 @@ function buildCommandBody(result: Awaited<ReturnType<typeof pollNextCommand>> & 
     // also corrupt metadata, which parseMetadata turns into {}) — an empty
     // string would fail the daemon's tag validator and put a spurious
     // "Tag not applied" line on every launch.
-    const tag = parseMetadata(result.metadataJson).tag;
+    const meta = parseMetadata(result.metadataJson);
+    const tag = meta.tag;
     if (tag) body.tag = tag;
+    // Tag inheritance candidate (the /launch's topic or swipe-reply session).
+    // Omitted when absent so an ordinary launch's wire shape is unchanged; an
+    // old daemon ignores it and the new session simply stays on auto:.
+    if (meta.inheritFromSessionId) body.inheritFromSessionId = meta.inheritFromSessionId;
   } else if (result.commandType === "kill") {
     body.sessionId = result.sessionId;
   } else if (result.commandType === "interrupt") {
