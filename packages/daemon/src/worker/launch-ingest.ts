@@ -62,7 +62,7 @@ export interface LaunchCommandInput {
    * The session this /launch was sent in the context of (its forum topic or a
    * swipe-reply to its notification), set by the worker only when no `--tag`
    * was given and that session is on this machine. If oc-tags says its tag is
-   * an explicit SESSION tag, the new session gets a copy. A directory-glob or
+   * an explicit SESSION tag, the new session gets a copy. A dir-rule or
    * `auto:` tag is never inherited. Absent from an old worker.
    */
   inheritFromSessionId?: string;
@@ -201,8 +201,8 @@ async function inheritTag(
       return `Tag not inherited from ${parent}: could not read oc-tags which output`;
     }
     if (which.kind === undefined) {
-      // A pre-column-4 oc-tags says `manual` for a session tag AND a directory
-      // glob alike; guessing would copy a place onto a piece of work.
+      // A pre-column-4 oc-tags says `manual` for a session tag AND a legacy
+      // dir rule alike; guessing would copy a place onto a piece of work.
       return `Tag not inherited from ${parent}: oc-tags is too old to tell a session tag from a directory tag`;
     }
     if (which.kind !== "session") {

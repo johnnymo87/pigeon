@@ -6,7 +6,7 @@ import { createTelegramClient } from "./telegram";
 import { parseTagArgs, TAG_USAGE_TEXT } from "./tag-command";
 import { LAUNCH_USAGE_TEXT, parseLaunchMessage } from "./launch-command";
 
-type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir";
+type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set";
 
 // Re-export generateCommandId for tests
 export { generateCommandId };
@@ -1251,7 +1251,7 @@ export async function handleTelegramWebhook(
       // typo silently becoming a prompt in a live session is a worse outcome
       // than any parse error.
       if (parsed.kind === "usage") {
-        await sendTelegramMessage(env, tagChatId, TAG_USAGE_TEXT, { messageThreadId: update.message.message_thread_id });
+        await sendTelegramMessage(env, tagChatId, parsed.message ?? TAG_USAGE_TEXT, { messageThreadId: update.message.message_thread_id });
         return OK();
       }
 
@@ -1269,12 +1269,6 @@ export async function handleTelegramWebhook(
       } else if (parsed.kind === "list") {
         commandType = "tag_list";
         ack = `Listing tags on ${resolved.machineId}...`;
-      } else if (parsed.kind === "setDir") {
-        commandType = "tag_set_dir";
-        command = parsed.tag;
-        metadataJson = JSON.stringify({ pattern: parsed.pattern });
-        // No backticks: the worker never sets parse_mode, so they would render literally.
-        ack = `Tagging ${parsed.pattern} as ${parsed.tag} on ${resolved.machineId}...`;
       } else {
         commandType = "tag_set";
         command = parsed.tag;

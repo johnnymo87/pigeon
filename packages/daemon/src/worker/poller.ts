@@ -352,7 +352,8 @@ export interface PollerCallbacks {
   onTagTop: (msg: TagTopMessage) => Promise<void>;
   onTagList: (msg: TagListMessage) => Promise<void>;
   onTagSet: (msg: TagSetMessage) => Promise<void>;
-  onTagSetDir: (msg: TagSetDirMessage) => Promise<void>;
+  /** Optional handler for stale tag_set_dir commands during deploy skew. */
+  onTagSetDir?: (msg: TagSetDirMessage) => Promise<void>;
   /**
    * Called for every inbound message that names a session, before it is dispatched.
    *
@@ -546,7 +547,9 @@ export class Poller {
       } else if (msg.commandType === "tag_set") {
         await this.callbacks.onTagSet(msg);
       } else if (msg.commandType === "tag_set_dir") {
-        await this.callbacks.onTagSetDir(msg);
+        if (this.callbacks.onTagSetDir) {
+          await this.callbacks.onTagSetDir(msg);
+        }
       }
     } catch (err) {
       // Callback threw — skip ack so the lease expires and command retries

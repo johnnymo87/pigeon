@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isValidDirPattern, isValidTag, parseTagArgs, TAG_USAGE_TEXT } from "../src/tag-command";
+import { isValidTag, parseTagArgs, TAG_USAGE_TEXT } from "../src/tag-command";
 
 describe("parseTagArgs", () => {
   it("treats a bare /tag as the backlog view", () => {
@@ -25,11 +25,18 @@ describe("parseTagArgs", () => {
     });
   });
 
-  it("parses the dir form", () => {
+  it("rejects /tag dir with a removal message rather than tagging a session 'dir'", () => {
+    expect(parseTagArgs("dir")).toEqual({
+      kind: "usage",
+      message: "/tag dir was removed; tag sessions individually",
+    });
     expect(parseTagArgs("dir /home/dev/projects/mono/.worktrees/* fbm")).toEqual({
-      kind: "setDir",
-      pattern: "/home/dev/projects/mono/.worktrees/*",
-      tag: "fbm",
+      kind: "usage",
+      message: "/tag dir was removed; tag sessions individually",
+    });
+    expect(parseTagArgs("dir anything else")).toEqual({
+      kind: "usage",
+      message: "/tag dir was removed; tag sessions individually",
     });
   });
 
@@ -46,23 +53,6 @@ describe("parseTagArgs", () => {
   it("rejects a tag that could be read as a flag by the oc-tags CLI", () => {
     expect(parseTagArgs("--dir").kind).toBe("usage");
     expect(parseTagArgs("-x").kind).toBe("usage");
-  });
-
-  it("rejects a dir form with the wrong arity", () => {
-    expect(parseTagArgs("dir").kind).toBe("usage");
-    expect(parseTagArgs("dir /home/dev/projects/mono/*").kind).toBe("usage");
-    expect(parseTagArgs("dir /a/* one two").kind).toBe("usage");
-  });
-
-  it("rejects a dir pattern that is not rooted", () => {
-    expect(parseTagArgs("dir mono/* fbm").kind).toBe("usage");
-    expect(parseTagArgs("dir --db fbm").kind).toBe("usage");
-  });
-
-  it("rejects a ~-rooted dir pattern, which oc-tags would store and never match", () => {
-    // oc-tags fnmatches the stored pattern against an ABSOLUTE directory and
-    // never expands ~, so accepting one would be a silent no-op.
-    expect(parseTagArgs("dir ~/projects/mono/* fbm").kind).toBe("usage");
   });
 
   it("treats /tag top as the backlog view, matching the oc-tags CLI", () => {
@@ -84,7 +74,7 @@ describe("parseTagArgs", () => {
 
   it("exposes usage text naming every form", () => {
     expect(TAG_USAGE_TEXT).toContain("/tag list");
-    expect(TAG_USAGE_TEXT).toContain("/tag dir");
+    expect(TAG_USAGE_TEXT).not.toContain("/tag dir");
   });
 });
 
@@ -108,25 +98,5 @@ describe("isValidTag", () => {
   it("rejects a non-string rather than coercing it to the tag \"undefined\"", () => {
     expect(isValidTag(undefined as unknown as string)).toBe(false);
     expect(isValidTag(null as unknown as string)).toBe(false);
-  });
-});
-
-describe("isValidDirPattern", () => {
-  it("accepts absolute globs", () => {
-    expect(isValidDirPattern("/home/dev/projects/mono/.worktrees/*")).toBe(true);
-  });
-
-  it("rejects relative, ~-rooted, flag-like, empty, and control-character patterns", () => {
-    for (const p of ["", "mono/*", "~/projects/mono", "--db", "-", "/a\nb"]) {
-      expect(isValidDirPattern(p)).toBe(false);
-    }
-  });
-
-  it("rejects a non-string, so corrupt wire data cannot be coerced into a pattern", () => {
-    expect(isValidDirPattern(undefined as unknown as string)).toBe(false);
-  });
-
-  it("rejects an over-long pattern", () => {
-    expect(isValidDirPattern("/" + "a".repeat(300))).toBe(false);
   });
 });

@@ -688,7 +688,7 @@ describe("ingestLaunchCommand", () => {
     });
 
     it.each([
-      ["a directory glob", `mono\tmanual\t${PARENT}\tdir\n`],
+      ["a legacy dir rule", `mono\tmanual\t${PARENT}\tdir\n`],
       ["the auto: fallback", `auto:pigeon\tauto\t${PARENT}\tauto\n`],
     ])("does not inherit a tag that comes from %s", async (_label, stdout) => {
       const runOcTags = setRunner();
@@ -702,7 +702,7 @@ describe("ingestLaunchCommand", () => {
     });
 
     it("does not inherit from an older oc-tags that prints only three columns", async () => {
-      // Column 2 says `manual` for a session tag AND a directory glob; without
+      // Column 2 says `manual` for a session tag AND a legacy dir rule; without
       // column 4 there is no way to tell them apart, so nothing is copied.
       const runOcTags = setRunner();
       const input = makeInput({

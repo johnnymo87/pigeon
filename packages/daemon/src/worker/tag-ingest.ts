@@ -6,18 +6,15 @@ import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
  * /tag — session tagging from Telegram, backed by the oc-tags binary.
  *
  * oc-tags is the single source of truth for tag precedence (explicit session tag
- * > directory glob > directory-derived "auto:" fallback) and for the sidecar DB
- * at ~/.local/share/oc-tags/tags.db. This module never reads either database; it
- * only shells out and renders the result for a phone screen.
+ * > "auto:" fallback) and for the sidecar DB at ~/.local/share/oc-tags/tags.db.
+ * This module never reads either database; it only shells out and renders the
+ * result for a phone screen.
  *
- * Two things follow from the model and shape the UX here:
+ * One thing follows from the model and shapes the UX here:
  *
  *  - Every session ALWAYS has a tag, so /tag never creates one from nothing — it
  *    converts a session from its "auto:" fallback to a manual tag. That is why
  *    the bare /tag form is a BACKLOG view rather than a prompt for a tag name.
- *  - A directory glob covers past and future sessions at once, so oc-tags' own
- *    prefix hints are the highest-leverage thing on the screen and are rendered
- *    even though they were not asked for.
  */
 
 // ─── input validation ─────────────────────────────────────────────────────────
@@ -42,19 +39,6 @@ const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]+$/;
 
 export function isValidTag(tag: string): boolean {
   return typeof tag === "string" && TAG_RE.test(tag) && !tag.toLowerCase().startsWith("auto:");
-}
-
-/**
- * Patterns must be ABSOLUTE. "~" is rejected rather than expanded: oc-tags stores
- * the pattern verbatim and fnmatches it against an absolute directory without
- * calling expanduser, so a "~"-rooted pattern would be written to tags.db and
- * then silently match nothing.
- */
-export function isValidDirPattern(pattern: string): boolean {
-  if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > 256) return false;
-  if (pattern[0] !== "/") return false;
-  // eslint-disable-next-line no-control-regex
-  return !/[\u0000-\u001f\u007f]/.test(pattern);
 }
 
 export function isValidSessionId(sessionId: string): boolean {
@@ -86,11 +70,6 @@ export interface TagSetCommandDeps extends TagCommandDeps {
   tag: string;
 }
 
-export interface TagSetDirCommandDeps extends TagCommandDeps {
-  pattern: string;
-  tag: string;
-}
-
 // ─── parsing oc-tags top ──────────────────────────────────────────────────────
 
 export interface TopRow {
@@ -100,16 +79,10 @@ export interface TopRow {
   directory: string;
 }
 
-export interface TopHint {
-  count: number;
-  pattern: string;
-}
-
 /** Separator between fields in oc-tags' printf: {dollars:>10}  {id:<32}  {title:<40}  {dir} */
 const FIELD_GAP = 2;
 
 const ROW_PREFIX_RE = /^\s*\$([\d,]+\.\d{2})\s+(\S+)/;
-const HINT_RE = /^Hint: (\d+) untagged roots share directory prefix '(.+)'\./;
 
 /**
  * Reads the field widths off oc-tags' own header line.
@@ -149,18 +122,11 @@ function parseHeaderWidths(line: string): { idWidth: number; titleWidth: number 
  * a format change upstream degrades to the raw-output fallback, never to
  * invented or misaligned rows.
  */
-export function parseTopOutput(stdout: string): { rows: TopRow[]; hints: TopHint[] } {
+export function parseTopOutput(stdout: string): { rows: TopRow[] } {
   const rows: TopRow[] = [];
-  const hints: TopHint[] = [];
   let widths: { idWidth: number; titleWidth: number } | null = null;
 
   for (const line of stdout.split("\n")) {
-    const hint = line.match(HINT_RE);
-    if (hint) {
-      hints.push({ count: Number(hint[1]), pattern: hint[2]! });
-      continue;
-    }
-
     if (!widths) {
       widths = parseHeaderWidths(line);
       continue;
@@ -188,13 +154,12 @@ export function parseTopOutput(stdout: string): { rows: TopRow[]; hints: TopHint
     });
   }
 
-  return { rows, hints };
+  return { rows };
 }
 
 // ─── rendering ────────────────────────────────────────────────────────────────
 
 const MAX_ROWS = 8;
-const MAX_HINTS = 3;
 /** Telegram's hard limit is 4096; this path does not split messages. */
 const MAX_TEXT = 3800;
 
@@ -293,7 +258,7 @@ export async function ingestTagTopCommand(deps: TagCommandDeps): Promise<void> {
   if (stdout === null) return;
 
   const homeDir = deps.homeDir ?? os.homedir();
-  const { rows, hints } = parseTopOutput(stdout);
+  const { rows } = parseTopOutput(stdout);
 
   if (rows.length === 0) {
     // Includes oc-tags' own "No untagged root sessions found." and any output
@@ -320,14 +285,6 @@ export async function ingestTagTopCommand(deps: TagCommandDeps): Promise<void> {
     b.append(truncate(shortenDirectory(row.directory, homeDir), 60)).newline();
     // Tap the code span to copy the whole command, then paste and append a tag.
     b.appendCode(`/tag ${row.sessionId}`).newline(2);
-  }
-
-  if (hints.length > 0) {
-    b.append("💡 ").appendBold("Cover many at once:").newline();
-    for (const hint of hints.slice(0, MAX_HINTS)) {
-      b.append(`${hint.count} roots share ${truncate(shortenDirectory(hint.pattern, homeDir), 60)}`).newline();
-      b.appendCode(`/tag dir ${hint.pattern}`).newline(2);
-    }
   }
 
   const msg = b.build();
@@ -384,35 +341,4 @@ export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void
   announceTagged(deps);
   console.log(`[tag-ingest] set commandId=${deps.commandId} session=${targetSessionId} tag=${tag}`);
   await deps.sendTelegramReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${targetSessionId} as ${tag}`, 500)}`);
-}
-
-// ─── /tag dir <glob> <tag> ────────────────────────────────────────────────────
-
-export async function ingestTagSetDirCommand(deps: TagSetDirCommandDeps): Promise<void> {
-  const { pattern, tag } = deps;
-
-  if (!isValidDirPattern(pattern)) {
-    await deps.sendTelegramReply(
-      deps.chatId,
-      `Invalid directory pattern: ${truncate(pattern, 128)}\nPatterns must be an absolute path starting with / (~ is not expanded).`,
-    );
-    return;
-  }
-  if (!isValidTag(tag)) {
-    await deps.sendTelegramReply(
-      deps.chatId,
-      `Invalid tag: ${truncate(tag, 64)}\nTags are one word of letters, digits, . _ - : / and may not start with "auto:".`,
-    );
-    return;
-  }
-
-  const stdout = await runOrExplain(deps, ["set", "--dir", pattern, tag], "set --dir");
-  if (stdout === null) return;
-
-  announceTagged(deps);
-  console.log(`[tag-ingest] set --dir commandId=${deps.commandId} pattern=${pattern} tag=${tag}`);
-  await deps.sendTelegramReply(
-    deps.chatId,
-    `🏷 ${truncate(stdout.trim() || `Tagged ${pattern} as ${tag}`, 500)}\n\nApplies to past and future sessions in that directory.`,
-  );
 }

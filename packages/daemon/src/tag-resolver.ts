@@ -4,8 +4,8 @@ import type { OcTagsRunner } from "./worker/oc-tags";
  * Caches each session's effective oc-tags tag for the notification footer.
  *
  * The tag is resolved by shelling out to `oc-tags which <session>`, which owns
- * the precedence rules (session tag > longest matching directory glob >
- * `auto:` fallback). Pigeon deliberately implements none of that — a second
+ * the precedence rules (session tag > `auto:` fallback). Pigeon deliberately
+ * implements none of that — a second
  * implementation would drift, and the tag beside a session would eventually
  * disagree with the tag its dollars are charted under.
  *
@@ -118,19 +118,6 @@ export class SessionTagResolver {
     void this.refresh(sessionId);
   }
 
-  /**
-   * Drops every cached tag.
-   *
-   * Used after `/tag dir <glob> <tag>`, which is retroactive: it can change the
-   * effective tag of sessions nobody named, so there is no smaller set to
-   * invalidate.
-   */
-  clear(): void {
-    this.generation += 1;
-    this.cache.clear();
-    this.warned.clear();
-  }
-
   /** Resolves when every in-flight refresh has settled. Test seam. */
   async drain(): Promise<void> {
     await Promise.all([...this.inFlight.values()]);
@@ -207,14 +194,13 @@ export class SessionTagResolver {
 
 export interface WhichLine {
   tag: string;
-  /** `manual` (a session tag OR a directory glob) or `auto`. */
+  /** `manual` (a session tag) or `auto`. */
   source: string;
   rootSessionId: string;
   /**
    * `session`, `dir` or `auto` — which rule produced the tag. Column 4, added
    * after the first three, so an older oc-tags omits it and this is undefined.
-   * Callers that need to tell a session tag from a directory glob must treat
-   * undefined as "unknown", never as `session`.
+   * Tolerates `dir` harmlessly if an older oc-tags emits it.
    */
   kind?: string;
 }

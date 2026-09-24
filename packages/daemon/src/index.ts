@@ -31,7 +31,6 @@ import { ingestModelListCommand, ingestModelSetCommand } from "./worker/model-in
 import {
   ingestTagListCommand,
   ingestTagSetCommand,
-  ingestTagSetDirCommand,
   ingestTagTopCommand,
 } from "./worker/tag-ingest";
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
@@ -680,14 +679,8 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onTagSetDir: async (msg) => {
-          await ingestTagSetDirCommand({
-            ...tagDeps(msg),
-            pattern: msg.pattern,
-            tag: msg.tag,
-            // A directory glob is retroactive and names no session, so there is
-            // no smaller set to invalidate than everything.
-            onTagged: () => tagResolver.clear(),
-          });
+          const sendReply = createTelegramReplySender(sendTelegramMessage, msg);
+          await sendReply(msg.chatId, "`/tag dir` was removed; tag sessions individually.");
         },
       },
       { healthMonitor: workerHealthMonitor },

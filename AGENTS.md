@@ -150,15 +150,12 @@ it: oc-tags owns tag precedence and owns the sidecar DB at `~/.local/share/oc-ta
 and it opens `opencode.db` read-only. There must be exactly one implementation of
 precedence, so pigeon reads neither database.
 
-Three facts about oc-tags' model shape this command, and it is not obvious from the name:
+Two facts about oc-tags' model shape this command, and it is not obvious from the name:
 
 - **Every session always has a tag.** An untagged session falls back to a
   directory-derived `auto:` tag (`auto:mono`, `auto:mono/some-worktree`). So `/tag` never
   creates a tag from nothing — it *converts* a session from `auto:` to a manual tag. That
   is why bare `/tag` is a **backlog view** rather than a prompt for a tag name.
-- **A directory glob covers past and future sessions at once**, so it is far higher
-  leverage than tagging one session. oc-tags emits prefix hints of its own, and the
-  backlog view renders them even though nobody asked for them.
 - **Roughly two thirds of the dollars sit in primary-root sessions** (`auto:mono`,
   `auto:workstation`) whose directory carries no signal about what the work was. Those can
   only be fixed per session — which is the whole reason this is worth having on a phone.
@@ -226,10 +223,9 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
 | `/rename <new title>` | *(reply to a session notification)* | Renames the session's forum topic to the given title. Worker-only — never reaches opencode |
 | `/tag` | *(reply to a session notification)* | Lists untagged sessions ranked by list-price dollars, each with a tap-to-copy `/tag <id>` |
-| `/tag list` | *(reply to a session notification)* | Lists tags defined so far, with session and directory counts |
+| `/tag list` | *(reply to a session notification)* | Lists tags defined so far, with session counts |
 | `/tag <tag>` | *(reply to a session notification)* | Tags the replied-to session |
 | `/tag <session-id> <tag>` | *(reply to a session notification)* | Tags a specific session — the one you are replying to only routes the command |
-| `/tag dir <glob> <tag>` | *(reply to a session notification)* | Tags a directory pattern, retroactively and prospectively |
 
 **`/launch` directory shorthand:** A bare word like `pigeon` expands to `~/projects/pigeon`. Full paths (`~/projects/pigeon`) and `~`-prefixed paths also work.
 
@@ -326,7 +322,7 @@ Three things shape `daemon/src/tag-resolver.ts` and are easy to undo by accident
 - **`get()` is synchronous and answers only from cache.** Notifications are formatted inside request handlers, and `POST /question-asked` is awaited by the plugin under a 3s timeout. A subprocess on that path is a latency risk for a decorative line, so refreshes run beside it (`warm()` on `/session-start`, and a fire-and-forget refresh on a stale read — it does not *await* the spawn, though a miss does pay the few ms of resolving the binary and forking). A session whose tag is not cached yet renders without the line. Making `get` async is how this feature starts costing questions.
 - **`warm()` never caches a negative, and that is the whole reason tagged launches work.** `/launch --tag` and `opencode-launch` both tag a session *after* creating and prompting it, so the warm-up at `/session-start` races that window and sees it untagged. Caching that would hide the tag from the session's first notification — the one read seconds after Telegram says `🏷 Tagged …`. Both writers also call back on success (`onTagged` → `refreshNow`), and an invalidation bumps a generation counter so a lookup that began before `oc-tags set` committed cannot write the pre-tag answer back over it.
 - **Only `manual` renders.** Every session always has a tag, but an untagged one resolves to `auto:<dir>` — which says nothing the cwd on that same line does not already say. `oc-tags which` reports the source; pigeon filters on it.
-- **Pigeon implements no precedence.** The tag comes from `oc-tags which <session>` (session tag > longest matching dir glob > `auto:`), for the same reason `/tag` shells out: a second implementation drifts, and the tag beside a session would end up disagreeing with the tag its dollars are charted under. A stale entry is served while its refresh runs (the tag changes rarely; blanking it would flicker), and `/tag` invalidates on success — per session for `/tag <tag>`, wholesale for `/tag dir`, which is retroactive and names no session.
+- **Pigeon implements no precedence.** The tag comes from `oc-tags which <session>` (session tag > `auto:`), for the same reason `/tag` shells out: a second implementation drifts, and the tag beside a session would end up disagreeing with the tag its dollars are charted under. A stale entry is served while its refresh runs (the tag changes rarely; blanking it would flicker), and `/tag` invalidates on success for the tagged session.
 
 Failure is always silence: no binary, non-zero exit, timeout, unparseable output all cache a null and omit the line, with one warning per session rather than one per notification.
 

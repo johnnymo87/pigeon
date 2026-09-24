@@ -5,7 +5,7 @@ import path from "node:path";
 /**
  * Locating and invoking the `oc-tags` binary.
  *
- * oc-tags owns tag precedence (explicit session tag > directory glob > "auto:"
+ * oc-tags owns tag precedence (explicit session tag > "auto:"
  * fallback) and owns the sidecar DB at ~/.local/share/oc-tags/tags.db. Pigeon
  * shells out to it rather than reading either database, so there is exactly one
  * implementation of precedence. oc-tags opens opencode.db read-only; nothing
@@ -117,7 +117,7 @@ export function describeOcTagsFailure(err: unknown, timeoutMs: number = RUN_TIME
 /**
  * Builds a runner that executes oc-tags with an argv ARRAY and no shell.
  *
- * Tag names and directory globs arrive from a chat message. Passing argv rather
+ * Tag names arrive from a chat message. Passing argv rather
  * than composing a command string means shell metacharacters in them are inert;
  * the remaining hazard is argument injection via a leading "-", which the input
  * validators reject.
