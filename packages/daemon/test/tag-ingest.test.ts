@@ -66,6 +66,18 @@ describe("parseTopOutput", () => {
     });
   });
 
+  it("ignores directory-prefix hint lines from an older oc-tags", () => {
+    // Deploy skew: an oc-tags that predates the removal of directory rules
+    // still appends these. They must be skipped, not parsed as rows.
+    const withHints = [
+      TOP_OUTPUT,
+      "",
+      "Hint: 3 untagged roots share directory prefix '/home/dev/projects/mono/.worktrees/*'. Cover them with:",
+      "  oc-tags set --dir '/home/dev/projects/mono/.worktrees/*' <tag>",
+    ].join("\n");
+    expect(parseTopOutput(withHints).rows).toEqual(parseTopOutput(TOP_OUTPUT).rows);
+  });
+
   it("parses thousands separators", () => {
     const { rows } = parseTopOutput(TOP_OUTPUT);
     expect(rows[2]!.dollars).toBe(1222.58);

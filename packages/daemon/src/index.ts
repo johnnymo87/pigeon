@@ -680,7 +680,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         },
         onTagSetDir: async (msg) => {
           const sendReply = createTelegramReplySender(sendTelegramMessage, msg);
-          await sendReply(msg.chatId, "`/tag dir` was removed; tag sessions individually.");
+          await sendReply(msg.chatId, "/tag dir was removed; tag sessions individually.");
         },
       },
       { healthMonitor: workerHealthMonitor },
