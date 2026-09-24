@@ -152,10 +152,8 @@ Tags opencode sessions for the `oc-tags` list-price chart. Parsing lives in `tag
 - `/tag list` -> `tag_list`
 - `/tag <tag>` -> `tag_set` against the session the message replies to / whose topic it is in.
 - `/tag <session-id> <tag>` -> `tag_set` against that session.
-- `/tag dir <glob> <tag>` -> `tag_set_dir`. The glob must be an ABSOLUTE path: oc-tags
-  fnmatches the stored pattern against an absolute directory and never expands `~`, so a
-  `~`-rooted pattern would be written to tags.db and then match nothing. Rejected rather
-  than expanded, so pigeon does not acquire a second opinion about what `~` means.
+- `/tag dir ...` is answered with a removal notice and never queued: oc-tags dropped
+  directory-glob tag rules.
 
 Two things about this command are unlike the others:
 
@@ -184,7 +182,7 @@ answer the user actually chose.
 
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "tag_set_dir"` (in `webhook.ts`)
+`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set"` (in `webhook.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt
@@ -198,7 +196,8 @@ answer the user actually chose.
 - `tag_top`: list untagged sessions ranked by list-price dollars
 - `tag_list`: list tags defined so far
 - `tag_set`: tag one session (`command` = tag, `metadata_json.targetSessionId` = session tagged)
-- `tag_set_dir`: tag a directory glob (`command` = tag, `metadata_json.pattern` = glob)
+- `tag_set_dir`: removed. The worker no longer creates it; the daemon still acks a stale
+  queued row with a removal reply, so a deploy-skew leftover is not redelivered for 24h.
 
 ## Command Delivery (Lease-Based)
 

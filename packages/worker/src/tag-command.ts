@@ -2,7 +2,7 @@
  * Parsing and validation for the /tag command.
  *
  * /tag shells out — on the daemon side — to the `oc-tags` binary, which owns tag
- * precedence (explicit session tag > directory glob > "auto:" fallback). Nothing
+ * precedence (explicit session tag > "auto:" fallback). Nothing
  * here reimplements any of that; this module only decides which oc-tags
  * invocation a chat message is asking for, and refuses input that has no business
  * being handed to a subprocess.
@@ -24,8 +24,9 @@ export type TagCommand =
   | { kind: "top" }
   | { kind: "list" }
   | { kind: "set"; targetSessionId?: string; tag: string }
-  | { kind: "setDir"; pattern: string; tag: string }
-  | { kind: "usage" };
+  | { kind: "usage"; message?: string };
+
+export const TAG_DIR_REMOVED_TEXT = "/tag dir was removed; tag sessions individually";
 
 export const TAG_USAGE_TEXT = [
   "Usage:",
@@ -33,7 +34,6 @@ export const TAG_USAGE_TEXT = [
   "/tag list — tags defined so far",
   "/tag <tag> — tag this session",
   "/tag <session-id> <tag> — tag a specific session",
-  "/tag dir <glob> <tag> — tag a directory pattern, absolute path (retroactive and prospective)",
 ].join("\n");
 
 /**
@@ -52,28 +52,6 @@ export function isValidTag(tag: string): boolean {
     return false;
   }
   return !tag.toLowerCase().startsWith("auto:");
-}
-
-/**
- * A directory pattern must be ABSOLUTE, which also rules out anything argparse
- * would read as a flag.
- *
- * "~" is rejected rather than expanded. oc-tags stores the pattern verbatim and
- * fnmatches it against an absolute directory without ever calling expanduser, so
- * a "~"-rooted pattern would be accepted, acknowledged, written to tags.db and
- * then match nothing — a silent no-op. Expanding it here instead would put a
- * second opinion about what "~" means into a system that is supposed to have
- * exactly one.
- */
-export function isValidDirPattern(pattern: string): boolean {
-  if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > 256) {
-    return false;
-  }
-  if (pattern[0] !== "/") {
-    return false;
-  }
-  // eslint-disable-next-line no-control-regex
-  return !/[\u0000-\u001f\u007f]/.test(pattern);
 }
 
 // Matches the shape pigeon uses elsewhere (daemon app.ts); opencode ids may
@@ -111,15 +89,7 @@ export function parseTagArgs(rest: string | undefined): TagCommand {
   }
 
   if (tokens[0] === "dir") {
-    if (tokens.length !== 3) {
-      return { kind: "usage" };
-    }
-    const pattern = tokens[1]!;
-    const tag = tokens[2]!;
-    if (!isValidDirPattern(pattern) || !isValidTag(tag)) {
-      return { kind: "usage" };
-    }
-    return { kind: "setDir", pattern, tag };
+    return { kind: "usage", message: TAG_DIR_REMOVED_TEXT };
   }
 
   if (tokens.length === 1) {

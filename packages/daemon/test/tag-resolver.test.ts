@@ -234,21 +234,6 @@ describe("SessionTagResolver", () => {
     expect(resolver.get("ses_a")).toBe("new");
   });
 
-  it("clear() also invalidates a refresh already in flight", async () => {
-    // `/tag dir` is retroactive, so it can change the answer a running lookup
-    // is about to return.
-    let release!: () => void;
-    const gate = new Promise<void>(r => { release = r; });
-    const resolver = new SessionTagResolver({
-      runner: async () => { await gate; return ok("old\tmanual\tses_a\n"); },
-    });
-    const stale = resolver.refresh("ses_a");
-    resolver.clear();
-    release();
-    await stale;
-    expect(resolver.get("ses_a")).toBeNull();
-  });
-
   it("logs a failure at most once per session", async () => {
     const warn = vi.fn();
     let now = 1000;

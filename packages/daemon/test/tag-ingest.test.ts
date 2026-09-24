@@ -2,9 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ingestTagListCommand,
   ingestTagSetCommand,
-  ingestTagSetDirCommand,
   ingestTagTopCommand,
-  isValidDirPattern,
   isValidTag,
   parseTopOutput,
   type TagCommandDeps,
@@ -18,9 +16,6 @@ const TOP_OUTPUT = [
   "   $305.41  ses_fca8c2910ffelugfbyTBCqvDdN    Labor day                                 /home/dev/projects/salmon-of-knowledge",
   " $1,222.58  ses_fdde36346ffeVDd8gsL7G9f0UV    LGTM timer: NYC hours, early stop         /home/dev/projects/workstation",
   "    $46.57  ses_1b57e2661ffeFV8tcxhsxkTTjI                                              /home/dev/projects/mono",
-  "",
-  "Hint: 12 untagged roots share directory prefix '/home/dev/projects/mono/.worktrees/*'. Cover them with:",
-  "  oc-tags set --dir '/home/dev/projects/mono/.worktrees/*' <tag>",
 ].join("\n");
 
 const EMOJI_TOP_OUTPUT = [
@@ -71,6 +66,18 @@ describe("parseTopOutput", () => {
     });
   });
 
+  it("ignores directory-prefix hint lines from an older oc-tags", () => {
+    // Deploy skew: an oc-tags that predates the removal of directory rules
+    // still appends these. They must be skipped, not parsed as rows.
+    const withHints = [
+      TOP_OUTPUT,
+      "",
+      "Hint: 3 untagged roots share directory prefix '/home/dev/projects/mono/.worktrees/*'. Cover them with:",
+      "  oc-tags set --dir '/home/dev/projects/mono/.worktrees/*' <tag>",
+    ].join("\n");
+    expect(parseTopOutput(withHints).rows).toEqual(parseTopOutput(TOP_OUTPUT).rows);
+  });
+
   it("parses thousands separators", () => {
     const { rows } = parseTopOutput(TOP_OUTPUT);
     expect(rows[2]!.dollars).toBe(1222.58);
@@ -86,13 +93,8 @@ describe("parseTopOutput", () => {
     });
   });
 
-  it("extracts the directory-prefix hints", () => {
-    const { hints } = parseTopOutput(TOP_OUTPUT);
-    expect(hints).toEqual([{ count: 12, pattern: "/home/dev/projects/mono/.worktrees/*" }]);
-  });
-
   it("returns nothing for unparseable output rather than inventing rows", () => {
-    expect(parseTopOutput("something entirely different\n")).toEqual({ rows: [], hints: [] });
+    expect(parseTopOutput("something entirely different\n")).toEqual({ rows: [] });
   });
 
   it("slices columns by code point, because oc-tags pads by code point", () => {
@@ -167,17 +169,6 @@ describe("ingestTagTopCommand", () => {
       .filter((e) => e.type === "code")
       .map((e) => text.slice(e.offset, e.offset + e.length));
     expect(codes).toContain("/tag ses_f966a4af3ffeIXwkQcs07oAfBL");
-  });
-
-  it("surfaces the directory-glob hint, which covers many sessions at once", async () => {
-    const deps = makeDeps({
-      runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: TOP_OUTPUT, stderr: "" }),
-    });
-    await ingestTagTopCommand(deps);
-
-    const text = sentText(deps);
-    expect(text).toContain("12");
-    expect(text).toContain("/tag dir /home/dev/projects/mono/.worktrees/*");
   });
 
   it("caps the number of rows so the reply fits in one Telegram message", async () => {
@@ -304,32 +295,12 @@ describe("ingestTagSetCommand", () => {
   });
 });
 
-describe("ingestTagSetDirCommand", () => {
-  it("passes --dir, the pattern and the tag as separate argv elements", async () => {
-    const deps = makeDeps({
-      runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged dir pattern '/a/*' as 'fbm'\n", stderr: "" }),
-    });
-    await ingestTagSetDirCommand({ ...deps, pattern: "/home/dev/projects/mono/.worktrees/*", tag: "fbm" });
-
-    expect(ocTagsArgs(deps)).toEqual(["set", "--dir", "/home/dev/projects/mono/.worktrees/*", "fbm"]);
-  });
-
-  it("refuses an unrooted pattern without spawning anything", async () => {
-    const deps = makeDeps();
-    await ingestTagSetDirCommand({ ...deps, pattern: "mono/*", tag: "fbm" });
-
-    expect((deps.runOcTags as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
-    expect(sentText(deps)).toContain("Invalid directory pattern");
-  });
-});
-
 describe("when oc-tags is not installed", () => {
   it("says so, naming the machine, for every form", async () => {
     for (const run of [
       (d: TagCommandDeps) => ingestTagTopCommand(d),
       (d: TagCommandDeps) => ingestTagListCommand(d),
       (d: TagCommandDeps) => ingestTagSetCommand({ ...d, targetSessionId: "ses_abcd1234", tag: "billing" }),
-      (d: TagCommandDeps) => ingestTagSetDirCommand({ ...d, pattern: "/a/*", tag: "fbm" }),
     ]) {
       const deps = makeDeps({ runOcTags: null });
       await run(deps);
@@ -351,14 +322,6 @@ describe("when oc-tags cannot be executed", () => {
 describe("malformed wire data", () => {
   // TypeScript says these are strings; the wire does not. A throw here would
   // skip the poller ack and redeliver the command every lease expiry for 24h.
-  it("rejects an absent pattern without throwing", async () => {
-    const deps = makeDeps();
-    await expect(
-      ingestTagSetDirCommand({ ...deps, pattern: undefined as unknown as string, tag: "fbm" }),
-    ).resolves.toBeUndefined();
-    expect((deps.runOcTags as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
-  });
-
   it("rejects an absent tag rather than tagging a session \"undefined\"", async () => {
     const deps = makeDeps();
     await expect(
@@ -418,10 +381,6 @@ describe("daemon-side input validation", () => {
     expect(isValidTag("auto:mono")).toBe(false);
     expect(isValidTag("--dir")).toBe(false);
     expect(isValidTag("")).toBe(false);
-    expect(isValidDirPattern("/home/dev/projects/mono/*")).toBe(true);
-    expect(isValidDirPattern("mono/*")).toBe(false);
-    expect(isValidDirPattern("~/projects/mono")).toBe(false);
     expect(isValidTag(undefined as unknown as string)).toBe(false);
-    expect(isValidDirPattern(undefined as unknown as string)).toBe(false);
   });
 });

@@ -12301,16 +12301,29 @@ describe("/tag command", () => {
     expect(rows[0]!.command).toBe("billing");
   });
 
-  it("queues tag_set_dir for /tag dir", async () => {
+  it("rejects /tag dir with removal message and does not queue any command", async () => {
     const { sessionId, notifMsgId } = await tagContext();
-    mockTelegramSendMessage();
+    let sentPayload: any;
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply((opts: any) => {
+        sentPayload = JSON.parse(String(opts.body));
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
 
     await sendWebhook(makeTextReply("/tag dir /home/dev/projects/mono/.worktrees/* fbm", notifMsgId));
 
-    const rows = (await queryQueueBySession(sessionId)).filter((r) => r.command_type === "tag_set_dir");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.command).toBe("fbm");
-    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ pattern: "/home/dev/projects/mono/.worktrees/*" });
+    expect(sentPayload.text).toBe("/tag dir was removed; tag sessions individually");
+
+    const rows = await queryQueueBySession(sessionId);
+    expect(rows.filter((r) => r.command_type === "execute")).toHaveLength(0);
+    expect(rows.filter((r) => (r.command_type ?? "").startsWith("tag_"))).toHaveLength(0);
   });
 
   it("answers malformed /tag with usage and never injects it as a prompt", async () => {

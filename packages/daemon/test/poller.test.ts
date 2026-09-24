@@ -1377,4 +1377,69 @@ describe("Poller dispatch — tag commands", () => {
     expect(acked.some((u) => u.includes("cmd-t1"))).toBe(true);
     poller.stop();
   });
+
+  it("gracefully handles and acks a stale tag_set_dir command even without onTagSetDir callback", async () => {
+    const acked: string[] = [];
+    const callbacks = makeCallbacks();
+    delete callbacks.onTagSetDir;
+    const staleMsg = {
+      commandId: "cmd-stale-dir",
+      commandType: "tag_set_dir" as const,
+      sessionId: "sess-1",
+      chatId: "chat-1",
+      pattern: "/home/dev/projects/mono/*",
+      tag: "fbm",
+    };
+    const fetchFn = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/next")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(staleMsg), { status: 200, headers: { "content-type": "application/json" } }),
+        );
+      }
+      acked.push(String(url));
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn as unknown as typeof fetch });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(acked.some((u) => u.includes("cmd-stale-dir"))).toBe(true);
+    poller.stop();
+  });
+
+  it("dispatches stale tag_set_dir to onTagSetDir which can reply and acks", async () => {
+    const acked: string[] = [];
+    const replies: string[] = [];
+    const callbacks = makeCallbacks();
+    callbacks.onTagSetDir = vi.fn().mockImplementation(async (_msg) => {
+      replies.push("/tag dir was removed; tag sessions individually");
+    });
+    const staleMsg = {
+      commandId: "cmd-stale-dir-reply",
+      commandType: "tag_set_dir" as const,
+      sessionId: "sess-1",
+      chatId: "chat-1",
+      pattern: "/home/dev/projects/mono/*",
+      tag: "fbm",
+    };
+    const fetchFn = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/next")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(staleMsg), { status: 200, headers: { "content-type": "application/json" } }),
+        );
+      }
+      acked.push(String(url));
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn as unknown as typeof fetch });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onTagSetDir).toHaveBeenCalledWith(staleMsg);
+    expect(replies).toEqual(["/tag dir was removed; tag sessions individually"]);
+    expect(acked.some((u) => u.includes("cmd-stale-dir-reply"))).toBe(true);
+    poller.stop();
+  });
 });
