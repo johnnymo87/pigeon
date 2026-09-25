@@ -15,6 +15,7 @@ export interface ArbiterClient {
   sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void>;
 }
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
+import { isOpencodeRoutable } from "../routing/opencode-routable";
 import { directoryMissing } from "./directory-check";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
@@ -270,7 +271,15 @@ export class SwarmArbiter {
       try {
         const client = this.clientForSession(target);
         if (!client) {
-          throw new TargetUnavailableError(`target ${target} not routable: no healthy serve available`);
+          // clientForSession also refuses sessions the opencode pool must not
+          // own (goose, or a registration with no backend). Naming those as a
+          // serve outage would send the sender hunting for one.
+          const row = this.storage.sessions.get(target);
+          throw new TargetUnavailableError(
+            row && !isOpencodeRoutable(row)
+              ? `target ${target} not routable: it has no opencode backend (backend_kind=${row.backendKind ?? "none"})`
+              : `target ${target} not routable: no healthy serve available`,
+          );
         }
         const directory = await this.directoryForSession(target);
         if (!directory) {

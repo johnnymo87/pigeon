@@ -550,6 +550,45 @@ describe("SwarmArbiter", () => {
     expect(notices).toHaveLength(1);
   });
 
+  it("4b. A target registered with no opencode backend fails with that reason, not 'no healthy serve'", async () => {
+    // clientForSession refuses sessions the opencode pool must not own. Saying
+    // "no healthy serve" for those would send the sender looking for a serve
+    // outage that does not exist.
+    fixture = makeFixture();
+    const { storage, arbiter } = fixture;
+    let now = 1_000;
+    fixture.setNow(now);
+    fixture.setClientForSession(() => undefined);
+    storage.sessions.upsert({ sessionId: "ses_b", notify: true, cwd: "/tmp/job" }, now);
+
+    storage.swarm.insert({
+      msgId: "m_nobackend",
+      fromSession: "ses_a",
+      toSession: "ses_b",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello",
+      deliverAt: null,
+      expiresAt: null,
+    }, now);
+
+    for (let i = 0; i < 15; i++) {
+      await arbiter.processOnce();
+      now += 60_000;
+      fixture.setNow(now);
+    }
+
+    expect(storage.swarm.getByMsgId("m_nobackend")!.state).toBe("failed");
+    const notices = storage.db
+      .prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'")
+      .all() as Array<Record<string, unknown>>;
+    expect(notices).toHaveLength(1);
+    expect(String(notices[0]!.payload)).toContain("no opencode backend");
+    expect(String(notices[0]!.payload)).not.toContain("no healthy serve");
+  });
+
   it("5. A timeout DOES burn budget (pins the non-idempotency decision)", async () => {
     fixture = makeFixture();
     const { storage, arbiter } = fixture;

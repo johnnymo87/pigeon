@@ -3,9 +3,10 @@ import { readFileSync } from "node:fs";
 import { gooseControlVerdict } from "../src/goose/control-guard.js";
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind.js";
 
-const lookup = (kind: string | null | undefined) => ({
+const lookup = (kind: string | null | undefined, routable = true) => ({
   backendKindOf: () => kind,
   gooseBackendKind: GOOSE_BACKEND_KIND,
+  opencodeRoutable: () => routable,
 });
 
 describe("gooseControlVerdict", () => {
@@ -20,6 +21,27 @@ describe("gooseControlVerdict", () => {
     // problem to report, and claiming it as goose would hide a real bug.
     expect(gooseControlVerdict("kill", "s", lookup(undefined)).kind).toBe("not-goose");
     expect(gooseControlVerdict("kill", "s", lookup(null)).kind).toBe("not-goose");
+  });
+
+  it("refuses every command for a session the opencode pool must not own, instead of going quiet", () => {
+    // A registered session with no backend (or one this daemon has no adapter
+    // for). clientForSession returns undefined for it, so without this the
+    // handler would log "not routable" and the human would hear nothing. /kill
+    // in particular must not tear anything down: there is no backend to stop,
+    // and the registrant re-creates its row on its next /session-start.
+    for (const cmd of ["kill", "interrupt", "compact", "mcp", "model"] as const) {
+      const v = gooseControlVerdict(cmd, "s", lookup(null, false));
+      expect(v.kind, cmd).toBe("refuse");
+      const reply = (v as { reply: string }).reply;
+      expect(reply, cmd).toContain(`/${cmd}`);
+      expect(reply, cmd).toMatch(/no backend pigeon can control/i);
+    }
+  });
+
+  it("does not let the routable check override the goose answers", () => {
+    // goose sessions are also not opencode-routable; they keep their own replies.
+    expect(gooseControlVerdict("kill", "s", lookup(GOOSE_BACKEND_KIND, false)).kind).toBe("kill");
+    expect((gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND, false)) as { reply: string }).reply).toMatch(/no interrupt/i);
   });
 
   it("refuses /interrupt without pretending to have stopped anything", () => {
@@ -68,13 +90,14 @@ describe("gooseControlVerdict", () => {
 describe("index.ts control-path wiring", () => {
   const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 
-  it("guards goose sessions inside clientForSession itself, not at its call sites", () => {
+  it("builds clientForSession from the guarded resolver, not by calling the factory directly", () => {
     // The choke point: every caller, present and future, is covered by this.
-    const decl = src.slice(src.indexOf("const clientForSession = ("));
-    const body = decl.slice(0, decl.indexOf("\n};"));
-    expect(body).toMatch(/if \(isGooseSession\(sessionId\)\) return undefined;/);
-    // And the guard must come before any routing call, not after it.
-    expect(body.indexOf("isGooseSession")).toBeLessThan(body.indexOf("clientFactory"));
+    // The guard itself (read the session before touching the factory) is
+    // behaviourally tested in test/routing/opencode-routable.test.ts; what is
+    // pinned here is that index.ts actually uses it.
+    expect(src).toMatch(/const clientForSession = makeClientForSession\(\{/);
+    // Nothing in index.ts may reach the router around it.
+    expect(src).not.toMatch(/clientFactory\.forSession\(/);
   });
 
   it("still asks the control guard first, so a goose session gets an answer rather than silence", () => {

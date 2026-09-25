@@ -43,6 +43,11 @@ export interface GooseControlLookup {
   /** The session's `backend_kind`, or undefined when there is no such session. */
   backendKindOf(sessionId: string): string | null | undefined;
   gooseBackendKind: string;
+  /**
+   * Whether the opencode serve pool may own this session (see
+   * routing/opencode-routable.ts). Consulted only for non-goose sessions.
+   */
+  opencodeRoutable(sessionId: string): boolean;
 }
 
 /**
@@ -57,7 +62,20 @@ export function gooseControlVerdict(
   lookup: GooseControlLookup,
 ): GooseControlVerdict {
   if (lookup.backendKindOf(sessionId) !== lookup.gooseBackendKind) {
-    return { kind: "not-goose" };
+    if (lookup.opencodeRoutable(sessionId)) return { kind: "not-goose" };
+    // A registered session the opencode pool must not own: no backend at all,
+    // or a kind this daemon has no adapter for. `clientForSession` returns
+    // undefined for it, and the handlers treat that as "log and go quiet", so
+    // answering here is the difference between an honest reply and silence.
+    // Nothing is torn down, /kill included: there is no backend to stop, and a
+    // registrant that re-registers on its next /session-start would bring the
+    // row straight back.
+    return {
+      kind: "refuse",
+      reply:
+        `/${command} is not available for this session: it has no backend pigeon can control. `
+        + "It can post to this topic, but pigeon cannot stop, steer or configure it from here.",
+    };
   }
 
   switch (command) {
