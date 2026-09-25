@@ -59,6 +59,7 @@ import {
 } from "./routing/flap-detector";
 import { ServeHealthPoller } from "./routing/serve-health-poller";
 import { OpencodeClientFactory } from "./routing/client-factory";
+import { isOpencodeRoutable, makeClientForSession } from "./routing/opencode-routable";
 import { ServeOutcomeSensor } from "./routing/serve-outcome";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
 
@@ -151,29 +152,28 @@ const clientFactory = ingressRouter
   : undefined;
 /**
  * Resolve the owning-serve client for a session; falls back to the legacy single
- * client when routing is unconfigured.
+ * client when routing is unconfigured. Returns `undefined` for any session the
+ * opencode pool must not own -- goose, a registration with no backend, or a
+ * backend kind this daemon has no adapter for.
  *
- * A goose session resolves to `undefined` HERE, at the choke point, rather than
- * at each call site. `forSession` -> `ensureRouted` -> `placeSession` does not
- * decline an id it has never seen: it writes a `session_assignment` row AND
- * acquires a live lease, and live leases are counted against `activeTurnCap`,
- * so a goose id would narrow placement for real opencode sessions -- damage to
- * OTHER sessions, which is what makes it hard to attribute afterwards.
- *
- * Guarding the nine control handlers individually was the first attempt and it
- * was not enough: this function is ALSO handed whole to the swarm arbiter
- * (below) and to `/launch`'s owner resolution, so a `/swarm/send` aimed at a
- * goose id would still have minted the lease. One guard here covers every
- * present and future caller.
+ * The guard lives in the resolver, at the choke point, rather than at call
+ * sites: `forSession` -> `ensureRouted` -> `placeSession` does not decline an id
+ * it has never seen, it writes a `session_assignment` row AND acquires a live
+ * lease counted against `activeTurnCap`, so a non-opencode id narrows placement
+ * for real opencode sessions. This resolver is handed whole to the swarm
+ * arbiter and to `/launch`'s owner resolution as well as to the control
+ * handlers, so one guard here covers every present and future caller. See
+ * routing/opencode-routable.ts for the allow-list and why it is one.
  *
  * The handlers still ask `handleGooseControl` first, because returning
  * `undefined` here only makes them log "not routable" and go quiet, and a
  * silent non-answer is exactly what the honest replies exist to avoid.
  */
-const clientForSession = (sessionId: string): OpencodeClient | undefined => {
-  if (isGooseSession(sessionId)) return undefined;
-  return clientFactory ? clientFactory.forSession(sessionId) : opencodeClient;
-};
+const clientForSession = makeClientForSession({
+  getSession: (sessionId) => storage.sessions.get(sessionId) ?? undefined,
+  clientFactory,
+  fallbackClient: opencodeClient,
+});
 
 /**
  * The app's own request handler, bound once it exists.
@@ -265,10 +265,6 @@ const gooseRunners = config.gooseAcpUrl
  */
 const canLaunchGoose = Boolean(gooseRunners && config.gooseAcpUrl);
 
-/** True for sessions this daemon speaks to over goose's ACP rather than opencode. */
-const isGooseSession = (sessionId: string): boolean =>
-  storage.sessions.get(sessionId)?.backendKind === GOOSE_BACKEND_KIND;
-
 /**
  * Intercepts a control command aimed at a goose session BEFORE it can reach
  * `clientForSession`. Returns true when the command was handled here.
@@ -283,6 +279,7 @@ async function handleGooseControl(
   const verdict = gooseControlVerdict(command, msg.sessionId, {
     backendKindOf: (id) => storage.sessions.get(id)?.backendKind,
     gooseBackendKind: GOOSE_BACKEND_KIND,
+    opencodeRoutable: (id) => isOpencodeRoutable(storage.sessions.get(id) ?? undefined),
   });
   if (verdict.kind === "not-goose") return false;
 
@@ -452,7 +449,10 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // is safe ONLY because the goose adapter declares
           // failurePolicy:"surface": that gates out the whole connection-error
           // block, including the no-client branch that would otherwise DELETE
-          // the session unconditionally.
+          // the session unconditionally. Every OTHER session it returns
+          // undefined for has no adapter at all (isOpencodeRoutable keeps every
+          // row selectAdapter would serve with a non-surface adapter), so it
+          // takes the honest "not reachable" reply and never reaches that block.
           const client = clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
