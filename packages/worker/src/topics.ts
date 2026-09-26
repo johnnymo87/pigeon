@@ -69,6 +69,7 @@ export function topicsEnabled(env: { TELEGRAM_TOPICS_ENABLED?: string }): boolea
 export const MACHINE_ICON_COLORS: Record<string, number> = {
   devbox: 7322096, // 0x6FB9F0 blue
   cloudbox: 9367192, // 0x8EEE98 green
+  macbook: 13338331, // 0xCB86DB purple
 };
 export const DEFAULT_ICON_COLOR = 16766590; // 0xFFD67E yellow
 

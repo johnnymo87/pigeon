@@ -225,6 +225,17 @@ Allow the worker to accept updates from both the old DM and the new Supergroup c
    the host and re-apply its NixOS configuration so the decrypted value is rewritten, then restart the
    daemon (next step). The daemon reads `TELEGRAM_CHAT_ID`, falling back to `TELEGRAM_GROUP_ID`
    (`packages/daemon/src/config.ts`). See the `secrets-and-auth` skill.
+
+   On **macOS** there is no sops: the launchd agent reads the Keychain item `pigeon-telegram-chat-id`
+   at start. Replace it and restart the agent (no rebuild needed, the plist is unchanged):
+   ```bash
+   security delete-generic-password -s pigeon-telegram-chat-id
+   security add-generic-password -a "$USER" -s pigeon-telegram-chat-id -w "-100XXXXXXXXXX"
+   launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon
+   ```
+   Each machine currently has its own supergroup: cloudbox `-1004391832753`, devbox `-1004232934695`,
+   macbook `-1003983501132`. A machine left on the DM chat id gets no topics — every notification
+   falls back to unthreaded.
 6. Restart daemon service on each host:
    ```bash
    sudo systemctl restart pigeon-daemon
