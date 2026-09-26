@@ -6853,6 +6853,7 @@ describe("topics module and topicName", () => {
     it("exports machine icon colors and default color", () => {
       expect(MACHINE_ICON_COLORS.devbox).toBe(7322096);
       expect(MACHINE_ICON_COLORS.cloudbox).toBe(9367192);
+      expect(MACHINE_ICON_COLORS.macbook).toBe(13338331);
       expect(DEFAULT_ICON_COLOR).toBe(16766590);
     });
   });
