@@ -10817,6 +10817,16 @@ describe("topics module and topicName", () => {
       expect(shouldCloseOrphans(atUtcHour(0))).toBe(false);
     });
 
+    it("(a2) pigeon-ln8z: exactly ONE tick per day closes orphans, at 04:00 UTC (midnight ET)", () => {
+      // A multi-hour window does not batch: new orphans (sessions crossing the 7-day TTL,
+      // deferred unregisters from the daemon's hourly reaper) keep appearing, so every
+      // "catch-up" tick found and closed a few more — observed 12/2/4/5 closes at 12–15 UTC.
+      const open = Array.from({ length: 24 }, (_, h) => h).filter((h) =>
+        shouldCloseOrphans(atUtcHour(h)),
+      );
+      expect(open).toEqual([4]);
+    });
+
     it("(b) closeOrphans:false skips the orphan-closer entirely, leaving the row open", async () => {
       const now = atUtcHour(3);
       await seedOrphan("ses_4890_gated", 68010, now);

@@ -14,23 +14,26 @@ export const DEFAULT_REAP_CAP = 5;
 export const DEFAULT_ORPHAN_CAP = 30;
 
 /**
- * pigeon-4890 — the orphan-closer only runs during a morning UTC window.
+ * pigeon-4890 / pigeon-ln8z — the orphan-closer runs on exactly ONE hourly tick per day.
  *
  * Closing a forum topic makes Telegram post a service message into it, which marks the topic
- * UNREAD. Running the closer on every hourly cron therefore trickled up to DEFAULT_ORPHAN_CAP
- * newly-unread topics into the sidebar around the clock. Batching them into one window turns
- * that into a single moment of the day.
+ * UNREAD. Running the closer on every hourly cron therefore trickled newly-unread topics into the
+ * sidebar around the clock. Gating it to a single tick turns that into a single moment of the day.
  *
- * The window is HOURS long rather than a single tick on purpose, and it replaces a durable
- * "last run was cut short" flag with something stateless: `closeOrphanedTopics` aborts the whole
- * run on a Telegram 429, and a backlog can exceed the per-run cap, so the trailing hours act as
- * catch-up. On an ordinary day the first tick drains everything and the remaining ticks find zero
- * orphans and post nothing at all, so the catch-up is invisible unless it is needed.
+ * It is one tick, not a multi-hour window. pigeon-4890 shipped a 4-hour window (12–15 UTC) whose
+ * trailing hours were meant as a stateless catch-up that would "find zero orphans" on an ordinary
+ * day. That premise was false: orphans appear continuously (sessions cross the 7-day TTL every
+ * hour, and the daemon's hourly reaper defers unregisters to this closer), so every trailing tick
+ * found and closed a few more — observed 12/2/4/5 closes at 12/13/14/15 UTC on 2026-09-30.
  *
- * 12:00 UTC is 08:00 US Eastern / 07:00 Central — the start of the operator's day.
+ * The cost of one tick: a run cut short by a Telegram 429, or a backlog over DEFAULT_ORPHAN_CAP,
+ * waits until tomorrow's tick. Both are rare, and a day's delay closing a dead topic is harmless.
+ *
+ * 04:00 UTC is midnight US Eastern during daylight time (23:00 during standard time — the cron is
+ * UTC-only, so the local hour shifts with DST).
  */
-export const TOPIC_CLOSE_WINDOW_START_HOUR_UTC = 12;
-export const TOPIC_CLOSE_WINDOW_HOURS = 4;
+export const TOPIC_CLOSE_WINDOW_START_HOUR_UTC = 4;
+export const TOPIC_CLOSE_WINDOW_HOURS = 1;
 
 /**
  * Whether a cron tick at `now` is inside the daily topic-close window.

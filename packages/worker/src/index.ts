@@ -122,7 +122,7 @@ export default {
     // The sweep also runs BEFORE the topic reaper so that topics orphaned by the sweep are
     // visible to it on this same tick. Note that the orphan half only acts during the daily
     // close window (see shouldCloseOrphans), and closes at most DEFAULT_ORPHAN_CAP (30) per
-    // tick, so a bulk sweep's topics drain over the window's ticks — possibly tomorrow's.
+    // tick, so a bulk sweep's topics beyond the cap drain on following days' ticks.
     try {
       await sweepStaleSessions(env.DB);
     } catch (err) {
