@@ -27,7 +27,10 @@ export const DEFAULT_ORPHAN_CAP = 30;
  * found and closed a few more — observed 12/2/4/5 closes at 12/13/14/15 UTC on 2026-09-30.
  *
  * The cost of one tick: a run cut short by a Telegram 429, or a backlog over DEFAULT_ORPHAN_CAP,
- * waits until tomorrow's tick. Both are rare, and a day's delay closing a dead topic is harmless.
+ * waits until tomorrow's tick. That is NOT rare: the loop is unpaced and each close posts into the
+ * same group, so busy days likely hit Telegram's per-group limit around ~20 closes (2026-09-23 ran
+ * 21/21/15 across the old window). Spill is still one batch per night, just a day later — harmless
+ * for a dead topic. Pacing the loop is the lever if that lag ever matters.
  *
  * 04:00 UTC is midnight US Eastern during daylight time (23:00 during standard time — the cron is
  * UTC-only, so the local hour shifts with DST).
