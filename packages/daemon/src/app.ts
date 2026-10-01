@@ -2,7 +2,8 @@ import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
-import type { StopNotifier } from "./notification-service";
+import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
+import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
@@ -299,7 +300,20 @@ interface AppOptions {
   router?: IngressRouter;
   authToken?: string;
   isSchedulerRunning?: () => boolean;
+  /**
+   * Session -> forum-topic lookup for `POST /alert` link buttons. Absent on a
+   * host with no worker connection; `links` is then ignored (fail open).
+   */
+  lookupTopics?: TopicLookup;
+  /** Bound on `lookupTopics` per alert. Test seam; production uses the default. */
+  alertLinkTimeoutMs?: number;
 }
+
+/**
+ * Floor on the send bound for a links-bearing `/alert`, so a lookup that ate
+ * most of the budget still leaves Telegram a real chance to answer.
+ */
+const ALERT_MIN_SEND_MS = 1_000;
 
 export function createApp(storage: StorageDb, options: AppOptions = {}) {
   const nowFn = options.nowFn ?? Date.now;
@@ -338,8 +352,38 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "alerting not configured" }, { status: 503 });
         }
 
+        // Optional link buttons. Resolved BEFORE the send and never throws: a bad
+        // `links` or an unreachable worker yields no keyboard, never a 4xx/5xx.
+        // When there is no keyboard the call below is made with exactly
+        // (text, severity), so an alert without links is unchanged on the wire.
+        //
+        // Time spent on the lookup is charged against the send's own bound, so a
+        // links-bearing alert answers within the same PLAIN_ALERT_TIMEOUT_MS as a
+        // plain one (callers size their HTTP timeout to it). Not nowFn: this is
+        // elapsed wall time, not a business timestamp.
+        const startedAt = Date.now();
+        const remaining = () =>
+          Math.max(ALERT_MIN_SEND_MS, PLAIN_ALERT_TIMEOUT_MS - (Date.now() - startedAt));
+        const replyMarkup = body.links === undefined
+          ? undefined
+          : await resolveAlertKeyboard(body.links, opts.lookupTopics, opts.alertLinkTimeoutMs);
+
         try {
-          await notifier.sendPlainAlert(text, severity);
+          if (replyMarkup) {
+            try {
+              await notifier.sendPlainAlert(text, severity, { replyMarkup, timeoutMs: remaining() });
+            } catch (err) {
+              // A 400 means Telegram rejected the payload and posted nothing —
+              // most plausibly the buttons. Resend once without them so the alert
+              // itself still lands. Any other failure (timeout, 5xx) has an
+              // unknown outcome and is NOT retried, to avoid a duplicate post.
+              if (!(err instanceof TelegramSendError && err.status === 400)) throw err;
+              console.warn(`[alert] Telegram rejected link buttons (${err.message}); resending without them`);
+              await notifier.sendPlainAlert(text, severity, { timeoutMs: remaining() });
+            }
+          } else {
+            await notifier.sendPlainAlert(text, severity);
+          }
           return new Response(null, { status: 204 });
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 502 });

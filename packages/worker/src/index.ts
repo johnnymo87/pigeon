@@ -5,6 +5,7 @@ import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media"
 import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
+import { handleTopicLookup } from "./topic-lookup";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -42,6 +43,11 @@ export default {
         }
         if (path === "/sessions/unregister" && method === "POST") {
           return handleSessionRequest(db, env, request, "unregister");
+        }
+
+        // Topics (read-only)
+        if (path === "/topics/lookup" && method === "POST") {
+          return handleTopicLookup(db, env, request);
         }
 
         // Media

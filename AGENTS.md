@@ -344,6 +344,13 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 
 **Message splitting:** When a notification body exceeds Telegram's 4096-character limit, it is split into multiple messages at natural boundaries (paragraph breaks, line breaks, sentence ends). Reply markup is attached only to the last chunk.
 
+**Plain alerts and link buttons (`POST /alert`):** `{text, severity, links?}`. The daemon posts `text` straight to Telegram in its configured chat — no topic, so in a forum it lands in General — and is not split, so callers keep it under 4096 characters. `links: [{label, sessionId}]` is optional. For each session that has a forum topic, it adds one url button (`https://t.me/c/<chat id without -100>/<thread id>`), so a digest that names sessions lets you tap straight into a session's thread and answer there. The mapping lives only in the worker's D1, so the daemon asks per alert with one `POST /topics/lookup`, bounded at 2s (`daemon/src/alert-links.ts`). The lookup's time is taken out of the send's own 10s bound, so a links-bearing alert answers within the same ~10s as a plain one. Callers should still set their HTTP timeout somewhat above 10s, because a timeout of exactly 10s can report failure for an alert that was posted. Four things are deliberate:
+
+- **It fails open, always.** If `links` is malformed or names a session with no topic, if the worker is unreachable or slow, or if this host has no worker connection, the alert is still sent, just without those buttons. Status codes are unchanged, and a bad `links` can never turn a 204 into a 4xx. Without a keyboard the send is byte-identical to an alert with no `links`.
+- **A Telegram 400 on the keyboard is retried once without it.** A 400 means nothing was posted. A timeout or 5xx is *not* retried, because it may have posted.
+- **The list is deduped, capped at 8 buttons, and labels are truncated to 64 characters.** Topics are created lazily, so a quiet or never-notified session gets no button. A closed topic is still linked, because it stays readable. But topics are closed only when the session is gone or idle for 7 days, so a reply typed there may answer "Session not found".
+- **The worker-health monitor ignores the lookup.** A decorative call must not be able to raise a worker-down alarm.
+
 ### Media Relay
 
 Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:

@@ -7,6 +7,7 @@
 
 import { BACKENDS_HEADER } from "./backends";
 import type { WorkerHealthObserver } from "./worker-health";
+import type { TopicMap } from "../alert-links";
 
 export interface SendNotificationInput {
   sessionId: string;
@@ -635,6 +636,33 @@ export class Poller {
       console.warn(`[poller] unregisterSession failed sessionId=${sessionId} kind=${result.kind} ${detail}`);
     }
     return result;
+  }
+
+  /**
+   * Batch session -> forum-topic lookup (`POST /topics/lookup`), used only to
+   * render optional link buttons on `POST /alert`. Throws on any failure: the
+   * single caller (`resolveAlertKeyboard`) fails open, and a throw is the
+   * simplest contract for it. Deliberately NOT recorded in the worker-health
+   * monitor — a decorative lookup must not be able to raise a worker-down alarm.
+   */
+  async lookupTopics(sessionIds: string[], signal?: AbortSignal): Promise<TopicMap> {
+    const response = await this.fetchFn(`${this.config.workerUrl}/topics/lookup`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionIds }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      throw new Error(`topics/lookup returned ${response.status}`);
+    }
+    const body = (await response.json()) as { topics?: unknown };
+    if (!body || typeof body.topics !== "object" || body.topics === null) {
+      throw new Error("topics/lookup returned no topics map");
+    }
+    return body.topics as TopicMap;
   }
 
   async sendNotification(
