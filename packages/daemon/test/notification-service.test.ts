@@ -278,6 +278,22 @@ describe("TelegramNotificationService.sendPlainAlert replyMarkup", () => {
     expect(bodyOf(fetchMock)).toEqual({ chat_id: "-1001234567890", text: "hi", reply_markup: replyMarkup });
   });
 
+  it("honours a shorter timeoutMs", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+      const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+      const settled = service.sendPlainAlert("hi", "info", { timeoutMs: 3_000 }).then(
+        () => "resolved",
+        (err: unknown) => String(err),
+      );
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await settled).toContain("timed out after 3000ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a non-2xx throws a TelegramSendError carrying the status", async () => {
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ ok: false, description: "Bad Request: BUTTON_URL_INVALID" }), { status: 400 }),

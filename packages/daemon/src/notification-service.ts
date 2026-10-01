@@ -11,7 +11,7 @@ import type { SendNotificationInput, WorkerResult } from "./worker/poller";
  * cost of waiting is a stalled delivery loop, while the cost of giving up is
  * one lost operational alert that is already best-effort.
  */
-const PLAIN_ALERT_TIMEOUT_MS = 10_000;
+export const PLAIN_ALERT_TIMEOUT_MS = 10_000;
 
 interface NotificationInput {
   event: string;
@@ -99,6 +99,12 @@ export interface PlainAlertOptions {
    * byte-identical to one sent before this option existed.
    */
   replyMarkup?: { inline_keyboard: Array<Array<{ text: string; url: string }>> };
+  /**
+   * Override the request bound (default PLAIN_ALERT_TIMEOUT_MS). Lets `/alert`
+   * charge time already spent on its link lookup against the same budget, so
+   * the route's worst case does not grow past today's.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -430,6 +436,7 @@ export class TelegramNotificationService implements StopNotifier {
   ): Promise<void> {
     const prefix =
       severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
+    const timeoutMs = options?.timeoutMs ?? PLAIN_ALERT_TIMEOUT_MS;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     // The AbortSignal alone only bounds a fetch that HONOURS it. Racing an
@@ -440,10 +447,10 @@ export class TelegramNotificationService implements StopNotifier {
         controller.abort();
         reject(
           new Error(
-            `Telegram sendMessage timed out after ${PLAIN_ALERT_TIMEOUT_MS}ms`,
+            `Telegram sendMessage timed out after ${timeoutMs}ms`,
           ),
         );
-      }, PLAIN_ALERT_TIMEOUT_MS);
+      }, timeoutMs);
     });
     deadline.catch(() => {});
 
@@ -464,7 +471,7 @@ export class TelegramNotificationService implements StopNotifier {
     } catch (err) {
       if (controller.signal.aborted) {
         throw new Error(
-          `Telegram sendMessage timed out after ${PLAIN_ALERT_TIMEOUT_MS}ms`,
+          `Telegram sendMessage timed out after ${timeoutMs}ms`,
         );
       }
       throw err;

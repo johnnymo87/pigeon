@@ -95,7 +95,25 @@ describe("POST /alert", () => {
       expect(lookupTopics.mock.calls[0]![0]).toEqual(["s1", "s2"]);
       expect(sendPlainAlert).toHaveBeenCalledWith("digest", "info", {
         replyMarkup: { inline_keyboard: [[{ text: "first", url: "https://t.me/c/1234567890/42" }]] },
+        timeoutMs: expect.any(Number),
       });
+    });
+
+    it("the lookup is charged against the send's 10s budget, so the total stays at today's bound", async () => {
+      let t = 0;
+      const realNow = Date.now;
+      Date.now = () => t;
+      try {
+        const lookupTopics = vi.fn(async () => {
+          t += 1_500;
+          return { s1: { chatId: CHAT, messageThreadId: 42, state: "open" as const } };
+        });
+        const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), lookupTopics });
+        await post(app, { text: "x", links: [{ label: "a", sessionId: "s1" }] });
+        expect(sendPlainAlert.mock.calls[0]![2].timeoutMs).toBe(8_500);
+      } finally {
+        Date.now = realNow;
+      }
     });
 
     it("no linkable session: sent exactly as if links were absent", async () => {
@@ -142,7 +160,9 @@ describe("POST /alert", () => {
       const res = await post(app, { text: "x", links: [{ label: "a", sessionId: "s1" }] });
       expect(res.status).toBe(204);
       expect(sendPlainAlert).toHaveBeenCalledTimes(2);
-      expect(sendPlainAlert.mock.calls[1]).toEqual(["x", "info"]);
+      expect(sendPlainAlert.mock.calls[1]![0]).toBe("x");
+      expect(sendPlainAlert.mock.calls[1]![2]).not.toHaveProperty("replyMarkup");
+      expect(sendPlainAlert.mock.calls[1]![2].timeoutMs).toBeLessThanOrEqual(10_000);
     });
 
     it("does not resend on a non-400 failure (it may have been delivered)", async () => {

@@ -108,7 +108,7 @@ function isTopicInfo(v: unknown): v is TopicInfo {
 /**
  * One url button per row, in link order. Sessions with no topic, a reserved
  * (thread-less) topic, or an unlinkable chat are skipped. A CLOSED topic is still
- * linked: it remains readable, and the next notification reopens it.
+ * linked because it remains readable, though its session is usually gone or idle.
  */
 export function buildAlertKeyboard(links: AlertLink[], topics: TopicMap): UrlKeyboard | undefined {
   const rows: UrlKeyboard["inline_keyboard"] = [];
