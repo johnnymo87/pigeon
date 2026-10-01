@@ -73,6 +73,7 @@ import {
   isServiceMessage,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
+import { handleNamedTopic, NAMED_TOPIC_HINT_TEXT } from "../src/named-topics";
 import { handlePollNext, handleAckCommand } from "../src/poll";
 import { handleSessionRequest, MAX_SESSIONS } from "../src/sessions";
 import {
@@ -161,6 +162,19 @@ const d1SchemaStatements = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
     ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at)`,
+  `CREATE TABLE IF NOT EXISTS named_topics (
+    chat_id            TEXT NOT NULL,
+    topic_key          TEXT NOT NULL,
+    message_thread_id  INTEGER NOT NULL,
+    name               TEXT NOT NULL,
+    reopen_checked_at  INTEGER,
+    hint_at            INTEGER,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, topic_key)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topics_thread
+    ON named_topics(chat_id, message_thread_id)`,
 ];
 
 beforeAll(async () => {
@@ -12817,5 +12831,186 @@ describe("unparseable 200 measurement (pigeon-jahv)", () => {
 
     await sendMessage("tok", { chatId: 1, text: "hi" });
     expect(warnSpy.mock.calls.find((c) => String(c[0]).includes("unparseable 200"))).toBeUndefined();
+  });
+});
+
+// ─── Named topics (POST /topics/named) ─────────────────────────────────
+
+describe("named topics", () => {
+  const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+  const CHAT = String(CHAT_ID_NUM);
+  let seq = 0;
+  const nextKey = () => `test:named-${Date.now()}-${++seq}`;
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+  });
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  /** Record calls to one Telegram method, replying with `result` (or a fn of the body). */
+  function onTelegram(method: string, reply: (body: any) => { ok: boolean; [k: string]: unknown }) {
+    const calls: any[] = [];
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
+      .reply((opts: any) => {
+        const body = JSON.parse(opts.body as string);
+        calls.push(body);
+        return {
+          statusCode: 200,
+          data: JSON.stringify(reply(body)),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      })
+      .persist();
+    return calls;
+  }
+
+  function named(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+    return handleNamedTopic(env.DB, e, new Request("https://worker/topics/named", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  test("requires auth", async () => {
+    const res = await named({ chatId: CHAT, key: nextKey(), name: "n" }, topicsEnv, { "Content-Type": "application/json" });
+    expect(res.status).toBe(401);
+  });
+
+  test("route is mounted", async () => {
+    const res = await SELF.fetch("https://worker/topics/named", { method: "POST", headers: authHeaders, body: "{}" });
+    expect(res.status).toBe(400);
+  });
+
+  test("rejects a bad key, a disallowed chat, and topics-disabled (all fail-open signals)", async () => {
+    expect((await named({ chatId: CHAT, key: "has space", name: "n" })).status).toBe(400);
+    expect((await named({ chatId: CHAT, key: "x".repeat(65), name: "n" })).status).toBe(400);
+    expect((await named({ chatId: CHAT, key: "", name: "n" })).status).toBe(400);
+    expect((await named({ chatId: CHAT, key: nextKey(), name: "n", staleThreadId: "7" })).status).toBe(400);
+    expect((await named({ chatId: "-1009999", key: nextKey(), name: "n" })).status).toBe(403);
+    expect((await named({ chatId: CHAT, key: nextKey(), name: "n" }, env as Env)).status).toBe(409);
+  });
+
+  test("creates a topic for a new key, then reuses it without another create", async () => {
+    const key = nextKey();
+    const creates = onTelegram("createForumTopic", (b) => ({ ok: true, result: { message_thread_id: 880001 + seq, name: b.name, icon_color: 0 } }));
+
+    const first = await named({ chatId: CHAT, key, name: "  Digest one  " });
+    expect(first.status).toBe(200);
+    const a = (await first.json()) as any;
+    expect(a).toEqual({ chatId: CHAT, messageThreadId: 880001 + seq, created: true });
+    expect(creates).toHaveLength(1);
+    expect(creates[0].name).toBe("Digest one");
+
+    const second = await named({ chatId: CHAT, key, name: "a different name is ignored" });
+    expect((await second.json()) as any).toEqual({ chatId: CHAT, messageThreadId: a.messageThreadId, created: false });
+    expect(creates).toHaveLength(1);
+  });
+
+  test("falls back to the key as the name, and truncates to 128 chars", async () => {
+    const creates = onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: 881000 + seq, name: "x", icon_color: 0 } }));
+    const k1 = nextKey();
+    await named({ chatId: CHAT, key: k1, name: "   " });
+    await named({ chatId: CHAT, key: nextKey(), name: "y".repeat(300) });
+    expect(creates[0].name).toBe(k1);
+    expect(creates[1].name).toHaveLength(128);
+  });
+
+  test("create failure -> 502, nothing stored", async () => {
+    const key = nextKey();
+    onTelegram("createForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: not enough rights to create a topic" }));
+    expect((await named({ chatId: CHAT, key, name: "n" })).status).toBe(502);
+    expect(await env.DB.prepare("SELECT * FROM named_topics WHERE topic_key = ?").bind(key).first()).toBeNull();
+  });
+
+  test("reopens an existing topic at most once per interval, and recreates one deleted out of band", async () => {
+    const key = nextKey();
+    const now = Date.now();
+    const thread = 882000 + seq;
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?, ?)`,
+    ).bind(CHAT, key, thread, now - 2 * 60 * 60 * 1000, now, now).run();
+
+    const reopens = onTelegram("reopenForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" }));
+    const r1 = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
+    const r2 = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
+    expect(r1.messageThreadId).toBe(thread);
+    expect(r2.messageThreadId).toBe(thread);
+    expect(reopens).toHaveLength(1);
+
+    // Deleted out of band: the daemon reports the stale thread and gets a new topic.
+    const creates = onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread + 1, name: "n", icon_color: 0 } }));
+    const r3 = (await (await named({ chatId: CHAT, key, name: "n", staleThreadId: thread })).json()) as any;
+    expect(r3).toEqual({ chatId: CHAT, messageThreadId: thread + 1, created: true });
+    expect(creates).toHaveLength(1);
+
+    // A stale report naming a thread that is no longer stored does not drop the new one.
+    const r4 = (await (await named({ chatId: CHAT, key, name: "n", staleThreadId: thread })).json()) as any;
+    expect(r4.messageThreadId).toBe(thread + 1);
+    expect(creates).toHaveLength(1);
+  });
+
+  test("a reopen that reports thread-not-found recreates the topic", async () => {
+    const key = nextKey();
+    const now = Date.now();
+    const thread = 883000 + seq;
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', NULL, ?, ?)`,
+    ).bind(CHAT, key, thread, now, now).run();
+    onTelegram("reopenForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }));
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread + 5, name: "n", icon_color: 0 } }));
+    const r = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
+    expect(r).toEqual({ chatId: CHAT, messageThreadId: thread + 5, created: true });
+  });
+
+  test("named topics are invisible to the orphan-closer and the reaper", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?)`,
+    ).bind(CHAT, nextKey(), 884000 + seq, now - 60 * 86400 * 1000, now - 60 * 86400 * 1000).run();
+    const closes = onTelegram("closeForumTopic", () => ({ ok: true, result: true }));
+    const deletes = onTelegram("deleteForumTopic", () => ({ ok: true, result: true }));
+    await closeOrphanedTopics(env.DB, { botToken: "t", now, orphanTtlMs: ORPHAN_TTL_MS });
+    await reapTopics(env.DB, { botToken: "t", now });
+    expect(closes.filter((c) => c.message_thread_id === 884000 + seq)).toHaveLength(0);
+    expect(deletes.filter((c) => c.message_thread_id === 884000 + seq)).toHaveLength(0);
+  });
+
+  test("a message typed in a named topic gets one rate-limited hint and is never queued", async () => {
+    const key = nextKey();
+    const now = Date.now();
+    const thread = 885000 + seq;
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?)`,
+    ).bind(CHAT, key, thread, now, now).run();
+    const sends = onTelegram("sendMessage", () => ({ ok: true, result: { message_id: 1 } }));
+
+    const update = () => ({
+      update_id: ++webhookUpdateCounter,
+      message: {
+        message_id: ++webhookUpdateCounter,
+        chat: { id: CHAT_ID_NUM },
+        from: { id: CHAT_ID_NUM },
+        message_thread_id: thread,
+        text: "what is the status?",
+      },
+    });
+    await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update()));
+    await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update()));
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({ chat_id: CHAT, message_thread_id: thread, text: NAMED_TOPIC_HINT_TEXT });
+    const queued = await env.DB.prepare("SELECT COUNT(*) AS n FROM commands WHERE message_thread_id = ?").bind(thread).first<{ n: number }>();
+    expect(queued?.n).toBe(0);
   });
 });

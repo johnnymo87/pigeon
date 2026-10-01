@@ -90,6 +90,11 @@ export interface StopNotifier {
     severity: AlertSeverity,
     options?: PlainAlertOptions,
   ): Promise<void>;
+  /**
+   * Optional: clear the pin Telegram puts on the first message of a newly
+   * created forum topic. Best-effort; callers must tolerate absence and failure.
+   */
+  unpinTopic?(messageThreadId: number): Promise<void>;
 }
 
 export interface PlainAlertOptions {
@@ -105,6 +110,11 @@ export interface PlainAlertOptions {
    * the route's worst case does not grow past today's.
    */
   timeoutMs?: number;
+  /**
+   * Forum topic to post into. Omitted from the request when absent, so an
+   * alert without a topic still lands in General exactly as before.
+   */
+  messageThreadId?: number;
 }
 
 /**
@@ -116,8 +126,10 @@ export class TelegramSendError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    /** Telegram's `description`, when the error body carried one. */
+    public readonly description?: string,
   ) {
-    super(message);
+    super(description ? `${message}: ${description}` : message);
     this.name = "TelegramSendError";
   }
 }
@@ -463,6 +475,7 @@ export class TelegramNotificationService implements StopNotifier {
           chat_id: this.chatId,
           text: `${prefix}${text}`,
           ...(options?.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+          ...(options?.messageThreadId !== undefined ? { message_thread_id: options.messageThreadId } : {}),
         }),
         signal: controller.signal,
       });
@@ -482,7 +495,46 @@ export class TelegramNotificationService implements StopNotifier {
       throw new TelegramSendError(
         response.status,
         `Telegram sendMessage returned ${response.status}`,
+        await readDescription(response),
       );
     }
+  }
+
+  async unpinTopic(messageThreadId: number): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PLAIN_ALERT_TIMEOUT_MS);
+    try {
+      const res = await this.fetchFn(`${this.apiBase}/unpinAllForumTopicMessages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: this.chatId, message_thread_id: messageThreadId }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`unpinAllForumTopicMessages returned ${res.status}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Telegram's error `description`, bounded: the response headers have arrived but
+ * a body read can still stall, and this sits on the alert's critical path.
+ */
+async function readDescription(response: Response): Promise<string | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const text = await Promise.race([
+      response.text(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(""), 1_000);
+      }),
+    ]);
+    const parsed = JSON.parse(text) as { description?: unknown };
+    return typeof parsed.description === "string" ? parsed.description : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
   }
 }

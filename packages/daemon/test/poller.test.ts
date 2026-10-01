@@ -1322,6 +1322,29 @@ describe("Poller.lookupTopics()", () => {
   });
 });
 
+describe("Poller.resolveNamedTopic()", () => {
+  it("POSTs chatId/key/name to /topics/named and returns the thread", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ chatId: "chat-42", messageThreadId: 9, created: true }), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    expect(await poller.resolveNamedTopic({ key: "k", name: "n", staleThreadId: 3 })).toEqual({ messageThreadId: 9, created: true });
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/topics/named");
+    expect(JSON.parse(init.body as string)).toEqual({ chatId: "chat-42", key: "k", name: "n", staleThreadId: 3 });
+  });
+
+  it("throws on non-2xx, a bad body, or no chat configured", async () => {
+    const f1 = vi.fn().mockResolvedValue(new Response("{}", { status: 502 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f1 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
+    const f2 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ messageThreadId: "x" }), { status: 200 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f2 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
+    const f3 = vi.fn();
+    await expect(new Poller({ ...BASE_CONFIG, chatId: undefined }, makeCallbacks(), { fetchFn: f3 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
+    expect(f3).not.toHaveBeenCalled();
+  });
+});
+
 describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
   function capture() {
     const bodies: unknown[] = [];

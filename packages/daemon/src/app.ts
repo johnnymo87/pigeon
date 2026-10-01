@@ -4,6 +4,12 @@ import { registerGooseSession } from "./goose/register-session.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
+import {
+  DEFAULT_TOPIC_RESOLVE_TIMEOUT_MS,
+  parseAlertTopic,
+  resolveAlertTopic,
+  type NamedTopicResolver,
+} from "./alert-topic";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
 import type { QuestionInfoData } from "./storage/types";
@@ -307,6 +313,13 @@ interface AppOptions {
   lookupTopics?: TopicLookup;
   /** Bound on `lookupTopics` per alert. Test seam; production uses the default. */
   alertLinkTimeoutMs?: number;
+  /**
+   * Find-or-create a caller-keyed forum topic for `POST /alert` `topic`. Absent
+   * on a host with no worker connection; `topic` is then ignored (General).
+   */
+  resolveNamedTopic?: NamedTopicResolver;
+  /** Bound on `resolveNamedTopic` per alert. Test seam. */
+  alertTopicTimeoutMs?: number;
 }
 
 /**
@@ -352,42 +365,99 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "alerting not configured" }, { status: 503 });
         }
 
-        // Optional link buttons. Resolved BEFORE the send and never throws: a bad
-        // `links` or an unreachable worker yields no keyboard, never a 4xx/5xx.
-        // When there is no keyboard the call below is made with exactly
-        // (text, severity), so an alert without links is unchanged on the wire.
+        // Optional link buttons and named topic. Both are resolved BEFORE the send,
+        // in parallel, and neither ever throws: a bad `links`/`topic` or an
+        // unreachable worker yields no keyboard / General, never a 4xx/5xx.
+        // When neither applies the call below is made with exactly
+        // (text, severity), so a plain alert is unchanged on the wire.
         //
-        // Time spent on the lookup is charged against the send's own bound, so a
-        // links-bearing alert answers within the same PLAIN_ALERT_TIMEOUT_MS as a
+        // Time spent resolving is charged against the send's own bound, so an
+        // enriched alert answers within about the same PLAIN_ALERT_TIMEOUT_MS as a
         // plain one (callers size their HTTP timeout to it). Not nowFn: this is
         // elapsed wall time, not a business timestamp.
         const startedAt = Date.now();
         const remaining = () =>
           Math.max(ALERT_MIN_SEND_MS, PLAIN_ALERT_TIMEOUT_MS - (Date.now() - startedAt));
-        const replyMarkup = body.links === undefined
-          ? undefined
-          : await resolveAlertKeyboard(body.links, opts.lookupTopics, opts.alertLinkTimeoutMs);
+        const topic = body.topic === undefined ? undefined : parseAlertTopic(body.topic);
+        const [keyboard, resolvedTopic] = await Promise.all([
+          body.links === undefined
+            ? undefined
+            : resolveAlertKeyboard(body.links, opts.lookupTopics, opts.alertLinkTimeoutMs),
+          topic ? resolveAlertTopic(topic, opts.resolveNamedTopic, opts.alertTopicTimeoutMs) : undefined,
+        ]);
 
-        try {
-          if (replyMarkup) {
-            try {
-              await notifier.sendPlainAlert(text, severity, { replyMarkup, timeoutMs: remaining() });
-            } catch (err) {
-              // A 400 means Telegram rejected the payload and posted nothing —
-              // most plausibly the buttons. Resend once without them so the alert
-              // itself still lands. Any other failure (timeout, 5xx) has an
-              // unknown outcome and is NOT retried, to avoid a duplicate post.
-              if (!(err instanceof TelegramSendError && err.status === 400)) throw err;
-              console.warn(`[alert] Telegram rejected link buttons (${err.message}); resending without them`);
-              await notifier.sendPlainAlert(text, severity, { timeoutMs: remaining() });
-            }
-          } else {
+        if (!keyboard && !resolvedTopic) {
+          try {
             await notifier.sendPlainAlert(text, severity);
+            return new Response(null, { status: 204 });
+          } catch (err) {
+            return Response.json({ error: String(err) }, { status: 502 });
           }
-          return new Response(null, { status: 204 });
+        }
+
+        // Fallback ladder. Only a Telegram 400 is retried: it means nothing was
+        // posted. A timeout or 5xx has an unknown outcome and is NOT retried, to
+        // avoid a duplicate post. Rungs: recreate a deleted topic once; drop the
+        // buttons; move to General (buttons restored); drop the buttons again.
+        // The topic is dropped at most once and never restored, so this ends at
+        // a plain alert in General after at most five sends.
+        let replyMarkup = keyboard;
+        let thread = resolvedTopic?.messageThreadId;
+        let createdThread = resolvedTopic?.created ? thread : undefined;
+        let recreated = false;
+        try {
+          for (;;) {
+            try {
+              await notifier.sendPlainAlert(text, severity, {
+                ...(replyMarkup ? { replyMarkup } : {}),
+                ...(thread !== undefined ? { messageThreadId: thread } : {}),
+                timeoutMs: remaining(),
+              });
+              break;
+            } catch (err) {
+              if (!(err instanceof TelegramSendError && err.status === 400)) throw err;
+              if (thread !== undefined && !recreated && /thread not found/i.test(err.description ?? "")) {
+                // The topic was deleted out of band: have the worker drop the
+                // stale mapping and make a new one, then try once more in it.
+                recreated = true;
+                const again = topic
+                  ? await resolveAlertTopic(
+                      topic,
+                      opts.resolveNamedTopic,
+                      Math.min(opts.alertTopicTimeoutMs ?? DEFAULT_TOPIC_RESOLVE_TIMEOUT_MS, remaining()),
+                      thread,
+                    )
+                  : undefined;
+                console.warn(`[alert] topic thread ${thread} not found; ${again ? `recreated as ${again.messageThreadId}` : "posting to General"}`);
+                thread = again?.messageThreadId;
+                createdThread = again?.created ? thread : undefined;
+              } else if (replyMarkup) {
+                console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
+                replyMarkup = undefined;
+              } else if (thread !== undefined) {
+                // The buttons were already dropped and it still failed, so the
+                // topic is the likelier culprit: try General WITH the buttons
+                // again before giving them up for good.
+                console.warn(`[alert] Telegram rejected the alert in its topic (${err.message}); posting to General`);
+                thread = undefined;
+                replyMarkup = keyboard;
+              } else {
+                throw err;
+              }
+            }
+          }
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 502 });
         }
+
+        // Telegram pins the first message of a new topic. Clear it, best-effort
+        // and off the response path.
+        if (createdThread !== undefined && thread === createdThread && notifier.unpinTopic) {
+          notifier.unpinTopic(createdThread).catch((err: unknown) => {
+            console.warn(`[alert] unpin of new topic ${createdThread} failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+        return new Response(null, { status: 204 });
       }
 
       if (request.method === "POST" && url.pathname === "/swarm/send") {
