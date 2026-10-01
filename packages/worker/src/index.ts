@@ -6,6 +6,7 @@ import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
+import { handleNamedTopic } from "./named-topics";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -48,6 +49,9 @@ export default {
         // Topics (read-only)
         if (path === "/topics/lookup" && method === "POST") {
           return handleTopicLookup(db, env, request);
+        }
+        if (path === "/topics/named" && method === "POST") {
+          return handleNamedTopic(db, env, request);
         }
 
         // Media

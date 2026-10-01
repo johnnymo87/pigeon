@@ -294,6 +294,31 @@ describe("TelegramNotificationService.sendPlainAlert replyMarkup", () => {
     }
   });
 
+  it("sends message_thread_id when given", async () => {
+    const fetchMock = okFetch();
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    await service.sendPlainAlert("hi", "info", { messageThreadId: 12 });
+    expect(bodyOf(fetchMock)).toEqual({ chat_id: "-1001234567890", text: "hi", message_thread_id: 12 });
+  });
+
+  it("a non-2xx carries Telegram's description", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: false, description: "Bad Request: message thread not found" }), { status: 400 }),
+    ) as unknown as typeof fetch;
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    const err = (await service.sendPlainAlert("hi", "info").catch((e: unknown) => e)) as TelegramSendError;
+    expect(err.description).toBe("Bad Request: message thread not found");
+  });
+
+  it("unpinTopic calls unpinAllForumTopicMessages for the thread", async () => {
+    const fetchMock = okFetch();
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    await service.unpinTopic(12);
+    const [url] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string];
+    expect(url).toContain("/unpinAllForumTopicMessages");
+    expect(bodyOf(fetchMock)).toEqual({ chat_id: "-1001234567890", message_thread_id: 12 });
+  });
+
   it("a non-2xx throws a TelegramSendError carrying the status", async () => {
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ ok: false, description: "Bad Request: BUTTON_URL_INVALID" }), { status: 400 }),

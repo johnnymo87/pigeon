@@ -175,6 +175,117 @@ describe("POST /alert", () => {
     });
   });
 
+  describe("topic", () => {
+    function post(app: ReturnType<typeof createApp>, body: unknown) {
+      return app(new Request("http://localhost/alert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+    }
+    const threadNotFound = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: message thread not found");
+
+    it("absent topic: notifier called with exactly (text, severity) and no resolve", async () => {
+      const resolveNamedTopic = vi.fn();
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
+      expect((await post(app, { text: "hi" })).status).toBe(204);
+      expect(sendPlainAlert.mock.calls[0]).toEqual(["hi", "info"]);
+      expect(resolveNamedTopic).not.toHaveBeenCalled();
+    });
+
+    it("posts into the resolved topic", async () => {
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
+      const res = await post(app, { text: "digest", topic: { key: "digest:a", name: "A" } });
+      expect(res.status).toBe(204);
+      expect(resolveNamedTopic.mock.calls[0]![0]).toEqual({ key: "digest:a", name: "A" });
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+      expect(sendPlainAlert.mock.calls[0]![2]).toMatchObject({ messageThreadId: 77 });
+    });
+
+    it("links and topic together: buttons ride in the topic", async () => {
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
+      const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "-1001234567890", messageThreadId: 42, state: "open" } });
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
+      await post(app, { text: "d", topic: { key: "k" }, links: [{ label: "a", sessionId: "s1" }] });
+      expect(sendPlainAlert.mock.calls[0]![2]).toMatchObject({
+        messageThreadId: 77,
+        replyMarkup: { inline_keyboard: [[{ text: "a", url: "https://t.me/c/1234567890/42" }]] },
+      });
+    });
+
+    it("a malformed topic or a failing resolver falls back to General with 204", async () => {
+      const failing = vi.fn().mockRejectedValue(new Error("worker down"));
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic: failing });
+      for (const topic of ["x", { key: "bad key" }, null, { key: "ok" }]) {
+        sendPlainAlert.mockClear();
+        const res = await post(app, { text: "x", topic });
+        expect(res.status).toBe(204);
+        expect(sendPlainAlert.mock.calls[0]).toEqual(["x", "info"]);
+      }
+      expect(failing).toHaveBeenCalledTimes(1); // only for the well-formed key
+    });
+
+    it("no resolver configured (no worker): General", async () => {
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true) });
+      expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
+      expect(sendPlainAlert.mock.calls[0]).toEqual(["x", "info"]);
+    });
+
+    it("thread not found: re-resolves with the stale thread and resends into the new topic", async () => {
+      const resolveNamedTopic = vi.fn()
+        .mockResolvedValueOnce({ messageThreadId: 77, created: false })
+        .mockResolvedValueOnce({ messageThreadId: 78, created: true });
+      sendPlainAlert.mockRejectedValueOnce(threadNotFound()).mockResolvedValueOnce(undefined);
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
+      expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
+      expect(resolveNamedTopic.mock.calls[1]![0]).toEqual({ key: "k", name: "k", staleThreadId: 77 });
+      expect(sendPlainAlert.mock.calls[1]![2]).toMatchObject({ messageThreadId: 78 });
+    });
+
+    it("thread not found and recreate fails: General", async () => {
+      const resolveNamedTopic = vi.fn()
+        .mockResolvedValueOnce({ messageThreadId: 77, created: false })
+        .mockRejectedValueOnce(new Error("create failed"));
+      sendPlainAlert.mockRejectedValueOnce(threadNotFound()).mockResolvedValueOnce(undefined);
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
+      expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
+      expect(sendPlainAlert.mock.calls[1]![2]).not.toHaveProperty("messageThreadId");
+    });
+
+    it("another 400 in the topic: drop the buttons, then the topic, before giving up", async () => {
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
+      const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "-1001234567890", messageThreadId: 42, state: "open" } });
+      const bad = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: something");
+      sendPlainAlert.mockRejectedValueOnce(bad()).mockRejectedValueOnce(bad()).mockResolvedValueOnce(undefined);
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
+      const res = await post(app, { text: "x", topic: { key: "k" }, links: [{ label: "a", sessionId: "s1" }] });
+      expect(res.status).toBe(204);
+      expect(sendPlainAlert).toHaveBeenCalledTimes(3);
+      expect(sendPlainAlert.mock.calls[1]![2]).toMatchObject({ messageThreadId: 77 });
+      expect(sendPlainAlert.mock.calls[1]![2]).not.toHaveProperty("replyMarkup");
+      expect(sendPlainAlert.mock.calls[2]![2]).not.toHaveProperty("messageThreadId");
+    });
+
+    it("a timeout in the topic is not retried (it may have posted)", async () => {
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
+      sendPlainAlert.mockRejectedValueOnce(new Error("Telegram sendMessage timed out after 10000ms"));
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
+      expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(502);
+      expect(sendPlainAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it("a newly created topic gets its auto-pin cleared, best-effort", async () => {
+      const unpinTopic = vi.fn().mockRejectedValue(new Error("no rights"));
+      const notifier = { sendPlainAlert, unpinTopic } as StopNotifier;
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 90, created: true });
+      const app = createApp(storage!, { nowFn: () => 1000, notifier, resolveNamedTopic });
+      expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(unpinTopic).toHaveBeenCalledWith(90);
+    });
+  });
+
   it("returns 503 when the notifier does not implement sendPlainAlert", async () => {
     const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(false) });
     const res = await app(new Request("http://localhost/alert", {

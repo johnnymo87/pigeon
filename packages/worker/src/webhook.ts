@@ -1,4 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
+import { maybeAnswerInNamedTopic } from "./named-topics";
 import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
@@ -1317,6 +1318,11 @@ export async function handleTelegramWebhook(
 
     const resolved = await resolveMessageSession(db, update.message, env);
     if (!resolved) {
+      // A message typed in a caller-keyed digest topic has no session behind it by design.
+      // Answer with a (rate-limited) hint instead of the generic error, and inject nothing.
+      if (chatId && await maybeAnswerInNamedTopic(db, env, String(chatId), update.message.message_thread_id)) {
+        return OK();
+      }
       if (chatId) {
         await sendTelegramMessage(env, chatId,
           "Could not find session for this message. Please reply to a recent notification or use /cmd TOKEN command format.", { messageThreadId: update.message.message_thread_id });

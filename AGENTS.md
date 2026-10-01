@@ -351,6 +351,11 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 - **The list is deduped, capped at 8 buttons, and labels are truncated to 64 characters.** Topics are created lazily, so a quiet or never-notified session gets no button. A closed topic is still linked, because it stays readable. But topics are closed only when the session is gone or idle for 7 days, so a reply typed there may answer "Session not found".
 - **The worker-health monitor ignores the lookup.** A decorative call must not be able to raise a worker-down alarm.
 
+**Named topics (`POST /alert` `topic`).** `topic: {key, name}` puts the alert in a forum topic of the caller's own instead of General: one per key, created on first use with `name` and reused afterwards (a changed `name` is ignored). `key` is `[A-Za-z0-9:._-]{1,64}`. The worker owns the mapping (`POST /topics/named`, D1 `named_topics`), and the daemon resolves the key in parallel with the link lookup, bounded at 3s, then sends the alert itself. It fails open the same way links do: a bad key, no worker, or a create failure puts the alert in General with the usual 204. If a send reports the topic deleted, the worker recreates it once. A topic closed by hand is reopened at most once an hour, since posting into a closed topic works anyway. Two things are deliberate:
+
+- **`named_topics` is a separate table from `topics`.** Everything that reads `topics` assumes a session owns the row: the orphan-closer closes rows whose session is gone, the reaper deletes them 30 days later, and inbound routing sends messages typed there to that session. A named topic has no session, so as a `topics` row it would be closed after a week and later deleted. The separate table exempts it from all three with no special cases.
+- **Typing in a named topic injects nothing.** No session reads it, so the worker replies with a short hint pointing at the link buttons, at most once per topic every 10 minutes, instead of the generic "Could not find session" error. A swipe-reply to a real session notification still routes normally.
+
 ### Media Relay
 
 Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:

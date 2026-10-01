@@ -81,3 +81,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
   ON topics(chat_id, message_thread_id) WHERE message_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at);
 
+
+-- Named topics: caller-keyed forum topics with no session (POST /alert `topic`).
+-- Separate from `topics` on purpose: the orphan-closer, reaper and inbound routing all treat a
+-- `topics` row as session-owned. See named-topics.ts.
+CREATE TABLE IF NOT EXISTS named_topics (
+  chat_id            TEXT NOT NULL,
+  topic_key          TEXT NOT NULL,
+  message_thread_id  INTEGER NOT NULL,
+  name               TEXT NOT NULL,
+  reopen_checked_at  INTEGER,
+  hint_at            INTEGER,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, topic_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topics_thread
+  ON named_topics(chat_id, message_thread_id);

@@ -665,6 +665,32 @@ export class Poller {
     return body.topics as TopicMap;
   }
 
+  /**
+   * Find-or-create a caller-keyed forum topic (`POST /topics/named`) in this
+   * daemon's chat, for `POST /alert` `topic`. Throws on any failure; the caller
+   * (`resolveAlertTopic`) fails open to General. Like `lookupTopics`, not
+   * recorded in the worker-health monitor.
+   */
+  async resolveNamedTopic(
+    req: { key: string; name: string; staleThreadId?: number },
+    signal?: AbortSignal,
+  ): Promise<{ messageThreadId: number; created: boolean }> {
+    if (!this.config.chatId) throw new Error("no chat configured");
+    const response = await this.fetchFn(`${this.config.workerUrl}/topics/named`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ chatId: this.config.chatId, ...req }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) throw new Error(`topics/named returned ${response.status}`);
+    const body = (await response.json()) as { messageThreadId?: unknown; created?: unknown };
+    if (typeof body?.messageThreadId !== "number") throw new Error("topics/named returned no thread");
+    return { messageThreadId: body.messageThreadId, created: body.created === true };
+  }
+
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
