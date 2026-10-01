@@ -253,7 +253,7 @@ describe("POST /alert", () => {
       expect(sendPlainAlert.mock.calls[1]![2]).not.toHaveProperty("messageThreadId");
     });
 
-    it("another 400 in the topic: drop the buttons, then the topic, before giving up", async () => {
+    it("another 400 in the topic: drop the buttons, then move to General with the buttons restored", async () => {
       const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
       const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "-1001234567890", messageThreadId: 42, state: "open" } });
       const bad = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: something");
@@ -265,6 +265,17 @@ describe("POST /alert", () => {
       expect(sendPlainAlert.mock.calls[1]![2]).toMatchObject({ messageThreadId: 77 });
       expect(sendPlainAlert.mock.calls[1]![2]).not.toHaveProperty("replyMarkup");
       expect(sendPlainAlert.mock.calls[2]![2]).not.toHaveProperty("messageThreadId");
+      expect(sendPlainAlert.mock.calls[2]![2]).toHaveProperty("replyMarkup");
+    });
+
+    it("400 on every rung: five sends at most, then 502", async () => {
+      const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
+      const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "-1001234567890", messageThreadId: 42, state: "open" } });
+      sendPlainAlert.mockRejectedValue(new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: x"));
+      const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
+      const res = await post(app, { text: "x", topic: { key: "k" }, links: [{ label: "a", sessionId: "s1" }] });
+      expect(res.status).toBe(502);
+      expect(sendPlainAlert.mock.calls.length).toBeLessThanOrEqual(5);
     });
 
     it("a timeout in the topic is not retried (it may have posted)", async () => {

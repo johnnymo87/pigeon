@@ -397,8 +397,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         // Fallback ladder. Only a Telegram 400 is retried: it means nothing was
         // posted. A timeout or 5xx has an unknown outcome and is NOT retried, to
-        // avoid a duplicate post. Each rung removes one enrichment, so this ends
-        // at a plain alert in General after at most four sends.
+        // avoid a duplicate post. Rungs: recreate a deleted topic once; drop the
+        // buttons; move to General (buttons restored); drop the buttons again.
+        // The topic is dropped at most once and never restored, so this ends at
+        // a plain alert in General after at most five sends.
         let replyMarkup = keyboard;
         let thread = resolvedTopic?.messageThreadId;
         let createdThread = resolvedTopic?.created ? thread : undefined;
@@ -433,8 +435,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
                 replyMarkup = undefined;
               } else if (thread !== undefined) {
+                // The buttons were already dropped and it still failed, so the
+                // topic is the likelier culprit: try General WITH the buttons
+                // again before giving them up for good.
                 console.warn(`[alert] Telegram rejected the alert in its topic (${err.message}); posting to General`);
                 thread = undefined;
+                replyMarkup = keyboard;
               } else {
                 throw err;
               }
