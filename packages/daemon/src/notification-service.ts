@@ -85,7 +85,35 @@ export interface StopNotifier {
    * bot. Implementations may omit this method; callers must check for
    * its presence and degrade gracefully.
    */
-  sendPlainAlert?(text: string, severity: AlertSeverity): Promise<void>;
+  sendPlainAlert?(
+    text: string,
+    severity: AlertSeverity,
+    options?: PlainAlertOptions,
+  ): Promise<void>;
+}
+
+export interface PlainAlertOptions {
+  /**
+   * Inline keyboard to attach (url buttons only — see alert-links.ts). Omitted
+   * entirely from the request when absent, so an alert without buttons is
+   * byte-identical to one sent before this option existed.
+   */
+  replyMarkup?: { inline_keyboard: Array<Array<{ text: string; url: string }>> };
+}
+
+/**
+ * Telegram answered with a non-2xx status. Carries the status so a caller can
+ * tell "Telegram rejected this payload" (400 — safe to resend a corrected
+ * payload, nothing was posted) from "unknown outcome" (timeouts, 5xx).
+ */
+export class TelegramSendError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TelegramSendError";
+  }
 }
 
 const EVENT_EMOJIS: Record<string, string> = {
@@ -395,7 +423,11 @@ export class TelegramNotificationService implements StopNotifier {
    * meant to report it. A try/catch does not help here: the failure mode is a
    * promise that never settles, not one that rejects.
    */
-  async sendPlainAlert(text: string, severity: AlertSeverity): Promise<void> {
+  async sendPlainAlert(
+    text: string,
+    severity: AlertSeverity,
+    options?: PlainAlertOptions,
+  ): Promise<void> {
     const prefix =
       severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
     const controller = new AbortController();
@@ -423,6 +455,7 @@ export class TelegramNotificationService implements StopNotifier {
         body: JSON.stringify({
           chat_id: this.chatId,
           text: `${prefix}${text}`,
+          ...(options?.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
         }),
         signal: controller.signal,
       });
@@ -439,7 +472,10 @@ export class TelegramNotificationService implements StopNotifier {
       clearTimeout(timer);
     }
     if (!response.ok) {
-      throw new Error(`Telegram sendMessage returned ${response.status}`);
+      throw new TelegramSendError(
+        response.status,
+        `Telegram sendMessage returned ${response.status}`,
+      );
     }
   }
 }

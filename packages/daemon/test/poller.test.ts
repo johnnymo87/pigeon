@@ -1290,6 +1290,38 @@ describe("Poller: inbound action clears unread", () => {
   });
 });
 
+describe("Poller.lookupTopics()", () => {
+  it("POSTs the ids to /topics/lookup with auth and the caller's signal, returning the map", async () => {
+    const topics = { s1: { chatId: "-1001", messageThreadId: 3, state: "open" }, s2: null };
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ topics }), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    const signal = new AbortController().signal;
+
+    expect(await poller.lookupTopics(["s1", "s2"], signal)).toEqual(topics);
+
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/topics/lookup");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
+    expect(JSON.parse(init.body as string)).toEqual({ sessionIds: ["s1", "s2"] });
+    expect(init.signal).toBe(signal);
+  });
+
+  it("throws on a non-2xx so the caller can fail open", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response("nope", { status: 404 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    await expect(poller.lookupTopics(["s1"])).rejects.toThrow(/404/);
+  });
+
+  it("throws when the body has no topics map", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    await expect(poller.lookupTopics(["s1"])).rejects.toThrow();
+  });
+});
+
 describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
   function capture() {
     const bodies: unknown[] = [];

@@ -80,6 +80,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `GET /sessions` (Bearer) -> JSON list of session rows
 - `POST /sessions/register` (Bearer) -> upsert session
 - `POST /sessions/unregister` (Bearer) -> remove session
+- `POST /topics/lookup` (Bearer) `{sessionIds: string[]}` (0-50) -> `{topics: {[sessionId]: {chatId, messageThreadId, state} | null}}`. Read-only view of the `topics` table; `null` = no topic (topics are created lazily). Used by the daemon's `/alert` link buttons.
 - `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
 - `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions.
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)

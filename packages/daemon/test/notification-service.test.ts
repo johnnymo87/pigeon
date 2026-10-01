@@ -8,6 +8,7 @@ import {
   formatEventTime,
   TelegramNotificationService,
   RateLimitError,
+  TelegramSendError,
   displayName,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";
@@ -248,6 +249,44 @@ describe("TelegramNotificationService", () => {
     const payload = JSON.parse(String(options.body)) as Record<string, unknown>;
     expect(payload.chat_id).toBe("8248645256");
     expect(payload.text).toBe("❌ Server error");
+  });
+});
+
+describe("TelegramNotificationService.sendPlainAlert replyMarkup", () => {
+  function okFetch() {
+    return vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 }),
+    ) as unknown as typeof fetch;
+  }
+  function bodyOf(fetchMock: typeof fetch): Record<string, unknown> {
+    const [, options] = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    return JSON.parse(String(options.body)) as Record<string, unknown>;
+  }
+
+  it("without options the request body is exactly {chat_id, text}", async () => {
+    const fetchMock = okFetch();
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    await service.sendPlainAlert("hi", "info");
+    expect(bodyOf(fetchMock)).toEqual({ chat_id: "-1001234567890", text: "hi" });
+  });
+
+  it("attaches reply_markup to the same chat when given", async () => {
+    const fetchMock = okFetch();
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    const replyMarkup = { inline_keyboard: [[{ text: "a", url: "https://t.me/c/1234567890/5" }]] };
+    await service.sendPlainAlert("hi", "info", { replyMarkup });
+    expect(bodyOf(fetchMock)).toEqual({ chat_id: "-1001234567890", text: "hi", reply_markup: replyMarkup });
+  });
+
+  it("a non-2xx throws a TelegramSendError carrying the status", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: false, description: "Bad Request: BUTTON_URL_INVALID" }), { status: 400 }),
+    ) as unknown as typeof fetch;
+    const service = new TelegramNotificationService({} as any, "t", "-1001234567890", () => 0, fetchMock);
+    const err = await service.sendPlainAlert("hi", "info").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TelegramSendError);
+    expect((err as TelegramSendError).status).toBe(400);
+    expect(String(err)).toContain("returned 400");
   });
 });
 

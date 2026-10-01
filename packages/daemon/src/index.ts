@@ -989,6 +989,9 @@ const app = createApp(storage, {
   router: ingressRouter,
   authToken: config.authToken,
   isSchedulerRunning: () => swarmArbiter !== undefined,
+  // Link buttons on POST /alert. Absent without a worker connection, in which
+  // case `links` is ignored and the alert is sent plain.
+  lookupTopics: poller ? (ids, signal) => poller.lookupTopics(ids, signal) : undefined,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
       await poller.registerSession(sessionId, label ?? undefined);

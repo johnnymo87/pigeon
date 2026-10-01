@@ -904,6 +904,77 @@ describe("GET /sessions", () => {
   });
 });
 
+// ─── Topic Lookup ──────────────────────────────────────────────────────
+
+describe("POST /topics/lookup", () => {
+  async function seedTopic(row: {
+    sessionId: string;
+    chatId: string;
+    threadId: number | null;
+    state?: "open" | "closed";
+  }): Promise<void> {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(row.sessionId, "m1", row.chatId, row.threadId, "n", row.state ?? "open", 1, 1)
+      .run();
+  }
+
+  function lookup(body: unknown, headers: Record<string, string> = authHeaders): Promise<Response> {
+    return SELF.fetch("https://worker/topics/lookup", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  }
+
+  test("requires auth", async () => {
+    const res = await lookup({ sessionIds: ["x"] }, { "Content-Type": "application/json" });
+    expect(res.status).toBe(401);
+  });
+
+  test("returns the topic for each known session and null for unknown ones", async () => {
+    await seedTopic({ sessionId: "tl-open", chatId: "-1001234567890", threadId: 42 });
+    await seedTopic({ sessionId: "tl-closed", chatId: "-1001234567890", threadId: 43, state: "closed" });
+    await seedTopic({ sessionId: "tl-reserved", chatId: "-1001234567890", threadId: null });
+
+    const res = await lookup({ sessionIds: ["tl-open", "tl-closed", "tl-reserved", "tl-missing"] });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      topics: {
+        "tl-open": { chatId: "-1001234567890", messageThreadId: 42, state: "open" },
+        "tl-closed": { chatId: "-1001234567890", messageThreadId: 43, state: "closed" },
+        "tl-reserved": { chatId: "-1001234567890", messageThreadId: null, state: "open" },
+        "tl-missing": null,
+      },
+    });
+  });
+
+  test("empty list returns an empty map", async () => {
+    const res = await lookup({ sessionIds: [] });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ topics: {} });
+  });
+
+  test("rejects a non-array, non-string ids, and an oversized batch with 400", async () => {
+    expect((await lookup({})).status).toBe(400);
+    expect((await lookup({ sessionIds: "x" })).status).toBe(400);
+    expect((await lookup({ sessionIds: [1] })).status).toBe(400);
+    expect((await lookup({ sessionIds: [""] })).status).toBe(400);
+    const tooMany = Array.from({ length: 51 }, (_, i) => `s${i}`);
+    expect((await lookup({ sessionIds: tooMany })).status).toBe(400);
+  });
+
+  test("duplicate ids are answered once", async () => {
+    await seedTopic({ sessionId: "tl-dup", chatId: "-1001234567890", threadId: 77 });
+    const res = await lookup({ sessionIds: ["tl-dup", "tl-dup"] });
+    expect(await res.json()).toEqual({
+      topics: { "tl-dup": { chatId: "-1001234567890", messageThreadId: 77, state: "open" } },
+    });
+  });
+});
+
 // ─── Notification: Unit Tests ──────────────────────────────────────────
 
 describe("isAllowedChatId", () => {
