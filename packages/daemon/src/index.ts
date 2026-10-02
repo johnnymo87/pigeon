@@ -43,6 +43,7 @@ import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
 import { startSessionReaper } from "./session-reaper";
+import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
 import type { TgEntity } from "./telegram-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
@@ -404,6 +405,13 @@ const workerHealthMonitor = new WorkerHealthMonitor({
     console.warn(`[worker-health] ${msg}`, fields ? JSON.stringify(fields) : ""),
 });
 
+// Who may bank a message for a pull-mode session. Empty (the default) means
+// nobody, and pull sessions answer "not reachable" exactly as before.
+const pullAllowedSenderIds: ReadonlySet<string> = new Set(config.pullAllowedUserIds);
+if (pullAllowedSenderIds.size === 0) {
+  console.log("[pull-inbox] PIGEON_PULL_ALLOWED_USER_IDS is empty: pull sessions will not bank inbound");
+}
+
 const poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
@@ -450,9 +458,11 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           // failurePolicy:"surface": that gates out the whole connection-error
           // block, including the no-client branch that would otherwise DELETE
           // the session unconditionally. Every OTHER session it returns
-          // undefined for has no adapter at all (isOpencodeRoutable keeps every
-          // row selectAdapter would serve with a non-surface adapter), so it
-          // takes the honest "not reachable" reply and never reaches that block.
+          // undefined for either has no adapter at all or a surface one (the
+          // goose-pull banking adapter; isOpencodeRoutable keeps every row
+          // selectAdapter would serve with a non-surface adapter), so it never
+          // reaches that block. A pull session also never gets placed: the
+          // routable guard refuses it before ensureRouted runs.
           const client = clientForSession(msg.sessionId);
           await ingestWorkerCommand(storage, msg, {
             workerUrl: config.workerUrl,
@@ -464,6 +474,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             tagLookup: tagResolver,
             unregisterSession: async (sessionId) => { if (poller) await poller.unregisterSession(sessionId); },
             ...(gooseRunners ? { gooseRunnerFor: (s: SessionRecord) => gooseRunners.get(s) } : {}),
+            pullAllowedSenderIds,
           });
         },
         onLaunch: async (msg) => {
@@ -793,6 +804,22 @@ setInterval(() => {
   const eventsCleaned = storage.sessionEvents.pruneOlderThan(now - SESSION_EVENTS_RETENTION_MS);
   if (eventsCleaned > 0) console.log(`[session-events] cleaned ${eventsCleaned} old rows`);
 }, 60 * 60 * 1000);
+
+// Pull-mode inbox maintenance. Every 5 minutes, not hourly: the
+// claimed-but-unacked alarm has a 30-minute threshold, and checking it hourly
+// would put up to 90 minutes between a client failing mid-drain and anyone
+// hearing about it. The queries are two indexed scans over a table that holds
+// only unread mail.
+const PULL_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  try {
+    runPullInboxMaintenance({ storage });
+  } catch (err) {
+    // Never let this kill the daemon: it is a monitor, and a monitor that takes
+    // the process down with it is worse than the silence it was watching for.
+    console.error("[pull-inbox] maintenance cycle failed", err);
+  }
+}, PULL_MAINTENANCE_INTERVAL_MS);
 
 // Reap stale Pigeon registry entries every hour. This must not delete opencode
 // session history; opencode-serve is restarted separately for process hygiene.

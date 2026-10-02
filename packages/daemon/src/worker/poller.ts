@@ -165,7 +165,15 @@ export interface ExecuteMessage {
   chatId: string;
   messageThreadId?: number;
   media?: { key: string; mime: string; filename: string; size: number };
-  metadata?: { questionRequestId?: string };
+  metadata?: {
+    questionRequestId?: string;
+    /** Telegram user id of the sender. Absent from older workers and button taps. */
+    senderId?: string;
+    /** True when the Telegram message was forwarded from someone else. */
+    forwarded?: boolean;
+    /** Up to 500 chars of the bot's own message the human swipe-replied to. */
+    inReplyTo?: string;
+  };
 }
 
 export interface LaunchMessage {

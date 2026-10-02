@@ -48,6 +48,7 @@ import {
   MACHINE_ICON_COLORS,
   DEFAULT_ICON_COLOR,
 } from "../src/topics";
+import { buildExecuteMetadata, IN_REPLY_TO_MAX_CHARS } from "../src/webhook";
 import { resolveTopic, RESERVATION_TTL_MS } from "../src/topic-manager";
 import {
   runTopicReaper,
@@ -6387,7 +6388,9 @@ describe("swipe-reply to question notification", () => {
     expect(pollBody.commandType).toBe("execute");
     expect(pollBody.sessionId).toBe(sessionId);
     expect(pollBody.command).toBe("Use MongoDB");
-    expect(pollBody.metadata).toEqual({ questionRequestId: "req-123" });
+    // The sender id rides along too (buildExecuteMetadata); this test is about
+    // the question id.
+    expect(pollBody.metadata).toMatchObject({ questionRequestId: "req-123" });
   });
 
   it("does not tag command with questionRequestId when replying to a non-question notification", async () => {
@@ -6430,7 +6433,7 @@ describe("swipe-reply to question notification", () => {
     expect(pollBody.commandType).toBe("execute");
     expect(pollBody.sessionId).toBe(sessionId);
     expect(pollBody.command).toBe("Continue please");
-    expect(pollBody.metadata).toBeUndefined();
+    expect((pollBody.metadata as Record<string, unknown> | undefined)?.questionRequestId).toBeUndefined();
   });
 });
 
@@ -13012,5 +13015,53 @@ describe("named topics", () => {
     expect(sends[0]).toMatchObject({ chat_id: CHAT, message_thread_id: thread, text: NAMED_TOPIC_HINT_TEXT });
     const queued = await env.DB.prepare("SELECT COUNT(*) AS n FROM commands WHERE message_thread_id = ?").bind(thread).first<{ n: number }>();
     expect(queued?.n).toBe(0);
+  });
+});
+
+// ─── Execute metadata: sender, forward, replied-to bot text ───────────────
+describe("buildExecuteMetadata", () => {
+  const env = { TELEGRAM_BOT_USERNAME: "the_bot" };
+  const base = { message_id: 1, chat: { id: 5 } };
+
+  it("returns null when there is nothing to carry", () => {
+    expect(buildExecuteMetadata({ ...base }, undefined, env)).toBeNull();
+  });
+
+  it("carries the sender id as a string, and the question id", () => {
+    const m = JSON.parse(buildExecuteMetadata({ ...base, from: { id: 1001 } }, "req-1", env)!);
+    expect(m).toEqual({ questionRequestId: "req-1", senderId: "1001" });
+  });
+
+  it("marks a forwarded message, by either forward field", () => {
+    expect(JSON.parse(buildExecuteMetadata({ ...base, forward_origin: { type: "user" } }, undefined, env)!).forwarded).toBe(true);
+    expect(JSON.parse(buildExecuteMetadata({ ...base, forward_date: 123 }, undefined, env)!).forwarded).toBe(true);
+    expect(JSON.parse(buildExecuteMetadata({ ...base, from: { id: 1 } }, undefined, env)!).forwarded).toBeUndefined();
+  });
+
+  it("carries replied-to text only when the replied-to message is this bot's own", () => {
+    const bot = { id: 9, is_bot: true, username: "The_Bot" };
+    const mine = buildExecuteMetadata(
+      { ...base, reply_to_message: { message_id: 2, from: bot, text: "  Rebase or wait?  " } },
+      undefined,
+      env,
+    );
+    expect(JSON.parse(mine!).inReplyTo).toBe("Rebase or wait?");
+
+    const otherBot = { id: 8, is_bot: true, username: "other_bot" };
+    expect(buildExecuteMetadata({ ...base, reply_to_message: { message_id: 2, from: otherBot, text: "x" } }, undefined, env)).toBeNull();
+    const human = { id: 7, is_bot: false, username: "the_bot" };
+    expect(buildExecuteMetadata({ ...base, reply_to_message: { message_id: 2, from: human, text: "x" } }, undefined, env)).toBeNull();
+    // Without a configured bot username there is no way to tell, so nothing is carried.
+    expect(buildExecuteMetadata({ ...base, reply_to_message: { message_id: 2, from: bot, text: "x" } }, undefined, {})).toBeNull();
+  });
+
+  it("bounds the replied-to text", () => {
+    const bot = { id: 9, is_bot: true, username: "the_bot" };
+    const m = JSON.parse(buildExecuteMetadata(
+      { ...base, reply_to_message: { message_id: 2, from: bot, text: "q".repeat(IN_REPLY_TO_MAX_CHARS + 10) } },
+      undefined,
+      env,
+    )!);
+    expect(m.inReplyTo).toHaveLength(IN_REPLY_TO_MAX_CHARS);
   });
 });

@@ -6,6 +6,7 @@ import type { GooseSessionRunner } from "../goose/session-runner.js";
 import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 import type { CommandDeliveryAdapter, CommandDeliveryContext, CommandDeliveryResult } from "../adapters/types";
 import { DirectChannelAdapter } from "../adapters/direct-channel";
+import { GoosePullAdapter, bankedReplyMessage, isPullBackend } from "../adapters/goose-pull";
 import { NvimRpcAdapter } from "../adapters/nvim-rpc";
 import {
   type OpencodeDirectExecuteResult,
@@ -22,6 +23,11 @@ import { reviveAndDeliver, type ReviveAndDeliverDeps } from "./revive-and-delive
 export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
   createAdapter?: (session: SessionRecord) => CommandDeliveryAdapter | null;
+  /**
+   * Telegram user ids allowed to bank for a pull-mode session. Absent or empty
+   * means pull sessions get no adapter (the "not reachable" reply).
+   */
+  pullAllowedSenderIds?: ReadonlySet<string>;
   /**
    * Resolves the long-lived runner for a goose session. Absent when goose is not
    * configured, which is what makes a goose session correctly unroutable rather
@@ -122,7 +128,22 @@ export function selectAdapter(
   session: SessionRecord,
   injectedPrompts?: InjectedPromptsRepository,
   gooseRunnerFor?: (session: SessionRecord) => GooseSessionRunner,
+  pull?: { storage: StorageDb; allowedSenderIds: ReadonlySet<string> },
 ): CommandDeliveryAdapter | null {
+  // PULL BACKENDS FIRST, and deliberately with no endpoint/token precondition:
+  // the whole point of a pull backend is that it has no address to hold. It is
+  // checked before the direct-channel branch so a client that somehow carried
+  // both cannot be pushed at by accident. The adapter is failurePolicy
+  // "surface", which is what lets isOpencodeRoutable refuse this kind.
+  //
+  // NO ALLOWLIST, NO ADAPTER. With nobody allowed to bank, a pull session is
+  // exactly as reachable as one with no backend, and it says so the same way.
+  // A pull row never falls through to the branches below.
+  if (isPullBackend(session)) {
+    if (!pull || pull.allowedSenderIds.size === 0) return null;
+    return new GoosePullAdapter({ storage: pull.storage, allowedSenderIds: pull.allowedSenderIds });
+  }
+
   if (
     session.backendKind === "opencode-plugin-direct"
     && session.backendEndpoint
@@ -453,7 +474,7 @@ async function ingestWorkerCommandInner(
 
       const adapter = options.createAdapter
         ? options.createAdapter(session)
-        : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
+        : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor, pullDeps(storage, options));
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -527,7 +548,7 @@ async function ingestWorkerCommandInner(
 
     const adapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
+      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor, pullDeps(storage, options));
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
@@ -609,7 +630,7 @@ async function ingestWorkerCommandInner(
 
     const fallbackAdapter = options.createAdapter
       ? options.createAdapter(session)
-      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
+      : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor, pullDeps(storage, options));
 
     if (fallbackAdapter?.deliverQuestionReply) {
       const answers: string[][] = [[msg.command.trim()]];
@@ -670,7 +691,7 @@ async function ingestWorkerCommandInner(
 
   const adapter = options.createAdapter
     ? options.createAdapter(session)
-    : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor);
+    : selectAdapter(session, storage.injectedPrompts, options.gooseRunnerFor, pullDeps(storage, options));
 
   if (!adapter) {
     console.warn(`[command-ingest] no adapter for session sessionId=${msg.sessionId} commandId=${commandId} backendKind=${session.backendKind}`);
@@ -830,6 +851,48 @@ async function tryEditNotification(
 }
 
 /** Best-effort user notification. Never throws; see dropCommand for the rationale. */
+const NO_PULL_SENDERS: ReadonlySet<string> = new Set();
+
+function pullDeps(
+  storage: StorageDb,
+  options: WorkerCommandIngestOptions,
+): { storage: StorageDb; allowedSenderIds: ReadonlySet<string> } {
+  return { storage, allowedSenderIds: options.pullAllowedSenderIds ?? NO_PULL_SENDERS };
+}
+
+/**
+ * Tell the human their message was BANKED, not delivered.
+ *
+ * Gated on the adapter's own `meta.banked` rather than on the session's backend
+ * kind, so the notice can only appear for a delivery that really was a bank --
+ * one fact, asserted by the code that performed it.
+ *
+ * WHY IT EXISTS. On success this path sends nothing, because Telegram has
+ * already toasted "Command sent" and a second confirmation would be noise. For a
+ * pull backend that toast can be false by days (the client runs only when
+ * scheduled). Silence here would leave the human believing an unattended agent
+ * had just been told something it may not read for days.
+ *
+ * Best-effort by construction: the message IS banked either way, and failing the
+ * command because a courtesy notice failed would trade a real delivery for a
+ * cosmetic one.
+ */
+async function notifyIfBanked(
+  result: CommandDeliveryResult,
+  session: SessionRecord,
+  msg: ExecuteMessage,
+  commandId: string,
+  options: WorkerCommandIngestOptions,
+): Promise<void> {
+  if (!result.ok || result.meta?.banked !== true) return;
+  await sendBestEffort(
+    options.sendTelegramReply,
+    msg.chatId,
+    bankedReplyMessage(session),
+    commandId,
+  );
+}
+
 async function sendBestEffort(
   sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
   chatId: string,
@@ -1245,10 +1308,21 @@ async function deliverViaAdapter(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const budgetMs = options.deliveryBudgetMs ?? DEFAULT_DELIVERY_BUDGET_MS;
 
+  // Telegram-side facts, coerced rather than trusted: metadata is JSON the
+  // worker built. Each coercion leans closed: a sender id must be exactly a
+  // non-empty string to count, and ANY truthy forward marker counts as a forward.
+  const meta = (msg.metadata ?? {}) as Record<string, unknown>;
+  const senderId = typeof meta.senderId === "string" && meta.senderId ? meta.senderId : undefined;
+  const forwarded = Boolean(meta.forwarded);
+  const inReplyTo = typeof meta.inReplyTo === "string" && meta.inReplyTo ? meta.inReplyTo : undefined;
+
   const deliver = () =>
     adapter.deliverCommand(session, msg.command, {
       commandId,
       chatId: msg.chatId,
+      ...(senderId ? { senderId } : {}),
+      ...(forwarded ? { forwarded } : {}),
+      ...(inReplyTo ? { inReplyTo } : {}),
       ...(modelOverride ? { modelOverride } : {}),
       ...(media ? { media } : {}),
     });
@@ -1284,6 +1358,7 @@ async function deliverViaAdapter(
   if (result.ok) {
     console.log(`[command-ingest] delivered commandId=${commandId} adapter=${adapter.name} sessionId=${msg.sessionId} attempts=${attempts}`);
     storage.inbox.markDone(commandId);
+    await notifyIfBanked(result, session, msg, commandId, options);
     return;
   }
 

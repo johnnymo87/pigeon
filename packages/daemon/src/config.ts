@@ -45,6 +45,14 @@ export interface DaemonConfig {
   gooseAcpUrl?: string;
   /** Matches the serve's `GOOSE_SERVER__SECRET_KEY`. Absent is valid only for a serve run unauthenticated. */
   gooseAcpToken?: string;
+  /**
+   * Telegram user ids allowed to bank a message for a pull-mode session
+   * (`PIGEON_PULL_ALLOWED_USER_IDS`, comma separated). EMPTY MEANS NOBODY: a pull
+   * session's banked text is input to a client that is not watched while it
+   * runs, so the default is closed. The worker's own chat allowlist admits every
+   * member of an allowed group chat, which is not the same thing as "the owner".
+   */
+  pullAllowedUserIds: string[];
 }
 
 const DEFAULT_PORT = 4731;
@@ -83,6 +91,14 @@ function numOr(value: string | undefined, defaultValue: number): number {
   return parsed;
 }
 
+/** Comma-separated ids; blanks and whitespace dropped. Exported for tests. */
+export function parseIdList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): DaemonConfig {
   const defaultDbPath = `${process.cwd()}/data/pigeon-daemon.db`;
   const opencodeUrl = env.OPENCODE_URL?.trim() || undefined;
@@ -116,6 +132,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     stuckAbortSilenceMs: numOr(env.STUCK_ABORT_SILENCE_MS, DEFAULT_STUCK_ABORT_SILENCE_MS),
     gooseAcpUrl: env.PIGEON_GOOSE_ACP_URL?.trim() || undefined,
     gooseAcpToken: env.PIGEON_GOOSE_ACP_TOKEN?.trim() || undefined,
+    pullAllowedUserIds: parseIdList(env.PIGEON_PULL_ALLOWED_USER_IDS),
     maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
   };
 }

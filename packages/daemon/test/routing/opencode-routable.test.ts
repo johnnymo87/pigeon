@@ -172,7 +172,9 @@ describe("isOpencodeRoutable agrees with selectAdapter", () => {
                 const id = `s${n++}`;
                 s.sessions.upsert({ sessionId: id, notify: true, backendKind, backendEndpoint: endpoint, backendAuthToken: token, nvimSocket, ptyPath }, 1);
                 const rec = s.sessions.get(id)!;
-                const adapter = selectAdapter(rec, undefined, runners);
+                // Pull deps WITH an allowlist, so a goose-pull row gets the real
+                // banking adapter here rather than the fail-closed null.
+                const adapter = selectAdapter(rec, undefined, runners, { storage: s, allowedSenderIds: new Set(["1"]) });
                 // KNOWN, PRE-EXISTING, NOT WIDENED HERE: a goose row that also
                 // carries an nvim socket + pty, on a daemon with goose
                 // unconfigured, gets NvimRpcAdapter. The goose-only guard this
