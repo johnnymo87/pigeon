@@ -195,20 +195,29 @@ interface TelegramVoice {
   file_size?: number;
 }
 
-interface TelegramMessage {
+export interface TelegramMessage {
   message_id: number;
   message_thread_id?: number;
   is_topic_message?: boolean;
   chat: { id: number };
-  from?: { id: number };
+  from?: { id: number; is_bot?: boolean; username?: string };
   text?: string;
   caption?: string;
+  // Forward markers. `forward_origin` is current Bot API; `forward_date` is the
+  // older field, still sent. Either means the author is not the sender.
+  forward_origin?: unknown;
+  forward_date?: number;
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
   audio?: TelegramAudio;
   video?: TelegramVideo;
   voice?: TelegramVoice;
-  reply_to_message?: { message_id: number };
+  reply_to_message?: {
+    message_id: number;
+    from?: { id: number; is_bot?: boolean; username?: string };
+    text?: string;
+    caption?: string;
+  };
   // Service messages. Telegram emits these into a chat as bot-visible updates with
   // no `text`/`caption`. They must never be routed to a session.
   forum_topic_created?: unknown;
@@ -830,6 +839,44 @@ async function resolveReplySession(
 /**
  * Handle an incoming Telegram webhook request.
  */
+/** Longest replied-to bot text forwarded as context. */
+export const IN_REPLY_TO_MAX_CHARS = 500;
+
+/**
+ * Metadata for a plain-message execute command. Exported for tests.
+ *
+ * Carries Telegram-side facts the daemon cannot recover later:
+ *   senderId    who sent it. A daemon backend may refuse unless it matches an
+ *               allowlist; this worker's own chat allowlist admits every member
+ *               of an allowed group chat.
+ *   forwarded   the text was forwarded, so its author is not the sender.
+ *   inReplyTo   the text of the message the human swipe-replied to, ONLY when
+ *               that message is this bot's own. Anyone else's message is not
+ *               context a backend should read as the bot's question.
+ * Returns null when there is nothing to carry.
+ */
+export function buildExecuteMetadata(
+  message: TelegramMessage,
+  questionRequestId: string | undefined,
+  env: Pick<Env, "TELEGRAM_BOT_USERNAME">,
+): string | null {
+  const meta: Record<string, unknown> = {};
+  if (questionRequestId) meta.questionRequestId = questionRequestId;
+  if (message.from?.id !== undefined) meta.senderId = String(message.from.id);
+  if (message.forward_origin !== undefined || message.forward_date !== undefined) meta.forwarded = true;
+  const replied = message.reply_to_message;
+  const botName = env.TELEGRAM_BOT_USERNAME?.trim().replace(/^@/, "").toLowerCase();
+  if (
+    replied?.from?.is_bot === true
+    && botName
+    && replied.from.username?.toLowerCase() === botName
+  ) {
+    const text = (replied.text ?? replied.caption ?? "").trim();
+    if (text) meta.inReplyTo = text.slice(0, IN_REPLY_TO_MAX_CHARS);
+  }
+  return Object.keys(meta).length > 0 ? JSON.stringify(meta) : null;
+}
+
 export async function handleTelegramWebhook(
   db: D1Database,
   env: Env,
@@ -1364,9 +1411,9 @@ export async function handleTelegramWebhook(
       mediaRef = { key: relayResult.key, mime: media.mime, filename: media.filename, size: media.size };
     }
 
-    const metadataJson = resolved.questionRequestId
-      ? JSON.stringify({ questionRequestId: resolved.questionRequestId })
-      : null;
+    // Button taps (the callback path below) deliberately carry no sender id:
+    // a backend that requires one refuses them, which fails closed.
+    const metadataJson = buildExecuteMetadata(update.message, resolved.questionRequestId, env);
     const commandId = await queueCommand(db, env, {
       machineId: machine.machineId,
       sessionId: resolved.sessionId,
