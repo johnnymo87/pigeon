@@ -322,6 +322,8 @@ interface AppOptions {
   resolveNamedTopic?: NamedTopicResolver;
   /** Bound on `resolveNamedTopic` per alert. Test seam. */
   alertTopicTimeoutMs?: number;
+  /** Bound on `bindNamedTopic` and `unbindNamedTopic`. Test seam. */
+  bindTimeoutMs?: number;
   /**
    * Bind a named topic to a session on `POST /session-start`.
    * Absent on a host with no worker connection.
@@ -339,6 +341,12 @@ interface AppOptions {
     signal?: AbortSignal,
   ) => Promise<{ unbound: number }>;
 }
+
+/**
+ * Bound on binding and unbinding named topics. Distinct from the 3s alert topic budget
+ * because the worker may make 1-2 Telegram calls (reopen hourly, create on first use).
+ */
+export const BIND_TIMEOUT_MS = 8_000;
 
 /**
  * Floor on the send bound for a links-bearing `/alert`, so a lookup that ate
@@ -983,11 +991,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           } else if (!opts.bindNamedTopic) {
             bindError = "no worker connection";
           } else {
-            const timeoutMs = opts.alertTopicTimeoutMs ?? DEFAULT_TOPIC_RESOLVE_TIMEOUT_MS;
+            const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
             const controller = new AbortController();
             let timer: ReturnType<typeof setTimeout> | undefined;
+            let timedOut = false;
             const deadline = new Promise<never>((_, reject) => {
               timer = setTimeout(() => {
+                timedOut = true;
                 controller.abort();
                 reject(new Error(`timed out after ${timeoutMs}ms`));
               }, timeoutMs);
@@ -1000,8 +1010,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               await Promise.race([inFlight, deadline]);
               bound = true;
             } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              bindError = `bind failed: ${msg}`;
+              if (timedOut) {
+                bindError = "bind timed out";
+              } else {
+                const msg = err instanceof Error ? err.message : String(err);
+                bindError = `bind failed: ${msg}`;
+              }
             } finally {
               clearTimeout(timer);
             }
@@ -1028,12 +1042,29 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!opts.unbindNamedTopic) {
           return Response.json({ error: "no worker connection" }, { status: 503 });
         }
+        const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let timedOut = false;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+            reject(new Error(`timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
         try {
-          const result = await opts.unbindNamedTopic(sessionId);
+          const inFlight = opts.unbindNamedTopic(sessionId, controller.signal);
+          const result = await Promise.race([inFlight, deadline]);
           return Response.json({ ok: true, unbound: result.unbound });
         } catch (err) {
+          if (timedOut) {
+            return Response.json({ error: "unbind timed out" }, { status: 504 });
+          }
           const msg = err instanceof Error ? err.message : String(err);
           return Response.json({ error: `unbind failed: ${msg}` }, { status: 502 });
+        } finally {
+          clearTimeout(timer);
         }
       }
 

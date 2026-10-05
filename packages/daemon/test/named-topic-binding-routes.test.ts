@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createApp } from "../src/app";
+import { createApp, BIND_TIMEOUT_MS } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { WorkerResult } from "../src/worker/poller";
 
@@ -151,6 +151,33 @@ describe("named topic binding routes", () => {
       });
     });
 
+    it("reports named_topic_error: 'bind timed out' when binding exceeds timeout", async () => {
+      expect(BIND_TIMEOUT_MS).toBe(8_000);
+      const onSessionStart = vi.fn().mockResolvedValue({ ok: true, status: 200 } as WorkerResult);
+      const bindNamedTopic = vi.fn().mockImplementation(
+        () => new Promise((resolve) => setTimeout(resolve, 50)),
+      );
+      const { app } = newApp({
+        onSessionStart,
+        bindNamedTopic,
+        bindTimeoutMs: 10,
+      });
+      const res = await post(app, "/session-start", {
+        session_id: "ses_1",
+        notify: true,
+        backend_kind: "goose-pull",
+        named_topic: { key: "digest:topic-1", name: "Topic" },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_1",
+        machine_id: null,
+        named_topic_bound: false,
+        named_topic_error: "bind timed out",
+      });
+    });
+
     it("calls register BEFORE bind and returns named_topic_bound: true on success", async () => {
       const callOrder: string[] = [];
       const onSessionStart = vi.fn().mockImplementation(async () => {
@@ -206,7 +233,7 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-unbind", { session_id: "ses_1" });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, unbound: 1 });
-      expect(unbindNamedTopic).toHaveBeenCalledWith("ses_1");
+      expect(unbindNamedTopic).toHaveBeenCalledWith("ses_1", expect.any(AbortSignal));
       // Session row preserved
       expect(s.sessions.get("ses_1")).not.toBeNull();
     });
@@ -217,6 +244,16 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-unbind", { session_id: "ses_1" });
       expect(res.status).toBe(502);
       expect(await res.json()).toEqual({ error: "unbind failed: network error" });
+    });
+
+    it("returns 504 on timeout", async () => {
+      const unbindNamedTopic = vi.fn().mockImplementation(
+        () => new Promise((resolve) => setTimeout(resolve, 50)),
+      );
+      const { app } = newApp({ unbindNamedTopic, bindTimeoutMs: 10 });
+      const res = await post(app, "/session-unbind", { session_id: "ses_1" });
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({ error: "unbind timed out" });
     });
   });
 });
