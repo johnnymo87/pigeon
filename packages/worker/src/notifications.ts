@@ -2,6 +2,7 @@ import { verifyApiKey, unauthorized } from "./auth";
 import { createTelegramClient, getTelegramErrorDetails, TelegramClient, TgResult } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
+import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
 
 interface SendNotificationBody {
@@ -407,7 +408,15 @@ export async function handleSendNotification(
     // the intended/actual column pair (pigeon-t5bd).
     let relocationReason: string | undefined;
 
-    if (topicsEnabled(env) && threaded !== false) {
+    const bound =
+      topicsEnabled(env) && threaded !== false
+        ? await getBindingForSession(db, sessionId)
+        : null;
+
+    if (bound) {
+      messageThreadId = bound.message_thread_id;
+      intendedThreadId = bound.message_thread_id;
+    } else if (topicsEnabled(env) && threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
       // intentionally NOT wrapped in withD1. A D1 error here falls to boundary catch as internal_error 500,
       // which triggers daemon retry identical to 503. Total D1 outage hits send.sessionLookup first (503).
@@ -451,7 +460,8 @@ export async function handleSendNotification(
       telegramResult.kind === "thread_not_found" &&
       messageThreadId !== undefined &&
       topicsEnabled(env) &&
-      threaded !== false
+      threaded !== false &&
+      !bound
     ) {
       // Delete stale finalized topic row from D1
       await deleteTopicBySession(db, sessionId, messageThreadId);

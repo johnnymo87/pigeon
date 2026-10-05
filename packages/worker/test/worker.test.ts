@@ -1792,6 +1792,117 @@ describe("telegram client module classifier", () => {
     expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(body.token).not.toBe("");
   });
+
+  it("bound session's notification -> sent with the named thread id, no topics row", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const sessionId = `ses_notif_bound_${Date.now()}`;
+    const key = `test:notif-key-${Date.now()}`;
+    const threadId = 887766;
+    const now = Date.now();
+
+    await registerSession(sessionId, "machine-bound", "test");
+
+    await env.DB.prepare(
+      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+    ).bind(CHAT_ID, key, threadId, now, now).run();
+
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(CHAT_ID, key, sessionId, now).run();
+
+    let sentPayload: any = null;
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, (opts: any) => {
+        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+        sentPayload = JSON.parse(raw);
+        return { ok: true, result: { message_id: 9911 } };
+      });
+
+    const request = new Request("https://worker/notifications/send", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        sessionId,
+        chatId: CHAT_ID,
+        text: "hello in bound named topic",
+        title: "Bound Title",
+        dir: "pigeon",
+        threaded: true,
+      }),
+    });
+
+    const res = await handleSendNotification(env.DB, testEnv, request);
+    expect(res.status).toBe(200);
+    expect(sentPayload).not.toBeNull();
+    expect(sentPayload.message_thread_id).toBe(threadId);
+
+    // Verify no session topic was created in topics table
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+  });
+
+  it("bound session's notification with thread_not_found skips T2.7 and relocates to General", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const sessionId = `ses_notif_deleted_thread_${Date.now()}`;
+    const key = `test:notif-key-del-${Date.now()}`;
+    const threadId = 887788;
+    const now = Date.now();
+
+    await registerSession(sessionId, "machine-bound", "test");
+
+    await env.DB.prepare(
+      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+    ).bind(CHAT_ID, key, threadId, now, now).run();
+
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(CHAT_ID, key, sessionId, now).run();
+
+    const sends: any[] = [];
+    // First send to topic returns thread_not_found
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(400, JSON.stringify({
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: message thread not found",
+      }), { headers: { "Content-Type": "application/json" } });
+
+    // Second send relocates to General and succeeds
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, (opts: any) => {
+        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+        sends.push(JSON.parse(raw));
+        return { ok: true, result: { message_id: 99120 } };
+      });
+
+    const request = new Request("https://worker/notifications/send", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        sessionId,
+        chatId: CHAT_ID,
+        text: "hello in deleted thread",
+        threaded: true,
+      }),
+    });
+
+    const res = await handleSendNotification(env.DB, testEnv, request);
+    expect(res.status).toBe(200);
+
+    // Verify it relocated to General (no message_thread_id on the second send)
+    expect(sends).toHaveLength(1);
+    expect(sends[0].message_thread_id).toBeUndefined();
+
+    // Verify no session topic was created in topics table (T2.7 did NOT run)
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+  });
 });
 
 // ─── Webhook: Helpers ─────────────────────────────────────────────────
