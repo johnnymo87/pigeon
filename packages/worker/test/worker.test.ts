@@ -74,7 +74,15 @@ import {
   isServiceMessage,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
-import { handleNamedTopic, NAMED_TOPIC_HINT_TEXT } from "../src/named-topics";
+import {
+  handleNamedTopic,
+  handleNamedTopicBind,
+  handleNamedTopicUnbind,
+  getBoundSessionByThread,
+  getBindingForSession,
+  unbindSession,
+  NAMED_TOPIC_HINT_TEXT,
+} from "../src/named-topics";
 import { handlePollNext, handleAckCommand } from "../src/poll";
 import { handleSessionRequest, MAX_SESSIONS } from "../src/sessions";
 import {
@@ -13024,6 +13032,219 @@ describe("named topics", () => {
     expect(sends[0]).toMatchObject({ chat_id: CHAT, message_thread_id: thread, text: NAMED_TOPIC_HINT_TEXT });
     const queued = await env.DB.prepare("SELECT COUNT(*) AS n FROM commands WHERE message_thread_id = ?").bind(thread).first<{ n: number }>();
     expect(queued?.n).toBe(0);
+  });
+});
+
+// ─── Named topic binding (POST /topics/named/bind, unbind) ───────────────
+
+describe("named topic binding", () => {
+  const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+  const CHAT = String(CHAT_ID_NUM);
+  let seq = 0;
+  const nextKey = () => `test:named-bind-${Date.now()}-${++seq}`;
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+  });
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  function onTelegram(method: string, reply: (body: any) => { ok: boolean; [k: string]: unknown }) {
+    const calls: any[] = [];
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
+      .reply((opts: any) => {
+        const body = JSON.parse(opts.body as string);
+        calls.push(body);
+        return {
+          statusCode: 200,
+          data: JSON.stringify(reply(body)),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      })
+      .persist();
+    return calls;
+  }
+
+  function bind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+    return handleNamedTopicBind(env.DB, e, new Request("https://worker/topics/named/bind", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  function unbind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+    return handleNamedTopicUnbind(env.DB, e, new Request("https://worker/topics/named/unbind", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  async function registerSessionRow(sessionId: string) {
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, 'devbox', null, ?, ?)",
+    ).bind(sessionId, now, now).run();
+  }
+
+  test("1. bind with no sessions row -> 409 session not registered, no binding row", async () => {
+    const key = nextKey();
+    const sessionId = `ses_no_session_${Date.now()}`;
+    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error).toBe("session not registered");
+    const row = await env.DB.prepare("SELECT * FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).first();
+    expect(row).toBeNull();
+  });
+
+  test("2. register session, bind -> 200 bound:true; getBoundSessionByThread returns the session", async () => {
+    const key = nextKey();
+    const sessionId = `ses_bind_ok_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const threadId = 991001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: threadId, name: "Topic", icon_color: 0 } }));
+
+    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body).toEqual({
+      chatId: CHAT,
+      messageThreadId: threadId,
+      created: true,
+      bound: true,
+      sessionId,
+    });
+
+    const bound = await getBoundSessionByThread(env.DB, CHAT, threadId);
+    expect(bound).toBe(sessionId);
+
+    const binding = await getBindingForSession(env.DB, sessionId);
+    expect(binding).toEqual({
+      chat_id: CHAT,
+      topic_key: key,
+      message_thread_id: threadId,
+    });
+  });
+
+  test("3. bind the same session to a second key -> first binding gone (one topic per session)", async () => {
+    const key1 = nextKey();
+    const key2 = nextKey();
+    const sessionId = `ses_rebind_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread1 = 992001 + (++seq);
+    const thread2 = 992002 + (++seq);
+    let createCount = 0;
+    onTelegram("createForumTopic", () => ({
+      ok: true,
+      result: { message_thread_id: ++createCount === 1 ? thread1 : thread2, name: "Topic", icon_color: 0 },
+    }));
+
+    const res1 = await bind({ chatId: CHAT, key: key1, name: "Topic 1", sessionId });
+    expect(res1.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBe(sessionId);
+
+    const res2 = await bind({ chatId: CHAT, key: key2, name: "Topic 2", sessionId });
+    expect(res2.status).toBe(200);
+
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBeNull();
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread2)).toBe(sessionId);
+
+    const binding = await getBindingForSession(env.DB, sessionId);
+    expect(binding?.topic_key).toBe(key2);
+  });
+
+  test("4. bind a second session to the same key -> key now routes to the second session", async () => {
+    const key = nextKey();
+    const session1 = `ses_s1_${Date.now()}`;
+    const session2 = `ses_s2_${Date.now()}`;
+    await registerSessionRow(session1);
+    await registerSessionRow(session2);
+    const thread = 993001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    const res1 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session1 });
+    expect(res1.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session1);
+
+    const res2 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session2 });
+    expect(res2.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session2);
+
+    expect(await getBindingForSession(env.DB, session1)).toBeNull();
+    expect((await getBindingForSession(env.DB, session2))?.topic_key).toBe(key);
+  });
+
+  test("5. unbind -> {unbound:1}; again -> {unbound:0}; lookup -> null", async () => {
+    const key = nextKey();
+    const sessionId = `ses_unbind_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread = 994001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
+
+    const res1 = await unbind({ sessionId });
+    expect(res1.status).toBe(200);
+    expect(await res1.json()).toEqual({ unbound: 1 });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+    expect(await getBindingForSession(env.DB, sessionId)).toBeNull();
+
+    const res2 = await unbind({ sessionId });
+    expect(res2.status).toBe(200);
+    expect(await res2.json()).toEqual({ unbound: 0 });
+  });
+
+  test("6. binding whose session row was deleted -> lookup null (inert)", async () => {
+    const key = nextKey();
+    const sessionId = `ses_deleted_row_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread = 995001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
+
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+  });
+
+  test("7. auth: no bearer -> 401 on both routes", async () => {
+    const noAuth = { "Content-Type": "application/json" };
+    const r1 = await bind({ chatId: CHAT, key: nextKey(), name: "n", sessionId: "ses_1" }, topicsEnv, noAuth);
+    expect(r1.status).toBe(401);
+    const r2 = await unbind({ sessionId: "ses_1" }, topicsEnv, noAuth);
+    expect(r2.status).toBe(401);
+  });
+
+  test("routes are mounted in worker", async () => {
+    const res1 = await SELF.fetch("https://worker/topics/named/bind", { method: "POST", headers: authHeaders, body: "{}" });
+    expect(res1.status).toBe(400);
+    const res2 = await SELF.fetch("https://worker/topics/named/unbind", { method: "POST", headers: authHeaders, body: "{}" });
+    expect(res2.status).toBe(400);
+  });
+
+  test("bind input validation: bad key, bad sessionId, disallowed chat, topics disabled", async () => {
+    const sessionId = "ses_valid";
+    await registerSessionRow(sessionId);
+    expect((await bind({ chatId: CHAT, key: "bad key", name: "n", sessionId })).status).toBe(400);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "" })).status).toBe(400);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "x".repeat(129) })).status).toBe(400);
+    expect((await bind({ chatId: "-1009999", key: "valid_key", name: "n", sessionId })).status).toBe(403);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId }, env as Env)).status).toBe(409);
+  });
+
+  test("unbind input validation: missing or invalid sessionId", async () => {
+    expect((await unbind({})).status).toBe(400);
+    expect((await unbind({ sessionId: "" })).status).toBe(400);
+    expect((await unbind({ sessionId: "x".repeat(129) })).status).toBe(400);
   });
 });
 
