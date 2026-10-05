@@ -2383,6 +2383,82 @@ describe("webhook reply routing", () => {
       ).bind(boundSessionId).all();
       expect(boundCmds.results).toHaveLength(0);
     });
+
+    it("6. plain message with realistic forum shape (topic header service reply) -> command queued for bound session", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          is_topic_message: true,
+          reply_to_message: { message_id: threadId },
+          text: "plain forum message in bound topic",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("plain forum message in bound topic");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+    });
+
+    it("7. swipe-reply to bot-authored message without messages row (e.g. alert) with quote -> carries inReplyTo and inReplyToQuote", async () => {
+      const botUsername = "pigeon_test_bot";
+      const botEnv = { ...topicsEnv, TELEGRAM_BOT_USERNAME: botUsername } as Env;
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const digestMsgId = 777000 + (++seq);
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          is_topic_message: true,
+          reply_to_message: {
+            message_id: digestMsgId,
+            from: { is_bot: true, username: botUsername },
+            text: "Daily Digest: 5 PRs merged today.",
+          },
+          quote: {
+            text: "5 PRs merged",
+          },
+          text: "Can you list them?",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("Can you list them?");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+      expect(meta.inReplyTo).toBe("Daily Digest: 5 PRs merged today.");
+      expect(meta.inReplyToQuote).toBe("5 PRs merged");
+    });
   });
 });
 
