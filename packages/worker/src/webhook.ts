@@ -1,5 +1,5 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
-import { maybeAnswerInNamedTopic } from "./named-topics";
+import { maybeAnswerInNamedTopic, getBoundSessionByThread } from "./named-topics";
 import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnabled } from "./topics";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
@@ -579,6 +579,13 @@ async function resolveMessageSession(
     if (topic) {
       return { sessionId: topic.session_id, command: text };
     }
+  }
+
+  // Try 2b: a named topic bound to a pull-mode session. PLAIN MESSAGES ONLY -- the slash
+  // commands use lookupContextSession, which deliberately does not follow bindings.
+  if (topicsEnabled(env) && message.message_thread_id !== undefined) {
+    const bound = await getBoundSessionByThread(db, chatId, message.message_thread_id);
+    if (bound) return { sessionId: bound, command: text };
   }
 
   // Try 3: /cmd TOKEN command format

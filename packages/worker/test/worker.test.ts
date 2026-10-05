@@ -2040,6 +2040,218 @@ describe("webhook reply routing", () => {
     });
     expect(res.status).toBe(200);
   });
+
+  describe("bound named topic routing (Task A3)", () => {
+    const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    let seq = 0;
+
+    function captureSends(): any[] {
+      const sent: any[] = [];
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          sent.push(typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .persist();
+      return sent;
+    }
+
+    async function setupBoundTopic() {
+      const now = Date.now();
+      const n = ++seq;
+      const key = `test:named-route-${now}-${n}`;
+      const threadId = 980000 + n;
+      const sessionId = `ses_bound_route_${now}_${n}`;
+      const machineId = `machine_bound_${now}_${n}`;
+      const chat = String(CHAT_ID_NUM);
+
+      await env.DB.prepare(
+        "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+      ).bind(chat, key, threadId, now, now).run();
+
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'label', ?, ?)",
+      ).bind(sessionId, machineId, now, now).run();
+
+      await touchMachine(env.DB, machineId, now);
+
+      await env.DB.prepare(
+        "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+      ).bind(chat, key, sessionId, now).run();
+
+      return { key, threadId, sessionId, machineId, chat };
+    }
+
+    it("1. message in a bound named topic, session registered + machine recent -> a command is queued with messageThreadId and senderId", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command in bound topic",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("plain command in bound topic");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+    });
+
+    it("2. same, binding removed -> no command; hint sent (existing behaviour)", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      await unbindSession(env.DB, sessionId);
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command with binding removed",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(NAMED_TOPIC_HINT_TEXT);
+    });
+
+    it("3. same, session row deleted -> hint, not 'Session not found'", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command with session row deleted",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE message_thread_id = ?",
+      ).bind(threadId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(NAMED_TOPIC_HINT_TEXT);
+      expect(sent[0].text).not.toContain("not found");
+    });
+
+    it("4. /kill typed in a bound topic -> 'Could not find a session for this topic.' and no command", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "/kill",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe("Could not find a session for this topic.");
+    });
+
+    it("5. swipe-reply in a bound topic to a message tracked in messages for ANOTHER session still goes to that other session", async () => {
+      const { threadId, sessionId: boundSessionId } = await setupBoundTopic();
+      captureSends();
+
+      const otherSessionId = `ses_other_${Date.now()}`;
+      const otherMachineId = `machine_other_${Date.now()}`;
+      const now = Date.now();
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'other', ?, ?)",
+      ).bind(otherSessionId, otherMachineId, now, now).run();
+      await touchMachine(env.DB, otherMachineId, now);
+
+      const notifMsgId = 888000 + (++seq);
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: notifMsgId,
+        sessionId: otherSessionId,
+        token: `tok_other_${Date.now()}`,
+      });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          reply_to_message: { message_id: notifMsgId },
+          text: "swipe-reply to other session",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const otherCmds = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(otherSessionId).all<any>();
+      expect(otherCmds.results).toHaveLength(1);
+      expect(otherCmds.results[0]!.command).toBe("swipe-reply to other session");
+
+      const boundCmds = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(boundSessionId).all();
+      expect(boundCmds.results).toHaveLength(0);
+    });
+  });
 });
 
 // ─── Command Queue + Alarm: Integration ───────────────────────────────
