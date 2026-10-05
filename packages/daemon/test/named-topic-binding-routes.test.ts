@@ -85,6 +85,62 @@ describe("named topic binding routes", () => {
       });
     });
 
+    it("returns named_topic_error: 'not a pull session' and skips bind when backend is not pull", async () => {
+      const bindNamedTopic = vi.fn();
+      const { app } = newApp({ bindNamedTopic });
+      const res = await post(app, "/session-start", {
+        session_id: "ses_1",
+        notify: true,
+        backend_kind: "opencode-plugin-direct",
+        named_topic: { key: "digest:topic-1", name: "Topic" },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_1",
+        machine_id: null,
+        named_topic_bound: false,
+        named_topic_error: "not a pull session",
+      });
+      expect(bindNamedTopic).not.toHaveBeenCalled();
+    });
+
+    it("returns named_topic_error: 'worker registration failed' when onSessionStart throws", async () => {
+      const onSessionStart = vi.fn().mockRejectedValue(new Error("network explode"));
+      const bindNamedTopic = vi.fn();
+      const { app } = newApp({ onSessionStart, bindNamedTopic });
+      const res = await post(app, "/session-start", {
+        session_id: "ses_1",
+        notify: true,
+        backend_kind: "goose-pull",
+        named_topic: { key: "digest:topic-1", name: "Topic" },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_1",
+        machine_id: null,
+        named_topic_bound: false,
+        named_topic_error: "worker registration failed",
+      });
+      expect(bindNamedTopic).not.toHaveBeenCalled();
+    });
+
+    it("returns 200 even when onSessionStart throws if named_topic is absent", async () => {
+      const onSessionStart = vi.fn().mockRejectedValue(new Error("network explode"));
+      const { app } = newApp({ onSessionStart });
+      const res = await post(app, "/session-start", {
+        session_id: "ses_1",
+        notify: true,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        session_id: "ses_1",
+        machine_id: null,
+      });
+    });
+
     it("returns named_topic_error: 'worker registration failed' and skips bind when onSessionStart returns ok:false", async () => {
       const callOrder: string[] = [];
       const onSessionStart = vi.fn().mockImplementation(async () => {
@@ -100,6 +156,7 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-start", {
         session_id: "ses_1",
         notify: true,
+        backend_kind: "goose-pull",
         named_topic: { key: "digest:topic-1", name: "Topic" },
       });
       expect(res.status).toBe(200);
@@ -120,6 +177,7 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-start", {
         session_id: "ses_1",
         notify: true,
+        backend_kind: "goose-pull",
         named_topic: { key: "digest:topic-1", name: "Topic" },
       });
       expect(res.status).toBe(200);
@@ -139,6 +197,7 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-start", {
         session_id: "ses_1",
         notify: true,
+        backend_kind: "goose-pull",
         named_topic: { key: "digest:topic-1", name: "Topic" },
       });
       expect(res.status).toBe(200);
@@ -193,6 +252,7 @@ describe("named topic binding routes", () => {
       const res = await post(app, "/session-start", {
         session_id: "ses_1",
         notify: true,
+        backend_kind: "goose-pull",
         named_topic: { key: "digest:topic-1", name: "Topic One" },
       });
       expect(res.status).toBe(200);

@@ -982,10 +982,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           let bound = false;
           let bindError: string | undefined;
 
+          const session = storage.sessions.get(sessionId);
+
           if (!parsedTopic) {
             bindError = "invalid named_topic";
           } else if (!effectiveNotify) {
             bindError = "notify is required";
+          } else if (!isPullBackend(session)) {
+            bindError = "not a pull session";
           } else if (!workerRegOk) {
             bindError = "worker registration failed";
           } else if (!opts.bindNamedTopic) {
