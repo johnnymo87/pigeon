@@ -26,6 +26,7 @@ export interface CommandDeliveryContext {
   senderId?: string;
   forwarded?: boolean;
   inReplyTo?: string;
+  inReplyToQuote?: string;
   media?: {
     mime: string;
     filename: string;

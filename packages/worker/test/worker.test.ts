@@ -74,7 +74,15 @@ import {
   isServiceMessage,
 } from "../src/webhook";
 import { cleanupExpiredMedia } from "../src/media";
-import { handleNamedTopic, NAMED_TOPIC_HINT_TEXT } from "../src/named-topics";
+import {
+  handleNamedTopic,
+  handleNamedTopicBind,
+  handleNamedTopicUnbind,
+  getBoundSessionByThread,
+  getBindingForSession,
+  unbindSession,
+  NAMED_TOPIC_HINT_TEXT,
+} from "../src/named-topics";
 import { handlePollNext, handleAckCommand } from "../src/poll";
 import { handleSessionRequest, MAX_SESSIONS } from "../src/sessions";
 import {
@@ -176,6 +184,15 @@ const d1SchemaStatements = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topics_thread
     ON named_topics(chat_id, message_thread_id)`,
+  `CREATE TABLE IF NOT EXISTS named_topic_bindings (
+    chat_id     TEXT NOT NULL,
+    topic_key   TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    bound_at    INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, topic_key)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
+    ON named_topic_bindings(session_id)`,
 ];
 
 beforeAll(async () => {
@@ -905,6 +922,27 @@ describe("POST /sessions/unregister", () => {
     });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "sessionId required" });
+  });
+
+  test("bound session unregistered -> binding row gone", async () => {
+    const sessionId = `sess-unreg-bound-${Date.now()}`;
+    const key = `test:unreg-key-${Date.now()}`;
+    const chat = String(CHAT_ID_NUM);
+    const now = Date.now();
+    await registerSession(sessionId, "devbox");
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(chat, key, sessionId, now).run();
+
+    const res = await SELF.fetch("https://worker/sessions/unregister", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ sessionId }),
+    });
+    expect(res.status).toBe(200);
+
+    const binding = await env.DB.prepare("SELECT * FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).first();
+    expect(binding).toBeNull();
   });
 });
 
@@ -1754,6 +1792,117 @@ describe("telegram client module classifier", () => {
     expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(body.token).not.toBe("");
   });
+
+  it("bound session's notification -> sent with the named thread id, no topics row", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const sessionId = `ses_notif_bound_${Date.now()}`;
+    const key = `test:notif-key-${Date.now()}`;
+    const threadId = 887766;
+    const now = Date.now();
+
+    await registerSession(sessionId, "machine-bound", "test");
+
+    await env.DB.prepare(
+      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+    ).bind(CHAT_ID, key, threadId, now, now).run();
+
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(CHAT_ID, key, sessionId, now).run();
+
+    let sentPayload: any = null;
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, (opts: any) => {
+        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+        sentPayload = JSON.parse(raw);
+        return { ok: true, result: { message_id: 9911 } };
+      });
+
+    const request = new Request("https://worker/notifications/send", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        sessionId,
+        chatId: CHAT_ID,
+        text: "hello in bound named topic",
+        title: "Bound Title",
+        dir: "pigeon",
+        threaded: true,
+      }),
+    });
+
+    const res = await handleSendNotification(env.DB, testEnv, request);
+    expect(res.status).toBe(200);
+    expect(sentPayload).not.toBeNull();
+    expect(sentPayload.message_thread_id).toBe(threadId);
+
+    // Verify no session topic was created in topics table
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+  });
+
+  it("bound session's notification with thread_not_found skips T2.7 and relocates to General", async () => {
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const sessionId = `ses_notif_deleted_thread_${Date.now()}`;
+    const key = `test:notif-key-del-${Date.now()}`;
+    const threadId = 887788;
+    const now = Date.now();
+
+    await registerSession(sessionId, "machine-bound", "test");
+
+    await env.DB.prepare(
+      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+    ).bind(CHAT_ID, key, threadId, now, now).run();
+
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(CHAT_ID, key, sessionId, now).run();
+
+    const sends: any[] = [];
+    // First send to topic returns thread_not_found
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(400, JSON.stringify({
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: message thread not found",
+      }), { headers: { "Content-Type": "application/json" } });
+
+    // Second send relocates to General and succeeds
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+      .reply(200, (opts: any) => {
+        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+        sends.push(JSON.parse(raw));
+        return { ok: true, result: { message_id: 99120 } };
+      });
+
+    const request = new Request("https://worker/notifications/send", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        sessionId,
+        chatId: CHAT_ID,
+        text: "hello in deleted thread",
+        threaded: true,
+      }),
+    });
+
+    const res = await handleSendNotification(env.DB, testEnv, request);
+    expect(res.status).toBe(200);
+
+    // Verify it relocated to General (no message_thread_id on the second send)
+    expect(sends).toHaveLength(1);
+    expect(sends[0].message_thread_id).toBeUndefined();
+
+    // Verify no session topic was created in topics table (T2.7 did NOT run)
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+  });
 });
 
 // ─── Webhook: Helpers ─────────────────────────────────────────────────
@@ -2022,6 +2171,294 @@ describe("webhook reply routing", () => {
       edited_message: { chat: { id: CHAT_ID_NUM }, text: "edited" },
     });
     expect(res.status).toBe(200);
+  });
+
+  describe("bound named topic routing (Task A3)", () => {
+    const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    let seq = 0;
+
+    function captureSends(): any[] {
+      const sent: any[] = [];
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          sent.push(typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body);
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 99999 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        })
+        .persist();
+      return sent;
+    }
+
+    async function setupBoundTopic() {
+      const now = Date.now();
+      const n = ++seq;
+      const key = `test:named-route-${now}-${n}`;
+      const threadId = 980000 + n;
+      const sessionId = `ses_bound_route_${now}_${n}`;
+      const machineId = `machine_bound_${now}_${n}`;
+      const chat = String(CHAT_ID_NUM);
+
+      await env.DB.prepare(
+        "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+      ).bind(chat, key, threadId, now, now).run();
+
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'label', ?, ?)",
+      ).bind(sessionId, machineId, now, now).run();
+
+      await touchMachine(env.DB, machineId, now);
+
+      await env.DB.prepare(
+        "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+      ).bind(chat, key, sessionId, now).run();
+
+      return { key, threadId, sessionId, machineId, chat };
+    }
+
+    it("1. message in a bound named topic, session registered + machine recent -> a command is queued with messageThreadId and senderId", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command in bound topic",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("plain command in bound topic");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+    });
+
+    it("2. same, binding removed -> no command; hint sent (existing behaviour)", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      await unbindSession(env.DB, sessionId);
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command with binding removed",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(NAMED_TOPIC_HINT_TEXT);
+    });
+
+    it("3. same, session row deleted -> hint, not 'Session not found'", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "plain command with session row deleted",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE message_thread_id = ?",
+      ).bind(threadId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe(NAMED_TOPIC_HINT_TEXT);
+      expect(sent[0].text).not.toContain("not found");
+    });
+
+    it("4. /kill typed in a bound topic -> 'Could not find a session for this topic.' and no command", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      const sent = captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          text: "/kill",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all();
+      expect(rows.results).toHaveLength(0);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toBe("Could not find a session for this topic.");
+    });
+
+    it("5. swipe-reply in a bound topic to a message tracked in messages for ANOTHER session still goes to that other session", async () => {
+      const { threadId, sessionId: boundSessionId } = await setupBoundTopic();
+      captureSends();
+
+      const otherSessionId = `ses_other_${Date.now()}`;
+      const otherMachineId = `machine_other_${Date.now()}`;
+      const now = Date.now();
+      await env.DB.prepare(
+        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'other', ?, ?)",
+      ).bind(otherSessionId, otherMachineId, now, now).run();
+      await touchMachine(env.DB, otherMachineId, now);
+
+      const notifMsgId = 888000 + (++seq);
+      await insertMessageMapping({
+        chatId: String(CHAT_ID_NUM),
+        messageId: notifMsgId,
+        sessionId: otherSessionId,
+        token: `tok_other_${Date.now()}`,
+      });
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          reply_to_message: { message_id: notifMsgId },
+          text: "swipe-reply to other session",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const otherCmds = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(otherSessionId).all<any>();
+      expect(otherCmds.results).toHaveLength(1);
+      expect(otherCmds.results[0]!.command).toBe("swipe-reply to other session");
+
+      const boundCmds = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(boundSessionId).all();
+      expect(boundCmds.results).toHaveLength(0);
+    });
+
+    it("6. plain message with realistic forum shape (topic header service reply) -> command queued for bound session", async () => {
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          is_topic_message: true,
+          reply_to_message: { message_id: threadId },
+          text: "plain forum message in bound topic",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("plain forum message in bound topic");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+    });
+
+    it("7. swipe-reply to bot-authored message without messages row (e.g. alert) with quote -> carries inReplyTo and inReplyToQuote", async () => {
+      const botUsername = "pigeon_test_bot";
+      const botEnv = { ...topicsEnv, TELEGRAM_BOT_USERNAME: botUsername } as Env;
+      const { threadId, sessionId } = await setupBoundTopic();
+      captureSends();
+
+      const digestMsgId = 777000 + (++seq);
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: 123456 },
+          message_thread_id: threadId,
+          is_topic_message: true,
+          reply_to_message: {
+            message_id: digestMsgId,
+            from: { is_bot: true, username: botUsername },
+            text: "Daily Digest: 5 PRs merged today.",
+          },
+          quote: {
+            text: "5 PRs merged",
+          },
+          text: "Can you list them?",
+        },
+      };
+
+      const res = await handleTelegramWebhook(env.DB, botEnv, makeWebhookRequest(update));
+      expect(res.status).toBe(200);
+
+      const rows = await env.DB.prepare(
+        "SELECT * FROM commands WHERE session_id = ?",
+      ).bind(sessionId).all<any>();
+
+      expect(rows.results).toHaveLength(1);
+      const cmd = rows.results[0]!;
+      expect(cmd.command).toBe("Can you list them?");
+      expect(cmd.message_thread_id).toBe(threadId);
+      const meta = JSON.parse(cmd.metadata_json!);
+      expect(meta.senderId).toBe("123456");
+      expect(meta.inReplyTo).toBe("Daily Digest: 5 PRs merged today.");
+      expect(meta.inReplyToQuote).toBe("5 PRs merged");
+    });
   });
 });
 
@@ -13018,6 +13455,348 @@ describe("named topics", () => {
   });
 });
 
+// ─── Named topic binding (POST /topics/named/bind, unbind) ───────────────
+
+describe("named topic binding", () => {
+  const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+  const CHAT = String(CHAT_ID_NUM);
+  let seq = 0;
+  const nextKey = () => `test:named-bind-${Date.now()}-${++seq}`;
+
+  beforeEach(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock.get("https://api.telegram.org").cleanMocks();
+  });
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  function onTelegram(method: string, reply: (body: any) => { ok: boolean; [k: string]: unknown }) {
+    const calls: any[] = [];
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
+      .reply((opts: any) => {
+        const body = JSON.parse(opts.body as string);
+        calls.push(body);
+        return {
+          statusCode: 200,
+          data: JSON.stringify(reply(body)),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      })
+      .persist();
+    return calls;
+  }
+
+  function bind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+    return handleNamedTopicBind(env.DB, e, new Request("https://worker/topics/named/bind", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  function unbind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+    return handleNamedTopicUnbind(env.DB, e, new Request("https://worker/topics/named/unbind", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+  }
+
+  async function registerSessionRow(sessionId: string) {
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, 'devbox', null, ?, ?)",
+    ).bind(sessionId, now, now).run();
+  }
+
+  test("1. bind with no sessions row -> 409 session not registered, no binding row", async () => {
+    const key = nextKey();
+    const sessionId = `ses_no_session_${Date.now()}`;
+    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error).toBe("session not registered");
+    const row = await env.DB.prepare("SELECT * FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).first();
+    expect(row).toBeNull();
+  });
+
+  test("2. register session, bind -> 200 bound:true; getBoundSessionByThread returns the session", async () => {
+    const key = nextKey();
+    const sessionId = `ses_bind_ok_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const threadId = 991001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: threadId, name: "Topic", icon_color: 0 } }));
+
+    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body).toEqual({
+      chatId: CHAT,
+      messageThreadId: threadId,
+      created: true,
+      bound: true,
+      sessionId,
+    });
+
+    const bound = await getBoundSessionByThread(env.DB, CHAT, threadId);
+    expect(bound).toBe(sessionId);
+
+    const binding = await getBindingForSession(env.DB, sessionId);
+    expect(binding).toEqual({
+      chat_id: CHAT,
+      topic_key: key,
+      message_thread_id: threadId,
+    });
+  });
+
+  test("3. bind the same session to a second key -> first binding gone (one topic per session)", async () => {
+    const key1 = nextKey();
+    const key2 = nextKey();
+    const sessionId = `ses_rebind_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread1 = 992001 + (++seq);
+    const thread2 = 992002 + (++seq);
+    let createCount = 0;
+    onTelegram("createForumTopic", () => ({
+      ok: true,
+      result: { message_thread_id: ++createCount === 1 ? thread1 : thread2, name: "Topic", icon_color: 0 },
+    }));
+
+    const res1 = await bind({ chatId: CHAT, key: key1, name: "Topic 1", sessionId });
+    expect(res1.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBe(sessionId);
+
+    const res2 = await bind({ chatId: CHAT, key: key2, name: "Topic 2", sessionId });
+    expect(res2.status).toBe(200);
+
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBeNull();
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread2)).toBe(sessionId);
+
+    const binding = await getBindingForSession(env.DB, sessionId);
+    expect(binding?.topic_key).toBe(key2);
+  });
+
+  test("4. bind a second session to the same key -> key now routes to the second session", async () => {
+    const key = nextKey();
+    const session1 = `ses_s1_${Date.now()}`;
+    const session2 = `ses_s2_${Date.now()}`;
+    await registerSessionRow(session1);
+    await registerSessionRow(session2);
+    const thread = 993001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    const res1 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session1 });
+    expect(res1.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session1);
+
+    const res2 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session2 });
+    expect(res2.status).toBe(200);
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session2);
+
+    expect(await getBindingForSession(env.DB, session1)).toBeNull();
+    expect((await getBindingForSession(env.DB, session2))?.topic_key).toBe(key);
+  });
+
+  test("5. unbind -> {unbound:1}; again -> {unbound:0}; lookup -> null", async () => {
+    const key = nextKey();
+    const sessionId = `ses_unbind_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread = 994001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
+
+    const res1 = await unbind({ sessionId });
+    expect(res1.status).toBe(200);
+    expect(await res1.json()).toEqual({ unbound: 1 });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+    expect(await getBindingForSession(env.DB, sessionId)).toBeNull();
+
+    const res2 = await unbind({ sessionId });
+    expect(res2.status).toBe(200);
+    expect(await res2.json()).toEqual({ unbound: 0 });
+  });
+
+  test("6. binding whose session row was deleted -> lookup null (inert)", async () => {
+    const key = nextKey();
+    const sessionId = `ses_deleted_row_${Date.now()}`;
+    await registerSessionRow(sessionId);
+    const thread = 995001 + (++seq);
+    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
+
+    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
+
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+    expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+  });
+
+  test("7. auth: no bearer -> 401 on both routes", async () => {
+    const noAuth = { "Content-Type": "application/json" };
+    const r1 = await bind({ chatId: CHAT, key: nextKey(), name: "n", sessionId: "ses_1" }, topicsEnv, noAuth);
+    expect(r1.status).toBe(401);
+    const r2 = await unbind({ sessionId: "ses_1" }, topicsEnv, noAuth);
+    expect(r2.status).toBe(401);
+  });
+
+  test("routes are mounted in worker", async () => {
+    const res1 = await SELF.fetch("https://worker/topics/named/bind", { method: "POST", headers: authHeaders, body: "{}" });
+    expect(res1.status).toBe(400);
+    const res2 = await SELF.fetch("https://worker/topics/named/unbind", { method: "POST", headers: authHeaders, body: "{}" });
+    expect(res2.status).toBe(400);
+  });
+
+  test("bind input validation: bad key, bad sessionId, disallowed chat, topics disabled", async () => {
+    const sessionId = "ses_valid";
+    await registerSessionRow(sessionId);
+    expect((await bind({ chatId: CHAT, key: "bad key", name: "n", sessionId })).status).toBe(400);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "" })).status).toBe(400);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "x".repeat(129) })).status).toBe(400);
+    expect((await bind({ chatId: "-1009999", key: "valid_key", name: "n", sessionId })).status).toBe(403);
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId }, env as Env)).status).toBe(409);
+  });
+
+  test("unbind input validation: missing or invalid sessionId", async () => {
+    expect((await unbind({})).status).toBe(400);
+    expect((await unbind({ sessionId: "" })).status).toBe(400);
+    expect((await unbind({ sessionId: "x".repeat(129) })).status).toBe(400);
+  });
+
+  test("schema skew: when named_topic_bindings is missing, lookups warn and degrade to null", async () => {
+    let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const now = Date.now();
+    const sessionId = `ses_skew_${now}`;
+    const thread = 886000 + (++seq);
+    const key = nextKey();
+
+    await registerSessionRow(sessionId);
+
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?)`,
+    ).bind(CHAT, key, thread, now, now).run();
+
+    try {
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await env.DB.exec("DROP TABLE named_topic_bindings");
+
+      expect(await getBindingForSession(env.DB, sessionId)).toBeNull();
+      expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, { ok: true, result: { message_thread_id: 12345, name: "Topic" } }, {
+          headers: { "Content-Type": "application/json" },
+        });
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(200, { ok: true, result: true }, {
+          headers: { "Content-Type": "application/json" },
+        });
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sentPayload = JSON.parse(raw);
+          return { ok: true, result: { message_id: 1234 } };
+        });
+
+      const notifRes = await handleSendNotification(
+        env.DB,
+        topicsEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: CHAT,
+            text: "notification during schema skew",
+            title: "Skew Title",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+      expect(notifRes.status).toBe(200);
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          message_thread_id: thread,
+          text: "hello in named topic during schema skew",
+        },
+      };
+
+      let hintSent: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          hintSent = JSON.parse(raw);
+          return { ok: true, result: { message_id: 1235 } };
+        });
+
+      const webhookRes = await handleTelegramWebhook(
+        env.DB,
+        topicsEnv,
+        makeWebhookRequest(update),
+      );
+      expect(webhookRes.status).toBe(200);
+      expect(hintSent).toMatchObject({
+        chat_id: CHAT,
+        message_thread_id: thread,
+        text: NAMED_TOPIC_HINT_TEXT,
+      });
+
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      await env.DB.prepare("DROP TABLE IF EXISTS named_topic_bindings").run().catch(() => {});
+      await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS named_topic_bindings (
+          chat_id     TEXT NOT NULL,
+          topic_key   TEXT NOT NULL,
+          session_id  TEXT NOT NULL,
+          bound_at    INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, topic_key)
+        )
+      `).run();
+      await env.DB.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
+          ON named_topic_bindings(session_id)
+      `).run();
+      warnSpy?.mockRestore();
+    }
+  });
+
+  test("a transient D1 error in the binding lookups still throws (only a missing table degrades)", async () => {
+    const failing = {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => {
+            throw new Error("D1_ERROR: Network connection lost.");
+          },
+        }),
+      }),
+    } as unknown as D1Database;
+    await expect(getBindingForSession(failing, "ses_x")).rejects.toThrow(/Network connection lost/);
+    await expect(getBoundSessionByThread(failing, "1", 2)).rejects.toThrow(/Network connection lost/);
+  });
+});
+
 // ─── Execute metadata: sender, forward, replied-to bot text ───────────────
 describe("buildExecuteMetadata", () => {
   const env = { TELEGRAM_BOT_USERNAME: "the_bot" };
@@ -13063,5 +13842,60 @@ describe("buildExecuteMetadata", () => {
       env,
     )!);
     expect(m.inReplyTo).toHaveLength(IN_REPLY_TO_MAX_CHARS);
+  });
+
+  it("carries partial quote only when replied-to message is this bot's own", () => {
+    const bot = { id: 9, is_bot: true, username: "The_Bot" };
+    const mine = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+        quote: { text: "  partial quoted span  " },
+      },
+      undefined,
+      env,
+    );
+    expect(JSON.parse(mine!).inReplyToQuote).toBe("partial quoted span");
+
+    // quote on someone else's message -> absent
+    const human = { id: 7, is_bot: false, username: "human_user" };
+    const notMine = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: human, text: "Human message" },
+        quote: { text: "partial quote of human" },
+      },
+      undefined,
+      env,
+    );
+    expect(notMine).toBeNull();
+
+    // empty or whitespace-only quote -> inReplyToQuote absent
+    const emptyQuote = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+        quote: { text: "   " },
+      },
+      undefined,
+      env,
+    );
+    expect(JSON.parse(emptyQuote!).inReplyToQuote).toBeUndefined();
+  });
+
+  it("bounds the partial quote to IN_REPLY_TO_MAX_CHARS", () => {
+    const bot = { id: 9, is_bot: true, username: "the_bot" };
+    const m = JSON.parse(
+      buildExecuteMetadata(
+        {
+          ...base,
+          reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+          quote: { text: "x".repeat(IN_REPLY_TO_MAX_CHARS + 20) },
+        },
+        undefined,
+        env,
+      )!,
+    );
+    expect(m.inReplyToQuote).toHaveLength(IN_REPLY_TO_MAX_CHARS);
   });
 });

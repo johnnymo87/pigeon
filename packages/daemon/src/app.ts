@@ -27,6 +27,7 @@ import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
+import type { WorkerResult } from "./worker/poller";
 
 interface LegacySession {
   session_id: string;
@@ -300,7 +301,7 @@ interface AppOptions {
   nowFn?: () => number;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
-  onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
+  onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
   chatId?: string;
   machineId?: string;
@@ -321,7 +322,31 @@ interface AppOptions {
   resolveNamedTopic?: NamedTopicResolver;
   /** Bound on `resolveNamedTopic` per alert. Test seam. */
   alertTopicTimeoutMs?: number;
+  /** Bound on `bindNamedTopic` and `unbindNamedTopic`. Test seam. */
+  bindTimeoutMs?: number;
+  /**
+   * Bind a named topic to a session on `POST /session-start`.
+   * Absent on a host with no worker connection.
+   */
+  bindNamedTopic?: (
+    req: { sessionId: string; key: string; name: string },
+    signal?: AbortSignal,
+  ) => Promise<{ messageThreadId: number }>;
+  /**
+   * Unbind a session from its named topic on `POST /session-unbind`.
+   * Absent on a host with no worker connection.
+   */
+  unbindNamedTopic?: (
+    sessionId: string,
+    signal?: AbortSignal,
+  ) => Promise<{ unbound: number }>;
 }
+
+/**
+ * Bound on binding and unbinding named topics. Distinct from the 3s alert topic budget
+ * because the worker may make 1-2 Telegram calls (reopen hourly, create on first use).
+ */
+export const BIND_TIMEOUT_MS = 8_000;
 
 /**
  * Floor on the send bound for a links-bearing `/alert`, so a lookup that ate
@@ -379,13 +404,21 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const startedAt = Date.now();
         const remaining = () =>
           Math.max(ALERT_MIN_SEND_MS, PLAIN_ALERT_TIMEOUT_MS - (Date.now() - startedAt));
+        const strict = body.strict_topic === true && body.topic !== undefined;
         const topic = body.topic === undefined ? undefined : parseAlertTopic(body.topic);
+        if (strict && !topic) {
+          return Response.json({ error: "invalid_topic" }, { status: 400 });
+        }
         const [keyboard, resolvedTopic] = await Promise.all([
           body.links === undefined
             ? undefined
             : resolveAlertKeyboard(body.links, opts.lookupTopics, opts.alertLinkTimeoutMs),
           topic ? resolveAlertTopic(topic, opts.resolveNamedTopic, opts.alertTopicTimeoutMs) : undefined,
         ]);
+
+        if (strict && !resolvedTopic) {
+          return Response.json({ error: "topic_unavailable" }, { status: 502 });
+        }
 
         if (!keyboard && !resolvedTopic) {
           try {
@@ -429,6 +462,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                       thread,
                     )
                   : undefined;
+                if (strict && !again) {
+                  return Response.json({ error: "topic_unavailable" }, { status: 502 });
+                }
                 console.warn(`[alert] topic thread ${thread} not found; ${again ? `recreated as ${again.messageThreadId}` : "posting to General"}`);
                 thread = again?.messageThreadId;
                 createdThread = again?.created ? thread : undefined;
@@ -436,6 +472,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
                 replyMarkup = undefined;
               } else if (thread !== undefined) {
+                if (strict) {
+                  const detail = err.description ?? err.message;
+                  return Response.json({ error: "rejected_in_topic", detail }, { status: 502 });
+                }
                 // The buttons were already dropped and it still failed, so the
                 // topic is the likelier culprit: try General WITH the buttons
                 // again before giving them up for good.
@@ -780,6 +820,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             payload: m.payload,
             sender_id: m.senderId,
             in_reply_to: m.inReplyTo,
+            in_reply_to_quote: m.inReplyToQuote ?? null,
             created_at: m.createdAt,
             claim_count: m.claimCount,
             // A row claimed before but never acked. The client may already have
@@ -917,11 +958,118 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         console.log(logParts.join(" "));
 
-        if (onSessionStart && ((body.notify as boolean | undefined) ?? existing?.notify ?? false)) {
-          await onSessionStart(sessionId, true, (typeof body.label === "string" ? body.label : null) ?? existing?.label);
+        const effectiveNotify = ((body.notify as boolean | undefined) ?? existing?.notify ?? false);
+        let workerRegOk = true;
+        if (onSessionStart && effectiveNotify) {
+          try {
+            const regResult = await onSessionStart(
+              sessionId,
+              true,
+              (typeof body.label === "string" ? body.label : null) ?? existing?.label,
+            );
+            if (regResult && typeof regResult === "object" && "ok" in regResult && regResult.ok === false) {
+              workerRegOk = false;
+            }
+          } catch {
+            workerRegOk = false;
+          }
         }
 
-        return Response.json({ ok: true, session_id: sessionId });
+        const machine_id = opts.machineId ?? null;
+
+        if (body.named_topic !== undefined) {
+          const parsedTopic = parseAlertTopic(body.named_topic);
+          let bound = false;
+          let bindError: string | undefined;
+
+          const session = storage.sessions.get(sessionId);
+
+          if (!parsedTopic) {
+            bindError = "invalid named_topic";
+          } else if (!effectiveNotify) {
+            bindError = "notify is required";
+          } else if (!isPullBackend(session)) {
+            bindError = "not a pull session";
+          } else if (!workerRegOk) {
+            bindError = "worker registration failed";
+          } else if (!opts.bindNamedTopic) {
+            bindError = "no worker connection";
+          } else {
+            const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
+            const controller = new AbortController();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let timedOut = false;
+            const deadline = new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+                reject(new Error(`timed out after ${timeoutMs}ms`));
+              }, timeoutMs);
+            });
+            try {
+              const inFlight = opts.bindNamedTopic(
+                { sessionId, key: parsedTopic.key, name: parsedTopic.name },
+                controller.signal,
+              );
+              await Promise.race([inFlight, deadline]);
+              bound = true;
+            } catch (err) {
+              if (timedOut) {
+                bindError = "bind timed out";
+              } else {
+                const msg = err instanceof Error ? err.message : String(err);
+                bindError = `bind failed: ${msg}`;
+              }
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+
+          return Response.json({
+            ok: true,
+            session_id: sessionId,
+            machine_id,
+            named_topic_bound: bound,
+            ...(bound ? {} : { named_topic_error: bindError }),
+          });
+        }
+
+        return Response.json({ ok: true, session_id: sessionId, machine_id });
+      }
+
+      if (request.method === "POST" && url.pathname === "/session-unbind") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        if (!opts.unbindNamedTopic) {
+          return Response.json({ error: "no worker connection" }, { status: 503 });
+        }
+        const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let timedOut = false;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+            reject(new Error(`timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        try {
+          const inFlight = opts.unbindNamedTopic(sessionId, controller.signal);
+          const result = await Promise.race([inFlight, deadline]);
+          return Response.json({ ok: true, unbound: result.unbound });
+        } catch (err) {
+          if (timedOut) {
+            return Response.json({ error: "unbind timed out" }, { status: 504 });
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: `unbind failed: ${msg}` }, { status: 502 });
+        } finally {
+          clearTimeout(timer);
+        }
       }
 
       if (request.method === "POST" && url.pathname === "/session-origin") {

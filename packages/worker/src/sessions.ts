@@ -160,6 +160,12 @@ async function unregisterSession(
   await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
   await db.prepare("DELETE FROM messages WHERE session_id = ?").bind(sessionId).run();
 
+  try {
+    await db.prepare("DELETE FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).run();
+  } catch (err) {
+    console.warn("[worker] unregister binding delete failed", { sessionId, error: String(err) });
+  }
+
   // Topic closing runs AFTER the deletes, and the order is load-bearing.
   //
   // Deleting the session is this endpoint's primary job; closing the topic is auxiliary. If the

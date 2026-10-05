@@ -6,7 +6,7 @@ import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
-import { handleNamedTopic } from "./named-topics";
+import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -52,6 +52,12 @@ export default {
         }
         if (path === "/topics/named" && method === "POST") {
           return handleNamedTopic(db, env, request);
+        }
+        if (path === "/topics/named/bind" && method === "POST") {
+          return handleNamedTopicBind(db, env, request);
+        }
+        if (path === "/topics/named/unbind" && method === "POST") {
+          return handleNamedTopicUnbind(db, env, request);
         }
 
         // Media

@@ -173,6 +173,8 @@ export interface ExecuteMessage {
     forwarded?: boolean;
     /** Up to 500 chars of the bot's own message the human swipe-replied to. */
     inReplyTo?: string;
+    /** Up to 500 chars of Telegram's partial quote when the human highlighted a span. */
+    inReplyToQuote?: string;
   };
 }
 
@@ -697,6 +699,76 @@ export class Poller {
     const body = (await response.json()) as { messageThreadId?: unknown; created?: unknown };
     if (typeof body?.messageThreadId !== "number") throw new Error("topics/named returned no thread");
     return { messageThreadId: body.messageThreadId, created: body.created === true };
+  }
+
+  /**
+   * Bind a named topic to a session. POSTs chatId/sessionId/key/name to
+   * `/topics/named/bind` in this daemon's chat. Throws on any failure (caller reports it).
+   * Not recorded in the worker-health monitor (same reasoning as resolveNamedTopic).
+   */
+  async bindNamedTopic(
+    req: { sessionId: string; key: string; name: string },
+    signal?: AbortSignal,
+  ): Promise<{ messageThreadId: number }> {
+    if (!this.config.chatId) throw new Error("no chat configured");
+    const response = await this.fetchFn(`${this.config.workerUrl}/topics/named/bind`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ chatId: this.config.chatId, ...req }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      let errDetail = "";
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        if (typeof body?.error === "string") errDetail = `: ${body.error}`;
+      } catch {
+        // ignore JSON parse failure
+      }
+      throw new Error(`topics/named/bind returned ${response.status}${errDetail}`);
+    }
+    const body = (await response.json()) as { messageThreadId?: unknown; bound?: unknown };
+    if (typeof body?.messageThreadId !== "number" || body?.bound !== true) {
+      throw new Error("topics/named/bind returned invalid response");
+    }
+    return { messageThreadId: body.messageThreadId };
+  }
+
+  /**
+   * Drop a session's named topic binding. POSTs sessionId to `/topics/named/unbind`.
+   * Throws on any failure.
+   */
+  async unbindNamedTopic(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<{ unbound: number }> {
+    const response = await this.fetchFn(`${this.config.workerUrl}/topics/named/unbind`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      let errDetail = "";
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        if (typeof body?.error === "string") errDetail = `: ${body.error}`;
+      } catch {
+        // ignore JSON parse failure
+      }
+      throw new Error(`topics/named/unbind returned ${response.status}${errDetail}`);
+    }
+    const body = (await response.json()) as { unbound?: unknown };
+    if (typeof body?.unbound !== "number") {
+      throw new Error("topics/named/unbind returned invalid response");
+    }
+    return { unbound: body.unbound };
   }
 
   async sendNotification(

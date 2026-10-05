@@ -1345,6 +1345,73 @@ describe("Poller.resolveNamedTopic()", () => {
   });
 });
 
+describe("Poller.bindNamedTopic()", () => {
+  it("POSTs chatId/sessionId/key/name to /topics/named/bind and returns the thread", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ chatId: "chat-42", messageThreadId: 17, created: false, bound: true, sessionId: "ses_1" }),
+        { status: 200 },
+      ),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    const result = await poller.bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" });
+    expect(result).toEqual({ messageThreadId: 17 });
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/topics/named/bind");
+    expect(init.headers).toMatchObject({
+      Authorization: `Bearer ${BASE_CONFIG.apiKey}`,
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(init.body as string)).toEqual({
+      chatId: "chat-42",
+      sessionId: "ses_1",
+      key: "k1",
+      name: "Topic 1",
+    });
+  });
+
+  it("throws when bound is not true, on non-2xx, or when no chat is configured", async () => {
+    // Missing or false bound flag
+    const f1 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ messageThreadId: 17, bound: false }), { status: 200 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f1 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow();
+
+    // 409 session not registered
+    const f2 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "session not registered" }), { status: 409 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f2 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow("session not registered");
+
+    // No chat configured
+    const f3 = vi.fn();
+    await expect(new Poller({ ...BASE_CONFIG, chatId: undefined }, makeCallbacks(), { fetchFn: f3 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow("no chat configured");
+    expect(f3).not.toHaveBeenCalled();
+  });
+});
+
+describe("Poller.unbindNamedTopic()", () => {
+  it("POSTs sessionId to /topics/named/unbind and returns unbound count", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ unbound: 1 }), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    const result = await poller.unbindNamedTopic("ses_1");
+    expect(result).toEqual({ unbound: 1 });
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/topics/named/unbind");
+    expect(init.headers).toMatchObject({
+      Authorization: `Bearer ${BASE_CONFIG.apiKey}`,
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(init.body as string)).toEqual({ sessionId: "ses_1" });
+  });
+
+  it("throws on non-2xx or invalid response body", async () => {
+    const f1 = vi.fn().mockResolvedValue(new Response("{}", { status: 502 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f1 as unknown as typeof fetch }).unbindNamedTopic("ses_1")).rejects.toThrow();
+
+    const f2 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ unbound: "not a number" }), { status: 200 }));
+    await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f2 as unknown as typeof fetch }).unbindNamedTopic("ses_1")).rejects.toThrow();
+  });
+});
+
 describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
   function capture() {
     const bodies: unknown[] = [];

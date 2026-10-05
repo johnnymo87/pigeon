@@ -271,3 +271,179 @@ export async function maybeAnswerInNamedTopic(
   }
   return true;
 }
+
+/**
+ * True only for the one failure these lookups may absorb: the worker was deployed before
+ * `named_topic_bindings` was created in D1 (the schema file is applied by hand, separately).
+ * Anything else -- a transient D1 error -- must still throw. Swallowing it would turn a
+ * notification the daemon would have retried into a permanent misroute into a fresh session
+ * topic, and tell the human nothing reads a topic that something does.
+ */
+function isMissingBindingsTable(err: unknown): boolean {
+  return /no such table/i.test(String(err));
+}
+
+/** The session a bound named topic routes to, or null. Inert when the session has no row. */
+export async function getBoundSessionByThread(
+  db: D1Database,
+  chatId: string,
+  messageThreadId: number,
+): Promise<string | null> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT b.session_id FROM named_topic_bindings b
+           JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
+           JOIN sessions s ON s.session_id = b.session_id
+          WHERE t.chat_id = ? AND t.message_thread_id = ?`,
+      )
+      .bind(chatId, messageThreadId)
+      .first<{ session_id: string }>();
+    return row?.session_id ?? null;
+  } catch (err) {
+    if (!isMissingBindingsTable(err)) throw err;
+    console.warn("[worker] getBoundSessionByThread: named_topic_bindings is missing (schema not applied?); treating as unbound");
+    return null;
+  }
+}
+
+export async function getBindingForSession(
+  db: D1Database,
+  sessionId: string,
+): Promise<{ chat_id: string; topic_key: string; message_thread_id: number } | null> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT b.chat_id, b.topic_key, t.message_thread_id
+           FROM named_topic_bindings b
+           JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
+          WHERE b.session_id = ?`,
+      )
+      .bind(sessionId)
+      .first<{ chat_id: string; topic_key: string; message_thread_id: number }>();
+    return row ?? null;
+  } catch (err) {
+    if (!isMissingBindingsTable(err)) throw err;
+    console.warn("[worker] getBindingForSession: named_topic_bindings is missing (schema not applied?); treating as unbound");
+    return null;
+  }
+}
+
+export async function unbindSession(db: D1Database, sessionId: string): Promise<number> {
+  const r = await db.prepare("DELETE FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).run();
+  return r.meta?.changes ?? 0;
+}
+
+/**
+ * POST /topics/named/bind  {chatId, key, name, sessionId}
+ *   200 {chatId, messageThreadId, created, bound: true, sessionId}
+ *   400 bad input · 403 chat not allowed · 409 topics disabled · 409 session not registered · 429/502
+ */
+export async function handleNamedTopicBind(
+  db: D1Database,
+  env: Env,
+  request: Request,
+): Promise<Response> {
+  if (!verifyApiKey(request, env.CCR_API_KEY)) return unauthorized();
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object") {
+    return Response.json({ error: "invalid body" }, { status: 400 });
+  }
+
+  const chatId = typeof body.chatId === "string" || typeof body.chatId === "number" ? String(body.chatId) : "";
+  const key = typeof body.key === "string" ? body.key : "";
+  const name = typeof body.name === "string" ? body.name : "";
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+
+  if (!chatId || !NAMED_TOPIC_KEY_RE.test(key) || !sessionId || sessionId.length > 128) {
+    return Response.json({ error: "chatId, a valid key, and sessionId (1-128 chars) are required" }, { status: 400 });
+  }
+  if (!isAllowedChatId(chatId, env)) {
+    return Response.json({ error: "Chat ID not allowed" }, { status: 403 });
+  }
+  if (!topicsEnabled(env)) {
+    return Response.json({ error: "topics disabled" }, { status: 409 });
+  }
+
+  const sessionRow = await db
+    .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+    .bind(sessionId)
+    .first();
+  if (!sessionRow) {
+    return Response.json({ error: "session not registered" }, { status: 409 });
+  }
+
+  const res = await resolveNamedTopic(db, {
+    chatId,
+    key,
+    name,
+    botToken: env.TELEGRAM_BOT_TOKEN,
+  });
+  if (!res.ok) {
+    if (res.kind === "rate_limited") {
+      return Response.json({ error: "rate_limited", retryAfter: res.retryAfter }, { status: 429 });
+    }
+    return Response.json({ error: "create_failed", details: res.details }, { status: 502 });
+  }
+
+  const now = Date.now();
+  await db.batch([
+    db
+      .prepare("DELETE FROM named_topic_bindings WHERE session_id = ? AND NOT (chat_id = ? AND topic_key = ?)")
+      .bind(sessionId, chatId, key),
+    db
+      .prepare(
+        `INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(chat_id, topic_key) DO UPDATE SET
+           session_id = excluded.session_id,
+           bound_at = excluded.bound_at`,
+      )
+      .bind(chatId, key, sessionId, now),
+  ]);
+
+  return Response.json({
+    chatId,
+    messageThreadId: res.messageThreadId,
+    created: res.created,
+    bound: true,
+    sessionId,
+  });
+}
+
+/**
+ * POST /topics/named/unbind  {sessionId}
+ *   200 {unbound: n}
+ *   400 bad input
+ */
+export async function handleNamedTopicUnbind(
+  db: D1Database,
+  env: Env,
+  request: Request,
+): Promise<Response> {
+  if (!verifyApiKey(request, env.CCR_API_KEY)) return unauthorized();
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object") {
+    return Response.json({ error: "invalid body" }, { status: 400 });
+  }
+
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+  if (!sessionId || sessionId.length > 128) {
+    return Response.json({ error: "sessionId (1-128 chars) is required" }, { status: 400 });
+  }
+
+  const unbound = await unbindSession(db, sessionId);
+  return Response.json({ unbound });
+}

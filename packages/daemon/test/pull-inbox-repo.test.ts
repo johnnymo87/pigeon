@@ -211,8 +211,24 @@ describe("PullInboxRepository", () => {
     raw.db.exec(`INSERT INTO pull_inbox (msg_id, session_id, source, payload, created_at, expires_at)
       VALUES ('old', 'ses_pull', 'telegram-reply', 'kept', 1000, 99999999)`);
     initPullInboxSchema(raw.db);
-    expect(raw.pullInbox.bank({ msgId: "new", sessionId: "ses_pull", source: "telegram-reply", payload: "x", senderId: "1" }, 1_000)).toBe(true);
+    expect(
+      raw.pullInbox.bank(
+        {
+          msgId: "new",
+          sessionId: "ses_pull",
+          source: "telegram-reply",
+          payload: "x",
+          senderId: "1",
+          inReplyTo: "prior",
+          inReplyToQuote: "quote",
+        },
+        1_000,
+      ),
+    ).toBe(true);
     expect(raw.pullInbox.pendingCount("ses_pull", 2_000)).toBe(2);
+    const claimed = raw.pullInbox.claim("ses_pull", 2_000);
+    const newRow = claimed.find((r) => r.msgId === "new");
+    expect(newRow?.inReplyToQuote).toBe("quote");
     raw.db.close();
   });
 
@@ -227,12 +243,17 @@ describe("PullInboxRepository", () => {
     expect(s.db.prepare("SELECT COUNT(*) AS n FROM pull_inbox").get()).toEqual({ n: 1 });
   });
 
-  it("carries the sender id and the replied-to bot text", () => {
+  it("carries the sender id, replied-to bot text, and partial quote", () => {
     const s = newDb();
-    bank(s, "a1", "ses_pull", 1_000, { senderId: "1001", inReplyTo: "Rebase or wait?" });
+    bank(s, "a1", "ses_pull", 1_000, {
+      senderId: "1001",
+      inReplyTo: "Rebase or wait?",
+      inReplyToQuote: "wait?",
+    });
     const [row] = s.pullInbox.claim("ses_pull", 2_000);
     expect(row!.senderId).toBe("1001");
     expect(row!.inReplyTo).toBe("Rebase or wait?");
+    expect(row!.inReplyToQuote).toBe("wait?");
   });
 
   it("reaps acked rows after the retention window, and keeps unacked ones", () => {
