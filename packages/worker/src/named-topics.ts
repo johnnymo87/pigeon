@@ -272,6 +272,17 @@ export async function maybeAnswerInNamedTopic(
   return true;
 }
 
+/**
+ * True only for the one failure these lookups may absorb: the worker was deployed before
+ * `named_topic_bindings` was created in D1 (the schema file is applied by hand, separately).
+ * Anything else -- a transient D1 error -- must still throw. Swallowing it would turn a
+ * notification the daemon would have retried into a permanent misroute into a fresh session
+ * topic, and tell the human nothing reads a topic that something does.
+ */
+function isMissingBindingsTable(err: unknown): boolean {
+  return /no such table/i.test(String(err));
+}
+
 /** The session a bound named topic routes to, or null. Inert when the session has no row. */
 export async function getBoundSessionByThread(
   db: D1Database,
@@ -290,7 +301,8 @@ export async function getBoundSessionByThread(
       .first<{ session_id: string }>();
     return row?.session_id ?? null;
   } catch (err) {
-    console.warn("[worker] getBoundSessionByThread lookup failed (schema skew?):", err);
+    if (!isMissingBindingsTable(err)) throw err;
+    console.warn("[worker] getBoundSessionByThread: named_topic_bindings is missing (schema not applied?); treating as unbound");
     return null;
   }
 }
@@ -311,7 +323,8 @@ export async function getBindingForSession(
       .first<{ chat_id: string; topic_key: string; message_thread_id: number }>();
     return row ?? null;
   } catch (err) {
-    console.warn("[worker] getBindingForSession lookup failed (schema skew?):", err);
+    if (!isMissingBindingsTable(err)) throw err;
+    console.warn("[worker] getBindingForSession: named_topic_bindings is missing (schema not applied?); treating as unbound");
     return null;
   }
 }

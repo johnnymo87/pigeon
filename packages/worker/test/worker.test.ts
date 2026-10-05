@@ -13781,6 +13781,20 @@ describe("named topic binding", () => {
       warnSpy?.mockRestore();
     }
   });
+
+  test("a transient D1 error in the binding lookups still throws (only a missing table degrades)", async () => {
+    const failing = {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => {
+            throw new Error("D1_ERROR: Network connection lost.");
+          },
+        }),
+      }),
+    } as unknown as D1Database;
+    await expect(getBindingForSession(failing, "ses_x")).rejects.toThrow(/Network connection lost/);
+    await expect(getBoundSessionByThread(failing, "1", 2)).rejects.toThrow(/Network connection lost/);
+  });
 });
 
 // ─── Execute metadata: sender, forward, replied-to bot text ───────────────
