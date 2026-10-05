@@ -98,3 +98,16 @@ CREATE TABLE IF NOT EXISTS named_topics (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topics_thread
   ON named_topics(chat_id, message_thread_id);
+
+-- A named topic (see named_topics) a pull-mode session reads. Separate table, not a column on
+-- named_topics: d1-schema.sql is re-applied by hand and must stay idempotent, and SQLite has no
+-- ADD COLUMN IF NOT EXISTS. One topic per session, one session per topic.
+CREATE TABLE IF NOT EXISTS named_topic_bindings (
+  chat_id     TEXT NOT NULL,
+  topic_key   TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  bound_at    INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, topic_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
+  ON named_topic_bindings(session_id);

@@ -176,6 +176,15 @@ const d1SchemaStatements = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topics_thread
     ON named_topics(chat_id, message_thread_id)`,
+  `CREATE TABLE IF NOT EXISTS named_topic_bindings (
+    chat_id     TEXT NOT NULL,
+    topic_key   TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    bound_at    INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, topic_key)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
+    ON named_topic_bindings(session_id)`,
 ];
 
 beforeAll(async () => {
