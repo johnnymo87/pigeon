@@ -13638,4 +13638,59 @@ describe("buildExecuteMetadata", () => {
     )!);
     expect(m.inReplyTo).toHaveLength(IN_REPLY_TO_MAX_CHARS);
   });
+
+  it("carries partial quote only when replied-to message is this bot's own", () => {
+    const bot = { id: 9, is_bot: true, username: "The_Bot" };
+    const mine = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+        quote: { text: "  partial quoted span  " },
+      },
+      undefined,
+      env,
+    );
+    expect(JSON.parse(mine!).inReplyToQuote).toBe("partial quoted span");
+
+    // quote on someone else's message -> absent
+    const human = { id: 7, is_bot: false, username: "human_user" };
+    const notMine = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: human, text: "Human message" },
+        quote: { text: "partial quote of human" },
+      },
+      undefined,
+      env,
+    );
+    expect(notMine).toBeNull();
+
+    // empty or whitespace-only quote -> inReplyToQuote absent
+    const emptyQuote = buildExecuteMetadata(
+      {
+        ...base,
+        reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+        quote: { text: "   " },
+      },
+      undefined,
+      env,
+    );
+    expect(JSON.parse(emptyQuote!).inReplyToQuote).toBeUndefined();
+  });
+
+  it("bounds the partial quote to IN_REPLY_TO_MAX_CHARS", () => {
+    const bot = { id: 9, is_bot: true, username: "the_bot" };
+    const m = JSON.parse(
+      buildExecuteMetadata(
+        {
+          ...base,
+          reply_to_message: { message_id: 2, from: bot, text: "Full bot message" },
+          quote: { text: "x".repeat(IN_REPLY_TO_MAX_CHARS + 20) },
+        },
+        undefined,
+        env,
+      )!,
+    );
+    expect(m.inReplyToQuote).toHaveLength(IN_REPLY_TO_MAX_CHARS);
+  });
 });

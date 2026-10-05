@@ -218,6 +218,7 @@ export interface TelegramMessage {
     text?: string;
     caption?: string;
   };
+  quote?: { text?: string; is_manual?: boolean };
   // Service messages. Telegram emits these into a chat as bot-visible updates with
   // no `text`/`caption`. They must never be routed to a session.
   forum_topic_created?: unknown;
@@ -880,6 +881,8 @@ export function buildExecuteMetadata(
   ) {
     const text = (replied.text ?? replied.caption ?? "").trim();
     if (text) meta.inReplyTo = text.slice(0, IN_REPLY_TO_MAX_CHARS);
+    const q = (message.quote?.text ?? "").trim();
+    if (q) meta.inReplyToQuote = q.slice(0, IN_REPLY_TO_MAX_CHARS);
   }
   return Object.keys(meta).length > 0 ? JSON.stringify(meta) : null;
 }
