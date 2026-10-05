@@ -82,6 +82,8 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `POST /sessions/unregister` (Bearer) -> remove session
 - `POST /topics/lookup` (Bearer) `{sessionIds: string[]}` (0-50) -> `{topics: {[sessionId]: {chatId, messageThreadId, state} | null}}`. Read-only view of the `topics` table; `null` = no topic (topics are created lazily). Used by the daemon's `/alert` link buttons.
 - `POST /topics/named` (Bearer) `{chatId, key, name, staleThreadId?}` -> `{chatId, messageThreadId, created}`. Find-or-create a caller-keyed forum topic (D1 `named_topics`, exempt from the orphan-closer and reaper). `staleThreadId` reports a thread deleted out of band and gets a new topic. Every non-200 means "post to General" to the daemon.
+- `POST /topics/named/bind` (Bearer) `{chatId, key, name, sessionId}` -> `{chatId, messageThreadId, created, bound: true, sessionId}`; `409 session not registered` when `sessions` has no row. Plain messages typed in the bound topic route to that session (D1 `named_topic_bindings`; slash commands do not follow bindings).
+- `POST /topics/named/unbind` (Bearer) `{sessionId}` -> `{unbound: n}` (0 is success).
 - `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
 - `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions.
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
