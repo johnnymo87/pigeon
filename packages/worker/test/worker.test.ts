@@ -13590,6 +13590,121 @@ describe("named topic binding", () => {
     expect((await unbind({ sessionId: "" })).status).toBe(400);
     expect((await unbind({ sessionId: "x".repeat(129) })).status).toBe(400);
   });
+
+  test("schema skew: when named_topic_bindings is missing, lookups warn and degrade to null", async () => {
+    let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const now = Date.now();
+    const sessionId = `ses_skew_${now}`;
+    const thread = 886000 + (++seq);
+    const key = nextKey();
+
+    await registerSessionRow(sessionId);
+
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?)`,
+    ).bind(CHAT, key, thread, now, now).run();
+
+    try {
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await env.DB.exec("DROP TABLE named_topic_bindings");
+
+      expect(await getBindingForSession(env.DB, sessionId)).toBeNull();
+      expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
+
+      let sentPayload: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, { ok: true, result: { message_thread_id: 12345, name: "Topic" } }, {
+          headers: { "Content-Type": "application/json" },
+        });
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(200, { ok: true, result: true }, {
+          headers: { "Content-Type": "application/json" },
+        });
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          sentPayload = JSON.parse(raw);
+          return { ok: true, result: { message_id: 1234 } };
+        });
+
+      const notifRes = await handleSendNotification(
+        env.DB,
+        topicsEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId: CHAT,
+            text: "notification during schema skew",
+            title: "Skew Title",
+            dir: "pigeon",
+            threaded: true,
+          }),
+        }),
+      );
+      expect(notifRes.status).toBe(200);
+
+      const update = {
+        update_id: ++webhookUpdateCounter,
+        message: {
+          message_id: ++webhookUpdateCounter,
+          chat: { id: CHAT_ID_NUM },
+          from: { id: CHAT_ID_NUM },
+          message_thread_id: thread,
+          text: "hello in named topic during schema skew",
+        },
+      };
+
+      let hintSent: any = null;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, (opts: any) => {
+          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+          hintSent = JSON.parse(raw);
+          return { ok: true, result: { message_id: 1235 } };
+        });
+
+      const webhookRes = await handleTelegramWebhook(
+        env.DB,
+        topicsEnv,
+        makeWebhookRequest(update),
+      );
+      expect(webhookRes.status).toBe(200);
+      expect(hintSent).toMatchObject({
+        chat_id: CHAT,
+        message_thread_id: thread,
+        text: NAMED_TOPIC_HINT_TEXT,
+      });
+
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      await env.DB.prepare("DROP TABLE IF EXISTS named_topic_bindings").run().catch(() => {});
+      await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS named_topic_bindings (
+          chat_id     TEXT NOT NULL,
+          topic_key   TEXT NOT NULL,
+          session_id  TEXT NOT NULL,
+          bound_at    INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, topic_key)
+        )
+      `).run();
+      await env.DB.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
+          ON named_topic_bindings(session_id)
+      `).run();
+      warnSpy?.mockRestore();
+    }
+  });
 });
 
 // ─── Execute metadata: sender, forward, replied-to bot text ───────────────

@@ -278,32 +278,42 @@ export async function getBoundSessionByThread(
   chatId: string,
   messageThreadId: number,
 ): Promise<string | null> {
-  const row = await db
-    .prepare(
-      `SELECT b.session_id FROM named_topic_bindings b
-         JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
-         JOIN sessions s ON s.session_id = b.session_id
-        WHERE t.chat_id = ? AND t.message_thread_id = ?`,
-    )
-    .bind(chatId, messageThreadId)
-    .first<{ session_id: string }>();
-  return row?.session_id ?? null;
+  try {
+    const row = await db
+      .prepare(
+        `SELECT b.session_id FROM named_topic_bindings b
+           JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
+           JOIN sessions s ON s.session_id = b.session_id
+          WHERE t.chat_id = ? AND t.message_thread_id = ?`,
+      )
+      .bind(chatId, messageThreadId)
+      .first<{ session_id: string }>();
+    return row?.session_id ?? null;
+  } catch (err) {
+    console.warn("[worker] getBoundSessionByThread lookup failed (schema skew?):", err);
+    return null;
+  }
 }
 
 export async function getBindingForSession(
   db: D1Database,
   sessionId: string,
 ): Promise<{ chat_id: string; topic_key: string; message_thread_id: number } | null> {
-  const row = await db
-    .prepare(
-      `SELECT b.chat_id, b.topic_key, t.message_thread_id
-         FROM named_topic_bindings b
-         JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
-        WHERE b.session_id = ?`,
-    )
-    .bind(sessionId)
-    .first<{ chat_id: string; topic_key: string; message_thread_id: number }>();
-  return row ?? null;
+  try {
+    const row = await db
+      .prepare(
+        `SELECT b.chat_id, b.topic_key, t.message_thread_id
+           FROM named_topic_bindings b
+           JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
+          WHERE b.session_id = ?`,
+      )
+      .bind(sessionId)
+      .first<{ chat_id: string; topic_key: string; message_thread_id: number }>();
+    return row ?? null;
+  } catch (err) {
+    console.warn("[worker] getBindingForSession lookup failed (schema skew?):", err);
+    return null;
+  }
 }
 
 export async function unbindSession(db: D1Database, sessionId: string): Promise<number> {
