@@ -322,6 +322,14 @@ describe("POST /alert", () => {
         expect(sendPlainAlert).toHaveBeenCalledTimes(1);
       });
 
+      it("strict_topic with malformed topic returns 400 invalid_topic and sends nothing", async () => {
+        const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true) });
+        const res = await post(app, { text: "x", topic: { key: "bad key with spaces" }, strict_topic: true });
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: "invalid_topic" });
+        expect(sendPlainAlert).not.toHaveBeenCalled();
+      });
+
       it("thread-not-found + strict → recreated thread used", async () => {
         const resolveNamedTopic = vi.fn()
           .mockResolvedValueOnce({ messageThreadId: 77, created: false })

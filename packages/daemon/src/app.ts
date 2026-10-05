@@ -396,8 +396,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const startedAt = Date.now();
         const remaining = () =>
           Math.max(ALERT_MIN_SEND_MS, PLAIN_ALERT_TIMEOUT_MS - (Date.now() - startedAt));
+        const strict = body.strict_topic === true && body.topic !== undefined;
         const topic = body.topic === undefined ? undefined : parseAlertTopic(body.topic);
-        const strict = body.strict_topic === true && topic !== undefined;
+        if (strict && !topic) {
+          return Response.json({ error: "invalid_topic" }, { status: 400 });
+        }
         const [keyboard, resolvedTopic] = await Promise.all([
           body.links === undefined
             ? undefined
