@@ -56,6 +56,7 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
     const names = new Set(existing.map((c) => c.name));
     if (!names.has("sender_id")) db.exec("ALTER TABLE pull_inbox ADD COLUMN sender_id TEXT");
     if (!names.has("in_reply_to")) db.exec("ALTER TABLE pull_inbox ADD COLUMN in_reply_to TEXT");
+    if (!names.has("in_reply_to_quote")) db.exec("ALTER TABLE pull_inbox ADD COLUMN in_reply_to_quote TEXT");
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS pull_inbox (
@@ -65,6 +66,7 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
       payload TEXT NOT NULL,
       sender_id TEXT,
       in_reply_to TEXT,
+      in_reply_to_quote TEXT,
       chat_id TEXT,
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,

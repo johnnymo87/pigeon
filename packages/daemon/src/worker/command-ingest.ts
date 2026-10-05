@@ -1315,6 +1315,7 @@ async function deliverViaAdapter(
   const senderId = typeof meta.senderId === "string" && meta.senderId ? meta.senderId : undefined;
   const forwarded = Boolean(meta.forwarded);
   const inReplyTo = typeof meta.inReplyTo === "string" && meta.inReplyTo ? meta.inReplyTo : undefined;
+  const inReplyToQuote = typeof meta.inReplyToQuote === "string" && meta.inReplyToQuote ? meta.inReplyToQuote : undefined;
 
   const deliver = () =>
     adapter.deliverCommand(session, msg.command, {
@@ -1323,6 +1324,7 @@ async function deliverViaAdapter(
       ...(senderId ? { senderId } : {}),
       ...(forwarded ? { forwarded } : {}),
       ...(inReplyTo ? { inReplyTo } : {}),
+      ...(inReplyToQuote ? { inReplyToQuote } : {}),
       ...(modelOverride ? { modelOverride } : {}),
       ...(media ? { media } : {}),
     });

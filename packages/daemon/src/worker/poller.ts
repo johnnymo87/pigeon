@@ -173,6 +173,8 @@ export interface ExecuteMessage {
     forwarded?: boolean;
     /** Up to 500 chars of the bot's own message the human swipe-replied to. */
     inReplyTo?: string;
+    /** Up to 500 chars of Telegram's partial quote when the human highlighted a span. */
+    inReplyToQuote?: string;
   };
 }
 

@@ -780,6 +780,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             payload: m.payload,
             sender_id: m.senderId,
             in_reply_to: m.inReplyTo,
+            in_reply_to_quote: m.inReplyToQuote ?? null,
             created_at: m.createdAt,
             claim_count: m.claimCount,
             // A row claimed before but never acked. The client may already have

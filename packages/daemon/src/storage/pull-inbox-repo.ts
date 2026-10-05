@@ -22,6 +22,7 @@ export interface PullInboxRecord {
    * user's message (the worker forwards it only when the replied-to message is the bot's).
    */
   inReplyTo: string | null;
+  inReplyToQuote: string | null;
   chatId: string | null;
   createdAt: number;
   expiresAt: number;
@@ -38,6 +39,7 @@ export interface BankPullMessageInput {
   payload: string;
   senderId?: string | null;
   inReplyTo?: string | null;
+  inReplyToQuote?: string | null;
   chatId?: string | null;
   ttlMs?: number;
 }
@@ -71,6 +73,7 @@ function asRecord(row: Row): PullInboxRecord {
     payload: String(row.payload),
     senderId: (row.sender_id as string | null) ?? null,
     inReplyTo: (row.in_reply_to as string | null) ?? null,
+    inReplyToQuote: (row.in_reply_to_quote as string | null) ?? null,
     chatId: (row.chat_id as string | null) ?? null,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
@@ -95,9 +98,9 @@ export class PullInboxRepository {
     const result = this.db
       .prepare(
         `INSERT INTO pull_inbox
-           (msg_id, session_id, source, payload, sender_id, in_reply_to, chat_id,
+           (msg_id, session_id, source, payload, sender_id, in_reply_to, in_reply_to_quote, chat_id,
             created_at, expires_at, claimed_at, claim_count, acked_at, unacked_alerted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -107,6 +110,7 @@ export class PullInboxRepository {
         input.payload,
         input.senderId ?? null,
         input.inReplyTo ?? null,
+        input.inReplyToQuote ?? null,
         input.chatId ?? null,
         now,
         now + (input.ttlMs ?? DEFAULT_PULL_TTL_MS),

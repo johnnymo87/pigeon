@@ -143,7 +143,7 @@ describe("pull routes", () => {
       expect(body.messages[0]!.redelivered).toBe(true);
     });
 
-    it("returns the sender id and the replied-to bot text, never a question id", async () => {
+    it("returns the sender id, replied-to bot text, and quote, never a question id", async () => {
       const { app, storage: s } = newApp();
       s.pullInbox.bank(
         {
@@ -153,16 +153,21 @@ describe("pull routes", () => {
           payload: "wait",
           senderId: "1001",
           inReplyTo: "Rebase or wait?",
+          inReplyToQuote: "wait?",
         },
         2_000,
       );
+      bank(s, "a2", 2_100);
       const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
       const body = (await res.json()) as {
         messages: Array<Record<string, unknown>>;
       };
       expect(body.messages[0]!.sender_id).toBe("1001");
       expect(body.messages[0]!.in_reply_to).toBe("Rebase or wait?");
+      expect(body.messages[0]!.in_reply_to_quote).toBe("wait?");
       expect(body.messages[0]).not.toHaveProperty("question_request_id");
+
+      expect(body.messages[1]!.in_reply_to_quote).toBeNull();
     });
   });
 

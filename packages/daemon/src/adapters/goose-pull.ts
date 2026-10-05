@@ -107,6 +107,9 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
     const inReplyTo = context.inReplyTo?.trim()
       ? context.inReplyTo.trim().slice(0, IN_REPLY_TO_MAX_CHARS)
       : null;
+    const inReplyToQuote = context.inReplyToQuote?.trim()
+      ? context.inReplyToQuote.trim().slice(0, IN_REPLY_TO_MAX_CHARS)
+      : null;
     return this.bank(session, {
       // Derived from commandId, never minted fresh. `command-ingest` explicitly
       // re-runs unfinished commands ("retry unfinished commandId=..."), so a
@@ -117,6 +120,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
       payload: command,
       senderId,
       inReplyTo,
+      inReplyToQuote,
       chatId: context.chatId,
     });
   }
@@ -129,6 +133,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
       payload: string;
       senderId: string;
       inReplyTo: string | null;
+      inReplyToQuote: string | null;
       chatId?: string | number;
     },
   ): CommandDeliveryResult {
@@ -157,6 +162,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
         payload,
         senderId: input.senderId,
         inReplyTo: input.inReplyTo,
+        inReplyToQuote: input.inReplyToQuote,
         chatId: input.chatId === undefined ? null : String(input.chatId),
       },
       this.nowFn(),

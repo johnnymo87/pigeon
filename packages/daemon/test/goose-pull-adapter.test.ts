@@ -125,6 +125,18 @@ describe("GoosePullAdapter", () => {
     expect(row!.inReplyTo).toBe("q".repeat(IN_REPLY_TO_MAX_CHARS));
   });
 
+  it("keeps the partial quote, trimmed and bounded", async () => {
+    const s = newDb();
+    await adapterFor(s).deliverCommand(session(s), "yes", {
+      commandId: "cmd-quote",
+      senderId: OWNER,
+      inReplyToQuote: `  ${"p".repeat(IN_REPLY_TO_MAX_CHARS + 50)}  `,
+    });
+    const [row] = s.pullInbox.claim("ses_pull", 3_000);
+    expect(row!.payload).toBe("yes");
+    expect(row!.inReplyToQuote).toBe("p".repeat(IN_REPLY_TO_MAX_CHARS));
+  });
+
   it("derives the bank id from the commandId, so an ingest retry banks once", async () => {
     const s = newDb();
     const adapter = adapterFor(s);
@@ -243,9 +255,20 @@ describe("command-ingest selects the goose-pull adapter", () => {
 
   it("carries the worker's forwarded flag and replied-to text into the bank", async () => {
     const s = pullDb();
-    await ingest(s, makeMsg({ metadata: { senderId: OWNER, inReplyTo: "Rebase or wait?" } }), OWNERS);
+    await ingest(
+      s,
+      makeMsg({
+        metadata: {
+          senderId: OWNER,
+          inReplyTo: "Rebase or wait?",
+          inReplyToQuote: "or wait?",
+        },
+      }),
+      OWNERS,
+    );
     const [row] = s.pullInbox.claim("ses_pull", 2_000);
     expect(row!.inReplyTo).toBe("Rebase or wait?");
+    expect(row!.inReplyToQuote).toBe("or wait?");
 
     const replies = await ingest(
       s,
