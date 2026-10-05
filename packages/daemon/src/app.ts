@@ -397,12 +397,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const remaining = () =>
           Math.max(ALERT_MIN_SEND_MS, PLAIN_ALERT_TIMEOUT_MS - (Date.now() - startedAt));
         const topic = body.topic === undefined ? undefined : parseAlertTopic(body.topic);
+        const strict = body.strict_topic === true && topic !== undefined;
         const [keyboard, resolvedTopic] = await Promise.all([
           body.links === undefined
             ? undefined
             : resolveAlertKeyboard(body.links, opts.lookupTopics, opts.alertLinkTimeoutMs),
           topic ? resolveAlertTopic(topic, opts.resolveNamedTopic, opts.alertTopicTimeoutMs) : undefined,
         ]);
+
+        if (strict && !resolvedTopic) {
+          return Response.json({ error: "topic_unavailable" }, { status: 502 });
+        }
 
         if (!keyboard && !resolvedTopic) {
           try {
@@ -446,6 +451,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                       thread,
                     )
                   : undefined;
+                if (strict && !again) {
+                  return Response.json({ error: "topic_unavailable" }, { status: 502 });
+                }
                 console.warn(`[alert] topic thread ${thread} not found; ${again ? `recreated as ${again.messageThreadId}` : "posting to General"}`);
                 thread = again?.messageThreadId;
                 createdThread = again?.created ? thread : undefined;
@@ -453,6 +461,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
                 replyMarkup = undefined;
               } else if (thread !== undefined) {
+                if (strict) {
+                  const detail = err.description ?? err.message;
+                  return Response.json({ error: "rejected_in_topic", detail }, { status: 502 });
+                }
                 // The buttons were already dropped and it still failed, so the
                 // topic is the likelier culprit: try General WITH the buttons
                 // again before giving them up for good.
