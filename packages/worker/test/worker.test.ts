@@ -923,6 +923,27 @@ describe("POST /sessions/unregister", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "sessionId required" });
   });
+
+  test("bound session unregistered -> binding row gone", async () => {
+    const sessionId = `sess-unreg-bound-${Date.now()}`;
+    const key = `test:unreg-key-${Date.now()}`;
+    const chat = String(CHAT_ID_NUM);
+    const now = Date.now();
+    await registerSession(sessionId, "devbox");
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(chat, key, sessionId, now).run();
+
+    const res = await SELF.fetch("https://worker/sessions/unregister", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ sessionId }),
+    });
+    expect(res.status).toBe(200);
+
+    const binding = await env.DB.prepare("SELECT * FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).first();
+    expect(binding).toBeNull();
+  });
 });
 
 // ─── Session Listing ───────────────────────────────────────────────────
