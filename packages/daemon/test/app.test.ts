@@ -111,7 +111,7 @@ describe("createApp", () => {
     }));
 
     expect(start.status).toBe(200);
-    expect(await start.json()).toEqual({ ok: true, session_id: "sess-1" });
+    expect(await start.json()).toEqual({ ok: true, session_id: "sess-1", machine_id: null });
 
     const list = await app(new Request("http://localhost/sessions"));
     const listBody = (await list.json()) as { ok: boolean; sessions: Array<Record<string, unknown>> };
@@ -146,7 +146,7 @@ describe("createApp", () => {
     }));
 
     expect(start.status).toBe(200);
-    expect(await start.json()).toEqual({ ok: true, session_id: "direct-sess-1" });
+    expect(await start.json()).toEqual({ ok: true, session_id: "direct-sess-1", machine_id: null });
 
     const list = await app(new Request("http://localhost/sessions"));
     const listBody = (await list.json()) as { ok: boolean; sessions: Array<Record<string, unknown>> };

@@ -27,6 +27,7 @@ import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
+import type { WorkerResult } from "./worker/poller";
 
 interface LegacySession {
   session_id: string;
@@ -300,7 +301,7 @@ interface AppOptions {
   nowFn?: () => number;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
-  onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<void> | void;
+  onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
   chatId?: string;
   machineId?: string;
@@ -321,6 +322,22 @@ interface AppOptions {
   resolveNamedTopic?: NamedTopicResolver;
   /** Bound on `resolveNamedTopic` per alert. Test seam. */
   alertTopicTimeoutMs?: number;
+  /**
+   * Bind a named topic to a session on `POST /session-start`.
+   * Absent on a host with no worker connection.
+   */
+  bindNamedTopic?: (
+    req: { sessionId: string; key: string; name: string },
+    signal?: AbortSignal,
+  ) => Promise<{ messageThreadId: number }>;
+  /**
+   * Unbind a session from its named topic on `POST /session-unbind`.
+   * Absent on a host with no worker connection.
+   */
+  unbindNamedTopic?: (
+    sessionId: string,
+    signal?: AbortSignal,
+  ) => Promise<{ unbound: number }>;
 }
 
 /**
@@ -918,11 +935,91 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
         console.log(logParts.join(" "));
 
-        if (onSessionStart && ((body.notify as boolean | undefined) ?? existing?.notify ?? false)) {
-          await onSessionStart(sessionId, true, (typeof body.label === "string" ? body.label : null) ?? existing?.label);
+        const effectiveNotify = ((body.notify as boolean | undefined) ?? existing?.notify ?? false);
+        let workerRegOk = true;
+        if (onSessionStart && effectiveNotify) {
+          try {
+            const regResult = await onSessionStart(
+              sessionId,
+              true,
+              (typeof body.label === "string" ? body.label : null) ?? existing?.label,
+            );
+            if (regResult && typeof regResult === "object" && "ok" in regResult && regResult.ok === false) {
+              workerRegOk = false;
+            }
+          } catch {
+            workerRegOk = false;
+          }
         }
 
-        return Response.json({ ok: true, session_id: sessionId });
+        const machine_id = opts.machineId ?? null;
+
+        if (body.named_topic !== undefined) {
+          const parsedTopic = parseAlertTopic(body.named_topic);
+          let bound = false;
+          let bindError: string | undefined;
+
+          if (!parsedTopic) {
+            bindError = "invalid named_topic";
+          } else if (!effectiveNotify) {
+            bindError = "notify is required";
+          } else if (!workerRegOk) {
+            bindError = "worker registration failed";
+          } else if (!opts.bindNamedTopic) {
+            bindError = "no worker connection";
+          } else {
+            const timeoutMs = opts.alertTopicTimeoutMs ?? DEFAULT_TOPIC_RESOLVE_TIMEOUT_MS;
+            const controller = new AbortController();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const deadline = new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                controller.abort();
+                reject(new Error(`timed out after ${timeoutMs}ms`));
+              }, timeoutMs);
+            });
+            try {
+              const inFlight = opts.bindNamedTopic(
+                { sessionId, key: parsedTopic.key, name: parsedTopic.name },
+                controller.signal,
+              );
+              await Promise.race([inFlight, deadline]);
+              bound = true;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              bindError = `bind failed: ${msg}`;
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+
+          return Response.json({
+            ok: true,
+            session_id: sessionId,
+            machine_id,
+            named_topic_bound: bound,
+            ...(bound ? {} : { named_topic_error: bindError }),
+          });
+        }
+
+        return Response.json({ ok: true, session_id: sessionId, machine_id });
+      }
+
+      if (request.method === "POST" && url.pathname === "/session-unbind") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        if (!opts.unbindNamedTopic) {
+          return Response.json({ error: "no worker connection" }, { status: 503 });
+        }
+        try {
+          const result = await opts.unbindNamedTopic(sessionId);
+          return Response.json({ ok: true, unbound: result.unbound });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: `unbind failed: ${msg}` }, { status: 502 });
+        }
       }
 
       if (request.method === "POST" && url.pathname === "/session-origin") {

@@ -1021,9 +1021,13 @@ const app = createApp(storage, {
   lookupTopics: poller ? (ids, signal) => poller.lookupTopics(ids, signal) : undefined,
   // Named topic for POST /alert `topic`. Absent without a worker: alerts go to General.
   resolveNamedTopic: poller ? (req, signal) => poller.resolveNamedTopic(req, signal) : undefined,
+  // Bind named topic for POST /session-start `named_topic`. Absent without a worker.
+  bindNamedTopic: poller ? (req, signal) => poller.bindNamedTopic(req, signal) : undefined,
+  // Unbind named topic for POST /session-unbind. Absent without a worker.
+  unbindNamedTopic: poller ? (sessionId, signal) => poller.unbindNamedTopic(sessionId, signal) : undefined,
   onSessionStart: async (sessionId, notify, label) => {
     if (notify && poller) {
-      await poller.registerSession(sessionId, label ?? undefined);
+      return await poller.registerSession(sessionId, label ?? undefined);
     }
   },
   onSessionDelete: async (sessionId) => {

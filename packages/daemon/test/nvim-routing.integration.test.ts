@@ -49,7 +49,7 @@ describe("nvim session routing — HTTP session model", () => {
     );
 
     expect(start.status).toBe(200);
-    expect(await start.json()).toEqual({ ok: true, session_id: "nvim-sess-1" });
+    expect(await start.json()).toEqual({ ok: true, session_id: "nvim-sess-1", machine_id: null });
 
     const list = await app(new Request("http://localhost/sessions"));
     const listBody = (await list.json()) as {
