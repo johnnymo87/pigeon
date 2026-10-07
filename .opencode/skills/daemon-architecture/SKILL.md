@@ -20,7 +20,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 ## Route Surface
 
 - `GET /health`
-- `POST /session-start`
+- `POST /session-start` -- register a session. Accepts optional `pull_sources: string[]` (`"telegram-reply"`, `"swarm"`) for pull sessions (`goose-pull`). Defaults to `["telegram-reply"]` when omitted on a fresh session, and RESETS to default when omitted on re-registration. Gates only swarm banking; invalid values return 400.
 - `POST /session-origin` -- declared provenance write (insert-or-upgrade, `source` hardcoded `declared`; precedence `inferred < declared`).
 - `GET /session-origin?session_id=` -- ops read: "why is this session silent?". A 404 means no row: the deliver-default applies.
 - `DELETE /session-origin?session_id=` -- ops hard reset, idempotent. Clears provenance so the session returns to default delivery policy. Afterwards declared writers may re-quiet the session later, but with no title layer, DELETE now makes a session louder, full stop.
@@ -28,7 +28,11 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `POST /stop`
 - `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question
-- `POST /swarm/send` -- enqueue a cross-session swarm message; daemon writes to `swarm_messages` and returns 202 with `msg_id`. Background SwarmArbiter delivers via opencode serve `prompt_async`. See `swarm-architecture` skill.
+- `POST /swarm/send` -- enqueue a cross-session swarm message. If target is an opted-in pull session (`pull_sources` contains `"swarm"`), banks in `pull_inbox`, bypasses arbiter, and returns 202 with `banked: true`. Refuses with 413 if payload > 4000 code points. Otherwise writes to `swarm_messages` and returns 202 with `msg_id` for background `SwarmArbiter` delivery. See `swarm-architecture` skill.
+- `POST /swarm/schedule` -- schedule a swarm message for future delivery. Refuses with 409 if target is an opted-in pull session (pull sessions have no delivery clock).
+- `POST /pull/drain` -- claim and drain unread messages for a pull session. Messages returned ordered `telegram-reply` before `swarm`, then `created_at`, `msg_id`. Each message includes `kind` and `reply_to` (`null` for telegram rows).
+- `POST /pull/ack` -- acknowledge claimed message IDs from `pull_inbox`.
+- `GET /pull/pending?session=<id>` -- check unread message count for a pull session; returns `pending` total and `by_source` breakdown (`{"telegram-reply": n, "swarm": m}`).
 - `GET /swarm/inbox?session=<id>[&since=<msg_id>]` -- read messages already delivered (`state='handed_off'`) to a target session, optionally cursor-paginated.
 - `POST /cleanup`
 
@@ -38,6 +42,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `session_tokens`: reply/command token validation state
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
+- `pull_inbox`: durable message queue for pull sessions (`goose-pull`) that cannot receive pushed prompts. Banks `telegram-reply` rows (replies in bound topics) and `swarm` rows (messages to sessions opted into `"swarm"` via `pull_sources`). Drained via `POST /pull/drain`, confirmed via `POST /pull/ack`. Expired unread swarm rows notify `ses_` senders (without human alert); unacked rows alert after 15 minutes.
 - `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint. Wizard columns: `current_step`, `answers_json_v2`, `version` for multi-question flows.
 - `outbox`: durable notification delivery queue for stop, question, and swarm mirror notifications. Keyed by `notification_id`, `kind` field (`"question"`, `"stop"`, `"swarm"`, or reserved `"mirror"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour (24h TTL for `"swarm"` kind). Outbox `getReady` sorts by session rank → per-row tier (conversational vs record) → `created_at`, with `SWARM_SUB_BUDGET = 6`/60s rate governance.
 - `model_override`: nullable TEXT column on `sessions` table. Stores `provider/model` string (e.g. `anthropic/claude-sonnet-4-20250514`). Read by `command-ingest.ts` and passed through the adapter to the plugin.
@@ -186,8 +191,10 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
 
 1. Sender (some `bash` shell, often a sub-shell of an opencode session) runs `pigeon-send <to> <payload>` (or `opencode-send <ses_*> <payload>` which auto-routes).
 2. `pigeon-send` POSTs to daemon `/swarm/send` with `{from, to, kind, priority, payload, [reply_to], [msg_id]}`.
-3. Daemon validates, mints `msg_id` if not caller-supplied, calls `storage.swarm.insert(...)`, enqueues best-effort Telegram topic mirror notice (outbox `kind='swarm'`, `w:<msg_id>`), and returns HTTP 202 `{accepted: true, msg_id}` immediately.
-4. Background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
+3. Daemon validates, mints `msg_id` if not caller-supplied, and routes insertion through `bankOrInsertSwarmMessage(...)`:
+   - **Banked pull session**: if the target is a pull-mode session (`goose-pull`) that opted into swarm banking (`pull_sources` contains `"swarm"`), the message is banked in `pull_inbox` (`source: 'swarm'`), Telegram topic notice is enqueued, and the daemon returns HTTP 202 `{accepted: true, msg_id, banked: true}` immediately. Delivery bypasses `SwarmArbiter` entirely. (Payloads over 4000 code points are refused with 413).
+   - **Standard session**: calls `storage.swarm.insert(...)`, enqueues best-effort Telegram topic mirror notice (outbox `kind='swarm'`, `w:<msg_id>`), and returns HTTP 202 `{accepted: true, msg_id}` immediately.
+4. For standard sessions, background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
 5. For each ready target (in parallel), `drainTarget` collapses concurrent calls onto a single in-flight promise (the at-most-one-in-flight invariant per target).
 6. Inside the per-target drain: pop one ready msg → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
 7. On failure: `storage.swarm.markRetry` with exponential backoff (or `markFailed` after MAX_ATTEMPTS=10).

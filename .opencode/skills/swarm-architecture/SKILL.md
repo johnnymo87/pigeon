@@ -27,7 +27,8 @@ It also gives us durable delivery, retry with backoff, replay via inbox, and an 
 | `packages/daemon/src/swarm/registry.ts` | `SessionDirectoryRegistry` — caches `sessionId → directory` (5min TTL) |
 | `packages/daemon/src/swarm/arbiter.ts` | `SwarmArbiter` — per-target queue with at-most-one in-flight delivery and retry/backoff |
 | `packages/daemon/src/swarm/telegram-notice.ts` | `enqueueSwarmTelegramNotice()` — helper enqueuing best-effort Telegram outbox notice |
-| `packages/daemon/src/app.ts` | `POST /swarm/send`, `GET /swarm/inbox` route blocks (flat `if`-style, mirrors existing routes) |
+| `packages/daemon/src/swarm/bank-or-insert.ts` | `bankOrInsertSwarmMessage()` — routes swarm inserts to either `pull_inbox` (for opted-in pull sessions) or `swarm_messages` (arbiter delivery) |
+| `packages/daemon/src/app.ts` | `POST /swarm/send`, `POST /swarm/schedule`, `GET /swarm/inbox` route blocks (flat `if`-style, mirrors existing routes) |
 | `packages/daemon/src/index.ts` | Boots arbiter conditionally on `opencodeClient && config.opencodeUrl` |
 | `packages/opencode-plugin/src/swarm-tool.ts` | `swarmRead()` helper + `createSwarmReadTool()` factory |
 
@@ -127,6 +128,41 @@ Request body (JSON):
 Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_..." }` immediately. The daemon writes the row in `state='queued'`; the arbiter dispatches asynchronously.
 
 Validation errors return 400 with `{ "error": "..." }`.
+
+#### Swarm Banking for Pull Sessions
+
+When `to` is a registered pull session (`backend_kind === "goose-pull"`) whose `pull_sources` includes `"swarm"`:
+
+- The message is banked into `pull_inbox` (`source: "swarm"`, `sender_id = from`, along with `kind` and `reply_to`) rather than inserted into `swarm_messages`.
+- The background `SwarmArbiter` is bypassed entirely — no `prompt_async` attempts, no delivery race.
+- Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_...", "banked": true }`. (Non-banked sends omit `banked`).
+- Payload limit: payloads exceeding 4000 Unicode code points (`[...payload].length > 4000`) are refused with HTTP 413 `{ "error": "payload exceeds maximum length of 4000 characters (...)" }` at send time. Pull clients cannot take larger prompts; refusing at send time alerts the sender immediately.
+- Non-opted-in pull sessions: sends to pull sessions that have not opted into `"swarm"` still enter `swarm_messages`, fail arbiter delivery (~10 attempts with `TargetUnavailableError`), and result in a loud `delivery.failed` message back to the sender. This keeps behavior intact for pull clients that only accept telegram replies.
+- Banking failed delivery notices: when delivery to any target fails and the original sender was itself an opted-in pull session, its `delivery.failed` notice is also banked in `pull_inbox`.
+
+### `POST /swarm/schedule`
+
+Request body (JSON):
+
+```json
+{
+  "from": "ses_abc...",
+  "to": "ses_def...",
+  "payload": "wake message",
+  "at": "2026-10-07T12:00:00Z",
+  "after": "1h",
+  "kind": "chat",
+  "priority": "normal",
+  "reply_to": "msg_xyz...",
+  "msg_id": "caller-supplied-id",
+  "expires_in": "6h",
+  "ref": "task-pointer"
+}
+```
+
+- Exactly one of `at` or `after` is required (`at` requires full RFC3339 timestamp with UTC offset or 'Z').
+- Refused for pull sessions: returns HTTP 409 `{ "error": "scheduled messages cannot be banked for a pull session" }` if `to` is an opted-in pull session. A pull session has no delivery clock to honour `deliver_at`, and moving scheduling onto the recipient was rejected.
+- Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_...", "deliver_at": ... }`.
 
 ### `GET /swarm/inbox?session=<id>[&since=<msg_id>]`
 
@@ -289,7 +325,7 @@ The arbiter therefore stats the directory before sending (`swarm/directory-check
 Every swarm IPC message is mirrored to the **receiver's** Telegram forum topic thread so operators can see why a session started working.
 
 ### Hook Sites & Guarantees
-- **Hooked at insert, not delivery**: Swarm rows enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
+- **Hooked at insert, not delivery**: Swarm rows route through `bankOrInsertSwarmMessage()` and enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). For banked pull messages, Telegram notices are still enqueued on fresh inserts, but arbiter delivery is skipped. Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
 - **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a Telegram post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
 - **Fault isolation**: The `enqueueSwarmTelegramNotice` helper (`packages/daemon/src/swarm/telegram-notice.ts`) is wrapped in an internal `try/catch`. A Telegram/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
 - **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).
