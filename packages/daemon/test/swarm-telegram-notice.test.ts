@@ -8,6 +8,7 @@ import { openStorageDb } from "../src/storage/database";
 import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
 import { notifySenderOfFailure } from "../src/swarm/notify-sender";
 import { DeliveryWatchdog, type WatchdogClient } from "../src/swarm/delivery-watchdog";
+import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
 
 function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRecord {
   return {
@@ -256,6 +257,46 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
       expect(outboxRow).not.toBeNull();
       expect(outboxRow!.sessionId).toBe("ses_sender_1");
       expect(outboxRow!.kind).toBe("swarm");
+    } finally {
+      storage.db.close();
+    }
+  });
+
+  it("notifySenderOfFailure banks delivery.failed for an opted-in pull session sender", () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      storage.sessions.upsert({
+        sessionId: "ses_sender_pull",
+        backendKind: PULL_BACKEND_KIND,
+        notify: true,
+      });
+      storage.sessions.setPullSources("ses_sender_pull", ["swarm"]);
+
+      const failedRecord = makeRecord({
+        msgId: "msg_original_pull",
+        fromSession: "ses_sender_pull",
+        toSession: "ses_receiver_1",
+        payload: "some payload",
+      });
+
+      notifySenderOfFailure(storage, failedRecord, "target unroutable", 1000);
+
+      // Banked in pull_inbox
+      const claimed = storage.pullInbox.claim("ses_sender_pull", 2000);
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0]!.source).toBe("swarm");
+      expect(claimed[0]!.senderId).toBe("pigeon");
+      expect(claimed[0]!.kind).toBe("delivery.failed");
+      expect(claimed[0]!.replyTo).toBe("msg_original_pull");
+
+      // NOT in swarm_messages
+      const row = storage.db.prepare("SELECT msg_id FROM swarm_messages WHERE from_session = 'pigeon'").get();
+      expect(row).toBeUndefined();
+
+      // Telegram notice enqueued
+      const outboxRow = storage.outbox.getByNotificationId(`w:${claimed[0]!.msgId}`);
+      expect(outboxRow).not.toBeNull();
+      expect(outboxRow!.sessionId).toBe("ses_sender_pull");
     } finally {
       storage.db.close();
     }

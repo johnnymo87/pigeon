@@ -23,6 +23,7 @@ import { clampPreservingSurrogates, excerptOf } from "./text";
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
+import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
@@ -511,7 +512,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const f = parsed.fields;
         const msgId = f.callerMsgId ?? makeMsgId();
-        const inserted = storage.swarm.insert(
+        const result = bankOrInsertSwarmMessage(
+          storage,
           {
             msgId,
             fromSession: f.from,
@@ -524,9 +526,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
-        if (inserted) {
-          const record = storage.swarm.getByMsgId(msgId);
-          if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
+
+        if (result.status === "refused") {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        if (result.status === "banked") {
+          return Response.json({ accepted: true, msg_id: msgId, banked: true }, { status: 202 });
         }
 
         return Response.json({ accepted: true, msg_id: msgId }, { status: 202 });
@@ -606,7 +612,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
         const msgId = f.callerMsgId ?? makeMsgId();
-        const inserted = storage.swarm.insert(
+        const result = bankOrInsertSwarmMessage(
+          storage,
           {
             msgId,
             fromSession: f.from,
@@ -623,7 +630,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
-        if (!inserted) {
+        if (result.status === "refused") {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        if (result.status === "banked") {
+          // Defensive: scheduled messages to banking targets are refused with 409 above.
+          return Response.json(
+            { accepted: true, msg_id: msgId, banked: true },
+            { status: 202 },
+          );
+        }
+
+        if (!result.inserted) {
           const stored = storage.swarm.getByMsgId(msgId);
           return Response.json(
             {
@@ -635,9 +654,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             { status: 409 },
           );
         }
-
-        const record = storage.swarm.getByMsgId(msgId);
-        if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
 
         return Response.json(
           {

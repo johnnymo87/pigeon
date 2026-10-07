@@ -3,6 +3,7 @@ import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { SwarmArbiter } from "../src/swarm/arbiter";
 import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
+import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
 
 describe("POST /swarm/send", () => {
   let storage: StorageDb | null = null;
@@ -212,6 +213,184 @@ describe("POST /swarm/send", () => {
     expect(row).not.toBeNull();
     const count = (s.db.prepare("SELECT COUNT(*) as c FROM outbox WHERE notification_id = ?").get("w:msg_idempotent_1") as { c: number }).c;
     expect(count).toBe(1);
+  });
+
+  it("banks message for opted-in pull session and returns banked: true", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_pull",
+          kind: "chat",
+          payload: "hello pull session",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
+    expect(body.accepted).toBe(true);
+    expect(body.banked).toBe(true);
+    expect(body.msg_id).toMatch(/^msg_/);
+
+    // Banked in pull_inbox
+    const claimed = s.pullInbox.claim("ses_pull", 2_000);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.msgId).toBe(body.msg_id);
+    expect(claimed[0]!.source).toBe("swarm");
+    expect(claimed[0]!.payload).toBe("hello pull session");
+
+    // NOT in swarm_messages
+    expect(s.swarm.getByMsgId(body.msg_id)).toBeNull();
+
+    // Telegram notice in outbox
+    expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).not.toBeNull();
+  });
+
+  it("idempotent repeat to opted-in pull session returns banked: true without second notice", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_pull", ["swarm"]);
+
+    for (let i = 0; i < 2; i++) {
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_id: "msg_bank_repeat",
+            from: "ses_a",
+            to: "ses_pull",
+            kind: "chat",
+            payload: "repeatable payload",
+          }),
+        }),
+      );
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
+      expect(body.banked).toBe(true);
+      expect(body.msg_id).toBe("msg_bank_repeat");
+    }
+
+    const count = (s.db.prepare("SELECT COUNT(*) as c FROM outbox WHERE notification_id = ?").get("w:msg_bank_repeat") as { c: number }).c;
+    expect(count).toBe(1);
+  });
+
+  it("does not bank for non-opted-in pull session (omits banked: true)", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull_default",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_a",
+          to: "ses_pull_default",
+          kind: "chat",
+          payload: "to non-opted pull",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
+    expect(body.banked).toBeUndefined();
+    expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    expect(s.pullInbox.pendingCount("ses_pull_default", 2_000)).toBe(0);
+  });
+
+  it("refuses payload > 4000 code points with 413 for opted-in pull session", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_pull", ["swarm"]);
+
+    const bigPayload = "🚀".repeat(2000) + "a".repeat(2001); // 4001 code points
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_too_big",
+          from: "ses_a",
+          to: "ses_pull",
+          kind: "chat",
+          payload: bigPayload,
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("4000");
+
+    // Writes nothing
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000)).toBe(0);
+    expect(s.swarm.getByMsgId("msg_too_big")).toBeNull();
+    expect(s.outbox.getByNotificationId("w:msg_too_big")).toBeNull();
+  });
+
+  it("re-registration without pull_sources stops banking (next send goes to swarm_messages)", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_pull", ["swarm"]);
+
+    // First send is banked
+    const res1 = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "ses_a", to: "ses_pull", payload: "first" }),
+      }),
+    );
+    expect((await res1.json()).banked).toBe(true);
+
+    // Re-register without pull_sources (simulating client rollback or restart omitting it)
+    await app(
+      new Request("http://localhost/session-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "ses_pull", backend_kind: PULL_BACKEND_KIND }),
+      }),
+    );
+
+    // Second send is NOT banked
+    const res2 = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "ses_a", to: "ses_pull", payload: "second" }),
+      }),
+    );
+    const body2 = await res2.json();
+    expect(body2.banked).toBeUndefined();
+    expect(s.swarm.getByMsgId(body2.msg_id)).not.toBeNull();
   });
 
   it("returns 202 when notice enqueue fails on send", async () => {
@@ -563,6 +742,39 @@ describe("POST /swarm/schedule", () => {
     expect(outboxRow).not.toBeNull();
     expect(outboxRow!.sessionId).toBe("ses_b");
     expect(outboxRow!.kind).toBe("swarm");
+  });
+
+  it("refuses scheduled message when target is an opted-in pull session with 409", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "ses_pull",
+      backendKind: PULL_BACKEND_KIND,
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_pull", ["swarm"]);
+
+    const res = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          msg_id: "msg_sched_pull",
+          from: "ses_a",
+          to: "ses_pull",
+          after: "1h",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("scheduled messages cannot be banked for a pull session");
+
+    // Writes nothing
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000_000)).toBe(0);
+    expect(s.swarm.getByMsgId("msg_sched_pull")).toBeNull();
+    expect(s.outbox.getByNotificationId("w:msg_sched_pull")).toBeNull();
   });
 
   it("M2: rejects scheduled messages targeting a channel with 400", async () => {
