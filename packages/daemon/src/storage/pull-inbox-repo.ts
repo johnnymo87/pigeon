@@ -262,9 +262,20 @@ export class PullInboxRepository {
    * the dedupe token.
    */
   /**
-   * `onExpired` runs inside the same transaction as each row's delete, so a
-   * row is never removed without its notice being recorded: if the callback
-   * throws, the whole sweep rolls back and the rows are retried next cycle.
+   * Delete unread mail that has passed its expiry, RETURNING what was deleted so
+   * the caller can say so.
+   *
+   * The return value is not a convenience. A row expiring unread is the human's
+   * message being dropped, and the usual notifier cannot cover it:
+   * `notifySenderOfFailure` returns early for any sender that is not `^ses_`,
+   * which a Telegram-originated message never is. Deleting inside the same
+   * transaction that reports is what makes the report exactly-once -- the row is
+   * the dedupe token.
+   *
+   * Each row's onExpired callback and delete run inside a nested transaction
+   * (savepoint). If the callback throws for a row, that row rolls back, the error
+   * is logged to console.error, and it remains for the next sweep cycle, while
+   * other rows still commit. Exactly-once still holds per row.
    */
   sweepExpired(now: number, onExpired?: (row: PullInboxRecord) => void): PullInboxRecord[] {
     return this.db.transaction(() => {
@@ -274,14 +285,23 @@ export class PullInboxRepository {
         )
         .all(now) as Row[];
       const records = rows.map(asRecord);
+      const deleted: PullInboxRecord[] = [];
       if (records.length > 0) {
         const del = this.db.prepare("DELETE FROM pull_inbox WHERE msg_id = ?");
-        for (const rec of records) {
+        const processRow = this.db.transaction((rec: PullInboxRecord) => {
           onExpired?.(rec);
           del.run(rec.msgId);
+        });
+        for (const rec of records) {
+          try {
+            processRow(rec);
+            deleted.push(rec);
+          } catch (err) {
+            console.error(`sweepExpired error for msg_id ${rec.msgId}:`, err);
+          }
         }
       }
-      return records;
+      return deleted;
     })();
   }
 

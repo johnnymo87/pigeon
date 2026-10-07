@@ -232,15 +232,16 @@ describe("PullInboxRepository", () => {
     raw.db.close();
   });
 
-  it("does not delete an expired row whose notice failed to record", () => {
+  it("leaves a row whose notice failed to record while deleting other expired rows", () => {
     const s = newDb();
     bank(s, "m1", "ses_pull", 1_000);
-    expect(() =>
-      s.pullInbox.sweepExpired(1_000 + 8 * 24 * 3_600_000, () => {
-        throw new Error("alerts table unavailable");
-      }),
-    ).toThrow();
-    expect(s.db.prepare("SELECT COUNT(*) AS n FROM pull_inbox").get()).toEqual({ n: 1 });
+    bank(s, "m2", "ses_pull", 1_000);
+    const deleted = s.pullInbox.sweepExpired(1_000 + 8 * 24 * 3_600_000, (row) => {
+      if (row.msgId === "m1") throw new Error("alerts table unavailable");
+    });
+    expect(deleted.map((r) => r.msgId)).toEqual(["m2"]);
+    const remaining = s.db.prepare("SELECT msg_id FROM pull_inbox").all() as Array<{ msg_id: string }>;
+    expect(remaining.map((r) => r.msg_id)).toEqual(["m1"]);
   });
 
   it("carries the sender id, replied-to bot text, and partial quote", () => {
