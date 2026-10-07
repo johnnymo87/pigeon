@@ -836,11 +836,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const now = nowFn();
+        // Swarm rows are held (not served, not counted) if the session is not currently
+        // opted into "swarm". An older or rolled-back client that does not understand
+        // swarm rows would reject them, ack them (losing the peer message with no
+        // delivery.failed), and misreport them to the human as rejected replies.
+        // Held rows wait in the bank for re-opt-in or expiry.
+        const includeSwarm = session.pullSources.includes("swarm");
         // Counted BEFORE the claim, and documented as such: it includes the rows
         // being returned. Counting after would report 0 on a full drain and read
         // as "nothing was waiting".
-        const pendingTotal = storage.pullInbox.pendingCount(sessionId, now);
-        const claimed = storage.pullInbox.claim(sessionId, now, limit);
+        const pendingTotal = storage.pullInbox.pendingCount(sessionId, now, { includeSwarm });
+        const claimed = storage.pullInbox.claim(sessionId, now, limit, { includeSwarm });
 
         return Response.json({
           ok: true,
@@ -891,8 +897,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // 200 with a flag, not 404. This is the cheap poll a wake gate runs; a
         // caller that treated an unknown session as an error would be waking on
         // the daemon's opinion of registration rather than on there being mail.
+        //
+        // Held swarm rows are excluded from counts when the session is not opted in
+        // so a wake gate does not spin on mail the client cannot collect.
+        const includeSwarm = session ? session.pullSources.includes("swarm") : false;
         const counts = session
-          ? storage.pullInbox.pendingCounts(sessionId, nowFn())
+          ? storage.pullInbox.pendingCounts(sessionId, nowFn(), { includeSwarm })
           : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
         return Response.json({
           ok: true,

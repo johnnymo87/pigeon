@@ -346,6 +346,41 @@ describe("PullInboxRepository", () => {
     });
   });
 
+  it("filters out swarm rows from claim, pendingCounts, and pendingCount when includeSwarm is false", () => {
+    const s = newDb();
+    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 1_000);
+    s.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" }, 1_000);
+    s.pullInbox.bank({ msgId: "s2", sessionId: "ses_pull", source: "swarm", payload: "sw2" }, 1_000);
+
+    // Default includeSwarm is true
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000)).toBe(3);
+    expect(s.pullInbox.pendingCounts("ses_pull", 2_000).total).toBe(3);
+    expect(s.pullInbox.pendingCounts("ses_pull", 2_000).bySource).toEqual({
+      "telegram-reply": 1,
+      swarm: 2,
+    });
+
+    // includeSwarm: false
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000, { includeSwarm: false })).toBe(1);
+    const filteredCounts = s.pullInbox.pendingCounts("ses_pull", 2_000, { includeSwarm: false });
+    expect(filteredCounts.total).toBe(1);
+    expect(filteredCounts.bySource).toEqual({
+      "telegram-reply": 1,
+      swarm: 0,
+    });
+
+    // claim with includeSwarm: false
+    const claimedWithoutSwarm = s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: false });
+    expect(claimedWithoutSwarm.map((r) => r.msgId)).toEqual(["t1"]);
+
+    // Ack the claimed telegram row
+    s.pullInbox.ack("ses_pull", ["t1"], 2_000);
+
+    // Subsequent claim with includeSwarm: true (or default) claims the held swarm rows
+    const claimedWithSwarm = s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: true });
+    expect(claimedWithSwarm.map((r) => r.msgId)).toEqual(["s1", "s2"]);
+  });
+
   it("migrates existing pull_inbox table by adding kind and reply_to columns", () => {
     const raw = openStorageDb(":memory:");
     raw.db.exec("DROP TABLE pull_inbox");

@@ -48,6 +48,17 @@ export interface BankPullMessageInput {
   ttlMs?: number;
 }
 
+export interface PullInboxFilterOptions {
+  /**
+   * Whether to include `source='swarm'` rows. Defaults to true.
+   *
+   * When false, swarm rows are held (neither returned nor counted) for sessions
+   * not currently opted into "swarm", protecting older clients from misinterpreting
+   * them and preventing wake gates from spinning.
+   */
+  includeSwarm?: boolean;
+}
+
 /**
  * How long a banked message survives unread.
  *
@@ -140,15 +151,27 @@ export class PullInboxRepository {
    * would reset the unacked alarm's clock on every episode, which is the shape
    * that already silenced a stall alarm: an
    * alarm whose clock is reset by the very loop it is watching never fires.
+   *
+   * When `options.includeSwarm` is false, `source='swarm'` rows are excluded
+   * (held) so an opted-out or rolled-back client that does not understand swarm
+   * rows does not receive, reject, or misreport them. Held rows remain in the bank
+   * to serve on re-opt-in or expire via sweep.
    */
-  claim(sessionId: string, now: number, limit = 50): PullInboxRecord[] {
+  claim(
+    sessionId: string,
+    now: number,
+    limit = 50,
+    options: PullInboxFilterOptions = {},
+  ): PullInboxRecord[] {
+    const includeSwarm = options.includeSwarm ?? true;
+    const swarmFilter = includeSwarm ? "" : " AND source != 'swarm'";
     return this.db.transaction(() => {
       const rows = this.db
         .prepare(
           `SELECT * FROM pull_inbox
             WHERE session_id = ?
               AND acked_at IS NULL
-              AND expires_at > ?
+              AND expires_at > ?${swarmFilter}
             ORDER BY CASE source WHEN 'telegram-reply' THEN 0 WHEN 'swarm' THEN 1 ELSE 2 END ASC,
                      created_at ASC,
                      msg_id ASC
@@ -183,6 +206,10 @@ export class PullInboxRepository {
    * a partial ack must be visible to the caller, because "I acked 5 of 5" and "I
    * acked 3 and two vanished" are different facts about whether the human's
    * message was read.
+   *
+   * Ack is deliberately NOT filtered by `includeSwarm`: a client that claimed
+   * rows while opted in must still be allowed to acknowledge them even after
+   * an opt-out so they do not falsely alert as unconfirmed / wedged.
    */
   ack(
     sessionId: string,
@@ -212,15 +239,21 @@ export class PullInboxRepository {
    * How much unread mail this session has, broken down by source.
    *
    * Always includes both keys ("telegram-reply" and "swarm").
+   * When `options.includeSwarm` is false, `source='swarm'` rows are excluded
+   * from the count (reporting 0) so wake gates do not spin on mail the client
+   * cannot currently collect.
    */
   pendingCounts(
     sessionId: string,
     now: number,
+    options: PullInboxFilterOptions = {},
   ): { total: number; bySource: Record<PullInboxSource, number> } {
+    const includeSwarm = options.includeSwarm ?? true;
+    const swarmFilter = includeSwarm ? "" : " AND source != 'swarm'";
     const rows = this.db
       .prepare(
         `SELECT source, COUNT(*) AS n FROM pull_inbox
-          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?
+          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?${swarmFilter}
           GROUP BY source`,
       )
       .all(sessionId, now) as Array<{ source: string; n: number }>;
@@ -246,8 +279,12 @@ export class PullInboxRepository {
    * returns nothing be distinguished from a drain that could not reach the bank
    * at all. Zero-rows-and-healthy must not look like broken.
    */
-  pendingCount(sessionId: string, now: number): number {
-    return this.pendingCounts(sessionId, now).total;
+  pendingCount(
+    sessionId: string,
+    now: number,
+    options: PullInboxFilterOptions = {},
+  ): number {
+    return this.pendingCounts(sessionId, now, options).total;
   }
 
   /**
@@ -260,17 +297,10 @@ export class PullInboxRepository {
    * which a Telegram-originated message never is. Deleting inside the same
    * transaction that reports is what makes the report exactly-once -- the row is
    * the dedupe token.
-   */
-  /**
-   * Delete unread mail that has passed its expiry, RETURNING what was deleted so
-   * the caller can say so.
    *
-   * The return value is not a convenience. A row expiring unread is the human's
-   * message being dropped, and the usual notifier cannot cover it:
-   * `notifySenderOfFailure` returns early for any sender that is not `^ses_`,
-   * which a Telegram-originated message never is. Deleting inside the same
-   * transaction that reports is what makes the report exactly-once -- the row is
-   * the dedupe token.
+   * The sweep is deliberately NOT filtered by `includeSwarm`: held swarm rows
+   * that expire uncollected must still be cleaned up and notify the sender
+   * ("never collected ... safe to resend").
    *
    * Each row's onExpired callback and delete run inside a nested transaction
    * (savepoint). If the callback throws for a row, that row rolls back, the error
@@ -310,6 +340,10 @@ export class PullInboxRepository {
    * reported so each is reported exactly once for the life of the row.
    *
    * Durable rather than an in-memory Set: see the schema comment.
+   *
+   * Deliberately NOT filtered by `includeSwarm`: a claimed swarm row that went
+   * unconfirmed indicates a broken or crashed client regardless of whether the
+   * session subsequent to the claim opted out of swarm.
    */
   listUnackedForAlert(now: number, thresholdMs: number): PullInboxRecord[] {
     return this.db.transaction(() => {
