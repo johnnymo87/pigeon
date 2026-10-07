@@ -72,6 +72,10 @@ export const additiveColumns = [
   // backend's here. NULL means "same as session_id", which is what every row
   // written before this column meant. See SessionRecord.backendSessionId.
   "ALTER TABLE sessions ADD COLUMN backend_session_id TEXT DEFAULT NULL",
+  // Pull sources opted into by the session (JSON-encoded array of strings,
+  // e.g. ["telegram-reply", "swarm"]). NULL means default (["telegram-reply"]).
+  // Only /session-start updates this column; other writers preserve it.
+  "ALTER TABLE sessions ADD COLUMN pull_sources TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(

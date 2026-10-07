@@ -373,6 +373,127 @@ describe("storage schema and repositories", () => {
     });
   });
 
+  describe("SessionRepository pullSources", () => {
+    it("defaults to ['telegram-reply'] for a fresh session", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-fresh",
+        cwd: "/tmp",
+        notify: true,
+      });
+
+      const session = storage.sessions.get("sess-fresh");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["telegram-reply"]);
+      storage.db.close();
+    });
+
+    it("setPullSources stores custom sources, updates updated_at, and returns true", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-custom",
+        cwd: "/tmp",
+        notify: true,
+      }, 1_000);
+
+      const updated = storage.sessions.setPullSources("sess-custom", ["telegram-reply", "swarm"], 2_000);
+      expect(updated).toBe(true);
+
+      const session = storage.sessions.get("sess-custom");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["telegram-reply", "swarm"]);
+      expect(session!.updatedAt).toBe(2_000);
+      storage.db.close();
+    });
+
+    it("setPullSources stores empty array []", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-empty",
+        cwd: "/tmp",
+        notify: true,
+      }, 1_000);
+
+      const updated = storage.sessions.setPullSources("sess-empty", [], 2_000);
+      expect(updated).toBe(true);
+
+      const session = storage.sessions.get("sess-empty");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual([]);
+      storage.db.close();
+    });
+
+    it("setPullSources with null resets column to NULL (defaulting to ['telegram-reply'])", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-reset",
+        cwd: "/tmp",
+        notify: true,
+      }, 1_000);
+
+      storage.sessions.setPullSources("sess-reset", ["swarm"], 2_000);
+      expect(storage.sessions.get("sess-reset")!.pullSources).toEqual(["swarm"]);
+
+      const resetResult = storage.sessions.setPullSources("sess-reset", null, 3_000);
+      expect(resetResult).toBe(true);
+
+      const session = storage.sessions.get("sess-reset");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["telegram-reply"]);
+      expect(session!.updatedAt).toBe(3_000);
+
+      // Verify underlying column in DB is actually null
+      const rawRow = storage.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("sess-reset") as { pull_sources: string | null };
+      expect(rawRow.pull_sources).toBeNull();
+
+      storage.db.close();
+    });
+
+    it("setPullSources returns false when no row matched", () => {
+      const storage = createStorage();
+      const updated = storage.sessions.setPullSources("nope", ["swarm"], 2_000);
+      expect(updated).toBe(false);
+      storage.db.close();
+    });
+
+    it("pullSources survives non-session-start upsert paths", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-survive",
+        cwd: "/tmp",
+        label: "initial",
+        notify: true,
+      }, 1_000);
+
+      storage.sessions.setPullSources("sess-survive", ["swarm"], 2_000);
+      expect(storage.sessions.get("sess-survive")!.pullSources).toEqual(["swarm"]);
+
+      // Calling upsert again (e.g. from goose registration or another writer)
+      storage.sessions.upsert({
+        sessionId: "sess-survive",
+        cwd: "/workspace",
+        label: "updated",
+        notify: false,
+      }, 3_000);
+
+      let session = storage.sessions.get("sess-survive");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["swarm"]);
+      expect(session!.label).toBe("updated");
+
+      // Other updates also preserve it
+      storage.sessions.touch("sess-survive", 4_000);
+      storage.sessions.setTitle("sess-survive", "New Title", 5_000);
+      storage.sessions.setModelOverride("sess-survive", "some-model");
+
+      session = storage.sessions.get("sess-survive");
+      expect(session!.pullSources).toEqual(["swarm"]);
+      expect(session!.title).toBe("New Title");
+
+      storage.db.close();
+    });
+  });
+
   describe("PendingQuestionRepository wizard state", () => {
     const q1 = { question: "Which DB?", header: "DB", options: [{ label: "PostgreSQL", description: "Relational" }] };
     const q2 = { question: "Which ORM?", header: "ORM", options: [{ label: "Prisma", description: "TypeScript ORM" }] };
@@ -766,6 +887,60 @@ describe("storage schema and repositories", () => {
         storage1.db.close();
 
         // Re-open again (should be idempotent and not throw duplicate column error)
+        expect(() => {
+          const storage2 = openStorageDb(dbPath);
+          storage2.db.close();
+        }).not.toThrow();
+      } finally {
+        rmSync(dbDir, { recursive: true, force: true });
+      }
+    });
+
+    it("migrates existing sessions table by adding pull_sources column cleanly", () => {
+      const dbDir = mkdtempSync(join(tmpdir(), "pigeon-test-db-sessions-pull-"));
+      const dbPath = join(dbDir, "storage.db");
+      try {
+        const dbOld = new BetterSqlite3(dbPath);
+        dbOld.exec(`
+          CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            ppid INTEGER,
+            pid INTEGER,
+            start_time INTEGER,
+            cwd TEXT,
+            label TEXT,
+            title TEXT DEFAULT NULL,
+            notify INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'running',
+            pty_path TEXT,
+            nvim_socket TEXT DEFAULT NULL,
+            backend_kind TEXT,
+            backend_protocol_version INTEGER,
+            backend_endpoint TEXT,
+            backend_auth_token TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+          );
+          INSERT INTO sessions (
+            session_id, created_at, updated_at, last_seen, expires_at
+          ) VALUES ('legacy-sess', 1000, 1000, 1000, 100000);
+        `);
+        dbOld.close();
+
+        const storage1 = openStorageDb(dbPath);
+        const columns = storage1.db.pragma("table_info(sessions)") as Array<{ name: string }>;
+        const columnNames = columns.map((c) => c.name);
+        expect(columnNames).toContain("pull_sources");
+
+        const session = storage1.sessions.get("legacy-sess");
+        expect(session).not.toBeNull();
+        expect(session!.pullSources).toEqual(["telegram-reply"]);
+
+        storage1.db.close();
+
+        // Idempotent re-open
         expect(() => {
           const storage2 = openStorageDb(dbPath);
           storage2.db.close();

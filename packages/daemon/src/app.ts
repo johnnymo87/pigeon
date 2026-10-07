@@ -12,7 +12,7 @@ import {
 } from "./alert-topic";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
-import type { QuestionInfoData } from "./storage/types";
+import { ALLOWED_PULL_SOURCES, type QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
@@ -873,6 +873,26 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ error: "session_id is required" }, { status: 400 });
         }
 
+        let pullSourcesToSet: string[] | null = null;
+        if (body.pull_sources !== undefined) {
+          if (!Array.isArray(body.pull_sources)) {
+            return Response.json(
+              { error: "pull_sources must be an array of: telegram-reply, swarm" },
+              { status: 400 },
+            );
+          }
+          const allowed = new Set<string>(ALLOWED_PULL_SOURCES);
+          for (const item of body.pull_sources) {
+            if (typeof item !== "string" || !allowed.has(item)) {
+              return Response.json(
+                { error: "pull_sources must be an array of: telegram-reply, swarm" },
+                { status: 400 },
+              );
+            }
+          }
+          pullSourcesToSet = Array.from(new Set(body.pull_sources));
+        }
+
         const existing = storage.sessions.get(sessionId);
 
         const nvim_socket = body.nvim_socket as string | undefined;
@@ -912,6 +932,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+
+        // SEMANTICS DIFFER FROM backend_kind ON PURPOSE:
+        // A re-registration WITHOUT the field RESETS it to the default (column NULL).
+        // Every episode of an unattended pull client re-registers, so this is what turns
+        // swarm banking off when the client stops advertising it (switched off, or rolled
+        // back to a version that does not know the field).
+        // Note: pull_sources gates ONLY swarm banking. Telegram-reply banking stays active
+        // as today regardless of whether it is listed in pull_sources.
+        storage.sessions.setPullSources(sessionId, pullSourcesToSet, nowFn());
 
         // Warm the tag cache off the request path. Resolving a tag costs a
         // subprocess, and every notification route reads the cache

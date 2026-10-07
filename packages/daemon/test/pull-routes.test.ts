@@ -254,6 +254,122 @@ describe("pull routes", () => {
     });
   });
 
+  describe("POST /session-start pull_sources", () => {
+    it("stores pull_sources when supplied", async () => {
+      const { app, storage: s } = newApp();
+      const res = await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: ["telegram-reply", "swarm"],
+      });
+      expect(res.status).toBe(200);
+      const session = s.sessions.get("ses_pull");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["telegram-reply", "swarm"]);
+    });
+
+    it("deduplicates pull_sources", async () => {
+      const { app, storage: s } = newApp();
+      const res = await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: ["swarm", "swarm", "telegram-reply"],
+      });
+      expect(res.status).toBe(200);
+      const session = s.sessions.get("ses_pull");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["swarm", "telegram-reply"]);
+    });
+
+    it("accepts empty array []", async () => {
+      const { app, storage: s } = newApp();
+      const res = await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: [],
+      });
+      expect(res.status).toBe(200);
+      const session = s.sessions.get("ses_pull");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual([]);
+    });
+
+    it("resets pull_sources to default (column NULL) when re-registration omits the field", async () => {
+      const { app, storage: s } = newApp();
+      // First register with pull_sources: ["swarm"]
+      const res1 = await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: ["swarm"],
+      });
+      expect(res1.status).toBe(200);
+      expect(s.sessions.get("ses_pull")!.pullSources).toEqual(["swarm"]);
+
+      // Re-register without pull_sources
+      const res2 = await post(app, "/session-start", {
+        session_id: "ses_pull",
+      });
+      expect(res2.status).toBe(200);
+      const session = s.sessions.get("ses_pull");
+      expect(session).not.toBeNull();
+      expect(session!.pullSources).toEqual(["telegram-reply"]);
+
+      // Verify column in DB is reset to NULL
+      const rawRow = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_pull") as { pull_sources: string | null };
+      expect(rawRow.pull_sources).toBeNull();
+    });
+
+    it("validates BEFORE any write and returns 400 for invalid pull_sources", async () => {
+      const { app, storage: s } = newApp();
+
+      // Non-array values
+      for (const invalid of ["swarm", 123, null, {}]) {
+        const res = await post(app, "/session-start", {
+          session_id: "ses_new_invalid",
+          pull_sources: invalid,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: string };
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(s.sessions.get("ses_new_invalid")).toBeNull();
+      }
+
+      // Non-string elements
+      for (const invalid of [[123], [null], ["swarm", 42]]) {
+        const res = await post(app, "/session-start", {
+          session_id: "ses_new_invalid2",
+          pull_sources: invalid,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: string };
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(s.sessions.get("ses_new_invalid2")).toBeNull();
+      }
+
+      // Unknown values
+      for (const invalid of [["unknown"], ["telegram-reply", "webhook"]]) {
+        const res = await post(app, "/session-start", {
+          session_id: "ses_new_invalid3",
+          pull_sources: invalid,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: string };
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(s.sessions.get("ses_new_invalid3")).toBeNull();
+      }
+
+      // Verify that for an existing session, invalid input does not modify the session row
+      await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: ["swarm"],
+      });
+      expect(s.sessions.get("ses_pull")!.pullSources).toEqual(["swarm"]);
+
+      const badRes = await post(app, "/session-start", {
+        session_id: "ses_pull",
+        pull_sources: ["invalid"],
+      });
+      expect(badRes.status).toBe(400);
+      expect(s.sessions.get("ses_pull")!.pullSources).toEqual(["swarm"]);
+    });
+  });
+
   describe("auth", () => {
     it("requires the bearer token like every other non-anonymous route", async () => {
       storage = openStorageDb(":memory:");

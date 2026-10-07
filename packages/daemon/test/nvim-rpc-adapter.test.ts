@@ -26,6 +26,7 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     backendEndpoint: null,
     backendAuthToken: null,
     backendSessionId: null,
+    pullSources: ["telegram-reply"],
     createdAt: Date.now(),
     updatedAt: Date.now(),
     lastSeen: Date.now(),

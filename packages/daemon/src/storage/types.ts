@@ -1,3 +1,7 @@
+export const DEFAULT_PULL_SOURCES: readonly string[] = ["telegram-reply"];
+export const ALLOWED_PULL_SOURCES = ["telegram-reply", "swarm"] as const;
+export type PullSource = (typeof ALLOWED_PULL_SOURCES)[number];
+
 export interface SessionRecord {
   sessionId: string;
   ppid: number | null;
@@ -46,6 +50,16 @@ export interface SessionRecord {
    * goes out as `undefined`.
    */
   backendSessionId: string | null;
+  /**
+   * Sources this session banks messages from in `pull_inbox`.
+   *
+   * Effective value: if the underlying `pull_sources` column is NULL,
+   * defaults to `["telegram-reply"]`.
+   *
+   * Gates ONLY swarm banking. Telegram-reply banking stays active
+   * regardless of whether it is listed here.
+   */
+  pullSources: string[];
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
