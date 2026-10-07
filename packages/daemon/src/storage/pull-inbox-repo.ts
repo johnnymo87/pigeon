@@ -7,7 +7,7 @@ import type BetterSqlite3 from "better-sqlite3";
  * Telegram reply is the only way in. Kept as a column so a second source is a
  * value, not a migration.
  */
-export type PullInboxSource = "telegram-reply";
+export type PullInboxSource = "telegram-reply" | "swarm";
 
 export interface PullInboxRecord {
   msgId: string;
@@ -24,6 +24,8 @@ export interface PullInboxRecord {
   inReplyTo: string | null;
   inReplyToQuote: string | null;
   chatId: string | null;
+  kind: string | null;
+  replyTo: string | null;
   createdAt: number;
   expiresAt: number;
   /** First-claim time. Preserved across redeliveries: it is the unacked alarm's clock. */
@@ -41,6 +43,8 @@ export interface BankPullMessageInput {
   inReplyTo?: string | null;
   inReplyToQuote?: string | null;
   chatId?: string | null;
+  kind?: string | null;
+  replyTo?: string | null;
   ttlMs?: number;
 }
 
@@ -75,6 +79,8 @@ function asRecord(row: Row): PullInboxRecord {
     inReplyTo: (row.in_reply_to as string | null) ?? null,
     inReplyToQuote: (row.in_reply_to_quote as string | null) ?? null,
     chatId: (row.chat_id as string | null) ?? null,
+    kind: (row.kind as string | null) ?? null,
+    replyTo: (row.reply_to as string | null) ?? null,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
     claimedAt: (row.claimed_at as number | null) ?? null,
@@ -99,8 +105,9 @@ export class PullInboxRepository {
       .prepare(
         `INSERT INTO pull_inbox
            (msg_id, session_id, source, payload, sender_id, in_reply_to, in_reply_to_quote, chat_id,
+            kind, reply_to,
             created_at, expires_at, claimed_at, claim_count, acked_at, unacked_alerted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -112,6 +119,8 @@ export class PullInboxRepository {
         input.inReplyTo ?? null,
         input.inReplyToQuote ?? null,
         input.chatId ?? null,
+        input.kind ?? null,
+        input.replyTo ?? null,
         now,
         now + (input.ttlMs ?? DEFAULT_PULL_TTL_MS),
       );
@@ -140,7 +149,9 @@ export class PullInboxRepository {
             WHERE session_id = ?
               AND acked_at IS NULL
               AND expires_at > ?
-            ORDER BY created_at ASC, msg_id ASC
+            ORDER BY CASE source WHEN 'telegram-reply' THEN 0 WHEN 'swarm' THEN 1 ELSE 2 END ASC,
+                     created_at ASC,
+                     msg_id ASC
             LIMIT ?`,
         )
         .all(sessionId, now, limit) as Row[];
@@ -198,6 +209,37 @@ export class PullInboxRepository {
   }
 
   /**
+   * How much unread mail this session has, broken down by source.
+   *
+   * Always includes both keys ("telegram-reply" and "swarm").
+   */
+  pendingCounts(
+    sessionId: string,
+    now: number,
+  ): { total: number; bySource: Record<PullInboxSource, number> } {
+    const rows = this.db
+      .prepare(
+        `SELECT source, COUNT(*) AS n FROM pull_inbox
+          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?
+          GROUP BY source`,
+      )
+      .all(sessionId, now) as Array<{ source: string; n: number }>;
+    const bySource: Record<PullInboxSource, number> = {
+      "telegram-reply": 0,
+      swarm: 0,
+    };
+    let total = 0;
+    for (const r of rows) {
+      const count = Number(r.n);
+      total += count;
+      if (r.source === "telegram-reply" || r.source === "swarm") {
+        bySource[r.source] = count;
+      }
+    }
+    return { total, bySource };
+  }
+
+  /**
    * How much unread mail this session has.
    *
    * Powers the "is anything waiting?" probe, and -- equally -- lets a drain that
@@ -205,13 +247,7 @@ export class PullInboxRepository {
    * at all. Zero-rows-and-healthy must not look like broken.
    */
   pendingCount(sessionId: string, now: number): number {
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM pull_inbox
-          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?`,
-      )
-      .get(sessionId, now) as { n: number };
-    return Number(row.n);
+    return this.pendingCounts(sessionId, now).total;
   }
 
   /**
