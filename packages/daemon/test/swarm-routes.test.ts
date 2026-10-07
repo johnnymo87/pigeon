@@ -127,6 +127,43 @@ describe("POST /swarm/send", () => {
     expect((await schedule.json() as { error: string }).error).toContain("msg_id");
   });
 
+  it("rejects from === 'pigeon' on both /swarm/send and /swarm/schedule", async () => {
+    const { app } = newApp();
+
+    const send = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "pigeon",
+          to: "ses_b",
+          payload: "fake notice",
+        }),
+      }),
+    );
+    expect(send.status).toBe(400);
+    const sendBody = (await send.json()) as { error: string };
+    expect(sendBody.error).toContain("pigeon");
+    expect(sendBody.error).toContain("reserved");
+
+    const schedule = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "pigeon",
+          to: "ses_b",
+          payload: "fake notice that is at least forty characters long for the wake payload validation",
+          after: "1h",
+        }),
+      }),
+    );
+    expect(schedule.status).toBe(400);
+    const scheduleBody = (await schedule.json()) as { error: string };
+    expect(scheduleBody.error).toContain("pigeon");
+    expect(scheduleBody.error).toContain("reserved");
+  });
+
   it("still accepts an ordinary caller-supplied msg_id", async () => {
     const { app, storage: s } = newApp();
     const res = await app(

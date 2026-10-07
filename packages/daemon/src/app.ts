@@ -189,6 +189,19 @@ export function parseSwarmSendBody(
     };
   }
 
+  // Reserve 'pigeon' as a sender id: pigeon is the daemon's own sender id for
+  // system notices (e.g. delivery.failed); a client given the shared token
+  // must not be able to forge one.
+  if (from === "pigeon") {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: "from cannot be 'pigeon' (reserved for pigeon-generated system notices)" },
+        { status: 400 },
+      ),
+    };
+  }
+
   if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
   if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
   if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };
