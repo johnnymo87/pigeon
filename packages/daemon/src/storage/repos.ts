@@ -17,8 +17,29 @@ import type {
   StorePendingQuestionInput,
   UpsertSessionInput,
 } from "./types";
+import { ALLOWED_PULL_SOURCES, DEFAULT_PULL_SOURCES } from "./types";
 
 type SqlRow = Record<string, unknown>;
+
+const allowedSources = new Set<string>(ALLOWED_PULL_SOURCES);
+
+function parsePullSources(value: unknown): string[] {
+  if (value === null || value === undefined) {
+    return [...DEFAULT_PULL_SOURCES];
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        // Fails closed to known allowed values so corrupt or stale stored entries cannot read as opted-in.
+        return parsed.filter((elem): elem is string => typeof elem === "string" && allowedSources.has(elem));
+      }
+    } catch {
+      return [...DEFAULT_PULL_SOURCES];
+    }
+  }
+  return [...DEFAULT_PULL_SOURCES];
+}
 
 function asSession(row: SqlRow): SessionRecord {
   return {
@@ -39,6 +60,7 @@ function asSession(row: SqlRow): SessionRecord {
     backendEndpoint: (row.backend_endpoint as string | null) ?? null,
     backendSessionId: (row.backend_session_id as string | null) ?? null,
     backendAuthToken: (row.backend_auth_token as string | null) ?? null,
+    pullSources: parsePullSources(row.pull_sources),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     lastSeen: Number(row.last_seen),
@@ -291,6 +313,22 @@ export class SessionRepository {
       .prepare("SELECT model_override FROM sessions WHERE session_id = ?")
       .get(sessionId) as { model_override: string | null } | null;
     return row?.model_override ?? null;
+  }
+
+  /**
+   * Updates pull_sources for a session.
+   *
+   * Stored as a JSON-encoded array of strings, or NULL when resetting to default.
+   * Only called by /session-start; left out of `sessions.upsert` so that other
+   * writers (goose registration, touch, title updates, state updates) do not
+   * clobber or alter it.
+   */
+  setPullSources(sessionId: string, sources: string[] | null, now = Date.now()): boolean {
+    const json = sources !== null ? JSON.stringify(sources) : null;
+    const result = this.db
+      .prepare("UPDATE sessions SET pull_sources = ?, updated_at = ? WHERE session_id = ?")
+      .run(json, now, sessionId);
+    return result.changes > 0;
   }
 
   cleanupExpired(now = Date.now()): number {

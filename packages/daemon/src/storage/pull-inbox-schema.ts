@@ -57,6 +57,8 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
     if (!names.has("sender_id")) db.exec("ALTER TABLE pull_inbox ADD COLUMN sender_id TEXT");
     if (!names.has("in_reply_to")) db.exec("ALTER TABLE pull_inbox ADD COLUMN in_reply_to TEXT");
     if (!names.has("in_reply_to_quote")) db.exec("ALTER TABLE pull_inbox ADD COLUMN in_reply_to_quote TEXT");
+    if (!names.has("kind")) db.exec("ALTER TABLE pull_inbox ADD COLUMN kind TEXT");
+    if (!names.has("reply_to")) db.exec("ALTER TABLE pull_inbox ADD COLUMN reply_to TEXT");
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS pull_inbox (
@@ -68,6 +70,8 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
       in_reply_to TEXT,
       in_reply_to_quote TEXT,
       chat_id TEXT,
+      kind TEXT,
+      reply_to TEXT,
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,
       claimed_at INTEGER,

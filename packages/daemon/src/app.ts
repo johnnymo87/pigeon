@@ -12,7 +12,7 @@ import {
 } from "./alert-topic";
 import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitTelegramMessage } from "./split-message";
-import type { QuestionInfoData } from "./storage/types";
+import { ALLOWED_PULL_SOURCES, type QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
@@ -23,11 +23,15 @@ import { clampPreservingSurrogates, excerptOf } from "./text";
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
+import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { WorkerResult } from "./worker/poller";
+
+const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
+const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
 
 interface LegacySession {
   session_id: string;
@@ -180,6 +184,19 @@ export function parseSwarmSendBody(
           error:
             "msg_id cannot contain ':' (reserved as pigeon's alert-reference delimiter)",
         },
+        { status: 400 },
+      ),
+    };
+  }
+
+  // Reserve 'pigeon' as a sender id: pigeon is the daemon's own sender id for
+  // system notices (e.g. delivery.failed); a client given the shared token
+  // must not be able to forge one. Reject any variation in whitespace or case.
+  if (from.trim().toLowerCase() === "pigeon") {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: "from cannot be 'pigeon' (reserved for pigeon-generated system notices)" },
         { status: 400 },
       ),
     };
@@ -508,7 +525,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const f = parsed.fields;
         const msgId = f.callerMsgId ?? makeMsgId();
-        const inserted = storage.swarm.insert(
+        const result = bankOrInsertSwarmMessage(
+          storage,
           {
             msgId,
             fromSession: f.from,
@@ -521,9 +539,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
-        if (inserted) {
-          const record = storage.swarm.getByMsgId(msgId);
-          if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
+
+        if (result.status === "refused") {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        if (result.status === "banked") {
+          return Response.json({ accepted: true, msg_id: msgId, banked: true }, { status: 202 });
         }
 
         return Response.json({ accepted: true, msg_id: msgId }, { status: 202 });
@@ -603,7 +625,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
         const msgId = f.callerMsgId ?? makeMsgId();
-        const inserted = storage.swarm.insert(
+        const result = bankOrInsertSwarmMessage(
+          storage,
           {
             msgId,
             fromSession: f.from,
@@ -620,7 +643,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           nowFn(),
         );
 
-        if (!inserted) {
+        if (result.status === "refused") {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        if (result.status === "banked") {
+          // Defensive: scheduled messages to banking targets are refused with 409 above.
+          return Response.json(
+            { accepted: true, msg_id: msgId, banked: true },
+            { status: 202 },
+          );
+        }
+
+        if (!result.inserted) {
           const stored = storage.swarm.getByMsgId(msgId);
           return Response.json(
             {
@@ -632,9 +667,6 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             { status: 409 },
           );
         }
-
-        const record = storage.swarm.getByMsgId(msgId);
-        if (record) enqueueSwarmTelegramNotice(storage, record, nowFn());
 
         return Response.json(
           {
@@ -804,11 +836,17 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const now = nowFn();
+        // Swarm rows are held (not served, not counted) if the session is not currently
+        // opted into "swarm". An older or rolled-back client that does not understand
+        // swarm rows would reject them, ack them (losing the peer message with no
+        // delivery.failed), and misreport them to the human as rejected replies.
+        // Held rows wait in the bank for re-opt-in or expiry.
+        const includeSwarm = session.pullSources.includes("swarm");
         // Counted BEFORE the claim, and documented as such: it includes the rows
         // being returned. Counting after would report 0 on a full drain and read
         // as "nothing was waiting".
-        const pendingTotal = storage.pullInbox.pendingCount(sessionId, now);
-        const claimed = storage.pullInbox.claim(sessionId, now, limit);
+        const pendingTotal = storage.pullInbox.pendingCount(sessionId, now, { includeSwarm });
+        const claimed = storage.pullInbox.claim(sessionId, now, limit, { includeSwarm });
 
         return Response.json({
           ok: true,
@@ -821,6 +859,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             sender_id: m.senderId,
             in_reply_to: m.inReplyTo,
             in_reply_to_quote: m.inReplyToQuote ?? null,
+            kind: m.kind,
+            reply_to: m.replyTo,
             created_at: m.createdAt,
             claim_count: m.claimCount,
             // A row claimed before but never acked. The client may already have
@@ -857,12 +897,20 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // 200 with a flag, not 404. This is the cheap poll a wake gate runs; a
         // caller that treated an unknown session as an error would be waking on
         // the daemon's opinion of registration rather than on there being mail.
+        //
+        // Held swarm rows are excluded from counts when the session is not opted in
+        // so a wake gate does not spin on mail the client cannot collect.
+        const includeSwarm = session ? session.pullSources.includes("swarm") : false;
+        const counts = session
+          ? storage.pullInbox.pendingCounts(sessionId, nowFn(), { includeSwarm })
+          : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
         return Response.json({
           ok: true,
           session_id: sessionId,
           session_known: Boolean(session),
           backend_kind: session?.backendKind ?? null,
-          pending: session ? storage.pullInbox.pendingCount(sessionId, nowFn()) : 0,
+          pending: counts.total,
+          by_source: counts.bySource,
         });
       }
 
@@ -871,6 +919,25 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const sessionId = typeof body.session_id === "string" ? body.session_id : "";
         if (!sessionId) {
           return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+
+        let pullSourcesToSet: string[] | null = null;
+        if (body.pull_sources !== undefined && body.pull_sources !== null) {
+          if (!Array.isArray(body.pull_sources)) {
+            return Response.json(
+              { error: INVALID_PULL_SOURCES_ERROR },
+              { status: 400 },
+            );
+          }
+          for (const item of body.pull_sources) {
+            if (typeof item !== "string" || !ALLOWED_PULL_SOURCES_SET.has(item)) {
+              return Response.json(
+                { error: INVALID_PULL_SOURCES_ERROR },
+                { status: 400 },
+              );
+            }
+          }
+          pullSourcesToSet = Array.from(new Set(body.pull_sources));
         }
 
         const existing = storage.sessions.get(sessionId);
@@ -912,6 +979,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           nowFn(),
         );
+
+        // SEMANTICS DIFFER FROM backend_kind ON PURPOSE:
+        // A re-registration WITHOUT the field RESETS it to the default (column NULL).
+        // Every episode of an unattended pull client re-registers, so this is what turns
+        // swarm banking off when the client stops advertising it (switched off, or rolled
+        // back to a version that does not know the field).
+        // Note: pull_sources gates ONLY swarm banking. Telegram-reply banking stays active
+        // as today regardless of whether it is listed in pull_sources.
+        storage.sessions.setPullSources(sessionId, pullSourcesToSet, nowFn());
 
         // Warm the tag cache off the request path. Resolving a tag costs a
         // subprocess, and every notification route reads the cache

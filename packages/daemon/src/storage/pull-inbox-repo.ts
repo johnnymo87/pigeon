@@ -1,13 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
 
 /**
- * Where a banked message came from. One value today: question cards are not
- * offered to pull sessions (a pending question captures every plain message to
- * its session, and nothing drains a question for a pull client), so a plain
- * Telegram reply is the only way in. Kept as a column so a second source is a
- * value, not a migration.
+ * Where a banked message came from: plain Telegram replies (via goose-pull
+ * adapter) and swarm messages (via bank-or-insert.ts for opted-in sessions).
+ * Question cards are not offered to pull sessions (a pending question captures
+ * every plain message to its session, and nothing drains a question for a pull
+ * client).
  */
-export type PullInboxSource = "telegram-reply";
+export type PullInboxSource = "telegram-reply" | "swarm";
 
 export interface PullInboxRecord {
   msgId: string;
@@ -24,6 +24,8 @@ export interface PullInboxRecord {
   inReplyTo: string | null;
   inReplyToQuote: string | null;
   chatId: string | null;
+  kind: string | null;
+  replyTo: string | null;
   createdAt: number;
   expiresAt: number;
   /** First-claim time. Preserved across redeliveries: it is the unacked alarm's clock. */
@@ -41,7 +43,20 @@ export interface BankPullMessageInput {
   inReplyTo?: string | null;
   inReplyToQuote?: string | null;
   chatId?: string | null;
+  kind?: string | null;
+  replyTo?: string | null;
   ttlMs?: number;
+}
+
+export interface PullInboxFilterOptions {
+  /**
+   * Whether to include `source='swarm'` rows. Defaults to true.
+   *
+   * When false, swarm rows are held (neither returned nor counted) for sessions
+   * not currently opted into "swarm", protecting older clients from misinterpreting
+   * them and preventing wake gates from spinning.
+   */
+  includeSwarm?: boolean;
 }
 
 /**
@@ -75,6 +90,8 @@ function asRecord(row: Row): PullInboxRecord {
     inReplyTo: (row.in_reply_to as string | null) ?? null,
     inReplyToQuote: (row.in_reply_to_quote as string | null) ?? null,
     chatId: (row.chat_id as string | null) ?? null,
+    kind: (row.kind as string | null) ?? null,
+    replyTo: (row.reply_to as string | null) ?? null,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
     claimedAt: (row.claimed_at as number | null) ?? null,
@@ -99,8 +116,9 @@ export class PullInboxRepository {
       .prepare(
         `INSERT INTO pull_inbox
            (msg_id, session_id, source, payload, sender_id, in_reply_to, in_reply_to_quote, chat_id,
+            kind, reply_to,
             created_at, expires_at, claimed_at, claim_count, acked_at, unacked_alerted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
       .run(
@@ -112,6 +130,8 @@ export class PullInboxRepository {
         input.inReplyTo ?? null,
         input.inReplyToQuote ?? null,
         input.chatId ?? null,
+        input.kind ?? null,
+        input.replyTo ?? null,
         now,
         now + (input.ttlMs ?? DEFAULT_PULL_TTL_MS),
       );
@@ -131,16 +151,30 @@ export class PullInboxRepository {
    * would reset the unacked alarm's clock on every episode, which is the shape
    * that already silenced a stall alarm: an
    * alarm whose clock is reset by the very loop it is watching never fires.
+   *
+   * When `options.includeSwarm` is false, `source='swarm'` rows are excluded
+   * (held) so an opted-out or rolled-back client that does not understand swarm
+   * rows does not receive, reject, or misreport them. Held rows remain in the bank
+   * to serve on re-opt-in or expire via sweep.
    */
-  claim(sessionId: string, now: number, limit = 50): PullInboxRecord[] {
+  claim(
+    sessionId: string,
+    now: number,
+    limit = 50,
+    options: PullInboxFilterOptions = {},
+  ): PullInboxRecord[] {
+    const includeSwarm = options.includeSwarm ?? true;
+    const swarmFilter = includeSwarm ? "" : " AND source != 'swarm'";
     return this.db.transaction(() => {
       const rows = this.db
         .prepare(
           `SELECT * FROM pull_inbox
             WHERE session_id = ?
               AND acked_at IS NULL
-              AND expires_at > ?
-            ORDER BY created_at ASC, msg_id ASC
+              AND expires_at > ?${swarmFilter}
+            ORDER BY CASE source WHEN 'telegram-reply' THEN 0 WHEN 'swarm' THEN 1 ELSE 2 END ASC,
+                     created_at ASC,
+                     msg_id ASC
             LIMIT ?`,
         )
         .all(sessionId, now, limit) as Row[];
@@ -172,6 +206,10 @@ export class PullInboxRepository {
    * a partial ack must be visible to the caller, because "I acked 5 of 5" and "I
    * acked 3 and two vanished" are different facts about whether the human's
    * message was read.
+   *
+   * Ack is deliberately NOT filtered by `includeSwarm`: a client that claimed
+   * rows while opted in must still be allowed to acknowledge them even after
+   * an opt-out so they do not falsely alert as unconfirmed / wedged.
    */
   ack(
     sessionId: string,
@@ -198,20 +236,55 @@ export class PullInboxRepository {
   }
 
   /**
+   * How much unread mail this session has, broken down by source.
+   *
+   * Always includes both keys ("telegram-reply" and "swarm").
+   * When `options.includeSwarm` is false, `source='swarm'` rows are excluded
+   * from the count (reporting 0) so wake gates do not spin on mail the client
+   * cannot currently collect.
+   */
+  pendingCounts(
+    sessionId: string,
+    now: number,
+    options: PullInboxFilterOptions = {},
+  ): { total: number; bySource: Record<PullInboxSource, number> } {
+    const includeSwarm = options.includeSwarm ?? true;
+    const swarmFilter = includeSwarm ? "" : " AND source != 'swarm'";
+    const rows = this.db
+      .prepare(
+        `SELECT source, COUNT(*) AS n FROM pull_inbox
+          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?${swarmFilter}
+          GROUP BY source`,
+      )
+      .all(sessionId, now) as Array<{ source: string; n: number }>;
+    const bySource: Record<PullInboxSource, number> = {
+      "telegram-reply": 0,
+      swarm: 0,
+    };
+    let total = 0;
+    for (const r of rows) {
+      const count = Number(r.n);
+      total += count;
+      if (r.source === "telegram-reply" || r.source === "swarm") {
+        bySource[r.source] = count;
+      }
+    }
+    return { total, bySource };
+  }
+
+  /**
    * How much unread mail this session has.
    *
    * Powers the "is anything waiting?" probe, and -- equally -- lets a drain that
    * returns nothing be distinguished from a drain that could not reach the bank
    * at all. Zero-rows-and-healthy must not look like broken.
    */
-  pendingCount(sessionId: string, now: number): number {
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM pull_inbox
-          WHERE session_id = ? AND acked_at IS NULL AND expires_at > ?`,
-      )
-      .get(sessionId, now) as { n: number };
-    return Number(row.n);
+  pendingCount(
+    sessionId: string,
+    now: number,
+    options: PullInboxFilterOptions = {},
+  ): number {
+    return this.pendingCounts(sessionId, now, options).total;
   }
 
   /**
@@ -224,11 +297,15 @@ export class PullInboxRepository {
    * which a Telegram-originated message never is. Deleting inside the same
    * transaction that reports is what makes the report exactly-once -- the row is
    * the dedupe token.
-   */
-  /**
-   * `onExpired` runs inside the same transaction as each row's delete, so a
-   * row is never removed without its notice being recorded: if the callback
-   * throws, the whole sweep rolls back and the rows are retried next cycle.
+   *
+   * The sweep is deliberately NOT filtered by `includeSwarm`: held swarm rows
+   * that expire uncollected must still be cleaned up and notify the sender
+   * ("never collected ... safe to resend").
+   *
+   * Each row's onExpired callback and delete run inside a nested transaction
+   * (savepoint). If the callback throws for a row, that row rolls back, the error
+   * is logged to console.error, and it remains for the next sweep cycle, while
+   * other rows still commit. Exactly-once still holds per row.
    */
   sweepExpired(now: number, onExpired?: (row: PullInboxRecord) => void): PullInboxRecord[] {
     return this.db.transaction(() => {
@@ -238,14 +315,23 @@ export class PullInboxRepository {
         )
         .all(now) as Row[];
       const records = rows.map(asRecord);
+      const deleted: PullInboxRecord[] = [];
       if (records.length > 0) {
         const del = this.db.prepare("DELETE FROM pull_inbox WHERE msg_id = ?");
-        for (const rec of records) {
+        const processRow = this.db.transaction((rec: PullInboxRecord) => {
           onExpired?.(rec);
           del.run(rec.msgId);
+        });
+        for (const rec of records) {
+          try {
+            processRow(rec);
+            deleted.push(rec);
+          } catch (err) {
+            console.error(`sweepExpired error for msg_id ${rec.msgId}:`, err);
+          }
         }
       }
-      return records;
+      return deleted;
     })();
   }
 
@@ -254,6 +340,10 @@ export class PullInboxRepository {
    * reported so each is reported exactly once for the life of the row.
    *
    * Durable rather than an in-memory Set: see the schema comment.
+   *
+   * Deliberately NOT filtered by `includeSwarm`: a claimed swarm row that went
+   * unconfirmed indicates a broken or crashed client regardless of whether the
+   * session subsequent to the claim opted out of swarm.
    */
   listUnackedForAlert(now: number, thresholdMs: number): PullInboxRecord[] {
     return this.db.transaction(() => {

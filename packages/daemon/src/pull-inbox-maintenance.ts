@@ -1,6 +1,10 @@
 import type { StorageDb } from "./storage/database";
 import { PULL_UNACKED_ALERT_MS } from "./storage/pull-inbox-repo";
 import { clampPreservingSurrogates } from "./text";
+import {
+  formatPullFailureNotice,
+  notifySenderOfFailure,
+} from "./swarm/notify-sender";
 
 /** How long an acked row is kept before reaping. Forensics only; nothing reads it. */
 export const PULL_ACKED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -52,6 +56,38 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
   const { storage } = deps;
 
   storage.pullInbox.sweepExpired(now, (row) => {
+    if (row.source === "swarm") {
+      // For pull clients, pigeon has no transcript observation, only whether
+      // the message was collected by /pull/drain and whether it was acknowledged.
+      const reason =
+        row.claimCount === 0
+          ? "expired in pull inbox without being collected"
+          : `expired in pull inbox after ${row.claimCount} unconfirmed collection attempt(s)`;
+      const payload = formatPullFailureNotice(
+        row.msgId,
+        row.sessionId,
+        reason,
+        row.claimCount,
+      );
+      // Notice routing handles loop guards, ses_ checks, and banks if the sender
+      // is itself an opted-in pull session. Human alert is skipped for swarm rows.
+      notifySenderOfFailure(
+        storage,
+        {
+          msgId: row.msgId,
+          fromSession: row.senderId ?? "",
+          toSession: row.sessionId,
+          kind: row.kind ?? undefined,
+        },
+        reason,
+        now,
+        "unobserved",
+        payload,
+      );
+      log(`expired unread msg=${row.msgId} session=${row.sessionId}`);
+      return;
+    }
+
     const label = storage.sessions.get(row.sessionId)?.label ?? row.sessionId;
     const ageHours = Math.round((now - row.createdAt) / 3_600_000);
     storage.alerts.enqueue({
@@ -69,7 +105,13 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
 
   const threshold = deps.unackedThresholdMs ?? PULL_UNACKED_ALERT_MS;
   for (const row of storage.pullInbox.listUnackedForAlert(now, threshold)) {
-    const label = storage.sessions.get(row.sessionId)?.label ?? row.sessionId;
+    const session = storage.sessions.get(row.sessionId);
+    const label = session?.label ?? row.sessionId;
+    const isHeldSwarm =
+      row.source === "swarm" && (!session || !session.pullSources.includes("swarm"));
+    const drainSentence = isHeldSwarm
+      ? "It is held because the session no longer accepts swarm messages, and will be served if it opts back in, or will expire unread"
+      : "It will be re-served on the next drain";
     storage.alerts.enqueue({
       source: "pull-inbox-unacked",
       refMsgId: `pull-unacked:${row.msgId}`,
@@ -78,7 +120,7 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
       text:
         `${label} collected a banked message but never confirmed it reached the ` +
         `agent (claimed ${Math.round((now - (row.claimedAt ?? now)) / 60_000)} min ago, ` +
-        `${row.claimCount} attempt(s)). It will be re-served on the next drain, ` +
+        `${row.claimCount} attempt(s)). ${drainSentence}, ` +
         `but something is failing between collection and use.\n\n` +
         `${row.source}: ${excerpt(row.payload)}`,
     });

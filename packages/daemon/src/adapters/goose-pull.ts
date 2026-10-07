@@ -137,9 +137,11 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
       chatId?: string | number;
     },
   ): CommandDeliveryResult {
-    // Belt and braces behind selectAdapter. This adapter is the only writer to
-    // the bank, and a bank keyed on a session id that no drain will ever ask for
-    // is mail that is written, never read, and never noticed.
+    // Belt and braces behind selectAdapter. Aside from swarm banking via
+    // bank-or-insert.ts for opted-in sessions, this adapter is the writer to
+    // the bank for human Telegram replies, and a bank keyed on a session id
+    // that no drain will ever ask for is mail that is written, never read,
+    // and never noticed.
     if (!isPullBackend(session)) {
       return {
         ok: false,

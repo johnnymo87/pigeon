@@ -85,6 +85,39 @@ describe("pull inbox maintenance", () => {
     expect(rows[0]!.ref_msg_id).toBe("pull-unacked:m1");
   });
 
+  it("uses conditional wording for unacked alert: held swarm row vs active row", () => {
+    const s = newDb();
+    // 1. Active telegram-reply row
+    s.pullInbox.bank(
+      { msgId: "m_active", sessionId: "ses_pull", source: "telegram-reply", payload: "active" },
+      1_000,
+    );
+    s.pullInbox.claim("ses_pull", 2_000);
+
+    // 2. Swarm row on an opted-out session (held)
+    // In newDb(), ses_pull default pullSources is ["telegram-reply"] (not opted into swarm)
+    s.pullInbox.bank(
+      { msgId: "m_held", sessionId: "ses_pull", source: "swarm", payload: "held" },
+      1_000,
+    );
+    // Claimed earlier (e.g. before opt-out)
+    s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: true });
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 2_000 + PULL_UNACKED_ALERT_MS + 1 });
+    const rows = alerts(s);
+    expect(rows).toHaveLength(2);
+
+    const activeAlert = rows.find((r) => r.ref_msg_id === "pull-unacked:m_active")!;
+    expect(activeAlert.text).toContain(
+      "It will be re-served on the next drain, but something is failing between collection and use.",
+    );
+
+    const heldAlert = rows.find((r) => r.ref_msg_id === "pull-unacked:m_held")!;
+    expect(heldAlert.text).toContain(
+      "It is held because the session no longer accepts swarm messages, and will be served if it opts back in, or will expire unread, but something is failing between collection and use.",
+    );
+  });
+
   // Durability, not politeness. Every dedupe set in the delivery watchdog is
   // in-memory, so a permanently stuck row re-alerts on each daemon restart -- and
   // a permanently stuck row is exactly the population that survives restarts.
@@ -123,5 +156,165 @@ describe("pull inbox maintenance", () => {
       runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 }),
     ).not.toThrow();
     expect(alerts(s)).toHaveLength(1);
+  });
+
+  it("notifies ses_ sender of expired unread swarm message with 'never delivered' wording and no human alert", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_never",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task",
+        senderId: "ses_sender_peer",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    // NO human alert
+    expect(alerts(s)).toEqual([]);
+
+    // Sender was notified via delivery.failed swarm message
+    const row = s.db.prepare("SELECT msg_id FROM swarm_messages WHERE to_session = 'ses_sender_peer'").get() as { msg_id: string } | undefined;
+    expect(row).toBeDefined();
+    const notice = s.swarm.getByMsgId(row!.msg_id);
+    expect(notice).not.toBeNull();
+    expect(notice!.kind).toBe("delivery.failed");
+    expect(notice!.fromSession).toBe("pigeon");
+    expect(notice!.replyTo).toBe("m_sw_never");
+    expect(notice!.payload).toBe(
+      "DELIVERY FAILED: your swarm message m_sw_never to ses_pull was never collected and was NOT received. " +
+      "Reason: expired in pull inbox without being collected. " +
+      "Nothing reached the target, so it is safe to resend.",
+    );
+    expect(notice!.payload).not.toContain("transcript");
+  });
+
+  it("notifies ses_ sender of expired unconfirmed swarm message with 'unconfirmed' wording and no human alert", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_claimed",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task 2",
+        senderId: "ses_sender_peer",
+        kind: "chat",
+      },
+      1_000,
+    );
+    // Claim it so claimCount > 0
+    s.pullInbox.claim("ses_pull", 2_000);
+
+    // Use unackedThresholdMs larger than elapsed time so unacked alert does not fire
+    runPullInboxMaintenance({
+      storage: s,
+      nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1,
+      unackedThresholdMs: 10 * DEFAULT_PULL_TTL_MS,
+    });
+
+    // NO human alert
+    expect(alerts(s)).toEqual([]);
+
+    // Sender was notified with unconfirmed wording
+    const row = s.db.prepare("SELECT msg_id FROM swarm_messages WHERE to_session = 'ses_sender_peer'").get() as { msg_id: string } | undefined;
+    expect(row).toBeDefined();
+    const notice = s.swarm.getByMsgId(row!.msg_id);
+    expect(notice).not.toBeNull();
+    expect(notice!.kind).toBe("delivery.failed");
+    expect(notice!.payload).toBe(
+      "DELIVERY UNCONFIRMED: your swarm message m_sw_claimed to ses_pull was handed to the target 1 time(s) but it never confirmed receiving it, and it has now expired. " +
+      "Reason: expired in pull inbox after 1 unconfirmed collection attempt(s). " +
+      "It may or may not have been acted on. Resend only if a duplicate would be harmless; otherwise reach the target another way.",
+    );
+    expect(notice!.payload).not.toContain("transcript");
+  });
+
+  it("does not notify sender and does not alert human when sender is pigeon or non-ses_", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_from_pigeon",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "pigeon text",
+        senderId: "pigeon",
+        kind: "chat",
+      },
+      1_000,
+    );
+    s.pullInbox.bank(
+      {
+        msgId: "m_from_non_ses",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "other text",
+        senderId: "coordinator-1",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    expect(alerts(s)).toEqual([]);
+    const noticeRows = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE from_session = 'pigeon'").get() as { n: number };
+    expect(noticeRows.n).toBe(0);
+  });
+
+  it("does not notify sender and does not alert human when kind is delivery.failed", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_failed_loop",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "failed notice",
+        senderId: "ses_sender_peer",
+        kind: "delivery.failed",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    expect(alerts(s)).toEqual([]);
+    const noticeRows = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE from_session = 'pigeon'").get() as { n: number };
+    expect(noticeRows.n).toBe(0);
+  });
+
+  it("banks delivery.failed when the expired message sender is itself an opted-in pull session", () => {
+    const s = newDb();
+    s.sessions.upsert({
+      sessionId: "ses_sender_pull",
+      backendKind: "goose-pull",
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_sender_pull", ["swarm"]);
+
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_from_pull",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task from pull",
+        senderId: "ses_sender_pull",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    // Banked for ses_sender_pull in pull_inbox
+    const claimed = s.pullInbox.claim("ses_sender_pull", 2_000 + DEFAULT_PULL_TTL_MS);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.source).toBe("swarm");
+    expect(claimed[0]!.kind).toBe("delivery.failed");
+    expect(claimed[0]!.senderId).toBe("pigeon");
+    expect(claimed[0]!.replyTo).toBe("m_sw_from_pull");
   });
 });

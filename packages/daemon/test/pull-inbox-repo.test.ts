@@ -232,15 +232,16 @@ describe("PullInboxRepository", () => {
     raw.db.close();
   });
 
-  it("does not delete an expired row whose notice failed to record", () => {
+  it("leaves a row whose notice failed to record while deleting other expired rows", () => {
     const s = newDb();
     bank(s, "m1", "ses_pull", 1_000);
-    expect(() =>
-      s.pullInbox.sweepExpired(1_000 + 8 * 24 * 3_600_000, () => {
-        throw new Error("alerts table unavailable");
-      }),
-    ).toThrow();
-    expect(s.db.prepare("SELECT COUNT(*) AS n FROM pull_inbox").get()).toEqual({ n: 1 });
+    bank(s, "m2", "ses_pull", 1_000);
+    const deleted = s.pullInbox.sweepExpired(1_000 + 8 * 24 * 3_600_000, (row) => {
+      if (row.msgId === "m1") throw new Error("alerts table unavailable");
+    });
+    expect(deleted.map((r) => r.msgId)).toEqual(["m2"]);
+    const remaining = s.db.prepare("SELECT msg_id FROM pull_inbox").all() as Array<{ msg_id: string }>;
+    expect(remaining.map((r) => r.msg_id)).toEqual(["m1"]);
   });
 
   it("carries the sender id, replied-to bot text, and partial quote", () => {
@@ -264,5 +265,151 @@ describe("PullInboxRepository", () => {
     s.pullInbox.ack("ses_pull", ["acked"], 1_200);
     expect(s.pullInbox.cleanupAcked(2_000)).toBe(1);
     expect(s.pullInbox.pendingCount("ses_pull", 2_000)).toBe(1);
+  });
+
+  it("banks a swarm row with kind and replyTo", () => {
+    const s = newDb();
+    expect(
+      s.pullInbox.bank(
+        {
+          msgId: "sw1",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "swarm payload",
+          senderId: "ses_peer",
+          kind: "chat",
+          replyTo: "orig_msg_1",
+        },
+        1_000,
+      ),
+    ).toBe(true);
+    const claimed = s.pullInbox.claim("ses_pull", 2_000);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.source).toBe("swarm");
+    expect(claimed[0]!.kind).toBe("chat");
+    expect(claimed[0]!.replyTo).toBe("orig_msg_1");
+    expect(claimed[0]!.senderId).toBe("ses_peer");
+  });
+
+  it("claims telegram-reply rows before swarm rows regardless of created_at, then created_at, msg_id", () => {
+    const s = newDb();
+    // Swarm message banked earlier
+    s.pullInbox.bank(
+      { msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" },
+      1_000,
+    );
+    // Telegram-reply message banked later
+    s.pullInbox.bank(
+      { msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg1" },
+      2_000,
+    );
+    // Second telegram-reply banked between them
+    s.pullInbox.bank(
+      { msgId: "t0", sessionId: "ses_pull", source: "telegram-reply", payload: "tg0" },
+      1_500,
+    );
+    // Second swarm banked earliest
+    s.pullInbox.bank(
+      { msgId: "s0", sessionId: "ses_pull", source: "swarm", payload: "sw0" },
+      500,
+    );
+
+    const claimed = s.pullInbox.claim("ses_pull", 3_000, 10);
+    expect(claimed.map((r) => r.msgId)).toEqual(["t0", "t1", "s0", "s1"]);
+
+    // Limit=1 claim: telegram-reply is claimed, peer swarm chatter never crowds it out
+    const s2 = newDb();
+    s2.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw" }, 1_000);
+    s2.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 2_000);
+    const top1 = s2.pullInbox.claim("ses_pull", 3_000, 1);
+    expect(top1.map((r) => r.msgId)).toEqual(["t1"]);
+  });
+
+  it("pendingCounts reports total and counts by source, always having both keys", () => {
+    const s = newDb();
+    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 1_000);
+    s.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" }, 1_000);
+    s.pullInbox.bank({ msgId: "s2", sessionId: "ses_pull", source: "swarm", payload: "sw2" }, 1_000);
+
+    const counts = s.pullInbox.pendingCounts("ses_pull", 2_000);
+    expect(counts.total).toBe(3);
+    expect(counts.bySource).toEqual({
+      "telegram-reply": 1,
+      swarm: 2,
+    });
+
+    const emptyCounts = s.pullInbox.pendingCounts("ses_none", 2_000);
+    expect(emptyCounts.total).toBe(0);
+    expect(emptyCounts.bySource).toEqual({
+      "telegram-reply": 0,
+      swarm: 0,
+    });
+  });
+
+  it("filters out swarm rows from claim, pendingCounts, and pendingCount when includeSwarm is false", () => {
+    const s = newDb();
+    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 1_000);
+    s.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" }, 1_000);
+    s.pullInbox.bank({ msgId: "s2", sessionId: "ses_pull", source: "swarm", payload: "sw2" }, 1_000);
+
+    // Default includeSwarm is true
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000)).toBe(3);
+    expect(s.pullInbox.pendingCounts("ses_pull", 2_000).total).toBe(3);
+    expect(s.pullInbox.pendingCounts("ses_pull", 2_000).bySource).toEqual({
+      "telegram-reply": 1,
+      swarm: 2,
+    });
+
+    // includeSwarm: false
+    expect(s.pullInbox.pendingCount("ses_pull", 2_000, { includeSwarm: false })).toBe(1);
+    const filteredCounts = s.pullInbox.pendingCounts("ses_pull", 2_000, { includeSwarm: false });
+    expect(filteredCounts.total).toBe(1);
+    expect(filteredCounts.bySource).toEqual({
+      "telegram-reply": 1,
+      swarm: 0,
+    });
+
+    // claim with includeSwarm: false
+    const claimedWithoutSwarm = s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: false });
+    expect(claimedWithoutSwarm.map((r) => r.msgId)).toEqual(["t1"]);
+
+    // Ack the claimed telegram row
+    s.pullInbox.ack("ses_pull", ["t1"], 2_000);
+
+    // Subsequent claim with includeSwarm: true (or default) claims the held swarm rows
+    const claimedWithSwarm = s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: true });
+    expect(claimedWithSwarm.map((r) => r.msgId)).toEqual(["s1", "s2"]);
+  });
+
+  it("migrates existing pull_inbox table by adding kind and reply_to columns", () => {
+    const raw = openStorageDb(":memory:");
+    raw.db.exec("DROP TABLE pull_inbox");
+    raw.db.exec(`CREATE TABLE pull_inbox (
+      msg_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, source TEXT NOT NULL,
+      payload TEXT NOT NULL, sender_id TEXT, in_reply_to TEXT, in_reply_to_quote TEXT,
+      chat_id TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+      claimed_at INTEGER, claim_count INTEGER NOT NULL DEFAULT 0, acked_at INTEGER,
+      unacked_alerted_at INTEGER)`);
+    raw.db.exec(`INSERT INTO pull_inbox (msg_id, session_id, source, payload, created_at, expires_at)
+      VALUES ('existing', 'ses_pull', 'telegram-reply', 'text', 1000, 99999999)`);
+    initPullInboxSchema(raw.db);
+    expect(
+      raw.pullInbox.bank(
+        {
+          msgId: "migrated_swarm",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "payload",
+          kind: "chat",
+          replyTo: "m_prev",
+        },
+        1_000,
+      ),
+    ).toBe(true);
+    const claimed = raw.pullInbox.claim("ses_pull", 2_000);
+    const swarmRow = claimed.find((r) => r.msgId === "migrated_swarm");
+    expect(swarmRow?.kind).toBe("chat");
+    expect(swarmRow?.replyTo).toBe("m_prev");
+    raw.db.close();
   });
 });

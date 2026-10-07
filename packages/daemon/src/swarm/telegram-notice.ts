@@ -9,9 +9,20 @@ import {
 import { splitTelegramMessage } from "../split-message";
 import { shouldEmitAncillaryFor } from "../ancillary-gate";
 
+export interface SwarmNoticeTarget {
+  msgId: string;
+  fromSession: string;
+  toSession: string | null;
+  kind: string;
+  priority: string;
+  payload: string;
+  createdAt: number;
+  deliverAt?: number | null;
+}
+
 export function enqueueSwarmTelegramNotice(
   storage: StorageDb,
-  record: SwarmMessageRecord,
+  record: SwarmNoticeTarget,
   now: number,
 ): void {
   try {

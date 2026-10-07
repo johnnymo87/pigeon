@@ -12,7 +12,7 @@ import {
   NUDGE_KIND,
 } from "./delivery-policy";
 import { makeMsgId } from "../ids";
-import { enqueueSwarmTelegramNotice } from "./telegram-notice";
+import { bankOrInsertSwarmMessage } from "./bank-or-insert";
 
 export { isWakeKind, isSuppressedFromRecovery };
 
@@ -1765,7 +1765,8 @@ export class DeliveryWatchdog {
     }
 
     const nudgeMsgId = makeMsgId();
-    const inserted = this.storage.swarm.insert(
+    const result = bankOrInsertSwarmMessage(
+      this.storage,
       {
         msgId: nudgeMsgId,
         fromSession: "pigeon",
@@ -1778,9 +1779,13 @@ export class DeliveryWatchdog {
       },
       now,
     );
-    if (inserted) {
-      const record = this.storage.swarm.getByMsgId(nudgeMsgId);
-      if (record) enqueueSwarmTelegramNotice(this.storage, record, now);
+    if (result.status === "refused") {
+      this.log("nudge-refused", {
+        msgId: row.msgId,
+        sessionId,
+        error: result.error,
+      });
+      return false;
     }
     counts.nudged++;
     this.log("nudged", {

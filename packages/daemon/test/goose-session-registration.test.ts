@@ -209,6 +209,28 @@ describe("registerGooseSession", () => {
     expect(storage.sessions.get("gse_fixed")?.backendSessionId).toBe("20260920_1");
   });
 
+  it("preserves pull_sources when re-registering an existing session", () => {
+    storage = openStorageDb(":memory:");
+    registerGooseSession(
+      storage.sessions,
+      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      1_000,
+      () => "gse_fixed",
+    );
+    storage.sessions.setPullSources("gse_fixed", ["swarm"]);
+    expect(storage.sessions.get("gse_fixed")?.pullSources).toEqual(["swarm"]);
+
+    // Re-registering through registerGooseSession (e.g. restart or reconnect)
+    registerGooseSession(
+      storage.sessions,
+      { backendSessionId: "20260920_1", endpoint: "ws://b/acp" },
+      2_000,
+      () => "gse_ignored",
+    );
+
+    expect(storage.sessions.get("gse_fixed")?.pullSources).toEqual(["swarm"]);
+  });
+
   it("does not match a pigeon id against the backend-id column", () => {
     storage = openStorageDb(":memory:");
     registerGooseSession(
