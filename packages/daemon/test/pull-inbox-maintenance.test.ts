@@ -85,6 +85,39 @@ describe("pull inbox maintenance", () => {
     expect(rows[0]!.ref_msg_id).toBe("pull-unacked:m1");
   });
 
+  it("uses conditional wording for unacked alert: held swarm row vs active row", () => {
+    const s = newDb();
+    // 1. Active telegram-reply row
+    s.pullInbox.bank(
+      { msgId: "m_active", sessionId: "ses_pull", source: "telegram-reply", payload: "active" },
+      1_000,
+    );
+    s.pullInbox.claim("ses_pull", 2_000);
+
+    // 2. Swarm row on an opted-out session (held)
+    // In newDb(), ses_pull default pullSources is ["telegram-reply"] (not opted into swarm)
+    s.pullInbox.bank(
+      { msgId: "m_held", sessionId: "ses_pull", source: "swarm", payload: "held" },
+      1_000,
+    );
+    // Claimed earlier (e.g. before opt-out)
+    s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: true });
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 2_000 + PULL_UNACKED_ALERT_MS + 1 });
+    const rows = alerts(s);
+    expect(rows).toHaveLength(2);
+
+    const activeAlert = rows.find((r) => r.ref_msg_id === "pull-unacked:m_active")!;
+    expect(activeAlert.text).toContain(
+      "It will be re-served on the next drain, but something is failing between collection and use.",
+    );
+
+    const heldAlert = rows.find((r) => r.ref_msg_id === "pull-unacked:m_held")!;
+    expect(heldAlert.text).toContain(
+      "It is held because the session no longer accepts swarm messages, and will be served if it opts back in or expire, but something is failing between collection and use.",
+    );
+  });
+
   // Durability, not politeness. Every dedupe set in the delivery watchdog is
   // in-memory, so a permanently stuck row re-alerts on each daemon restart -- and
   // a permanently stuck row is exactly the population that survives restarts.

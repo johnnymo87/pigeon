@@ -105,7 +105,13 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
 
   const threshold = deps.unackedThresholdMs ?? PULL_UNACKED_ALERT_MS;
   for (const row of storage.pullInbox.listUnackedForAlert(now, threshold)) {
-    const label = storage.sessions.get(row.sessionId)?.label ?? row.sessionId;
+    const session = storage.sessions.get(row.sessionId);
+    const label = session?.label ?? row.sessionId;
+    const isHeldSwarm =
+      row.source === "swarm" && (!session || !session.pullSources.includes("swarm"));
+    const drainSentence = isHeldSwarm
+      ? "It is held because the session no longer accepts swarm messages, and will be served if it opts back in or expire"
+      : "It will be re-served on the next drain";
     storage.alerts.enqueue({
       source: "pull-inbox-unacked",
       refMsgId: `pull-unacked:${row.msgId}`,
@@ -114,7 +120,7 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
       text:
         `${label} collected a banked message but never confirmed it reached the ` +
         `agent (claimed ${Math.round((now - (row.claimedAt ?? now)) / 60_000)} min ago, ` +
-        `${row.claimCount} attempt(s)). It will be re-served on the next drain, ` +
+        `${row.claimCount} attempt(s)). ${drainSentence}, ` +
         `but something is failing between collection and use.\n\n` +
         `${row.source}: ${excerpt(row.payload)}`,
     });
