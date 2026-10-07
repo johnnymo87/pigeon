@@ -80,6 +80,42 @@ export function formatFailureNotice(
 }
 
 /**
+ * Failure notice formatter for banked pull messages that expired unread.
+ *
+ * For pull sessions, pigeon has no transcript observation, only whether
+ * the message was collected by /pull/drain and whether it was acknowledged.
+ */
+export function formatPullFailureNotice(
+  msgId: string,
+  target: string,
+  reason: string,
+  claimCount: number,
+): string {
+  if (claimCount === 0) {
+    return (
+      `DELIVERY FAILED: your swarm message ${msgId} to ${target} ` +
+      `was never collected and was NOT received. Reason: ${reason}. ` +
+      `Nothing reached the target, so it is safe to resend.`
+    );
+  }
+  return (
+    `DELIVERY UNCONFIRMED: your swarm message ${msgId} to ${target} ` +
+    `was handed to the target ${claimCount} time(s) but it never confirmed receiving it, and it has now expired. ` +
+    `Reason: ${reason}. It may or may not have been acted on. ` +
+    `Resend only if a duplicate would be harmless; otherwise reach the target another way.`
+  );
+}
+
+export interface FailedNoticeTarget {
+  msgId: string;
+  fromSession: string;
+  toSession?: string | null;
+  channel?: string | null;
+  kind?: string;
+  handedOffAt?: number | null;
+}
+
+/**
  * Enqueue a system notification back to the original sender when their
  * message could not be delivered (terminal failure). The sender's only
  * prior signal was the optimistic ack at send time, so without this a
@@ -90,10 +126,11 @@ export function formatFailureNotice(
  */
 export function notifySenderOfFailure(
   storage: StorageDb,
-  failed: SwarmMessageRecord,
+  failed: FailedNoticeTarget,
   reason: string,
   now: number,
   evidence: DeliveryEvidence = "unobserved",
+  customPayload?: string,
 ): void {
   // Loop guard: a failed delivery.failed notification must not spawn another.
   if (failed.kind === DELIVERY_FAILED_KIND) return;
@@ -103,7 +140,14 @@ export function notifySenderOfFailure(
   if (!/^ses_[A-Za-z0-9_-]+$/.test(failed.fromSession)) return;
 
   const target = failed.toSession ?? failed.channel ?? "(unknown target)";
-  const payload = formatFailureNotice(failed, target, reason, evidence);
+  const payload =
+    customPayload ??
+    formatFailureNotice(
+      { msgId: failed.msgId, handedOffAt: failed.handedOffAt ?? null },
+      target,
+      reason,
+      evidence,
+    );
   const msgId = makeMsgId();
   const result = bankOrInsertSwarmMessage(
     storage,

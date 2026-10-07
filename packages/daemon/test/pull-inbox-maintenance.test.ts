@@ -152,9 +152,12 @@ describe("pull inbox maintenance", () => {
     expect(notice!.kind).toBe("delivery.failed");
     expect(notice!.fromSession).toBe("pigeon");
     expect(notice!.replyTo).toBe("m_sw_never");
-    expect(notice!.payload).toContain("never delivered");
-    expect(notice!.payload).toContain("NOT received");
-    expect(notice!.payload).toContain("safe to resend");
+    expect(notice!.payload).toBe(
+      "DELIVERY FAILED: your swarm message m_sw_never to ses_pull was never collected and was NOT received. " +
+      "Reason: expired in pull inbox without being collected. " +
+      "Nothing reached the target, so it is safe to resend.",
+    );
+    expect(notice!.payload).not.toContain("transcript");
   });
 
   it("notifies ses_ sender of expired unconfirmed swarm message with 'unconfirmed' wording and no human alert", () => {
@@ -189,8 +192,12 @@ describe("pull inbox maintenance", () => {
     const notice = s.swarm.getByMsgId(row!.msg_id);
     expect(notice).not.toBeNull();
     expect(notice!.kind).toBe("delivery.failed");
-    expect(notice!.payload).toContain("unconfirmed");
-    expect(notice!.payload).toContain("Do NOT resend");
+    expect(notice!.payload).toBe(
+      "DELIVERY UNCONFIRMED: your swarm message m_sw_claimed to ses_pull was handed to the target 1 time(s) but it never confirmed receiving it, and it has now expired. " +
+      "Reason: expired in pull inbox after 1 unconfirmed collection attempt(s). " +
+      "It may or may not have been acted on. Resend only if a duplicate would be harmless; otherwise reach the target another way.",
+    );
+    expect(notice!.payload).not.toContain("transcript");
   });
 
   it("does not notify sender and does not alert human when sender is pigeon or non-ses_", () => {

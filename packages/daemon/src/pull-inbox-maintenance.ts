@@ -2,12 +2,9 @@ import type { StorageDb } from "./storage/database";
 import { PULL_UNACKED_ALERT_MS } from "./storage/pull-inbox-repo";
 import { clampPreservingSurrogates } from "./text";
 import {
-  DELIVERY_FAILED_KIND,
-  formatFailureNotice,
-  type DeliveryEvidence,
+  formatPullFailureNotice,
+  notifySenderOfFailure,
 } from "./swarm/notify-sender";
-import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
-import { makeMsgId } from "./ids";
 
 /** How long an acked row is kept before reaping. Forensics only; nothing reads it. */
 export const PULL_ACKED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -60,45 +57,33 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
 
   storage.pullInbox.sweepExpired(now, (row) => {
     if (row.source === "swarm") {
-      // Loop guards: notify only real ses_ senders and never reply to a delivery.failed message.
-      // Senders that are "pigeon" or non-ses_ are logged only with no notice and no human alert.
-      const isSesSender = Boolean(row.senderId && /^ses_[A-Za-z0-9_-]+$/.test(row.senderId));
-      const isDeliveryFailed = row.kind === DELIVERY_FAILED_KIND;
-
-      if (isSesSender && !isDeliveryFailed) {
-        // Honest evidence wording:
-        // never collected => evidence "absent" ("never delivered and was NOT received ... safe to resend")
-        // collected but unconfirmed => evidence "present" ("unconfirmed ... Do NOT resend")
-        const evidence: DeliveryEvidence = row.claimCount > 0 ? "present" : "absent";
-        const reason =
-          row.claimCount === 0
-            ? "expired in pull inbox without being collected"
-            : `expired in pull inbox after ${row.claimCount} unconfirmed collection attempt(s)`;
-        const payload = formatFailureNotice(
-          { msgId: row.msgId, handedOffAt: row.claimedAt },
-          row.sessionId,
-          reason,
-          evidence,
-        );
-        const noticeMsgId = makeMsgId();
-        const result = bankOrInsertSwarmMessage(
-          storage,
-          {
-            msgId: noticeMsgId,
-            fromSession: "pigeon",
-            toSession: row.senderId!,
-            channel: null,
-            kind: DELIVERY_FAILED_KIND,
-            priority: "normal",
-            replyTo: row.msgId,
-            payload,
-          },
-          now,
-        );
-        if (result.status === "refused") {
-          log(`expired swarm notice refused for ${row.senderId}: ${result.error}`);
-        }
-      }
+      // For pull clients, pigeon has no transcript observation, only whether
+      // the message was collected by /pull/drain and whether it was acknowledged.
+      const reason =
+        row.claimCount === 0
+          ? "expired in pull inbox without being collected"
+          : `expired in pull inbox after ${row.claimCount} unconfirmed collection attempt(s)`;
+      const payload = formatPullFailureNotice(
+        row.msgId,
+        row.sessionId,
+        reason,
+        row.claimCount,
+      );
+      // Notice routing handles loop guards, ses_ checks, and banks if the sender
+      // is itself an opted-in pull session. Human alert is skipped for swarm rows.
+      notifySenderOfFailure(
+        storage,
+        {
+          msgId: row.msgId,
+          fromSession: row.senderId ?? "",
+          toSession: row.sessionId,
+          kind: row.kind ?? undefined,
+        },
+        reason,
+        now,
+        "unobserved",
+        payload,
+      );
       log(`expired unread msg=${row.msgId} session=${row.sessionId}`);
       return;
     }
