@@ -29,6 +29,9 @@ import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { WorkerResult } from "./worker/poller";
 
+const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
+const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
+
 interface LegacySession {
   session_id: string;
   ppid: number | null;
@@ -877,15 +880,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (body.pull_sources !== undefined) {
           if (!Array.isArray(body.pull_sources)) {
             return Response.json(
-              { error: "pull_sources must be an array of: telegram-reply, swarm" },
+              { error: INVALID_PULL_SOURCES_ERROR },
               { status: 400 },
             );
           }
-          const allowed = new Set<string>(ALLOWED_PULL_SOURCES);
           for (const item of body.pull_sources) {
-            if (typeof item !== "string" || !allowed.has(item)) {
+            if (typeof item !== "string" || !ALLOWED_PULL_SOURCES_SET.has(item)) {
               return Response.json(
-                { error: "pull_sources must be an array of: telegram-reply, swarm" },
+                { error: INVALID_PULL_SOURCES_ERROR },
                 { status: 400 },
               );
             }

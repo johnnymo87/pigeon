@@ -456,6 +456,32 @@ describe("storage schema and repositories", () => {
       storage.db.close();
     });
 
+    it("handles malformed JSON, non-array, non-string, or unknown elements in pull_sources column without throwing", () => {
+      const storage = createStorage();
+      storage.sessions.upsert({
+        sessionId: "sess-corrupt",
+        cwd: "/tmp",
+        notify: true,
+      });
+
+      // 1. Malformed JSON string
+      storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run("{not-json", "sess-corrupt");
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+
+      // 2. Non-array JSON (e.g. object or number)
+      storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run(JSON.stringify({ not: "array" }), "sess-corrupt");
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+
+      storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run("123", "sess-corrupt");
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+
+      // 3. Array with non-string and unknown elements filters to only allowed strings
+      storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run(JSON.stringify([123, "invalid", "swarm", null]), "sess-corrupt");
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["swarm"]);
+
+      storage.db.close();
+    });
+
     it("pullSources survives non-session-start upsert paths", () => {
       const storage = createStorage();
       storage.sessions.upsert({

@@ -17,9 +17,11 @@ import type {
   StorePendingQuestionInput,
   UpsertSessionInput,
 } from "./types";
-import { DEFAULT_PULL_SOURCES } from "./types";
+import { ALLOWED_PULL_SOURCES, DEFAULT_PULL_SOURCES } from "./types";
 
 type SqlRow = Record<string, unknown>;
+
+const allowedSources = new Set<string>(ALLOWED_PULL_SOURCES);
 
 function parsePullSources(value: unknown): string[] {
   if (value === null || value === undefined) {
@@ -29,7 +31,8 @@ function parsePullSources(value: unknown): string[] {
     try {
       const parsed = JSON.parse(value);
       if (Array.isArray(parsed)) {
-        return parsed.map(String);
+        // Fails closed to known allowed values so corrupt or stale stored entries cannot read as opted-in.
+        return parsed.filter((elem): elem is string => typeof elem === "string" && allowedSources.has(elem));
       }
     } catch {
       return [...DEFAULT_PULL_SOURCES];
