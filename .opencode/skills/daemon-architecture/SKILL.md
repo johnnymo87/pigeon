@@ -28,7 +28,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `POST /stop`
 - `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question
-- `POST /swarm/send` -- enqueue a cross-session swarm message. If target is an opted-in pull session (`pull_sources` contains `"swarm"`), banks in `pull_inbox`, bypasses arbiter, and returns 202 with `banked: true`. Refuses with 413 if payload > 4000 code points. Otherwise writes to `swarm_messages` and returns 202 with `msg_id` for background `SwarmArbiter` delivery. See `swarm-architecture` skill.
+- `POST /swarm/send` -- enqueue a cross-session swarm message. Banking and the 413 payload limit apply only to an opted-in pull target (`pull_sources` contains `"swarm"`): banks in `pull_inbox` (refusing with 413 if payload > 4000 code points), bypasses arbiter, and returns 202 with `banked: true`. Otherwise writes to `swarm_messages` and returns 202 with `msg_id` for background `SwarmArbiter` delivery. See `swarm-architecture` skill.
 - `POST /swarm/schedule` -- schedule a swarm message for future delivery. Refuses with 409 if target is an opted-in pull session (pull sessions have no delivery clock).
 - `POST /pull/drain` -- claim and drain unread messages for a pull session. Messages returned ordered `telegram-reply` before `swarm`, then `created_at`, `msg_id`. Each message includes `kind` and `reply_to` (`null` for telegram rows).
 - `POST /pull/ack` -- acknowledge claimed message IDs from `pull_inbox`.

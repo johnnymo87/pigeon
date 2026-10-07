@@ -1,11 +1,11 @@
 import type BetterSqlite3 from "better-sqlite3";
 
 /**
- * Where a banked message came from. One value today: question cards are not
- * offered to pull sessions (a pending question captures every plain message to
- * its session, and nothing drains a question for a pull client), so a plain
- * Telegram reply is the only way in. Kept as a column so a second source is a
- * value, not a migration.
+ * Where a banked message came from: plain Telegram replies (via goose-pull
+ * adapter) and swarm messages (via bank-or-insert.ts for opted-in sessions).
+ * Question cards are not offered to pull sessions (a pending question captures
+ * every plain message to its session, and nothing drains a question for a pull
+ * client).
  */
 export type PullInboxSource = "telegram-reply" | "swarm";
 
