@@ -912,7 +912,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         let pullSourcesToSet: string[] | null = null;
-        if (body.pull_sources !== undefined) {
+        if (body.pull_sources !== undefined && body.pull_sources !== null) {
           if (!Array.isArray(body.pull_sources)) {
             return Response.json(
               { error: INVALID_PULL_SOURCES_ERROR },

@@ -399,11 +399,40 @@ describe("pull routes", () => {
       expect(rawRow.pull_sources).toBeNull();
     });
 
+    it("treats pull_sources: null as absent (resets to default), not 400", async () => {
+      const { app, storage: s } = newApp();
+      // Fresh session with pull_sources: null
+      const res1 = await post(app, "/session-start", {
+        session_id: "ses_null_fresh",
+        pull_sources: null,
+      });
+      expect(res1.status).toBe(200);
+      expect(s.sessions.get("ses_null_fresh")!.pullSources).toEqual(["telegram-reply"]);
+      const raw1 = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_null_fresh") as { pull_sources: string | null };
+      expect(raw1.pull_sources).toBeNull();
+
+      // Existing session with pull_sources: ["swarm"] reset via pull_sources: null
+      await post(app, "/session-start", {
+        session_id: "ses_null_reset",
+        pull_sources: ["swarm"],
+      });
+      expect(s.sessions.get("ses_null_reset")!.pullSources).toEqual(["swarm"]);
+
+      const res2 = await post(app, "/session-start", {
+        session_id: "ses_null_reset",
+        pull_sources: null,
+      });
+      expect(res2.status).toBe(200);
+      expect(s.sessions.get("ses_null_reset")!.pullSources).toEqual(["telegram-reply"]);
+      const raw2 = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_null_reset") as { pull_sources: string | null };
+      expect(raw2.pull_sources).toBeNull();
+    });
+
     it("validates BEFORE any write and returns 400 for invalid pull_sources", async () => {
       const { app, storage: s } = newApp();
 
       // Non-array values
-      for (const invalid of ["swarm", 123, null, {}]) {
+      for (const invalid of ["swarm", 123, {}]) {
         const res = await post(app, "/session-start", {
           session_id: "ses_new_invalid",
           pull_sources: invalid,
