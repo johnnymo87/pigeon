@@ -124,4 +124,157 @@ describe("pull inbox maintenance", () => {
     ).not.toThrow();
     expect(alerts(s)).toHaveLength(1);
   });
+
+  it("notifies ses_ sender of expired unread swarm message with 'never delivered' wording and no human alert", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_never",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task",
+        senderId: "ses_sender_peer",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    // NO human alert
+    expect(alerts(s)).toEqual([]);
+
+    // Sender was notified via delivery.failed swarm message
+    const row = s.db.prepare("SELECT msg_id FROM swarm_messages WHERE to_session = 'ses_sender_peer'").get() as { msg_id: string } | undefined;
+    expect(row).toBeDefined();
+    const notice = s.swarm.getByMsgId(row!.msg_id);
+    expect(notice).not.toBeNull();
+    expect(notice!.kind).toBe("delivery.failed");
+    expect(notice!.fromSession).toBe("pigeon");
+    expect(notice!.replyTo).toBe("m_sw_never");
+    expect(notice!.payload).toContain("never delivered");
+    expect(notice!.payload).toContain("NOT received");
+    expect(notice!.payload).toContain("safe to resend");
+  });
+
+  it("notifies ses_ sender of expired unconfirmed swarm message with 'unconfirmed' wording and no human alert", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_claimed",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task 2",
+        senderId: "ses_sender_peer",
+        kind: "chat",
+      },
+      1_000,
+    );
+    // Claim it so claimCount > 0
+    s.pullInbox.claim("ses_pull", 2_000);
+
+    // Use unackedThresholdMs larger than elapsed time so unacked alert does not fire
+    runPullInboxMaintenance({
+      storage: s,
+      nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1,
+      unackedThresholdMs: 10 * DEFAULT_PULL_TTL_MS,
+    });
+
+    // NO human alert
+    expect(alerts(s)).toEqual([]);
+
+    // Sender was notified with unconfirmed wording
+    const row = s.db.prepare("SELECT msg_id FROM swarm_messages WHERE to_session = 'ses_sender_peer'").get() as { msg_id: string } | undefined;
+    expect(row).toBeDefined();
+    const notice = s.swarm.getByMsgId(row!.msg_id);
+    expect(notice).not.toBeNull();
+    expect(notice!.kind).toBe("delivery.failed");
+    expect(notice!.payload).toContain("unconfirmed");
+    expect(notice!.payload).toContain("Do NOT resend");
+  });
+
+  it("does not notify sender and does not alert human when sender is pigeon or non-ses_", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_from_pigeon",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "pigeon text",
+        senderId: "pigeon",
+        kind: "chat",
+      },
+      1_000,
+    );
+    s.pullInbox.bank(
+      {
+        msgId: "m_from_non_ses",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "other text",
+        senderId: "coordinator-1",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    expect(alerts(s)).toEqual([]);
+    const noticeRows = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE from_session = 'pigeon'").get() as { n: number };
+    expect(noticeRows.n).toBe(0);
+  });
+
+  it("does not notify sender and does not alert human when kind is delivery.failed", () => {
+    const s = newDb();
+    s.pullInbox.bank(
+      {
+        msgId: "m_failed_loop",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "failed notice",
+        senderId: "ses_sender_peer",
+        kind: "delivery.failed",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    expect(alerts(s)).toEqual([]);
+    const noticeRows = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE from_session = 'pigeon'").get() as { n: number };
+    expect(noticeRows.n).toBe(0);
+  });
+
+  it("banks delivery.failed when the expired message sender is itself an opted-in pull session", () => {
+    const s = newDb();
+    s.sessions.upsert({
+      sessionId: "ses_sender_pull",
+      backendKind: "goose-pull",
+      notify: true,
+    });
+    s.sessions.setPullSources("ses_sender_pull", ["swarm"]);
+
+    s.pullInbox.bank(
+      {
+        msgId: "m_sw_from_pull",
+        sessionId: "ses_pull",
+        source: "swarm",
+        payload: "swarm task from pull",
+        senderId: "ses_sender_pull",
+        kind: "chat",
+      },
+      1_000,
+    );
+
+    runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
+
+    // Banked for ses_sender_pull in pull_inbox
+    const claimed = s.pullInbox.claim("ses_sender_pull", 2_000 + DEFAULT_PULL_TTL_MS);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.source).toBe("swarm");
+    expect(claimed[0]!.kind).toBe("delivery.failed");
+    expect(claimed[0]!.senderId).toBe("pigeon");
+    expect(claimed[0]!.replyTo).toBe("m_sw_from_pull");
+  });
 });
