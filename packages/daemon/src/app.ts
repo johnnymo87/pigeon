@@ -191,8 +191,8 @@ export function parseSwarmSendBody(
 
   // Reserve 'pigeon' as a sender id: pigeon is the daemon's own sender id for
   // system notices (e.g. delivery.failed); a client given the shared token
-  // must not be able to forge one.
-  if (from === "pigeon") {
+  // must not be able to forge one. Reject any variation in whitespace or case.
+  if (from.trim().toLowerCase() === "pigeon") {
     return {
       ok: false,
       response: Response.json(

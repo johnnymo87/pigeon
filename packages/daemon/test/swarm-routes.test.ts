@@ -162,6 +162,24 @@ describe("POST /swarm/send", () => {
     const scheduleBody = (await schedule.json()) as { error: string };
     expect(scheduleBody.error).toContain("pigeon");
     expect(scheduleBody.error).toContain("reserved");
+
+    for (const disguised of [" pigeon", "PIGEON", "pigeon\n"]) {
+      const sendDisguised = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: disguised,
+            to: "ses_b",
+            payload: "fake notice",
+          }),
+        }),
+      );
+      expect(sendDisguised.status).toBe(400);
+      const body = (await sendDisguised.json()) as { error: string };
+      expect(body.error).toContain("pigeon");
+      expect(body.error).toContain("reserved");
+    }
   });
 
   it("still accepts an ordinary caller-supplied msg_id", async () => {
