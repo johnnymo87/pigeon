@@ -840,6 +840,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             sender_id: m.senderId,
             in_reply_to: m.inReplyTo,
             in_reply_to_quote: m.inReplyToQuote ?? null,
+            kind: m.kind,
+            reply_to: m.replyTo,
             created_at: m.createdAt,
             claim_count: m.claimCount,
             // A row claimed before but never acked. The client may already have
@@ -876,12 +878,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // 200 with a flag, not 404. This is the cheap poll a wake gate runs; a
         // caller that treated an unknown session as an error would be waking on
         // the daemon's opinion of registration rather than on there being mail.
+        const counts = session
+          ? storage.pullInbox.pendingCounts(sessionId, nowFn())
+          : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
         return Response.json({
           ok: true,
           session_id: sessionId,
           session_known: Boolean(session),
           backend_kind: session?.backendKind ?? null,
-          pending: session ? storage.pullInbox.pendingCount(sessionId, nowFn()) : 0,
+          pending: counts.total,
+          by_source: counts.bySource,
         });
       }
 

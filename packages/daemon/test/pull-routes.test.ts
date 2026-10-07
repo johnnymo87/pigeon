@@ -169,6 +169,61 @@ describe("pull routes", () => {
 
       expect(body.messages[1]!.in_reply_to_quote).toBeNull();
     });
+
+    it("returns kind and reply_to (null for telegram rows, values for swarm rows)", async () => {
+      const { app, storage: s } = newApp();
+      bank(s, "tg1", 2_000);
+      s.pullInbox.bank(
+        {
+          msgId: "sw1",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "swarm text",
+          senderId: "ses_peer",
+          kind: "chat",
+          replyTo: "orig_1",
+        },
+        2_100,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          source: string;
+          kind: string | null;
+          reply_to: string | null;
+        }>;
+      };
+
+      const tgMsg = body.messages.find((m) => m.msg_id === "tg1")!;
+      expect(tgMsg.source).toBe("telegram-reply");
+      expect(tgMsg.kind).toBeNull();
+      expect(tgMsg.reply_to).toBeNull();
+
+      const swMsg = body.messages.find((m) => m.msg_id === "sw1")!;
+      expect(swMsg.source).toBe("swarm");
+      expect(swMsg.kind).toBe("chat");
+      expect(swMsg.reply_to).toBe("orig_1");
+    });
+
+    it("claims telegram-reply rows before swarm rows under limit", async () => {
+      const { app, storage: s } = newApp();
+      // swarm arrived earlier
+      s.pullInbox.bank(
+        { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "swarm early" },
+        1_000,
+      );
+      // telegram reply arrived later
+      bank(s, "tg1", 2_000);
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull", limit: 1 });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { messages: Array<{ msg_id: string }> };
+      expect(body.messages).toHaveLength(1);
+      expect(body.messages[0]!.msg_id).toBe("tg1");
+    });
   });
 
   describe("POST /pull/ack", () => {
@@ -223,7 +278,7 @@ describe("pull routes", () => {
   });
 
   describe("GET /pull/pending", () => {
-    it("reports the unread count for a registered pull session", async () => {
+    it("reports the unread count and by_source breakdown for a registered pull session", async () => {
       const { app, storage: s } = newApp();
       bank(s, "m1", 2_000);
       const res = await app(new Request("http://localhost/pull/pending?session=ses_pull"));
@@ -234,6 +289,28 @@ describe("pull routes", () => {
         session_known: true,
         backend_kind: PULL_BACKEND_KIND,
         pending: 1,
+        by_source: {
+          "telegram-reply": 1,
+          swarm: 0,
+        },
+      });
+    });
+
+    it("reports by_source breakdown with both telegram-reply and swarm keys", async () => {
+      const { app, storage: s } = newApp();
+      bank(s, "tg1", 2_000);
+      s.pullInbox.bank(
+        { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "sw" },
+        2_100,
+      );
+
+      const res = await app(new Request("http://localhost/pull/pending?session=ses_pull"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pending: number; by_source: Record<string, number> };
+      expect(body.pending).toBe(2);
+      expect(body.by_source).toEqual({
+        "telegram-reply": 1,
+        swarm: 1,
       });
     });
 
@@ -241,11 +318,18 @@ describe("pull routes", () => {
     // wake gate would run, and a caller that treats "unknown session" as an
     // error would wake on the daemon's opinion of registration rather than on
     // there being mail.
-    it("reports an unknown session as known=false with a zero count", async () => {
+    it("reports an unknown session as known=false with a zero count and zero by_source", async () => {
       const { app } = newApp();
       const res = await app(new Request("http://localhost/pull/pending?session=ses_ghost"));
       expect(res.status).toBe(200);
-      expect(await res.json()).toMatchObject({ session_known: false, pending: 0 });
+      expect(await res.json()).toMatchObject({
+        session_known: false,
+        pending: 0,
+        by_source: {
+          "telegram-reply": 0,
+          swarm: 0,
+        },
+      });
     });
 
     it("400s without a session", async () => {
