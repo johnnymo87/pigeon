@@ -114,7 +114,7 @@ describe("pull inbox maintenance", () => {
 
     const heldAlert = rows.find((r) => r.ref_msg_id === "pull-unacked:m_held")!;
     expect(heldAlert.text).toContain(
-      "It is held because the session no longer accepts swarm messages, and will be served if it opts back in or expire, but something is failing between collection and use.",
+      "It is held because the session no longer accepts swarm messages, and will be served if it opts back in, or will expire unread, but something is failing between collection and use.",
     );
   });
 

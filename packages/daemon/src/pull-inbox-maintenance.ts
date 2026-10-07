@@ -110,7 +110,7 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
     const isHeldSwarm =
       row.source === "swarm" && (!session || !session.pullSources.includes("swarm"));
     const drainSentence = isHeldSwarm
-      ? "It is held because the session no longer accepts swarm messages, and will be served if it opts back in or expire"
+      ? "It is held because the session no longer accepts swarm messages, and will be served if it opts back in, or will expire unread"
       : "It will be re-served on the next drain";
     storage.alerts.enqueue({
       source: "pull-inbox-unacked",
