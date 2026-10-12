@@ -32,17 +32,21 @@
  *    as soon as a turn starts, so a second message can STEER the running turn
  *    without first provoking a busy rejection.
  *  - pigeon sends goose no cancel, so this module has no cancellation path.
- *  - A turn does NOT survive its WebSocket closing. The 1.48.0 note here used to
- *    say it did; re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
+ *  - A turn does NOT survive its WebSocket closing against bare goose.
+ *    Re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
  *    also honk docs/spike/m0-findings.md T5), goose cancels every run a
  *    connection started the moment that connection closes -- a blip, the
  *    watchdog's own close(), or this daemon exiting. Nothing the turn had done
  *    yet (not even a started tool call) is recorded in the history; only the
- *    user's message is. So every notice below says "cancelled", never "it
- *    will finish on goose's side".
+ *    user's message is. So every notice for bare goose says "cancelled", never
+ *    "it will finish on goose's side".
+ *  - Through honkd (isHonk true), turns survive a client disconnect. On WS drop
+ *    mid-turn, pigeon reconnects once and resends the prompt with the same
+ *    client_req_id, which honkd attaches to the in-flight turn or returns the
+ *    stored reply.
  *  - A fresh connection can prompt an EXISTING session id and still has its
  *    history, so reconnecting is cheap and a daemon restart does not orphan a
- *    SESSION -- only the turn that was in flight.
+ *    SESSION -- only the turn that was in flight (on bare goose).
  */
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
@@ -56,7 +60,14 @@ import { DisconnectedDuringTurn } from "./acp-client.js";
  * run when it does -- the earlier text promised the turn "will finish on its
  * side", which sent the human off to wait for work that had been cancelled.
  */
-export function gooseShutdownNotice(sessionId: string): string {
+export function gooseShutdownNotice(sessionId: string, isHonk = false): string {
+  if (isHonk) {
+    return (
+      `pigeon is restarting while a goose turn was running on ${sessionId}. `
+      + "The connection to honkd was closed, but the turn may still be running in honkd. "
+      + `${HONK_RESUME_ADVICE} (Once pigeon is back.)`
+    );
+  }
   return (
     `pigeon is restarting while a goose turn was running on ${sessionId}. `
     + "goose cancels a turn when its connection closes, so that turn was cancelled and will not finish. "
@@ -73,20 +84,37 @@ export function gooseShutdownNotice(sessionId: string): string {
  * started -- so a reply re-runs the task from the start, blind to whatever it
  * had already pushed or posted. That is where duplicates come from.
  */
-const RESUME_ADVICE =
-  "Your message is still in the session's history with no reply, and nothing was resent. "
-  + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
-  + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
-  + "or it may do it again.";
+function resumeAdvice(resent = false): string {
+  const resendClause = resent ? "one resend was attempted" : "nothing was resent";
+  return (
+    `Your message is still in the session's history with no reply, and ${resendClause}. `
+    + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
+    + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
+    + "or it may do it again."
+  );
+}
+
+function honkResumeAdvice(resent = false): string {
+  const resendClause = resent ? "one resend was attempted" : "nothing was resent";
+  return (
+    `Your message is still in the session's history with no reply, and ${resendClause}. `
+    + "The turn may have finished in goose's history; the reply just wasn't collected."
+  );
+}
+
+const RESUME_ADVICE = resumeAdvice(false);
+const HONK_RESUME_ADVICE = honkResumeAdvice(false);
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
   connect(): Promise<void>;
   /** True once the socket has closed, so the runner knows to reconnect. */
   isClosed(): boolean;
+  /** True when connected to honkd. Bare goose is false. */
+  readonly isHonk?: boolean;
   /** Round-trips a cheap request; never settles on a dead socket. */
   ping(): Promise<void>;
-  prompt(sessionId: string, text: string): Promise<unknown>;
+  prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
   close(): void;
@@ -119,6 +147,16 @@ export interface GooseSessionRunnerOptions {
   maxTranscriptBytes?: number;
   /** Silence after which a turn is presumed dead. Defaults to 30 minutes. */
   turnIdleTimeoutMs?: number;
+  /** Inactivity period after which an idle socket is closed. Defaults to 10 minutes. 0 disables. */
+  idleSocketTimeoutMs?: number;
+  /** Total time budget for retrying reconnection to honkd. Defaults to 2 minutes (~120s). */
+  honkReconnectBudgetMs?: number;
+  /** Initial delay before retrying connect to honkd. Defaults to 250ms. */
+  honkReconnectInitialDelayMs?: number;
+  /** Max delay between reconnect attempts. Defaults to 5s. */
+  honkReconnectMaxDelayMs?: number;
+  /** Optional injectable sleep function for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface Turn {
@@ -148,9 +186,19 @@ interface Turn {
    */
   abandoned: boolean;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
+  resent?: boolean;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
+const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+
+const BUSY_NOT_DELIVERED_TEXT =
+  "goose was already running a turn and pigeon could not add this message to it. "
+  + "It was NOT delivered -- please send it again once the current turn finishes.";
+
+const DEFAULT_HONK_RECONNECT_BUDGET_MS = 120_000;
+const DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS = 250;
+const DEFAULT_HONK_RECONNECT_MAX_DELAY_MS = 5_000;
 
 /**
  * How long a turn may emit NOTHING before pigeon stops believing in it.
@@ -172,6 +220,15 @@ const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
  * the same kind and arrives immediately.
  */
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * How long a connected socket may sit without a turn in flight before closing.
+ *
+ * honkd keeps sessions in memory while an attached viewer socket remains open,
+ * so leaving connections open indefinitely exhausts honkd's session limit.
+ * Pigeon reconnects lazily on the next turn via ensureConnected().
+ */
+const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Deadline for every await on the delivery path that is NOT the turn itself.
@@ -210,9 +267,21 @@ export class GooseSessionRunner {
   private lastSettled: Promise<void> = Promise.resolve();
   private connected = false;
   private connecting: Promise<void> | undefined;
+  private idleSocketTimer: ReturnType<typeof setTimeout> | undefined;
+  private sleepTimer: ReturnType<typeof setTimeout> | undefined;
+  private sleepResolve: (() => void) | undefined;
+  private closed = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  get isHonk(): boolean {
+    return Boolean(this.opts.client.isHonk);
   }
 
   /**
@@ -266,6 +335,8 @@ export class GooseSessionRunner {
    * redelivery then cannot duplicate a prompt.
    */
   async deliver(commandId: string, text: string): Promise<DeliverOutcome> {
+    this.clearIdleSocketTimer();
+
     // Redelivery of the command that started the turn we are already running.
     // The poller redelivers whenever an ack fails; without this the human's
     // message goes into goose twice.
@@ -351,6 +422,7 @@ export class GooseSessionRunner {
    * That is what makes "throw means nothing was sent" true for callers.
    */
   private startTurn(commandId: string, text: string): DeliverOutcome {
+    this.clearIdleSocketTimer();
     const turn: Turn = {
       commandId,
       startedAt: Date.now(),
@@ -366,20 +438,140 @@ export class GooseSessionRunner {
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
-    this.lastSettled = turn.settled = this.opts.client
-      .prompt(this.backendSessionId, text)
-      .then(
-        (outcome) => this.onPromptOutcome(turn, text, outcome),
-        (err: unknown) => this.finishTurn(turn, undefined, err),
-      )
-      .catch((err: unknown) => {
-        // finishTurn is written not to throw. If it somehow does, this is the
-        // difference between a logged anomaly and a dead daemon.
-        this.log("goose runner: turn continuation threw", {
-          sessionId: this.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    this.lastSettled = turn.settled = (async () => {
+      try {
+        const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+        await this.onPromptOutcome(turn, text, outcome);
+      } catch (err) {
+        if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          if (this.closed || turn.abandoned) {
+            await this.finishTurn(turn, undefined, err);
+            return;
+          }
+          if (turn.idleTimer) {
+            clearTimeout(turn.idleTimer);
+            turn.idleTimer = undefined;
+          }
+          this.log("honk disconnect mid-turn, retrying reconnect and resend with backoff", {
+            sessionId: this.sessionId,
+            commandId,
+          });
+
+          const budgetMs = this.opts.honkReconnectBudgetMs ?? DEFAULT_HONK_RECONNECT_BUDGET_MS;
+          const deadline = Date.now() + budgetMs;
+          let delay = this.opts.honkReconnectInitialDelayMs ?? DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS;
+          const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
+
+          while (Date.now() < deadline) {
+            if (this.closed || turn.abandoned) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+            try {
+              await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+            } catch (connectErr) {
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) break;
+              const waitTime = Math.min(delay, maxDelay, remaining);
+              delay = Math.min(delay * 2, maxDelay);
+              this.log("honk reconnect attempt failed, backing off", {
+                sessionId: this.sessionId,
+                commandId,
+                delay: waitTime,
+                error: connectErr instanceof Error ? connectErr.message : String(connectErr),
+              });
+              await this.sleep(waitTime);
+              continue;
+            }
+
+            if (this.closed || turn.abandoned) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+
+            if (!this.opts.client.isHonk) {
+              this.log("reconnected endpoint is not honkd, not resending prompt", {
+                sessionId: this.sessionId,
+                commandId,
+              });
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+
+            turn.lastActivityAt = Date.now();
+            this.armIdleTimer(turn);
+            turn.resent = true;
+
+            try {
+              const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              await this.onPromptOutcome(turn, text, outcome);
+              return;
+            } catch (resendErr) {
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              if (resendErr instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+                if (turn.idleTimer) {
+                  clearTimeout(turn.idleTimer);
+                  turn.idleTimer = undefined;
+                }
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) break;
+                const waitTime = Math.min(delay, maxDelay, remaining);
+                delay = Math.min(delay * 2, maxDelay);
+                this.log("honk resend disconnected, backing off and retrying reconnect", {
+                  sessionId: this.sessionId,
+                  commandId,
+                  delay: waitTime,
+                });
+                await this.sleep(waitTime);
+                continue;
+              }
+              this.log("honk resend failed with non-disconnect error", {
+                sessionId: this.sessionId,
+                commandId,
+                error: resendErr instanceof Error ? resendErr.message : String(resendErr),
+              });
+              await this.finishTurn(turn, undefined, resendErr);
+              return;
+            }
+          }
+
+          this.log("honk reconnect budget exhausted, reporting lost contact", {
+            sessionId: this.sessionId,
+            commandId,
+            budgetMs,
+          });
+          await this.finishTurn(
+            turn,
+            undefined,
+            new Error("lost contact with honkd; the turn may still be running and its reply was not collected"),
+          );
+          return;
+        }
+        await this.finishTurn(turn, undefined, err);
+      } finally {
+        if (this.opts.client.isHonk && !this.turn && this.connected && !this.opts.client.isClosed() && !this.closed) {
+          this.armIdleSocketTimer();
+        }
+      }
+    })().catch((err: unknown) => {
+      // finishTurn is written not to throw. If it somehow does, this is the
+      // difference between a logged anomaly and a dead daemon.
+      this.log("goose runner: turn continuation threw", {
+        sessionId: this.sessionId,
+        error: err instanceof Error ? err.message : String(err),
       });
+    });
 
     return { ok: true, meta: { mode: "prompt", commandId } };
   }
@@ -408,6 +600,18 @@ export class GooseSessionRunner {
     const kind = (outcome as { kind?: string } | undefined)?.kind;
     if (kind === "busy") {
       const runId = (outcome as { runId?: string }).runId;
+      if (turn.resent) {
+        this.log("honkd rejected the resend as busy, reporting message not delivered", {
+          sessionId: this.sessionId,
+          runId,
+        });
+        await this.finishTurn(
+          turn,
+          undefined,
+          new Error(BUSY_NOT_DELIVERED_TEXT),
+        );
+        return;
+      }
       this.log("goose rejected the prompt as busy; steering the live turn instead", {
         sessionId: this.sessionId,
         runId,
@@ -440,14 +644,11 @@ export class GooseSessionRunner {
       await this.finishTurn(
         turn,
         undefined,
-        new Error(
-          "goose was already running a turn and pigeon could not add this message to it. "
-            + "It was NOT delivered -- please send it again once the current turn finishes.",
-        ),
+        new Error(BUSY_NOT_DELIVERED_TEXT),
       );
       return;
     }
-    await this.finishTurn(turn, outcome as { stopReason?: string }, undefined);
+    await this.finishTurn(turn, outcome as { stopReason?: string; text?: string }, undefined);
   }
 
   /** Feeds a `session/update` frame in. Must not throw: called from a socket callback. */
@@ -483,6 +684,9 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
+    if (this.opts.client.isHonk && this.connected && !this.opts.client.isClosed() && !this.closed) {
+      this.armIdleSocketTimer();
+    }
   }
 
   /**
@@ -494,6 +698,7 @@ export class GooseSessionRunner {
    * which is why there is no lifecycle to tear down anywhere else.
    */
   private armIdleTimer(turn: Turn): void {
+    if (this.closed) return;
     const timeout = this.opts.turnIdleTimeoutMs ?? DEFAULT_TURN_IDLE_TIMEOUT_MS;
     if (turn.idleTimer) clearTimeout(turn.idleTimer);
     turn.idleTimer = setTimeout(() => {
@@ -569,7 +774,15 @@ export class GooseSessionRunner {
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
     if (turn.abandoned || this.turn !== turn) return;
     turn.abandoned = true;
+    this.connected = false;
+    this.cancelSleep();
+    try {
+      this.opts.client.close();
+    } catch {
+      /* best effort */
+    }
     this.clearTurn();
+    this.clearIdleSocketTimer();
 
     this.log("goose runner: abandoning a stalled turn", {
       sessionId: this.sessionId,
@@ -577,29 +790,19 @@ export class GooseSessionRunner {
       reason,
     });
 
-    // Drop the socket so the next delivery reconnects onto a live one. Safe to
-    // do before reporting: the transport callbacks are fenced on identity, so
-    // this socket's eventual close cannot disturb the connection that replaces it.
-    try {
-      this.opts.client.close();
-    } catch {
-      /* best effort */
-    }
-    this.connected = false;
-
     try {
       const partial = turn.text.join("");
+      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdvice(turn.resent)}`;
+      const bareDetail =
+        "goose cancels a turn once it sees its connection close, so do not wait for this one: "
+        + `no result is coming here. ${resumeAdvice(turn.resent)}`;
       await this.opts.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,
         message:
           (partial === "" ? "" : `${partial}\n\n`)
           + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
-          // "once it sees" rather than "has": this path runs because the socket
-          // stopped answering, possibly half-open, so goose may not have
-          // noticed the close yet. Either way no result is coming HERE.
-          + "goose cancels a turn once it sees its connection close, so do not wait for this one: "
-          + `no result is coming here. ${RESUME_ADVICE}`,
+          + (this.opts.client.isHonk ? honkDetail : bareDetail),
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
@@ -616,7 +819,7 @@ export class GooseSessionRunner {
    */
   private async finishTurn(
     turn: Turn,
-    receipt: { stopReason?: string } | undefined,
+    receipt: { stopReason?: string; text?: string; honkReason?: string } | undefined,
     err: unknown,
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
@@ -649,21 +852,46 @@ export class GooseSessionRunner {
       const stopReason = receipt?.stopReason;
       const failed = err !== undefined || (stopReason !== undefined && stopReason !== "end_turn");
 
-      let message = turn.text.join("");
-      if (turn.truncated) {
-        message += "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+      const cap = this.opts.maxTranscriptBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
+      let message: string;
+      if (typeof receipt?.text === "string") {
+        if (receipt.text.length > cap) {
+          let sliceEnd = cap;
+          const c = receipt.text.charCodeAt(sliceEnd - 1);
+          if (c >= 0xd800 && c <= 0xdbff) {
+            sliceEnd = cap - 1;
+          }
+          message = receipt.text.slice(0, sliceEnd) + TRUNCATION_NOTICE;
+        } else {
+          message = receipt.text;
+        }
+      } else {
+        message = turn.text.join("");
+        if (turn.truncated) {
+          message += TRUNCATION_NOTICE;
+        }
       }
       if (err instanceof DisconnectedDuringTurn) {
         // Said in the human's terms rather than as the raw error, because the
         // one thing they need to know -- that they should NOT wait for this
         // turn -- is otherwise buried after a close code and a run id.
+        const advice = resumeAdvice(turn.resent);
         const detail =
           "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
-          + `closes, so this turn was cancelled and will not finish. ${RESUME_ADVICE}`
+          + `closes, so this turn was cancelled and will not finish. ${advice}`
           + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "not_delivered") {
+        const detail = "The message was not delivered; please send it again.";
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "upstream_restart") {
+        const detail = "goose restarted and the turn was cancelled.";
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "delivery_unknown") {
+        const detail = "honkd could not confirm goose received this message; check the session before resending.";
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (message === "") {
         // A turn that ends with no assistant text is a real outcome (a pure tool
@@ -701,6 +929,9 @@ export class GooseSessionRunner {
   }
 
   private async ensureConnected(): Promise<void> {
+    if (this.closed) {
+      throw new Error("goose runner is closed");
+    }
     // A socket that closed under us leaves `connected` true, and sending into a
     // closed WebSocket is a SILENT no-op -- so without this the first blip would
     // wedge the session permanently (and, via an unanswerable steer, freeze
@@ -718,6 +949,14 @@ export class GooseSessionRunner {
     if (!this.connecting) {
       this.connecting = withDeadline(this.opts.client.connect(), NON_TURN_TIMEOUT_MS, "handshake")
         .then(() => {
+          if (this.closed) {
+            try {
+              this.opts.client.close();
+            } catch {
+              /* best effort */
+            }
+            throw new Error("goose runner is closed");
+          }
           this.connected = true;
         })
         .catch((err: unknown) => {
@@ -738,7 +977,77 @@ export class GooseSessionRunner {
     await this.connecting;
   }
 
+  private armIdleSocketTimer(): void {
+    if (!this.opts.client.isHonk || this.closed) return;
+    const timeout = this.opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
+    if (timeout <= 0) return;
+    this.clearIdleSocketTimer();
+    this.idleSocketTimer = setTimeout(() => {
+      if (!this.turn && this.connected && !this.closed && this.opts.client.isHonk) {
+        this.log("goose runner: closing idle socket after inactivity", {
+          sessionId: this.sessionId,
+        });
+        this.closeSocket();
+      }
+    }, timeout);
+    this.idleSocketTimer.unref?.();
+  }
+
+  private clearIdleSocketTimer(): void {
+    if (this.idleSocketTimer) {
+      clearTimeout(this.idleSocketTimer);
+      this.idleSocketTimer = undefined;
+    }
+  }
+
+  private closeSocket(): void {
+    this.clearIdleSocketTimer();
+    this.connected = false;
+    try {
+      this.opts.client.close();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    if (this.closed) return;
+    if (this.opts.sleep) {
+      await new Promise<void>((resolve, reject) => {
+        this.sleepResolve = resolve;
+        this.opts.sleep!(ms).then(resolve, reject);
+      }).finally(() => {
+        this.sleepResolve = undefined;
+      });
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.sleepResolve = resolve;
+      this.sleepTimer = setTimeout(() => {
+        this.sleepTimer = undefined;
+        this.sleepResolve = undefined;
+        resolve();
+      }, ms);
+      this.sleepTimer.unref?.();
+    });
+  }
+
+  private cancelSleep(): void {
+    if (this.sleepTimer) {
+      clearTimeout(this.sleepTimer);
+      this.sleepTimer = undefined;
+    }
+    if (this.sleepResolve) {
+      const resolve = this.sleepResolve;
+      this.sleepResolve = undefined;
+      resolve();
+    }
+  }
+
   close(): void {
+    this.closed = true;
+    this.cancelSleep();
+    this.clearIdleSocketTimer();
     // The timer is unref'd, so it cannot hold the process open -- but a runner
     // dropped from the registry should not leave one running against a turn
     // nobody is listening for either.
