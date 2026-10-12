@@ -182,10 +182,8 @@ describe("honkd live integration with real pigeon client", () => {
 
         // Settles well before the 10s sleep
         expect(elapsed).toBeLessThan(7000);
-        expect(stopReports).toHaveLength(1);
-        expect(stopReports[0]!.event).toBe("Error");
-        expect(stopReports[0]!.error_kind).toBe("goose-stop-cancelled");
-        expect(String(stopReports[0]!.message)).not.toContain("LIVE_TEST_HONKD_CANCEL_FAILED");
+        // Turn cancel requested ends turn without posting stop notification (/kill reply covers it)
+        expect(stopReports).toHaveLength(0);
       } finally {
         runner.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
@@ -212,6 +210,7 @@ describe("honkd live integration with real pigeon client", () => {
       await clientA.connect();
       expect(clientA.isHonk).toBe(true);
       const backendSid = await clientA.newSession(tmpdir);
+      let clientB: GooseAcpClient | undefined;
 
       try {
         const start = Date.now();
@@ -224,7 +223,7 @@ describe("honkd live integration with real pigeon client", () => {
         await new Promise((r) => setTimeout(r, 1500));
 
         // Client B connects on a separate socket, sends cancel, and closes immediately
-        const clientB = new GooseAcpClient({
+        clientB = new GooseAcpClient({
           url: HONKD_URL!,
           transportFactory: webSocketTransport(HONKD_TOKEN!),
         });
@@ -242,6 +241,7 @@ describe("honkd live integration with real pigeon client", () => {
         expect(receipt.stopReason).toBe("cancelled");
         expect(elapsed).toBeLessThan(7000);
       } finally {
+        clientB?.close();
         clientA.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
       }
@@ -268,6 +268,8 @@ describe("honkd live integration with real pigeon client", () => {
       await client1.connect();
       expect(client1.isHonk).toBe(true);
       const backendSid = await client1.newSession(tmpdir);
+      let freshRunner: GooseSessionRunner | undefined;
+      let freshClient: GooseAcpClient | undefined;
 
       try {
         const start = Date.now();
@@ -280,11 +282,11 @@ describe("honkd live integration with real pigeon client", () => {
         await new Promise((r) => setTimeout(r, 1500));
 
         // Simulate after-restart: a fresh runner with a fresh client that has NEVER connected
-        const freshClient = new GooseAcpClient({
+        freshClient = new GooseAcpClient({
           url: HONKD_URL!,
           transportFactory: webSocketTransport(HONKD_TOKEN!),
         });
-        const freshRunner = new GooseSessionRunner({
+        freshRunner = new GooseSessionRunner({
           session: {
             sessionId: `sess-restart-${Date.now()}`,
             backendKind: "goose",
@@ -308,6 +310,8 @@ describe("honkd live integration with real pigeon client", () => {
         expect(receipt.stopReason).toBe("cancelled");
         expect(elapsed).toBeLessThan(7000);
       } finally {
+        freshRunner?.close();
+        freshClient?.close();
         client1.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
       }

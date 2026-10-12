@@ -85,10 +85,10 @@ export function gooseControlVerdict(
       return {
         kind: "refuse",
         reply:
-          "goose has no interrupt in pigeon: pigeon cannot stop a turn that has started. "
+          "/interrupt cannot stop a turn that has started. "
           + "Sending a message now steers the running turn instead — the model "
           + "decides whether to change course, so it is not a stop. /kill asks goose to "
-          + "cancel the turn and closes the session.",
+          + "cancel the turn and stops pigeon tracking the session.",
       };
     case "compact":
       return {

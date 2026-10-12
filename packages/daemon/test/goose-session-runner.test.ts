@@ -1794,7 +1794,7 @@ describe("GooseSessionRunner liveness probing", () => {
     });
 
     it("cancels during honk reconnect backoff: wakes sleep, sends cancel, and sends NO resend prompt", async () => {
-      const { runner, client } = makeRunner({
+      const { runner, client, stops } = makeRunner({
         honkReconnectBudgetMs: 30_000,
         honkReconnectInitialDelayMs: 5_000,
       });
@@ -1842,8 +1842,9 @@ describe("GooseSessionRunner liveness probing", () => {
       // Await turn settled
       await runner.settled();
 
-      // Verify: NO second session/prompt was sent!
+      // Verify: NO second session/prompt was sent and NO stop notification posted!
       expect(client.prompts).toEqual(["initial-prompt"]);
+      expect(stops).toHaveLength(0);
     });
 
     it("cancel() when client already closed: attempts reconnect; if reconnect fails returns 'failed'", async () => {

@@ -188,6 +188,7 @@ interface Turn {
   abandoned: boolean;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
   resent?: boolean;
+  cancelRequested?: boolean;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
@@ -279,7 +280,6 @@ export class GooseSessionRunner {
   private sleepTimer: ReturnType<typeof setTimeout> | undefined;
   private sleepResolve: (() => void) | undefined;
   private closed = false;
-  private cancelRequested = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
@@ -457,7 +457,7 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
-          if (this.closed || turn.abandoned || this.cancelRequested) {
+          if (this.closed || turn.abandoned || turn.cancelRequested) {
             await this.finishTurn(turn, undefined, err);
             return;
           }
@@ -476,14 +476,14 @@ export class GooseSessionRunner {
           const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
 
           while (Date.now() < deadline) {
-            if (this.closed || turn.abandoned || this.cancelRequested) {
+            if (this.closed || turn.abandoned || turn.cancelRequested) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
             try {
               await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
             } catch (connectErr) {
-              if (this.closed || turn.abandoned || this.cancelRequested) {
+              if (this.closed || turn.abandoned || turn.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
@@ -501,7 +501,7 @@ export class GooseSessionRunner {
               continue;
             }
 
-            if (this.closed || turn.abandoned || this.cancelRequested) {
+            if (this.closed || turn.abandoned || turn.cancelRequested) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
@@ -519,21 +519,21 @@ export class GooseSessionRunner {
             this.armIdleTimer(turn);
             turn.resent = true;
 
-            if (this.closed || turn.abandoned || this.cancelRequested) {
+            if (this.closed || turn.abandoned || turn.cancelRequested) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
 
             try {
               const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
-              if (this.closed || turn.abandoned || this.cancelRequested) {
+              if (this.closed || turn.abandoned || turn.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
               await this.onPromptOutcome(turn, text, outcome);
               return;
             } catch (resendErr) {
-              if (this.closed || turn.abandoned || this.cancelRequested) {
+              if (this.closed || turn.abandoned || turn.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
@@ -842,6 +842,14 @@ export class GooseSessionRunner {
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
 
+    if (turn.cancelRequested) {
+      this.log("goose runner: turn cancel was requested; skipping stop notification", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      return;
+    }
+
     // A turn the watchdog already gave up on, settling late. The two cases mean
     // opposite things and are treated as such.
     if (turn.abandoned) {
@@ -1086,7 +1094,9 @@ export class GooseSessionRunner {
    * Leaves socket closing to close() / registry.drop().
    */
   async cancel(): Promise<"sent" | "no-connection" | "failed"> {
-    this.cancelRequested = true;
+    if (this.turn) {
+      this.turn.cancelRequested = true;
+    }
     this.cancelSleep();
 
     if (this.connected && !this.opts.client.isClosed() && !this.closed) {

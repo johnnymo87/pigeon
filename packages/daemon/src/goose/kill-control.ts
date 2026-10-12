@@ -18,6 +18,8 @@ export interface GooseKillDeps {
   reply: (text: string) => Promise<unknown>;
 }
 
+export type KillOutcome = "sent" | "no-connection" | "failed" | "no-runner";
+
 /**
  * Chooses the /kill notice based on runner cancel outcome and whether the
  * endpoint is honkd or bare goose.
@@ -26,13 +28,21 @@ export interface GooseKillDeps {
  * honk + "failed": Honest "may still be running there", plus cancel could not be sent.
  * bare + "sent": Pigeon sent goose a cancel and dropped the connection (any running turn is cancelled).
  * bare + "no-connection" / "failed": Closing connection cancels any running turn on goose (today's bare wording).
+ * no-runner: When no runner exists (e.g. absent session record), cautious wording (turn may still be running).
  * isHonk unknown + "failed": Cautious wording, the turn may still be running.
  */
 export function pickKillReply(
-  outcome: "sent" | "no-connection" | "failed",
+  outcome: KillOutcome,
   isHonk: boolean | undefined,
   isHonkKnown: boolean | undefined,
 ): string {
+  if (outcome === "no-runner") {
+    return (
+      "Session closed. Could not send cancel; the turn may still be running; "
+      + "pigeon has stopped tracking the session."
+    );
+  }
+
   if (isHonk) {
     if (outcome === "sent") {
       return (
@@ -77,7 +87,7 @@ export function pickKillReply(
  */
 export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): Promise<void> {
   const session = deps.storage.sessions.get(sessionId);
-  let outcome: "sent" | "no-connection" | "failed" = "no-connection";
+  let outcome: KillOutcome = "no-runner";
   let runner: GooseSessionRunner | undefined;
   if (session && deps.gooseRunners) {
     try {

@@ -51,6 +51,13 @@ describe("pickKillReply", () => {
     expect(text).toContain("Could not send cancel; the turn may still be running;");
     expect(text).toContain("pigeon has stopped tracking the session.");
   });
+
+  it("no-runner: uses cautious wording that turn may still be running", () => {
+    const text = pickKillReply("no-runner", undefined, undefined);
+    expect(text).toBe(
+      "Session closed. Could not send cancel; the turn may still be running; pigeon has stopped tracking the session.",
+    );
+  });
 });
 
 describe("executeGooseKill", () => {
@@ -223,7 +230,7 @@ describe("executeGooseKill", () => {
     expect(events).toContain("assignments.delete:unknown_sess");
     expect(events).toContain("poller.unregisterSession:unknown_sess");
     expect(deps.reply).toHaveBeenCalledWith(
-      "Session closed. That dropped pigeon's connection to goose, which cancels any turn that was running; pigeon has stopped tracking the session.",
+      "Session closed. Could not send cancel; the turn may still be running; pigeon has stopped tracking the session.",
     );
   });
 
