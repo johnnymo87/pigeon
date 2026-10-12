@@ -84,11 +84,14 @@ export type SteerOutcome = GooseSteered | GooseNoActiveRun;
 /**
  * The socket dropped while a turn was outstanding (hazard R1).
  *
- * goose cancels the run when the connection closes (see fact 4 above), so the
- * turn is over and will never produce a receipt. The prompt stays in goose's
- * session history unanswered, which is why nothing resends it: "send it
- * again" and "say continue" are both defensible, and only the human knows
- * which they want.
+ * Against bare goose, goose cancels the run when the connection closes (see
+ * fact 4 above), so the turn is over and will never produce a receipt. The prompt
+ * stays in goose's session history unanswered, which is why bare goose does not
+ * resend it: "send it again" and "say continue" are both defensible, and only
+ * the human knows which they want.
+ *
+ * Connected through honkd (`client.isHonk`), turns survive a disconnect;
+ * GooseSessionRunner reconnects once and resends with the same clientReqId.
  */
 export class DisconnectedDuringTurn extends Error {
   readonly sessionId: string;

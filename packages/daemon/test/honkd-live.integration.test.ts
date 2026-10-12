@@ -55,8 +55,8 @@ describe("honkd live integration with real pigeon client", () => {
         const receipt = outcome as GooseReceipt;
         expect(receipt.stopReason).toBe("end_turn");
 
-        const effectiveText = receipt.text ?? accumulatedText.join("");
-        expect(effectiveText).toContain("PIGEON_OK");
+        expect(receipt.text).toBeDefined();
+        expect(receipt.text).toContain("PIGEON_OK");
       } finally {
         client.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
