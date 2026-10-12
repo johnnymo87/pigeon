@@ -192,6 +192,10 @@ interface Turn {
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
 
+const BUSY_NOT_DELIVERED_TEXT =
+  "goose was already running a turn and pigeon could not add this message to it. "
+  + "It was NOT delivered -- please send it again once the current turn finishes.";
+
 const DEFAULT_HONK_RECONNECT_BUDGET_MS = 120_000;
 const DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_HONK_RECONNECT_MAX_DELAY_MS = 5_000;
@@ -597,14 +601,14 @@ export class GooseSessionRunner {
     if (kind === "busy") {
       const runId = (outcome as { runId?: string }).runId;
       if (turn.resent) {
-        this.log("honkd rejected the resend as busy, reporting honkd lost track of request", {
+        this.log("honkd rejected the resend as busy, reporting message not delivered", {
           sessionId: this.sessionId,
           runId,
         });
         await this.finishTurn(
           turn,
           undefined,
-          new Error("honkd lost track of the request"),
+          new Error(BUSY_NOT_DELIVERED_TEXT),
         );
         return;
       }
@@ -640,10 +644,7 @@ export class GooseSessionRunner {
       await this.finishTurn(
         turn,
         undefined,
-        new Error(
-          "goose was already running a turn and pigeon could not add this message to it. "
-            + "It was NOT delivered -- please send it again once the current turn finishes.",
-        ),
+        new Error(BUSY_NOT_DELIVERED_TEXT),
       );
       return;
     }

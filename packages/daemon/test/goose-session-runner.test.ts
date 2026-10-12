@@ -1135,7 +1135,8 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(stops).toHaveLength(1);
       expect(stops[0]!.event).toBe("Error");
       expect(stops[0]!.error_kind).toBe("goose-turn-failed");
-      expect(stops[0]!.message).toContain("honkd lost track of the request");
+      expect(stops[0]!.message).toContain("was NOT delivered -- please send it again once the current turn finishes");
+      expect(stops[0]!.message).not.toContain("honkd lost track of the request");
       expect(runner.isBusy()).toBe(false);
     });
 
