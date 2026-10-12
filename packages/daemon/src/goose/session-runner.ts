@@ -125,6 +125,8 @@ export interface GooseSessionRunnerOptions {
   maxTranscriptBytes?: number;
   /** Silence after which a turn is presumed dead. Defaults to 30 minutes. */
   turnIdleTimeoutMs?: number;
+  /** Inactivity period after which an idle socket is closed. Defaults to 10 minutes. 0 disables. */
+  idleSocketTimeoutMs?: number;
 }
 
 interface Turn {
@@ -180,6 +182,15 @@ const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
+ * How long a connected socket may sit without a turn in flight before closing.
+ *
+ * honkd keeps sessions in memory while an attached viewer socket remains open,
+ * so leaving connections open indefinitely exhausts honkd's session limit.
+ * Pigeon reconnects lazily on the next turn via ensureConnected().
+ */
+const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
  * Deadline for every await on the delivery path that is NOT the turn itself.
  *
  * The contract in adapters/types.ts requires it: "Bound every await inside
@@ -216,6 +227,7 @@ export class GooseSessionRunner {
   private lastSettled: Promise<void> = Promise.resolve();
   private connected = false;
   private connecting: Promise<void> | undefined;
+  private idleSocketTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
@@ -272,6 +284,8 @@ export class GooseSessionRunner {
    * redelivery then cannot duplicate a prompt.
    */
   async deliver(commandId: string, text: string): Promise<DeliverOutcome> {
+    this.clearIdleSocketTimer();
+
     // Redelivery of the command that started the turn we are already running.
     // The poller redelivers whenever an ack fails; without this the human's
     // message goes into goose twice.
@@ -514,6 +528,9 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
+    if (this.connected) {
+      this.armIdleSocketTimer();
+    }
   }
 
   /**
@@ -599,6 +616,7 @@ export class GooseSessionRunner {
    */
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
     if (turn.abandoned || this.turn !== turn) return;
+    this.clearIdleSocketTimer();
     turn.abandoned = true;
     this.clearTurn();
 
@@ -767,9 +785,45 @@ export class GooseSessionRunner {
         });
     }
     await this.connecting;
+    if (!this.turn && this.connected) {
+      this.armIdleSocketTimer();
+    }
+  }
+
+  private armIdleSocketTimer(): void {
+    const timeout = this.opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
+    if (timeout <= 0) return;
+    this.clearIdleSocketTimer();
+    this.idleSocketTimer = setTimeout(() => {
+      if (!this.turn && this.connected) {
+        this.log("goose runner: closing idle socket after inactivity", {
+          sessionId: this.sessionId,
+        });
+        this.closeSocket();
+      }
+    }, timeout);
+    this.idleSocketTimer.unref?.();
+  }
+
+  private clearIdleSocketTimer(): void {
+    if (this.idleSocketTimer) {
+      clearTimeout(this.idleSocketTimer);
+      this.idleSocketTimer = undefined;
+    }
+  }
+
+  private closeSocket(): void {
+    this.clearIdleSocketTimer();
+    this.connected = false;
+    try {
+      this.opts.client.close();
+    } catch {
+      /* best effort */
+    }
   }
 
   close(): void {
+    this.clearIdleSocketTimer();
     // The timer is unref'd, so it cannot hold the process open -- but a runner
     // dropped from the registry should not leave one running against a turn
     // nobody is listening for either.

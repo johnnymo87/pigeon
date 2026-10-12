@@ -953,4 +953,64 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
   });
+
+  describe("idle socket close", () => {
+    it("closes the socket after being idle for idleSocketTimeoutMs", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        await runner.deliver("c1", "hello");
+        client.finishTurn();
+        await runner.settled();
+
+        expect(client.closed).toBe(false);
+
+        // Advance past idle socket timeout
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(client.closed).toBe(true);
+
+        // Next deliver reconnects cleanly
+        await runner.deliver("c2", "world");
+        expect(client.connectCalls).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("resets the idle socket timer when a new turn starts before timeout", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        await runner.deliver("c1", "first");
+        client.finishTurn();
+        await runner.settled();
+
+        // Advance halfway
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(client.closed).toBe(false);
+
+        // Deliver second turn
+        await runner.deliver("c2", "second");
+        expect(client.closed).toBe(false);
+
+        // Advance 40s (70s total since first turn, but second turn is active)
+        await vi.advanceTimersByTimeAsync(40_000);
+        expect(client.closed).toBe(false);
+
+        // Finish second turn
+        client.finishTurn();
+        await runner.settled();
+
+        // 30s after second turn: still not closed
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(client.closed).toBe(false);
+
+        // 60s after second turn: closed
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(client.closed).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });
