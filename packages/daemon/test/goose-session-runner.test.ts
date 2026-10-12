@@ -953,6 +953,86 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("throws on deliver when runner is closed and does not connect", async () => {
+      const { runner, client } = makeRunner();
+      runner.close();
+      expect(runner.isClosed).toBe(true);
+      await expect(runner.deliver("c1", "hello")).rejects.toThrow(/closed/i);
+      expect(client.connectCalls).toBe(0);
+    });
+
+    it("bails on reconnect and resend when runner is closed mid-reconnect, reporting turn as cancelled", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect with connectImpl held pending
+      let finishConnect: () => void = () => {};
+      client.connectImpl = () =>
+        new Promise<void>((resolve) => {
+          finishConnect = () => {
+            client.connected = true;
+            client.closed = false;
+            resolve();
+          };
+        });
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Runner is closed while reconnect is in flight
+      runner.close();
+      expect(runner.isClosed).toBe(true);
+
+      // Finish connect
+      finishConnect();
+      await runner.settled();
+
+      // No resend prompt was issued
+      expect(client.prompts).toEqual(["build"]);
+      // Idle socket timer must not be armed
+      expect((runner as any).idleSocketTimer).toBeUndefined();
+      // Turn settled reporting honest cancellation matching main (#168)
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("bails when runner is closed during the resend prompt", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for reconnect to succeed and resend prompt to be issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Now runner is closed while resend prompt is in flight
+      runner.close();
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect((runner as any).idleSocketTimer).toBeUndefined();
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("never arms idleSocketTimer when runner is closed", async () => {
+      const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      await runner.deliver("c1", "hello");
+      runner.close();
+      client.finishTurn();
+      await runner.settled();
+
+      expect((runner as any).idleSocketTimer).toBeUndefined();
+    });
+
     it("clears the stall watchdog timer during reconnect so it cannot fire mid-reconnect", async () => {
       vi.useFakeTimers();
       try {

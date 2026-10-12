@@ -228,9 +228,14 @@ export class GooseSessionRunner {
   private connected = false;
   private connecting: Promise<void> | undefined;
   private idleSocketTimer: ReturnType<typeof setTimeout> | undefined;
+  private closed = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
   }
 
   /**
@@ -393,6 +398,10 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          if (this.closed) {
+            await this.finishTurn(turn, undefined, err);
+            return;
+          }
           if (turn.idleTimer) {
             clearTimeout(turn.idleTimer);
             turn.idleTimer = undefined;
@@ -404,12 +413,24 @@ export class GooseSessionRunner {
           try {
             this.connected = false;
             await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+            if (this.closed) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
             turn.lastActivityAt = Date.now();
             this.armIdleTimer(turn);
             const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+            if (this.closed) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
             await this.onPromptOutcome(turn, text, outcome);
             return;
           } catch (resendErr) {
+            if (this.closed) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
             this.log("honk reconnect or resend failed", {
               sessionId: this.sessionId,
               commandId,
@@ -533,7 +554,7 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
-    if (this.connected && !this.opts.client.isClosed()) {
+    if (this.connected && !this.opts.client.isClosed() && !this.closed) {
       this.armIdleSocketTimer();
     }
   }
@@ -547,6 +568,7 @@ export class GooseSessionRunner {
    * which is why there is no lifecycle to tear down anywhere else.
    */
   private armIdleTimer(turn: Turn): void {
+    if (this.closed) return;
     const timeout = this.opts.turnIdleTimeoutMs ?? DEFAULT_TURN_IDLE_TIMEOUT_MS;
     if (turn.idleTimer) clearTimeout(turn.idleTimer);
     turn.idleTimer = setTimeout(() => {
@@ -751,6 +773,9 @@ export class GooseSessionRunner {
   }
 
   private async ensureConnected(): Promise<void> {
+    if (this.closed) {
+      throw new Error("goose runner is closed");
+    }
     // A socket that closed under us leaves `connected` true, and sending into a
     // closed WebSocket is a SILENT no-op -- so without this the first blip would
     // wedge the session permanently (and, via an unanswerable steer, freeze
@@ -789,11 +814,12 @@ export class GooseSessionRunner {
   }
 
   private armIdleSocketTimer(): void {
+    if (this.closed) return;
     const timeout = this.opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
     if (timeout <= 0) return;
     this.clearIdleSocketTimer();
     this.idleSocketTimer = setTimeout(() => {
-      if (!this.turn && this.connected) {
+      if (!this.turn && this.connected && !this.closed) {
         this.log("goose runner: closing idle socket after inactivity", {
           sessionId: this.sessionId,
         });
@@ -821,6 +847,7 @@ export class GooseSessionRunner {
   }
 
   close(): void {
+    this.closed = true;
     this.clearIdleSocketTimer();
     // The timer is unref'd, so it cannot hold the process open -- but a runner
     // dropped from the registry should not leave one running against a turn
