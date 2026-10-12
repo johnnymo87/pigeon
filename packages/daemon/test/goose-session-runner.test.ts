@@ -335,6 +335,19 @@ describe("GooseSessionRunner failure containment", () => {
     expect(msg.length - notice.length).toBeGreaterThanOrEqual(100);
   });
 
+  it("caps receipt.text with maxTranscriptBytes before posting to /stop", async () => {
+    const { runner, client, stops } = makeRunner({ maxTranscriptBytes: 100 });
+    await runner.deliver("c1", "x");
+    const longText = "a".repeat(250);
+    client.finishTurn("end_turn", { text: longText });
+    await runner.settled();
+
+    const msg = String(stops[0]!.message);
+    const notice = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+    expect(msg.endsWith(notice)).toBe(true);
+    expect(msg).toBe("a".repeat(100) + notice);
+  });
+
   it("ignores tool chatter in the reported message but counts it as liveness", async () => {
     const { runner, client, stops } = makeRunner();
     await runner.deliver("c1", "x");

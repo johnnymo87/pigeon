@@ -166,6 +166,7 @@ interface Turn {
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
+const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
 
 /**
  * How long a turn may emit NOTHING before pigeon stops believing in it.
@@ -758,9 +759,19 @@ export class GooseSessionRunner {
       const stopReason = receipt?.stopReason;
       const failed = err !== undefined || (stopReason !== undefined && stopReason !== "end_turn");
 
-      let message = typeof receipt?.text === "string" ? receipt.text : turn.text.join("");
-      if (typeof receipt?.text !== "string" && turn.truncated) {
-        message += "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+      const cap = this.opts.maxTranscriptBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
+      let message: string;
+      if (typeof receipt?.text === "string") {
+        if (receipt.text.length > cap) {
+          message = receipt.text.slice(0, cap) + TRUNCATION_NOTICE;
+        } else {
+          message = receipt.text;
+        }
+      } else {
+        message = turn.text.join("");
+        if (turn.truncated) {
+          message += TRUNCATION_NOTICE;
+        }
       }
       if (err instanceof DisconnectedDuringTurn) {
         // Said in the human's terms rather than as the raw error, because the
