@@ -193,6 +193,127 @@ describe("honkd live integration with real pigeon client", () => {
     },
     120_000,
   );
+
+  runTest(
+    "cancels in-flight turn via separate fresh client B, client A prompt resolves stopReason 'cancelled'",
+    async () => {
+      const tmpdir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "pigeon-honkd-client-cancel-test-"),
+      );
+
+      const clientA = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      await clientA.connect();
+      expect(clientA.isHonk).toBe(true);
+      const backendSid = await clientA.newSession(tmpdir);
+
+      try {
+        const start = Date.now();
+        const promptA = clientA.prompt(
+          backendSid,
+          "Run this shell command: sleep 10 && echo LIVE_TEST_CLIENT_A_SHOULD_BE_CANCELLED",
+        );
+
+        // Wait for command to start running in goose
+        await new Promise((r) => setTimeout(r, 1500));
+
+        // Client B connects on a separate socket, sends cancel, and closes immediately
+        const clientB = new GooseAcpClient({
+          url: HONKD_URL!,
+          transportFactory: webSocketTransport(HONKD_TOKEN!),
+        });
+        await clientB.connect();
+        expect(clientB.isHonk).toBe(true);
+        clientB.cancel(backendSid);
+        clientB.close();
+
+        // Client A's in-flight prompt resolves with cancelled
+        const outcome = await promptA;
+        const elapsed = Date.now() - start;
+
+        expect(outcome.kind).toBe("receipt");
+        const receipt = outcome as GooseReceipt;
+        expect(receipt.stopReason).toBe("cancelled");
+        expect(elapsed).toBeLessThan(7000);
+      } finally {
+        clientA.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runTest(
+    "runner.cancel() on fresh (never-connected) runner against honkd while turn is running (after-restart path)",
+    async () => {
+      const tmpdir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "pigeon-honkd-restart-cancel-test-"),
+      );
+
+      // Connection 1: starts a long turn
+      const client1 = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      await client1.connect();
+      expect(client1.isHonk).toBe(true);
+      const backendSid = await client1.newSession(tmpdir);
+
+      try {
+        const start = Date.now();
+        const prompt1 = client1.prompt(
+          backendSid,
+          "Run this shell command: sleep 10 && echo LIVE_TEST_RESTART_SHOULD_BE_CANCELLED",
+        );
+
+        // Wait for command to start running in goose
+        await new Promise((r) => setTimeout(r, 1500));
+
+        // Simulate after-restart: a fresh runner with a fresh client that has NEVER connected
+        const freshClient = new GooseAcpClient({
+          url: HONKD_URL!,
+          transportFactory: webSocketTransport(HONKD_TOKEN!),
+        });
+        const freshRunner = new GooseSessionRunner({
+          session: {
+            sessionId: `sess-restart-${Date.now()}`,
+            backendKind: "goose",
+            backendSessionId: backendSid,
+          } as SessionRecord,
+          client: freshClient,
+          postStop: async () => {},
+          touch: () => {},
+        });
+
+        // Fresh runner connects within 3s and sends cancel
+        const cancelOutcome = await freshRunner.cancel();
+        expect(cancelOutcome).toBe("sent");
+
+        // Client 1's prompt resolves with "cancelled"
+        const outcome = await prompt1;
+        const elapsed = Date.now() - start;
+
+        expect(outcome.kind).toBe("receipt");
+        const receipt = outcome as GooseReceipt;
+        expect(receipt.stopReason).toBe("cancelled");
+        expect(elapsed).toBeLessThan(7000);
+      } finally {
+        client1.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
 });
 
 describe("bare sandbox goose live integration with real pigeon client", () => {

@@ -631,6 +631,17 @@ describe("GooseAcpClient", () => {
         /disallowed method/,
       );
     });
+
+    it("notify leaves pending size 0", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      expect((client as any).pending.size).toBe(0);
+      client.cancel("sess-1");
+      expect((client as any).pending.size).toBe(0);
+    });
   });
 
 });

@@ -1,5 +1,5 @@
 import type { SessionRecord } from "../storage/types.js";
-import type { GooseRunnerRegistry } from "./session-runner.js";
+import type { GooseRunnerRegistry, GooseSessionRunner } from "./session-runner.js";
 
 export interface GooseKillDeps {
   storage: {
@@ -23,9 +23,9 @@ export interface GooseKillDeps {
  * endpoint is honkd or bare goose.
  *
  * honk + "sent": Asked honkd to cancel; does not claim "cancelled" because honkd does not confirm.
- * honk + "failed": Honest "may still be running in honkd", plus cancel could not be sent.
- * bare + "sent"/"no-connection": Dropping connection cancels any running turn on goose.
- * bare + "failed": Closing connection still cancels on goose, so keep bare wording.
+ * honk + "failed": Honest "may still be running there", plus cancel could not be sent.
+ * bare + "sent": Pigeon sent goose a cancel and dropped the connection (any running turn is cancelled).
+ * bare + "no-connection" / "failed": Closing connection cancels any running turn on goose (today's bare wording).
  * isHonk unknown + "failed": Cautious wording, the turn may still be running.
  */
 export function pickKillReply(
@@ -41,20 +41,27 @@ export function pickKillReply(
       );
     }
     return (
-      "Session closed. Could not send cancel to honkd; the turn may still be running in honkd; "
+      "Session closed. Could not send cancel to honkd; the turn may still be running there; "
       + "pigeon has stopped tracking the session."
     );
   }
 
-  if (isHonkKnown) {
-    // Known bare goose: closing the connection cancels any turn that was running
+  if (outcome === "sent") {
+    return (
+      "Session closed. Pigeon sent goose a cancel and dropped the connection; "
+      + "any running turn is cancelled; pigeon has stopped tracking the session."
+    );
+  }
+
+  if (outcome === "no-connection" || isHonkKnown) {
+    // Known bare goose or no-connection: closing the connection cancels any turn that was running
     return (
       "Session closed. That dropped pigeon's connection to goose, which cancels "
       + "any turn that was running; pigeon has stopped tracking the session."
     );
   }
 
-  // isHonk is unknown when connect failed: treat as honk-unknown and use cautious wording
+  // outcome === "failed" and isHonk is unknown (e.g. connect failed before initialize)
   return (
     "Session closed. Could not send cancel; the turn may still be running; "
     + "pigeon has stopped tracking the session."
@@ -70,8 +77,17 @@ export function pickKillReply(
  */
 export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): Promise<void> {
   const session = deps.storage.sessions.get(sessionId);
-  const runner = session && deps.gooseRunners ? deps.gooseRunners.get(session) : undefined;
-  const outcome = runner ? await runner.cancel() : "no-connection";
+  let outcome: "sent" | "no-connection" | "failed" = "no-connection";
+  let runner: GooseSessionRunner | undefined;
+  if (session && deps.gooseRunners) {
+    try {
+      runner = deps.gooseRunners.get(session);
+      outcome = await runner.cancel();
+    } catch (err) {
+      console.warn(`[kill-control] runner.cancel failed for ${sessionId}:`, err);
+      outcome = "failed";
+    }
+  }
   const isHonk = runner?.isHonk;
   const isHonkKnown = runner?.isHonkKnown;
 

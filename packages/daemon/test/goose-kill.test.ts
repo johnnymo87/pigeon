@@ -10,29 +10,40 @@ describe("pickKillReply", () => {
     expect(text).toContain("pigeon has stopped tracking the session.");
   });
 
-  it("honk + failed: keeps honest may still be running in honkd text and mentions cancel could not be sent", () => {
+  it("honk + failed: keeps honest may still be running in honkd text without doubled honkd and mentions cancel could not be sent", () => {
     const text = pickKillReply("failed", true, true);
-    expect(text).toContain("Could not send cancel to honkd");
-    expect(text).toContain("may still be running in honkd");
+    expect(text).toContain("Could not send cancel to honkd; the turn may still be running there;");
+    expect(text).not.toContain("running in honkd");
     expect(text).toContain("pigeon has stopped tracking the session.");
   });
 
-  it("bare + sent: cancel sent and connection dropped, cancels running turn", () => {
+  it("bare + sent: says pigeon sent goose a cancel and dropped the connection", () => {
     const text = pickKillReply("sent", false, true);
-    expect(text).toContain("That dropped pigeon's connection to goose, which cancels any turn that was running");
-    expect(text).toContain("pigeon has stopped tracking the session.");
+    expect(text).toBe(
+      "Session closed. Pigeon sent goose a cancel and dropped the connection; any running turn is cancelled; pigeon has stopped tracking the session.",
+    );
   });
 
-  it("bare + no-connection: connection dropped, cancels running turn", () => {
+  it("bare + no-connection: keeps today's bare wording", () => {
     const text = pickKillReply("no-connection", false, true);
-    expect(text).toContain("That dropped pigeon's connection to goose, which cancels any turn that was running");
-    expect(text).toContain("pigeon has stopped tracking the session.");
+    expect(text).toBe(
+      "Session closed. That dropped pigeon's connection to goose, which cancels any turn that was running; pigeon has stopped tracking the session.",
+    );
   });
 
   it("bare + failed: keeps today's bare wording", () => {
     const text = pickKillReply("failed", false, true);
-    expect(text).toContain("That dropped pigeon's connection to goose, which cancels any turn that was running");
-    expect(text).toContain("pigeon has stopped tracking the session.");
+    expect(text).toBe(
+      "Session closed. That dropped pigeon's connection to goose, which cancels any turn that was running; pigeon has stopped tracking the session.",
+    );
+  });
+
+  it("asserts distinct texts between bare+sent and bare+no-connection/failed", () => {
+    const sent = pickKillReply("sent", false, true);
+    const noConn = pickKillReply("no-connection", false, true);
+    const failed = pickKillReply("failed", false, true);
+    expect(sent).not.toEqual(noConn);
+    expect(noConn).toEqual(failed);
   });
 
   it("isHonk unknown when connect failed: uses cautious wording that turn may still be running", () => {
@@ -169,7 +180,7 @@ describe("executeGooseKill", () => {
     await executeGooseKill("gse_123", deps);
 
     expect(deps.reply).toHaveBeenCalledWith(
-      "Session closed. Could not send cancel to honkd; the turn may still be running in honkd; pigeon has stopped tracking the session.",
+      "Session closed. Could not send cancel to honkd; the turn may still be running there; pigeon has stopped tracking the session.",
     );
   });
 
@@ -181,7 +192,7 @@ describe("executeGooseKill", () => {
     await executeGooseKill("gse_123", deps);
 
     expect(deps.reply).toHaveBeenCalledWith(
-      "Session closed. That dropped pigeon's connection to goose, which cancels any turn that was running; pigeon has stopped tracking the session.",
+      "Session closed. Pigeon sent goose a cancel and dropped the connection; any running turn is cancelled; pigeon has stopped tracking the session.",
     );
   });
 
@@ -195,5 +206,64 @@ describe("executeGooseKill", () => {
     expect(deps.reply).toHaveBeenCalledWith(
       "Session closed. Could not send cancel; the turn may still be running; pigeon has stopped tracking the session.",
     );
+  });
+
+  it("handles sessions.get returning undefined gracefully", async () => {
+    const { deps, events } = makeDeps();
+    (deps.storage.sessions.get as any).mockImplementation((id: string) => {
+      events.push(`sessions.get:${id}`);
+      return undefined;
+    });
+
+    await executeGooseKill("unknown_sess", deps);
+
+    expect(events).toContain("sessions.get:unknown_sess");
+    expect(events).toContain("gooseRunners.drop:unknown_sess");
+    expect(events).toContain("sessions.delete:unknown_sess");
+    expect(events).toContain("assignments.delete:unknown_sess");
+    expect(events).toContain("poller.unregisterSession:unknown_sess");
+    expect(deps.reply).toHaveBeenCalledWith(
+      "Session closed. That dropped pigeon's connection to goose, which cancels any turn that was running; pigeon has stopped tracking the session.",
+    );
+  });
+
+  it("handles runner.cancel throwing: logs console.warn and still drops/deletes/unregisters/replies", async () => {
+    const { deps, events, fakeRunner } = makeDeps();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fakeRunner.cancel.mockRejectedValue(new Error("runner exploded"));
+
+    await executeGooseKill("gse_123", deps);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("runner.cancel failed for gse_123"),
+      expect.any(Error),
+    );
+    expect(events).toContain("gooseRunners.drop:gse_123");
+    expect(events).toContain("sessions.delete:gse_123");
+    expect(events).toContain("assignments.delete:gse_123");
+    expect(events).toContain("poller.unregisterSession:gse_123");
+    expect(deps.reply).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("handles gooseRunners.get throwing: logs console.warn and still drops/deletes/unregisters/replies", async () => {
+    const { deps, events } = makeDeps();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    (deps.gooseRunners!.get as any).mockImplementation(() => {
+      throw new Error("registry crashed");
+    });
+
+    await executeGooseKill("gse_123", deps);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("runner.cancel failed for gse_123"),
+      expect.any(Error),
+    );
+    expect(events).toContain("gooseRunners.drop:gse_123");
+    expect(events).toContain("sessions.delete:gse_123");
+    expect(events).toContain("assignments.delete:gse_123");
+    expect(events).toContain("poller.unregisterSession:gse_123");
+    expect(deps.reply).toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

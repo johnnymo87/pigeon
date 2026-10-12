@@ -117,7 +117,7 @@ export interface RunnerClient {
   prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
-  cancel?(sessionId: string): void;
+  cancel(sessionId: string): void;
   close(): void;
 }
 
@@ -279,6 +279,7 @@ export class GooseSessionRunner {
   private sleepTimer: ReturnType<typeof setTimeout> | undefined;
   private sleepResolve: (() => void) | undefined;
   private closed = false;
+  private cancelRequested = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
@@ -456,7 +457,7 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
-          if (this.closed || turn.abandoned) {
+          if (this.closed || turn.abandoned || this.cancelRequested) {
             await this.finishTurn(turn, undefined, err);
             return;
           }
@@ -475,14 +476,14 @@ export class GooseSessionRunner {
           const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
 
           while (Date.now() < deadline) {
-            if (this.closed || turn.abandoned) {
+            if (this.closed || turn.abandoned || this.cancelRequested) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
             try {
               await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
             } catch (connectErr) {
-              if (this.closed || turn.abandoned) {
+              if (this.closed || turn.abandoned || this.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
@@ -500,7 +501,7 @@ export class GooseSessionRunner {
               continue;
             }
 
-            if (this.closed || turn.abandoned) {
+            if (this.closed || turn.abandoned || this.cancelRequested) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
@@ -518,16 +519,21 @@ export class GooseSessionRunner {
             this.armIdleTimer(turn);
             turn.resent = true;
 
+            if (this.closed || turn.abandoned || this.cancelRequested) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+
             try {
               const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
-              if (this.closed || turn.abandoned) {
+              if (this.closed || turn.abandoned || this.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
               await this.onPromptOutcome(turn, text, outcome);
               return;
             } catch (resendErr) {
-              if (this.closed || turn.abandoned) {
+              if (this.closed || turn.abandoned || this.cancelRequested) {
                 await this.finishTurn(turn, undefined, err);
                 return;
               }
@@ -1057,6 +1063,15 @@ export class GooseSessionRunner {
     }
   }
 
+  private sendCancel(): "sent" | "failed" {
+    try {
+      this.opts.client.cancel(this.backendSessionId);
+      return "sent";
+    } catch {
+      return "failed";
+    }
+  }
+
   /**
    * Sends session/cancel to goose/honkd for this session.
    *
@@ -1071,13 +1086,11 @@ export class GooseSessionRunner {
    * Leaves socket closing to close() / registry.drop().
    */
   async cancel(): Promise<"sent" | "no-connection" | "failed"> {
+    this.cancelRequested = true;
+    this.cancelSleep();
+
     if (this.connected && !this.opts.client.isClosed() && !this.closed) {
-      try {
-        this.opts.client.cancel?.(this.backendSessionId);
-        return "sent";
-      } catch {
-        return "failed";
-      }
+      return this.sendCancel();
     }
 
     try {
@@ -1087,12 +1100,7 @@ export class GooseSessionRunner {
     }
 
     if (this.opts.client.isHonk) {
-      try {
-        this.opts.client.cancel?.(this.backendSessionId);
-        return "sent";
-      } catch {
-        return "failed";
-      }
+      return this.sendCancel();
     }
 
     return "no-connection";
