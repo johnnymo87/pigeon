@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
-import { DisconnectedDuringTurn } from "../src/goose/acp-client.js";
+import { DisconnectedDuringTurn, GooseProtocolError } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
 
 /**
@@ -930,6 +930,56 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(stops[0]!.event).toBe("Error");
       expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
       expect(stops[0]!.message).toMatch(/cancelled/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("reports the resend error honestly as goose-turn-failed when honkd answers resend with protocol error", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for reconnect to succeed and resend prompt to be issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Honkd answers resend with JSON-RPC error
+      client.failTurn(new GooseProtocolError(-32000, "session expired on honkd", "session destroyed"));
+      await runner.settled();
+
+      // Must report the resend error honestly as goose-turn-failed, NOT goose-turn-disconnected
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("session expired on honkd: session destroyed");
+      expect(stops[0]!.message).not.toMatch(/nothing was resent/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("reports honk resend disconnect with accurate notice stating one resend was attempted", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // First disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Resend prompt issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Resend also disconnects
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(stops[0]!.message).toMatch(/one resend was attempted/i);
+      expect(stops[0]!.message).not.toMatch(/nothing was resent/i);
       expect(runner.isBusy()).toBe(false);
     });
 

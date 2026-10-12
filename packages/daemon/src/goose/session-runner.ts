@@ -77,11 +77,17 @@ export function gooseShutdownNotice(sessionId: string): string {
  * started -- so a reply re-runs the task from the start, blind to whatever it
  * had already pushed or posted. That is where duplicates come from.
  */
-const RESUME_ADVICE =
-  "Your message is still in the session's history with no reply, and nothing was resent. "
-  + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
-  + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
-  + "or it may do it again.";
+function resumeAdvice(resent = false): string {
+  const resendClause = resent ? "one resend was attempted" : "nothing was resent";
+  return (
+    `Your message is still in the session's history with no reply, and ${resendClause}. `
+    + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
+    + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
+    + "or it may do it again."
+  );
+}
+
+const RESUME_ADVICE = resumeAdvice(false);
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
@@ -156,6 +162,7 @@ interface Turn {
    */
   abandoned: boolean;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
+  resent?: boolean;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
@@ -410,6 +417,7 @@ export class GooseSessionRunner {
             sessionId: this.sessionId,
             commandId,
           });
+          let resendAttempted = false;
           try {
             this.connected = false;
             await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
@@ -419,6 +427,8 @@ export class GooseSessionRunner {
             }
             turn.lastActivityAt = Date.now();
             this.armIdleTimer(turn);
+            resendAttempted = true;
+            turn.resent = true;
             const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
             if (this.closed) {
               await this.finishTurn(turn, undefined, err);
@@ -436,8 +446,11 @@ export class GooseSessionRunner {
               commandId,
               error: resendErr instanceof Error ? resendErr.message : String(resendErr),
             });
-            const failureErr = resendErr instanceof DisconnectedDuringTurn ? resendErr : err;
-            await this.finishTurn(turn, undefined, failureErr);
+            if (!resendAttempted) {
+              await this.finishTurn(turn, undefined, err);
+            } else {
+              await this.finishTurn(turn, undefined, resendErr);
+            }
             return;
           }
         }
@@ -729,9 +742,10 @@ export class GooseSessionRunner {
         // Said in the human's terms rather than as the raw error, because the
         // one thing they need to know -- that they should NOT wait for this
         // turn -- is otherwise buried after a close code and a run id.
+        const advice = resumeAdvice(turn.resent);
         const detail =
           "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
-          + `closes, so this turn was cancelled and will not finish. ${RESUME_ADVICE}`
+          + `closes, so this turn was cancelled and will not finish. ${advice}`
           + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
