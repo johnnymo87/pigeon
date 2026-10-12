@@ -60,7 +60,14 @@ import { DisconnectedDuringTurn } from "./acp-client.js";
  * run when it does -- the earlier text promised the turn "will finish on its
  * side", which sent the human off to wait for work that had been cancelled.
  */
-export function gooseShutdownNotice(sessionId: string): string {
+export function gooseShutdownNotice(sessionId: string, isHonk = false): string {
+  if (isHonk) {
+    return (
+      `pigeon is restarting while a goose turn was running on ${sessionId}. `
+      + "The connection to honkd was closed, but the turn may still be running in honkd. "
+      + `${RESUME_ADVICE} (Once pigeon is back.)`
+    );
+  }
   return (
     `pigeon is restarting while a goose turn was running on ${sessionId}. `
     + "goose cancels a turn when its connection closes, so that turn was cancelled and will not finish. "
@@ -244,6 +251,10 @@ export class GooseSessionRunner {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get isHonk(): boolean {
+    return Boolean(this.opts.client.isHonk);
   }
 
   /**
@@ -699,17 +710,17 @@ export class GooseSessionRunner {
 
     try {
       const partial = turn.text.join("");
+      const honkDetail = `The turn may still be running in honkd. ${RESUME_ADVICE}`;
+      const bareDetail =
+        "goose cancels a turn once it sees its connection close, so do not wait for this one: "
+        + `no result is coming here. ${RESUME_ADVICE}`;
       await this.opts.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,
         message:
           (partial === "" ? "" : `${partial}\n\n`)
           + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
-          // "once it sees" rather than "has": this path runs because the socket
-          // stopped answering, possibly half-open, so goose may not have
-          // noticed the close yet. Either way no result is coming HERE.
-          + "goose cancels a turn once it sees its connection close, so do not wait for this one: "
-          + `no result is coming here. ${RESUME_ADVICE}`,
+          + (this.opts.client.isHonk ? honkDetail : bareDetail),
         event: "Error",
         error_kind: "goose-turn-stalled",
       });

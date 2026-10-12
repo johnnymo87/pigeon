@@ -292,6 +292,7 @@ async function handleGooseControl(
     // and goose cancels a run when the connection that started it closes
     // (bead pigeon-jlb6) -- so this also stops an in-flight turn, even though
     // pigeon sends goose no cancel.
+    const isHonk = gooseRunners?.peek(msg.sessionId)?.isHonk;
     gooseRunners?.drop(msg.sessionId);
     storage.sessions.delete(msg.sessionId);
     storage.assignments.delete(msg.sessionId);
@@ -303,8 +304,10 @@ async function handleGooseControl(
       }
     }
     await reply(
-      "Session closed. That dropped pigeon's connection to goose, which cancels "
-      + "any turn that was running; pigeon has stopped tracking the session.",
+      isHonk
+        ? "Session closed. That dropped pigeon's connection to honkd; the turn may still be running in honkd; pigeon has stopped tracking the session."
+        : "Session closed. That dropped pigeon's connection to goose, which cancels "
+          + "any turn that was running; pigeon has stopped tracking the session.",
     );
     return true;
   }
@@ -1135,9 +1138,10 @@ async function shutdown(signal: string): Promise<void> {
     console.warn(`[pigeon-daemon] ${busy.length} goose turn(s) in flight at shutdown: ${busy.join(", ")}`);
     for (const sessionId of busy) {
       try {
+        const isHonk = gooseRunners?.peek(sessionId)?.isHonk;
         await sendTelegramMessage(
           config.telegramChatId,
-          gooseShutdownNotice(sessionId),
+          gooseShutdownNotice(sessionId, isHonk),
           { messageThreadId: undefined },
         );
       } catch (err) {

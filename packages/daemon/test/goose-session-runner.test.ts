@@ -296,6 +296,13 @@ describe("GooseSessionRunner failure containment", () => {
     expect(notice).not.toMatch(/will finish|finish on its side/i);
   });
 
+  it("says turn may still be running in honkd when isHonk is true on shutdown", () => {
+    const notice = gooseShutdownNotice("gse_1", true);
+    expect(notice).toContain("gse_1");
+    expect(notice).toContain("turn may still be running in honkd");
+    expect(notice).not.toMatch(/was cancelled and will not finish/i);
+  });
+
   it("survives postStop throwing, and still clears the turn", async () => {
     // A detached turn's continuation runs with no caller. On Node an unhandled
     // rejection terminates the PROCESS, which would take down command delivery
@@ -650,6 +657,27 @@ describe("GooseSessionRunner idle watchdog", () => {
     expect(runner.isBusy()).toBe(false);
     // And the socket is dropped so the next delivery reconnects.
     expect(client.closed).toBe(true);
+  });
+
+  it("says turn may still be running in honkd in stall notice when isHonk is true", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000 });
+      client.isHonk = true;
+      client.pingImpl = async () => {
+        throw new Error("dead");
+      };
+      await runner.deliver("c1", "stalling");
+
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+      expect(stops[0]!.message).toContain("turn may still be running in honkd");
+      expect(stops[0]!.message).not.toMatch(/no result is coming here/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not abandon a turn that is quietly working", async () => {
