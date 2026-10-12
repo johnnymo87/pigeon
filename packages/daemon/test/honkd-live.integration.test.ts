@@ -5,6 +5,7 @@ import {
 } from "../src/goose/acp-client.js";
 import { GooseSessionRunner } from "../src/goose/session-runner.js";
 import { webSocketTransport } from "../src/goose/ws-transport.js";
+import type { SessionRecord } from "../src/storage/types.js";
 import * as os from "node:os";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -93,9 +94,7 @@ describe("honkd live integration with real pigeon client", () => {
           sessionId: `live-sess-${Date.now()}`,
           backendKind: "goose",
           backendSessionId: backendSid,
-          createdAt: new Date(),
-          lastSeen: new Date(),
-        },
+        } as SessionRecord,
         client,
         postStop: async (body) => {
           stopReports.push(body);
