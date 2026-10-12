@@ -31,15 +31,53 @@
  *  - The active run id arrives in `session_info_update._meta.goose.activeRunId`
  *    as soon as a turn starts, so a second message can STEER the running turn
  *    without first provoking a busy rejection.
- *  - There is NO cancel or interrupt method on the ACP surface at all, and a turn
- *    survives a client disconnect. Once a turn starts, it finishes. That is why
- *    this module has no cancellation path: there is nothing to call.
+ *  - pigeon sends goose no cancel, so this module has no cancellation path.
+ *  - A turn does NOT survive its WebSocket closing. The 1.48.0 note here used to
+ *    say it did; re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
+ *    also honk docs/spike/m0-findings.md T5), goose cancels every run a
+ *    connection started the moment that connection closes -- a blip, the
+ *    watchdog's own close(), or this daemon exiting. Nothing the turn had done
+ *    yet (not even a started tool call) is recorded in the history; only the
+ *    user's message is. So every notice below says "cancelled", never "it
+ *    will finish on goose's side".
  *  - A fresh connection can prompt an EXISTING session id and still has its
  *    history, so reconnecting is cheap and a daemon restart does not orphan a
- *    session.
+ *    SESSION -- only the turn that was in flight.
  */
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import { DisconnectedDuringTurn } from "./acp-client.js";
+
+/**
+ * What the human is told when the daemon shuts down with a goose turn in flight.
+ *
+ * Lives here, beside the other turn notices, so it is tested; it is sent from
+ * index.ts's shutdown handler. Exiting closes the socket, and goose cancels the
+ * run when it does -- the earlier text promised the turn "will finish on its
+ * side", which sent the human off to wait for work that had been cancelled.
+ */
+export function gooseShutdownNotice(sessionId: string): string {
+  return (
+    `pigeon is restarting while a goose turn was running on ${sessionId}. `
+    + "goose cancels a turn when its connection closes, so that turn was cancelled and will not finish. "
+    + `${RESUME_ADVICE} (Once pigeon is back.)`
+  );
+}
+
+/**
+ * What every "your turn is gone" notice tells the human to do next.
+ *
+ * One string so the three notices cannot drift apart. The warning in the
+ * second half is load-bearing: measured, the cancelled turn leaves NOTHING in
+ * goose's history but the user's message -- not even a tool call that had
+ * started -- so a reply re-runs the task from the start, blind to whatever it
+ * had already pushed or posted. That is where duplicates come from.
+ */
+const RESUME_ADVICE =
+  "Your message is still in the session's history with no reply, and nothing was resent. "
+  + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
+  + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
+  + "or it may do it again.";
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
@@ -355,10 +393,16 @@ export class GooseSessionRunner {
    * turn (which an earlier version did, by casting it to a receipt) reported a
    * cheerful "finished with no message" while silently dropping what they typed.
    *
-   * It is reachable on the ordinary path: pigeon restarts, a turn is still
-   * running on goose's side, and the next message opens a fresh connection that
-   * knows nothing about it. Steering is the correct recovery, and it is safe
-   * precisely because nothing was persisted.
+   * It is reachable whenever the session already has a run this connection did
+   * not start: one started by another goose client on the same serve, or a run
+   * of a connection pigeon just lost that goose has not finished cancelling yet
+   * (unmeasured, but possible right after a half-open socket is abandoned). It
+   * is NOT the "turn still finishing after a pigeon restart" case an earlier
+   * note named: the restart closes the socket, and goose cancels that run.
+   * Steering is the recovery, and it is safe because nothing was persisted --
+   * but note that a run this connection did not start reports its receipt to
+   * whoever started it, never to us, so a message steered into it gets no
+   * notification here.
    */
   private async onPromptOutcome(turn: Turn, text: string, outcome: unknown): Promise<void> {
     const kind = (outcome as { kind?: string } | undefined)?.kind;
@@ -551,9 +595,11 @@ export class GooseSessionRunner {
         message:
           (partial === "" ? "" : `${partial}\n\n`)
           + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
-          + "goose cannot be interrupted, so if that turn is still running it will finish on goose's side -- "
-          + "but its result will NOT appear here, because the connection it would have come back on is gone. "
-          + "The session history is intact, so send a message to pick it up.",
+          // "once it sees" rather than "has": this path runs because the socket
+          // stopped answering, possibly half-open, so goose may not have
+          // noticed the close yet. Either way no result is coming HERE.
+          + "goose cancels a turn once it sees its connection close, so do not wait for this one: "
+          + `no result is coming here. ${RESUME_ADVICE}`,
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
@@ -607,7 +653,16 @@ export class GooseSessionRunner {
       if (turn.truncated) {
         message += "\n\n[... truncated: the turn produced more output than pigeon buffers]";
       }
-      if (err !== undefined) {
+      if (err instanceof DisconnectedDuringTurn) {
+        // Said in the human's terms rather than as the raw error, because the
+        // one thing they need to know -- that they should NOT wait for this
+        // turn -- is otherwise buried after a close code and a run id.
+        const detail =
+          "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
+          + `closes, so this turn was cancelled and will not finish. ${RESUME_ADVICE}`
+          + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (message === "") {
@@ -625,7 +680,14 @@ export class GooseSessionRunner {
         message,
         event: failed ? "Error" : "Stop",
         ...(failed
-          ? { error_kind: err !== undefined ? "goose-turn-failed" : `goose-stop-${stopReason}` }
+          ? {
+              error_kind:
+                err instanceof DisconnectedDuringTurn
+                  ? "goose-turn-disconnected"
+                  : err !== undefined
+                    ? "goose-turn-failed"
+                    : `goose-stop-${stopReason}`,
+            }
           : {}),
       });
     } catch (reportErr) {

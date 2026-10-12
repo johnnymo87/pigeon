@@ -45,10 +45,9 @@ describe("gooseControlVerdict", () => {
   });
 
   it("refuses /interrupt without pretending to have stopped anything", () => {
-    // Measured on goose 1.48.0: there is NO cancel method on the ACP surface at
-    // all, and a turn survives a client disconnect. A reply that implied the
-    // turn had been stopped would mislead the human at the exact moment they
-    // are trying to stop something expensive or destructive.
+    // pigeon sends goose no cancel. A reply that implied the turn had been
+    // stopped would mislead the human at the exact moment they are trying to
+    // stop something expensive or destructive.
     const v = gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND));
     expect(v.kind).toBe("refuse");
     const reply = (v as { reply: string }).reply;
@@ -56,6 +55,9 @@ describe("gooseControlVerdict", () => {
     expect(reply).toMatch(/\/kill/);
     // It must not claim a steer is a stop.
     expect(reply).toMatch(/not a stop/i);
+    // Nor that the turn outlives pigeon's connection: goose cancels a run when
+    // the WebSocket that started it closes (measured on patched-1.54.0.3).
+    expect(reply).not.toMatch(/keeps running even if pigeon disconnects/i);
   });
 
   it("routes /kill to the goose teardown rather than the opencode client", () => {

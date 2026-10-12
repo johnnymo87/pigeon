@@ -249,12 +249,12 @@ async function main(): Promise<void> {
   );
   check(
     "as a turn failure via onClose, NOT as a watchdog stall",
-    String(deadStalls[0]?.error_kind) === "goose-turn-failed",
+    String(deadStalls[0]?.error_kind) === "goose-turn-disconnected",
     String(deadStalls[0]?.error_kind),
   );
   check(
-    "naming the disconnect so the human knows the prompt may be orphaned",
-    String(deadStalls[0]?.message ?? "").includes("connection closed"),
+    "telling the human goose cancelled the turn, so they do not wait for it",
+    /cancelled/.test(String(deadStalls[0]?.message ?? "")),
     String(deadStalls[0]?.message ?? "").slice(0, 90),
   );
   check("and the runner is no longer wedged", onDead.isBusy() === false);

@@ -30,15 +30,18 @@
  *    is refused with "no active run to steer" -- also a value, not a throw,
  *    because losing the race is an ordinary outcome.
  *
- * 4. DISCONNECT IS SILENT LOSS (§17 Q6, hazard R1). This is the dangerous one.
- *    When the socket drops mid-turn, goose keeps the user message in the
- *    session's history and never runs it -- the same shape as opencode's
- *    founding bug, and a pigeon restart mid-turn is a ROUTINE event, not an
- *    exotic one. So it gets its own error class rather than a generic throw,
- *    and it says out loud that the payload may already exist without a turn.
- *    Nothing here retries automatically: a blind replay is exactly how that
- *    persisted-but-unrun message becomes a duplicate. Retry is the caller's
- *    decision, made with the row state in front of it.
+ * 4. DISCONNECT CANCELS THE TURN (§17 Q6, hazard R1). This is the dangerous one.
+ *    When a WebSocket closes, goose shuts that connection's agent down, which
+ *    drops the in-flight `session/prompt` and CANCELS its run (goose's
+ *    `ActiveRunDropGuard`). Re-measured on patched-1.54.0.3, 2026-10-12, with a
+ *    run parked in a `sleep` tool call: after the close the model was never
+ *    called again, and the session history held the user message and nothing
+ *    else -- not even the tool call that had started. Same result for a clean
+ *    close and for the client process exiting. A pigeon restart mid-turn is a
+ *    ROUTINE event, so this gets its own error class rather than a generic
+ *    throw, and it says out loud that the turn is gone.
+ *    Nothing here retries automatically: the prompt is still in goose's history,
+ *    so a blind replay puts it there twice. Retry is the human's decision.
  */
 
 export interface AcpTransport {
@@ -78,10 +81,11 @@ export type SteerOutcome = GooseSteered | GooseNoActiveRun;
 /**
  * The socket dropped while a turn was outstanding (hazard R1).
  *
- * Carries the ids a caller needs to decide what to do, and deliberately does
- * NOT decide for them. The prompt may already be sitting in goose's session
- * history with no run behind it, so "send it again" and "leave it" are both
- * defensible and only the delivery row's state can choose between them.
+ * goose cancels the run when the connection closes (see fact 4 above), so the
+ * turn is over and will never produce a receipt. The prompt stays in goose's
+ * session history unanswered, which is why nothing resends it: "send it
+ * again" and "say continue" are both defensible, and only the human knows
+ * which they want.
  */
 export class DisconnectedDuringTurn extends Error {
   readonly sessionId: string;
@@ -91,7 +95,8 @@ export class DisconnectedDuringTurn extends Error {
     super(
       `goose connection closed (code ${closeCode}) while a turn was outstanding for session ${sessionId}` +
         (runId ? ` (run ${runId})` : "") +
-        `; the prompt may already be persisted in the session with no turn behind it, so it is NOT resent automatically`,
+        `; goose cancels a run when its connection closes, so the turn was cancelled. The prompt stays in the ` +
+        `session's history unanswered, and it is NOT resent automatically`,
     );
     this.name = "DisconnectedDuringTurn";
     this.sessionId = sessionId;
