@@ -371,6 +371,7 @@ export class GooseSessionRunner {
    * That is what makes "throw means nothing was sent" true for callers.
    */
   private startTurn(commandId: string, text: string): DeliverOutcome {
+    this.clearIdleSocketTimer();
     const turn: Turn = {
       commandId,
       startedAt: Date.now(),
@@ -532,7 +533,7 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
-    if (this.connected) {
+    if (this.connected && !this.opts.client.isClosed()) {
       this.armIdleSocketTimer();
     }
   }
@@ -620,25 +621,21 @@ export class GooseSessionRunner {
    */
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
     if (turn.abandoned || this.turn !== turn) return;
-    this.clearIdleSocketTimer();
     turn.abandoned = true;
+    this.connected = false;
+    try {
+      this.opts.client.close();
+    } catch {
+      /* best effort */
+    }
     this.clearTurn();
+    this.clearIdleSocketTimer();
 
     this.log("goose runner: abandoning a stalled turn", {
       sessionId: this.sessionId,
       commandId: turn.commandId,
       reason,
     });
-
-    // Drop the socket so the next delivery reconnects onto a live one. Safe to
-    // do before reporting: the transport callbacks are fenced on identity, so
-    // this socket's eventual close cannot disturb the connection that replaces it.
-    try {
-      this.opts.client.close();
-    } catch {
-      /* best effort */
-    }
-    this.connected = false;
 
     try {
       const partial = turn.text.join("");
@@ -789,9 +786,6 @@ export class GooseSessionRunner {
         });
     }
     await this.connecting;
-    if (!this.turn && this.connected) {
-      this.armIdleSocketTimer();
-    }
   }
 
   private armIdleSocketTimer(): void {

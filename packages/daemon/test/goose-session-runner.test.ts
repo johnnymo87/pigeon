@@ -1058,5 +1058,64 @@ describe("GooseSessionRunner liveness probing", () => {
         vi.useRealTimers();
       }
     });
+
+    it("never runs an idle socket timer during a turn longer than idleSocketTimeoutMs", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        await runner.deliver("c1", "long-in-flight");
+
+        // The timer should not be armed during a turn
+        expect((runner as any).idleSocketTimer).toBeUndefined();
+
+        // Advance well past idleSocketTimeoutMs while turn is still running
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(client.closed).toBe(false);
+        expect(runner.isBusy()).toBe(true);
+
+        // Turn finishes normally
+        client.finishTurn();
+        await runner.settled();
+
+        // Now idle socket timer should be armed
+        expect((runner as any).idleSocketTimer).toBeDefined();
+
+        // Advance past idle timeout: socket should close
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(client.closed).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("leaves no idle timer armed after abandonTurn", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000, idleSocketTimeoutMs: 60_000 });
+        client.pingImpl = async () => {
+          throw new Error("dead");
+        };
+        await runner.deliver("c1", "stalling");
+
+        await vi.advanceTimersByTimeAsync(6_000);
+
+        expect(stops).toHaveLength(1);
+        expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+        expect(client.closed).toBe(true);
+        expect((runner as any).idleSocketTimer).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not arm idle timer on clearTurn if socket is already closed", async () => {
+      const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      await runner.deliver("c1", "test");
+      client.dropSocket();
+      client.failTurn(new Error("socket dropped"));
+      await runner.settled();
+
+      expect((runner as any).idleSocketTimer).toBeUndefined();
+    });
   });
 });
