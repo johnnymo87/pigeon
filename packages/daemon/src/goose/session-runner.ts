@@ -60,10 +60,24 @@ export function gooseShutdownNotice(sessionId: string): string {
   return (
     `pigeon is restarting while a goose turn was running on ${sessionId}. `
     + "goose cancels a turn when its connection closes, so that turn was cancelled and will not finish. "
-    + "Your message is still in the session's history with no reply, and nothing will be resent: "
-    + "once pigeon is back, send a message (\"continue\" is enough) to pick it up."
+    + `${RESUME_ADVICE} (Once pigeon is back.)`
   );
 }
+
+/**
+ * What every "your turn is gone" notice tells the human to do next.
+ *
+ * One string so the three notices cannot drift apart. The warning in the
+ * second half is load-bearing: measured, the cancelled turn leaves NOTHING in
+ * goose's history but the user's message -- not even a tool call that had
+ * started -- so a reply re-runs the task from the start, blind to whatever it
+ * had already pushed or posted. That is where duplicates come from.
+ */
+const RESUME_ADVICE =
+  "Your message is still in the session's history with no reply, and nothing was resent. "
+  + "Replying (\"continue\" is enough) starts a fresh turn that sees that message but NOT what the "
+  + "cancelled turn had already done -- so if it may have pushed, posted or sent something, say so, "
+  + "or it may do it again.";
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
@@ -380,10 +394,15 @@ export class GooseSessionRunner {
    * cheerful "finished with no message" while silently dropping what they typed.
    *
    * It is reachable whenever the session already has a run this connection did
-   * not start, e.g. one started by another goose client on the same serve. (It
-   * is NOT the pigeon-restart case an earlier note named: the restart closes
-   * the socket, and goose cancels that run.) Steering is the correct recovery,
-   * and it is safe precisely because nothing was persisted.
+   * not start: one started by another goose client on the same serve, or a run
+   * of a connection pigeon just lost that goose has not finished cancelling yet
+   * (unmeasured, but possible right after a half-open socket is abandoned). It
+   * is NOT the "turn still finishing after a pigeon restart" case an earlier
+   * note named: the restart closes the socket, and goose cancels that run.
+   * Steering is the recovery, and it is safe because nothing was persisted --
+   * but note that a run this connection did not start reports its receipt to
+   * whoever started it, never to us, so a message steered into it gets no
+   * notification here.
    */
   private async onPromptOutcome(turn: Turn, text: string, outcome: unknown): Promise<void> {
     const kind = (outcome as { kind?: string } | undefined)?.kind;
@@ -576,9 +595,11 @@ export class GooseSessionRunner {
         message:
           (partial === "" ? "" : `${partial}\n\n`)
           + `goose stopped sending updates on this session (${reason}), so pigeon reset the connection. `
-          + "goose cancels a turn when its connection closes, so that turn is over and no result is coming. "
-          + "Your message is still in the session's history with no reply, and nothing was resent: "
-          + "send a message (\"continue\" is enough) to pick it up.",
+          // "once it sees" rather than "has": this path runs because the socket
+          // stopped answering, possibly half-open, so goose may not have
+          // noticed the close yet. Either way no result is coming HERE.
+          + "goose cancels a turn once it sees its connection close, so do not wait for this one: "
+          + `no result is coming here. ${RESUME_ADVICE}`,
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
@@ -638,10 +659,7 @@ export class GooseSessionRunner {
         // turn -- is otherwise buried after a close code and a run id.
         const detail =
           "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
-          + "closes, so this turn was cancelled and will not finish. Your message is still in the "
-          + "session's history with no reply, and nothing was resent: send a message (\"continue\" "
-          + "is enough) to pick it up. Anything the turn had already done, such as files it edited, "
-          + "is not undone, but goose's history does not record it."
+          + `closes, so this turn was cancelled and will not finish. ${RESUME_ADVICE}`
           + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {

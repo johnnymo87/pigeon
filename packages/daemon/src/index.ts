@@ -287,9 +287,11 @@ async function handleGooseControl(
   const send = createTelegramReplySender(sendTelegramMessage, msg);
   const reply = (text: string) => send(msg.chatId, text);
   if (verdict.kind === "kill") {
-    // goose has no cancel, so a /kill cannot stop an in-flight turn server-side.
-    // What it CAN do honestly is drop pigeon's side of the session, which is
-    // what the human is asking for: stop routing this to me.
+    // Drops pigeon's side of the session, which is what the human is asking
+    // for: stop routing this to me. Dropping the runner closes its WebSocket,
+    // and goose cancels a run when the connection that started it closes
+    // (bead pigeon-jlb6) -- so this also stops an in-flight turn, even though
+    // pigeon sends goose no cancel.
     gooseRunners?.drop(msg.sessionId);
     storage.sessions.delete(msg.sessionId);
     storage.assignments.delete(msg.sessionId);
@@ -301,8 +303,8 @@ async function handleGooseControl(
       }
     }
     await reply(
-      "Session closed. Note that goose has no cancel, so a turn already running "
-      + "will finish on the goose side; pigeon has stopped tracking it.",
+      "Session closed. That dropped pigeon's connection to goose, which cancels "
+      + "any turn that was running; pigeon has stopped tracking the session.",
     );
     return true;
   }
