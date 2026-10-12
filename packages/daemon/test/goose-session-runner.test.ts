@@ -1081,10 +1081,14 @@ describe("GooseSessionRunner liveness probing", () => {
     });
 
     it("retries connect with backoff when honkd is restarting, and delivers exactly one receipt upon reconnecting", async () => {
+      const sleepDelays: number[] = [];
       const { runner, client, stops } = makeRunner({
         honkReconnectBudgetMs: 5_000,
         honkReconnectInitialDelayMs: 10,
         honkReconnectMaxDelayMs: 50,
+        sleep: async (ms: number) => {
+          sleepDelays.push(ms);
+        },
       });
       client.isHonk = true;
       await runner.deliver("c1", "build");
@@ -1107,6 +1111,7 @@ describe("GooseSessionRunner liveness probing", () => {
       // Wait for resend prompt after retries
       await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
       expect(connectAttempts).toBe(3);
+      expect(sleepDelays).toEqual([10, 20]);
 
       // Now honkd replies with receipt
       client.finishTurn("end_turn", { text: "reconnected build success" });
@@ -1170,27 +1175,38 @@ describe("GooseSessionRunner liveness probing", () => {
     });
 
     it("reports honk-specific lost contact message when reconnect budget is exhausted", async () => {
-      const { runner, client, stops } = makeRunner({
-        honkReconnectBudgetMs: 50,
-        honkReconnectInitialDelayMs: 10,
-        honkReconnectMaxDelayMs: 20,
-      });
-      client.isHonk = true;
-      await runner.deliver("c1", "build");
+      let now = 1_000;
+      const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        const { runner, client, stops } = makeRunner({
+          honkReconnectBudgetMs: 50,
+          honkReconnectInitialDelayMs: 10,
+          honkReconnectMaxDelayMs: 20,
+          sleep: async (ms: number) => {
+            now += ms;
+          },
+        });
+        client.isHonk = true;
+        await runner.deliver("c1", "build");
 
-      client.connectImpl = async () => {
-        throw new Error("ECONNREFUSED");
-      };
-      client.dropSocket();
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
-      await runner.settled();
+        client.connectImpl = async () => {
+          throw new Error("ECONNREFUSED");
+        };
+        client.dropSocket();
+        client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+        await runner.settled();
 
-      expect(client.prompts).toEqual(["build"]);
-      expect(stops).toHaveLength(1);
-      expect(stops[0]!.event).toBe("Error");
-      expect(stops[0]!.message).toContain("lost contact with honkd; the turn may still be running and its reply was not collected");
-      expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
-      expect(runner.isBusy()).toBe(false);
+        expect(client.prompts).toEqual(["build"]);
+        expect(stops).toHaveLength(1);
+        expect(stops[0]!.event).toBe("Error");
+        expect(stops[0]!.message).toContain(
+          "lost contact with honkd; the turn may still be running and its reply was not collected",
+        );
+        expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
+        expect(runner.isBusy()).toBe(false);
+      } finally {
+        dateSpy.mockRestore();
+      }
     });
 
     it("loops back to reconnect and resend when resend disconnects, succeeding on subsequent attempt", async () => {
@@ -1198,6 +1214,7 @@ describe("GooseSessionRunner liveness probing", () => {
         honkReconnectBudgetMs: 5_000,
         honkReconnectInitialDelayMs: 10,
         honkReconnectMaxDelayMs: 50,
+        sleep: async () => {},
       });
       client.isHonk = true;
       await runner.deliver("c1", "build");
@@ -1227,35 +1244,46 @@ describe("GooseSessionRunner liveness probing", () => {
     });
 
     it("loops back to reconnect if resend itself disconnects, reporting honk-specific lost contact if budget exhausted", async () => {
-      const { runner, client, stops } = makeRunner({
-        honkReconnectBudgetMs: 80,
-        honkReconnectInitialDelayMs: 10,
-        honkReconnectMaxDelayMs: 20,
-      });
-      client.isHonk = true;
-      await runner.deliver("c1", "build");
+      let now = 1_000;
+      const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        const { runner, client, stops } = makeRunner({
+          honkReconnectBudgetMs: 80,
+          honkReconnectInitialDelayMs: 10,
+          honkReconnectMaxDelayMs: 20,
+          sleep: async (ms: number) => {
+            now += ms;
+          },
+        });
+        client.isHonk = true;
+        await runner.deliver("c1", "build");
 
-      // Mid-turn disconnect
-      client.dropSocket();
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+        // Mid-turn disconnect
+        client.dropSocket();
+        client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
 
-      // Wait for first resend prompt
-      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+        // Wait for first resend prompt
+        await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
 
-      // Resend prompt also disconnects
-      client.dropSocket();
-      // Make next reconnects fail until budget exhausted
-      client.connectImpl = async () => {
-        throw new Error("ECONNREFUSED");
-      };
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
-      await runner.settled();
+        // Resend prompt also disconnects
+        client.dropSocket();
+        // Make next reconnects fail until budget exhausted
+        client.connectImpl = async () => {
+          throw new Error("ECONNREFUSED");
+        };
+        client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+        await runner.settled();
 
-      expect(stops).toHaveLength(1);
-      expect(stops[0]!.event).toBe("Error");
-      expect(stops[0]!.message).toContain("lost contact with honkd; the turn may still be running and its reply was not collected");
-      expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
-      expect(runner.isBusy()).toBe(false);
+        expect(stops).toHaveLength(1);
+        expect(stops[0]!.event).toBe("Error");
+        expect(stops[0]!.message).toContain(
+          "lost contact with honkd; the turn may still be running and its reply was not collected",
+        );
+        expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
+        expect(runner.isBusy()).toBe(false);
+      } finally {
+        dateSpy.mockRestore();
+      }
     });
 
     it("leaves no orphaned open transport when deliver() reconnects during reconnect backoff", async () => {
@@ -1331,6 +1359,41 @@ describe("GooseSessionRunner liveness probing", () => {
 
       await expect(deliverPromise).rejects.toThrow(/closed/i);
       expect(client.isClosed()).toBe(true);
+    });
+
+    it("ends the loop with exactly one /stop when close() is called during a backoff sleep", async () => {
+      let sleeping = false;
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 5_000,
+        honkReconnectInitialDelayMs: 1_000,
+        sleep: async () => {
+          sleeping = true;
+          // Unresolved promise that cancelSleep should resolve
+          await new Promise(() => {});
+        },
+      });
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.connectImpl = async () => {
+        throw new Error("ECONNREFUSED");
+      };
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait until reconnect attempt 1 fails and runner enters backoff sleep
+      await vi.waitFor(() => expect(sleeping).toBe(true));
+
+      // Close runner while sleeping in backoff
+      runner.close();
+
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(runner.isBusy()).toBe(false);
     });
 
     it("throws on deliver when runner is closed and does not connect", async () => {

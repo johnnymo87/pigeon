@@ -1011,8 +1011,14 @@ export class GooseSessionRunner {
   }
 
   private async sleep(ms: number): Promise<void> {
+    if (this.closed) return;
     if (this.opts.sleep) {
-      await this.opts.sleep(ms);
+      await new Promise<void>((resolve, reject) => {
+        this.sleepResolve = resolve;
+        this.opts.sleep!(ms).then(resolve, reject);
+      }).finally(() => {
+        this.sleepResolve = undefined;
+      });
       return;
     }
     await new Promise<void>((resolve) => {
