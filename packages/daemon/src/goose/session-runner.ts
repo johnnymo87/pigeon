@@ -504,6 +504,18 @@ export class GooseSessionRunner {
     const kind = (outcome as { kind?: string } | undefined)?.kind;
     if (kind === "busy") {
       const runId = (outcome as { runId?: string }).runId;
+      if (turn.resent) {
+        this.log("honkd rejected the resend as busy, reporting honkd lost track of request", {
+          sessionId: this.sessionId,
+          runId,
+        });
+        await this.finishTurn(
+          turn,
+          undefined,
+          new Error("honkd lost track of the request"),
+        );
+        return;
+      }
       this.log("goose rejected the prompt as busy; steering the live turn instead", {
         sessionId: this.sessionId,
         runId,

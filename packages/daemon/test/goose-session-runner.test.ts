@@ -981,6 +981,31 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("reports honestly when honkd answers resend with busy instead of steering", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for reconnect to succeed and resend prompt to be issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Honkd answers resend with busy
+      client.finishBusy("run_other");
+      await runner.settled();
+
+      // Must NOT attempt to steer (which would duplicate the prompt into the run)
+      expect(client.steers).toEqual([]);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("honkd lost track of the request");
+      expect(runner.isBusy()).toBe(false);
+    });
+
     it("reports honk resend disconnect with accurate notice stating one resend was attempted", async () => {
       const { runner, client, stops } = makeRunner();
       client.isHonk = true;
