@@ -856,6 +856,29 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("does not resend if endpoint changed to bare goose after reconnect", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // On reconnect, endpoint turns out to be bare goose (isHonk = false)
+      client.connectImpl = async () => {
+        client.connected = true;
+        client.closed = false;
+        client.isHonk = false;
+      };
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(client.prompts).toEqual(["build"]);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(stops[0]!.message).toMatch(/nothing was resent/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
     it("reconnects once and resends with same clientReqId when isHonk is true, preferring receipt text", async () => {
       const { runner, client, stops } = makeRunner();
       client.isHonk = true;

@@ -421,7 +421,15 @@ export class GooseSessionRunner {
           try {
             this.connected = false;
             await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
-            if (this.closed) {
+            if (this.closed || turn.abandoned) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+            if (!this.opts.client.isHonk) {
+              this.log("reconnected endpoint is not honkd, not resending prompt", {
+                sessionId: this.sessionId,
+                commandId,
+              });
               await this.finishTurn(turn, undefined, err);
               return;
             }
