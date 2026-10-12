@@ -1051,6 +1051,22 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("reports delivery_unknown honk cancel reason advising user to check before resending", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      client.finishTurn("cancelled", { honkReason: "delivery_unknown" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-stop-cancelled");
+      expect(stops[0]!.message).toContain(
+        "honkd could not confirm goose received this message; check the session before resending.",
+      );
+      expect(runner.isBusy()).toBe(false);
+    });
+
     it("retries connect with backoff when honkd is restarting, and delivers exactly one receipt upon reconnecting", async () => {
       const { runner, client, stops } = makeRunner({
         honkReconnectBudgetMs: 5_000,

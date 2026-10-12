@@ -885,6 +885,9 @@ export class GooseSessionRunner {
       } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "upstream_restart") {
         const detail = "goose restarted and the turn was cancelled.";
         message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "delivery_unknown") {
+        const detail = "honkd could not confirm goose received this message; check the session before resending.";
+        message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (message === "") {
         // A turn that ends with no assistant text is a real outcome (a pure tool
         // run, a refusal). Saying so beats an empty Telegram message, which the
