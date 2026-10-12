@@ -20,18 +20,15 @@
  * count of six missed the last three; they are enumerated in a test so the next
  * handler added to that file has to notice this file exists.
  *
- * WHAT GOOSE CAN AND CANNOT DO, measured against 1.48.0 on 2026-09-18
+ * WHAT GOOSE CAN AND CANNOT DO
  *
  * Most of these commands have no goose equivalent, and the honest answer is to
  * say so rather than to half-answer. `/interrupt` is the one worth being careful
- * about: goose's ACP surface has NO cancel method at all -- `session/cancel`,
- * `session/interrupt`, `session/abort`, `session/stop` and the `_goose/unstable`
- * spellings all return `-32601 Method not found`, and a turn survived a
- * notification-form cancel. (The same 1.48.0 note said a turn also survived a
- * client disconnect; on patched-1.54.0.3 it does not -- closing the WebSocket
- * cancels the run, which is what /kill now does in effect. Bead pigeon-jlb6.)
- * pigeon sends no cancel, so a running goose turn cannot be stopped from pigeon
- * short of /kill. Claiming otherwise would fail at precisely the
+ * about: measured against 1.48.0, goose had no cancel method. On patched-1.54,
+ * goose honours the notification-form `session/cancel` (verified live 2026-10-12).
+ * /kill sends `session/cancel` against honkd and bare goose and closes the session.
+ * On /interrupt pigeon sends no cancel, so a running goose turn cannot be stopped
+ * from pigeon short of /kill. Claiming otherwise would fail at precisely the
  * moment the human needs it most, so the reply says what is true and points at
  * the one lever that does exist.
  */
@@ -88,10 +85,10 @@ export function gooseControlVerdict(
       return {
         kind: "refuse",
         reply:
-          "goose has no interrupt in pigeon: pigeon cannot stop a turn that has started. "
+          "/interrupt cannot stop a turn that has started. "
           + "Sending a message now steers the running turn instead — the model "
-          + "decides whether to change course, so it is not a stop. To stop it for "
-          + "certain, use /kill.",
+          + "decides whether to change course, so it is not a stop. /kill asks goose to "
+          + "cancel the turn and stops pigeon tracking the session.",
       };
     case "compact":
       return {

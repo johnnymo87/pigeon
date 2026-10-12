@@ -78,6 +78,12 @@ class FakeClient {
   isClosed(): boolean {
     return this.closed;
   }
+  cancelCalls: string[] = [];
+  cancelImpl: ((sessionId: string) => void) | undefined;
+  cancel(sessionId: string): void {
+    this.cancelCalls.push(sessionId);
+    if (this.cancelImpl) this.cancelImpl(sessionId);
+  }
   /** Answers by default; tests set pingImpl to model a dead socket. */
   pingImpl: (() => Promise<void>) | undefined;
   pings = 0;
@@ -1691,6 +1697,174 @@ describe("GooseSessionRunner liveness probing", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe("GooseSessionRunner.cancel()", () => {
+    it("when client is connected and not closed -> sends cancel with backend id and returns 'sent'", async () => {
+      const { runner, client, stops } = makeRunner();
+      // Connect runner by delivering a prompt
+      await runner.deliver("c1", "hello");
+      expect(client.connected).toBe(true);
+      expect(client.isClosed()).toBe(false);
+
+      const res = await runner.cancel();
+      expect(res).toBe("sent");
+      // Check that cancel was called with the backend sessionId
+      expect(client.cancelCalls).toEqual(["20260918_1"]);
+      // Does not emit notifications
+      expect(stops).toHaveLength(0);
+      // Does not close the client or change turn directly (drop/close handles that)
+      expect(client.isClosed()).toBe(false);
+    });
+
+    it("when client is connected and cancel throws -> returns 'failed'", async () => {
+      const { runner, client } = makeRunner();
+      await runner.deliver("c1", "hello");
+      client.cancelImpl = () => {
+        throw new Error("transport send failed");
+      };
+
+      const res = await runner.cancel();
+      expect(res).toBe("failed");
+    });
+
+    it("when not connected and client.isHonk is true -> connects and sends cancel, returns 'sent'", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      expect(client.connected).toBe(false);
+
+      const res = await runner.cancel();
+      expect(res).toBe("sent");
+      expect(client.connectCalls).toBe(1);
+      expect(client.cancelCalls).toEqual(["20260918_1"]);
+      expect(stops).toHaveLength(0);
+    });
+
+    it("when not connected and client is bare goose (isHonk false) -> connects, sends nothing, returns 'no-connection'", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+      expect(client.connected).toBe(false);
+
+      const res = await runner.cancel();
+      expect(res).toBe("no-connection");
+      expect(client.connectCalls).toBe(1);
+      expect(client.cancelCalls).toHaveLength(0);
+      expect(stops).toHaveLength(0);
+    });
+
+    it("when not connected and connect fails -> returns 'failed'", async () => {
+      const { runner, client } = makeRunner();
+      client.connectImpl = async () => {
+        throw new Error("connection refused");
+      };
+
+      const res = await runner.cancel();
+      expect(res).toBe("failed");
+      expect(client.cancelCalls).toHaveLength(0);
+    });
+
+    it("when not connected and connect times out (>3s) -> bounds connect and returns 'failed'", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner();
+        client.connectImpl = () => new Promise(() => {}); // hangs indefinitely
+
+        const cancelPromise = runner.cancel();
+        // Advance past 3s timeout
+        await vi.advanceTimersByTimeAsync(3_500);
+
+        const res = await cancelPromise;
+        expect(res).toBe("failed");
+        expect(client.cancelCalls).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not start a turn, change turn state, or emit notifications", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+
+      await runner.cancel();
+
+      expect(runner.isBusy()).toBe(false);
+      expect(stops).toHaveLength(0);
+      expect(client.prompts).toHaveLength(0);
+    });
+
+    it("cancels during honk reconnect backoff: wakes sleep, sends cancel, and sends NO resend prompt", async () => {
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 30_000,
+        honkReconnectInitialDelayMs: 5_000,
+      });
+      client.isHonk = true;
+
+      await runner.deliver("c1", "initial-prompt");
+      expect(client.prompts).toEqual(["initial-prompt"]);
+
+      // Turn disconnects mid-flight
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Runner catches DisconnectedDuringTurn and attempts first reconnect.
+      // Make the first connect attempt fail so it enters backoff sleep.
+      let connectAttempt = 0;
+      let resolveSecondConnect: (() => void) | undefined;
+      client.connectImpl = async () => {
+        connectAttempt++;
+        if (connectAttempt === 1) {
+          throw new Error("honkd temporarily down");
+        }
+        await new Promise<void>((r) => {
+          resolveSecondConnect = r;
+        });
+      };
+
+      // Let the first failed connect run and enter backoff sleep
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Now the loop is sleeping in backoff! Trigger cancel()!
+      const cancelPromise = runner.cancel();
+
+      // cancel() sets cancelRequested, cancels sleep, and calls ensureConnected().
+      await new Promise((r) => setTimeout(r, 50));
+      expect(resolveSecondConnect).toBeDefined();
+
+      // Resolve the second connect
+      resolveSecondConnect!();
+
+      // cancel() should complete with "sent"
+      const cancelOutcome = await cancelPromise;
+      expect(cancelOutcome).toBe("sent");
+      expect(client.cancelCalls).toEqual(["20260918_1"]);
+
+      // Await turn settled
+      await runner.settled();
+
+      // Verify: NO second session/prompt was sent and NO stop notification posted!
+      expect(client.prompts).toEqual(["initial-prompt"]);
+      expect(stops).toHaveLength(0);
+    });
+
+    it("cancel() when client already closed: attempts reconnect; if reconnect fails returns 'failed'", async () => {
+      const { runner, client } = makeRunner();
+      client.close();
+      client.connectImpl = async () => {
+        throw new Error("cannot connect");
+      };
+
+      const res = await runner.cancel();
+      expect(res).toBe("failed");
+    });
+
+    it("cancel() when client already closed: attempts reconnect; if bare goose returns 'no-connection'", async () => {
+      const { runner, client } = makeRunner();
+      client.close();
+      client.isHonk = false;
+
+      const res = await runner.cancel();
+      expect(res).toBe("no-connection");
     });
   });
 });

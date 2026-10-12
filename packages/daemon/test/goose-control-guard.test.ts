@@ -41,17 +41,17 @@ describe("gooseControlVerdict", () => {
   it("does not let the routable check override the goose answers", () => {
     // goose sessions are also not opencode-routable; they keep their own replies.
     expect(gooseControlVerdict("kill", "s", lookup(GOOSE_BACKEND_KIND, false)).kind).toBe("kill");
-    expect((gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND, false)) as { reply: string }).reply).toMatch(/no interrupt/i);
+    expect((gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND, false)) as { reply: string }).reply).toMatch(/cannot stop/i);
   });
 
   it("refuses /interrupt without pretending to have stopped anything", () => {
-    // pigeon sends goose no cancel. A reply that implied the turn had been
+    // on /interrupt pigeon sends goose no cancel. A reply that implied the turn had been
     // stopped would mislead the human at the exact moment they are trying to
     // stop something expensive or destructive.
     const v = gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND));
     expect(v.kind).toBe("refuse");
     const reply = (v as { reply: string }).reply;
-    expect(reply).toMatch(/no interrupt/i);
+    expect(reply).toMatch(/cannot stop/i);
     expect(reply).toMatch(/\/kill/);
     // It must not claim a steer is a stop.
     expect(reply).toMatch(/not a stop/i);

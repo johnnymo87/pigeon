@@ -46,6 +46,7 @@ class StubClient {
   activeRunId(): string | undefined {
     return undefined;
   }
+  cancel(): void {}
   close(): void {}
   finish(stopReason = "end_turn"): void {
     this.resolve?.({ kind: "receipt", stopReason });
