@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { GooseSessionRunner, GooseRunnerRegistry } from "../src/goose/session-runner.js";
+import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
+import { DisconnectedDuringTurn } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
 
 /**
@@ -251,6 +252,45 @@ describe("GooseSessionRunner failure containment", () => {
     expect(stops[0]!.event).toBe("Error");
     expect(String(stops[0]!.message)).toContain("disconnected during turn");
     expect(runner.isBusy()).toBe(false);
+  });
+
+  it("tells the human a disconnect CANCELLED the turn, and resends nothing", async () => {
+    // Measured against goose patched-1.54.0.3 (and honk m0-findings T5): when an
+    // ACP WebSocket closes, goose cancels every run that connection started --
+    // the tool call in flight is not recorded, no reply is ever written. The old
+    // notice said only that the prompt "may" be persisted, and the shutdown and
+    // stall notices said the turn would FINISH on goose's side, which sent the
+    // human off to wait for an answer that was never coming.
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "build the thing");
+    runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "Starting the build." } });
+    client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+    await runner.settled();
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.event).toBe("Error");
+    expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+    const msg = String(stops[0]!.message);
+    expect(msg).toContain("Starting the build.");
+    expect(msg).toMatch(/cancel/i);
+    expect(msg).toMatch(/not resent|nothing was resent/i);
+    expect(msg).not.toMatch(/will finish|still running|may already be persisted/i);
+    // Never an automatic resend: one prompt, and the session is free again.
+    expect(client.prompts).toEqual(["build the thing"]);
+    expect(runner.isBusy()).toBe(false);
+
+    // The human's next message is a fresh turn on a fresh connection.
+    client.dropSocket();
+    await runner.deliver("c2", "continue");
+    expect(client.prompts).toEqual(["build the thing", "continue"]);
+    expect(client.connectCalls).toBe(2);
+  });
+
+  it("does not promise that a turn outlives pigeon shutting down", () => {
+    const notice = gooseShutdownNotice("gse_1");
+    expect(notice).toContain("gse_1");
+    expect(notice).toMatch(/cancel/i);
+    expect(notice).not.toMatch(/will finish|finish on its side/i);
   });
 
   it("survives postStop throwing, and still clears the turn", async () => {
@@ -586,6 +626,10 @@ describe("GooseSessionRunner idle watchdog", () => {
     expect(stops).toHaveLength(1);
     expect(stops[0]!.event).toBe("Error");
     expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+    // Closing the socket cancels any run goose still had going for it, so the
+    // notice must not tell the human to wait for it to finish.
+    expect(String(stops[0]!.message)).not.toMatch(/will finish/i);
+    expect(String(stops[0]!.message)).toMatch(/cancel/i);
     // The session must be usable again -- that is the whole point.
     expect(runner.isBusy()).toBe(false);
     // And the socket is dropped so the next delivery reconnects.

@@ -41,7 +41,7 @@ import { gooseControlVerdict } from "./goose/control-guard.js";
 import { GooseAcpClient } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
-import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
+import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice } from "./goose/session-runner.js";
 import { startSessionReaper } from "./session-reaper";
 import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
 import type { TgEntity } from "./telegram-message";
@@ -1121,11 +1121,13 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
 
-  // Goose turns outlive this process. There is no cancel on goose's ACP surface
-  // and a turn survives a client disconnect, so a turn in flight right now WILL
-  // finish -- but its receipt arrives on a socket that is about to close, so
-  // nobody will ever report it. Telling the human beats their message appearing
-  // to vanish, which is indistinguishable from a bug in the adapter.
+  // Goose turns do NOT outlive this process: exiting closes each runner's
+  // WebSocket, and goose cancels every run a connection started when it closes
+  // (measured on patched-1.54.0.3, bead pigeon-jlb6). So a turn in flight right
+  // now is about to be cancelled, and no receipt will ever come. Telling the
+  // human beats their message appearing to vanish -- and telling them it will
+  // "finish on goose's side", as this used to, is worse than either, because it
+  // sends them off to wait for work that is no longer happening.
   const busy = gooseRunners?.busySessionIds() ?? [];
   if (busy.length > 0 && config.telegramChatId) {
     console.warn(`[pigeon-daemon] ${busy.length} goose turn(s) in flight at shutdown: ${busy.join(", ")}`);
@@ -1133,9 +1135,7 @@ async function shutdown(signal: string): Promise<void> {
       try {
         await sendTelegramMessage(
           config.telegramChatId,
-          `pigeon is restarting while a goose turn was running on ${sessionId}. `
-            + `goose cannot be interrupted, so the turn will finish on its side, but its `
-            + `result will not be reported here. Send /status or ask again once it is done.`,
+          gooseShutdownNotice(sessionId),
           { messageThreadId: undefined },
         );
       } catch (err) {

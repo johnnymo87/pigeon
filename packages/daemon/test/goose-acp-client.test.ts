@@ -127,9 +127,13 @@ describe("GooseAcpClient", () => {
       await expect(inFlight).rejects.toBeInstanceOf(DisconnectedDuringTurn);
       await inFlight.catch((e: DisconnectedDuringTurn) => {
         expect(e.sessionId).toBe("sess-1");
-        // The prompt is already persisted in goose's history with no run.
-        // The message has to say so -- that is the whole point of the class.
-        expect(e.message).toMatch(/may already be persisted|no turn/i);
+        // goose cancels a connection's runs when it closes (measured on
+        // patched-1.54.0.3; honk m0-findings T5), leaving the prompt in history
+        // unanswered. The message has to say so -- that is the whole point of
+        // the class -- and must not hedge it into "may".
+        expect(e.message).toMatch(/cancel/i);
+        expect(e.message).toMatch(/NOT resent/);
+        expect(e.message).not.toMatch(/may already be persisted/i);
       });
     });
 

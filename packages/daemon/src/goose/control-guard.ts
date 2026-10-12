@@ -26,9 +26,12 @@
  * say so rather than to half-answer. `/interrupt` is the one worth being careful
  * about: goose's ACP surface has NO cancel method at all -- `session/cancel`,
  * `session/interrupt`, `session/abort`, `session/stop` and the `_goose/unstable`
- * spellings all return `-32601 Method not found`, and a turn survives both a
- * notification-form cancel and a full client disconnect. A running goose turn
- * cannot be stopped from pigeon. Claiming otherwise would fail at precisely the
+ * spellings all return `-32601 Method not found`, and a turn survived a
+ * notification-form cancel. (The same 1.48.0 note said a turn also survived a
+ * client disconnect; on patched-1.54.0.3 it does not -- closing the WebSocket
+ * cancels the run, which is what /kill now does in effect. Bead pigeon-jlb6.)
+ * pigeon sends no cancel, so a running goose turn cannot be stopped from pigeon
+ * short of /kill. Claiming otherwise would fail at precisely the
  * moment the human needs it most, so the reply says what is true and points at
  * the one lever that does exist.
  */
@@ -85,8 +88,7 @@ export function gooseControlVerdict(
       return {
         kind: "refuse",
         reply:
-          "goose has no interrupt: this version exposes no way to stop a turn "
-          + "that has started, and the turn keeps running even if pigeon disconnects. "
+          "goose has no interrupt in pigeon: pigeon cannot stop a turn that has started. "
           + "Sending a message now steers the running turn instead — the model "
           + "decides whether to change course, so it is not a stop. To stop it for "
           + "certain, use /kill.",
