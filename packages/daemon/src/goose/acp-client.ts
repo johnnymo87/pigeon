@@ -500,7 +500,7 @@ export class GooseAcpClient {
       sessionId,
       prompt: [{ type: "text", text }],
     };
-    if (options?.clientReqId !== undefined) {
+    if (this.honk && options?.clientReqId !== undefined) {
       params._meta = { honk: { client_req_id: options.clientReqId } };
     }
     const res = await this.call(

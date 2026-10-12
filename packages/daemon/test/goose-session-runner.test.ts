@@ -371,6 +371,19 @@ describe("GooseSessionRunner failure containment", () => {
     expect(msg).toBe("a".repeat(100) + notice);
   });
 
+  it("does not split a surrogate pair when capping receipt.text", async () => {
+    const { runner, client, stops } = makeRunner({ maxTranscriptBytes: 100 });
+    await runner.deliver("c1", "x");
+    const textWithEmoji = "a".repeat(99) + "🦀" + "b".repeat(50);
+    client.finishTurn("end_turn", { text: textWithEmoji });
+    await runner.settled();
+
+    const msg = String(stops[0]!.message);
+    const notice = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+    expect(msg.endsWith(notice)).toBe(true);
+    expect(msg).toBe("a".repeat(99) + notice);
+  });
+
   it("ignores tool chatter in the reported message but counts it as liveness", async () => {
     const { runner, client, stops } = makeRunner();
     await runner.deliver("c1", "x");

@@ -856,7 +856,12 @@ export class GooseSessionRunner {
       let message: string;
       if (typeof receipt?.text === "string") {
         if (receipt.text.length > cap) {
-          message = receipt.text.slice(0, cap) + TRUNCATION_NOTICE;
+          let sliceEnd = cap;
+          const c = receipt.text.charCodeAt(sliceEnd - 1);
+          if (c >= 0xd800 && c <= 0xdbff) {
+            sliceEnd = cap - 1;
+          }
+          message = receipt.text.slice(0, sliceEnd) + TRUNCATION_NOTICE;
         } else {
           message = receipt.text;
         }

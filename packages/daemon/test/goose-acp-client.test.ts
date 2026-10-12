@@ -920,11 +920,38 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       expect(client.isHonk).toBe(false);
     });
 
-    it("sends client_req_id in _meta.honk on session/prompt params when clientReqId is provided", async () => {
+    it("does not send _meta on bare goose session/prompt params even when clientReqId is provided", async () => {
       const peer = new FakePeer();
       autoHandshake(peer);
       const client = makeClient(peer);
       await client.connect();
+      expect(client.isHonk).toBe(false);
+
+      const p = client.prompt("sess-1", "do work", { clientReqId: "cmd-456" });
+      const req = peer.lastOf("session/prompt")!;
+      expect(req.params).toEqual({
+        sessionId: "sess-1",
+        prompt: [{ type: "text", text: "do work" }],
+      });
+      expect((req.params as Record<string, unknown>)._meta).toBeUndefined();
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("sends client_req_id in _meta.honk on session/prompt params when isHonk is true and clientReqId is provided", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0" } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+      expect(client.isHonk).toBe(true);
 
       const p = client.prompt("sess-1", "do work", { clientReqId: "cmd-456" });
       const req = peer.lastOf("session/prompt")!;
