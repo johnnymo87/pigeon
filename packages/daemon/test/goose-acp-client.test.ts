@@ -976,5 +976,25 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       });
       expect((receipt as { text?: string }).text).toBeUndefined();
     });
+
+    it("parses _meta.honk.reason on cancelled prompt reply when present", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "do work", { clientReqId: "cmd-789" });
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, {
+        stopReason: "cancelled",
+        _meta: { honk: { reason: "not_delivered" } },
+      });
+      const receipt = await p;
+      expect(receipt).toEqual({
+        kind: "receipt",
+        stopReason: "cancelled",
+        honkReason: "not_delivered",
+      });
+    });
   });
 });

@@ -726,7 +726,7 @@ export class GooseSessionRunner {
    */
   private async finishTurn(
     turn: Turn,
-    receipt: { stopReason?: string; text?: string } | undefined,
+    receipt: { stopReason?: string; text?: string; honkReason?: string } | undefined,
     err: unknown,
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
@@ -785,6 +785,12 @@ export class GooseSessionRunner {
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "not_delivered") {
+        const detail = "The message was not delivered; please send it again.";
+        message = message === "" ? detail : `${message}\n\n${detail}`;
+      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "upstream_restart") {
+        const detail = "goose restarted and the turn was cancelled.";
         message = message === "" ? detail : `${message}\n\n${detail}`;
       } else if (message === "") {
         // A turn that ends with no assistant text is a real outcome (a pure tool

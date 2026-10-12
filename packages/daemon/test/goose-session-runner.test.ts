@@ -944,6 +944,35 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("reports not_delivered honk cancel reason with advice to send again", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      client.finishTurn("cancelled", { honkReason: "not_delivered" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-stop-cancelled");
+      expect(stops[0]!.message).toMatch(/message was not delivered/i);
+      expect(stops[0]!.message).toMatch(/send it again/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("reports upstream_restart honk cancel reason stating goose restarted", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      client.finishTurn("cancelled", { honkReason: "upstream_restart" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-stop-cancelled");
+      expect(stops[0]!.message).toMatch(/goose restarted and the turn was cancelled/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
     it("falls back to the #168 honest-failure report once if the resend also fails", async () => {
       const { runner, client, stops } = makeRunner();
       client.isHonk = true;

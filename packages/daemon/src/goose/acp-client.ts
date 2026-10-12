@@ -61,6 +61,8 @@ export interface GooseReceipt {
   usage?: unknown;
   /** Authoritative full turn text from honkd (`_meta.honk.text`) when present. */
   text?: string;
+  /** Honk cancel reason from `_meta.honk.reason` when present. */
+  honkReason?: string;
 }
 /** Session already has a run; use {@link GooseAcpClient.steer} with this id. */
 export interface GooseBusy {
@@ -514,12 +516,15 @@ export class GooseAcpClient {
       throw new GooseProtocolError(-1, "session/prompt returned no stopReason");
     }
     this.runIds.delete(sessionId);
-    const honkText = (res.result?._meta as { honk?: { text?: unknown } } | undefined)?.honk?.text;
+    const honk = (res.result?._meta as { honk?: { text?: unknown; reason?: unknown } } | undefined)?.honk;
+    const honkText = honk?.text;
+    const honkReason = honk?.reason;
     return {
       kind: "receipt",
       stopReason,
       usage: res.result?.usage,
       ...(typeof honkText === "string" ? { text: honkText } : {}),
+      ...(typeof honkReason === "string" ? { honkReason } : {}),
     };
   }
 
