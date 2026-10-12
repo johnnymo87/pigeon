@@ -140,6 +140,14 @@ export interface GooseSessionRunnerOptions {
   turnIdleTimeoutMs?: number;
   /** Inactivity period after which an idle socket is closed. Defaults to 10 minutes. 0 disables. */
   idleSocketTimeoutMs?: number;
+  /** Total time budget for retrying reconnection to honkd. Defaults to 2 minutes (~120s). */
+  honkReconnectBudgetMs?: number;
+  /** Initial delay before retrying connect to honkd. Defaults to 250ms. */
+  honkReconnectInitialDelayMs?: number;
+  /** Max delay between reconnect attempts. Defaults to 5s. */
+  honkReconnectMaxDelayMs?: number;
+  /** Optional injectable sleep function for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface Turn {
@@ -174,6 +182,10 @@ interface Turn {
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+
+const DEFAULT_HONK_RECONNECT_BUDGET_MS = 120_000;
+const DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS = 250;
+const DEFAULT_HONK_RECONNECT_MAX_DELAY_MS = 5_000;
 
 /**
  * How long a turn may emit NOTHING before pigeon stops believing in it.
@@ -243,6 +255,8 @@ export class GooseSessionRunner {
   private connected = false;
   private connecting: Promise<void> | undefined;
   private idleSocketTimer: ReturnType<typeof setTimeout> | undefined;
+  private sleepTimer: ReturnType<typeof setTimeout> | undefined;
+  private sleepResolve: (() => void) | undefined;
   private closed = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
@@ -425,18 +439,48 @@ export class GooseSessionRunner {
             clearTimeout(turn.idleTimer);
             turn.idleTimer = undefined;
           }
-          this.log("honk disconnect mid-turn, attempting single reconnect and resend", {
+          this.log("honk disconnect mid-turn, retrying reconnect and resend with backoff", {
             sessionId: this.sessionId,
             commandId,
           });
-          let resendAttempted = false;
-          try {
-            this.connected = false;
-            await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+
+          const budgetMs = this.opts.honkReconnectBudgetMs ?? DEFAULT_HONK_RECONNECT_BUDGET_MS;
+          const deadline = Date.now() + budgetMs;
+          let delay = this.opts.honkReconnectInitialDelayMs ?? DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS;
+          const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
+
+          while (Date.now() < deadline) {
             if (this.closed || turn.abandoned) {
               await this.finishTurn(turn, undefined, err);
               return;
             }
+            try {
+              this.connected = false;
+              await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+            } catch (connectErr) {
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) break;
+              const waitTime = Math.min(delay, maxDelay, remaining);
+              delay = Math.min(delay * 2, maxDelay);
+              this.log("honk reconnect attempt failed, backing off", {
+                sessionId: this.sessionId,
+                commandId,
+                delay: waitTime,
+                error: connectErr instanceof Error ? connectErr.message : String(connectErr),
+              });
+              await this.sleep(waitTime);
+              continue;
+            }
+
+            if (this.closed || turn.abandoned) {
+              await this.finishTurn(turn, undefined, err);
+              return;
+            }
+
             if (!this.opts.client.isHonk) {
               this.log("reconnected endpoint is not honkd, not resending prompt", {
                 sessionId: this.sessionId,
@@ -445,34 +489,62 @@ export class GooseSessionRunner {
               await this.finishTurn(turn, undefined, err);
               return;
             }
+
             turn.lastActivityAt = Date.now();
             this.armIdleTimer(turn);
-            resendAttempted = true;
             turn.resent = true;
-            const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
-            if (this.closed) {
-              await this.finishTurn(turn, undefined, err);
+
+            try {
+              const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              await this.onPromptOutcome(turn, text, outcome);
               return;
-            }
-            await this.onPromptOutcome(turn, text, outcome);
-            return;
-          } catch (resendErr) {
-            if (this.closed) {
-              await this.finishTurn(turn, undefined, err);
-              return;
-            }
-            this.log("honk reconnect or resend failed", {
-              sessionId: this.sessionId,
-              commandId,
-              error: resendErr instanceof Error ? resendErr.message : String(resendErr),
-            });
-            if (!resendAttempted) {
-              await this.finishTurn(turn, undefined, err);
-            } else {
+            } catch (resendErr) {
+              if (this.closed || turn.abandoned) {
+                await this.finishTurn(turn, undefined, err);
+                return;
+              }
+              if (resendErr instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+                if (turn.idleTimer) {
+                  clearTimeout(turn.idleTimer);
+                  turn.idleTimer = undefined;
+                }
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) break;
+                const waitTime = Math.min(delay, maxDelay, remaining);
+                delay = Math.min(delay * 2, maxDelay);
+                this.log("honk resend disconnected, backing off and retrying reconnect", {
+                  sessionId: this.sessionId,
+                  commandId,
+                  delay: waitTime,
+                });
+                await this.sleep(waitTime);
+                continue;
+              }
+              this.log("honk resend failed with non-disconnect error", {
+                sessionId: this.sessionId,
+                commandId,
+                error: resendErr instanceof Error ? resendErr.message : String(resendErr),
+              });
               await this.finishTurn(turn, undefined, resendErr);
+              return;
             }
-            return;
           }
+
+          this.log("honk reconnect budget exhausted, reporting lost contact", {
+            sessionId: this.sessionId,
+            commandId,
+            budgetMs,
+          });
+          await this.finishTurn(
+            turn,
+            undefined,
+            new Error("lost contact with honkd; the turn may still be running and its reply was not collected"),
+          );
+          return;
         }
         await this.finishTurn(turn, undefined, err);
       } finally {
@@ -694,6 +766,7 @@ export class GooseSessionRunner {
     if (turn.abandoned || this.turn !== turn) return;
     turn.abandoned = true;
     this.connected = false;
+    this.cancelSleep();
     try {
       this.opts.client.close();
     } catch {
@@ -912,8 +985,37 @@ export class GooseSessionRunner {
     }
   }
 
+  private async sleep(ms: number): Promise<void> {
+    if (this.opts.sleep) {
+      await this.opts.sleep(ms);
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.sleepResolve = resolve;
+      this.sleepTimer = setTimeout(() => {
+        this.sleepTimer = undefined;
+        this.sleepResolve = undefined;
+        resolve();
+      }, ms);
+      this.sleepTimer.unref?.();
+    });
+  }
+
+  private cancelSleep(): void {
+    if (this.sleepTimer) {
+      clearTimeout(this.sleepTimer);
+      this.sleepTimer = undefined;
+    }
+    if (this.sleepResolve) {
+      const resolve = this.sleepResolve;
+      this.sleepResolve = undefined;
+      resolve();
+    }
+  }
+
   close(): void {
     this.closed = true;
+    this.cancelSleep();
     this.clearIdleSocketTimer();
     // The timer is unref'd, so it cannot hold the process open -- but a runner
     // dropped from the registry should not leave one running against a turn

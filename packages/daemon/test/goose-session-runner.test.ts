@@ -1001,28 +1001,41 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
-    it("falls back to the #168 honest-failure report once if the resend also fails", async () => {
-      const { runner, client, stops } = makeRunner();
+    it("retries connect with backoff when honkd is restarting, and delivers exactly one receipt upon reconnecting", async () => {
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 5_000,
+        honkReconnectInitialDelayMs: 10,
+        honkReconnectMaxDelayMs: 50,
+      });
       client.isHonk = true;
       await runner.deliver("c1", "build");
 
+      // Mid-turn disconnect
       client.dropSocket();
+
+      let connectAttempts = 0;
+      client.connectImpl = async () => {
+        connectAttempts++;
+        if (connectAttempts < 3) {
+          throw new Error("ECONNREFUSED");
+        }
+        client.connected = true;
+        client.closed = false;
+      };
+
       client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
 
-      // Wait for the resend prompt to be issued
+      // Wait for resend prompt after retries
       await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+      expect(connectAttempts).toBe(3);
 
-      // Reconnect succeeded and resend prompt was issued. Now the resend also disconnects:
-      client.dropSocket();
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      // Now honkd replies with receipt
+      client.finishTurn("end_turn", { text: "reconnected build success" });
       await runner.settled();
 
-      // Must NOT retry again; reported once with #168 error
-      expect(client.prompts).toEqual(["build", "build"]);
       expect(stops).toHaveLength(1);
-      expect(stops[0]!.event).toBe("Error");
-      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
-      expect(stops[0]!.message).toMatch(/cancelled/i);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.message).toBe("reconnected build success");
       expect(runner.isBusy()).toBe(false);
     });
 
@@ -1076,39 +1089,17 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
-    it("reports honk resend disconnect with accurate notice stating one resend was attempted", async () => {
-      const { runner, client, stops } = makeRunner();
+    it("reports honk-specific lost contact message when reconnect budget is exhausted", async () => {
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 50,
+        honkReconnectInitialDelayMs: 10,
+        honkReconnectMaxDelayMs: 20,
+      });
       client.isHonk = true;
       await runner.deliver("c1", "build");
 
-      // First disconnect
-      client.dropSocket();
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
-
-      // Resend prompt issued
-      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
-
-      // Resend also disconnects
-      client.dropSocket();
-      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
-      await runner.settled();
-
-      expect(stops).toHaveLength(1);
-      expect(stops[0]!.event).toBe("Error");
-      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
-      expect(stops[0]!.message).toMatch(/one resend was attempted/i);
-      expect(stops[0]!.message).not.toMatch(/nothing was resent/i);
-      expect(runner.isBusy()).toBe(false);
-    });
-
-    it("falls back to the #168 honest-failure report once if reconnect fails", async () => {
-      const { runner, client, stops } = makeRunner();
-      client.isHonk = true;
-      await runner.deliver("c1", "build");
-
-      // Make reconnect fail
       client.connectImpl = async () => {
-        throw new Error("connection refused");
+        throw new Error("ECONNREFUSED");
       };
       client.dropSocket();
       client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
@@ -1117,7 +1108,73 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(client.prompts).toEqual(["build"]);
       expect(stops).toHaveLength(1);
       expect(stops[0]!.event).toBe("Error");
-      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(stops[0]!.message).toContain("lost contact with honkd; the turn may still be running and its reply was not collected");
+      expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("loops back to reconnect and resend when resend disconnects, succeeding on subsequent attempt", async () => {
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 5_000,
+        honkReconnectInitialDelayMs: 10,
+        honkReconnectMaxDelayMs: 50,
+      });
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect 1
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Resend 1 issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Resend 1 also disconnects
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Resend 2 issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build", "build"]));
+
+      // Resend 2 succeeds
+      client.finishTurn("end_turn", { text: "success after two disconnects" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.message).toBe("success after two disconnects");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("loops back to reconnect if resend itself disconnects, reporting honk-specific lost contact if budget exhausted", async () => {
+      const { runner, client, stops } = makeRunner({
+        honkReconnectBudgetMs: 80,
+        honkReconnectInitialDelayMs: 10,
+        honkReconnectMaxDelayMs: 20,
+      });
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for first resend prompt
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Resend prompt also disconnects
+      client.dropSocket();
+      // Make next reconnects fail until budget exhausted
+      client.connectImpl = async () => {
+        throw new Error("ECONNREFUSED");
+      };
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.message).toContain("lost contact with honkd; the turn may still be running and its reply was not collected");
+      expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
       expect(runner.isBusy()).toBe(false);
     });
 
