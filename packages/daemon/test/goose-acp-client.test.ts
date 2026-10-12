@@ -570,6 +570,7 @@ describe("GooseAcpClient", () => {
         "session/new",
         "session/prompt",
         "_goose/unstable/session/steer",
+        "session/cancel",
       ]);
     });
 
@@ -578,6 +579,57 @@ describe("GooseAcpClient", () => {
         expect(m).not.toMatch(/tools?\//);
         expect(m).not.toMatch(/call_tool/);
       }
+    });
+
+    it("sends session/cancel notification with no id and backend sessionId", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const beforeSentCount = peer.sent.length;
+      client.cancel("20261012_1");
+
+      expect(peer.sent.length).toBe(beforeSentCount + 1);
+      const frame = peer.sent[peer.sent.length - 1];
+      expect(frame).toEqual({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId: "20261012_1" },
+      });
+      expect(frame).not.toHaveProperty("id");
+    });
+
+    it("cancel() throws if client is not connected", () => {
+      const peer = new FakePeer();
+      const client = makeClient(peer);
+
+      expect(() => client.cancel("sess-1")).toThrow(/not connected/i);
+    });
+
+    it("cancel() throws if client is closed", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+      client.close();
+
+      expect(() => client.cancel("sess-1")).toThrow(/closed/i);
+    });
+
+    it("notify() refuses disallowed methods", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const notifyPrivate = (client as unknown as {
+        notify: (m: string, p: unknown) => void;
+      }).notify.bind(client);
+
+      expect(() => notifyPrivate("_goose/unstable/tools/call", { name: "shell" })).toThrow(
+        /disallowed method/,
+      );
     });
   });
 

@@ -42,6 +42,7 @@ import { GooseAcpClient } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice } from "./goose/session-runner.js";
+import { executeGooseKill } from "./goose/kill-control.js";
 import { startSessionReaper } from "./session-reaper";
 import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
 import type { TgEntity } from "./telegram-message";
@@ -288,27 +289,14 @@ async function handleGooseControl(
   const reply = (text: string) => send(msg.chatId, text);
   if (verdict.kind === "kill") {
     // Drops pigeon's side of the session, which is what the human is asking
-    // for: stop routing this to me. Dropping the runner closes its WebSocket,
-    // and goose cancels a run when the connection that started it closes
-    // (bead pigeon-jlb6) -- so this also stops an in-flight turn, even though
-    // pigeon sends goose no cancel.
-    const isHonk = gooseRunners?.peek(msg.sessionId)?.isHonk;
-    gooseRunners?.drop(msg.sessionId);
-    storage.sessions.delete(msg.sessionId);
-    storage.assignments.delete(msg.sessionId);
-    if (poller) {
-      try {
-        await poller.unregisterSession(msg.sessionId);
-      } catch (err) {
-        console.warn(`[index] onKill: goose session unregister failed for ${msg.sessionId}:`, err);
-      }
-    }
-    await reply(
-      isHonk
-        ? "Session closed. That dropped pigeon's connection to honkd; the turn may still be running in honkd; pigeon has stopped tracking the session."
-        : "Session closed. That dropped pigeon's connection to goose, which cancels "
-          + "any turn that was running; pigeon has stopped tracking the session.",
-    );
+    // for: stop routing this to me. Sends session/cancel against honkd and
+    // bare goose, then drops the runner to close the WebSocket.
+    await executeGooseKill(msg.sessionId, {
+      storage,
+      gooseRunners,
+      poller,
+      reply,
+    });
     return true;
   }
 

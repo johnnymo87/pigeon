@@ -561,6 +561,31 @@ export class GooseAcpClient {
     this.transport?.close();
   }
 
+  /**
+   * Sends a session/cancel notification frame to cancel an in-flight turn.
+   * Throws if the client is not connected or closed, like call().
+   */
+  cancel(sessionId: string): void {
+    this.notify("session/cancel", { sessionId });
+  }
+
+  private notify(method: string, params: Record<string, unknown>): void {
+    const transport = this.transport;
+    if (!transport) throw new Error("goose acp client is not connected");
+    // Fail loudly rather than writing into a closed socket, which is silent.
+    if (this.closed) throw new GooseProtocolError(-1, "goose acp connection is closed");
+    // Enforced, not merely declared: see ALLOWED_ACP_METHODS for why a
+    // tool-execution method must never appear here.
+    if (!(ALLOWED_ACP_METHODS as readonly string[]).includes(method)) {
+      throw new Error(
+        `goose acp client refused to send disallowed method ${method} `
+          + `(see ALLOWED_ACP_METHODS -- adding a tool-execution method is a trust `
+          + `boundary decision, not a code change)`,
+      );
+    }
+    transport.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+  }
+
   private call(
     method: string,
     params: Record<string, unknown>,
@@ -791,10 +816,15 @@ function refuse(options: PermissionParams["options"]): string | undefined {
  * So this client stays on the session-oriented surface and never acquires a
  * tool-execution capability. If a future change needs one, that is a trust
  * boundary decision for a human, not a diff.
+ *
+ * Human decision (2026-10-12): Added `session/cancel` to ALLOWED_ACP_METHODS.
+ * It cancels a turn and executes nothing. /kill on a goose session sends
+ * `session/cancel` against both honkd and bare goose, then closes the socket.
  */
 export const ALLOWED_ACP_METHODS = [
   "initialize",
   "session/new",
   "session/prompt",
   "_goose/unstable/session/steer",
+  "session/cancel",
 ] as const;

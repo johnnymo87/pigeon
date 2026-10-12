@@ -29,9 +29,10 @@
  * spellings all return `-32601 Method not found`, and a turn survived a
  * notification-form cancel. (The same 1.48.0 note said a turn also survived a
  * client disconnect; on patched-1.54.0.3 it does not -- closing the WebSocket
- * cancels the run, which is what /kill now does in effect. Bead pigeon-jlb6.)
- * pigeon sends no cancel, so a running goose turn cannot be stopped from pigeon
- * short of /kill. Claiming otherwise would fail at precisely the
+ * cancels the run, which is what /kill now does in effect, alongside sending
+ * session/cancel. Bead pigeon-jlb6.)
+ * On /interrupt pigeon sends no cancel, so a running goose turn cannot be stopped
+ * from pigeon short of /kill. Claiming otherwise would fail at precisely the
  * moment the human needs it most, so the reply says what is true and points at
  * the one lever that does exist.
  */

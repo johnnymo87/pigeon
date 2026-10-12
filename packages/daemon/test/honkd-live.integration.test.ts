@@ -14,6 +14,8 @@ import { execSync } from "node:child_process";
 const HONKD_URL = process.env.PIGEON_TEST_HONKD_URL;
 const HONKD_TOKEN = process.env.PIGEON_TEST_HONKD_TOKEN;
 const HONKD_RESTART_CMD = process.env.PIGEON_TEST_HONKD_RESTART_CMD;
+const GOOSE_URL = process.env.PIGEON_TEST_GOOSE_URL;
+const GOOSE_TOKEN = process.env.PIGEON_TEST_GOOSE_TOKEN;
 
 describe("honkd live integration with real pigeon client", () => {
   const runTest = HONKD_URL && HONKD_TOKEN ? it : it.skip;
@@ -123,6 +125,119 @@ describe("honkd live integration with real pigeon client", () => {
         expect(String(stopReports[0]!.message)).toContain("LIVE_TEST_RECOVERY_OK");
       } finally {
         runner.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runTest(
+    "cancels in-flight turn via runner.cancel(), prompt resolves with stopReason 'cancelled' well before completion",
+    async () => {
+      const tmpdir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "pigeon-honkd-cancel-test-"),
+      );
+      const stopReports: Array<Record<string, unknown>> = [];
+
+      const client = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      await client.connect();
+      expect(client.isHonk).toBe(true);
+      const backendSid = await client.newSession(tmpdir);
+
+      const runner = new GooseSessionRunner({
+        session: {
+          sessionId: `live-sess-cancel-${Date.now()}`,
+          backendKind: "goose",
+          backendSessionId: backendSid,
+        } as SessionRecord,
+        client,
+        postStop: async (body) => {
+          stopReports.push(body);
+        },
+        touch: () => {},
+      });
+
+      try {
+        const start = Date.now();
+        await runner.deliver(
+          `cmd-live-cancel-${Date.now()}`,
+          "Run this shell command: sleep 10 && echo LIVE_TEST_HONKD_CANCEL_FAILED",
+        );
+
+        // Wait for command to start running in goose
+        await new Promise((r) => setTimeout(r, 1500));
+
+        const cancelOutcome = await runner.cancel();
+        expect(cancelOutcome).toBe("sent");
+
+        await runner.settled();
+        const elapsed = Date.now() - start;
+
+        // Settles well before the 10s sleep
+        expect(elapsed).toBeLessThan(7000);
+        expect(stopReports).toHaveLength(1);
+        expect(stopReports[0]!.event).toBe("Error");
+        expect(stopReports[0]!.error_kind).toBe("goose-stop-cancelled");
+        expect(String(stopReports[0]!.message)).not.toContain("LIVE_TEST_HONKD_CANCEL_FAILED");
+      } finally {
+        runner.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+});
+
+describe("bare sandbox goose live integration with real pigeon client", () => {
+  const runBareTest = GOOSE_URL && GOOSE_TOKEN ? it : it.skip;
+
+  runBareTest(
+    "cancels in-flight turn against bare sandbox goose via session/cancel",
+    async () => {
+      const tmpdir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "pigeon-goose-cancel-test-"),
+      );
+      const client = new GooseAcpClient({
+        url: GOOSE_URL!,
+        transportFactory: webSocketTransport(GOOSE_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      try {
+        await client.connect();
+        expect(client.isHonk).toBe(false);
+
+        const sid = await client.newSession(tmpdir);
+        expect(sid).toBeTruthy();
+
+        const start = Date.now();
+        const promptPromise = client.prompt(
+          sid,
+          "Run this shell command: sleep 10 && echo LIVE_TEST_BARE_CANCEL_FAILED",
+        );
+
+        // Wait for command to start running in goose
+        await new Promise((r) => setTimeout(r, 1500));
+
+        client.cancel(sid);
+        const outcome = await promptPromise;
+        const elapsed = Date.now() - start;
+
+        expect(outcome.kind).toBe("receipt");
+        const receipt = outcome as GooseReceipt;
+        expect(receipt.stopReason).toBe("cancelled");
+        expect(elapsed).toBeLessThan(7000);
+      } finally {
+        client.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
       }
     },

@@ -31,7 +31,7 @@
  *  - The active run id arrives in `session_info_update._meta.goose.activeRunId`
  *    as soon as a turn starts, so a second message can STEER the running turn
  *    without first provoking a busy rejection.
- *  - pigeon sends goose no cancel, so this module has no cancellation path.
+ *  - /kill sends session/cancel via cancel() (against both honkd and bare goose).
  *  - A turn does NOT survive its WebSocket closing against bare goose.
  *    Re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
  *    also honk docs/spike/m0-findings.md T5), goose cancels every run a
@@ -117,6 +117,7 @@ export interface RunnerClient {
   prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
+  cancel?(sessionId: string): void;
   close(): void;
 }
 
@@ -231,6 +232,12 @@ const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
+ * Timeout for connect attempt during cancel().
+ * Never let /kill hang.
+ */
+const CANCEL_CONNECT_TIMEOUT_MS = 3_000;
+
+/**
  * Deadline for every await on the delivery path that is NOT the turn itself.
  *
  * The contract in adapters/types.ts requires it: "Bound every await inside
@@ -266,6 +273,7 @@ export class GooseSessionRunner {
   /** The most recent turn's continuation. See settled(). */
   private lastSettled: Promise<void> = Promise.resolve();
   private connected = false;
+  private connectedOnce = false;
   private connecting: Promise<void> | undefined;
   private idleSocketTimer: ReturnType<typeof setTimeout> | undefined;
   private sleepTimer: ReturnType<typeof setTimeout> | undefined;
@@ -282,6 +290,10 @@ export class GooseSessionRunner {
 
   get isHonk(): boolean {
     return Boolean(this.opts.client.isHonk);
+  }
+
+  get isHonkKnown(): boolean {
+    return Boolean(this.opts.client.isHonk) || this.connectedOnce;
   }
 
   /**
@@ -958,6 +970,7 @@ export class GooseSessionRunner {
             throw new Error("goose runner is closed");
           }
           this.connected = true;
+          this.connectedOnce = true;
         })
         .catch((err: unknown) => {
           // A handshake that timed out may have left a socket half-open. Close it
@@ -1042,6 +1055,47 @@ export class GooseSessionRunner {
       this.sleepResolve = undefined;
       resolve();
     }
+  }
+
+  /**
+   * Sends session/cancel to goose/honkd for this session.
+   *
+   * If the client is connected and not closed, sends cancel with the backend id
+   * and returns "sent". Catches a throw and returns "failed".
+   *
+   * If not connected, connects with a bounded timeout (~3s):
+   * - honkd (client.isHonk): turn may still be running; sends cancel -> "sent"
+   * - bare goose: no connection means no turn; sends nothing -> "no-connection"
+   * - failed or timed-out connect -> "failed"
+   *
+   * Leaves socket closing to close() / registry.drop().
+   */
+  async cancel(): Promise<"sent" | "no-connection" | "failed"> {
+    if (this.connected && !this.opts.client.isClosed() && !this.closed) {
+      try {
+        this.opts.client.cancel?.(this.backendSessionId);
+        return "sent";
+      } catch {
+        return "failed";
+      }
+    }
+
+    try {
+      await withDeadline(this.ensureConnected(), CANCEL_CONNECT_TIMEOUT_MS, "connect");
+    } catch {
+      return "failed";
+    }
+
+    if (this.opts.client.isHonk) {
+      try {
+        this.opts.client.cancel?.(this.backendSessionId);
+        return "sent";
+      } catch {
+        return "failed";
+      }
+    }
+
+    return "no-connection";
   }
 
   close(): void {

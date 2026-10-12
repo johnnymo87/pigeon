@@ -45,7 +45,7 @@ describe("gooseControlVerdict", () => {
   });
 
   it("refuses /interrupt without pretending to have stopped anything", () => {
-    // pigeon sends goose no cancel. A reply that implied the turn had been
+    // on /interrupt pigeon sends goose no cancel. A reply that implied the turn had been
     // stopped would mislead the human at the exact moment they are trying to
     // stop something expensive or destructive.
     const v = gooseControlVerdict("interrupt", "s", lookup(GOOSE_BACKEND_KIND));
