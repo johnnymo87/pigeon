@@ -874,4 +874,107 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
     expect(String(err)).toMatch(/summon/);
     expect(String(err)).toMatch(/todo/);
   });
+
+  describe("honk relay integration (Task B1)", () => {
+    it("records isHonk = true when initialize response carries _meta.honk", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0" } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      expect(client.isHonk).toBe(false);
+      await client.connect();
+      expect(client.isHonk).toBe(true);
+    });
+
+    it("records isHonk = false when initialize response has no _meta.honk", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+      expect(client.isHonk).toBe(false);
+    });
+
+    it("sends client_req_id in _meta.honk on session/prompt params when clientReqId is provided", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "do work", { clientReqId: "cmd-456" });
+      const req = peer.lastOf("session/prompt")!;
+      expect(req.params).toEqual({
+        sessionId: "sess-1",
+        prompt: [{ type: "text", text: "do work" }],
+        _meta: { honk: { client_req_id: "cmd-456" } },
+      });
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("does not send _meta.honk on session/prompt params when clientReqId is omitted", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "do work");
+      const req = peer.lastOf("session/prompt")!;
+      expect(req.params).toEqual({
+        sessionId: "sess-1",
+        prompt: [{ type: "text", text: "do work" }],
+      });
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("prefers _meta.honk.text on prompt reply when present", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "do work", { clientReqId: "cmd-789" });
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, {
+        stopReason: "end_turn",
+        usage: { totalTokens: 50 },
+        _meta: { honk: { text: "authoritative honk text" } },
+      });
+      const receipt = await p;
+      expect(receipt).toEqual({
+        kind: "receipt",
+        stopReason: "end_turn",
+        usage: { totalTokens: 50 },
+        text: "authoritative honk text",
+      });
+    });
+
+    it("leaves receipt text undefined when _meta.honk.text is absent", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "do work");
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, {
+        stopReason: "end_turn",
+        usage: { totalTokens: 10 },
+      });
+      const receipt = await p;
+      expect(receipt).toEqual({
+        kind: "receipt",
+        stopReason: "end_turn",
+        usage: { totalTokens: 10 },
+      });
+      expect((receipt as { text?: string }).text).toBeUndefined();
+    });
+  });
 });

@@ -31,17 +31,18 @@
  *    because losing the race is an ordinary outcome.
  *
  * 4. DISCONNECT CANCELS THE TURN (§17 Q6, hazard R1). This is the dangerous one.
- *    When a WebSocket closes, goose shuts that connection's agent down, which
+ *    When a WebSocket closes, bare goose shuts that connection's agent down, which
  *    drops the in-flight `session/prompt` and CANCELS its run (goose's
  *    `ActiveRunDropGuard`). Re-measured on patched-1.54.0.3, 2026-10-12, with a
  *    run parked in a `sleep` tool call: after the close the model was never
  *    called again, and the session history held the user message and nothing
  *    else -- not even the tool call that had started. Same result for a clean
- *    close and for the client process exiting. A pigeon restart mid-turn is a
- *    ROUTINE event, so this gets its own error class rather than a generic
- *    throw, and it says out loud that the turn is gone.
- *    Nothing here retries automatically: the prompt is still in goose's history,
- *    so a blind replay puts it there twice. Retry is the human's decision.
+ *    close and for the client process exiting. Through honkd (a durable ACP relay),
+ *    turns survive a disconnect and continue running.
+ *    Against bare goose, nothing here retries automatically: the prompt is still
+ *    in goose's history, so a blind replay puts it there twice. Retry is the human's
+ *    decision. Against honkd (when isHonk is true), pigeon reconnects once and
+ *    resends with the same client_req_id, which honkd attaches to the in-flight turn.
  */
 
 export interface AcpTransport {
@@ -58,6 +59,8 @@ export interface GooseReceipt {
   kind: "receipt";
   stopReason: string;
   usage?: unknown;
+  /** Authoritative full turn text from honkd (`_meta.honk.text`) when present. */
+  text?: string;
 }
 /** Session already has a run; use {@link GooseAcpClient.steer} with this id. */
 export interface GooseBusy {
@@ -292,6 +295,7 @@ export class GooseAcpClient {
    * such wait freezes command delivery for every session on the machine.
    */
   private closed = false;
+  private honk = false;
   private nextId = 0;
   private pending = new Map<string, Pending>();
   /** Last run id observed for a session, learned from a busy rejection. */
@@ -308,6 +312,11 @@ export class GooseAcpClient {
   /** True once the socket has closed; the caller should discard this client. */
   isClosed(): boolean {
     return this.closed;
+  }
+
+  /** True when the connected peer is honkd (learned from initialize _meta.honk). */
+  get isHonk(): boolean {
+    return this.honk;
   }
 
   async connect(): Promise<void> {
@@ -328,11 +337,12 @@ export class GooseAcpClient {
       if (this.transport !== transport) return;
       this.onClose(code, reason);
     });
-    await this.call("initialize", {
+    const initRes = await this.call("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
-    this.log("goose acp connected", { url: this.opts.url });
+    this.honk = Boolean((initRes.result?._meta as { honk?: unknown } | undefined)?.honk);
+    this.log("goose acp connected", { url: this.opts.url, isHonk: this.honk });
   }
 
   /**
@@ -469,10 +479,21 @@ export class GooseAcpClient {
    * Sends a prompt and waits for the TURN to end. May take minutes; that is
    * normal and is not a stall (see fact 1 in the file header).
    */
-  async prompt(sessionId: string, text: string): Promise<PromptOutcome> {
+  async prompt(
+    sessionId: string,
+    text: string,
+    options?: { clientReqId?: string },
+  ): Promise<PromptOutcome> {
+    const params: Record<string, unknown> = {
+      sessionId,
+      prompt: [{ type: "text", text }],
+    };
+    if (options?.clientReqId !== undefined) {
+      params._meta = { honk: { client_req_id: options.clientReqId } };
+    }
     const res = await this.call(
       "session/prompt",
-      { sessionId, prompt: [{ type: "text", text }] },
+      params,
       { sessionId, isTurn: true },
     );
     if (res.error) {
@@ -490,7 +511,13 @@ export class GooseAcpClient {
       throw new GooseProtocolError(-1, "session/prompt returned no stopReason");
     }
     this.runIds.delete(sessionId);
-    return { kind: "receipt", stopReason, usage: res.result?.usage };
+    const honkText = (res.result?._meta as { honk?: { text?: unknown } } | undefined)?.honk?.text;
+    return {
+      kind: "receipt",
+      stopReason,
+      usage: res.result?.usage,
+      ...(typeof honkText === "string" ? { text: honkText } : {}),
+    };
   }
 
   /** Injects into the RUNNING turn identified by `expectedRunId` (CAS). */
