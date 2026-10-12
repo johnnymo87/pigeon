@@ -32,17 +32,21 @@
  *    as soon as a turn starts, so a second message can STEER the running turn
  *    without first provoking a busy rejection.
  *  - pigeon sends goose no cancel, so this module has no cancellation path.
- *  - A turn does NOT survive its WebSocket closing. The 1.48.0 note here used to
- *    say it did; re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
+ *  - A turn does NOT survive its WebSocket closing against bare goose.
+ *    Re-measured on patched-1.54.0.3 (2026-10-12, bead pigeon-jlb6;
  *    also honk docs/spike/m0-findings.md T5), goose cancels every run a
  *    connection started the moment that connection closes -- a blip, the
  *    watchdog's own close(), or this daemon exiting. Nothing the turn had done
  *    yet (not even a started tool call) is recorded in the history; only the
- *    user's message is. So every notice below says "cancelled", never "it
- *    will finish on goose's side".
+ *    user's message is. So every notice for bare goose says "cancelled", never
+ *    "it will finish on goose's side".
+ *  - Through honkd (isHonk true), turns survive a client disconnect. On WS drop
+ *    mid-turn, pigeon reconnects once and resends the prompt with the same
+ *    client_req_id, which honkd attaches to the in-flight turn or returns the
+ *    stored reply.
  *  - A fresh connection can prompt an EXISTING session id and still has its
  *    history, so reconnecting is cheap and a daemon restart does not orphan a
- *    SESSION -- only the turn that was in flight.
+ *    SESSION -- only the turn that was in flight (on bare goose).
  */
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
@@ -84,9 +88,11 @@ export interface RunnerClient {
   connect(): Promise<void>;
   /** True once the socket has closed, so the runner knows to reconnect. */
   isClosed(): boolean;
+  /** True when connected to honkd. Bare goose is false. */
+  readonly isHonk?: boolean;
   /** Round-trips a cheap request; never settles on a dead socket. */
   ping(): Promise<void>;
-  prompt(sessionId: string, text: string): Promise<unknown>;
+  prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
   close(): void;
@@ -366,20 +372,45 @@ export class GooseSessionRunner {
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
-    this.lastSettled = turn.settled = this.opts.client
-      .prompt(this.backendSessionId, text)
-      .then(
-        (outcome) => this.onPromptOutcome(turn, text, outcome),
-        (err: unknown) => this.finishTurn(turn, undefined, err),
-      )
-      .catch((err: unknown) => {
-        // finishTurn is written not to throw. If it somehow does, this is the
-        // difference between a logged anomaly and a dead daemon.
-        this.log("goose runner: turn continuation threw", {
-          sessionId: this.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    this.lastSettled = turn.settled = (async () => {
+      try {
+        const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+        await this.onPromptOutcome(turn, text, outcome);
+      } catch (err) {
+        if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          this.log("honk disconnect mid-turn, attempting single reconnect and resend", {
+            sessionId: this.sessionId,
+            commandId,
+          });
+          try {
+            this.connected = false;
+            await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+            turn.lastActivityAt = Date.now();
+            this.armIdleTimer(turn);
+            const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
+            await this.onPromptOutcome(turn, text, outcome);
+            return;
+          } catch (resendErr) {
+            this.log("honk reconnect or resend failed", {
+              sessionId: this.sessionId,
+              commandId,
+              error: resendErr instanceof Error ? resendErr.message : String(resendErr),
+            });
+            const failureErr = resendErr instanceof DisconnectedDuringTurn ? resendErr : err;
+            await this.finishTurn(turn, undefined, failureErr);
+            return;
+          }
+        }
+        await this.finishTurn(turn, undefined, err);
+      }
+    })().catch((err: unknown) => {
+      // finishTurn is written not to throw. If it somehow does, this is the
+      // difference between a logged anomaly and a dead daemon.
+      this.log("goose runner: turn continuation threw", {
+        sessionId: this.sessionId,
+        error: err instanceof Error ? err.message : String(err),
       });
+    });
 
     return { ok: true, meta: { mode: "prompt", commandId } };
   }
@@ -447,7 +478,7 @@ export class GooseSessionRunner {
       );
       return;
     }
-    await this.finishTurn(turn, outcome as { stopReason?: string }, undefined);
+    await this.finishTurn(turn, outcome as { stopReason?: string; text?: string }, undefined);
   }
 
   /** Feeds a `session/update` frame in. Must not throw: called from a socket callback. */
@@ -616,7 +647,7 @@ export class GooseSessionRunner {
    */
   private async finishTurn(
     turn: Turn,
-    receipt: { stopReason?: string } | undefined,
+    receipt: { stopReason?: string; text?: string } | undefined,
     err: unknown,
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
@@ -649,8 +680,8 @@ export class GooseSessionRunner {
       const stopReason = receipt?.stopReason;
       const failed = err !== undefined || (stopReason !== undefined && stopReason !== "end_turn");
 
-      let message = turn.text.join("");
-      if (turn.truncated) {
+      let message = typeof receipt?.text === "string" ? receipt.text : turn.text.join("");
+      if (typeof receipt?.text !== "string" && turn.truncated) {
         message += "\n\n[... truncated: the turn produced more output than pigeon buffers]";
       }
       if (err instanceof DisconnectedDuringTurn) {

@@ -14,9 +14,11 @@ class FakeClient {
   connected = false;
   connectCalls = 0;
   closed = false;
+  isHonk = false;
   /** Resolvers for in-flight prompts, keyed by the text that started them. */
   private turns: Array<{ text: string; resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
   prompts: string[] = [];
+  promptOptions: Array<{ clientReqId?: string } | undefined> = [];
   steers: Array<{ runId: string; text: string }> = [];
   steerOutcome: unknown = { kind: "steered", runId: "run_1", messageId: "m1" };
   connectImpl: () => Promise<void> = async () => {
@@ -46,9 +48,10 @@ class FakeClient {
   steerSessionIds: string[] = [];
   activeRunIdSessionIds: string[] = [];
 
-  prompt(sessionId: string, text: string): Promise<unknown> {
+  prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown> {
     this.promptSessionIds.push(sessionId);
     this.prompts.push(text);
+    this.promptOptions.push(options);
     return new Promise((resolve, reject) => this.turns.push({ text, resolve, reject }));
   }
   steerImpl: (() => Promise<unknown>) | undefined;
@@ -80,8 +83,8 @@ class FakeClient {
   setRunId(sessionId: string, runId: string): void {
     this.runIds.set(sessionId, runId);
   }
-  finishTurn(stopReason = "end_turn"): void {
-    this.turns.shift()?.resolve({ kind: "receipt", stopReason, usage: { totalTokens: 10 } });
+  finishTurn(stopReason = "end_turn", extra?: Record<string, unknown>): void {
+    this.turns.shift()?.resolve({ kind: "receipt", stopReason, usage: { totalTokens: 10 }, ...extra });
   }
   failTurn(err: Error): void {
     this.turns.shift()?.reject(err);
@@ -830,5 +833,124 @@ describe("GooseSessionRunner liveness probing", () => {
     // Exactly one probe per idle period -- not one per timer tick, and not zero,
     // which a <= assertion would have accepted while the watchdog did nothing.
     expect(client.pings).toBe(3);
+  });
+
+  describe("honk relay integration (Task B1)", () => {
+    it("passes commandId as clientReqId to client.prompt", async () => {
+      const { runner, client } = makeRunner();
+      await runner.deliver("cmd-abc", "hello");
+      expect(client.promptOptions).toEqual([{ clientReqId: "cmd-abc" }]);
+    });
+
+    it("does not resend on disconnect when isHonk is false (bare goose)", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+      await runner.deliver("c1", "build");
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(client.prompts).toEqual(["build"]);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("reconnects once and resends with same clientReqId when isHonk is true, preferring receipt text", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "partial streamed chunk" } });
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for runner to reconnect and issue the resent prompt
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+      expect(client.connectCalls).toBe(2);
+      expect(client.promptOptions).toEqual([
+        { clientReqId: "c1" },
+        { clientReqId: "c1" },
+      ]);
+
+      // Resent prompt finishes with receipt carrying honk text
+      client.finishTurn("end_turn", { text: "full canonical honk text" });
+      await runner.settled();
+
+      // Exactly one receipt reported, preferring text over partial streamed chunk
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("full canonical honk text");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("falls back to streamed chunks if honk receipt text is absent", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "chunk 1" } });
+
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for the resend prompt to be issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: " chunk 2" } });
+      client.finishTurn("end_turn"); // no extra text
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.message).toBe("chunk 1 chunk 2");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("falls back to the #168 honest-failure report once if the resend also fails", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for the resend prompt to be issued
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+      // Reconnect succeeded and resend prompt was issued. Now the resend also disconnects:
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      // Must NOT retry again; reported once with #168 error
+      expect(client.prompts).toEqual(["build", "build"]);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(stops[0]!.message).toMatch(/cancelled/i);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("falls back to the #168 honest-failure report once if reconnect fails", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      // Make reconnect fail
+      client.connectImpl = async () => {
+        throw new Error("connection refused");
+      };
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await runner.settled();
+
+      expect(client.prompts).toEqual(["build"]);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
+      expect(runner.isBusy()).toBe(false);
+    });
   });
 });
