@@ -65,7 +65,7 @@ export function gooseShutdownNotice(sessionId: string, isHonk = false): string {
     return (
       `pigeon is restarting while a goose turn was running on ${sessionId}. `
       + "The connection to honkd was closed, but the turn may still be running in honkd. "
-      + `${RESUME_ADVICE} (Once pigeon is back.)`
+      + `${HONK_RESUME_ADVICE} (Once pigeon is back.)`
     );
   }
   return (
@@ -94,7 +94,16 @@ function resumeAdvice(resent = false): string {
   );
 }
 
+function honkResumeAdvice(resent = false): string {
+  const resendClause = resent ? "one resend was attempted" : "nothing was resent";
+  return (
+    `Your message is still in the session's history with no reply, and ${resendClause}. `
+    + "The turn may have finished in goose's history; the reply just wasn't collected."
+  );
+}
+
 const RESUME_ADVICE = resumeAdvice(false);
+const HONK_RESUME_ADVICE = honkResumeAdvice(false);
 
 /** The slice of GooseAcpClient the runner needs. Structural, so tests can fake it. */
 export interface RunnerClient {
@@ -782,10 +791,10 @@ export class GooseSessionRunner {
 
     try {
       const partial = turn.text.join("");
-      const honkDetail = `The turn may still be running in honkd. ${RESUME_ADVICE}`;
+      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdvice(turn.resent)}`;
       const bareDetail =
         "goose cancels a turn once it sees its connection close, so do not wait for this one: "
-        + `no result is coming here. ${RESUME_ADVICE}`;
+        + `no result is coming here. ${resumeAdvice(turn.resent)}`;
       await this.opts.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,

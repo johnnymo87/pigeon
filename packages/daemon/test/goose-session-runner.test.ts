@@ -315,6 +315,8 @@ describe("GooseSessionRunner failure containment", () => {
     expect(notice).toContain("gse_1");
     expect(notice).toContain("turn may still be running in honkd");
     expect(notice).not.toMatch(/was cancelled and will not finish/i);
+    expect(notice).not.toMatch(/the cancelled turn/i);
+    expect(notice).toMatch(/the turn may have finished in goose's history; the reply just wasn't collected/i);
   });
 
   it("survives postStop throwing, and still clears the turn", async () => {
@@ -688,7 +690,41 @@ describe("GooseSessionRunner idle watchdog", () => {
       expect(stops).toHaveLength(1);
       expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
       expect(stops[0]!.message).toContain("turn may still be running in honkd");
+      expect(stops[0]!.message).toMatch(/the turn may have finished in goose's history; the reply just wasn't collected/i);
+      expect(stops[0]!.message).not.toMatch(/the cancelled turn/i);
       expect(stops[0]!.message).not.toMatch(/no result is coming here/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports 'one resend was attempted' instead of 'nothing was resent' in stall notice after resend", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000 });
+      client.isHonk = true;
+      await runner.deliver("c1", "resending-then-stalling");
+
+      // Mid-turn disconnect
+      client.dropSocket();
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait for resend prompt
+      await vi.advanceTimersByTimeAsync(1);
+      expect(client.prompts).toEqual(["resending-then-stalling", "resending-then-stalling"]);
+
+      // Now the resend turn stalls
+      client.pingImpl = async () => {
+        throw new Error("dead");
+      };
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+      expect(stops[0]!.message).toContain("one resend was attempted");
+      expect(stops[0]!.message).not.toMatch(/nothing was resent/i);
+      expect(stops[0]!.message).toMatch(/the turn may have finished in goose's history; the reply just wasn't collected/i);
+      expect(stops[0]!.message).not.toMatch(/the cancelled turn/i);
     } finally {
       vi.useRealTimers();
     }
