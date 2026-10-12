@@ -1075,6 +1075,7 @@ describe("GooseSessionRunner liveness probing", () => {
 
     it("never arms idleSocketTimer when runner is closed", async () => {
       const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      client.isHonk = true;
       await runner.deliver("c1", "hello");
       runner.close();
       client.finishTurn();
@@ -1135,6 +1136,7 @@ describe("GooseSessionRunner liveness probing", () => {
       vi.useFakeTimers();
       try {
         const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
         await runner.deliver("c1", "hello");
         client.finishTurn();
         await runner.settled();
@@ -1157,6 +1159,7 @@ describe("GooseSessionRunner liveness probing", () => {
       vi.useFakeTimers();
       try {
         const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
         await runner.deliver("c1", "first");
         client.finishTurn();
         await runner.settled();
@@ -1193,6 +1196,7 @@ describe("GooseSessionRunner liveness probing", () => {
       vi.useFakeTimers();
       try {
         const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
         await runner.deliver("c1", "long-in-flight");
 
         // The timer should not be armed during a turn
@@ -1222,6 +1226,7 @@ describe("GooseSessionRunner liveness probing", () => {
       vi.useFakeTimers();
       try {
         const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000, idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
         client.pingImpl = async () => {
           throw new Error("dead");
         };
@@ -1240,12 +1245,59 @@ describe("GooseSessionRunner liveness probing", () => {
 
     it("does not arm idle timer on clearTurn if socket is already closed", async () => {
       const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      client.isHonk = true;
       await runner.deliver("c1", "test");
       client.dropSocket();
       client.failTurn(new Error("socket dropped"));
       await runner.settled();
 
       expect((runner as any).idleSocketTimer).toBeUndefined();
+    });
+
+    it("never arms idle socket timer for bare goose (isHonk false)", async () => {
+      const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      client.isHonk = false;
+      await runner.deliver("c1", "hello");
+      client.finishTurn();
+      await runner.settled();
+
+      expect((runner as any).idleSocketTimer).toBeUndefined();
+    });
+
+    it("arms idle socket timer after a steered turn continuation ends under honk", async () => {
+      const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+      client.isHonk = true;
+      await runner.deliver("c1", "steer me");
+      client.finishBusy("run_live");
+      await runner.settled();
+
+      expect(runner.isBusy()).toBe(false);
+      expect((runner as any).idleSocketTimer).toBeDefined();
+    });
+
+    it("does not resend when turn was abandoned under honk", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000, idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
+        client.pingImpl = async () => {
+          throw new Error("dead");
+        };
+        await runner.deliver("c1", "stalling");
+
+        await vi.advanceTimersByTimeAsync(6_000);
+
+        expect(stops).toHaveLength(1);
+        expect(stops[0]!.error_kind).toBe("goose-turn-stalled");
+
+        client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+        await runner.settled();
+
+        expect(client.prompts).toEqual(["stalling"]);
+        expect(stops).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

@@ -405,7 +405,7 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
-          if (this.closed) {
+          if (this.closed || turn.abandoned) {
             await this.finishTurn(turn, undefined, err);
             return;
           }
@@ -455,6 +455,10 @@ export class GooseSessionRunner {
           }
         }
         await this.finishTurn(turn, undefined, err);
+      } finally {
+        if (this.opts.client.isHonk && !this.turn && this.connected && !this.opts.client.isClosed() && !this.closed) {
+          this.armIdleSocketTimer();
+        }
       }
     })().catch((err: unknown) => {
       // finishTurn is written not to throw. If it somehow does, this is the
@@ -567,7 +571,7 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
-    if (this.connected && !this.opts.client.isClosed() && !this.closed) {
+    if (this.opts.client.isHonk && this.connected && !this.opts.client.isClosed() && !this.closed) {
       this.armIdleSocketTimer();
     }
   }
@@ -828,12 +832,12 @@ export class GooseSessionRunner {
   }
 
   private armIdleSocketTimer(): void {
-    if (this.closed) return;
+    if (!this.opts.client.isHonk || this.closed) return;
     const timeout = this.opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
     if (timeout <= 0) return;
     this.clearIdleSocketTimer();
     this.idleSocketTimer = setTimeout(() => {
-      if (!this.turn && this.connected && !this.closed) {
+      if (!this.turn && this.connected && !this.closed && this.opts.client.isHonk) {
         this.log("goose runner: closing idle socket after inactivity", {
           sessionId: this.sessionId,
         });
