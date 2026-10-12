@@ -392,6 +392,10 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          if (turn.idleTimer) {
+            clearTimeout(turn.idleTimer);
+            turn.idleTimer = undefined;
+          }
           this.log("honk disconnect mid-turn, attempting single reconnect and resend", {
             sessionId: this.sessionId,
             commandId,

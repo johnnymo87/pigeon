@@ -952,6 +952,52 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(stops[0]!.error_kind).toBe("goose-turn-disconnected");
       expect(runner.isBusy()).toBe(false);
     });
+
+    it("clears the stall watchdog timer during reconnect so it cannot fire mid-reconnect", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client, stops } = makeRunner({ turnIdleTimeoutMs: 5_000 });
+        client.isHonk = true;
+        // Ping fails on a dead socket
+        client.pingImpl = async () => {
+          if (client.isClosed()) throw new Error("dead socket");
+        };
+        await runner.deliver("c1", "build");
+
+        // Mid-turn disconnect with connectImpl held pending
+        let finishConnect: () => void = () => {};
+        client.connectImpl = () =>
+          new Promise<void>((resolve) => {
+            finishConnect = () => {
+              client.connected = true;
+              client.closed = false;
+              resolve();
+            };
+          });
+        client.dropSocket();
+        client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+        // Advance timers past turnIdleTimeoutMs (5s) but within NON_TURN_TIMEOUT_MS (10s)
+        await vi.advanceTimersByTimeAsync(6_000);
+
+        // Watchdog should NOT have fired or abandoned turn during reconnect
+        expect(stops).toHaveLength(0);
+
+        // Finish reconnect
+        finishConnect();
+        await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+
+        // Now prompt finishes
+        client.finishTurn("end_turn", { text: "done" });
+        await runner.settled();
+
+        expect(stops).toHaveLength(1);
+        expect(stops[0]!.event).toBe("Stop");
+        expect(stops[0]!.error_kind).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("idle socket close", () => {
