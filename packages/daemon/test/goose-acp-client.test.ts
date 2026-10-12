@@ -483,6 +483,25 @@ describe("GooseAcpClient", () => {
       await expect(live).resolves.toMatchObject({ kind: "receipt", stopReason: "end_turn" });
       expect(client.isClosed()).toBe(false);
     });
+
+    it("closes any previous transport when connect is called again without prior close", async () => {
+      const first = new FakePeer();
+      const second = new FakePeer();
+      autoHandshake(first);
+      autoHandshake(second);
+
+      let next = first;
+      const client = makeClient(first, { transportFactory: () => next });
+      await client.connect();
+      expect(first.closed).toBe(false);
+
+      // Reconnect without explicit client.close()
+      next = second;
+      await client.connect();
+
+      expect(first.closed).toBe(true);
+      expect(second.closed).toBe(false);
+    });
   });
 
   /**

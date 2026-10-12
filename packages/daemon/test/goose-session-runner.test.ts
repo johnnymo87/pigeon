@@ -21,6 +21,10 @@ class FakeClient {
   promptOptions: Array<{ clientReqId?: string } | undefined> = [];
   steers: Array<{ runId: string; text: string }> = [];
   steerOutcome: unknown = { kind: "steered", runId: "run_1", messageId: "m1" };
+  transports: Array<{ closed: boolean }> = [];
+  get openTransports(): number {
+    return this.transports.filter((t) => !t.closed).length;
+  }
   connectImpl: () => Promise<void> = async () => {
     this.connected = true;
     this.closed = false;
@@ -28,12 +32,18 @@ class FakeClient {
   /** Simulate the socket dropping under us without anyone calling close(). */
   dropSocket(): void {
     this.closed = true;
+    this.connected = false;
+    const last = [...this.transports].reverse().find((t) => !t.closed);
+    if (last) last.closed = true;
   }
   private runIds = new Map<string, string>();
 
   async connect(): Promise<void> {
     this.connectCalls++;
     await this.connectImpl();
+    this.transports.push({ closed: false });
+    this.connected = true;
+    this.closed = false;
   }
   /**
    * Session ids this fake was actually CALLED with, per ACP method.
@@ -77,6 +87,10 @@ class FakeClient {
   }
   close(): void {
     this.closed = true;
+    this.connected = false;
+    for (const t of this.transports) {
+      t.closed = true;
+    }
   }
 
   // --- test controls ---
@@ -1176,6 +1190,81 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(stops[0]!.message).toContain("lost contact with honkd; the turn may still be running and its reply was not collected");
       expect(stops[0]!.message).not.toMatch(/goose cancels a turn/i);
       expect(runner.isBusy()).toBe(false);
+    });
+
+    it("leaves no orphaned open transport when deliver() reconnects during reconnect backoff", async () => {
+      let sleeping = false;
+      let sleepResolve: (() => void) | undefined;
+      const sleepPromise = new Promise<void>((r) => {
+        sleepResolve = r;
+      });
+      const { runner, client } = makeRunner({
+        honkReconnectBudgetMs: 5_000,
+        honkReconnectInitialDelayMs: 100,
+        sleep: async () => {
+          sleeping = true;
+          await sleepPromise;
+        },
+      });
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      expect(client.openTransports).toBe(1);
+
+      // Reconnect attempt 1 will fail
+      client.connectImpl = async () => {
+        throw new Error("ECONNREFUSED");
+      };
+      // Mid-turn disconnect
+      client.dropSocket();
+      expect(client.openTransports).toBe(0);
+
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+
+      // Wait until reconnect attempt 1 fails and runner enters sleep in backoff
+      await vi.waitFor(() => expect(sleeping).toBe(true));
+      expect(client.connectCalls).toBe(2);
+
+      // Now a concurrent deliver() arrives while sleeping, and its reconnect succeeds.
+      client.connectImpl = async () => {};
+      const deliverPromise = runner.deliver("c2", "steer text");
+      await deliverPromise;
+      expect(client.openTransports).toBe(1);
+      expect(client.connectCalls).toBe(3); // 1 initial + 1 failed reconnect + 1 deliver reconnect
+
+      // Wake the backoff sleep
+      sleepResolve!();
+
+      // Backoff loop continues: it must not force connected=false and call connect() again
+      await vi.waitFor(() => expect(client.prompts).toEqual(["build", "build"]));
+      expect(client.openTransports).toBe(1);
+      expect(client.connectCalls).toBe(3);
+
+      client.finishTurn("end_turn", { text: "done" });
+      await runner.settled();
+      expect(client.openTransports).toBe(1);
+      runner.close();
+      expect(client.openTransports).toBe(0);
+    });
+
+    it("ensures client ends closed when close() is called while connect is in flight", async () => {
+      const { runner, client } = makeRunner();
+      let resolveConnect: (() => void) | undefined;
+      client.connectImpl = () =>
+        new Promise<void>((r) => {
+          resolveConnect = r;
+        });
+
+      const deliverPromise = runner.deliver("c1", "start");
+      await vi.waitFor(() => expect(client.connectCalls).toBe(1));
+
+      // Close runner while connect is still in flight
+      runner.close();
+
+      // Now connect resolves
+      resolveConnect!();
+
+      await expect(deliverPromise).rejects.toThrow(/closed/i);
+      expect(client.isClosed()).toBe(true);
     });
 
     it("throws on deliver when runner is closed and does not connect", async () => {

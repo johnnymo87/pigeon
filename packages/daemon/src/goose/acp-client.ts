@@ -325,6 +325,13 @@ export class GooseAcpClient {
   }
 
   async connect(): Promise<void> {
+    const previous = this.transport;
+    this.transport = undefined;
+    try {
+      previous?.close();
+    } catch {
+      /* best effort */
+    }
     const transport = await this.opts.transportFactory(this.opts.url);
     this.transport = transport;
     this.closed = false;

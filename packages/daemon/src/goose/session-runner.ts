@@ -455,7 +455,6 @@ export class GooseSessionRunner {
               return;
             }
             try {
-              this.connected = false;
               await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
             } catch (connectErr) {
               if (this.closed || turn.abandoned) {
@@ -932,6 +931,14 @@ export class GooseSessionRunner {
     if (!this.connecting) {
       this.connecting = withDeadline(this.opts.client.connect(), NON_TURN_TIMEOUT_MS, "handshake")
         .then(() => {
+          if (this.closed) {
+            try {
+              this.opts.client.close();
+            } catch {
+              /* best effort */
+            }
+            throw new Error("goose runner is closed");
+          }
           this.connected = true;
         })
         .catch((err: unknown) => {
