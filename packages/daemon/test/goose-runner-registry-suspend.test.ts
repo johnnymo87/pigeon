@@ -61,6 +61,15 @@ class FakeInflightStore implements GooseInflightStore {
     }
   }
 
+  markResumed(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.cleanSuspend = false;
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
   bumpAttempts(commandId: string, now: number = Date.now()): number {
     this.bumps.push({ commandId, now });
     const row = this.rows.get(commandId);
