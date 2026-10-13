@@ -2063,6 +2063,36 @@ describe("DeliveryWatchdog", () => {
       expect(second.alerted).toBe(0);
     });
 
+    // pigeon-bql2: the restart test above only covers a restart while the alert
+    // is "still on the books". In production the alert is SENT within seconds,
+    // and the hourly sweep then deleted it an hour later, freeing its ref. A
+    // lost wake has no terminal exit, so the row stays eligible forever and
+    // every later restart (the nightly one, any deploy) re-sent the same alert.
+    it("does not re-alert after a restart once the sent alert is past retention, while the row is still unverified", async () => {
+      const f = lostWakeFixture("m_bql2_restart", "payload");
+      const { storage, watchdog, resolveClients } = f;
+
+      expect((await watchdog.processOnce()).alerted).toBe(1);
+      const row = alertRows(storage)[0]!;
+      storage.alerts.markSent(String(row.id), f.now + 1_000);
+
+      // The hourly sweep, a day later: past the 1h sent-retention.
+      const later = f.now + 24 * 60 * 60 * 1000;
+      storage.alerts.cleanupOlderThan(later - 60 * 60 * 1000, later - 7 * 24 * 60 * 60 * 1000);
+
+      const restarted = new DeliveryWatchdog({
+        storage,
+        resolveClients,
+        notifier: { sendPlainAlert: f.sendPlainAlert },
+        nowFn: () => later,
+        log: () => {},
+      });
+      const second = await restarted.processOnce();
+
+      expect(second.alerted).toBe(0);
+      expect(alertRows(storage)).toHaveLength(1);
+    });
+
     it("an earlier namespaced advisory for the same row cannot suppress the durable payload alert", async () => {
       // `stuckAlerted` is SHARED with the queued-behind-turn branch. While the
       // lost-wake branch was gated on that Set, a row that first appeared
