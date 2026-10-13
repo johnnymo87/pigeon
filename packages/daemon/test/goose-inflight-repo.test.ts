@@ -201,6 +201,32 @@ describe("GooseInflightRepository", () => {
     expect(suspended.createdAt).toBe(1000);
   });
 
+  it("markResumed sets clean_suspend=0, last_alive_at=now, updated_at=now", () => {
+    const s = newStorage();
+    createSession(s, "ses_test_1");
+    const repo = s.gooseInflight;
+
+    repo.insert({
+      commandId: "cmd_resume",
+      sessionId: "ses_test_1",
+      backendSessionId: "b1",
+      isHonk: true,
+      promptText: "resume me",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastAliveAt: 1000,
+      cleanSuspend: true,
+    });
+
+    repo.markResumed("cmd_resume", 1500);
+
+    const resumed = repo.get("cmd_resume")!;
+    expect(resumed.cleanSuspend).toBe(false);
+    expect(resumed.lastAliveAt).toBe(1500);
+    expect(resumed.updatedAt).toBe(1500);
+    expect(resumed.createdAt).toBe(1000);
+  });
+
   it("bumpAttempts increments recovery_attempts and updates updated_at", () => {
     const s = newStorage();
     createSession(s, "ses_test_1");

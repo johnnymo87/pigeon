@@ -16,12 +16,15 @@ import { execSync } from "node:child_process";
 const HONKD_URL = process.env.PIGEON_TEST_HONKD_URL;
 const HONKD_TOKEN = process.env.PIGEON_TEST_HONKD_TOKEN;
 const HONKD_RESTART_CMD = process.env.PIGEON_TEST_HONKD_RESTART_CMD;
+const HONKD_STOP_CMD = process.env.PIGEON_TEST_HONKD_STOP_CMD;
+const HONKD_START_CMD = process.env.PIGEON_TEST_HONKD_START_CMD;
 const GOOSE_URL = process.env.PIGEON_TEST_GOOSE_URL;
 const GOOSE_TOKEN = process.env.PIGEON_TEST_GOOSE_TOKEN;
 
 describe("honkd live integration with real pigeon client", () => {
   const runTest = HONKD_URL && HONKD_TOKEN ? it : it.skip;
   const runRestartTest = HONKD_URL && HONKD_TOKEN && HONKD_RESTART_CMD ? it : it.skip;
+  const runStopStartTest = HONKD_URL && HONKD_TOKEN && HONKD_STOP_CMD && HONKD_START_CMD ? it : it.skip;
 
   runTest(
     "connects through honkd, starts developer session, and completes turn",
@@ -619,6 +622,137 @@ describe("honkd live integration with real pigeon client", () => {
         expect(client.activeRunId(sid)).toBeUndefined();
       } finally {
         client.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runStopStartTest(
+    "recovery case 4: recovery starts while honkd is stopped, retries in backoff, and collects reply once honkd starts",
+    async () => {
+      const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "pigeon-honkd-recover-4-"));
+      const dbPath = path.join(tmpdir, "pigeon.db");
+
+      const clientSetup = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+      await clientSetup.connect();
+      const backendSid = await clientSetup.newSession(tmpdir);
+      clientSetup.close();
+
+      const cmdId = `cmd-live-rec4-${Date.now()}`;
+      const sessId = `sess-live-rec4-${Date.now()}`;
+
+      // --- PHASE A: Registry A starts turn and immediately suspends ---
+      const storageA = openStorageDb(dbPath);
+      storageA.sessions.upsert({
+        sessionId: sessId,
+        backendKind: "goose",
+        backendSessionId: backendSid,
+        backendEndpoint: HONKD_URL!,
+        backendAuthToken: HONKD_TOKEN!,
+        cwd: tmpdir,
+        notify: true,
+      });
+      storageA.inbox.persist({ commandId: cmdId, payload: "Run this shell command: sleep 4 && echo LIVE_CASE4_DOWN_BOOT_OK" });
+
+      const clientA = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      const registryA = new GooseRunnerRegistry({
+        inbox: storageA.inbox,
+        inflight: storageA.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: clientA,
+            inflight: storageA.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+      const runnerA = registryA.get(storageA.sessions.get(sessId)!);
+
+      try {
+        await runnerA.deliver(cmdId, "Run this shell command: sleep 4 && echo LIVE_CASE4_DOWN_BOOT_OK");
+        await registryA.suspendAll();
+      } finally {
+        storageA.db.close();
+      }
+
+      // Stop honkd while pigeon is down!
+      execSync(HONKD_STOP_CMD!, { stdio: "inherit", shell: "/bin/bash" });
+
+      // --- PHASE B: Start Pigeon recovery WHILE honkd is STOPPED ---
+      const storageB = openStorageDb(dbPath);
+      const stopReportsB: Array<Record<string, unknown>> = [];
+
+      const registryB = new GooseRunnerRegistry({
+        inbox: storageB.inbox,
+        inflight: storageB.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: new GooseAcpClient({
+              url: HONKD_URL!,
+              transportFactory: webSocketTransport(HONKD_TOKEN!),
+              permissionPolicy: (params) => params.options[0]?.optionId,
+              sessionExtensions: [{ type: "platform", name: "developer" }],
+              serveFloor: ["developer"],
+            }),
+            inflight: storageB.gooseInflight,
+            honkReconnectInitialDelayMs: 250,
+            honkReconnectMaxDelayMs: 1000,
+            postStop: async (body) => {
+              stopReportsB.push(body);
+            },
+            touch: () => {},
+          }),
+      });
+
+      try {
+        await recoverGooseTurns({
+          storage: storageB,
+          gooseRunners: registryB,
+          postStop: async (body) => {
+            stopReportsB.push(body);
+          },
+        });
+
+        const runnerB = registryB.peek(sessId);
+        expect(runnerB).toBeDefined();
+        expect(runnerB?.isBusy()).toBe(true);
+
+        // Wait 1.5 seconds with honkd down — runnerB is retrying in backoff
+        await new Promise((r) => setTimeout(r, 1500));
+        expect(runnerB?.isBusy()).toBe(true);
+        expect(stopReportsB).toHaveLength(0); // Not failed or given up!
+
+        // Now START honkd!
+        execSync(HONKD_START_CMD!, { stdio: "inherit", shell: "/bin/bash" });
+
+        // Once honkd is back up, runnerB connects, prompts resumeOnly, and settles!
+        await runnerB?.settled();
+
+        expect(stopReportsB).toHaveLength(1);
+        expect(stopReportsB[0]!.event).toBe("Stop");
+        expect(String(stopReportsB[0]!.message)).toContain("LIVE_CASE4_DOWN_BOOT_OK");
+
+        expect(storageB.gooseInflight.get(cmdId)).toBeUndefined();
+        expect(storageB.inbox.get(cmdId)?.status).toBe("done");
+      } finally {
+        registryB.closeAll();
+        storageB.db.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
       }
     },

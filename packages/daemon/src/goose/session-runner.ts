@@ -337,6 +337,15 @@ export class GooseSessionRunner {
   }
 
   resume(row: GooseInflightRecord): void {
+    if (this.turn) {
+      this.log("goose runner: cannot resume turn because a turn is already active; leaving row for next boot", {
+        sessionId: this.sessionId,
+        activeCommandId: this.turn.commandId,
+        incomingCommandId: row.commandId,
+      });
+      return;
+    }
+
     this.clearIdleSocketTimer();
     const turn: Turn = {
       commandId: row.commandId,
@@ -356,6 +365,8 @@ export class GooseSessionRunner {
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
+    this.opts.inflight?.markResumed(row.commandId, Date.now());
+
     this.recoveryResolvedOrAttached = new Promise<void>((resolve) => {
       this.resolveRecoveryAttached = resolve;
     });
@@ -367,7 +378,7 @@ export class GooseSessionRunner {
         try {
           await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "connect");
         } catch (connectErr) {
-          if (this.opts.client.isHonk) {
+          if (row.isHonk) {
             await this.reconnectAndResend(turn, row.promptText, connectErr, recoveryBudgetMs);
             return;
           }
@@ -382,16 +393,24 @@ export class GooseSessionRunner {
             isHonk: this.opts.client.isHonk,
             supportsResumeOnly: this.opts.client.supportsResumeOnly,
           });
-          await this.opts.postStop({
-            session_id: this.sessionId,
-            notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
-            message:
-              "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
-            event: "Error",
-            error_kind: "goose-turn-recovery-unsupported",
-          });
-          this.retire(turn);
           if (this.turn === turn) this.clearTurn();
+          try {
+            await this.opts.postStop({
+              session_id: this.sessionId,
+              notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
+              message:
+                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              event: "Error",
+              error_kind: "goose-turn-recovery-unsupported",
+            });
+            this.retire(turn);
+          } catch (reportErr) {
+            this.log("goose runner: could not report unsupported recovery notice", {
+              sessionId: this.sessionId,
+              commandId: row.commandId,
+              error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+            });
+          }
           return;
         }
 
@@ -403,6 +422,7 @@ export class GooseSessionRunner {
           await this.onPromptOutcome(turn, row.promptText, outcome);
         } catch (err) {
           if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+            this.connected = false;
             await this.reconnectAndResend(turn, row.promptText, err, recoveryBudgetMs);
             return;
           }
@@ -628,6 +648,7 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          this.connected = false;
           const budgetMs = this.opts.honkReconnectBudgetMs ?? DEFAULT_HONK_RECONNECT_BUDGET_MS;
           await this.reconnectAndResend(turn, text, err, budgetMs);
           return;
@@ -704,11 +725,34 @@ export class GooseSessionRunner {
         return;
       }
 
-      if (!this.opts.client.isHonk) {
-        this.log("reconnected endpoint is not honkd, not resending prompt", {
+      if (!this.opts.client.isHonk || (turn.recovered && !this.opts.client.supportsResumeOnly)) {
+        this.log("reconnected endpoint is not honkd or does not advertise resume_only for recovered turn", {
           sessionId: this.sessionId,
           commandId: turn.commandId,
+          isHonk: this.opts.client.isHonk,
+          supportsResumeOnly: this.opts.client.supportsResumeOnly,
         });
+        if (turn.recovered) {
+          if (this.turn === turn) this.clearTurn();
+          try {
+            await this.opts.postStop({
+              session_id: this.sessionId,
+              notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+              message:
+                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              event: "Error",
+              error_kind: "goose-turn-recovery-unsupported",
+            });
+            this.retire(turn);
+          } catch (reportErr) {
+            this.log("goose runner: could not report unsupported recovery notice", {
+              sessionId: this.sessionId,
+              commandId: turn.commandId,
+              error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+            });
+          }
+          return;
+        }
         await this.finishTurn(turn, undefined, cause);
         return;
       }
@@ -740,6 +784,7 @@ export class GooseSessionRunner {
           return;
         }
         if (resendErr instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          this.connected = false;
           if (turn.idleTimer) {
             clearTimeout(turn.idleTimer);
             turn.idleTimer = undefined;
@@ -805,15 +850,23 @@ export class GooseSessionRunner {
         sessionId: this.sessionId,
         commandId: turn.commandId,
       });
-      await this.opts.postStop({
-        session_id: this.sessionId,
-        notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
-        message: "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent.",
-        event: "Error",
-        error_kind: "honk-unknown-request",
-      });
-      this.retire(turn);
       if (this.turn === turn) this.clearTurn();
+      try {
+        await this.opts.postStop({
+          session_id: this.sessionId,
+          notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+          message: "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent.",
+          event: "Error",
+          error_kind: "honk-unknown-request",
+        });
+        this.retire(turn);
+      } catch (reportErr) {
+        this.log("goose runner: could not report unknown-request notice", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+        });
+      }
       return;
     }
     if (kind === "busy") {
@@ -823,16 +876,23 @@ export class GooseSessionRunner {
           sessionId: this.sessionId,
           runId,
         });
-        await this.opts.postStop({
-          session_id: this.sessionId,
-          notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
-          message:
-            "goose was already running a different turn when pigeon reconnected; the earlier turn's reply could not be collected, and nothing was resent.",
-          event: "Error",
-          error_kind: "goose-busy-recovered",
-        });
-        this.retire(turn);
         if (this.turn === turn) this.clearTurn();
+        try {
+          await this.opts.postStop({
+            session_id: this.sessionId,
+            notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+            message: "your message was not delivered (goose was busy); nothing was resent — send it again.",
+            event: "Error",
+            error_kind: "goose-busy-recovered",
+          });
+          this.retire(turn);
+        } catch (reportErr) {
+          this.log("goose runner: could not report busy-recovered notice", {
+            sessionId: this.sessionId,
+            commandId: turn.commandId,
+            error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+          });
+        }
         return;
       }
       if (turn.resent) {
@@ -1508,7 +1568,10 @@ export class GooseRunnerRegistry {
       const turn = runner.activeTurn;
       if (!turn) continue;
 
-      if (runner.isHonk) {
+      const inflightRow = inflight?.get(turn.commandId);
+      const isHonk = inflightRow !== undefined ? inflightRow.isHonk : runner.isHonk;
+
+      if (isHonk) {
         // Honk runner: markSuspended and keep row, no notice
         try {
           inflight?.markSuspended(turn.commandId, now);

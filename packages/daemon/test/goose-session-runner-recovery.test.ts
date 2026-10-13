@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { GooseSessionRunner } from "../src/goose/session-runner";
+import { GooseRunnerRegistry, GooseSessionRunner } from "../src/goose/session-runner";
 import { DisconnectedDuringTurn } from "../src/goose/acp-client";
 import type { SessionRecord } from "../src/storage/types";
 import type { GooseInflightRecord, GooseInflightStore, InsertGooseInflightInput } from "../src/storage/goose-inflight-repo";
@@ -10,6 +10,7 @@ class FakeInflightStore implements GooseInflightStore {
   touches: Array<{ commandId: string; now: number }> = [];
   deletes: string[] = [];
   suspends: Array<{ commandId: string; now: number }> = [];
+  resumes: Array<{ commandId: string; now: number }> = [];
   bumps: Array<{ commandId: string; now: number }> = [];
 
   insert(input: InsertGooseInflightInput, now: number = Date.now()): void {
@@ -52,6 +53,23 @@ class FakeInflightStore implements GooseInflightStore {
 
   markSuspended(commandId: string, now: number = Date.now()): void {
     this.suspends.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.cleanSuspend = true;
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+      row.recoveryAttempts = 0;
+    }
+  }
+
+  markResumed(commandId: string, now: number = Date.now()): void {
+    this.resumes.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.cleanSuspend = false;
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
   }
 
   bumpAttempts(commandId: string, now: number = Date.now()): number {
@@ -63,6 +81,13 @@ class FakeInflightStore implements GooseInflightStore {
 class FakeRecoveryClient {
   connected = false;
   closed = false;
+  honkEnabled = true;
+  honkFeatures = ["resume_only"];
+  // Gating per review: isHonk and supportsResumeOnly are FALSE until connect/initialize
+  isHonk = false;
+  supportsResumeOnly = false;
+  connectFailsRemaining = 0;
+  connectCalls = 0;
   prompts: string[] = [];
   promptOptions: Array<{ clientReqId?: string; resumeOnly?: boolean } | undefined> = [];
   turns: Array<{
@@ -71,13 +96,19 @@ class FakeRecoveryClient {
     reject: (err: unknown) => void;
   }> = [];
   steers: Array<{ runId: string; text: string }> = [];
-  isHonk = true;
-  supportsResumeOnly = true;
   runIds = new Map<string, string>();
+  cancelCalls: string[] = [];
 
   async connect(): Promise<void> {
+    this.connectCalls++;
+    if (this.connectFailsRemaining > 0) {
+      this.connectFailsRemaining--;
+      throw new Error("connect ECONNREFUSED");
+    }
     this.connected = true;
     this.closed = false;
+    this.isHonk = this.honkEnabled;
+    this.supportsResumeOnly = this.honkEnabled && this.honkFeatures.includes("resume_only");
   }
 
   isClosed(): boolean {
@@ -103,7 +134,9 @@ class FakeRecoveryClient {
     return this.runIds.get(sessionId);
   }
 
-  cancel(sessionId: string): void {}
+  cancel(sessionId: string): void {
+    this.cancelCalls.push(sessionId);
+  }
 
   async ping(): Promise<void> {}
 
@@ -173,7 +206,7 @@ function makeInflightRow(over: Partial<GooseInflightRecord> = {}): GooseInflight
 }
 
 describe("GooseSessionRunner Recovery (Commit 2)", () => {
-  it("resume(row) sets this.turn synchronously with recovered=true and resent=true", () => {
+  it("resume(row) sets this.turn synchronously with recovered=true, resent=true, and marks row resumed", () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
     const postStop = vi.fn().mockResolvedValue(undefined);
@@ -193,6 +226,9 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     runner.resume(row);
     expect(runner.isBusy()).toBe(true);
     expect(runner.activeTurn?.commandId).toBe("cmd_rec_1");
+    // clean_suspend must be cleared via markResumed (Review #3)
+    expect(inflight.resumes).toHaveLength(1);
+    expect(inflight.get("cmd_rec_1")?.cleanSuspend).toBe(false);
   });
 
   it("redelivery of the same commandId while recovered returns already-running", async () => {
@@ -222,7 +258,7 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
   it("gating: if endpoint is not honk, sends NO prompt, posts honest notice, and retires row", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
-    client.isHonk = false; // Not honk!
+    client.honkEnabled = false; // Not honk!
     const postStop = vi.fn().mockResolvedValue(undefined);
 
     const runner = new GooseSessionRunner({
@@ -251,8 +287,8 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
   it("gating: if honk does not advertise resume_only, sends NO prompt, posts honest notice, and retires row", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
-    client.isHonk = true;
-    client.supportsResumeOnly = false; // Feature not advertised!
+    client.honkEnabled = true;
+    client.honkFeatures = []; // Feature not advertised!
     const postStop = vi.fn().mockResolvedValue(undefined);
 
     const runner = new GooseSessionRunner({
@@ -278,11 +314,284 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     expect(runner.isBusy()).toBe(false);
   });
 
+  it("Review #2: honkd down at boot (first N connects fail) uses recovery budget, succeeds when honkd comes up", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    client.honkEnabled = true;
+    client.connectFailsRemaining = 2; // Fails first 2 connect attempts!
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+      honkReconnectInitialDelayMs: 5,
+      honkReconnectMaxDelayMs: 10,
+    });
+
+    const row = makeInflightRow({ commandId: "cmd_down_at_boot", isHonk: true });
+    inflight.insert(row);
+    runner.resume(row);
+
+    // Give time for the 2 connect retries to back off and the 3rd to succeed
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(client.connectCalls).toBeGreaterThanOrEqual(3);
+    expect(client.prompts).toHaveLength(1);
+    expect(client.promptOptions[0]?.resumeOnly).toBe(true);
+
+    client.finishTurn("end_turn", { text: "honkd came up!" });
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].message).toBe("honkd came up!");
+    expect(inflight.deletes).toContain("cmd_down_at_boot");
+  });
+
+  it("Review #1: reconnectAndResend on recovered turn checks supportsResumeOnly; if false on reconnect, no prompt sent and posts notice", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    client.honkEnabled = true;
+    client.honkFeatures = ["resume_only"];
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+      honkReconnectInitialDelayMs: 5,
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(client.prompts).toHaveLength(1);
+
+    // Disconnect happens mid-turn
+    // On the 2nd connect, honkd rolls back and loses resume_only!
+    client.honkFeatures = []; // Removed on 2nd connection!
+    client.failTurn(new DisconnectedDuringTurn("ses_rec_1", "run_1", 1006));
+
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Must NOT have resent the prompt!
+    expect(client.prompts).toHaveLength(1);
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].message).toContain(
+      "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent",
+    );
+    expect(inflight.deletes).toContain("cmd_rec_1");
+  });
+
+  it("Review #2: suspendAll decides honk vs bare from persisted row is_honk when client never connected yet", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    client.connectFailsRemaining = 999; // Never connects!
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    let createdRunner: GooseSessionRunner | undefined;
+    const registry = new GooseRunnerRegistry({
+      inbox: { markDone: () => {} },
+      inflight,
+      createRunner: (session) => {
+        createdRunner = new GooseSessionRunner({
+          session,
+          client,
+          inflight,
+          postStop,
+          touch: () => {},
+          honkReconnectInitialDelayMs: 5,
+        });
+        return createdRunner;
+      },
+    });
+
+    const session = makeSession();
+    const row = makeInflightRow({ commandId: "cmd_honk_backoff", isHonk: true });
+    inflight.insert(row);
+
+    const runner = registry.get(session);
+    runner.resume(row);
+
+    // client.isHonk is currently false because connect() has not succeeded
+    expect(client.isHonk).toBe(false);
+
+    // SuspendAll called while runner is in reconnect backoff
+    await registry.suspendAll({ now: 2000 });
+
+    // Must NOT post bare shutdown notice
+    expect(postStop).not.toHaveBeenCalled();
+
+    // Must have marked row suspended and kept row!
+    expect(inflight.deletes).not.toContain("cmd_honk_backoff");
+    const stored = inflight.get("cmd_honk_backoff");
+    expect(stored?.cleanSuspend).toBe(true);
+    expect(stored?.lastAliveAt).toBe(2000);
+  });
+
+  it("Review #4a: resume() gate-failed branch survives postStop throw and still clears this.turn", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    client.honkEnabled = false; // Gate fails
+    const postStop = vi.fn().mockRejectedValue(new Error("app not ready / 500"));
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    // Turn must be cleared even though postStop threw (session not wedged)
+    expect(runner.isBusy()).toBe(false);
+    // Row is kept when postStop throws
+    expect(inflight.get("cmd_rec_1")).toBeDefined();
+  });
+
+  it("Review #4b: resume() refuses/skips if this.turn is already set, leaving row for next boot", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    // Start a normal turn first
+    await runner.deliver("cmd_existing", "first prompt");
+    expect(runner.activeTurn?.commandId).toBe("cmd_existing");
+
+    // Attempt to resume a different row while turn is active
+    const row2 = makeInflightRow({ commandId: "cmd_second" });
+    inflight.insert(row2);
+    runner.resume(row2);
+
+    // Must refuse to clobber active turn!
+    expect(runner.activeTurn?.commandId).toBe("cmd_existing");
+    expect(inflight.get("cmd_second")).toBeDefined(); // row left alone
+  });
+
+  it("Review #5: busy-on-resume notice text matches exact requested wording", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    client.finishBusy("run_other");
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].message).toBe(
+      "your message was not delivered (goose was busy); nothing was resent — send it again.",
+    );
+    expect(inflight.deletes).toContain("cmd_rec_1");
+  });
+
+  it("/kill on a recovered turn sends cancel, skips stop receipt, and retires row", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(client.prompts).toHaveLength(1);
+
+    // Send cancel via /kill
+    const cancelOutcome = await runner.cancel();
+    expect(cancelOutcome).toBe("sent");
+
+    // Client finishes with cancelled
+    client.finishTurn("cancelled", { text: "cancelled" });
+    await runner.settled();
+
+    // /kill covers it, so postStop receipt is skipped
+    expect(postStop).not.toHaveBeenCalled();
+    // But row is retired
+    expect(inflight.deletes).toContain("cmd_rec_1");
+    expect(runner.isBusy()).toBe(false);
+  });
+
+  it("recovered turn exhausting reconnect budget posts one lost-contact notice and deletes row", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+      honkRecoveryBudgetMs: 20, // Short budget for test
+      honkReconnectInitialDelayMs: 5,
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+    // Mid-turn disconnect occurs
+    client.failTurn(new DisconnectedDuringTurn("ses_rec_1", "run_1", 1006));
+
+    // Force all reconnects to fail
+    client.connectFailsRemaining = 999;
+
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].message).toContain("lost contact with honkd");
+    expect(inflight.deletes).toContain("cmd_rec_1");
+    expect(runner.isBusy()).toBe(false);
+  });
+
   it("sends prompt with resumeOnly: true and same clientReqId when resume_only is advertised", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
-    client.isHonk = true;
-    client.supportsResumeOnly = true;
     const postStop = vi.fn().mockResolvedValue(undefined);
 
     const runner = new GooseSessionRunner({
@@ -297,7 +606,6 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     inflight.insert(row);
     runner.resume(row);
 
-    // Yield to allow connect and prompt to be issued
     await new Promise((r) => setTimeout(r, 10));
 
     expect(client.prompts).toHaveLength(1);
@@ -401,35 +709,6 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     expect(postStop.mock.calls[0]![0].message).toContain(
       "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent.",
     );
-    expect(inflight.deletes).toContain("cmd_rec_1");
-  });
-
-  it("busy on recovery: posts recovered-specific notice, does NOT steer, retires row", async () => {
-    const inflight = new FakeInflightStore();
-    const client = new FakeRecoveryClient();
-    const postStop = vi.fn().mockResolvedValue(undefined);
-
-    const runner = new GooseSessionRunner({
-      session: makeSession(),
-      client,
-      inflight,
-      postStop,
-      touch: () => {},
-    });
-
-    const row = makeInflightRow();
-    inflight.insert(row);
-    runner.resume(row);
-
-    await new Promise((r) => setTimeout(r, 10));
-
-    client.finishBusy("run_other");
-    await runner.settled();
-
-    // Must NOT call steer
-    expect(client.steers).toHaveLength(0);
-    expect(postStop).toHaveBeenCalledTimes(1);
-    expect(postStop.mock.calls[0]![0].error_kind).toBe("goose-busy-recovered");
     expect(inflight.deletes).toContain("cmd_rec_1");
   });
 

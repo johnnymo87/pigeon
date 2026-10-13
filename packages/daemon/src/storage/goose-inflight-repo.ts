@@ -32,6 +32,7 @@ export interface GooseInflightStore {
   listAll(): GooseInflightRecord[];
   touchAlive(commandId: string, now?: number): void;
   markSuspended(commandId: string, now?: number): void;
+  markResumed(commandId: string, now?: number): void;
   bumpAttempts(commandId: string, now?: number): number;
   get(commandId: string): GooseInflightRecord | undefined;
 }
@@ -146,6 +147,14 @@ export class GooseInflightRepository implements GooseInflightStore {
     this.db
       .prepare(
         "UPDATE goose_inflight_turns SET clean_suspend = 1, last_alive_at = ?, updated_at = ?, recovery_attempts = 0 WHERE command_id = ?",
+      )
+      .run(now, now, commandId);
+  }
+
+  markResumed(commandId: string, now: number = Date.now()): void {
+    this.db
+      .prepare(
+        "UPDATE goose_inflight_turns SET clean_suspend = 0, last_alive_at = ?, updated_at = ? WHERE command_id = ?",
       )
       .run(now, now, commandId);
   }
