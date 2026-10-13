@@ -659,7 +659,7 @@ describe("honkd live integration with real pigeon client", () => {
         cwd: tmpdir,
         notify: true,
       });
-      storageA.inbox.persist({ commandId: cmdId, payload: "Run this shell command: sleep 4 && echo LIVE_CASE4_DOWN_BOOT_OK" });
+      storageA.inbox.persist({ commandId: cmdId, payload: "Run this shell command: sleep 12 && echo LIVE_CASE4_DOWN_BOOT_OK" });
 
       const clientA = new GooseAcpClient({
         url: HONKD_URL!,
@@ -684,13 +684,15 @@ describe("honkd live integration with real pigeon client", () => {
       const runnerA = registryA.get(storageA.sessions.get(sessId)!);
 
       try {
-        await runnerA.deliver(cmdId, "Run this shell command: sleep 4 && echo LIVE_CASE4_DOWN_BOOT_OK");
+        await runnerA.deliver(cmdId, "Run this shell command: sleep 12 && echo LIVE_CASE4_DOWN_BOOT_OK");
         await registryA.suspendAll();
       } finally {
         storageA.db.close();
       }
 
-      // Stop honkd while pigeon is down!
+      // Stop honkd while pigeon is down. The turn (sleep 12) is still running
+      // in goose when honkd comes back: this case tests pigeon's reconnect
+      // backoff.
       execSync(HONKD_STOP_CMD!, { stdio: "inherit", shell: "/bin/bash" });
 
       // --- PHASE B: Start Pigeon recovery WHILE honkd is STOPPED ---
@@ -746,7 +748,13 @@ describe("honkd live integration with real pigeon client", () => {
 
         expect(stopReportsB).toHaveLength(1);
         expect(stopReportsB[0]!.event).toBe("Stop");
-        expect(String(stopReportsB[0]!.message)).toContain("LIVE_CASE4_DOWN_BOOT_OK");
+        // Pigeon's side: one report, no resend. honkd sometimes returns the
+        // collected reply without _meta.honk.text after its own restart
+        // (bead honk-znj.13); pigeon must then say so rather than guess.
+        // Tighten to toContain("LIVE_CASE4_DOWN_BOOT_OK") once that is fixed.
+        expect(String(stopReportsB[0]!.message)).toMatch(
+          /LIVE_CASE4_DOWN_BOOT_OK|^goose reply text is unavailable \(pigeon restarted mid-turn\)\.$/,
+        );
 
         expect(storageB.gooseInflight.get(cmdId)).toBeUndefined();
         expect(storageB.inbox.get(cmdId)?.status).toBe("done");
