@@ -1041,6 +1041,52 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(runner.isBusy()).toBe(false);
     });
 
+    it("honk receipt text empty string: posts honest receipt and does not fall back to chunk accumulator", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "chunk from tool noise" } });
+
+      client.finishTurn("end_turn", { text: "" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("goose ended the turn without a reply.");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("honk receipt text empty string with no chunks: posts honest receipt", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.finishTurn("end_turn", { text: "" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("goose ended the turn without a reply.");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("honk receipt text absent with no chunks: posts finished with no message", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.finishTurn("end_turn"); // text undefined (absent)
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("goose finished the turn with no message (stopReason: end_turn).");
+      expect(runner.isBusy()).toBe(false);
+    });
+
     it("reports not_delivered honk cancel reason with advice to send again", async () => {
       const { runner, client, stops } = makeRunner();
       client.isHonk = true;
