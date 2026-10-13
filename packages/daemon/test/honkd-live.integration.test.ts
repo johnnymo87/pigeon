@@ -3,8 +3,10 @@ import {
   GooseAcpClient,
   type GooseReceipt,
 } from "../src/goose/acp-client.js";
-import { GooseSessionRunner } from "../src/goose/session-runner.js";
+import { GooseSessionRunner, GooseRunnerRegistry } from "../src/goose/session-runner.js";
 import { webSocketTransport } from "../src/goose/ws-transport.js";
+import { openStorageDb } from "../src/storage/database.js";
+import { recoverGooseTurns } from "../src/goose/recover-inflight.js";
 import type { SessionRecord } from "../src/storage/types.js";
 import * as os from "node:os";
 import * as fs from "node:fs/promises";
@@ -313,6 +315,310 @@ describe("honkd live integration with real pigeon client", () => {
         freshRunner?.close();
         freshClient?.close();
         client1.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runTest(
+    "recovery case 1: long turn suspended mid-flight, recoverGooseTurns collects full reply across simulated restart",
+    async () => {
+      const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "pigeon-honkd-recover-1-"));
+      const dbPath = path.join(tmpdir, "pigeon.db");
+      const clientSetup = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+      await clientSetup.connect();
+      expect(clientSetup.isHonk).toBe(true);
+      expect(clientSetup.supportsResumeOnly).toBe(true);
+      const backendSid = await clientSetup.newSession(tmpdir);
+      clientSetup.close();
+
+      const cmdId = `cmd-live-rec1-${Date.now()}`;
+      const sessId = `sess-live-rec1-${Date.now()}`;
+
+      // --- PHASE A: Registry A on dbPath starts turn and suspends ---
+      const storageA = openStorageDb(dbPath);
+      storageA.sessions.upsert({
+        sessionId: sessId,
+        backendKind: "goose",
+        backendSessionId: backendSid,
+        backendEndpoint: HONKD_URL!,
+        backendAuthToken: HONKD_TOKEN!,
+        cwd: tmpdir,
+        notify: true,
+      });
+      storageA.inbox.persist({ commandId: cmdId, payload: "Run this shell command: sleep 4 && echo LIVE_CASE1_OK" });
+
+      let firstChunkReceived = false;
+      let onFirstChunk: (() => void) | undefined;
+      const firstChunkPromise = new Promise<void>((resolve) => {
+        onFirstChunk = resolve;
+      });
+
+      const clientA = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+        onSessionUpdate: (_sid, update) => {
+          if (update.sessionUpdate === "agent_message_chunk" && !firstChunkReceived) {
+            firstChunkReceived = true;
+            onFirstChunk?.();
+          }
+        },
+      });
+
+      const registryA = new GooseRunnerRegistry({
+        inbox: storageA.inbox,
+        inflight: storageA.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: clientA,
+            inflight: storageA.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+      const runnerA = registryA.get(storageA.sessions.get(sessId)!);
+
+      try {
+        await runnerA.deliver(cmdId, "Run this shell command: sleep 4 && echo LIVE_CASE1_OK");
+
+        // Wait for first chunk from goose
+        await Promise.race([
+          firstChunkPromise,
+          new Promise((r) => setTimeout(r, 2000)),
+        ]);
+
+        // Suspend all runners while turn is running
+        await registryA.suspendAll();
+
+        // Row should be kept and marked clean_suspend
+        const inflightRow = storageA.gooseInflight.get(cmdId);
+        expect(inflightRow).toBeDefined();
+        expect(inflightRow?.cleanSuspend).toBe(true);
+      } finally {
+        storageA.db.close();
+      }
+
+      // --- PHASE B: Registry B starts on same dbPath and recovers ---
+      const storageB = openStorageDb(dbPath);
+      const stopReportsB: Array<Record<string, unknown>> = [];
+
+      const registryB = new GooseRunnerRegistry({
+        inbox: storageB.inbox,
+        inflight: storageB.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: new GooseAcpClient({
+              url: HONKD_URL!,
+              transportFactory: webSocketTransport(HONKD_TOKEN!),
+              permissionPolicy: (params) => params.options[0]?.optionId,
+              sessionExtensions: [{ type: "platform", name: "developer" }],
+              serveFloor: ["developer"],
+            }),
+            inflight: storageB.gooseInflight,
+            postStop: async (body) => {
+              stopReportsB.push(body);
+            },
+            touch: () => {},
+          }),
+      });
+
+      try {
+        await recoverGooseTurns({
+          storage: storageB,
+          gooseRunners: registryB,
+          postStop: async (body) => {
+            stopReportsB.push(body);
+          },
+        });
+
+        const runnerB = registryB.peek(sessId);
+        expect(runnerB).toBeDefined();
+        await runnerB?.settled();
+
+        // Exactly one postStop with full text
+        expect(stopReportsB).toHaveLength(1);
+        expect(stopReportsB[0]!.event).toBe("Stop");
+        expect(String(stopReportsB[0]!.message)).toContain("LIVE_CASE1_OK");
+
+        // Row is gone from inflight and inbox marked done
+        expect(storageB.gooseInflight.get(cmdId)).toBeUndefined();
+        expect(storageB.inbox.get(cmdId)?.status).toBe("done");
+      } finally {
+        registryB.closeAll();
+        storageB.db.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runTest(
+    "recovery case 2: turn finishes while pigeon is down, cached reply collected on startup",
+    async () => {
+      const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "pigeon-honkd-recover-2-"));
+      const dbPath = path.join(tmpdir, "pigeon.db");
+
+      const clientSetup = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+      await clientSetup.connect();
+      const backendSid = await clientSetup.newSession(tmpdir);
+      clientSetup.close();
+
+      const cmdId = `cmd-live-rec2-${Date.now()}`;
+      const sessId = `sess-live-rec2-${Date.now()}`;
+
+      // --- PHASE A: Registry A starts turn and immediately suspends ---
+      const storageA = openStorageDb(dbPath);
+      storageA.sessions.upsert({
+        sessionId: sessId,
+        backendKind: "goose",
+        backendSessionId: backendSid,
+        backendEndpoint: HONKD_URL!,
+        backendAuthToken: HONKD_TOKEN!,
+        cwd: tmpdir,
+        notify: true,
+      });
+      storageA.inbox.persist({ commandId: cmdId, payload: "Run this shell command: sleep 2 && echo LIVE_CASE2_CACHED_OK" });
+
+      const clientA = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      const registryA = new GooseRunnerRegistry({
+        inbox: storageA.inbox,
+        inflight: storageA.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: clientA,
+            inflight: storageA.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+      const runnerA = registryA.get(storageA.sessions.get(sessId)!);
+
+      try {
+        await runnerA.deliver(cmdId, "Run this shell command: sleep 2 && echo LIVE_CASE2_CACHED_OK");
+        // Suspend immediately while turn is running on honkd
+        await registryA.suspendAll();
+      } finally {
+        storageA.db.close();
+      }
+
+      // Wait 4 seconds while pigeon is "down" for the turn to complete in honkd/goose
+      await new Promise((r) => setTimeout(r, 4000));
+
+      // --- PHASE B: Pigeon starts up and recovers cached reply ---
+      const storageB = openStorageDb(dbPath);
+      const stopReportsB: Array<Record<string, unknown>> = [];
+
+      const registryB = new GooseRunnerRegistry({
+        inbox: storageB.inbox,
+        inflight: storageB.gooseInflight,
+        createRunner: (session) =>
+          new GooseSessionRunner({
+            session,
+            client: new GooseAcpClient({
+              url: HONKD_URL!,
+              transportFactory: webSocketTransport(HONKD_TOKEN!),
+              permissionPolicy: (params) => params.options[0]?.optionId,
+              sessionExtensions: [{ type: "platform", name: "developer" }],
+              serveFloor: ["developer"],
+            }),
+            inflight: storageB.gooseInflight,
+            postStop: async (body) => {
+              stopReportsB.push(body);
+            },
+            touch: () => {},
+          }),
+      });
+
+      try {
+        await recoverGooseTurns({
+          storage: storageB,
+          gooseRunners: registryB,
+          postStop: async (body) => {
+            stopReportsB.push(body);
+          },
+        });
+
+        const runnerB = registryB.peek(sessId);
+        expect(runnerB).toBeDefined();
+        await runnerB?.settled();
+
+        // Cached reply collected
+        expect(stopReportsB).toHaveLength(1);
+        expect(stopReportsB[0]!.event).toBe("Stop");
+        expect(String(stopReportsB[0]!.message)).toContain("LIVE_CASE2_CACHED_OK");
+
+        // Row is gone from inflight and inbox marked done
+        expect(storageB.gooseInflight.get(cmdId)).toBeUndefined();
+        expect(storageB.inbox.get(cmdId)?.status).toBe("done");
+      } finally {
+        registryB.closeAll();
+        storageB.db.close();
+        await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+    120_000,
+  );
+
+  runTest(
+    "recovery case 3: random client_req_id + resumeOnly -> -32004, no run",
+    async () => {
+      const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "pigeon-honkd-recover-3-"));
+      const client = new GooseAcpClient({
+        url: HONKD_URL!,
+        transportFactory: webSocketTransport(HONKD_TOKEN!),
+        permissionPolicy: (params) => params.options[0]?.optionId,
+        sessionExtensions: [{ type: "platform", name: "developer" }],
+        serveFloor: ["developer"],
+      });
+
+      try {
+        await client.connect();
+        expect(client.isHonk).toBe(true);
+        expect(client.supportsResumeOnly).toBe(true);
+
+        const sid = await client.newSession(tmpdir);
+        expect(sid).toBeTruthy();
+
+        // Send resumeOnly: true with a random unknown clientReqId
+        const randomCrid = `cmd-random-${Date.now()}-${Math.random()}`;
+        const outcome = await client.prompt(sid, "This prompt should never execute", {
+          clientReqId: randomCrid,
+          resumeOnly: true,
+        });
+
+        // Must return unknown-request (honkd error -32004)
+        expect(outcome.kind).toBe("unknown-request");
+
+        // Verify no run was started: session should be idle
+        expect(client.activeRunId(sid)).toBeUndefined();
+      } finally {
+        client.close();
         await fs.rm(tmpdir, { recursive: true, force: true }).catch(() => {});
       }
     },

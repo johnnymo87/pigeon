@@ -42,6 +42,7 @@ import { GooseAcpClient } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
+import { recoverGooseTurns } from "./goose/recover-inflight.js";
 import { executeGooseKill } from "./goose/kill-control.js";
 import { startSessionReaper } from "./session-reaper";
 import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
@@ -186,6 +187,25 @@ const clientForSession = makeClientForSession({
  * is the smallest thing that bridges that ordering.
  */
 let appHandler: ((request: Request) => Promise<Response>) | undefined;
+let resolveAppReady: ((handler: (request: Request) => Promise<Response>) => void) | undefined;
+const appReady = new Promise<(request: Request) => Promise<Response>>((resolve) => {
+  resolveAppReady = resolve;
+});
+
+async function getAppHandler(): Promise<(request: Request) => Promise<Response>> {
+  if (appHandler) return appHandler;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      appReady,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("daemon app did not become ready within 30s")), 30_000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Long-lived goose turn runners, one per session.
@@ -228,8 +248,9 @@ const gooseRunners = config.gooseAcpUrl
             // notification idempotency, notify policy, formatting, splitting,
             // the scroll anchor and last_seen touching -- all of which live
             // between reading that body and enqueueing the outbox row.
-            if (!appHandler) throw new Error("daemon app is not ready to accept /stop yet");
-            const res = await appHandler(
+            // Awaits appReady deferred instead of throwing when app is not built yet (R10).
+            const handler = await getAppHandler();
+            const res = await handler(
               new Request(`http://127.0.0.1:${config.port}/stop`, {
                 method: "POST",
                 headers: {
@@ -694,6 +715,15 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
     )
   : undefined;
 
+if (gooseRunners) {
+  void recoverGooseTurns({
+    storage,
+    gooseRunners,
+  }).catch((err) => {
+    console.error("[pigeon-daemon] recoverGooseTurns failed:", err);
+  });
+}
+
 if (poller) {
   poller.start();
 }
@@ -1044,6 +1074,7 @@ const app = createApp(storage, {
   },
 });
 appHandler = app;
+resolveAppReady?.(app);
 
 const server = startServer(config, app);
 
