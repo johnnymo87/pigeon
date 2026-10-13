@@ -336,14 +336,14 @@ export class GooseSessionRunner {
     }
   }
 
-  resume(row: GooseInflightRecord): void {
+  resume(row: GooseInflightRecord): boolean {
     if (this.turn) {
       this.log("goose runner: cannot resume turn because a turn is already active; leaving row for next boot", {
         sessionId: this.sessionId,
         activeCommandId: this.turn.commandId,
         incomingCommandId: row.commandId,
       });
-      return;
+      return false;
     }
 
     this.clearIdleSocketTimer();
@@ -365,7 +365,15 @@ export class GooseSessionRunner {
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
-    this.opts.inflight?.markResumed(row.commandId, Date.now());
+    try {
+      this.opts.inflight?.markResumed(row.commandId, Date.now());
+    } catch (err) {
+      this.log("goose runner: markResumed failed", {
+        sessionId: this.sessionId,
+        commandId: row.commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     this.recoveryResolvedOrAttached = new Promise<void>((resolve) => {
       this.resolveRecoveryAttached = resolve;
@@ -440,6 +448,8 @@ export class GooseSessionRunner {
         error: err instanceof Error ? err.message : String(err),
       });
     });
+
+    return true;
   }
 
   async postShutdownNotice(commandId: string): Promise<void> {

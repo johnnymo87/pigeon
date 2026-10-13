@@ -566,4 +566,114 @@ describe("recoverGooseTurns (Commit 2)", () => {
     expect(s.inbox.get("cmd_1")?.status).toBe("done");
     expect(s.inbox.get("cmd_2")?.status).toBe("done");
   });
+
+  it("two rows for one session, human turn starts between them: row 2 waits for human turn, exactly one receipt each", async () => {
+    const s = newStorage();
+    createSession(s, "ses_human_interleave");
+    const now = 1000;
+    const client = new FakeClient();
+    const receipts: Array<{ commandId?: string; text?: unknown }> = [];
+
+    let deliverHumanOnR1 = true;
+    let runnerRef: GooseSessionRunner | undefined;
+
+    const postStop = vi.fn().mockImplementation(async (body: Record<string, unknown>) => {
+      const commandId = String(body.notification_id).replace(/^.*:/, "");
+      receipts.push({
+        commandId,
+        text: body.message,
+      });
+      if (commandId === "cmd_r1" && deliverHumanOnR1 && runnerRef) {
+        deliverHumanOnR1 = false;
+        // Human replies immediately upon seeing cmd_r1 notification!
+        await runnerRef.deliver("cmd_human", "human question");
+      }
+    });
+
+    s.inbox.persist({ commandId: "cmd_r1", payload: "payload 1" });
+    s.inbox.persist({ commandId: "cmd_r2", payload: "payload 2" });
+
+    s.gooseInflight.insert({
+      commandId: "cmd_r2",
+      sessionId: "ses_human_interleave",
+      backendSessionId: "b_hi",
+      isHonk: true,
+      promptText: "recovery row 2",
+      cleanSuspend: true,
+      createdAt: 200,
+      lastAliveAt: now,
+    });
+    s.gooseInflight.insert({
+      commandId: "cmd_r1",
+      sessionId: "ses_human_interleave",
+      backendSessionId: "b_hi",
+      isHonk: true,
+      promptText: "recovery row 1",
+      cleanSuspend: true,
+      createdAt: 100,
+      lastAliveAt: now,
+    });
+
+    const registry = new GooseRunnerRegistry({
+      inbox: s.inbox,
+      inflight: s.gooseInflight,
+      createRunner: (session) => {
+        const r = new GooseSessionRunner({
+          session,
+          client,
+          inflight: s.gooseInflight,
+          postStop,
+          touch: () => {},
+        });
+        runnerRef = r;
+        return r;
+      },
+    });
+
+    await recoverGooseTurns({
+      storage: s,
+      gooseRunners: registry,
+      now,
+      postStop,
+    });
+
+    const runner = registry.peek("ses_human_interleave")!;
+    expect(runner.activeTurn?.commandId).toBe("cmd_r1");
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(client.prompts).toHaveLength(1);
+    expect(client.prompts[0]).toBe("recovery row 1");
+
+    // Settle cmd_r1. In postStop, human delivers cmd_human!
+    client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "reply 1" });
+
+    // Wait for human turn prompt to arrive at client
+    await new Promise((r) => setTimeout(r, 15));
+    expect(client.prompts).toHaveLength(2);
+    expect(client.prompts[1]).toBe("human question");
+    expect(runner.activeTurn?.commandId).toBe("cmd_human");
+
+    // Settle human turn
+    client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "human answer" });
+
+    // Now recovery should resume row 2 after human turn settles!
+    await new Promise((r) => setTimeout(r, 20));
+    expect(client.prompts).toHaveLength(3);
+    expect(client.prompts[2]).toBe("recovery row 2");
+    expect(runner.activeTurn?.commandId).toBe("cmd_r2");
+
+    // Settle cmd_r2
+    client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "reply 2" });
+    await runner.settled();
+
+    // Check receipts: exactly one receipt each
+    expect(receipts).toHaveLength(3);
+    expect(receipts.map((r) => r.commandId)).toEqual(["cmd_r1", "cmd_human", "cmd_r2"]);
+
+    // Both recovery rows gone and marked done
+    expect(s.gooseInflight.get("cmd_r1")).toBeUndefined();
+    expect(s.gooseInflight.get("cmd_r2")).toBeUndefined();
+    expect(s.inbox.get("cmd_r1")?.status).toBe("done");
+    expect(s.inbox.get("cmd_r2")?.status).toBe("done");
+  });
 });

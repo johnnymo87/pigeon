@@ -43,7 +43,12 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
 
   // Process rows per session oldest-first, one at a time (R5)
   for (const [sessionId, rows] of bySession) {
-    void processSessionRows(sessionId, rows);
+    void processSessionRows(sessionId, rows).catch((err) => {
+      log("processSessionRows failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   async function processSessionRows(sessionId: string, rows: GooseInflightRecord[]): Promise<void> {
@@ -164,12 +169,19 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
 
       // Check 7: Valid honk row to resume!
       const runner = opts.gooseRunners.get(session);
-      runner.resume(row);
 
-      // Wait for turn to settle before processing any subsequent row for the same session (R5)
-      await runner.settled().finally(() => {
-        opts.storage.inbox.markDone(commandId);
-      });
+      // Wait while the runner is busy before resuming this row
+      while (runner.isBusy()) {
+        await runner.settled();
+      }
+
+      const resumed = runner.resume(row);
+      if (resumed) {
+        // Wait for turn to settle before processing any subsequent row for the same session (R5)
+        await runner.settled().finally(() => {
+          opts.storage.inbox.markDone(commandId);
+        });
+      }
     }
   }
 

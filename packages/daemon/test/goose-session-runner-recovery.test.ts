@@ -484,9 +484,10 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     // Attempt to resume a different row while turn is active
     const row2 = makeInflightRow({ commandId: "cmd_second" });
     inflight.insert(row2);
-    runner.resume(row2);
+    const taken = runner.resume(row2);
 
-    // Must refuse to clobber active turn!
+    // Must return false and refuse to clobber active turn!
+    expect(taken).toBe(false);
     expect(runner.activeTurn?.commandId).toBe("cmd_existing");
     expect(inflight.get("cmd_second")).toBeDefined(); // row left alone
   });
