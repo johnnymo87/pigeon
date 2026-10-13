@@ -797,6 +797,30 @@ describe("GooseSessionRunner idle watchdog", () => {
     expect(stops[1]!.notification_id).not.toBe(stalledId);
   });
 
+  it("abandoned turn answering late with empty string text: posts honest receipt", async () => {
+    vi.useFakeTimers();
+    const { runner, client, stops } = makeRunner();
+    client.isHonk = true;
+    client.setRunId("20260918_1", "run_1");
+    client.pingImpl = () => new Promise(() => {});
+    await runner.deliver("c1", "slow but alive");
+
+    await vi.advanceTimersByTimeAsync(IDLE + 1_000);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(stops).toHaveLength(1);
+    const stalledId = stops[0]!.notification_id as string;
+
+    // goose was fine all along and finally answers with text: ""
+    client.finishTurn("end_turn", { text: "" });
+    await vi.runAllTimersAsync();
+    await runner.settled();
+
+    expect(stops).toHaveLength(2);
+    expect(stops[1]!.event).toBe("Stop");
+    expect(stops[1]!.message).toBe("goose ended the turn without a reply.");
+    expect(stops[1]!.notification_id).not.toBe(stalledId);
+  });
+
   it("stays quiet when the abandoned turn merely errors out later", async () => {
     vi.useFakeTimers();
     const { runner, client, stops } = makeRunner();
@@ -1038,6 +1062,77 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(stops).toHaveLength(1);
       expect(stops[0]!.event).toBe("Stop");
       expect(stops[0]!.message).toBe("chunk 1 chunk 2");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("on live turn, if honk says empty string but chunks were received, renders accumulator and logs warning", async () => {
+      const logs: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+      const { runner, client, stops } = makeRunner({
+        log: (msg: string, fields?: Record<string, unknown>) => {
+          logs.push({ msg, fields });
+        },
+      });
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+      runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "live streamed text" } });
+
+      client.finishTurn("end_turn", { text: "" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("live streamed text");
+      expect(runner.isBusy()).toBe(false);
+      expect(logs.some((l) => l.msg.includes("honk text empty but 18 chars received"))).toBe(true);
+    });
+
+    it("honk receipt text empty string with no chunks: posts honest receipt", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.finishTurn("end_turn", { text: "" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("goose ended the turn without a reply.");
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it.each([
+      ["max_tokens", "goose ended the turn without a reply (stopReason: max_tokens)."],
+      ["refusal", "goose ended the turn without a reply (stopReason: refusal)."],
+      ["max_turn_requests", "goose ended the turn without a reply (stopReason: max_turn_requests)."],
+      ["cancelled", "goose ended the turn without a reply (stopReason: cancelled)."],
+    ])("honk receipt text empty string with stopReason '%s': appends stopReason to message", async (stopReason, expectedMessage) => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.finishTurn(stopReason, { text: "" });
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.message).toBe(expectedMessage);
+      expect(runner.isBusy()).toBe(false);
+    });
+
+    it("honk receipt text absent with no chunks: posts finished with no message", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c1", "build");
+
+      client.finishTurn("end_turn"); // text undefined (absent)
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Stop");
+      expect(stops[0]!.error_kind).toBeUndefined();
+      expect(stops[0]!.message).toBe("goose finished the turn with no message (stopReason: end_turn).");
       expect(runner.isBusy()).toBe(false);
     });
 

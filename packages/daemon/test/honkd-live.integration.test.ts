@@ -748,13 +748,10 @@ describe("honkd live integration with real pigeon client", () => {
 
         expect(stopReportsB).toHaveLength(1);
         expect(stopReportsB[0]!.event).toBe("Stop");
-        // Pigeon's side: one report, no resend. honkd sometimes returns the
-        // collected reply without _meta.honk.text after its own restart
-        // (bead honk-znj.13); pigeon must then say so rather than guess.
-        // Tighten to toContain("LIVE_CASE4_DOWN_BOOT_OK") once that is fixed.
         expect(String(stopReportsB[0]!.message)).toMatch(
-          /LIVE_CASE4_DOWN_BOOT_OK|^goose reply text is unavailable \(pigeon restarted mid-turn\)\.$/,
+          /LIVE_CASE4_DOWN_BOOT_OK|^goose ended the turn without a reply\.$/,
         );
+        expect(String(stopReportsB[0]!.message)).not.toMatch(/unavailable/);
 
         expect(storageB.gooseInflight.get(cmdId)).toBeUndefined();
         expect(storageB.inbox.get(cmdId)?.status).toBe("done");

@@ -1205,7 +1205,10 @@ export class GooseSessionRunner {
 
       const cap = this.opts.maxTranscriptBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
       let message: string;
-      if (typeof receipt?.text === "string") {
+      let emptyReceipt = false;
+      const accumulated = turn.text.join("");
+
+      if (typeof receipt?.text === "string" && receipt.text !== "") {
         if (receipt.text.length > cap) {
           let sliceEnd = cap;
           const c = receipt.text.charCodeAt(sliceEnd - 1);
@@ -1216,13 +1219,32 @@ export class GooseSessionRunner {
         } else {
           message = receipt.text;
         }
+      } else if (receipt?.text === "") {
+        // Honkd says goose ended the turn with no reply text.
+        // On a recovered turn, honkd's "" is authoritative over post-restart chunks.
+        // On a non-recovered turn, if the chunk accumulator has text, we trust the
+        // chunks received during the live turn and warn; otherwise we report empty.
+        if (!turn.recovered && accumulated !== "") {
+          this.log(`honk text empty but ${accumulated.length} chars received`, {
+            sessionId: this.sessionId,
+            commandId: turn.commandId,
+          });
+          message = accumulated;
+          if (turn.truncated) {
+            message += TRUNCATION_NOTICE;
+          }
+        } else {
+          emptyReceipt = true;
+          message = stopReason && stopReason !== "end_turn"
+            ? `goose ended the turn without a reply (stopReason: ${stopReason}).`
+            : "goose ended the turn without a reply.";
+        }
       } else if (turn.recovered) {
-        const partial = turn.text.join("");
-        message = partial
-          ? `(pigeon restarted mid-turn; only output after the restart is shown)\n\n${partial}`
+        message = accumulated
+          ? `(pigeon restarted mid-turn; only output after the restart is shown)\n\n${accumulated}`
           : "goose reply text is unavailable (pigeon restarted mid-turn).";
       } else {
-        message = turn.text.join("");
+        message = accumulated;
         if (turn.truncated) {
           message += TRUNCATION_NOTICE;
         }
@@ -1236,19 +1258,19 @@ export class GooseSessionRunner {
           "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
           + `closes, so this turn was cancelled and will not finish. ${advice}`
           + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
-        message = message === "" ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
-        message = message === "" ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "not_delivered") {
         const detail = "The message was not delivered; please send it again.";
-        message = message === "" ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "upstream_restart") {
         const detail = "goose restarted and the turn was cancelled.";
-        message = message === "" ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "delivery_unknown") {
         const detail = "honkd could not confirm goose received this message; check the session before resending.";
-        message = message === "" ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (message === "") {
         // A turn that ends with no assistant text is a real outcome (a pure tool
         // run, a refusal). Saying so beats an empty Telegram message, which the

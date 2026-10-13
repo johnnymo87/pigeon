@@ -683,6 +683,93 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     expect(msg).toContain("goose reply text is unavailable");
   });
 
+  it("honk receipt text empty string on recovered turn: posts honest receipt without falling back to chunks or saying unavailable", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Post-restart chunk arrives
+    runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "chunk after restart" } });
+
+    // Reply finishes with _meta.honk.text = ""
+    client.finishTurn("end_turn", { text: "" });
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].event).toBe("Stop");
+    expect(postStop.mock.calls[0]![0].message).toBe("goose ended the turn without a reply.");
+  });
+
+  it("honk receipt text empty string on recovered turn with no chunks: posts honest receipt", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Reply finishes with _meta.honk.text = "" and NO chunks arrived
+    client.finishTurn("end_turn", { text: "" });
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].event).toBe("Stop");
+    expect(postStop.mock.calls[0]![0].message).toBe("goose ended the turn without a reply.");
+  });
+
+  it("honk receipt text empty string on recovered turn with stopReason other than end_turn: appends stopReason", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+
+    const row = makeInflightRow();
+    inflight.insert(row);
+    runner.resume(row);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Reply finishes with _meta.honk.text = "" and stopReason: "max_tokens"
+    client.finishTurn("max_tokens", { text: "" });
+    await runner.settled();
+
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(postStop.mock.calls[0]![0].event).toBe("Error");
+    expect(postStop.mock.calls[0]![0].message).toBe("goose ended the turn without a reply (stopReason: max_tokens).");
+  });
+
   it("-32004 (unknown-request) on recovery: posts honest notice, does not resend, retires row", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
