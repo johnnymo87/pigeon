@@ -357,6 +357,65 @@ describe("AlertRepository", () => {
     storage.db.close();
   });
 
+  // pigeon-bql2: a sent lost-wake advisory is the watchdog's only durable record
+  // that it already alerted. Deleting it while its swarm row is still handed_off
+  // and unverified (which a lost wake can be forever) re-arms the alert at the
+  // next daemon restart.
+  describe("lost-wake advisory retention (pigeon-bql2)", () => {
+    function setup(msgId: string) {
+      const storage = createStorage();
+      storage.swarm.insert({
+        msgId,
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        channel: null,
+        kind: "wake",
+        priority: "normal",
+        replyTo: null,
+        payload: "p",
+      }, 1_000);
+      storage.swarm.markHandedOff(msgId, 2_000);
+      storage.alerts.enqueue({
+        id: "adv",
+        source: "wake-lost-unverified",
+        refMsgId: `wake-lost:${msgId}`,
+        text: "advisory",
+        severity: "error",
+        now: 10_000,
+      });
+      storage.alerts.markSent("adv", 20_000);
+      return storage;
+    }
+
+    it("keeps a sent wake-lost advisory past retention while its row is still unverified", () => {
+      const storage = setup("m_keep");
+      expect(storage.alerts.cleanupOlderThan(50_000, 50_000)).toBe(0);
+      expect(storage.alerts.getById("adv")).toBeDefined();
+      storage.db.close();
+    });
+
+    it("releases it once the row is verified", () => {
+      const storage = setup("m_verified");
+      storage.swarm.markVerified("m_verified", 30_000);
+      expect(storage.alerts.cleanupOlderThan(50_000, 50_000)).toBe(1);
+      storage.db.close();
+    });
+
+    it("releases it once the row has left handed_off", () => {
+      const storage = setup("m_failed");
+      storage.swarm.markFailed("m_failed", 30_000);
+      expect(storage.alerts.cleanupOlderThan(50_000, 50_000)).toBe(1);
+      storage.db.close();
+    });
+
+    it("releases it once the row no longer exists", () => {
+      const storage = setup("m_gone");
+      storage.db.prepare("DELETE FROM swarm_messages WHERE msg_id = ?").run("m_gone");
+      expect(storage.alerts.cleanupOlderThan(50_000, 50_000)).toBe(1);
+      storage.db.close();
+    });
+  });
+
   it("cleanupOlderThan deletes old sent and old abandoned rows but never queued rows", () => {
     const storage = createStorage();
     const now = 100_000;

@@ -181,11 +181,36 @@ export class AlertRepository {
   }
 
   // Cleans up old sent (by sent_at) and old abandoned (by created_at, i.e. age since creation) alerts.
+  //
+  // EXCEPT a sent lost-wake advisory whose swarm row is still handed_off and
+  // unverified (pigeon-bql2). That row is the watchdog's only record across a
+  // restart that it already alerted (its in-memory Set empties on restart), and a
+  // lost wake has no terminal exit: it can stay eligible forever. Deleting the
+  // advisory an hour after sending re-armed it, so the same payload alert went out
+  // again after every later restart (nightly, and every deploy). It is released as
+  // soon as the row is verified, leaves handed_off, or is deleted -- i.e. exactly
+  // when the watchdog stops looking at it. The predicate mirrors
+  // SwarmRepository.listUnverifiedHandedOff.
+  //
+  // Scoped to `wake-lost:` on purpose. The `silent:` advisory re-arms per silent
+  // EPISODE (see delivery-watchdog.ts), and retaining its row would suppress a
+  // later, possibly different, episode on the same row.
   cleanupOlderThan(sentCutoff: number, abandonedCutoff: number): number {
     const result = this.db
       .prepare(
         `DELETE FROM operational_alerts
-         WHERE (state = 'sent' AND sent_at < ?)
+         WHERE (
+                 state = 'sent' AND sent_at < ?
+                 AND NOT (
+                   ref_msg_id LIKE 'wake-lost:%'
+                   AND EXISTS (
+                     SELECT 1 FROM swarm_messages s
+                     WHERE s.msg_id = substr(operational_alerts.ref_msg_id, 11)
+                       AND s.state = 'handed_off'
+                       AND s.verified_at IS NULL
+                   )
+                 )
+               )
             OR (state = 'abandoned' AND created_at < ?)`,
       )
       .run(sentCutoff, abandonedCutoff);
