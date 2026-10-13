@@ -1164,6 +1164,13 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       "The operation timed out",
       "This operation was aborted",
       "prompt_async failed: AbortError",
+      // pigeon-7yby: the plugin's prompt_async connection dropped mid-request.
+      // Whether opencode-serve received it is unknown, so this is ambiguous, not
+      // a deliberate rejection. These used to fall through to "terminal" and the
+      // message was dropped with "Command rejected: ...".
+      "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+      "read ECONNRESET",
+      "socket hang up",
     ])("revives on an ambiguous plugin-internal failure: %s", async (errorMessage) => {
       const storage = openStorageDb(":memory:");
       storage.sessions.upsert({
@@ -1243,6 +1250,57 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       // Retried through the plugin and succeeded — no revive (no duplicate).
       expect(calls).toBe(2);
       expect(sendPromptCalls).toHaveLength(0);
+      expect(storage.inbox.listUnfinished()).toHaveLength(0);
+
+      storage.db.close();
+    });
+
+    it("retries a dropped prompt_async socket through the plugin and succeeds, with no 'Command rejected' (pigeon-7yby)", async () => {
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-socket",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, 1_000);
+
+      const sendPromptCalls: string[] = [];
+      const replies: string[] = [];
+      let calls = 0;
+
+      await ingestWorkerCommand(
+        storage,
+        makeMsg({ commandId: "cmd-socket", sessionId: "sess-socket", command: "fix the bug", chatId: "7" }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              calls++;
+              if (calls === 1) {
+                return {
+                  ok: false,
+                  error: "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+                };
+              }
+              return { ok: true };
+            },
+          }),
+          opencodeClient: {
+            async getSession() { return { id: "sess-socket", directory: "/tmp/proj" }; },
+            async sendPrompt(_sid, _dir, prompt) { sendPromptCalls.push(prompt); },
+          },
+          spawn: mockSpawn,
+          sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+          deliveryBudgetMs: 40_000,
+          sleep: async () => {},
+        },
+      );
+
+      expect(calls).toBe(2);
+      expect(sendPromptCalls).toHaveLength(0);
+      expect(replies.filter((r) => r.includes("Command rejected"))).toEqual([]);
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();

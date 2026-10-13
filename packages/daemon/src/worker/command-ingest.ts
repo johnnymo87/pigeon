@@ -760,7 +760,7 @@ async function ingestWorkerCommandInner(
  * Callers on the question-reply path (specifically `throwIfTransientQuestionReplyFailure`)
  * must pass `{ error: result.error }` without `meta`.
  *
- * - `ambiguous`: a timeout/abort. The plugin may be alive but busy (event-loop
+ * - `ambiguous`: a timeout/abort, or a connection reset mid-request. The plugin may be alive but busy (event-loop
  *   starved mid-turn); the injection may or may not have landed. Retrying
  *   through the idempotent plugin can still produce a clean 1× delivery, so we
  *   retry within the budget before reviving.
@@ -785,6 +785,22 @@ function classifyDeliveryFailure(
   if (error) {
     const lower = error.toLowerCase();
     if (lower.includes("timed out") || lower.includes("abort")) {
+      return "ambiguous";
+    }
+    // A connection that dropped MID-request (pigeon-7yby). The usual source is the
+    // plugin's own prompt_async call inside opencode-serve, which runs on Bun and
+    // words it "The socket connection was closed unexpectedly"; Node says
+    // ECONNRESET / "socket hang up". The request may or may not have reached
+    // opencode-serve, so this is the same case as a timeout: retry through the
+    // idempotent plugin (it does not cache failures), then revive. Before this
+    // it fell through to "terminal" and the message was dropped as "Command rejected".
+    // Checked before the "fetch failed" rule on purpose: a reset is not proof of
+    // non-delivery the way a refused connection is.
+    if (
+      lower.includes("socket connection was closed") ||
+      lower.includes("econnreset") ||
+      lower.includes("socket hang up")
+    ) {
       return "ambiguous";
     }
     if (
