@@ -2029,6 +2029,50 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       storage.db.close();
     });
 
+    // pigeon-7yby made a mid-request socket reset "ambiguous" on the EXECUTE path only.
+    // On the question-reply path "ambiguous" throws for poller redelivery, and a
+    // redelivered answer that was in fact consumed falls through to prompt injection.
+    // Pin that the question path is unchanged: a reset does not throw.
+    it("does not throw for redelivery when a question reply hits a socket reset (execute-only reclassification)", async () => {
+      const now = Date.now();
+      const storage = openStorageDb(":memory:");
+      storage.sessions.upsert({
+        sessionId: "sess-meta-reset",
+        notify: true,
+        backendKind: "opencode-plugin-direct",
+        backendProtocolVersion: 1,
+        backendEndpoint: "http://127.0.0.1:7777/pigeon/direct/execute",
+        backendAuthToken: "tok",
+      }, now);
+
+      await expect(ingestWorkerCommand(
+        storage,
+        makeMsg({
+          commandId: "cmd-meta-reset",
+          sessionId: "sess-meta-reset",
+          command: "my plain text answer",
+          chatId: "1",
+          metadata: { questionRequestId: "req-meta-reset" },
+        }),
+        {
+          createAdapter: () => ({
+            name: "mock-direct",
+            async deliverCommand() {
+              return { ok: true as const };
+            },
+            async deliverQuestionReply() {
+              return {
+                ok: false as const,
+                error: "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+              };
+            },
+          }),
+        },
+      )).resolves.toBeUndefined();
+
+      storage.db.close();
+    });
+
     it("does not fall through to regular command delivery when metadata fallback hits a transient timeout error", async () => {
       const now = Date.now();
       const storage = openStorageDb(":memory:");
