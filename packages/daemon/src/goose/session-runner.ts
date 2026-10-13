@@ -50,6 +50,7 @@
  */
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import type { GooseInflightRecord, GooseInflightStore } from "../storage/goose-inflight-repo.js";
 import { DisconnectedDuringTurn } from "./acp-client.js";
 
 /**
@@ -112,9 +113,11 @@ export interface RunnerClient {
   isClosed(): boolean;
   /** True when connected to honkd. Bare goose is false. */
   readonly isHonk?: boolean;
+  /** True when honkd advertises resume_only feature. */
+  readonly supportsResumeOnly?: boolean;
   /** Round-trips a cheap request; never settles on a dead socket. */
   ping(): Promise<void>;
-  prompt(sessionId: string, text: string, options?: { clientReqId?: string }): Promise<unknown>;
+  prompt(sessionId: string, text: string, options?: { clientReqId?: string; resumeOnly?: boolean }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
   cancel(sessionId: string): void;
@@ -143,6 +146,8 @@ export interface GooseSessionRunnerOptions {
   postStop: (body: Record<string, unknown>) => Promise<void>;
   /** Keeps the reaper off a session whose only activity is goose-side. */
   touch: (sessionId: string) => void;
+  /** Persisted in-flight turns store for crash recovery (honk-znj.10). */
+  inflight?: GooseInflightStore;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
   /** Transcript buffer cap. A runaway turn must not be able to exhaust memory. */
   maxTranscriptBytes?: number;
@@ -152,6 +157,8 @@ export interface GooseSessionRunnerOptions {
   idleSocketTimeoutMs?: number;
   /** Total time budget for retrying reconnection to honkd. Defaults to 2 minutes (~120s). */
   honkReconnectBudgetMs?: number;
+  /** Total time budget for recovering an in-flight turn through honkd. Defaults to 10 minutes. */
+  honkRecoveryBudgetMs?: number;
   /** Initial delay before retrying connect to honkd. Defaults to 250ms. */
   honkReconnectInitialDelayMs?: number;
   /** Max delay between reconnect attempts. Defaults to 5s. */
@@ -165,6 +172,8 @@ interface Turn {
   startedAt: number;
   /** Last time ANY frame arrived for this turn. The watchdog's only input. */
   lastActivityAt: number;
+  /** Last time inflight last_alive_at was touched. Throttled to ~1/min (R1). */
+  lastAliveTouchAt?: number;
   text: string[];
   bytes: number;
   truncated: boolean;
@@ -188,17 +197,20 @@ interface Turn {
   abandoned: boolean;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
   resent?: boolean;
+  recovered?: boolean;
   cancelRequested?: boolean;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
 
 const BUSY_NOT_DELIVERED_TEXT =
   "goose was already running a turn and pigeon could not add this message to it. "
   + "It was NOT delivered -- please send it again once the current turn finishes.";
 
 const DEFAULT_HONK_RECONNECT_BUDGET_MS = 120_000;
+const DEFAULT_HONK_RECOVERY_BUDGET_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_HONK_RECONNECT_MAX_DELAY_MS = 5_000;
 
@@ -280,6 +292,9 @@ export class GooseSessionRunner {
   private sleepTimer: ReturnType<typeof setTimeout> | undefined;
   private sleepResolve: (() => void) | undefined;
   private closed = false;
+  private suspended = false;
+  private recoveryResolvedOrAttached: Promise<void> | undefined;
+  private resolveRecoveryAttached: (() => void) | undefined;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
@@ -287,6 +302,168 @@ export class GooseSessionRunner {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get isSuspended(): boolean {
+    return this.suspended;
+  }
+
+  suspend(): void {
+    this.suspended = true;
+  }
+
+  get activeTurn(): { commandId: string } | undefined {
+    return this.turn ? { commandId: this.turn.commandId } : undefined;
+  }
+
+  retire(turn: { commandId: string }): void {
+    try {
+      this.opts.inflight?.delete(turn.commandId);
+    } catch (err) {
+      this.log("goose runner: could not retire inflight turn", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private notifyRecoveryResolvedOrAttached(): void {
+    if (this.resolveRecoveryAttached) {
+      const resolve = this.resolveRecoveryAttached;
+      this.resolveRecoveryAttached = undefined;
+      resolve();
+    }
+  }
+
+  resume(row: GooseInflightRecord): boolean {
+    if (this.turn) {
+      this.log("goose runner: cannot resume turn because a turn is already active; leaving row for next boot", {
+        sessionId: this.sessionId,
+        activeCommandId: this.turn.commandId,
+        incomingCommandId: row.commandId,
+      });
+      return false;
+    }
+
+    this.clearIdleSocketTimer();
+    const turn: Turn = {
+      commandId: row.commandId,
+      startedAt: row.createdAt,
+      lastActivityAt: Date.now(),
+      lastAliveTouchAt: Date.now(),
+      text: [],
+      bytes: 0,
+      truncated: false,
+      settled: Promise.resolve(),
+      abandoned: false,
+      idleTimer: undefined,
+      resent: true,
+      recovered: true,
+    };
+    this.turn = turn;
+    this.opts.touch(this.sessionId);
+    this.armIdleTimer(turn);
+
+    try {
+      this.opts.inflight?.markResumed(row.commandId, Date.now());
+    } catch (err) {
+      this.log("goose runner: markResumed failed", {
+        sessionId: this.sessionId,
+        commandId: row.commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    this.recoveryResolvedOrAttached = new Promise<void>((resolve) => {
+      this.resolveRecoveryAttached = resolve;
+    });
+
+    const recoveryBudgetMs = this.opts.honkRecoveryBudgetMs ?? DEFAULT_HONK_RECOVERY_BUDGET_MS;
+
+    this.lastSettled = turn.settled = (async () => {
+      try {
+        try {
+          await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "connect");
+        } catch (connectErr) {
+          if (row.isHonk) {
+            await this.reconnectAndResend(turn, row.promptText, connectErr, recoveryBudgetMs);
+            return;
+          }
+          await this.finishTurn(turn, undefined, connectErr);
+          return;
+        }
+
+        if (!this.opts.client.isHonk || !this.opts.client.supportsResumeOnly) {
+          this.log("honkd does not advertise resume_only; cannot safely collect reply", {
+            sessionId: this.sessionId,
+            commandId: row.commandId,
+            isHonk: this.opts.client.isHonk,
+            supportsResumeOnly: this.opts.client.supportsResumeOnly,
+          });
+          if (this.turn === turn) this.clearTurn();
+          try {
+            await this.opts.postStop({
+              session_id: this.sessionId,
+              notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
+              message:
+                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              event: "Error",
+              error_kind: "goose-turn-recovery-unsupported",
+            });
+            this.retire(turn);
+          } catch (reportErr) {
+            this.log("goose runner: could not report unsupported recovery notice", {
+              sessionId: this.sessionId,
+              commandId: row.commandId,
+              error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+            });
+          }
+          return;
+        }
+
+        try {
+          const outcome = await this.opts.client.prompt(this.backendSessionId, row.promptText, {
+            clientReqId: row.commandId,
+            resumeOnly: true,
+          });
+          await this.onPromptOutcome(turn, row.promptText, outcome);
+        } catch (err) {
+          if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+            this.connected = false;
+            await this.reconnectAndResend(turn, row.promptText, err, recoveryBudgetMs);
+            return;
+          }
+          await this.finishTurn(turn, undefined, err);
+        }
+      } finally {
+        this.notifyRecoveryResolvedOrAttached();
+        if (this.opts.client.isHonk && !this.turn && this.connected && !this.opts.client.isClosed() && !this.closed) {
+          this.armIdleSocketTimer();
+        }
+      }
+    })().catch((err: unknown) => {
+      this.log("goose runner: recovery continuation threw", {
+        sessionId: this.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    return true;
+  }
+
+  async postShutdownNotice(commandId: string): Promise<void> {
+    await this.opts.postStop({
+      session_id: this.sessionId,
+      notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}`,
+      message: gooseShutdownNotice(this.sessionId, false),
+      event: "Error",
+      error_kind: "goose-turn-cancelled-by-restart",
+    });
+  }
+
+  async postNotice(body: Record<string, unknown>): Promise<void> {
+    await this.opts.postStop(body);
   }
 
   get isHonk(): boolean {
@@ -358,6 +535,19 @@ export class GooseSessionRunner {
     }
 
     await this.ensureConnected();
+
+    // R3: If the active turn is a recovered turn and has no runId yet, await attach or resolution
+    if (this.turn?.recovered && !this.runId()) {
+      try {
+        await withDeadline(
+          this.recoveryResolvedOrAttached ?? Promise.resolve(),
+          NON_TURN_TIMEOUT_MS,
+          "recovery attach",
+        );
+      } catch {
+        /* proceed to check turn state */
+      }
+    }
 
     // A turn is in flight, so this message steers it rather than starting a
     // competing one. goose would reject a second prompt as busy anyway; steering
@@ -436,6 +626,17 @@ export class GooseSessionRunner {
    */
   private startTurn(commandId: string, text: string): DeliverOutcome {
     this.clearIdleSocketTimer();
+
+    if (this.opts.inflight) {
+      this.opts.inflight.insert({
+        commandId,
+        sessionId: this.sessionId,
+        backendSessionId: this.backendSessionId,
+        isHonk: this.isHonk,
+        promptText: text,
+      });
+    }
+
     const turn: Turn = {
       commandId,
       startedAt: Date.now(),
@@ -457,123 +658,9 @@ export class GooseSessionRunner {
         await this.onPromptOutcome(turn, text, outcome);
       } catch (err) {
         if (err instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
-          if (this.closed || turn.abandoned || turn.cancelRequested) {
-            await this.finishTurn(turn, undefined, err);
-            return;
-          }
-          if (turn.idleTimer) {
-            clearTimeout(turn.idleTimer);
-            turn.idleTimer = undefined;
-          }
-          this.log("honk disconnect mid-turn, retrying reconnect and resend with backoff", {
-            sessionId: this.sessionId,
-            commandId,
-          });
-
+          this.connected = false;
           const budgetMs = this.opts.honkReconnectBudgetMs ?? DEFAULT_HONK_RECONNECT_BUDGET_MS;
-          const deadline = Date.now() + budgetMs;
-          let delay = this.opts.honkReconnectInitialDelayMs ?? DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS;
-          const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
-
-          while (Date.now() < deadline) {
-            if (this.closed || turn.abandoned || turn.cancelRequested) {
-              await this.finishTurn(turn, undefined, err);
-              return;
-            }
-            try {
-              await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
-            } catch (connectErr) {
-              if (this.closed || turn.abandoned || turn.cancelRequested) {
-                await this.finishTurn(turn, undefined, err);
-                return;
-              }
-              const remaining = deadline - Date.now();
-              if (remaining <= 0) break;
-              const waitTime = Math.min(delay, maxDelay, remaining);
-              delay = Math.min(delay * 2, maxDelay);
-              this.log("honk reconnect attempt failed, backing off", {
-                sessionId: this.sessionId,
-                commandId,
-                delay: waitTime,
-                error: connectErr instanceof Error ? connectErr.message : String(connectErr),
-              });
-              await this.sleep(waitTime);
-              continue;
-            }
-
-            if (this.closed || turn.abandoned || turn.cancelRequested) {
-              await this.finishTurn(turn, undefined, err);
-              return;
-            }
-
-            if (!this.opts.client.isHonk) {
-              this.log("reconnected endpoint is not honkd, not resending prompt", {
-                sessionId: this.sessionId,
-                commandId,
-              });
-              await this.finishTurn(turn, undefined, err);
-              return;
-            }
-
-            turn.lastActivityAt = Date.now();
-            this.armIdleTimer(turn);
-            turn.resent = true;
-
-            if (this.closed || turn.abandoned || turn.cancelRequested) {
-              await this.finishTurn(turn, undefined, err);
-              return;
-            }
-
-            try {
-              const outcome = await this.opts.client.prompt(this.backendSessionId, text, { clientReqId: commandId });
-              if (this.closed || turn.abandoned || turn.cancelRequested) {
-                await this.finishTurn(turn, undefined, err);
-                return;
-              }
-              await this.onPromptOutcome(turn, text, outcome);
-              return;
-            } catch (resendErr) {
-              if (this.closed || turn.abandoned || turn.cancelRequested) {
-                await this.finishTurn(turn, undefined, err);
-                return;
-              }
-              if (resendErr instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
-                if (turn.idleTimer) {
-                  clearTimeout(turn.idleTimer);
-                  turn.idleTimer = undefined;
-                }
-                const remaining = deadline - Date.now();
-                if (remaining <= 0) break;
-                const waitTime = Math.min(delay, maxDelay, remaining);
-                delay = Math.min(delay * 2, maxDelay);
-                this.log("honk resend disconnected, backing off and retrying reconnect", {
-                  sessionId: this.sessionId,
-                  commandId,
-                  delay: waitTime,
-                });
-                await this.sleep(waitTime);
-                continue;
-              }
-              this.log("honk resend failed with non-disconnect error", {
-                sessionId: this.sessionId,
-                commandId,
-                error: resendErr instanceof Error ? resendErr.message : String(resendErr),
-              });
-              await this.finishTurn(turn, undefined, resendErr);
-              return;
-            }
-          }
-
-          this.log("honk reconnect budget exhausted, reporting lost contact", {
-            sessionId: this.sessionId,
-            commandId,
-            budgetMs,
-          });
-          await this.finishTurn(
-            turn,
-            undefined,
-            new Error("lost contact with honkd; the turn may still be running and its reply was not collected"),
-          );
+          await this.reconnectAndResend(turn, text, err, budgetMs);
           return;
         }
         await this.finishTurn(turn, undefined, err);
@@ -592,6 +679,158 @@ export class GooseSessionRunner {
     });
 
     return { ok: true, meta: { mode: "prompt", commandId } };
+  }
+
+  private async reconnectAndResend(
+    turn: Turn,
+    text: string,
+    cause: unknown,
+    budgetMs: number,
+  ): Promise<void> {
+    if (this.closed || turn.abandoned || turn.cancelRequested) {
+      await this.finishTurn(turn, undefined, cause);
+      return;
+    }
+    if (turn.idleTimer) {
+      clearTimeout(turn.idleTimer);
+      turn.idleTimer = undefined;
+    }
+    this.log("honk disconnect mid-turn, retrying reconnect and resend with backoff", {
+      sessionId: this.sessionId,
+      commandId: turn.commandId,
+    });
+
+    const deadline = Date.now() + budgetMs;
+    let delay = this.opts.honkReconnectInitialDelayMs ?? DEFAULT_HONK_RECONNECT_INITIAL_DELAY_MS;
+    const maxDelay = this.opts.honkReconnectMaxDelayMs ?? DEFAULT_HONK_RECONNECT_MAX_DELAY_MS;
+
+    while (Date.now() < deadline) {
+      if (this.closed || turn.abandoned || turn.cancelRequested) {
+        await this.finishTurn(turn, undefined, cause);
+        return;
+      }
+      try {
+        await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "reconnect");
+      } catch (connectErr) {
+        if (this.closed || turn.abandoned || turn.cancelRequested) {
+          await this.finishTurn(turn, undefined, cause);
+          return;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const waitTime = Math.min(delay, maxDelay, remaining);
+        delay = Math.min(delay * 2, maxDelay);
+        this.log("honk reconnect attempt failed, backing off", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          delay: waitTime,
+          error: connectErr instanceof Error ? connectErr.message : String(connectErr),
+        });
+        await this.sleep(waitTime);
+        continue;
+      }
+
+      if (this.closed || turn.abandoned || turn.cancelRequested) {
+        await this.finishTurn(turn, undefined, cause);
+        return;
+      }
+
+      if (!this.opts.client.isHonk || (turn.recovered && !this.opts.client.supportsResumeOnly)) {
+        this.log("reconnected endpoint is not honkd or does not advertise resume_only for recovered turn", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          isHonk: this.opts.client.isHonk,
+          supportsResumeOnly: this.opts.client.supportsResumeOnly,
+        });
+        if (turn.recovered) {
+          if (this.turn === turn) this.clearTurn();
+          try {
+            await this.opts.postStop({
+              session_id: this.sessionId,
+              notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+              message:
+                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              event: "Error",
+              error_kind: "goose-turn-recovery-unsupported",
+            });
+            this.retire(turn);
+          } catch (reportErr) {
+            this.log("goose runner: could not report unsupported recovery notice", {
+              sessionId: this.sessionId,
+              commandId: turn.commandId,
+              error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+            });
+          }
+          return;
+        }
+        await this.finishTurn(turn, undefined, cause);
+        return;
+      }
+
+      turn.lastActivityAt = Date.now();
+      this.armIdleTimer(turn);
+      turn.resent = true;
+
+      if (this.closed || turn.abandoned || turn.cancelRequested) {
+        await this.finishTurn(turn, undefined, cause);
+        return;
+      }
+
+      try {
+        const promptOpts: { clientReqId: string; resumeOnly?: boolean } = {
+          clientReqId: turn.commandId,
+          ...(turn.recovered ? { resumeOnly: true } : {}),
+        };
+        const outcome = await this.opts.client.prompt(this.backendSessionId, text, promptOpts);
+        if (this.closed || turn.abandoned || turn.cancelRequested) {
+          await this.finishTurn(turn, undefined, cause);
+          return;
+        }
+        await this.onPromptOutcome(turn, text, outcome);
+        return;
+      } catch (resendErr) {
+        if (this.closed || turn.abandoned || turn.cancelRequested) {
+          await this.finishTurn(turn, undefined, cause);
+          return;
+        }
+        if (resendErr instanceof DisconnectedDuringTurn && this.opts.client.isHonk) {
+          this.connected = false;
+          if (turn.idleTimer) {
+            clearTimeout(turn.idleTimer);
+            turn.idleTimer = undefined;
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          const waitTime = Math.min(delay, maxDelay, remaining);
+          delay = Math.min(delay * 2, maxDelay);
+          this.log("honk resend disconnected, backing off and retrying reconnect", {
+            sessionId: this.sessionId,
+            commandId: turn.commandId,
+            delay: waitTime,
+          });
+          await this.sleep(waitTime);
+          continue;
+        }
+        this.log("honk resend failed with non-disconnect error", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: resendErr instanceof Error ? resendErr.message : String(resendErr),
+        });
+        await this.finishTurn(turn, undefined, resendErr);
+        return;
+      }
+    }
+
+    this.log("honk reconnect budget exhausted, reporting lost contact", {
+      sessionId: this.sessionId,
+      commandId: turn.commandId,
+      budgetMs,
+    });
+    await this.finishTurn(
+      turn,
+      undefined,
+      new Error("lost contact with honkd; the turn may still be running and its reply was not collected"),
+    );
   }
 
   /**
@@ -616,8 +855,56 @@ export class GooseSessionRunner {
    */
   private async onPromptOutcome(turn: Turn, text: string, outcome: unknown): Promise<void> {
     const kind = (outcome as { kind?: string } | undefined)?.kind;
+    if (kind === "unknown-request") {
+      this.log("honkd reported unknown client_req_id for recovery prompt", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      if (this.turn === turn) this.clearTurn();
+      try {
+        await this.opts.postStop({
+          session_id: this.sessionId,
+          notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+          message: "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent.",
+          event: "Error",
+          error_kind: "honk-unknown-request",
+        });
+        this.retire(turn);
+      } catch (reportErr) {
+        this.log("goose runner: could not report unknown-request notice", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+        });
+      }
+      return;
+    }
     if (kind === "busy") {
       const runId = (outcome as { runId?: string }).runId;
+      if (turn.recovered) {
+        this.log("honkd rejected the recovery request as busy, reporting message not delivered", {
+          sessionId: this.sessionId,
+          runId,
+        });
+        if (this.turn === turn) this.clearTurn();
+        try {
+          await this.opts.postStop({
+            session_id: this.sessionId,
+            notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
+            message: "your message was not delivered (goose was busy); nothing was resent — send it again.",
+            event: "Error",
+            error_kind: "goose-busy-recovered",
+          });
+          this.retire(turn);
+        } catch (reportErr) {
+          this.log("goose runner: could not report busy-recovered notice", {
+            sessionId: this.sessionId,
+            commandId: turn.commandId,
+            error: reportErr instanceof Error ? reportErr.message : String(reportErr),
+          });
+        }
+        return;
+      }
       if (turn.resent) {
         this.log("honkd rejected the resend as busy, reporting message not delivered", {
           sessionId: this.sessionId,
@@ -649,6 +936,7 @@ export class GooseSessionRunner {
           // reports its own completion, so this turn is over as a bookkeeping
           // matter and must not also report.
           if (this.turn === turn) this.clearTurn();
+          this.retire(turn);
           return;
         }
       } catch (err) {
@@ -681,6 +969,24 @@ export class GooseSessionRunner {
     // false positive that costs the human their answer.
     turn.lastActivityAt = Date.now();
 
+    if (turn.recovered && this.runId()) {
+      this.notifyRecoveryResolvedOrAttached();
+    }
+
+    const now = Date.now();
+    if (!turn.lastAliveTouchAt || now - turn.lastAliveTouchAt >= TOUCH_ALIVE_INTERVAL_MS) {
+      turn.lastAliveTouchAt = now;
+      try {
+        this.opts.inflight?.touchAlive(turn.commandId, now);
+      } catch (err) {
+        this.log("goose runner: touchAlive failed", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     if (update.sessionUpdate !== "agent_message_chunk") return;
 
     const text = (update.content as { text?: unknown } | undefined)?.text;
@@ -702,6 +1008,7 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
+    this.notifyRecoveryResolvedOrAttached();
     if (this.opts.client.isHonk && this.connected && !this.opts.client.isClosed() && !this.closed) {
       this.armIdleSocketTimer();
     }
@@ -790,6 +1097,13 @@ export class GooseSessionRunner {
    * `finishTurn` depends on that id being free.
    */
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
+    if (this.suspended) {
+      this.log("goose runner: turn abandoned while suspended; skipping report and keeping inflight row", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      return;
+    }
     if (turn.abandoned || this.turn !== turn) return;
     turn.abandoned = true;
     this.connected = false;
@@ -824,6 +1138,7 @@ export class GooseSessionRunner {
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
+      this.retire(turn);
     } catch (reportErr) {
       this.log("goose runner: could not report a stalled turn", {
         sessionId: this.sessionId,
@@ -842,11 +1157,20 @@ export class GooseSessionRunner {
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
 
+    if (this.suspended) {
+      this.log("goose runner: turn finished while suspended; skipping report and keeping inflight row", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      return;
+    }
+
     if (turn.cancelRequested) {
       this.log("goose runner: turn cancel was requested; skipping stop notification", {
         sessionId: this.sessionId,
         commandId: turn.commandId,
       });
+      this.retire(turn);
       return;
     }
 
@@ -862,6 +1186,7 @@ export class GooseSessionRunner {
           commandId: turn.commandId,
           error: err instanceof Error ? err.message : String(err),
         });
+        this.retire(turn);
         return;
       }
       // goose was alive the whole time and has answered. The watchdog was wrong,
@@ -891,6 +1216,11 @@ export class GooseSessionRunner {
         } else {
           message = receipt.text;
         }
+      } else if (turn.recovered) {
+        const partial = turn.text.join("");
+        message = partial
+          ? `(pigeon restarted mid-turn; only output after the restart is shown)\n\n${partial}`
+          : "goose reply text is unavailable (pigeon restarted mid-turn).";
       } else {
         message = turn.text.join("");
         if (turn.truncated) {
@@ -944,6 +1274,7 @@ export class GooseSessionRunner {
             }
           : {}),
       });
+      this.retire(turn);
     } catch (reportErr) {
       // Losing the report is bad; taking the process down with it is worse.
       this.log("goose runner: could not report finished turn", {
@@ -1134,13 +1465,15 @@ export class GooseSessionRunner {
 }
 
 /** `/stop` notification ids are charset-restricted; keep ours inside it. */
-function sanitiseIdPart(s: string): string {
+export function sanitiseIdPart(s: string): string {
   const cleaned = s.replace(/[^A-Za-z0-9_.-]/g, "-");
   return cleaned === "" ? "turn" : cleaned.slice(0, 64);
 }
 
 export interface GooseRunnerRegistryOptions {
   createRunner: (session: SessionRecord) => GooseSessionRunner;
+  inbox?: { markDone: (commandId: string) => void };
+  inflight?: GooseInflightStore;
 }
 
 /**
@@ -1214,6 +1547,60 @@ export class GooseRunnerRegistry {
     for (const runner of this.runners.values()) runner.close();
     this.runners.clear();
     this.byBackendId.clear();
+  }
+
+  /**
+   * Suspends all runners on daemon shutdown (R7 ordering):
+   * 1. Set suspended on all runners first so background continuations do not report or delete.
+   * 2. For bare-goose runners with an active turn: post "cancelled by restart" via postStop
+   *    under s:sid:cmd, then delete inflight row and inbox.markDone (R6). If postStop fails,
+   *    row is kept for startup recovery.
+   * 3. For honk runners with an active turn: markSuspended (clean_suspend=1, last_alive_at=now,
+   *    recovery_attempts=0) and KEEP row, no notice.
+   * 4. Close all runners and clear maps.
+   */
+  async suspendAll(opts?: {
+    now?: number;
+    inbox?: { markDone: (commandId: string) => void };
+    inflight?: GooseInflightStore;
+  }): Promise<void> {
+    const now = opts?.now ?? Date.now();
+    const inbox = opts?.inbox ?? this.opts.inbox;
+    const inflight = opts?.inflight ?? this.opts.inflight;
+
+    // R7: set suspended on all runners FIRST
+    for (const runner of this.runners.values()) {
+      runner.suspend();
+    }
+
+    // Process all active turns
+    for (const runner of this.runners.values()) {
+      const turn = runner.activeTurn;
+      if (!turn) continue;
+
+      const inflightRow = inflight?.get(turn.commandId);
+      const isHonk = inflightRow !== undefined ? inflightRow.isHonk : runner.isHonk;
+
+      if (isHonk) {
+        // Honk runner: markSuspended and keep row, no notice
+        try {
+          inflight?.markSuspended(turn.commandId, now);
+        } catch {
+          /* best effort */
+        }
+      } else {
+        // Bare goose runner: post notice via postStop, delete row + inbox.markDone
+        try {
+          await runner.postShutdownNotice(turn.commandId);
+          inflight?.delete(turn.commandId);
+          inbox?.markDone(turn.commandId);
+        } catch {
+          // If post fails, row survives and startup recovery posts the same notice under same id
+        }
+      }
+    }
+
+    this.closeAll();
   }
 
   /** Sessions with a turn in flight — used to warn the human on shutdown. */

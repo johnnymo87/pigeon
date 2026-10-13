@@ -1105,5 +1105,137 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
         honkReason: "not_delivered",
       });
     });
+
+    it("records features and supportsResumeOnly = true when initialize response carries _meta.honk.features containing 'resume_only'", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0", features: ["resume_only"] } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      expect(client.supportsResumeOnly).toBe(false);
+      await client.connect();
+      expect(client.isHonk).toBe(true);
+      expect(client.supportsResumeOnly).toBe(true);
+      expect(client.features).toContain("resume_only");
+    });
+
+    it("supportsResumeOnly = false when _meta.honk.features is absent or does not include resume_only", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0" } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+      expect(client.isHonk).toBe(true);
+      expect(client.supportsResumeOnly).toBe(false);
+    });
+
+    it("sends resume_only: true in _meta.honk on session/prompt params when resumeOnly is true", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0", features: ["resume_only"] } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "recover me", { clientReqId: "cmd-rec-1", resumeOnly: true });
+      const req = peer.lastOf("session/prompt")!;
+      expect(req.params).toEqual({
+        sessionId: "sess-1",
+        prompt: [{ type: "text", text: "recover me" }],
+        _meta: {
+          honk: {
+            client_req_id: "cmd-rec-1",
+            resume_only: true,
+          },
+        },
+      });
+      peer.reply(req.id, { stopReason: "end_turn", _meta: { honk: { text: "recovered text" } } });
+      const outcome = await p;
+      expect(outcome).toEqual({
+        kind: "receipt",
+        stopReason: "end_turn",
+        text: "recovered text",
+      });
+    });
+
+    it("does not send resume_only in _meta.honk when resumeOnly is omitted or false", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0", features: ["resume_only"] } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "normal turn", { clientReqId: "cmd-norm-1" });
+      const req = peer.lastOf("session/prompt")!;
+      expect(req.params).toEqual({
+        sessionId: "sess-1",
+        prompt: [{ type: "text", text: "normal turn" }],
+        _meta: {
+          honk: {
+            client_req_id: "cmd-norm-1",
+          },
+        },
+      });
+      expect(((req.params as Record<string, unknown>)._meta as any).honk.resume_only).toBeUndefined();
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("returns outcome { kind: 'unknown-request' } when session/prompt errors with code -32004", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1, version: "0.1.0", features: ["resume_only"] } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "recover me", { clientReqId: "cmd-unknown", resumeOnly: true });
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32004,
+          message: "unknown client_req_id; resume_only prompt not started",
+        },
+      });
+
+      const outcome = await p;
+      expect(outcome).toEqual({
+        kind: "unknown-request",
+      });
+    });
   });
 });

@@ -79,8 +79,12 @@ export interface GooseSteered {
 export interface GooseNoActiveRun {
   kind: "no-active-run";
 }
+/** honkd has no record of this client_req_id on a resume_only request (-32004). */
+export interface GooseUnknownRequest {
+  kind: "unknown-request";
+}
 
-export type PromptOutcome = GooseReceipt | GooseBusy;
+export type PromptOutcome = GooseReceipt | GooseBusy | GooseUnknownRequest;
 export type SteerOutcome = GooseSteered | GooseNoActiveRun;
 
 /**
@@ -301,6 +305,7 @@ export class GooseAcpClient {
    */
   private closed = false;
   private honk = false;
+  private honkFeatures: string[] = [];
   private nextId = 0;
   private pending = new Map<string, Pending>();
   /** Last run id observed for a session, learned from a busy rejection. */
@@ -322,6 +327,14 @@ export class GooseAcpClient {
   /** True when the connected peer is honkd (learned from initialize _meta.honk). */
   get isHonk(): boolean {
     return this.honk;
+  }
+
+  get supportsResumeOnly(): boolean {
+    return this.honk && this.honkFeatures.includes("resume_only");
+  }
+
+  get features(): readonly string[] {
+    return this.honkFeatures;
   }
 
   async connect(): Promise<void> {
@@ -353,8 +366,15 @@ export class GooseAcpClient {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
-    this.honk = Boolean((initRes.result?._meta as { honk?: unknown } | undefined)?.honk);
-    this.log("goose acp connected", { url: this.opts.url, isHonk: this.honk });
+    const honkMeta = (initRes.result?._meta as { honk?: unknown } | undefined)?.honk;
+    this.honk = Boolean(honkMeta);
+    if (honkMeta && typeof honkMeta === "object" && Array.isArray((honkMeta as { features?: unknown }).features)) {
+      this.honkFeatures = ((honkMeta as { features: unknown[] }).features)
+        .filter((f): f is string => typeof f === "string");
+    } else {
+      this.honkFeatures = [];
+    }
+    this.log("goose acp connected", { url: this.opts.url, isHonk: this.honk, features: this.honkFeatures });
   }
 
   /**
@@ -494,14 +514,19 @@ export class GooseAcpClient {
   async prompt(
     sessionId: string,
     text: string,
-    options?: { clientReqId?: string },
+    options?: { clientReqId?: string; resumeOnly?: boolean },
   ): Promise<PromptOutcome> {
     const params: Record<string, unknown> = {
       sessionId,
       prompt: [{ type: "text", text }],
     };
-    if (this.honk && options?.clientReqId !== undefined) {
-      params._meta = { honk: { client_req_id: options.clientReqId } };
+    if (this.honk && (options?.clientReqId !== undefined || options?.resumeOnly)) {
+      params._meta = {
+        honk: {
+          ...(options?.clientReqId !== undefined ? { client_req_id: options.clientReqId } : {}),
+          ...(options?.resumeOnly ? { resume_only: true } : {}),
+        },
+      };
     }
     const res = await this.call(
       "session/prompt",
@@ -509,6 +534,13 @@ export class GooseAcpClient {
       { sessionId, isTurn: true },
     );
     if (res.error) {
+      if (res.error.code === -32004) {
+        this.log("honkd resume_only rejected as unknown client_req_id", {
+          sessionId,
+          clientReqId: options?.clientReqId,
+        });
+        return { kind: "unknown-request" };
+      }
       const busy = BUSY_RUN_ID.exec(res.error.data ?? "");
       if (busy) {
         const runId = busy[1]!;
