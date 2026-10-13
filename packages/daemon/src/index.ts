@@ -41,7 +41,7 @@ import { gooseControlVerdict } from "./goose/control-guard.js";
 import { GooseAcpClient } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
-import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice } from "./goose/session-runner.js";
+import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
 import { executeGooseKill } from "./goose/kill-control.js";
 import { startSessionReaper } from "./session-reaper";
 import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
@@ -197,9 +197,12 @@ let appHandler: ((request: Request) => Promise<Response>) | undefined;
  */
 const gooseRunners = config.gooseAcpUrl
   ? new GooseRunnerRegistry({
+      inbox: storage.inbox,
+      inflight: storage.gooseInflight,
       createRunner: (session) =>
         new GooseSessionRunner({
           session,
+          inflight: storage.gooseInflight,
           client: new GooseAcpClient({
             url: session.backendEndpoint ?? config.gooseAcpUrl!,
             transportFactory: webSocketTransport(session.backendAuthToken ?? config.gooseAcpToken),
@@ -1122,22 +1125,10 @@ async function shutdown(signal: string): Promise<void> {
   // "finish on goose's side", as this used to, is worse than either, because it
   // sends them off to wait for work that is no longer happening.
   const busy = gooseRunners?.busySessionIds() ?? [];
-  if (busy.length > 0 && config.telegramChatId) {
+  if (busy.length > 0) {
     console.warn(`[pigeon-daemon] ${busy.length} goose turn(s) in flight at shutdown: ${busy.join(", ")}`);
-    for (const sessionId of busy) {
-      try {
-        const isHonk = gooseRunners?.peek(sessionId)?.isHonk;
-        await sendTelegramMessage(
-          config.telegramChatId,
-          gooseShutdownNotice(sessionId, isHonk),
-          { messageThreadId: undefined },
-        );
-      } catch (err) {
-        console.warn(`[pigeon-daemon] could not warn about in-flight goose turn ${sessionId}:`, err);
-      }
-    }
   }
-  gooseRunners?.closeAll();
+  await gooseRunners?.suspendAll();
 
   process.exit(0);
 }

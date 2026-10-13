@@ -50,6 +50,7 @@
  */
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import type { GooseInflightStore } from "../storage/goose-inflight-repo.js";
 import { DisconnectedDuringTurn } from "./acp-client.js";
 
 /**
@@ -143,6 +144,8 @@ export interface GooseSessionRunnerOptions {
   postStop: (body: Record<string, unknown>) => Promise<void>;
   /** Keeps the reaper off a session whose only activity is goose-side. */
   touch: (sessionId: string) => void;
+  /** Persisted in-flight turns store for crash recovery (honk-znj.10). */
+  inflight?: GooseInflightStore;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
   /** Transcript buffer cap. A runaway turn must not be able to exhaust memory. */
   maxTranscriptBytes?: number;
@@ -165,6 +168,8 @@ interface Turn {
   startedAt: number;
   /** Last time ANY frame arrived for this turn. The watchdog's only input. */
   lastActivityAt: number;
+  /** Last time inflight last_alive_at was touched. Throttled to ~1/min (R1). */
+  lastAliveTouchAt?: number;
   text: string[];
   bytes: number;
   truncated: boolean;
@@ -193,6 +198,7 @@ interface Turn {
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
+const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
 
 const BUSY_NOT_DELIVERED_TEXT =
   "goose was already running a turn and pigeon could not add this message to it. "
@@ -280,6 +286,7 @@ export class GooseSessionRunner {
   private sleepTimer: ReturnType<typeof setTimeout> | undefined;
   private sleepResolve: (() => void) | undefined;
   private closed = false;
+  private suspended = false;
 
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
@@ -287,6 +294,40 @@ export class GooseSessionRunner {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get isSuspended(): boolean {
+    return this.suspended;
+  }
+
+  suspend(): void {
+    this.suspended = true;
+  }
+
+  get activeTurn(): { commandId: string } | undefined {
+    return this.turn ? { commandId: this.turn.commandId } : undefined;
+  }
+
+  retire(turn: { commandId: string }): void {
+    try {
+      this.opts.inflight?.delete(turn.commandId);
+    } catch (err) {
+      this.log("goose runner: could not retire inflight turn", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  async postShutdownNotice(commandId: string): Promise<void> {
+    await this.opts.postStop({
+      session_id: this.sessionId,
+      notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}`,
+      message: gooseShutdownNotice(this.sessionId, false),
+      event: "Error",
+      error_kind: "goose-turn-cancelled-by-restart",
+    });
   }
 
   get isHonk(): boolean {
@@ -436,6 +477,17 @@ export class GooseSessionRunner {
    */
   private startTurn(commandId: string, text: string): DeliverOutcome {
     this.clearIdleSocketTimer();
+
+    if (this.opts.inflight) {
+      this.opts.inflight.insert({
+        commandId,
+        sessionId: this.sessionId,
+        backendSessionId: this.backendSessionId,
+        isHonk: this.isHonk,
+        promptText: text,
+      });
+    }
+
     const turn: Turn = {
       commandId,
       startedAt: Date.now(),
@@ -649,6 +701,7 @@ export class GooseSessionRunner {
           // reports its own completion, so this turn is over as a bookkeeping
           // matter and must not also report.
           if (this.turn === turn) this.clearTurn();
+          this.retire(turn);
           return;
         }
       } catch (err) {
@@ -680,6 +733,20 @@ export class GooseSessionRunner {
     // make a working turn look silent to the watchdog, which is precisely the
     // false positive that costs the human their answer.
     turn.lastActivityAt = Date.now();
+
+    const now = Date.now();
+    if (!turn.lastAliveTouchAt || now - turn.lastAliveTouchAt >= TOUCH_ALIVE_INTERVAL_MS) {
+      turn.lastAliveTouchAt = now;
+      try {
+        this.opts.inflight?.touchAlive(turn.commandId, now);
+      } catch (err) {
+        this.log("goose runner: touchAlive failed", {
+          sessionId: this.sessionId,
+          commandId: turn.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     if (update.sessionUpdate !== "agent_message_chunk") return;
 
@@ -790,6 +857,13 @@ export class GooseSessionRunner {
    * `finishTurn` depends on that id being free.
    */
   private async abandonTurn(turn: Turn, reason: string): Promise<void> {
+    if (this.suspended) {
+      this.log("goose runner: turn abandoned while suspended; skipping report and keeping inflight row", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      return;
+    }
     if (turn.abandoned || this.turn !== turn) return;
     turn.abandoned = true;
     this.connected = false;
@@ -824,6 +898,7 @@ export class GooseSessionRunner {
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
+      this.retire(turn);
     } catch (reportErr) {
       this.log("goose runner: could not report a stalled turn", {
         sessionId: this.sessionId,
@@ -842,11 +917,20 @@ export class GooseSessionRunner {
   ): Promise<void> {
     if (this.turn === turn) this.clearTurn();
 
+    if (this.suspended) {
+      this.log("goose runner: turn finished while suspended; skipping report and keeping inflight row", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+      });
+      return;
+    }
+
     if (turn.cancelRequested) {
       this.log("goose runner: turn cancel was requested; skipping stop notification", {
         sessionId: this.sessionId,
         commandId: turn.commandId,
       });
+      this.retire(turn);
       return;
     }
 
@@ -862,6 +946,7 @@ export class GooseSessionRunner {
           commandId: turn.commandId,
           error: err instanceof Error ? err.message : String(err),
         });
+        this.retire(turn);
         return;
       }
       // goose was alive the whole time and has answered. The watchdog was wrong,
@@ -944,6 +1029,7 @@ export class GooseSessionRunner {
             }
           : {}),
       });
+      this.retire(turn);
     } catch (reportErr) {
       // Losing the report is bad; taking the process down with it is worse.
       this.log("goose runner: could not report finished turn", {
@@ -1141,6 +1227,8 @@ function sanitiseIdPart(s: string): string {
 
 export interface GooseRunnerRegistryOptions {
   createRunner: (session: SessionRecord) => GooseSessionRunner;
+  inbox?: { markDone: (commandId: string) => void };
+  inflight?: GooseInflightStore;
 }
 
 /**
@@ -1214,6 +1302,57 @@ export class GooseRunnerRegistry {
     for (const runner of this.runners.values()) runner.close();
     this.runners.clear();
     this.byBackendId.clear();
+  }
+
+  /**
+   * Suspends all runners on daemon shutdown (R7 ordering):
+   * 1. Set suspended on all runners first so background continuations do not report or delete.
+   * 2. For bare-goose runners with an active turn: post "cancelled by restart" via postStop
+   *    under s:sid:cmd, then delete inflight row and inbox.markDone (R6). If postStop fails,
+   *    row is kept for startup recovery.
+   * 3. For honk runners with an active turn: markSuspended (clean_suspend=1, last_alive_at=now,
+   *    recovery_attempts=0) and KEEP row, no notice.
+   * 4. Close all runners and clear maps.
+   */
+  async suspendAll(opts?: {
+    now?: number;
+    inbox?: { markDone: (commandId: string) => void };
+    inflight?: GooseInflightStore;
+  }): Promise<void> {
+    const now = opts?.now ?? Date.now();
+    const inbox = opts?.inbox ?? this.opts.inbox;
+    const inflight = opts?.inflight ?? this.opts.inflight;
+
+    // R7: set suspended on all runners FIRST
+    for (const runner of this.runners.values()) {
+      runner.suspend();
+    }
+
+    // Process all active turns
+    for (const runner of this.runners.values()) {
+      const turn = runner.activeTurn;
+      if (!turn) continue;
+
+      if (runner.isHonk) {
+        // Honk runner: markSuspended and keep row, no notice
+        try {
+          inflight?.markSuspended(turn.commandId, now);
+        } catch {
+          /* best effort */
+        }
+      } else {
+        // Bare goose runner: post notice via postStop, delete row + inbox.markDone
+        try {
+          await runner.postShutdownNotice(turn.commandId);
+          inflight?.delete(turn.commandId);
+          inbox?.markDone(turn.commandId);
+        } catch {
+          // If post fails, row survives and startup recovery posts the same notice under same id
+        }
+      }
+    }
+
+    this.closeAll();
   }
 
   /** Sessions with a turn in flight — used to warn the human on shutdown. */
