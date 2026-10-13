@@ -804,6 +804,41 @@ function classifyDeliveryFailure(
 }
 
 /**
+ * `classifyDeliveryFailure` for the EXECUTE path only, which additionally treats a
+ * connection that dropped mid-request as ambiguous (pigeon-7yby).
+ *
+ * The usual source is the plugin's own prompt_async call inside opencode-serve,
+ * which runs on Bun and words it "The socket connection was closed unexpectedly";
+ * Node says ECONNRESET / "socket hang up". The request may or may not have reached
+ * opencode-serve, so it is the same case as a timeout: retry through the plugin,
+ * then revive. Before this it fell through to "terminal" and the message was
+ * dropped as "Command rejected: ...". As with a timeout, a request that did land
+ * can be injected twice: the plugin dedups only successes, and the plugin turns
+ * this exception into a failure. A duplicate is accepted over a lost message.
+ *
+ * Checked before the "fetch failed" rule: a reset is not proof of non-delivery
+ * the way a refused connection is.
+ *
+ * Deliberately NOT applied to question replies. There, "ambiguous" throws for
+ * poller redelivery, and if the first answer was in fact consumed, the redelivery
+ * finds no pending question and falls through to injecting the answer text as a
+ * fresh prompt. Timeouts already carry that hazard; this change does not widen it.
+ */
+function classifyExecuteFailure(
+  result: Pick<CommandDeliveryResult, "error" | "meta">,
+): DeliveryFailureKind {
+  const lower = result.error?.toLowerCase() ?? "";
+  if (
+    lower.includes("socket connection was closed") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up")
+  ) {
+    return "ambiguous";
+  }
+  return classifyDeliveryFailure(result);
+}
+
+/**
  * Abandon a command that cannot be delivered, without losing it silently.
  *
  * Every caller here is a permanent failure: we return normally, so the Poller acks
@@ -1270,7 +1305,7 @@ async function dropUnanswerableQuestion(
 function isConnectionError(result: Pick<CommandDeliveryResult, "error" | "meta">): boolean {
   // Both ambiguous (timeout) and definitely-not-delivered failures warrant the
   // revive fallback; only terminal failures do not.
-  return classifyDeliveryFailure(result) !== "terminal";
+  return classifyExecuteFailure(result) !== "terminal";
 }
 
 function throwIfTransientQuestionReplyFailure(result: CommandDeliveryResult, commandId: string): void {
@@ -1348,7 +1383,7 @@ async function deliverViaAdapter(
   while (
     classifyFailures &&
     !result.ok &&
-    classifyDeliveryFailure(result) === "ambiguous" &&
+    classifyExecuteFailure(result) === "ambiguous" &&
     now() - startedAt < budgetMs
   ) {
     await sleep(Math.min(1_000 * attempts, 5_000));
