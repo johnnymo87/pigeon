@@ -51,7 +51,7 @@
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
 import type { GooseInflightRecord, GooseInflightStore } from "../storage/goose-inflight-repo.js";
-import { DisconnectedDuringTurn, type RunOwnership } from "./acp-client.js";
+import { DisconnectedDuringTurn, type RunOwnership, type RunState, type RunStateInfo } from "./acp-client.js";
 
 /**
  * What the human is told when the daemon shuts down with a goose turn in flight.
@@ -121,6 +121,7 @@ export interface RunnerClient {
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
   runOwnership?(sessionId: string): RunOwnership;
+  runState?(sessionId: string): RunState;
   cancel(sessionId: string): void;
   close(): void;
 }
@@ -156,6 +157,8 @@ export interface GooseSessionRunnerOptions {
   turnIdleTimeoutMs?: number;
   /** Inactivity period after which an idle socket is closed. Defaults to 10 minutes. 0 disables. */
   idleSocketTimeoutMs?: number;
+  /** Fallback drain interval while queue is non-empty and no turn is running. Defaults to 2 minutes. */
+  drainFallbackIntervalMs?: number;
   /** Total time budget for retrying reconnection to honkd. Defaults to 2 minutes (~120s). */
   honkReconnectBudgetMs?: number;
   /** Total time budget for recovering an in-flight turn through honkd. Defaults to 10 minutes. */
@@ -200,11 +203,22 @@ interface Turn {
   resent?: boolean;
   recovered?: boolean;
   cancelRequested?: boolean;
+  queuedNoticeSent?: boolean;
+  fromQueue?: boolean;
+}
+
+interface QueuedItem {
+  commandId: string;
+  text: string;
+  queuedNoticeSent?: boolean;
 }
 
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
 const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
+const DEFAULT_DRAIN_FALLBACK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes (Item 6)
+const QUEUED_NOTICE_MESSAGE =
+  "goose is busy with a turn pigeon did not start (or cannot yet confirm is its own), so this was not added to it. It is queued and will be sent as a new turn when that turn ends.";
 
 const BUSY_NOT_DELIVERED_TEXT =
   "goose was already running a turn and pigeon could not add this message to it. "
@@ -294,6 +308,10 @@ export class GooseSessionRunner {
   private sleepResolve: (() => void) | undefined;
   private closed = false;
   private suspended = false;
+  private queue: QueuedItem[] = [];
+  private sentSteers = new Map<string, { commandId: string; text: string }>();
+  private draining = false;
+  private drainFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryResolvedOrAttached: Promise<void> | undefined;
   private resolveRecoveryAttached: (() => void) | undefined;
 
@@ -311,6 +329,56 @@ export class GooseSessionRunner {
 
   suspend(): void {
     this.suspended = true;
+    this.clearDrainFallbackTimer();
+  }
+
+  dropQueued(): number {
+    const count = this.queue.length;
+    for (const item of this.queue) {
+      try {
+        this.opts.inflight?.delete(item.commandId);
+      } catch (err) {
+        this.log("goose runner: dropQueued delete failed", {
+          commandId: item.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    this.queue = [];
+    this.clearDrainFallbackTimer();
+    return count;
+  }
+
+  enqueueRecovered(row: GooseInflightRecord): void {
+    this.queue.push({
+      commandId: row.commandId,
+      text: row.promptText,
+      queuedNoticeSent: true,
+    });
+    this.scheduleDrain();
+    this.armDrainFallbackTimer();
+  }
+
+  onRunStateChange(_view?: RunStateInfo): void {
+    this.scheduleDrain();
+  }
+
+  onSteerUnconsumed(messageId: string): void {
+    const steer = this.sentSteers.get(messageId);
+    if (!steer) return;
+    this.sentSteers.delete(messageId);
+
+    void this.enqueue(
+      steer.commandId,
+      steer.text,
+      "your message reached goose too late for the turn it was added to; queued",
+    ).catch((err) => {
+      this.log("goose runner: onSteerUnconsumed enqueue failed", {
+        sessionId: this.sessionId,
+        messageId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   get activeTurn(): { commandId: string } | undefined {
@@ -521,71 +589,46 @@ export class GooseSessionRunner {
   /**
    * Sends `text` to goose and returns WITHOUT waiting for the turn.
    *
-   * Throws only for failures provably before anything was sent -- which is the
-   * `failurePolicy: "surface"` contract's definition of a safe throw, because
-   * redelivery then cannot duplicate a prompt.
+   * Deliver outcome contract (Spec bead eng-agent-platform-555.17):
+   * ok: true  meta.mode "prompt" | "steered" | "queued" | "already-running" | "already-queued"
+   * ok: false only for permanent refusals (e.g. steer-timeout)
+   * throw only before anything was saved or sent
    */
   async deliver(commandId: string, text: string): Promise<DeliverOutcome> {
     this.clearIdleSocketTimer();
 
-    // Redelivery of the command that started the turn we are already running.
-    // The poller redelivers whenever an ack fails; without this the human's
-    // message goes into goose twice.
+    // 3a. Redelivery of the command that started the turn we are already running.
     if (this.turn?.commandId === commandId) {
       return { ok: true, meta: { mode: "already-running", runId: this.runId() } };
     }
 
-    await this.ensureConnected();
-
-    // R3: If the active turn is a recovered turn and has no runId yet, await attach or resolution
-    if (this.turn?.recovered && !this.runId()) {
-      try {
-        await withDeadline(
-          this.recoveryResolvedOrAttached ?? Promise.resolve(),
-          NON_TURN_TIMEOUT_MS,
-          "recovery attach",
-        );
-      } catch {
-        /* proceed to check turn state */
-      }
+    // 3b. commandId already queued -> ok:true meta.mode "already-queued" (no second notice).
+    if (this.queue.some((item) => item.commandId === commandId)) {
+      return { ok: true, meta: { mode: "already-queued" } };
     }
 
-    // A turn is in flight, so this message steers it rather than starting a
-    // competing one. goose would reject a second prompt as busy anyway; steering
-    // is what the human actually means by sending a message mid-turn.
+    // 3c. this.turn set (our turn in flight):
+    // if client ownership is "own" AND a run id is known AND not a recovered turn -> steer as today
+    // Otherwise (pending, unknown, foreign, or no run id yet -- this REPLACES the "no-run-id-yet" refusal
+    // and also covers recovered turns) -> enqueue.
     if (this.turn) {
-      // Captured, not re-read after the awaits below. The watchdog can settle
-      // and clear this turn while the steer is in flight, and TypeScript's
-      // narrowing does not survive an await even though the field can change
-      // under it -- so re-reading `this.turn` in the catch could hand `undefined`
-      // to abandonTurn and turn a bounded steer timeout into a thrown TypeError.
-      const steeringTurn = this.turn;
+      const isOwn = !this.turn.recovered && this.ownsActiveRun();
       const runId = this.runId();
-      if (!runId) {
-        // The turn is starting but has not yet announced its run id. Nothing has
-        // been sent, so this is a safe permanent-shaped refusal rather than a
-        // throw: a redelivery storm here would just race the same gap again.
-        return {
-          ok: false,
-          error: "goose is starting a turn for this session; send that again in a few seconds",
-          meta: { mode: "no-run-id-yet" },
-        };
+      if (!isOwn || !runId) {
+        return this.enqueue(commandId, text);
       }
-      let outcome: { kind?: string };
+
+      await this.ensureConnected();
+
+      const steeringTurn = this.turn;
+      let outcome: { kind?: string; messageId?: string };
       try {
         outcome = (await withDeadline(
           this.opts.client.steer(this.backendSessionId, runId, text),
           NON_TURN_TIMEOUT_MS,
           "steer",
-        )) as { kind?: string };
+        )) as { kind?: string; messageId?: string };
       } catch (err) {
-        // A steer answers in about a millisecond, so ten seconds of silence on
-        // one is good evidence the socket is dead -- and it arrives the moment a
-        // human touches a wedged session, rather than after the watchdog's thirty
-        // minutes. But the same rule applies here as in checkStalled: silence is
-        // not proof, and abandoning a live turn costs the human their answer. So
-        // confirm with a liveness probe before giving up, and merely decline if
-        // the socket answers.
         try {
           await withDeadline(this.opts.client.ping(), NON_TURN_TIMEOUT_MS, "liveness ping");
           this.log("goose runner: steer timed out but the socket is alive", {
@@ -594,9 +637,6 @@ export class GooseSessionRunner {
         } catch {
           await this.abandonTurn(steeringTurn, "a steer and a liveness check both went unanswered");
         }
-        // Deliberately ok:false rather than a throw. A throw would redeliver and
-        // could steer twice; more importantly the alternative to bounding this at
-        // all is a frozen poller, which costs every other session on the machine.
         return {
           ok: false,
           error: `goose did not acknowledge the steer: ${err instanceof Error ? err.message : String(err)}`,
@@ -605,6 +645,9 @@ export class GooseSessionRunner {
       }
       if (outcome?.kind === "steered") {
         this.opts.touch(this.sessionId);
+        if (outcome.messageId) {
+          this.sentSteers.set(outcome.messageId, { commandId, text });
+        }
         return { ok: true, meta: { mode: "steered", runId } };
       }
       // `no-active-run`: the turn ended between our check and the steer. A fresh
@@ -613,9 +656,150 @@ export class GooseSessionRunner {
         sessionId: this.sessionId,
       });
       this.clearTurn();
+      if (this.queue.length > 0) {
+        return this.enqueue(commandId, text);
+      }
     }
 
+    // 3d. no turn of ours but queue non-empty -> enqueue (order).
+    if (this.queue.length > 0) {
+      return this.enqueue(commandId, text);
+    }
+
+    // 3e. otherwise ensureConnected + startTurn as today.
+    await this.ensureConnected();
     return this.startTurn(commandId, text);
+  }
+
+  private async enqueue(commandId: string, text: string, customMessage?: string): Promise<DeliverOutcome> {
+    if (this.opts.inflight) {
+      this.opts.inflight.insert({
+        commandId,
+        sessionId: this.sessionId,
+        backendSessionId: this.backendSessionId,
+        isHonk: this.isHonk,
+        promptText: text,
+        state: "queued",
+      });
+    }
+
+    this.queue.push({ commandId, text, queuedNoticeSent: true });
+
+    const message = customMessage ?? QUEUED_NOTICE_MESSAGE;
+    try {
+      await this.opts.postStop({
+        session_id: this.sessionId,
+        notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}:queued`,
+        message,
+        event: "Queued",
+      });
+    } catch (err) {
+      this.log("goose runner: could not post queued notice", {
+        sessionId: this.sessionId,
+        commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    this.scheduleDrain();
+    this.armDrainFallbackTimer();
+
+    return { ok: true, meta: { mode: "queued" } };
+  }
+
+  private scheduleDrain(): void {
+    queueMicrotask(() => {
+      void this.maybeDrain().catch((err: unknown) => {
+        this.log("goose runner: maybeDrain unhandled error", {
+          sessionId: this.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    });
+  }
+
+  async maybeDrain(): Promise<void> {
+    if (this.draining) return;
+    if (this.closed || this.suspended) return;
+    if (this.turn) return;
+    if (this.queue.length === 0) return;
+
+    const runState = this.opts.client.runState?.(this.backendSessionId);
+    if (runState === "running") {
+      this.armDrainFallbackTimer();
+      return;
+    }
+
+    this.draining = true;
+    try {
+      if (this.closed || this.suspended || this.turn || this.queue.length === 0) return;
+
+      const item = this.queue.shift();
+      if (!item) return;
+
+      try {
+        await this.ensureConnected();
+      } catch (err) {
+        this.queue.unshift(item);
+        this.log("goose runner: ensureConnected failed during drain", {
+          sessionId: this.sessionId,
+          commandId: item.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        this.armDrainFallbackTimer();
+        return;
+      }
+
+      try {
+        this.startTurn(item.commandId, item.text, { fromQueue: true });
+      } catch (err) {
+        this.queue.unshift(item);
+        this.log("goose runner: startTurn failed during drain", {
+          sessionId: this.sessionId,
+          commandId: item.commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        this.armDrainFallbackTimer();
+        return;
+      }
+
+      if (this.queue.length === 0) {
+        this.clearDrainFallbackTimer();
+      }
+    } catch (outerErr) {
+      this.log("goose runner: unexpected error in maybeDrain", {
+        sessionId: this.sessionId,
+        error: outerErr instanceof Error ? outerErr.message : String(outerErr),
+      });
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private armDrainFallbackTimer(): void {
+    if (this.closed || this.suspended) return;
+    if (this.queue.length === 0 || this.turn) {
+      this.clearDrainFallbackTimer();
+      return;
+    }
+    if (this.drainFallbackTimer) return;
+
+    const interval = this.opts.drainFallbackIntervalMs ?? DEFAULT_DRAIN_FALLBACK_INTERVAL_MS;
+    this.drainFallbackTimer = setTimeout(() => {
+      this.drainFallbackTimer = undefined;
+      this.scheduleDrain();
+      if (this.queue.length > 0 && !this.turn) {
+        this.armDrainFallbackTimer();
+      }
+    }, interval);
+    this.drainFallbackTimer.unref?.();
+  }
+
+  private clearDrainFallbackTimer(): void {
+    if (this.drainFallbackTimer) {
+      clearTimeout(this.drainFallbackTimer);
+      this.drainFallbackTimer = undefined;
+    }
   }
 
   /**
@@ -625,17 +809,23 @@ export class GooseSessionRunner {
    * promise, so by the time this function returns the command HAS been sent.
    * That is what makes "throw means nothing was sent" true for callers.
    */
-  private startTurn(commandId: string, text: string): DeliverOutcome {
+  private startTurn(commandId: string, text: string, options?: { fromQueue?: boolean }): DeliverOutcome {
     this.clearIdleSocketTimer();
+    this.clearDrainFallbackTimer();
 
     if (this.opts.inflight) {
-      this.opts.inflight.insert({
-        commandId,
-        sessionId: this.sessionId,
-        backendSessionId: this.backendSessionId,
-        isHonk: this.isHonk,
-        promptText: text,
-      });
+      if (options?.fromQueue) {
+        this.opts.inflight.markSent(commandId, Date.now());
+      } else {
+        this.opts.inflight.insert({
+          commandId,
+          sessionId: this.sessionId,
+          backendSessionId: this.backendSessionId,
+          isHonk: this.isHonk,
+          promptText: text,
+          state: "sent",
+        });
+      }
     }
 
     const turn: Turn = {
@@ -648,6 +838,8 @@ export class GooseSessionRunner {
       settled: Promise.resolve(),
       abandoned: false,
       idleTimer: undefined,
+      queuedNoticeSent: options?.fromQueue ?? false,
+      fromQueue: options?.fromQueue ?? false,
     };
     this.turn = turn;
     this.opts.touch(this.sessionId);
@@ -918,6 +1110,48 @@ export class GooseSessionRunner {
         );
         return;
       }
+      if (this.isHonk) {
+        this.log("honkd rejected the prompt as busy; queueing turn instead of steering", {
+          sessionId: this.sessionId,
+          runId,
+          commandId: turn.commandId,
+        });
+        try {
+          this.opts.inflight?.markQueued(turn.commandId, Date.now());
+        } catch (err) {
+          this.log("goose runner: markQueued failed on busy", {
+            sessionId: this.sessionId,
+            commandId: turn.commandId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        if (this.turn === turn) {
+          this.clearTurn();
+        }
+        const alreadyNoticeSent = turn.queuedNoticeSent ?? false;
+        this.queue.unshift({ commandId: turn.commandId, text, queuedNoticeSent: true });
+        this.armDrainFallbackTimer();
+
+        if (!alreadyNoticeSent) {
+          try {
+            await this.opts.postStop({
+              session_id: this.sessionId,
+              notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:queued`,
+              message: QUEUED_NOTICE_MESSAGE,
+              event: "Queued",
+            });
+          } catch (postErr) {
+            this.log("goose runner: could not post queued notice on busy", {
+              sessionId: this.sessionId,
+              commandId: turn.commandId,
+              error: postErr instanceof Error ? postErr.message : String(postErr),
+            });
+          }
+        }
+        return;
+      }
+
+      // Bare goose (client not honk): keep today's steer-after-busy (nothing tells pigeon when a foreign bare-goose run ends); a follow-up bead exists to handle bare-goose queueing.
       this.log("goose rejected the prompt as busy; steering the live turn instead", {
         sessionId: this.sessionId,
         runId,
@@ -1009,9 +1243,14 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
+    this.sentSteers.clear();
     this.notifyRecoveryResolvedOrAttached();
     if (this.opts.client.isHonk && this.connected && !this.opts.client.isClosed() && !this.closed) {
       this.armIdleSocketTimer();
+    }
+    this.scheduleDrain();
+    if (this.queue.length > 0) {
+      this.armDrainFallbackTimer();
     }
   }
 
@@ -1360,10 +1599,12 @@ export class GooseSessionRunner {
 
   private armIdleSocketTimer(): void {
     if (!this.opts.client.isHonk || this.closed) return;
+    if (this.queue.length > 0) return;
     const timeout = this.opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
     if (timeout <= 0) return;
     this.clearIdleSocketTimer();
     this.idleSocketTimer = setTimeout(() => {
+      if (this.queue.length > 0) return;
       if (!this.turn && this.connected && !this.closed && this.opts.client.isHonk) {
         this.log("goose runner: closing idle socket after inactivity", {
           sessionId: this.sessionId,
@@ -1478,6 +1719,7 @@ export class GooseSessionRunner {
     this.closed = true;
     this.cancelSleep();
     this.clearIdleSocketTimer();
+    this.clearDrainFallbackTimer();
     // The timer is unref'd, so it cannot hold the process open -- but a runner
     // dropped from the registry should not leave one running against a turn
     // nobody is listening for either.

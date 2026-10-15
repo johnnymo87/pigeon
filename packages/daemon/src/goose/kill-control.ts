@@ -101,6 +101,15 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
   const isHonk = runner?.isHonk;
   const isHonkKnown = runner?.isHonkKnown;
 
+  let droppedQueued = 0;
+  if (runner) {
+    try {
+      droppedQueued = runner.dropQueued();
+    } catch (err) {
+      console.warn(`[kill-control] runner.dropQueued failed for ${sessionId}:`, err);
+    }
+  }
+
   deps.gooseRunners?.drop(sessionId);
   deps.storage.sessions.delete(sessionId);
   deps.storage.assignments.delete(sessionId);
@@ -112,6 +121,9 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
     }
   }
 
-  const replyText = pickKillReply(outcome, isHonk, isHonkKnown);
+  let replyText = pickKillReply(outcome, isHonk, isHonkKnown);
+  if (droppedQueued > 0) {
+    replyText += ` ${droppedQueued} queued message(s) were discarded.`;
+  }
   await deps.reply(replyText);
 }

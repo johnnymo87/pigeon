@@ -2,6 +2,104 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
 import { DisconnectedDuringTurn, GooseProtocolError } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
+import type { GooseInflightStore, GooseInflightRecord, InsertGooseInflightInput } from "../src/storage/goose-inflight-repo.js";
+
+class FakeInflightStore implements GooseInflightStore {
+  rows = new Map<string, GooseInflightRecord>();
+  inserts: InsertGooseInflightInput[] = [];
+  touches: Array<{ commandId: string; now: number }> = [];
+  deletes: string[] = [];
+  suspends: Array<{ commandId: string; now: number }> = [];
+  resumes: Array<{ commandId: string; now: number }> = [];
+  bumps: Array<{ commandId: string; now: number }> = [];
+  markSents: Array<{ commandId: string; now: number }> = [];
+  markQueueds: Array<{ commandId: string; now: number }> = [];
+
+  insert(input: InsertGooseInflightInput, now: number = Date.now()): void {
+    this.inserts.push(input);
+    this.rows.set(input.commandId, {
+      commandId: input.commandId,
+      sessionId: input.sessionId,
+      backendSessionId: input.backendSessionId,
+      isHonk: input.isHonk,
+      promptText: input.promptText,
+      recoveryAttempts: input.recoveryAttempts ?? 0,
+      createdAt: input.createdAt ?? now,
+      updatedAt: input.updatedAt ?? now,
+      lastAliveAt: input.lastAliveAt ?? now,
+      cleanSuspend: input.cleanSuspend ?? false,
+      state: input.state ?? "sent",
+    });
+  }
+
+  delete(commandId: string): boolean {
+    this.deletes.push(commandId);
+    return this.rows.delete(commandId);
+  }
+
+  get(commandId: string): GooseInflightRecord | undefined {
+    return this.rows.get(commandId);
+  }
+
+  listAll(): GooseInflightRecord[] {
+    return [...this.rows.values()].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  touchAlive(commandId: string, now: number = Date.now()): void {
+    this.touches.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markSuspended(commandId: string, now: number = Date.now()): void {
+    this.suspends.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.cleanSuspend = true;
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+      row.recoveryAttempts = 0;
+    }
+  }
+
+  markResumed(commandId: string, now: number = Date.now()): void {
+    this.resumes.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.cleanSuspend = false;
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markSent(commandId: string, now: number = Date.now()): void {
+    this.markSents.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "sent";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markQueued(commandId: string, now: number = Date.now()): void {
+    this.markQueueds.push({ commandId, now });
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "queued";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  bumpAttempts(commandId: string, now: number = Date.now()): number {
+    this.bumps.push({ commandId, now });
+    return 1;
+  }
+}
 
 /**
  * The runner is tested against a scripted fake of the ACP client rather than a
@@ -75,7 +173,10 @@ class FakeClient {
     this.activeRunIdSessionIds.push(sessionId);
     return this.runIds.get(sessionId);
   }
-  runOwnership?: (sessionId: string) => "own" | "pending" | "foreign" | "unknown";
+  ownership: "own" | "pending" | "foreign" | "unknown" = "own";
+  runOwnership?: (sessionId: string) => "own" | "pending" | "foreign" | "unknown" = () => this.ownership;
+  runStateValue: "unknown" | "idle" | "running" = "idle";
+  runState?: (sessionId: string) => "unknown" | "idle" | "running" = () => this.runStateValue;
   isClosed(): boolean {
     return this.closed;
   }
@@ -148,9 +249,11 @@ function makeRunner(over: Record<string, unknown> = {}) {
   const client = new FakeClient();
   const stops: Array<Record<string, unknown>> = [];
   const touches: string[] = [];
+  const inflight = (over.inflight as FakeInflightStore | undefined) ?? new FakeInflightStore();
   const runner = new GooseSessionRunner({
     session: session(),
     client: client as never,
+    inflight,
     postStop: async (body) => {
       stops.push(body);
     },
@@ -158,7 +261,7 @@ function makeRunner(over: Record<string, unknown> = {}) {
     log: () => {},
     ...over,
   });
-  return { runner, client, stops, touches };
+  return { runner, client, stops, touches, inflight };
 }
 
 describe("GooseSessionRunner turn lifecycle", () => {
@@ -1404,6 +1507,7 @@ describe("GooseSessionRunner liveness probing", () => {
       });
       client.isHonk = true;
       await runner.deliver("c1", "build");
+      client.setRunId("20260918_1", "run_1");
       expect(client.openTransports).toBe(1);
 
       // Reconnect attempt 1 will fail
@@ -1762,8 +1866,10 @@ describe("GooseSessionRunner liveness probing", () => {
     it("arms idle socket timer after a steered turn continuation ends under honk", async () => {
       const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
       client.isHonk = true;
-      await runner.deliver("c1", "steer me");
-      client.finishBusy("run_live");
+      await runner.deliver("c1", "first");
+      client.setRunId("20260918_1", "run_live");
+      await runner.deliver("c2", "steer me");
+      client.finishTurn();
       await runner.settled();
 
       expect(runner.isBusy()).toBe(false);
@@ -1967,6 +2073,7 @@ describe("GooseSessionRunner liveness probing", () => {
   describe("ownsActiveRun", () => {
     it("returns true only when client.runOwnership returns 'own'", () => {
       const { runner, client } = makeRunner();
+      client.runOwnership = undefined;
       expect(runner.ownsActiveRun()).toBe(false);
 
       let ownership: "own" | "pending" | "foreign" | "unknown" = "pending";
@@ -1985,6 +2092,333 @@ describe("GooseSessionRunner liveness probing", () => {
 
       ownership = "own";
       expect(runner.ownsActiveRun()).toBe(true);
+    });
+  });
+
+  describe("Queueing and serialization (spec bead eng-agent-platform-555.17)", () => {
+    it("message during own run with run id -> steer", async () => {
+      const { runner, client, inflight } = makeRunner();
+      client.ownership = "own";
+      await runner.deliver("c1", "first prompt");
+      client.setRunId("20260918_1", "run_live");
+
+      const res = await runner.deliver("c2", "steer prompt");
+      expect(res.ok).toBe(true);
+      expect(res.meta?.mode).toBe("steered");
+      expect(client.steers).toEqual([{ runId: "run_live", text: "steer prompt" }]);
+      expect(inflight.get("c2")).toBeUndefined();
+    });
+
+    it("message during pending / unknown / foreign / no-run-id-yet / recovered turn -> queued and NOT steered", async () => {
+      // 1. Pending ownership
+      const { runner, client, stops, inflight } = makeRunner();
+      await runner.deliver("c1", "first");
+      client.setRunId("20260918_1", "run_1");
+      client.ownership = "pending";
+
+      const resPending = await runner.deliver("c2_pending", "text pending");
+      expect(resPending.ok).toBe(true);
+      expect(resPending.meta?.mode).toBe("queued");
+      expect(client.steers).toHaveLength(0);
+      expect(inflight.get("c2_pending")?.state).toBe("queued");
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Queued");
+      expect(stops[0]!.notification_id).toBe(`s:${runner.sessionId}:c2_pending:queued`);
+      expect(stops[0]!.message).toContain("goose is busy with a turn pigeon did not start");
+
+      // 2. Unknown ownership
+      client.ownership = "unknown";
+      const resUnknown = await runner.deliver("c2_unknown", "text unknown");
+      expect(resUnknown.ok).toBe(true);
+      expect(resUnknown.meta?.mode).toBe("queued");
+      expect(client.steers).toHaveLength(0);
+      expect(inflight.get("c2_unknown")?.state).toBe("queued");
+
+      // 3. Foreign ownership
+      client.ownership = "foreign";
+      const resForeign = await runner.deliver("c2_foreign", "text foreign");
+      expect(resForeign.ok).toBe(true);
+      expect(resForeign.meta?.mode).toBe("queued");
+      expect(client.steers).toHaveLength(0);
+      expect(inflight.get("c2_foreign")?.state).toBe("queued");
+
+      // 4. No run id yet (own ownership, but no run id)
+      const r4 = makeRunner();
+      r4.client.ownership = "own";
+      await r4.runner.deliver("c1_b", "first b");
+      // no setRunId called
+      const resNoRunId = await r4.runner.deliver("c2_norunid", "text norunid");
+      expect(resNoRunId.ok).toBe(true);
+      expect(resNoRunId.meta?.mode).toBe("queued");
+      expect(r4.client.steers).toHaveLength(0);
+      expect(r4.inflight.get("c2_norunid")?.state).toBe("queued");
+
+      // 5. Recovered turn
+      const r5 = makeRunner();
+      r5.client.ownership = "own";
+      r5.client.setRunId("20260918_1", "run_rec");
+      const recRow: GooseInflightRecord = {
+        commandId: "c_rec",
+        sessionId: "sess_test",
+        backendSessionId: "20260918_1",
+        isHonk: true,
+        promptText: "recovered turn",
+        recoveryAttempts: 0,
+        createdAt: 100,
+        updatedAt: 100,
+        lastAliveAt: 100,
+        cleanSuspend: true,
+        state: "sent",
+      };
+      r5.inflight.insert(recRow);
+      r5.runner.resume(recRow);
+
+      const resRecovered = await r5.runner.deliver("c2_rec", "text rec");
+      expect(resRecovered.ok).toBe(true);
+      expect(resRecovered.meta?.mode).toBe("queued");
+      expect(r5.client.steers).toHaveLength(0);
+      expect(r5.inflight.get("c2_rec")?.state).toBe("queued");
+    });
+
+    it("already-queued redelivery -> ok:true meta.mode already-queued (no second notice)", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      await runner.deliver("c1", "first");
+      client.ownership = "foreign";
+
+      const res1 = await runner.deliver("c2", "queued text");
+      expect(res1.ok).toBe(true);
+      expect(res1.meta?.mode).toBe("queued");
+      expect(stops).toHaveLength(1);
+
+      const res2 = await runner.deliver("c2", "queued text");
+      expect(res2.ok).toBe(true);
+      expect(res2.meta?.mode).toBe("already-queued");
+      expect(stops).toHaveLength(1); // No second notice
+    });
+
+    it("no turn of ours but queue non-empty -> enqueue (order)", async () => {
+      const { runner, client, inflight } = makeRunner();
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running"; // foreign turn running
+      client.ownership = "foreign";
+
+      // With c0 in flight and ownership foreign, c1 is queued:
+      const res1 = await runner.deliver("c1", "first queued");
+      expect(res1.meta?.mode).toBe("queued");
+      expect(inflight.get("c1")?.state).toBe("queued");
+
+      // c0 finishes, so no turn of ours, but queue has c1 and client is still running foreign run:
+      client.finishTurn();
+      await runner.settled();
+
+      // c2 is delivered while queue is non-empty:
+      const res2 = await runner.deliver("c2", "second queued");
+      expect(res2.ok).toBe(true);
+      expect(res2.meta?.mode).toBe("queued");
+      expect(inflight.get("c2")?.state).toBe("queued");
+    });
+
+    it("busy on honk -> queued (no steer call, no stop notice), drained with fresh prompt using same commandId as clientReqId when onRunStateChange reports idle", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      client.isHonk = true;
+
+      await runner.deliver("c1", "prompt honk");
+      expect(inflight.get("c1")?.state).toBe("sent");
+
+      // Honkd rejects with busy while foreign turn is running
+      client.runStateValue = "running";
+      client.finishBusy("run_other");
+      await runner.settled();
+
+      expect(client.steers).toHaveLength(0); // Did NOT steer
+      expect(inflight.get("c1")?.state).toBe("queued"); // Marked queued
+      expect(stops).toHaveLength(1); // Posted Queued notice
+      expect(stops[0]!.event).toBe("Queued");
+      expect(stops[0]!.notification_id).toBe(`s:${runner.sessionId}:c1:queued`);
+      expect(runner.isBusy()).toBe(false);
+
+      // Now foreign run ends: onRunStateChange reports idle
+      client.runStateValue = "idle";
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+
+      // Allow microtask to run maybeDrain
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(client.prompts).toEqual(["prompt honk", "prompt honk"]);
+      expect(client.promptOptions[1]).toEqual({ clientReqId: "c1" });
+      expect(inflight.get("c1")?.state).toBe("sent");
+    });
+
+    it("busy on bare goose -> still steers", async () => {
+      const { runner, client } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("c1", "prompt bare");
+      client.finishBusy("run_bare_live");
+      await runner.settled();
+
+      expect(client.steers).toEqual([{ runId: "run_bare_live", text: "prompt bare" }]);
+    });
+
+    it("drain order FIFO, one turn at a time", async () => {
+      const { runner, client } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("c1", "turn 1");
+      await runner.deliver("c2", "turn 2");
+      await runner.deliver("c3", "turn 3");
+
+      expect(client.prompts).toEqual(["turn 0"]);
+
+      // c0 finishes
+      client.finishTurn();
+      await runner.settled();
+
+      // Foreign run completes: idle
+      client.runStateValue = "idle";
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // c1 should be prompted, but NOT c2 or c3 yet (one turn at a time)
+      expect(client.prompts).toEqual(["turn 0", "turn 1"]);
+      expect(runner.isBusy()).toBe(true);
+
+      // Finish c1
+      client.finishTurn();
+      await runner.settled();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // c2 is prompted
+      expect(client.prompts).toEqual(["turn 0", "turn 1", "turn 2"]);
+
+      // Finish c2
+      client.finishTurn();
+      await runner.settled();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // c3 is prompted
+      expect(client.prompts).toEqual(["turn 0", "turn 1", "turn 2", "turn 3"]);
+    });
+
+    it("busy during drain -> back to the front, no duplicate notice", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      client.isHonk = true;
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("c1", "turn 1");
+      expect(stops).toHaveLength(1); // 1 queued notice
+
+      client.finishTurn();
+      await runner.settled();
+
+      // Trigger drain
+      client.runStateValue = "idle";
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(client.prompts).toEqual(["turn 0", "turn 1"]);
+
+      // Turn 1 hits busy again during drain
+      client.runStateValue = "running";
+      client.finishBusy("run_busy_again");
+      await runner.settled();
+
+      expect(inflight.get("c1")?.state).toBe("queued");
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(1); // NO duplicate notice posted!
+    });
+
+    it("idle socket not closed while queued", async () => {
+      const { runner, client } = makeRunner({ idleSocketTimeoutMs: 50 });
+      client.isHonk = true;
+      await client.connect();
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("c1", "queued turn");
+      expect(client.isClosed()).toBe(false);
+
+      // Wait past idle socket timeout
+      await new Promise((r) => setTimeout(r, 80));
+
+      // Socket must NOT have been closed while queue is non-empty
+      expect(client.isClosed()).toBe(false);
+    });
+
+    it("fallback timer drains", async () => {
+      const { runner, client } = makeRunner({ drainFallbackIntervalMs: 50 });
+      client.isHonk = true;
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("c1", "fallback drain test");
+      expect(client.prompts).toEqual(["turn 0"]);
+
+      client.finishTurn();
+      await runner.settled();
+
+      // Suppose honk goes idle, but no onRunStateChange notification is received
+      client.runStateValue = "idle";
+
+      // Wait for fallback timer (50ms)
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(client.prompts).toEqual(["turn 0", "fallback drain test"]);
+    });
+
+    it("unconsumed steer -> queued", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      client.ownership = "own";
+      client.setRunId("20260918_1", "run_1");
+      client.steerOutcome = { kind: "steered", runId: "run_1", messageId: "steer_msg_99" };
+
+      await runner.deliver("c1", "first");
+      await runner.deliver("c2", "steer text");
+
+      expect(client.steers).toHaveLength(1);
+      expect(stops).toHaveLength(0);
+
+      // Honk reports steer was unconsumed
+      runner.onSteerUnconsumed("steer_msg_99");
+
+      expect(inflight.get("c2")?.state).toBe("queued");
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Queued");
+      expect(stops[0]!.notification_id).toBe(`s:${runner.sessionId}:c2:queued`);
+      expect(stops[0]!.message).toBe("your message reached goose too late for the turn it was added to; queued");
+
+      // Finish turn: map entry forgotten
+      client.finishTurn();
+      await runner.settled();
+
+      // Subsequent call for steer_msg_99 does nothing
+      runner.onSteerUnconsumed("steer_msg_99");
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(1);
+    });
+
+    it("runner.dropQueued() deletes queued rows and returns count", async () => {
+      const { runner, client, inflight } = makeRunner();
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("c1", "q1");
+      await runner.deliver("c2", "q2");
+      expect(inflight.get("c1")?.state).toBe("queued");
+      expect(inflight.get("c2")?.state).toBe("queued");
+
+      const dropped = runner.dropQueued();
+      expect(dropped).toBe(2);
+      expect(inflight.get("c1")).toBeUndefined();
+      expect(inflight.get("c2")).toBeUndefined();
     });
   });
 });

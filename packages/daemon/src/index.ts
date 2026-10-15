@@ -242,6 +242,10 @@ const gooseRunners = config.gooseAcpUrl
             // run to completion with the human seeing none of it.
             onSessionUpdate: (backendSessionId, update) =>
               gooseRunners?.peekByBackendId(backendSessionId)?.onUpdate(update),
+            onRunStateChange: (backendSessionId, state) =>
+              gooseRunners?.peekByBackendId(backendSessionId)?.onRunStateChange(state),
+            onSteerUnconsumed: (backendSessionId, messageId) =>
+              gooseRunners?.peekByBackendId(backendSessionId)?.onSteerUnconsumed(messageId),
           }),
           postStop: async (body) => {
             // Reuses the daemon's own /stop route rather than reimplementing

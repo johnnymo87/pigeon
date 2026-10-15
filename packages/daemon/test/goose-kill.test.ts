@@ -76,6 +76,7 @@ describe("executeGooseKill", () => {
     let cancelOutcome: "sent" | "no-connection" | "failed" = "sent";
     let isHonk = false;
     let isHonkKnown = true;
+    let queuedCount = 0;
 
     const fakeRunner = {
       get isHonk() { return isHonk; },
@@ -83,6 +84,10 @@ describe("executeGooseKill", () => {
       cancel: vi.fn(async () => {
         events.push("cancel");
         return cancelOutcome;
+      }),
+      dropQueued: vi.fn(() => {
+        events.push("dropQueued");
+        return queuedCount;
       }),
     };
 
@@ -129,6 +134,7 @@ describe("executeGooseKill", () => {
       fakeRunner,
       setCancelOutcome: (o: "sent" | "no-connection" | "failed") => { cancelOutcome = o; },
       setIsHonk: (h: boolean, known = true) => { isHonk = h; isHonkKnown = known; },
+      setQueuedCount: (n: number) => { queuedCount = n; },
     };
   }
 
@@ -141,6 +147,7 @@ describe("executeGooseKill", () => {
       "sessions.get:gse_123",
       "gooseRunners.get",
       "cancel",
+      "dropQueued",
       "gooseRunners.drop:gse_123",
       "sessions.delete:gse_123",
       "assignments.delete:gse_123",
@@ -273,5 +280,21 @@ describe("executeGooseKill", () => {
     expect(events).toContain("poller.unregisterSession:gse_123");
     expect(deps.reply).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+
+  it("calls runner.dropQueued() before drop and appends discarded count to reply when >0", async () => {
+    const { deps, events, setQueuedCount } = makeDeps();
+    setQueuedCount(3);
+
+    await executeGooseKill("gse_123", deps);
+
+    const dropQueuedIdx = events.indexOf("dropQueued");
+    const dropRunnerIdx = events.indexOf("gooseRunners.drop:gse_123");
+    expect(dropQueuedIdx).toBeGreaterThanOrEqual(0);
+    expect(dropRunnerIdx).toBeGreaterThan(dropQueuedIdx);
+
+    expect(deps.reply).toHaveBeenCalledWith(
+      expect.stringMatching(/ 3 queued message\(s\) were discarded\.$/),
+    );
   });
 });

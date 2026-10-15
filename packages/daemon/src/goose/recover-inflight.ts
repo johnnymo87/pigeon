@@ -53,7 +53,10 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
   }
 
   async function processSessionRows(sessionId: string, rows: GooseInflightRecord[]): Promise<void> {
-    for (const row of rows) {
+    const sentRows = rows.filter((r) => r.state === "sent");
+    const queuedRows = rows.filter((r) => r.state === "queued");
+
+    for (const row of sentRows) {
       const commandId = row.commandId;
       const sanitisedCmd = sanitiseIdPart(commandId);
 
@@ -182,6 +185,73 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
         await runner.settled().finally(() => {
           opts.storage.inbox.markDone(commandId);
         });
+      }
+    }
+
+    // Queued rows in created order handed to runner.enqueueRecovered (Item 9)
+    if (queuedRows.length > 0) {
+      for (const row of queuedRows) {
+        const commandId = row.commandId;
+        const sanitisedCmd = sanitiseIdPart(commandId);
+        const normalNotifId = `s:${sessionId}:${sanitisedCmd}`;
+        const stalledNotifId = `s:${sessionId}:${sanitisedCmd}:stalled`;
+
+        // Check 1: 24h stale check posts notice and deletes row
+        if (now - row.createdAt > staleCutoffMs) {
+          log("queued row older than 24h, posting stale notice and deleting", {
+            commandId,
+            sessionId,
+            createdAt: row.createdAt,
+          });
+          const session = opts.storage.sessions.get(sessionId);
+          if (session) {
+            void sendPostStop(
+              {
+                session_id: sessionId,
+                notification_id: normalNotifId,
+                message:
+                  "pigeon queued this message more than 24h ago and never sent it; nothing was sent",
+                event: "Error",
+                error_kind: "goose-queued-stale",
+              },
+              session,
+            );
+          }
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 2: Session missing or not goose
+        const session = opts.storage.sessions.get(sessionId);
+        if (!session || session.backendKind !== GOOSE_BACKEND_KIND) {
+          log("session missing or not goose, deleting queued row without notice", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 3: Outbox pre-check for s:sid:cmd and s:sid:cmd:stalled
+        if (
+          opts.storage.outbox.getByNotificationId(normalNotifId) ||
+          opts.storage.outbox.getByNotificationId(stalledNotifId)
+        ) {
+          log("notification already in outbox, deleting queued row without enqueuing", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Hand to runner enqueueRecovered (push without notice) and trigger drain.
+        // Recovery loop must not wait for queued items to settle.
+        const runner = opts.gooseRunners.get(session);
+        runner.enqueueRecovered(row);
       }
     }
   }

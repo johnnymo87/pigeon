@@ -58,6 +58,7 @@ describe("GooseInflightRepository", () => {
       updatedAt: 1050,
       lastAliveAt: 1050,
       cleanSuspend: true,
+      state: "sent",
     });
   });
 
@@ -90,6 +91,7 @@ describe("GooseInflightRepository", () => {
       updatedAt: now,
       lastAliveAt: now,
       cleanSuspend: false,
+      state: "sent",
     });
   });
 
@@ -279,5 +281,109 @@ describe("GooseInflightRepository", () => {
     s.sessions.delete("ses_cascade");
 
     expect(repo.get("cmd_cascade")).toBeUndefined();
+  });
+
+  it("supports state='queued' during insert", () => {
+    const s = newStorage();
+    createSession(s, "ses_test_q");
+    const repo = s.gooseInflight;
+
+    repo.insert({
+      commandId: "cmd_q1",
+      sessionId: "ses_test_q",
+      backendSessionId: "b_q1",
+      isHonk: true,
+      promptText: "queued prompt",
+      state: "queued",
+    });
+
+    const row = repo.get("cmd_q1")!;
+    expect(row.state).toBe("queued");
+  });
+
+  it("markSent updates state to 'sent', last_alive_at, and updated_at", () => {
+    const s = newStorage();
+    createSession(s, "ses_test_ms");
+    const repo = s.gooseInflight;
+
+    repo.insert({
+      commandId: "cmd_ms",
+      sessionId: "ses_test_ms",
+      backendSessionId: "b_ms",
+      isHonk: true,
+      promptText: "to mark sent",
+      state: "queued",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastAliveAt: 1000,
+    });
+
+    repo.markSent("cmd_ms", 1500);
+
+    const updated = repo.get("cmd_ms")!;
+    expect(updated.state).toBe("sent");
+    expect(updated.lastAliveAt).toBe(1500);
+    expect(updated.updatedAt).toBe(1500);
+  });
+
+  it("markQueued updates state to 'queued', last_alive_at, and updated_at", () => {
+    const s = newStorage();
+    createSession(s, "ses_test_mq");
+    const repo = s.gooseInflight;
+
+    repo.insert({
+      commandId: "cmd_mq",
+      sessionId: "ses_test_mq",
+      backendSessionId: "b_mq",
+      isHonk: true,
+      promptText: "to mark queued",
+      state: "sent",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastAliveAt: 1000,
+    });
+
+    repo.markQueued("cmd_mq", 1800);
+
+    const updated = repo.get("cmd_mq")!;
+    expect(updated.state).toBe("queued");
+    expect(updated.lastAliveAt).toBe(1800);
+    expect(updated.updatedAt).toBe(1800);
+  });
+
+  it("schema migration adds the state column to an existing table without it", async () => {
+    const BetterSqlite3 = (await import("better-sqlite3")).default;
+    const db = new BetterSqlite3(":memory:");
+    try {
+      // Create table without state column (simulating existing older schema)
+      db.exec(`
+        CREATE TABLE goose_inflight_turns (
+          command_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          backend_session_id TEXT NOT NULL,
+          is_honk INTEGER NOT NULL,
+          prompt_text TEXT NOT NULL,
+          recovery_attempts INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          last_alive_at INTEGER NOT NULL,
+          clean_suspend INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO goose_inflight_turns VALUES ('old_cmd', 's1', 'b1', 1, 'text', 0, 100, 100, 100, 0);
+      `);
+
+      // Run initGooseInflightSchema (import dynamically)
+      const { initGooseInflightSchema } = await import("../src/storage/goose-inflight-schema");
+      initGooseInflightSchema(db);
+
+      // Verify row now has state='sent' by default
+      const row = db.prepare("SELECT * FROM goose_inflight_turns WHERE command_id = 'old_cmd'").get() as any;
+      expect(row.state).toBe("sent");
+
+      // Verify idempotent (second run doesn't throw)
+      expect(() => initGooseInflightSchema(db)).not.toThrow();
+    } finally {
+      db.close();
+    }
   });
 });

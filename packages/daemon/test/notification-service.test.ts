@@ -174,6 +174,19 @@ describe("formatTelegramNotification", () => {
     expect(errorResult.header.text).toContain("❌");
   });
 
+  it("produces ⏳ emoji header for Queued event", () => {
+    const queuedResult = formatTelegramNotification({
+      event: "Queued",
+      label: "my-label",
+      summary: "Queued",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      sessionId: "sess-123",
+    });
+
+    expect(queuedResult.header.text).toContain("⏳");
+  });
+
   it("includes machine ID in footer when provided", () => {
     const result = formatTelegramNotification({
       event: "Stop",

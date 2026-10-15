@@ -1,5 +1,7 @@
 import type BetterSqlite3 from "better-sqlite3";
 
+export type GooseInflightState = "queued" | "sent";
+
 export interface GooseInflightRecord {
   commandId: string;
   sessionId: string;
@@ -11,6 +13,7 @@ export interface GooseInflightRecord {
   updatedAt: number;
   lastAliveAt: number;
   cleanSuspend: boolean;
+  state: GooseInflightState;
 }
 
 export interface InsertGooseInflightInput {
@@ -24,6 +27,7 @@ export interface InsertGooseInflightInput {
   updatedAt?: number;
   lastAliveAt?: number;
   cleanSuspend?: boolean;
+  state?: GooseInflightState;
 }
 
 export interface GooseInflightStore {
@@ -33,6 +37,8 @@ export interface GooseInflightStore {
   touchAlive(commandId: string, now?: number): void;
   markSuspended(commandId: string, now?: number): void;
   markResumed(commandId: string, now?: number): void;
+  markSent(commandId: string, now?: number): void;
+  markQueued(commandId: string, now?: number): void;
   bumpAttempts(commandId: string, now?: number): number;
   get(commandId: string): GooseInflightRecord | undefined;
 }
@@ -48,6 +54,7 @@ interface GooseInflightDbRow {
   updated_at: number;
   last_alive_at: number;
   clean_suspend: number;
+  state: string;
 }
 
 function toRecord(row: GooseInflightDbRow): GooseInflightRecord {
@@ -62,6 +69,7 @@ function toRecord(row: GooseInflightDbRow): GooseInflightRecord {
     updatedAt: row.updated_at,
     lastAliveAt: row.last_alive_at,
     cleanSuspend: row.clean_suspend === 1,
+    state: (row.state as GooseInflightState) || "sent",
   };
 }
 
@@ -75,6 +83,7 @@ export class GooseInflightRepository implements GooseInflightStore {
     const recoveryAttempts = input.recoveryAttempts ?? 0;
     const cleanSuspend = input.cleanSuspend ? 1 : 0;
     const isHonk = input.isHonk ? 1 : 0;
+    const state = input.state ?? "sent";
 
     this.db
       .prepare(
@@ -88,8 +97,9 @@ export class GooseInflightRepository implements GooseInflightStore {
           created_at,
           updated_at,
           last_alive_at,
-          clean_suspend
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          clean_suspend,
+          state
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.commandId,
@@ -102,6 +112,7 @@ export class GooseInflightRepository implements GooseInflightStore {
         updatedAt,
         lastAliveAt,
         cleanSuspend,
+        state,
       );
   }
 
@@ -116,7 +127,7 @@ export class GooseInflightRepository implements GooseInflightStore {
     const row = this.db
       .prepare(
         `SELECT command_id, session_id, backend_session_id, is_honk, prompt_text,
-                recovery_attempts, created_at, updated_at, last_alive_at, clean_suspend
+                recovery_attempts, created_at, updated_at, last_alive_at, clean_suspend, state
          FROM goose_inflight_turns WHERE command_id = ?`,
       )
       .get(commandId) as GooseInflightDbRow | undefined;
@@ -127,7 +138,7 @@ export class GooseInflightRepository implements GooseInflightStore {
     const rows = this.db
       .prepare(
         `SELECT command_id, session_id, backend_session_id, is_honk, prompt_text,
-                recovery_attempts, created_at, updated_at, last_alive_at, clean_suspend
+                recovery_attempts, created_at, updated_at, last_alive_at, clean_suspend, state
          FROM goose_inflight_turns
          ORDER BY created_at ASC, command_id ASC`,
       )
@@ -155,6 +166,22 @@ export class GooseInflightRepository implements GooseInflightStore {
     this.db
       .prepare(
         "UPDATE goose_inflight_turns SET clean_suspend = 0, last_alive_at = ?, updated_at = ? WHERE command_id = ?",
+      )
+      .run(now, now, commandId);
+  }
+
+  markSent(commandId: string, now: number = Date.now()): void {
+    this.db
+      .prepare(
+        "UPDATE goose_inflight_turns SET state = 'sent', last_alive_at = ?, updated_at = ? WHERE command_id = ?",
+      )
+      .run(now, now, commandId);
+  }
+
+  markQueued(commandId: string, now: number = Date.now()): void {
+    this.db
+      .prepare(
+        "UPDATE goose_inflight_turns SET state = 'queued', last_alive_at = ?, updated_at = ? WHERE command_id = ?",
       )
       .run(now, now, commandId);
   }
