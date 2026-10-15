@@ -51,7 +51,7 @@
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
 import type { GooseInflightRecord, GooseInflightStore } from "../storage/goose-inflight-repo.js";
-import { DisconnectedDuringTurn } from "./acp-client.js";
+import { DisconnectedDuringTurn, type RunOwnership } from "./acp-client.js";
 
 /**
  * What the human is told when the daemon shuts down with a goose turn in flight.
@@ -120,6 +120,7 @@ export interface RunnerClient {
   prompt(sessionId: string, text: string, options?: { clientReqId?: string; resumeOnly?: boolean }): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
+  runOwnership?(sessionId: string): RunOwnership;
   cancel(sessionId: string): void;
   close(): void;
 }
@@ -1467,6 +1468,10 @@ export class GooseSessionRunner {
     }
 
     return "no-connection";
+  }
+
+  ownsActiveRun(): boolean {
+    return this.opts.client.runOwnership?.(this.backendSessionId) === "own";
   }
 
   close(): void {

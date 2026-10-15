@@ -75,6 +75,7 @@ class FakeClient {
     this.activeRunIdSessionIds.push(sessionId);
     return this.runIds.get(sessionId);
   }
+  runOwnership?: (sessionId: string) => "own" | "pending" | "foreign" | "unknown";
   isClosed(): boolean {
     return this.closed;
   }
@@ -1962,4 +1963,29 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(res).toBe("no-connection");
     });
   });
+
+  describe("ownsActiveRun", () => {
+    it("returns true only when client.runOwnership returns 'own'", () => {
+      const { runner, client } = makeRunner();
+      expect(runner.ownsActiveRun()).toBe(false);
+
+      let ownership: "own" | "pending" | "foreign" | "unknown" = "pending";
+      client.runOwnership = (sid: string) => {
+        expect(sid).toBe("20260918_1");
+        return ownership;
+      };
+
+      expect(runner.ownsActiveRun()).toBe(false);
+
+      ownership = "foreign";
+      expect(runner.ownsActiveRun()).toBe(false);
+
+      ownership = "unknown";
+      expect(runner.ownsActiveRun()).toBe(false);
+
+      ownership = "own";
+      expect(runner.ownsActiveRun()).toBe(true);
+    });
+  });
 });
+
