@@ -38,7 +38,8 @@ const SLASH_COMMAND_RE = /^\/([^\s/]+)(?:\s|$)/;
  * or null when the text is an ordinary prompt.
  */
 export function gooseCommandIn(text: string): string | null {
-  const trimmed = text.trim();
+  // Rust's trim() also strips U+0085 (NEL), which JS's does not.
+  const trimmed = text.replace(/^[\s\u0085]+|[\s\u0085]+$/g, "");
   const slash = SLASH_COMMAND_RE.exec(trimmed);
   if (slash) return `/${slash[1]}`;
   const normalized = trimmed.toLowerCase().replace(/[.!\s]+$/, "");

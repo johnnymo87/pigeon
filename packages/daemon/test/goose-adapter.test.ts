@@ -178,14 +178,36 @@ describe("GooseAcpAdapter sender allowlist", () => {
     expect(delivered).toEqual([]);
   });
 
-  it("refuses everyone when the allowlist is empty", async () => {
+  function unconfigured() {
+    const delivered: string[] = [];
     const adapter = new GooseAcpAdapter({
-      runnerFor: () => ({ deliver: async () => ({ ok: true }) }) as unknown as GooseSessionRunner,
+      runnerFor: () => ({ deliver: async (_c: string, t: string) => { delivered.push(t); return { ok: true }; } }) as unknown as GooseSessionRunner,
       allowedSenderIds: new Set(),
       reachability: async () => ({ kind: "ok" }),
     });
-    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1", senderId: OWNER });
+    return { adapter, delivered };
+  }
+
+  it("with no list configured, a bound session refuses everyone and names the setting", async () => {
+    const { adapter, delivered } = unconfigured();
+    const res = await adapter.deliverCommand(session({ boundTopicKey: "stallwatch:mono" }), "x", { commandId: "c1", senderId: OWNER });
     expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/PIGEON_PULL_ALLOWED_USER_IDS/);
+    expect(delivered).toEqual([]);
+  });
+
+  it("with no list configured, an unbound session accepts any sender, as before (devbox, macOS)", async () => {
+    const { adapter, delivered } = unconfigured();
+    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1", senderId: "2002" });
+    expect(res.ok).toBe(true);
+    expect(delivered).toEqual(["x"]);
+  });
+
+  it("with no list configured, a forwarded message is still refused", async () => {
+    const { adapter, delivered } = unconfigured();
+    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1", senderId: "2002", forwarded: true });
+    expect(res.ok).toBe(false);
+    expect(delivered).toEqual([]);
   });
 });
 
@@ -198,6 +220,7 @@ describe("GooseAcpAdapter refuses goose commands for a pinned session", () => {
   for (const text of [
     "/clear",
     "  /clear  ",
+    "\u0085/clear",
     "/compact",
     "/summarize",
     "/goal ship it",
@@ -255,7 +278,7 @@ describe("GooseAcpAdapter carries what a message replied to", () => {
   it("prefixes the replied-to bot message", async () => {
     const { adapter, delivered } = makeAdapter({ kind: "ok" });
     await adapter.deliverCommand(session(), "yes, do it", { ...ctx, inReplyTo: "Shall I rebase #176?" });
-    expect(delivered[0]!.text).toBe('[Replying to your earlier message: "Shall I rebase #176?"]\n\nyes, do it');
+    expect(delivered[0]!.text).toBe('[Replying to this earlier message in the topic: "Shall I rebase #176?"]\n\nyes, do it');
   });
 
   it("prefers the highlighted part when the human quoted one", async () => {
@@ -265,13 +288,13 @@ describe("GooseAcpAdapter carries what a message replied to", () => {
       inReplyTo: "Two options: A, rebase. B, merge.",
       inReplyToQuote: "B, merge.",
     });
-    expect(delivered[0]!.text).toBe('[Replying to this part of your earlier message: "B, merge."]\n\nthis one');
+    expect(delivered[0]!.text).toBe('[Replying to this part of an earlier message in the topic: "B, merge."]\n\nthis one');
   });
 
   it("caps the context like goose-pull does", async () => {
     const { adapter, delivered } = makeAdapter({ kind: "ok" });
     await adapter.deliverCommand(session(), "ok", { ...ctx, inReplyTo: "x".repeat(5000) });
-    expect(delivered[0]!.text).toBe(`[Replying to your earlier message: "${"x".repeat(500)}"]\n\nok`);
+    expect(delivered[0]!.text).toBe(`[Replying to this earlier message in the topic: "${"x".repeat(500)}"]\n\nok`);
   });
 
   it("sends the text alone when there is nothing, or only whitespace, to carry", async () => {

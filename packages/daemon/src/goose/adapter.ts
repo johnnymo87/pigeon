@@ -45,9 +45,11 @@ export interface GooseAcpAdapterOptions {
   runnerFor: (session: SessionRecord) => GooseSessionRunner;
   /**
    * Telegram user ids allowed to prompt a goose session: the owner's
-   * (`PIGEON_PULL_ALLOWED_USER_IDS`, the same set goose-pull uses). Required,
-   * and an empty set refuses everyone; `selectAdapter` returns no adapter at
-   * all in that case.
+   * (`PIGEON_PULL_ALLOWED_USER_IDS`, the same set goose-pull uses). When it is
+   * non-empty, only those senders get through. When it is empty, a session
+   * bound to a topic refuses everyone (that is the case the list exists for),
+   * and an unbound one accepts any sender the worker admitted, as before: the
+   * list is not configured on devbox or macOS, which run goose sessions.
    */
   allowedSenderIds: ReadonlySet<string>;
   /** Injected for tests; defaults to the real HTTP probe. */
@@ -76,14 +78,25 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     // worker's chat allowlist admits every member of an allowed group chat. A
     // missing sender id fails closed: a button tap or an older worker produces
     // it, and neither is evidence of the owner.
-    const senderId = context.senderId;
-    if (!senderId || !this.opts.allowedSenderIds.has(senderId)) {
+    const allowed = this.opts.allowedSenderIds;
+    if (allowed.size > 0) {
+      const senderId = context.senderId;
+      if (!senderId || !allowed.has(senderId)) {
+        return {
+          ok: false,
+          error: "this session only accepts messages from its owner's Telegram account",
+        };
+      }
+    } else if (session.boundTopicKey) {
       return {
         ok: false,
-        error: "this session only accepts messages from its owner's Telegram account",
+        error:
+          "this session is bound to its topic and accepts only its owner's messages, but this machine "
+          + "has no owner configured (PIGEON_PULL_ALLOWED_USER_IDS is empty), so it accepts none",
       };
     }
-    // The allowlist proves who SENT a message, not who wrote it.
+    // The allowlist proves who SENT a message, not who wrote it. Refused even
+    // without a list: a forwarded prompt is someone else's words either way.
     if (context.forwarded) {
       return {
         ok: false,
@@ -176,6 +189,10 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
  * preamble would turn it into prose (and `/goal x` would swallow the preamble
  * as its argument). Pinned sessions never get that far; see builtin-commands.
  *
+ * The wording does not say who wrote that message: the bot also posts digests,
+ * alerts and pigeon's own replies into a topic, and telling the model it wrote
+ * one of those invites it to adopt the content as its own plan.
+ *
  * Deterministic in its inputs, so a redelivered command produces the same text.
  */
 export function withReplyContext(command: string, context: CommandDeliveryContext): string {
@@ -188,7 +205,7 @@ export function withReplyContext(command: string, context: CommandDeliveryContex
   const replied = cap(context.inReplyTo);
   if (!quote && !replied) return command;
   const lines = quote
-    ? [`[Replying to this part of your earlier message: "${quote}"]`]
-    : [`[Replying to your earlier message: "${replied}"]`];
+    ? [`[Replying to this part of an earlier message in the topic: "${quote}"]`]
+    : [`[Replying to this earlier message in the topic: "${replied}"]`];
   return `${lines.join("\n")}\n\n${command}`;
 }
