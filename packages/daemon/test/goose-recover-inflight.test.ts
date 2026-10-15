@@ -850,5 +850,85 @@ describe("recoverGooseTurns (Commit 2)", () => {
       expect(notices[0]!.notification_id).toBe(`s:${session.sessionId}:cmd_q_stale`);
       expect(notices[0]!.message).toBe("pigeon queued this message more than 24h ago and never sent it; nothing was sent");
     });
+
+    it("a deliver() during a resumed turn queues behind the recovered queued row, and nothing drains before the sent rows are processed", async () => {
+      const s = newStorage();
+      const session = createSession(s, "ses_q_order");
+      const client = new FakeClient();
+      const registry = new GooseRunnerRegistry({
+        inbox: s.inbox,
+        inflight: s.gooseInflight,
+        createRunner: (sess) =>
+          new GooseSessionRunner({
+            session: sess,
+            client,
+            inflight: s.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+
+      const now = 1000;
+      // 1 sent row and 1 queued row
+      s.gooseInflight.insert({
+        commandId: "cmd_sent",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "sent prompt",
+        createdAt: 100,
+        state: "sent",
+      });
+      s.gooseInflight.insert({
+        commandId: "cmd_queued",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "queued prompt",
+        createdAt: 200,
+        state: "queued",
+      });
+
+      const runner = registry.get(session);
+
+      // Start recovery in background
+      void recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now,
+      });
+
+      // Wait for resumed sent row to start
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(1));
+      expect(client.prompts[0]).toBe("sent prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_sent");
+
+      // While cmd_sent is active, poller delivers cmd_poller
+      const deliverRes = await runner.deliver("cmd_poller", "poller prompt");
+      expect(deliverRes.ok).toBe(true);
+      expect(deliverRes.meta?.mode).toBe("queued");
+
+      // Nothing drains before the sent rows are processed
+      await new Promise((r) => setTimeout(r, 20));
+      expect(client.prompts).toHaveLength(1);
+
+      // Settle sent row
+      client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "sent answer" });
+      await runner.settled();
+
+      // Now queued row should drain FIRST (before cmd_poller)
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(2));
+      expect(client.prompts[1]).toBe("queued prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_queued");
+
+      // Settle queued row
+      client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "queued answer" });
+      await runner.settled();
+
+      // Finally poller row drains
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(3));
+      expect(client.prompts[2]).toBe("poller prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_poller");
+    });
   });
 });

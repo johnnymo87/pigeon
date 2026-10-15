@@ -308,6 +308,7 @@ export class GooseSessionRunner {
   private sleepResolve: (() => void) | undefined;
   private closed = false;
   private suspended = false;
+  private drainHeld = false;
   private queue: QueuedItem[] = [];
   private sentSteers = new Map<string, { commandId: string; text: string }>();
   private draining = false;
@@ -347,6 +348,15 @@ export class GooseSessionRunner {
     this.queue = [];
     this.clearDrainFallbackTimer();
     return count;
+  }
+
+  holdDrain(): void {
+    this.drainHeld = true;
+  }
+
+  releaseDrain(): void {
+    this.drainHeld = false;
+    this.scheduleDrain();
   }
 
   enqueueRecovered(row: GooseInflightRecord): void {
@@ -431,6 +441,7 @@ export class GooseSessionRunner {
       recovered: true,
     };
     this.turn = turn;
+    this.sentSteers.clear();
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
@@ -487,6 +498,8 @@ export class GooseSessionRunner {
               commandId: row.commandId,
               error: reportErr instanceof Error ? reportErr.message : String(reportErr),
             });
+          } finally {
+            this.scheduleDrain();
           }
           return;
         }
@@ -720,7 +733,7 @@ export class GooseSessionRunner {
 
   async maybeDrain(): Promise<void> {
     if (this.draining) return;
-    if (this.closed || this.suspended) return;
+    if (this.closed || this.suspended || this.drainHeld) return;
     if (this.turn) return;
     if (this.queue.length === 0) return;
 
@@ -732,15 +745,14 @@ export class GooseSessionRunner {
 
     this.draining = true;
     try {
-      if (this.closed || this.suspended || this.turn || this.queue.length === 0) return;
+      if (this.closed || this.suspended || this.drainHeld || this.turn || this.queue.length === 0) return;
 
-      const item = this.queue.shift();
+      const item = this.queue[0];
       if (!item) return;
 
       try {
         await this.ensureConnected();
       } catch (err) {
-        this.queue.unshift(item);
         this.log("goose runner: ensureConnected failed during drain", {
           sessionId: this.sessionId,
           commandId: item.commandId,
@@ -749,6 +761,14 @@ export class GooseSessionRunner {
         this.armDrainFallbackTimer();
         return;
       }
+
+      // Re-check after awaiting ensureConnected:
+      // closed, suspended, this.turn set, or queue head changed
+      if (this.closed || this.suspended || this.turn || this.queue[0]?.commandId !== item.commandId) {
+        return;
+      }
+
+      this.queue.shift();
 
       try {
         this.startTurn(item.commandId, item.text, { fromQueue: true });
@@ -810,6 +830,7 @@ export class GooseSessionRunner {
    * That is what makes "throw means nothing was sent" true for callers.
    */
   private startTurn(commandId: string, text: string, options?: { fromQueue?: boolean }): DeliverOutcome {
+    this.sentSteers.clear();
     this.clearIdleSocketTimer();
     this.clearDrainFallbackTimer();
 
@@ -953,6 +974,8 @@ export class GooseSessionRunner {
               commandId: turn.commandId,
               error: reportErr instanceof Error ? reportErr.message : String(reportErr),
             });
+          } finally {
+            this.scheduleDrain();
           }
           return;
         }
@@ -1069,6 +1092,8 @@ export class GooseSessionRunner {
           commandId: turn.commandId,
           error: reportErr instanceof Error ? reportErr.message : String(reportErr),
         });
+      } finally {
+        this.scheduleDrain();
       }
       return;
     }
@@ -1095,6 +1120,8 @@ export class GooseSessionRunner {
             commandId: turn.commandId,
             error: reportErr instanceof Error ? reportErr.message : String(reportErr),
           });
+        } finally {
+          this.scheduleDrain();
         }
         return;
       }
@@ -1172,6 +1199,7 @@ export class GooseSessionRunner {
           // matter and must not also report.
           if (this.turn === turn) this.clearTurn();
           this.retire(turn);
+          this.scheduleDrain();
           return;
         }
       } catch (err) {
@@ -1243,12 +1271,10 @@ export class GooseSessionRunner {
   private clearTurn(): void {
     if (this.turn?.idleTimer) clearTimeout(this.turn.idleTimer);
     this.turn = undefined;
-    this.sentSteers.clear();
     this.notifyRecoveryResolvedOrAttached();
     if (this.opts.client.isHonk && this.connected && !this.opts.client.isClosed() && !this.closed) {
       this.armIdleSocketTimer();
     }
-    this.scheduleDrain();
     if (this.queue.length > 0) {
       this.armDrainFallbackTimer();
     }
@@ -1384,6 +1410,8 @@ export class GooseSessionRunner {
         sessionId: this.sessionId,
         error: reportErr instanceof Error ? reportErr.message : String(reportErr),
       });
+    } finally {
+      this.scheduleDrain();
     }
   }
 
@@ -1411,6 +1439,7 @@ export class GooseSessionRunner {
         commandId: turn.commandId,
       });
       this.retire(turn);
+      this.scheduleDrain();
       return;
     }
 
@@ -1544,6 +1573,8 @@ export class GooseSessionRunner {
         commandId: turn.commandId,
         error: reportErr instanceof Error ? reportErr.message : String(reportErr),
       });
+    } finally {
+      this.scheduleDrain();
     }
   }
 

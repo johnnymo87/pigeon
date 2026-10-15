@@ -2373,7 +2373,7 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(client.prompts).toEqual(["turn 0", "fallback drain test"]);
     });
 
-    it("unconsumed steer -> queued", async () => {
+    it("late _honk/steer_unconsumed after the receipt still finds its entry until a new turn starts", async () => {
       const { runner, client, stops, inflight } = makeRunner();
       client.ownership = "own";
       client.setRunId("20260918_1", "run_1");
@@ -2385,23 +2385,27 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(client.steers).toHaveLength(1);
       expect(stops).toHaveLength(0);
 
-      // Honk reports steer was unconsumed
+      // Finish turn: receipt arrives, turn settles
+      client.finishTurn();
+      await runner.settled();
+      expect(runner.isBusy()).toBe(false);
+
+      // Late steer_unconsumed arrives after receipt
       runner.onSteerUnconsumed("steer_msg_99");
 
       expect(inflight.get("c2")?.state).toBe("queued");
-      expect(stops).toHaveLength(1);
-      expect(stops[0]!.event).toBe("Queued");
-      expect(stops[0]!.notification_id).toBe(`s:${runner.sessionId}:c2:queued`);
-      expect(stops[0]!.message).toBe("your message reached goose too late for the turn it was added to; queued");
-
-      // Finish turn: map entry forgotten
-      client.finishTurn();
-      await runner.settled();
-
-      // Subsequent call for steer_msg_99 does nothing
-      runner.onSteerUnconsumed("steer_msg_99");
       const queuedStops = stops.filter((s) => s.event === "Queued");
       expect(queuedStops).toHaveLength(1);
+      expect(queuedStops[0]!.notification_id).toBe(`s:${runner.sessionId}:c2:queued`);
+      expect(queuedStops[0]!.message).toBe("your message reached goose too late for the turn it was added to; queued");
+
+      // Now a new turn starts: sentSteers is cleared
+      client.runStateValue = "running";
+      await runner.deliver("c3", "third");
+
+      // A repeat of steer_msg_99 now does nothing
+      runner.onSteerUnconsumed("steer_msg_99");
+      expect(stops.filter((s) => s.notification_id === `s:${runner.sessionId}:c2:queued`)).toHaveLength(1);
     });
 
     it("runner.dropQueued() deletes queued rows and returns count", async () => {
@@ -2419,6 +2423,197 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(dropped).toBe(2);
       expect(inflight.get("c1")).toBeUndefined();
       expect(inflight.get("c2")).toBeUndefined();
+    });
+
+    it("busy with runState unknown does not re-prompt until fallback timer or run-state change", async () => {
+      const { runner, client } = makeRunner();
+      client.isHonk = true;
+      client.runStateValue = "unknown";
+
+      await runner.deliver("c1", "first prompt");
+      expect(client.prompts).toEqual(["first prompt"]);
+
+      // Honkd rejects with busy while runState is unknown
+      client.finishBusy("run_live");
+      await runner.settled();
+
+      // Wait a bit for any drain microtask
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Must NOT have immediately re-prompted!
+      expect(client.prompts).toEqual(["first prompt"]);
+
+      // State changes to idle
+      client.runStateValue = "idle";
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Now it re-prompts
+      expect(client.prompts).toEqual(["first prompt", "first prompt"]);
+    });
+
+    it("a queued item is not prompted until the previous turn's postStop has resolved", async () => {
+      let resolvePostStop: () => void;
+      const postStopPromise = new Promise<void>((r) => {
+        resolvePostStop = r;
+      });
+
+      const { runner, client } = makeRunner({
+        postStop: async (body: Record<string, unknown>) => {
+          // If body is for the finishing turn c0 (event Stop), hang until resolved
+          if (body.event === "Stop" || (typeof body.notification_id === "string" && body.notification_id.includes(":c0"))) {
+            await postStopPromise;
+          }
+        },
+      });
+      client.isHonk = true;
+
+      // Start turn c0
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      // Queue turn c1
+      await runner.deliver("c1", "turn 1");
+
+      // c0 finishes on client
+      client.runStateValue = "idle";
+      client.finishTurn("end_turn", { text: "done 0" });
+
+      // Wait a tick for any microtask
+      await new Promise((r) => setTimeout(r, 20));
+
+      // PostStop is still pending, so c1 must NOT have been prompted yet
+      expect(client.prompts).toEqual(["turn 0"]);
+
+      // Now postStop resolves
+      resolvePostStop!();
+      await runner.settled();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Now c1 has drained and been prompted
+      expect(client.prompts).toEqual(["turn 0", "turn 1"]);
+    });
+
+    it("redelivery of head commandId while drain is connecting returns already-queued (no SQLite PK error, no second turn)", async () => {
+      const { runner, client } = makeRunner();
+      client.isHonk = true;
+
+      // Queue an item c1
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+      await runner.deliver("c1", "text c1");
+
+      // Set up connectImpl to hang
+      let resolveConnect: () => void;
+      const connectPromise = new Promise<void>((r) => {
+        resolveConnect = r;
+      });
+      // Drop connection so drain has to call ensureConnected()
+      client.close();
+      client.connectImpl = () => connectPromise;
+
+      // Finish c0 and report idle to trigger drain
+      client.runStateValue = "idle";
+      client.finishTurn();
+      await runner.settled();
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Drain is now waiting in ensureConnected().
+      // Redeliver c1 while drain is connecting:
+      const redeliverRes = await runner.deliver("c1", "text c1");
+      expect(redeliverRes.ok).toBe(true);
+      expect(redeliverRes.meta?.mode).toBe("already-queued");
+
+      // Connect completes
+      resolveConnect!();
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(client.prompts).toEqual(["turn 0", "text c1"]); // no second turn
+    });
+
+    it("a distinct new message while drain is connecting is queued behind, not started concurrently", async () => {
+      const { runner, client, inflight } = makeRunner();
+      client.isHonk = true;
+
+      // Queue an item c1
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+      await runner.deliver("c1", "text c1");
+
+      // Set up connectImpl to hang
+      let resolveConnect: () => void;
+      const connectPromise = new Promise<void>((r) => {
+        resolveConnect = r;
+      });
+      client.close();
+      client.connectImpl = () => connectPromise;
+
+      // Finish c0 and report idle to trigger drain
+      client.runStateValue = "idle";
+      client.finishTurn();
+      await runner.settled();
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Deliver distinct new message c2 while drain of c1 is connecting:
+      const res2 = await runner.deliver("c2", "text c2");
+      expect(res2.ok).toBe(true);
+      expect(res2.meta?.mode).toBe("queued");
+      expect(inflight.get("c2")?.state).toBe("queued");
+
+      // Connect completes
+      resolveConnect!();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Only c1 started, c2 is queued behind it
+      expect(client.prompts).toEqual(["turn 0", "text c1"]);
+      expect(runner.isBusy()).toBe(true);
+
+      // Finish c1
+      client.finishTurn();
+      await runner.settled();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // c2 runs next
+      expect(client.prompts).toEqual(["turn 0", "text c1", "text c2"]);
+    });
+
+    it("close() during the connect await starts nothing", async () => {
+      const { runner, client } = makeRunner();
+      client.isHonk = true;
+
+      // Queue an item c1
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+      await runner.deliver("c1", "text c1");
+
+      // Set up connectImpl to hang
+      let resolveConnect: () => void;
+      const connectPromise = new Promise<void>((r) => {
+        resolveConnect = r;
+      });
+      client.close();
+      client.connectImpl = () => connectPromise;
+
+      // Finish c0 and trigger drain
+      client.runStateValue = "idle";
+      client.finishTurn();
+      await runner.settled();
+      runner.onRunStateChange({ state: "idle", ownership: "unknown" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Close runner while connect is awaiting
+      runner.close();
+      resolveConnect!();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // c1 should never have been started
+      expect(client.prompts).toEqual(["turn 0"]);
     });
   });
 });

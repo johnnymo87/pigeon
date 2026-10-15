@@ -89,9 +89,15 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
   const session = deps.storage.sessions.get(sessionId);
   let outcome: KillOutcome = "no-runner";
   let runner: GooseSessionRunner | undefined;
+  let droppedQueued = 0;
   if (session && deps.gooseRunners) {
     try {
       runner = deps.gooseRunners.get(session);
+      try {
+        droppedQueued = runner.dropQueued();
+      } catch (err) {
+        console.warn(`[kill-control] runner.dropQueued failed for ${sessionId}:`, err);
+      }
       outcome = await runner.cancel();
     } catch (err) {
       console.warn(`[kill-control] runner.cancel failed for ${sessionId}:`, err);
@@ -100,15 +106,6 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
   }
   const isHonk = runner?.isHonk;
   const isHonkKnown = runner?.isHonkKnown;
-
-  let droppedQueued = 0;
-  if (runner) {
-    try {
-      droppedQueued = runner.dropQueued();
-    } catch (err) {
-      console.warn(`[kill-control] runner.dropQueued failed for ${sessionId}:`, err);
-    }
-  }
 
   deps.gooseRunners?.drop(sessionId);
   deps.storage.sessions.delete(sessionId);
