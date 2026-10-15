@@ -38,7 +38,7 @@ import { SessionTagResolver } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
-import { GooseAcpClient } from "./goose/acp-client.js";
+import { GooseAcpClient, ownRunPolicy } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
@@ -226,14 +226,17 @@ const gooseRunners = config.gooseAcpUrl
           client: new GooseAcpClient({
             url: session.backendEndpoint ?? config.gooseAcpUrl!,
             transportFactory: webSocketTransport(session.backendAuthToken ?? config.gooseAcpToken),
-            // Approved by the human for the daily-driver MVP on the stated basis
-            // that their opencode config already allows every tool, so this
-            // surrenders no gate they currently hold. It is NOT a claim that
-            // unattended auto-approval is safe in general: an unanswered
-            // permission request parks a goose turn forever, and there is no
-            // cancel to recover with, so the alternative is a session that
-            // wedges rather than one that asks.
-            permissionPolicy: (params) => params.options[0]?.optionId,
+            // Auto-approve tool calls only in confirmed own runs, using allow_once.
+            // On goose 1.48+ the option set starts with allow_always, which rewrites
+            // ~/.config/goose/permission.yaml host-wide and is immediately honoured by
+            // the running serve (bead eng-agent-platform-1o9). An unattended client must
+            // never select allow_always.
+            // Furthermore, honkd offers pending requests verbatim to EVERY attached viewer,
+            // and any viewer's answer settles it for all viewers. Answering in another
+            // client's run decides that client's tool call. So auto-approve only in confirmed
+            // own turns with allow_once; leave others' requests to their owner, and unknown
+            // never authorizes (bead eng-agent-platform-555.18).
+            permissionPolicy: ownRunPolicy,
             log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
             // `sessionId` here is GOOSE's, off the socket -- not pigeon's, which
             // is what `peek` takes. They differ for every session launched
@@ -246,6 +249,8 @@ const gooseRunners = config.gooseAcpUrl
               gooseRunners?.peekByBackendId(backendSessionId)?.onRunStateChange(state),
             onSteerUnconsumed: (backendSessionId, messageId) =>
               gooseRunners?.peekByBackendId(backendSessionId)?.onSteerUnconsumed(messageId),
+            onPermissionDeferred: (backendSessionId, detail) =>
+              gooseRunners?.peekByBackendId(backendSessionId)?.onPermissionDeferred(detail),
           }),
           postStop: async (body) => {
             // Reuses the daemon's own /stop route rather than reimplementing

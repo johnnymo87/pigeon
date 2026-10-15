@@ -205,6 +205,7 @@ interface Turn {
   cancelRequested?: boolean;
   queuedNoticeSent?: boolean;
   fromQueue?: boolean;
+  permissionNoticePosted?: boolean;
 }
 
 interface QueuedItem {
@@ -371,6 +372,32 @@ export class GooseSessionRunner {
 
   onRunStateChange(_view?: RunStateInfo): void {
     this.scheduleDrain();
+  }
+
+  async onPermissionDeferred(_detail: { held: boolean; ownership: RunOwnership }): Promise<void> {
+    const turn = this.turn;
+    if (!turn) {
+      return;
+    }
+    if (turn.permissionNoticePosted) {
+      return;
+    }
+    turn.permissionNoticePosted = true;
+    try {
+      await this.opts.postStop({
+        session_id: this.sessionId,
+        notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:permission`,
+        message:
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat, or /kill to cancel the turn.",
+        event: "Permission",
+      });
+    } catch (err) {
+      this.log("goose runner: could not post permission deferred notice", {
+        sessionId: this.sessionId,
+        commandId: turn.commandId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   onSteerUnconsumed(messageId: string): void {

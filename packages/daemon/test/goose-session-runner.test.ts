@@ -2616,5 +2616,38 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(client.prompts).toEqual(["turn 0"]);
     });
   });
+
+  describe("bead eng-agent-platform-555.18: permission deferred notice", () => {
+    it("posts notice once per turn when deferred/held during pigeon's own tracked turn", async () => {
+      const { runner, stops } = makeRunner();
+      await runner.deliver("cmd-perm-1", "do work");
+      expect(runner.isBusy()).toBe(true);
+
+      // Request deferred/held
+      await runner.onPermissionDeferred({ held: true, ownership: "pending" });
+
+      const permStops = stops.filter((s) => s.event === "Permission");
+      expect(permStops).toHaveLength(1);
+      expect(permStops[0]).toMatchObject({
+        session_id: "20260918_1",
+        notification_id: "s:20260918_1:cmd-perm-1:permission",
+        event: "Permission",
+        message:
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat, or /kill to cancel the turn.",
+      });
+
+      // Deferred again in the same turn -> no second notice
+      await runner.onPermissionDeferred({ held: true, ownership: "pending" });
+      expect(stops.filter((s) => s.event === "Permission")).toHaveLength(1);
+    });
+
+    it("does not post notice for foreign runs without a pigeon turn in flight", async () => {
+      const { runner, stops } = makeRunner();
+      expect(runner.isBusy()).toBe(false);
+
+      await runner.onPermissionDeferred({ held: false, ownership: "foreign" });
+      expect(stops).toHaveLength(0);
+    });
+  });
 });
 

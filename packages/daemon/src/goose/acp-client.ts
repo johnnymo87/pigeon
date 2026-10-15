@@ -164,7 +164,61 @@ export class GooseProtocolError extends Error {
  * Chooses an option for a mid-turn `session/request_permission` (hazard R6).
  * An UNANSWERED request stalls the turn indefinitely, so this always answers.
  */
-export type PermissionPolicy = (params: PermissionParams) => string | undefined;
+export type PermissionDecision =
+  | { answer: string | undefined; defer?: never }
+  | { defer: true; answer?: never };
+
+export type PermissionPolicy = (
+  params: PermissionParams,
+  ctx: { ownership: RunOwnership; isHonk: boolean },
+) => PermissionDecision | string | undefined;
+
+/**
+ * Goose 1.48+ measured option set for session/request_permission.
+ *
+ * NOTE: allow_always rewrites ~/.config/goose/permission.yaml host-wide,
+ * which the running serve honours immediately. It must never be selected
+ * by an unattended client (bead eng-agent-platform-1o9).
+ */
+export const MEASURED_GOOSE_PERMISSION_OPTIONS = [
+  { optionId: "allow_always", kind: "allow_always", name: "Always Allow" },
+  { optionId: "allow_once", kind: "allow_once", name: "Allow" },
+  { optionId: "reject_once", kind: "reject_once", name: "Deny" },
+  { optionId: "reject_always", kind: "reject_always", name: "Always Deny" },
+];
+
+/**
+ * Policy helper for unattended goose runs (beads eng-agent-platform-555.18 & 1o9):
+ *  - ownership "own" (honk or bare): choose option with kind === "allow_once"
+ *    (fall back to optionId === "allow_once"); if none, refuse.
+ *    NEVER choose allow_always (guarded and converted to refuse).
+ *  - bare goose: treat as own regardless of tracked ownership.
+ *  - honk, ownership foreign: defer (do not answer).
+ *  - honk, ownership pending or unknown: defer and hold.
+ */
+export function ownRunPolicy(
+  params: PermissionParams,
+  ctx: { ownership: RunOwnership; isHonk: boolean },
+): PermissionDecision {
+  const isOwn = !ctx.isHonk || ctx.ownership === "own";
+  if (!isOwn) {
+    return { defer: true };
+  }
+
+  const options = Array.isArray(params.options) ? params.options : [];
+  const allowOnce =
+    options.find((o) => o.kind === "allow_once") ??
+    options.find((o) => o.optionId === "allow_once");
+
+  if (allowOnce) {
+    if (allowOnce.kind === "allow_always" || allowOnce.optionId === "allow_always") {
+      return { answer: refuse(options) };
+    }
+    return { answer: allowOnce.optionId };
+  }
+
+  return { answer: refuse(options) };
+}
 
 export interface PermissionParams {
   sessionId?: string;
@@ -311,6 +365,13 @@ export interface GooseAcpClientOptions {
    * and at replay_done.
    */
   onRunStateChange?: (sessionId: string, state: RunStateInfo) => void;
+  /**
+   * Called when a permission request is deferred (foreign run) or held (pending/unknown run).
+   */
+  onPermissionDeferred?: (
+    sessionId: string,
+    detail: { held: boolean; ownership: RunOwnership },
+  ) => void;
 }
 
 interface Pending {
@@ -349,6 +410,12 @@ interface SessionTrack {
   replaying: boolean;
 }
 
+interface HeldPermissionRequest {
+  id: unknown;
+  msg: JsonRpcResponse;
+  params: PermissionParams;
+}
+
 export class GooseAcpClient {
   private readonly opts: GooseAcpClientOptions;
   private transport: AcpTransport | undefined;
@@ -370,6 +437,7 @@ export class GooseAcpClient {
   private ourCrids = new Map<string, Set<string>>();
   private lastNotified = new Map<string, RunStateInfo>();
   private nextSentinelId = 0;
+  private heldRequests = new Map<string, HeldPermissionRequest[]>();
 
   constructor(opts: GooseAcpClientOptions) {
     this.opts = opts;
@@ -419,6 +487,9 @@ export class GooseAcpClient {
     track.ownership = update.ownership;
     if (changed && !track.replaying) {
       this.notifyRunStateChange(sessionId, track);
+      if (track.ownership === "own") {
+        this.drainHeldRequests(sessionId);
+      }
     }
   }
 
@@ -432,6 +503,7 @@ export class GooseAcpClient {
     track.ownership = "unknown";
     track.lastEchoCrid = undefined;
     track.replaying = false;
+    this.dropHeldRequests(sessionId, "reset_track");
     if (changed) {
       this.notifyRunStateChange(sessionId, track);
     }
@@ -473,9 +545,128 @@ export class GooseAcpClient {
         track.replaying = false;
       }
     }
+    this.dropAllHeldRequests("reset_tracks");
     this.tracks.clear();
     this.ourCrids.clear();
     this.lastNotified.clear();
+  }
+
+  private drainHeldRequests(sessionId: string): void {
+    const list = this.heldRequests.get(sessionId);
+    if (!list || list.length === 0) return;
+    this.heldRequests.delete(sessionId);
+
+    const track = this.tracks.get(sessionId);
+    const ownership = track?.ownership ?? "own";
+    const ctx = { ownership, isHonk: this.isHonk };
+
+    for (const req of list) {
+      const options = Array.isArray(req.params.options) ? req.params.options : [];
+      let decision: PermissionDecision;
+      try {
+        const res = this.opts.permissionPolicy
+          ? this.opts.permissionPolicy(req.params, ctx)
+          : { answer: refuse(options) };
+        if (typeof res === "string" || res === undefined) {
+          decision = { answer: res ?? refuse(options) };
+        } else if ("defer" in res && res.defer) {
+          decision = { defer: true };
+        } else {
+          decision = { answer: res.answer };
+        }
+      } catch (err) {
+        // Honk own run: falls back to refusal
+        decision = { answer: refuse(options) };
+        this.log("goose acp: permission policy threw while draining held request, falling back to refusal", {
+          id: req.id,
+          method: req.msg.method,
+          sessionId,
+          ownership,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      if (decision.defer) {
+        this.log("goose acp: deferred server request", {
+          method: req.msg.method,
+          id: req.id,
+          sessionId,
+          ownership,
+          held: false,
+        });
+        continue;
+      }
+
+      let optionId = decision.answer ?? refuse(options);
+
+      const chosenOption = options.find((o) => o.optionId === optionId);
+      if (
+        optionId === "allow_always" ||
+        chosenOption?.kind === "allow_always" ||
+        chosenOption?.optionId === "allow_always"
+      ) {
+        this.log("goose acp: allow_always requested by policy converted to refusal", {
+          id: req.id,
+          method: req.msg.method,
+          sessionId,
+          ownership,
+          optionId,
+        });
+        optionId = refuse(options);
+      }
+
+      this.log("goose acp: answered server request", {
+        method: req.msg.method,
+        id: req.id,
+        optionId,
+        ownership,
+        sessionId,
+      });
+
+      try {
+        this.transport?.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: optionId ? { outcome: { outcome: "selected", optionId } } : {},
+          }),
+        );
+      } catch (err) {
+        this.log("goose acp: failed to send held permission answer, retrying bare", {
+          id: req.id,
+          method: req.msg.method,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        try {
+          this.transport?.send(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: {} }));
+        } catch {
+          this.log("goose acp: could not answer held permission request at all", { id: req.id });
+        }
+      }
+    }
+  }
+
+  private dropHeldRequests(sessionId: string, reason: string): void {
+    const list = this.heldRequests.get(sessionId);
+    if (!list || list.length === 0) return;
+    this.heldRequests.delete(sessionId);
+    const track = this.tracks.get(sessionId);
+    const ownership = track?.ownership ?? "unknown";
+    for (const req of list) {
+      this.log("goose acp: dropped held server request", {
+        method: req.msg.method,
+        id: req.id,
+        sessionId,
+        ownership,
+        reason,
+      });
+    }
+  }
+
+  private dropAllHeldRequests(reason: string): void {
+    for (const sessionId of [...this.heldRequests.keys()]) {
+      this.dropHeldRequests(sessionId, reason);
+    }
   }
 
   private addOurCrid(sessionId: string, crid: string): void {
@@ -804,6 +995,7 @@ export class GooseAcpClient {
       if (NO_ACTIVE_RUN.test(res.error.data ?? "")) {
         const track = this.getOrCreateTrack(sessionId);
         track.lastEchoCrid = undefined;
+        this.dropHeldRequests(sessionId, "no_active_run");
         this.updateRunState(sessionId, track, {
           state: "idle",
           runId: undefined,
@@ -948,6 +1140,9 @@ export class GooseAcpClient {
     const track = this.getOrCreateTrack(sessionId);
     track.replaying = false;
     this.notifyRunStateChange(sessionId, track);
+    if (track.ownership === "own") {
+      this.drainHeldRequests(sessionId);
+    }
   }
 
   private onHonkSteerUnconsumed(params: Record<string, unknown>): void {
@@ -1020,6 +1215,7 @@ export class GooseAcpClient {
         }
       } else if (activeRunId === null) {
         track.lastEchoCrid = undefined;
+        this.dropHeldRequests(sessionId, "run_ended");
         this.updateRunState(sessionId, track, {
           state: "idle",
           runId: undefined,
@@ -1062,29 +1258,103 @@ export class GooseAcpClient {
   private answerServerRequest(msg: JsonRpcResponse): void {
     const params = (msg.params ?? {}) as unknown as PermissionParams;
     const options = Array.isArray(params.options) ? params.options : [];
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+    const ownership: RunOwnership = sessionId ? this.runOwnership(sessionId) : "unknown";
+    const ctx = { ownership, isHonk: this.isHonk };
 
-    let optionId: string | undefined;
+    let decision: PermissionDecision;
     try {
-      const chosen = this.opts.permissionPolicy
-        ? this.opts.permissionPolicy(params)
-        : refuse(options);
-      optionId = chosen ?? refuse(options);
-    } catch (err) {
-      // Deliberately falls back to the DEFAULT REFUSAL rather than to nothing:
-      // a policy that cannot decide must not become a policy that allows.
-      try {
-        optionId = refuse(options);
-      } catch {
-        optionId = undefined;
+      const res = this.opts.permissionPolicy
+        ? this.opts.permissionPolicy(params, ctx)
+        : { answer: refuse(options) };
+      if (typeof res === "string" || res === undefined) {
+        decision = { answer: res ?? refuse(options) };
+      } else if ("defer" in res && res.defer) {
+        decision = { defer: true };
+      } else {
+        decision = { answer: res.answer };
       }
-      this.log("goose acp: permission policy threw, falling back to refusal", {
+    } catch (err) {
+      if (this.isHonk && ownership !== "own") {
+        decision = { defer: true };
+      } else {
+        decision = { answer: refuse(options) };
+      }
+      this.log("goose acp: permission policy threw, falling back", {
         method: msg.method,
-        optionId,
+        ownership,
+        sessionId,
+        fallback: decision.defer ? "defer" : "refuse",
         error: err instanceof Error ? err.message : String(err),
       });
     }
 
-    this.log("goose acp: answered server request", { method: msg.method, optionId });
+    if (decision.defer) {
+      const held = this.isHonk && (ownership === "pending" || ownership === "unknown");
+      if (held && sessionId) {
+        let list = this.heldRequests.get(sessionId);
+        if (!list) {
+          list = [];
+          this.heldRequests.set(sessionId, list);
+        }
+        if (!list.some((r) => r.id === msg.id)) {
+          list.push({ id: msg.id, msg, params });
+        }
+        this.log("goose acp: held server request", {
+          method: msg.method,
+          id: msg.id,
+          ownership,
+          sessionId,
+        });
+      } else {
+        this.log("goose acp: deferred server request", {
+          method: msg.method,
+          id: msg.id,
+          ownership,
+          sessionId,
+          held: false,
+        });
+      }
+
+      if (sessionId) {
+        try {
+          this.opts.onPermissionDeferred?.(sessionId, { held, ownership });
+        } catch (err) {
+          this.log("goose acp: onPermissionDeferred subscriber threw", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return;
+    }
+
+    let optionId = decision.answer ?? refuse(options);
+
+    // Guard against allow_always
+    const chosenOption = options.find((o) => o.optionId === optionId);
+    if (
+      optionId === "allow_always" ||
+      chosenOption?.kind === "allow_always" ||
+      chosenOption?.optionId === "allow_always"
+    ) {
+      this.log("goose acp: allow_always requested by policy converted to refusal", {
+        method: msg.method,
+        id: msg.id,
+        optionId,
+        ownership,
+        sessionId,
+      });
+      optionId = refuse(options);
+    }
+
+    this.log("goose acp: answered server request", {
+      method: msg.method,
+      id: msg.id,
+      optionId,
+      ownership,
+      sessionId,
+    });
     try {
       this.transport?.send(
         JSON.stringify({
@@ -1144,10 +1414,14 @@ export class GooseAcpClient {
 }
 
 /** Prefer an explicit reject option; fall back to the last (conventionally the
- * most restrictive) rather than the first, which is conventionally "allow". */
-function refuse(options: PermissionParams["options"]): string | undefined {
-  const rejectish = options.find((o) => /reject|deny|no/i.test(o.optionId ?? o.name ?? ""));
-  return rejectish?.optionId ?? options[options.length - 1]?.optionId;
+ * most restrictive) rather than the first, which is conventionally "allow".
+ * Never selects allow_always. */
+export function refuse(options: PermissionParams["options"]): string | undefined {
+  const safeOptions = options.filter(
+    (o) => o.kind !== "allow_always" && o.optionId !== "allow_always",
+  );
+  const rejectish = safeOptions.find((o) => /reject|deny|no/i.test(o.optionId ?? o.name ?? ""));
+  return rejectish?.optionId ?? safeOptions[safeOptions.length - 1]?.optionId;
 }
 
 /**

@@ -5,6 +5,9 @@ import {
   DEFAULT_SESSION_EXTENSIONS,
   DEFAULT_SERVE_FLOOR,
   DisconnectedDuringTurn,
+  ownRunPolicy,
+  refuse,
+  MEASURED_GOOSE_PERMISSION_OPTIONS,
   type AcpTransport,
   type AcpTransportFactory,
   type GooseAcpClientOptions,
@@ -423,6 +426,442 @@ describe("GooseAcpClient", () => {
       expect(peer.sent.find((m) => m.id === "perm-b")!.result).toEqual({
         outcome: { outcome: "selected", optionId: "allow_once" },
       });
+    });
+  });
+
+  describe("bead eng-agent-platform-1o9: permission options and allow_always guard", () => {
+    it("refuse() picks reject_once from the measured option set", () => {
+      expect(refuse(MEASURED_GOOSE_PERMISSION_OPTIONS)).toBe("reject_once");
+    });
+
+    it("ownRunPolicy in an own run picks allow_once from the measured option set", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "own", isHonk: true },
+      );
+      expect(decision).toEqual({ answer: "allow_once" });
+    });
+
+    it("bare goose treats as own regardless of ownership and picks allow_once", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "foreign", isHonk: false },
+      );
+      expect(decision).toEqual({ answer: "allow_once" });
+    });
+
+    it("ownRunPolicy defers on honk for foreign runs", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "foreign", isHonk: true },
+      );
+      expect(decision).toEqual({ defer: true });
+    });
+
+    it("ownRunPolicy defers on honk for pending or unknown runs", () => {
+      expect(
+        ownRunPolicy(
+          { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+          { ownership: "pending", isHonk: true },
+        ),
+      ).toEqual({ defer: true });
+      expect(
+        ownRunPolicy(
+          { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+          { ownership: "unknown", isHonk: true },
+        ),
+      ).toEqual({ defer: true });
+    });
+
+    it("nothing ever picks allow_always (a policy that tries is converted to refusal and logged)", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const logs: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: () => ({ answer: "allow_always" }),
+        log: (msg, fields) => logs.push({ msg, fields }),
+      });
+      await client.connect();
+      void client.prompt("sess-1", "x").catch(() => {});
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-always",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-always");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
+      expect(logs.some((l) => l.msg.includes("allow_always"))).toBe(true);
+    });
+  });
+
+  describe("bead eng-agent-platform-555.18: answer goose permission requests only in pigeon's own runs", () => {
+    it("own honk run -> allow_once answered", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      const promptPromise = client.prompt("sess-1", "hello", { clientReqId: "crid-own" });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-own",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-own" } } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_own_1" } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-own",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-own");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await promptPromise;
+    });
+
+    it("foreign honk run -> no answer frame sent at all", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_foreign_1" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-foreign",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-foreign");
+      expect(answer).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: false, ownership: "foreign" } },
+      ]);
+    });
+
+    it("pending -> held, then echo makes it own -> answered once with allow_once", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      const promptPromise = client.prompt("sess-1", "hello", { clientReqId: "crid-pending" });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pending_1" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-pending",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-pending")).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: true, ownership: "pending" } },
+      ]);
+
+      // Synth echo arrives for our clientReqId -> makes ownership own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-pending",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-pending" } } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      const answer = peer.sent.find((m) => m.id === "perm-pending");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+      const answersCount = peer.sent.filter((m) => m.id === "perm-pending").length;
+      expect(answersCount).toBe(1);
+
+      // Finish turn
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await promptPromise;
+
+      // Ensure never answered twice
+      expect(peer.sent.filter((m) => m.id === "perm-pending").length).toBe(1);
+    });
+
+    it("unknown -> held, run ends (null) -> dropped, never answered", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-unk",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-unk")).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: true, ownership: "unknown" } },
+      ]);
+
+      // Run ends (activeRunId: null) -> dropped
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: null } },
+          },
+        },
+      });
+
+      // Later run becomes own -> perm-unk was dropped and must not be answered
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_new_1" } },
+          },
+        },
+      });
+
+      expect(peer.sent.find((m) => m.id === "perm-unk")).toBeUndefined();
+    });
+
+    it("socket close drops held", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-close",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-close")).toBeUndefined();
+
+      // Socket drops
+      peer.drop();
+      await client.connect();
+
+      // Run becomes own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_after_close" } },
+          },
+        },
+      });
+
+      expect(peer.sent.find((m) => m.id === "perm-close")).toBeUndefined();
+    });
+
+    it("bare goose -> allow_once regardless of ownership", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer); // bare goose: initialize without _meta.honk
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      // Session ownership is unknown
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-bare",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-bare");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+    });
+
+    it("throwing policy on honk non-own -> no answer, on bare -> refusal", async () => {
+      const honkPeer = new FakePeer();
+      honkPeer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const honkClient = makeClient(honkPeer, {
+        permissionPolicy: () => {
+          throw new Error("policy explosion");
+        },
+      });
+      await honkClient.connect();
+
+      // Non-own run on honk
+      honkPeer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_honk_foreign" } },
+          },
+        },
+      });
+      expect(honkClient.runOwnership("sess-1")).toBe("foreign");
+
+      honkPeer.emit({
+        jsonrpc: "2.0",
+        id: "perm-honk-throw",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Honk non-own: no answer frame sent
+      expect(honkPeer.sent.find((m) => m.id === "perm-honk-throw")).toBeUndefined();
+
+      // Bare goose peer
+      const barePeer = new FakePeer();
+      autoHandshake(barePeer);
+      const bareClient = makeClient(barePeer, {
+        permissionPolicy: () => {
+          throw new Error("bare policy explosion");
+        },
+      });
+      await bareClient.connect();
+
+      barePeer.emit({
+        jsonrpc: "2.0",
+        id: "perm-bare-throw",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Bare goose: falls back to refusal
+      const bareAnswer = barePeer.sent.find((m) => m.id === "perm-bare-throw");
+      expect(bareAnswer).toBeDefined();
+      expect(bareAnswer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
     });
   });
 

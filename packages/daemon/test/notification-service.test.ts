@@ -187,6 +187,19 @@ describe("formatTelegramNotification", () => {
     expect(queuedResult.header.text).toContain("⏳");
   });
 
+  it("produces 🔐 emoji header for Permission event", () => {
+    const permissionResult = formatTelegramNotification({
+      event: "Permission",
+      label: "my-label",
+      summary: "Permission",
+      cwd: "/home/dev/projects/pigeon",
+      token: "tok123",
+      sessionId: "sess-123",
+    });
+
+    expect(permissionResult.header.text).toContain("🔐");
+  });
+
   it("includes machine ID in footer when provided", () => {
     const result = formatTelegramNotification({
       event: "Stop",

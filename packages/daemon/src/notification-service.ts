@@ -142,6 +142,7 @@ const EVENT_EMOJIS: Record<string, string> = {
   Question: "❓",
   Notification: "🔔",
   Queued: "⏳",
+  Permission: "🔐",
 };
 
 function eventEmoji(event: string): string {
