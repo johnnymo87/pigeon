@@ -45,6 +45,8 @@
  *    resends with the same client_req_id, which honkd attaches to the in-flight turn.
  */
 
+import { randomUUID } from "node:crypto";
+
 export interface AcpTransport {
   send(data: string): void;
   onMessage(cb: (data: string) => void): void;
@@ -88,6 +90,26 @@ export type PromptOutcome = GooseReceipt | GooseBusy | GooseUnknownRequest;
 export type SteerOutcome = GooseSteered | GooseNoActiveRun;
 
 export type RunState = "unknown" | "idle" | "running";
+
+/**
+ * WHY RUN OWNERSHIP EXISTS, AND WHAT EACH STATE AUTHORIZES
+ * --------------------------------------------------------
+ * honkd is a durable multi-client relay: several viewers can attach to the same
+ * session, and honkd maintains a queue of parked prompts. Pigeon must track
+ * whether the currently active run is OUR OWN so it knows whether it is
+ * authorized to steer or report the turn:
+ *
+ *  - "own": honkd sent a synthesized echo carrying one of our outstanding
+ *    client_req_ids, or bare goose started a run during our prompt.
+ *  - "pending": our prompt is outstanding but its echo has not been seen yet;
+ *    the run may be ours (delayed delivery path) or our prompt may be parked
+ *    behind another client's prompt. Authorizes nothing.
+ *  - "foreign": the run was started by another client (or our prompt settled
+ *    without matching the run, or a busy rejection named the run).
+ *  - "unknown": no live evidence for the session (e.g. untracked session, or
+ *    after reconnect/restart, since honk-aware viewers get no synthesized run
+ *    state on attach). Also authorizes nothing.
+ */
 export type RunOwnership = "own" | "pending" | "foreign" | "unknown";
 
 export interface RunStateInfo {
@@ -313,7 +335,17 @@ interface SessionTrack {
   state: RunState;
   runId?: string;
   ownership: RunOwnership;
+  /**
+   * Echo usually precedes the run-start frame (`session_info_update`), but
+   * delayed delivery paths can send it after the run start. Buffered here so
+   * whichever arrives first can be matched against the other.
+   */
   lastEchoCrid?: string;
+  /**
+   * honkd pushes unsolicited history replays to honk-aware viewers between
+   * `_honk/reset` and `_honk/replay_done`. Forwarding them to onSessionUpdate
+   * would put old history into the current turn's reply text.
+   */
   replaying: boolean;
 }
 
@@ -336,6 +368,7 @@ export class GooseAcpClient {
   private pending = new Map<string, Pending>();
   private tracks = new Map<string, SessionTrack>();
   private ourCrids = new Map<string, Set<string>>();
+  private lastNotified = new Map<string, RunStateInfo>();
   private nextSentinelId = 0;
 
   constructor(opts: GooseAcpClientOptions) {
@@ -356,12 +389,14 @@ export class GooseAcpClient {
   }
 
   private notifyRunStateChange(sessionId: string, track: SessionTrack): void {
+    const info: RunStateInfo = {
+      state: track.state,
+      runId: track.runId,
+      ownership: track.ownership,
+    };
+    this.lastNotified.set(sessionId, info);
     try {
-      this.opts.onRunStateChange?.(sessionId, {
-        state: track.state,
-        runId: track.runId,
-        ownership: track.ownership,
-      });
+      this.opts.onRunStateChange?.(sessionId, info);
     } catch (err) {
       this.log("goose acp: onRunStateChange subscriber threw", {
         sessionId,
@@ -403,10 +438,44 @@ export class GooseAcpClient {
   }
 
   private resetAllTracks(): void {
-    for (const [sessionId, track] of this.tracks.entries()) {
-      this.resetTrackToUnknown(sessionId, track);
+    const sessionIds = new Set<string>([
+      ...this.tracks.keys(),
+      ...this.lastNotified.keys(),
+    ]);
+    for (const sessionId of sessionIds) {
+      const notified = this.lastNotified.get(sessionId);
+      const wasKnown =
+        notified &&
+        (notified.state !== "unknown" ||
+          notified.runId !== undefined ||
+          notified.ownership !== "unknown");
+      const track = this.tracks.get(sessionId);
+      const trackWasKnown =
+        track &&
+        (track.state !== "unknown" ||
+          track.runId !== undefined ||
+          track.ownership !== "unknown");
+      if (wasKnown || trackWasKnown) {
+        try {
+          this.opts.onRunStateChange?.(sessionId, {
+            state: "unknown",
+            runId: undefined,
+            ownership: "unknown",
+          });
+        } catch (err) {
+          this.log("goose acp: onRunStateChange subscriber threw", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (track) {
+        track.replaying = false;
+      }
     }
+    this.tracks.clear();
     this.ourCrids.clear();
+    this.lastNotified.clear();
   }
 
   private addOurCrid(sessionId: string, crid: string): void {
@@ -424,6 +493,17 @@ export class GooseAcpClient {
       set.delete(crid);
       if (set.size === 0) {
         this.ourCrids.delete(sessionId);
+      }
+    }
+    const remaining = this.ourCrids.get(sessionId)?.size ?? 0;
+    if (remaining === 0) {
+      const track = this.tracks.get(sessionId);
+      if (track && track.state === "running" && track.ownership === "pending") {
+        this.updateRunState(sessionId, track, {
+          state: track.state,
+          runId: track.runId,
+          ownership: "foreign",
+        });
       }
     }
   }
@@ -638,15 +718,18 @@ export class GooseAcpClient {
       sessionId,
       prompt: [{ type: "text", text }],
     };
-    if (this.honk && (options?.clientReqId !== undefined || options?.resumeOnly)) {
+    let crid: string;
+    if (this.honk) {
+      crid = options?.clientReqId ?? `pigeon-${randomUUID()}`;
       params._meta = {
         honk: {
-          ...(options?.clientReqId !== undefined ? { client_req_id: options.clientReqId } : {}),
+          client_req_id: crid,
           ...(options?.resumeOnly ? { resume_only: true } : {}),
         },
       };
+    } else {
+      crid = options?.clientReqId ?? `__sentinel_${++this.nextSentinelId}`;
     }
-    const crid = options?.clientReqId ?? `__sentinel_${++this.nextSentinelId}`;
     this.addOurCrid(sessionId, crid);
     let res: JsonRpcResponse;
     try {
@@ -686,6 +769,9 @@ export class GooseAcpClient {
     if (typeof stopReason !== "string") {
       throw new GooseProtocolError(-1, "session/prompt returned no stopReason");
     }
+    // For a honk peer, receipt must NOT reset run state: honkd may already have
+    // started the next parked prompt and sent its echo + run id before our reply
+    // arrives. Bare goose has no parked queue, so receipt means the turn is over.
     if (!this.honk) {
       const track = this.getOrCreateTrack(sessionId);
       track.lastEchoCrid = undefined;
@@ -1033,7 +1119,14 @@ export class GooseAcpClient {
       if (p.isTurn && p.sessionId) {
         const runId = this.activeRunId(p.sessionId) ?? this.tracks.get(p.sessionId)?.runId;
         const err = new DisconnectedDuringTurn(p.sessionId, runId, code);
-        this.opts.onTurnLost?.(err);
+        try {
+          this.opts.onTurnLost?.(err);
+        } catch (subErr) {
+          this.log("goose acp: onTurnLost subscriber threw", {
+            sessionId: p.sessionId,
+            error: subErr instanceof Error ? subErr.message : String(subErr),
+          });
+        }
         p.reject(err);
       } else {
         p.reject(new GooseProtocolError(-1, `connection closed (code ${code}) before reply`));
