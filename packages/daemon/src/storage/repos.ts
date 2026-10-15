@@ -61,6 +61,7 @@ function asSession(row: SqlRow): SessionRecord {
     backendSessionId: (row.backend_session_id as string | null) ?? null,
     backendAuthToken: (row.backend_auth_token as string | null) ?? null,
     pullSources: parsePullSources(row.pull_sources),
+    boundTopicKey: (row.bound_topic_key as string | null | undefined) ?? null,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     lastSeen: Number(row.last_seen),
@@ -209,9 +210,13 @@ export class SessionRepository {
     return rows.map(asSession);
   }
 
+  /**
+   * Sessions the reaper should remove. A session bound to a named topic is
+   * excluded: see `bound_topic_key` and setBoundTopicKey.
+   */
   listStale(cutoff: number): SessionRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM sessions WHERE last_seen < ?")
+      .prepare("SELECT * FROM sessions WHERE last_seen < ? AND bound_topic_key IS NULL")
       .all(cutoff) as SqlRow[];
     return rows.map(asSession);
   }
@@ -331,8 +336,64 @@ export class SessionRepository {
     return result.changes > 0;
   }
 
+  /**
+   * Record (or clear, with null) the named-topic key this session is bound to.
+   *
+   * Binding a key that another row holds MOVES it, in one transaction: the
+   * worker's bind is an upsert on the key, so the previous holder is no longer
+   * bound there, and leaving its pin behind would keep a dead row out of the
+   * reaper forever. A rotation (new goose session, same topic) is exactly that.
+   */
+  setBoundTopicKey(sessionId: string, key: string | null, now = Date.now()): boolean {
+    const tx = this.db.transaction(() => {
+      if (key !== null) {
+        this.db
+          .prepare("UPDATE sessions SET bound_topic_key = NULL, updated_at = ? WHERE bound_topic_key = ? AND session_id != ?")
+          .run(now, key, sessionId);
+      }
+      return this.db
+        .prepare("UPDATE sessions SET bound_topic_key = ?, updated_at = ? WHERE session_id = ?")
+        .run(key, now, sessionId).changes > 0;
+    });
+    return tx();
+  }
+
+  /**
+   * Pin `key` on a session WITHOUT taking it from any other holder.
+   *
+   * Used before the worker bind call, so a bind whose outcome is unknown (a
+   * timeout, or a transport error after the worker wrote the binding) cannot
+   * leave a live, bound session unpinned. Both rows stay pinned until a bind
+   * succeeds and setBoundTopicKey moves the key. An extra pinned row costs a row;
+   * an unpinned bound coordinator is reaped and its topic silently unbound.
+   */
+  pinTopicKey(sessionId: string, key: string, now = Date.now()): boolean {
+    return this.db
+      .prepare("UPDATE sessions SET bound_topic_key = ?, updated_at = ? WHERE session_id = ?")
+      .run(key, now, sessionId).changes > 0;
+  }
+
+  /** Every pinned session; the reaper keeps their worker rows alive. */
+  listPinned(): SessionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM sessions WHERE bound_topic_key IS NOT NULL")
+      .all() as SqlRow[];
+    return rows.map(asSession);
+  }
+
+  /** The session this daemon most recently pinned `key` on, or null. */
+  getByBoundTopicKey(key: string): SessionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM sessions WHERE bound_topic_key = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(key) as SqlRow | null;
+    return row ? asSession(row) : null;
+  }
+
+  /** Deletes expired rows, except bound ones (see setBoundTopicKey). */
   cleanupExpired(now = Date.now()): number {
-    const result = this.db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now);
+    const result = this.db
+      .prepare("DELETE FROM sessions WHERE expires_at < ? AND bound_topic_key IS NULL")
+      .run(now);
     return result.changes;
   }
 }

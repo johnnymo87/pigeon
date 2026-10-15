@@ -365,6 +365,8 @@ interface AppOptions {
  */
 export const BIND_TIMEOUT_MS = 8_000;
 
+type BindOutcome = { bound: true } | { bound: false; error: string };
+
 /**
  * Floor on the send bound for a links-bearing `/alert`, so a lookup that ate
  * most of the budget still leaves Telegram a real chance to answer.
@@ -377,6 +379,62 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
   const onSessionStart = options.onSessionStart;
   const onSessionDelete = options.onSessionDelete;
   const opts = options;
+
+  /**
+   * The bind half shared by `/session-start` (pull sessions) and
+   * `/goose/sessions` (goose-acp sessions), after each route's own eligibility
+   * checks.
+   *
+   * With `pin` (goose-acp only), the key is mirrored onto the local row, which
+   * exempts it from the 7-day reaper and has the reaper keep its worker row
+   * alive. The pin is written BEFORE the worker call and kept on any failure,
+   * because a failed call is not proof of no binding: the worker writes the
+   * binding as its last step, so a timeout or a reset after that point leaves
+   * a bound session that an unpinned row would lose at 7 days. Only success
+   * moves the key off a previous holder (a rotation). A pin left by a bind that
+   * never succeeds lasts until the caller retries or deletes the row.
+   *
+   * Pull sessions are not pinned: they re-register on every episode, so they
+   * never go stale while their client lives, and pinning them would only make
+   * an abandoned mailbox immortal.
+   */
+  async function bindTopicToSession(
+    sessionId: string,
+    topic: { key: string; name: string },
+    workerRegOk: boolean,
+    pin: boolean,
+  ): Promise<BindOutcome> {
+    if (!workerRegOk) return { bound: false, error: "worker registration failed" };
+    if (!opts.bindNamedTopic) return { bound: false, error: "no worker connection" };
+    if (pin) storage.sessions.pinTopicKey(sessionId, topic.key, nowFn());
+
+    const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(new Error(`timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      const inFlight = opts.bindNamedTopic(
+        { sessionId, key: topic.key, name: topic.name },
+        controller.signal,
+      );
+      await Promise.race([inFlight, deadline]);
+    } catch (err) {
+      if (timedOut) return { bound: false, error: "bind timed out" };
+      const msg = err instanceof Error ? err.message : String(err);
+      return { bound: false, error: `bind failed: ${msg}` };
+    } finally {
+      clearTimeout(timer);
+    }
+    if (pin) storage.sessions.setBoundTopicKey(sessionId, topic.key, nowFn());
+    return { bound: true };
+  }
 
   return async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -942,6 +1000,29 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const existing = storage.sessions.get(sessionId);
 
+        // Refuse to change a session's backend kind, and keep this route away
+        // from goose-acp rows altogether. The upsert below rewrites the row
+        // wholesale, so a stray /session-start against a goose-acp session
+        // would re-point its endpoint and token, and one naming another kind
+        // would hand a live session to a different adapter. goose-acp rows are
+        // created and refreshed only by /goose/sessions, which mints the id and
+        // records goose's own.
+        const suppliedKind = typeof body.backend_kind === "string" ? body.backend_kind : undefined;
+        if (existing?.backendKind === GOOSE_BACKEND_KIND || suppliedKind === GOOSE_BACKEND_KIND) {
+          return Response.json(
+            { error: `${GOOSE_BACKEND_KIND} sessions are registered through POST /goose/sessions, not /session-start` },
+            { status: 409 },
+          );
+        }
+        if (existing?.backendKind && suppliedKind !== undefined && suppliedKind !== existing.backendKind) {
+          return Response.json(
+            {
+              error: `session ${sessionId} already exists with backend_kind=${existing.backendKind}; refusing to convert it to ${suppliedKind}`,
+            },
+            { status: 409 },
+          );
+        }
+
         const nvim_socket = body.nvim_socket as string | undefined;
 
         const suppliedEndpoint =
@@ -1055,49 +1136,27 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         if (body.named_topic !== undefined) {
           const parsedTopic = parseAlertTopic(body.named_topic);
-          let bound = false;
-          let bindError: string | undefined;
-
           const session = storage.sessions.get(sessionId);
 
+          let result: BindOutcome;
           if (!parsedTopic) {
-            bindError = "invalid named_topic";
+            result = { bound: false, error: "invalid named_topic" };
           } else if (!effectiveNotify) {
-            bindError = "notify is required";
+            result = { bound: false, error: "notify is required" };
           } else if (!isPullBackend(session)) {
-            bindError = "not a pull session";
-          } else if (!workerRegOk) {
-            bindError = "worker registration failed";
-          } else if (!opts.bindNamedTopic) {
-            bindError = "no worker connection";
+            result = { bound: false, error: "not a pull session" };
           } else {
-            const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
-            const controller = new AbortController();
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            let timedOut = false;
-            const deadline = new Promise<never>((_, reject) => {
-              timer = setTimeout(() => {
-                timedOut = true;
-                controller.abort();
-                reject(new Error(`timed out after ${timeoutMs}ms`));
-              }, timeoutMs);
-            });
-            try {
-              const inFlight = opts.bindNamedTopic(
-                { sessionId, key: parsedTopic.key, name: parsedTopic.name },
-                controller.signal,
-              );
-              await Promise.race([inFlight, deadline]);
-              bound = true;
-            } catch (err) {
-              if (timedOut) {
-                bindError = "bind timed out";
-              } else {
-                const msg = err instanceof Error ? err.message : String(err);
-                bindError = `bind failed: ${msg}`;
-              }
-            } finally {
-              clearTimeout(timer);
+            // A pull client must not take back a topic that has moved to a
+            // goose-acp session. stall-watch's goose-pull upkeep re-binds its
+            // mailbox on every tick, so without this a program that has moved to
+            // a coordinator session would be silently re-pointed at the old
+            // mailbox within minutes. Moving a topic back is an explicit
+            // /session-unbind of the goose-acp session first.
+            const holder = storage.sessions.getByBoundTopicKey(parsedTopic.key);
+            if (holder && holder.sessionId !== sessionId && holder.backendKind === GOOSE_BACKEND_KIND) {
+              result = { bound: false, error: `topic is bound to goose-acp session ${holder.sessionId}` };
+            } else {
+              result = await bindTopicToSession(sessionId, parsedTopic, workerRegOk, false);
             }
           }
 
@@ -1105,8 +1164,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             ok: true,
             session_id: sessionId,
             machine_id,
-            named_topic_bound: bound,
-            ...(bound ? {} : { named_topic_error: bindError }),
+            named_topic_bound: result.bound,
+            ...(result.bound ? {} : { named_topic_error: result.error }),
           });
         }
 
@@ -1136,6 +1195,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         try {
           const inFlight = opts.unbindNamedTopic(sessionId, controller.signal);
           const result = await Promise.race([inFlight, deadline]);
+          // The worker no longer holds a binding for this session, whatever
+          // `unbound` says, so the pin goes too. A failure or timeout keeps it:
+          // the binding may still exist.
+          storage.sessions.setBoundTopicKey(sessionId, null, nowFn());
           return Response.json({ ok: true, unbound: result.unbound });
         } catch (err) {
           if (timedOut) {
@@ -1278,6 +1341,41 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!registered.ok) {
           return Response.json({ error: registered.conflict }, { status: 409 });
         }
+
+        if (body.named_topic !== undefined) {
+          // Bind a named topic to this goose-acp session (a stall-watch
+          // coordinator bound to its program topic). Same contract as
+          // /session-start's `named_topic`: HTTP 200 because the session did
+          // register, and anything but `named_topic_bound: true` means "not
+          // bound". Unlike /session-start this may take a key from a pull
+          // session -- that is the migration step -- and registering again is
+          // the idempotent retry, including after an indeterminate timeout.
+          const parsedTopic = parseAlertTopic(body.named_topic);
+          let workerRegOk = true;
+          if (onSessionStart) {
+            try {
+              const regResult = await onSessionStart(registered.sessionId, true, label);
+              if (regResult && typeof regResult === "object" && "ok" in regResult && regResult.ok === false) {
+                workerRegOk = false;
+              }
+            } catch {
+              workerRegOk = false;
+            }
+          }
+          const result: BindOutcome = parsedTopic
+            ? await bindTopicToSession(registered.sessionId, parsedTopic, workerRegOk, true)
+            : { bound: false, error: "invalid named_topic" };
+          return Response.json({
+            ok: true,
+            session_id: registered.sessionId,
+            backend_session_id: sessionId,
+            backend: GOOSE_BACKEND_KIND,
+            machine_id: opts.machineId ?? null,
+            named_topic_bound: result.bound,
+            ...(result.bound ? {} : { named_topic_error: result.error }),
+          });
+        }
+
         if (onSessionStart) {
           await onSessionStart(registered.sessionId, true, label);
         }
