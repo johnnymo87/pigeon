@@ -76,12 +76,12 @@ export const additiveColumns = [
   // e.g. ["telegram-reply", "swarm"]). NULL means default (["telegram-reply"]).
   // Only /session-start updates this column; other writers preserve it.
   "ALTER TABLE sessions ADD COLUMN pull_sources TEXT DEFAULT NULL",
-  // The named-topic key this session is bound to, mirrored from the worker's
-  // `named_topic_bindings` on a successful bind and cleared on unbind. Non-NULL
-  // pins the row against the 7-day reaper: a bound session (a stall-watch
-  // coordinator) can go a week without pigeon seeing it, and reaping it would
-  // unregister it and silently unbind its topic. Written only by
-  // setBoundTopicKey; `sessions.upsert` leaves it alone.
+  // The named-topic key a goose-acp session is bound to (a stall-watch
+  // coordinator), written before the worker bind and cleared on unbind.
+  // Non-NULL pins the row against the 7-day reaper, which instead re-registers
+  // it with the worker each cycle: a coordinator can go weeks without pigeon
+  // seeing it, and reaping it would silently unbind its topic. Written only by
+  // pinTopicKey/setBoundTopicKey; `sessions.upsert` leaves it alone.
   "ALTER TABLE sessions ADD COLUMN bound_topic_key TEXT DEFAULT NULL",
 ];
 

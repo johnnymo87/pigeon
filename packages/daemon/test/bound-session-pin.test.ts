@@ -85,6 +85,57 @@ describe("bound-topic pin", () => {
     expect(s.sessions.get("gse_bound")).not.toBeNull();
   });
 
+  it("pinTopicKey pins without taking the key from another holder", () => {
+    const s = open();
+    s.sessions.upsert({ sessionId: "gse_old", notify: true }, 1_000);
+    s.sessions.upsert({ sessionId: "gse_new", notify: true }, 1_000);
+    s.sessions.setBoundTopicKey("gse_old", "stallwatch:mono", 1_000);
+    s.sessions.pinTopicKey("gse_new", "stallwatch:mono", 2_000);
+    expect(s.sessions.get("gse_old")?.boundTopicKey).toBe("stallwatch:mono");
+    expect(s.sessions.get("gse_new")?.boundTopicKey).toBe("stallwatch:mono");
+    expect(s.sessions.listPinned().map((r) => r.sessionId).sort()).toEqual(["gse_new", "gse_old"]);
+  });
+
+  it("the reaper re-registers each pinned session so the worker's 14-day sweep never collects it", async () => {
+    const s = open();
+    s.sessions.upsert({ sessionId: "gse_bound", notify: true, label: "stall-watch mono" }, 1_000);
+    s.sessions.setBoundTopicKey("gse_bound", "stallwatch:mono", 1_000);
+    s.sessions.upsert({ sessionId: "ses_free", notify: true }, 1_000);
+
+    const registerSession = vi.fn().mockResolvedValue({ ok: true });
+    const result = await reapStaleSessions({
+      storage: s,
+      unregisterSession: vi.fn().mockResolvedValue(undefined),
+      registerSession,
+      nowFn: () => 2_000,
+      log: () => {},
+    });
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(registerSession).toHaveBeenCalledWith("gse_bound", "stall-watch mono");
+    expect(result.refreshedPinned).toBe(1);
+  });
+
+  it("a failed keep-alive registration is not fatal and not counted", async () => {
+    const s = open();
+    s.sessions.upsert({ sessionId: "gse_a", notify: true }, 1_000);
+    s.sessions.setBoundTopicKey("gse_a", "k:a", 1_000);
+    s.sessions.upsert({ sessionId: "gse_b", notify: true }, 1_000);
+    s.sessions.setBoundTopicKey("gse_b", "k:b", 1_000);
+
+    const registerSession = vi.fn()
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 500 });
+    const result = await reapStaleSessions({
+      storage: s,
+      unregisterSession: vi.fn(),
+      registerSession,
+      nowFn: () => 2_000,
+      log: () => {},
+    });
+    expect(registerSession).toHaveBeenCalledTimes(2);
+    expect(result.refreshedPinned).toBe(0);
+  });
+
   it("an unbound session is reaped again as usual", async () => {
     const s = open();
     s.sessions.upsert({ sessionId: "gse_1", notify: true }, 1_000);

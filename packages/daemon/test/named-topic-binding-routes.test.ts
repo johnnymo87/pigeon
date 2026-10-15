@@ -339,8 +339,8 @@ describe("named topic binding routes", () => {
     });
   });
 
-  describe("POST /session-start pins a bound pull session", () => {
-    it("records the bound key on success", async () => {
+  describe("POST /session-start binding a pull session", () => {
+    it("does not pin a pull session: it re-registers every episode and needs no pin", async () => {
       const bindNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 42 });
       const { app, storage: s } = newApp({ bindNamedTopic });
       const res = await post(app, "/session-start", {
@@ -350,18 +350,6 @@ describe("named topic binding routes", () => {
         named_topic: { key: "digest:topic-1", name: "Topic" },
       });
       expect((await res.json()).named_topic_bound).toBe(true);
-      expect(s.sessions.get("ses_pull")?.boundTopicKey).toBe("digest:topic-1");
-    });
-
-    it("leaves no pin when the bind fails", async () => {
-      const bindNamedTopic = vi.fn().mockRejectedValue(new Error("boom"));
-      const { app, storage: s } = newApp({ bindNamedTopic });
-      await post(app, "/session-start", {
-        session_id: "ses_pull",
-        notify: true,
-        backend_kind: "goose-pull",
-        named_topic: { key: "digest:topic-1", name: "Topic" },
-      });
       expect(s.sessions.get("ses_pull")?.boundTopicKey).toBeNull();
     });
 
@@ -532,12 +520,27 @@ describe("named topic binding routes", () => {
     it("may take a key from a goose-pull session (the migration step)", async () => {
       const bindNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 42 });
       const { app, storage: s } = newApp({ bindNamedTopic });
-      s.sessions.upsert({ sessionId: "ses_stallwatch_mono", notify: true, backendKind: "goose-pull" }, 1_000);
-      s.sessions.setBoundTopicKey("ses_stallwatch_mono", "stallwatch:mono", 1_000);
+      const pull = await post(app, "/session-start", {
+        session_id: "ses_stallwatch_mono",
+        notify: true,
+        backend_kind: "goose-pull",
+        named_topic: { key: "stallwatch:mono", name: "mono" },
+      });
+      expect((await pull.json()).named_topic_bound).toBe(true);
 
       const json = (await (await post(app, "/goose/sessions", body)).json()) as Record<string, unknown>;
       expect(json.named_topic_bound).toBe(true);
-      expect(s.sessions.get("ses_stallwatch_mono")?.boundTopicKey).toBeNull();
+      expect(s.sessions.get(json.session_id as string)?.boundTopicKey).toBe("stallwatch:mono");
+
+      // ...and from then on the pull client's per-tick upkeep cannot take it back.
+      const again = await post(app, "/session-start", {
+        session_id: "ses_stallwatch_mono",
+        notify: true,
+        backend_kind: "goose-pull",
+        named_topic: { key: "stallwatch:mono", name: "mono" },
+      });
+      expect((await again.json()).named_topic_error).toBe(`topic is bound to goose-acp session ${json.session_id}`);
+      expect(bindNamedTopic).toHaveBeenCalledTimes(2);
     });
 
     it("reports, but does not fail on, a worker registration error", async () => {
@@ -564,13 +567,33 @@ describe("named topic binding routes", () => {
       expect(bindNamedTopic).not.toHaveBeenCalled();
     });
 
-    it("reports a bind failure and leaves no pin", async () => {
-      const bindNamedTopic = vi.fn().mockRejectedValue(new Error("session not registered"));
+    it("reports a bind failure but keeps the pin: a failed call is not proof of no binding", async () => {
+      // The worker writes the binding as its last step, so a reset after that
+      // point fails here while the topic IS bound. Unpinned, that coordinator
+      // would be reaped at 7 days and its topic silently unbound.
+      const bindNamedTopic = vi.fn().mockRejectedValue(new Error("socket hang up"));
       const { app, storage: s } = newApp({ bindNamedTopic });
       const json = (await (await post(app, "/goose/sessions", body)).json()) as Record<string, unknown>;
       expect(json.named_topic_bound).toBe(false);
-      expect(json.named_topic_error).toBe("bind failed: session not registered");
-      expect(s.sessions.get(json.session_id as string)?.boundTopicKey).toBeNull();
+      expect(json.named_topic_error).toBe("bind failed: socket hang up");
+      expect(s.sessions.get(json.session_id as string)?.boundTopicKey).toBe("stallwatch:mono");
+    });
+
+    it("a failed rotation keeps the old row pinned too, until a bind succeeds", async () => {
+      const bindNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 42 });
+      const { app, storage: s } = newApp({ bindNamedTopic });
+      const a = (await (await post(app, "/goose/sessions", body)).json()) as Record<string, unknown>;
+
+      bindNamedTopic.mockRejectedValueOnce(new Error("socket hang up"));
+      const b = (await (await post(app, "/goose/sessions", { ...body, session_id: "20261015_2" })).json()) as Record<string, unknown>;
+      expect(b.named_topic_bound).toBe(false);
+      expect(s.sessions.get(a.session_id as string)?.boundTopicKey).toBe("stallwatch:mono");
+      expect(s.sessions.get(b.session_id as string)?.boundTopicKey).toBe("stallwatch:mono");
+
+      const retry = (await (await post(app, "/goose/sessions", { ...body, session_id: "20261015_2" })).json()) as Record<string, unknown>;
+      expect(retry.named_topic_bound).toBe(true);
+      expect(s.sessions.get(a.session_id as string)?.boundTopicKey).toBeNull();
+      expect(s.sessions.get(b.session_id as string)?.boundTopicKey).toBe("stallwatch:mono");
     });
 
     it("reports 'no worker connection' when the daemon has none", async () => {

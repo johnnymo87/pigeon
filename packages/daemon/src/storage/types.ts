@@ -61,12 +61,14 @@ export interface SessionRecord {
    */
   pullSources: string[];
   /**
-   * The named-topic key this session is bound to on the worker, or NULL.
+   * The named-topic key this goose-acp session is (or may be) bound to on the
+   * worker, or NULL. Pull sessions are never pinned.
    *
-   * A local mirror of the worker's binding, written on a successful bind and
-   * cleared on unbind (or when the key is re-pointed at another session). Its
-   * job is the pin: a bound session is exempt from the 7-day reaper and from
-   * `cleanupExpired`. See SessionRepository.setBoundTopicKey.
+   * Written before the worker bind and kept if it fails (the outcome may be
+   * unknown), cleared on unbind or when a successful bind moves the key to
+   * another session. Its job is the pin: the row is exempt from the 7-day
+   * reaper and from `cleanupExpired`, and the reaper re-registers it with the
+   * worker instead. See SessionRepository.pinTopicKey / setBoundTopicKey.
    *
    * Optional only so hand-built test records need not spell it out; a record
    * read from storage always carries it (null when unbound).

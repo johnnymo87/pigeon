@@ -358,7 +358,30 @@ export class SessionRepository {
     return tx();
   }
 
-  /** The session this daemon last bound `key` to, or null. */
+  /**
+   * Pin `key` on a session WITHOUT taking it from any other holder.
+   *
+   * Used before the worker bind call, so a bind whose outcome is unknown (a
+   * timeout, or a transport error after the worker wrote the binding) cannot
+   * leave a live, bound session unpinned. Both rows stay pinned until a bind
+   * succeeds and setBoundTopicKey moves the key. An extra pinned row costs a row;
+   * an unpinned bound coordinator is reaped and its topic silently unbound.
+   */
+  pinTopicKey(sessionId: string, key: string, now = Date.now()): boolean {
+    return this.db
+      .prepare("UPDATE sessions SET bound_topic_key = ?, updated_at = ? WHERE session_id = ?")
+      .run(key, now, sessionId).changes > 0;
+  }
+
+  /** Every pinned session; the reaper keeps their worker rows alive. */
+  listPinned(): SessionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM sessions WHERE bound_topic_key IS NOT NULL")
+      .all() as SqlRow[];
+    return rows.map(asSession);
+  }
+
+  /** The session this daemon most recently pinned `key` on, or null. */
   getByBoundTopicKey(key: string): SessionRecord | null {
     const row = this.db
       .prepare("SELECT * FROM sessions WHERE bound_topic_key = ? ORDER BY updated_at DESC LIMIT 1")

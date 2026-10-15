@@ -859,6 +859,7 @@ if (poller) {
       gooseRunners?.drop(sessionId);
       return poller.unregisterSession(sessionId);
     },
+    registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
 }

@@ -9,6 +9,14 @@ interface ReapDeps {
   // retried by the next hourly cycle only if the local row still exists. The outbox's compensating
   // unregister DOES inspect the result, because nothing else can clean up after it.
   unregisterSession: (sessionId: string) => Promise<unknown>;
+  /**
+   * Re-register a session with the worker, which bumps its `updated_at`. Called
+   * every cycle for each pinned (topic-bound goose-acp) session, so the worker's
+   * 14-day sweep never collects a coordinator this daemon still holds, while a
+   * daemon that loses its state stops refreshing and its rows are swept as
+   * before. Optional so a host without a worker connection still reaps.
+   */
+  registerSession?: (sessionId: string, label?: string) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string) => void;
 }
@@ -18,6 +26,7 @@ interface ReapResult {
   expired: number;
   orphanedQuestions: number;
   expiredInjectedPrompts: number;
+  refreshedPinned: number;
 }
 
 export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
@@ -45,6 +54,20 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     reaped++;
   }
 
+  // Pinned sessions are skipped by listStale and cleanupExpired; keep their
+  // worker rows fresh too (see ReapDeps.registerSession).
+  let refreshedPinned = 0;
+  if (deps.registerSession) {
+    for (const session of deps.storage.sessions.listPinned()) {
+      try {
+        const r = await deps.registerSession(session.sessionId, session.label ?? undefined);
+        if (!(r && typeof r === "object" && "ok" in r && r.ok === false)) refreshedPinned++;
+      } catch {
+        // Best-effort; the next hourly cycle tries again, well inside 14 days.
+      }
+    }
+  }
+
   const expired = deps.storage.sessions.cleanupExpired(now);
   if (expired > 0) {
     log(`cleaned ${expired} expired session records`);
@@ -64,7 +87,7 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     log(`cleaned ${expiredInjectedPrompts} expired injected prompt records`);
   }
 
-  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts };
+  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts, refreshedPinned };
 }
 
 interface StartReaperDeps extends ReapDeps {

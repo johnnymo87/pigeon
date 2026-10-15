@@ -753,31 +753,6 @@ describe("stale-session TTL sweep (pigeon-bea)", () => {
     expect(check).not.toBeNull();
   });
 
-  test("does NOT sweep a stale session that is bound to a named topic", async () => {
-    // A stall-watch coordinator bound to its program topic is woken straight through
-    // honkd, so nothing touches its worker row for as long as nobody types in the
-    // topic. Sweeping it would make the binding inert (the routing lookup joins
-    // sessions) and the topic would fall back to the "nobody reads this" hint.
-    const now = Date.now();
-    const staleTime = now - (SESSION_SWEEP_TTL_MS + 10_000);
-    const bound = `${PREFIX}bound_coord`;
-    const unbound = `${PREFIX}unbound_stale`;
-
-    for (const id of [bound, unbound]) {
-      await env.DB.prepare(
-        "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-      ).bind(id, "cloudbox", "x", staleTime, staleTime).run();
-    }
-    await env.DB.prepare(
-      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)"
-    ).bind("-100123", "stallwatch:sweep-test", bound, staleTime).run();
-
-    await sweepStaleSessions(env.DB, { now, limit: 10_000 });
-
-    expect(await env.DB.prepare("SELECT 1 FROM sessions WHERE session_id = ?").bind(bound).first()).not.toBeNull();
-    expect(await env.DB.prepare("SELECT 1 FROM sessions WHERE session_id = ?").bind(unbound).first()).toBeNull();
-  });
-
   test("deletes messages rows belonging to swept session but keeps messages for surviving session", async () => {
     const now = Date.now();
     const staleTime = now - (SESSION_SWEEP_TTL_MS + 10_000);

@@ -383,18 +383,30 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
   /**
    * The bind half shared by `/session-start` (pull sessions) and
    * `/goose/sessions` (goose-acp sessions), after each route's own eligibility
-   * checks. On success the key is mirrored onto the local row, which pins it
-   * against the 7-day reaper. A timeout leaves no pin even though the binding
-   * may exist: the caller is told it is indeterminate and retries, and if it
-   * never does, the reaper's unregister removes the binding with the row.
+   * checks.
+   *
+   * With `pin` (goose-acp only), the key is mirrored onto the local row, which
+   * exempts it from the 7-day reaper and has the reaper keep its worker row
+   * alive. The pin is written BEFORE the worker call and kept on any failure,
+   * because a failed call is not proof of no binding: the worker writes the
+   * binding as its last step, so a timeout or a reset after that point leaves
+   * a bound session that an unpinned row would lose at 7 days. Only success
+   * moves the key off a previous holder (a rotation). A pin left by a bind that
+   * never succeeds lasts until the caller retries or deletes the row.
+   *
+   * Pull sessions are not pinned: they re-register on every episode, so they
+   * never go stale while their client lives, and pinning them would only make
+   * an abandoned mailbox immortal.
    */
   async function bindTopicToSession(
     sessionId: string,
     topic: { key: string; name: string },
     workerRegOk: boolean,
+    pin: boolean,
   ): Promise<BindOutcome> {
     if (!workerRegOk) return { bound: false, error: "worker registration failed" };
     if (!opts.bindNamedTopic) return { bound: false, error: "no worker connection" };
+    if (pin) storage.sessions.pinTopicKey(sessionId, topic.key, nowFn());
 
     const timeoutMs = opts.bindTimeoutMs ?? BIND_TIMEOUT_MS;
     const controller = new AbortController();
@@ -420,7 +432,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     } finally {
       clearTimeout(timer);
     }
-    storage.sessions.setBoundTopicKey(sessionId, topic.key, nowFn());
+    if (pin) storage.sessions.setBoundTopicKey(sessionId, topic.key, nowFn());
     return { bound: true };
   }
 
@@ -1144,7 +1156,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             if (holder && holder.sessionId !== sessionId && holder.backendKind === GOOSE_BACKEND_KIND) {
               result = { bound: false, error: `topic is bound to goose-acp session ${holder.sessionId}` };
             } else {
-              result = await bindTopicToSession(sessionId, parsedTopic, workerRegOk);
+              result = await bindTopicToSession(sessionId, parsedTopic, workerRegOk, false);
             }
           }
 
@@ -1351,7 +1363,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             }
           }
           const result: BindOutcome = parsedTopic
-            ? await bindTopicToSession(registered.sessionId, parsedTopic, workerRegOk)
+            ? await bindTopicToSession(registered.sessionId, parsedTopic, workerRegOk, true)
             : { bound: false, error: "invalid named_topic" };
           return Response.json({
             ok: true,

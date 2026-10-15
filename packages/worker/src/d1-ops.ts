@@ -404,18 +404,9 @@ export async function sweepStaleSessions(
   const cutoff = (opts?.now ?? Date.now()) - ttlMs;
   const limit = opts?.limit ?? 500;
 
-  // A session bound to a named topic is exempt. Its binding is an explicit act that
-  // only /topics/named/unbind or /sessions/unregister undoes, and the session may be
-  // legitimately silent for weeks (a stall-watch coordinator is woken straight through
-  // honkd, so nothing touches this row unless someone types in its topic). Sweeping it
-  // would leave the binding inert, because the routing lookup joins `sessions`.
-  // The daemon pins the same sessions against its own 7-day reaper.
   const { results: victims } = await db
     .prepare(
-      `SELECT session_id FROM sessions
-        WHERE updated_at < ?
-          AND NOT EXISTS (SELECT 1 FROM named_topic_bindings b WHERE b.session_id = sessions.session_id)
-        ORDER BY updated_at, session_id LIMIT ?`,
+      "SELECT session_id FROM sessions WHERE updated_at < ? ORDER BY updated_at, session_id LIMIT ?",
     )
     .bind(cutoff, limit)
     .all<{ session_id: string }>();
