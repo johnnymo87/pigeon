@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "./backend-kind.js";
 import type { StorageDb } from "../storage/database.js";
 import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice, sanitiseIdPart } from "./session-runner.js";
 import type { GooseInflightRecord } from "../storage/goose-inflight-repo.js";
@@ -70,7 +71,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
 
       // Check 2: Session missing or not goose
       const session = opts.storage.sessions.get(sessionId);
-      if (!session || session.backendKind !== "goose") {
+      if (!session || session.backendKind !== GOOSE_BACKEND_KIND) {
         log("session missing or not goose, deleting row without notice", {
           commandId,
           sessionId,

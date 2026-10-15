@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, it, expect, vi } from "vitest";
 import { executeGooseKill, pickKillReply, type GooseKillDeps } from "../src/goose/kill-control.js";
 import type { SessionRecord } from "../src/storage/types.js";
@@ -65,7 +66,7 @@ describe("executeGooseKill", () => {
     const events: string[] = [];
     const sessionRecord = {
       sessionId: "gse_123",
-      backendKind: "goose",
+      backendKind: GOOSE_BACKEND_KIND,
       backendSessionId: "20261012_1",
       createdAt: 1000,
       updatedAt: 1000,
