@@ -60,6 +60,18 @@ export interface SessionRecord {
    * regardless of whether it is listed here.
    */
   pullSources: string[];
+  /**
+   * The named-topic key this session is bound to on the worker, or NULL.
+   *
+   * A local mirror of the worker's binding, written on a successful bind and
+   * cleared on unbind (or when the key is re-pointed at another session). Its
+   * job is the pin: a bound session is exempt from the 7-day reaper and from
+   * `cleanupExpired`. See SessionRepository.setBoundTopicKey.
+   *
+   * Optional only so hand-built test records need not spell it out; a record
+   * read from storage always carries it (null when unbound).
+   */
+  boundTopicKey?: string | null;
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
