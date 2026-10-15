@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { afterEach, describe, expect, it } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import type { GooseInflightRecord } from "../src/storage/goose-inflight-repo";
@@ -21,7 +22,7 @@ describe("GooseInflightRepository", () => {
     s.sessions.upsert({
       sessionId,
       cwd: "/tmp",
-      backendKind: "goose",
+      backendKind: GOOSE_BACKEND_KIND,
     });
   }
 

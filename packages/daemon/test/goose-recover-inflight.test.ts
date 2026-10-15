@@ -1,7 +1,9 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { GooseRunnerRegistry, GooseSessionRunner } from "../src/goose/session-runner";
 import { recoverGooseTurns } from "../src/goose/recover-inflight";
+import { registerGooseSession } from "../src/goose/register-session";
 import type { SessionRecord } from "../src/storage/types";
 
 class FakeClient {
@@ -74,7 +76,7 @@ describe("recoverGooseTurns (Commit 2)", () => {
     s.sessions.upsert({
       sessionId,
       cwd: "/tmp",
-      backendKind: "goose",
+      backendKind: GOOSE_BACKEND_KIND,
       notify: true,
       ...over,
     });
@@ -158,6 +160,56 @@ describe("recoverGooseTurns (Commit 2)", () => {
     expect(postStop).not.toHaveBeenCalled();
     expect(s.gooseInflight.get("cmd_missing")).toBeUndefined();
     expect(s.inbox.get("cmd_missing")?.status).toBe("done");
+  });
+
+  it("resumes a turn for a session created by the production registration path (555.15)", async () => {
+    // Regression: recovery compared backendKind to the literal "goose" while the
+    // real kind is GOOSE_BACKEND_KIND ("goose-acp"), so every in-flight goose
+    // turn was deleted and markDone'd on restart with no notice. Fixtures used
+    // the same wrong literal, which is why no test caught it. Register through
+    // registerGooseSession so the fixture cannot drift from production again.
+    const s = newStorage();
+    const reg = registerGooseSession(
+      s.sessions,
+      { backendSessionId: "20261015_1", endpoint: "ws://127.0.0.1:1/acp" },
+      1000,
+      () => "gse_real",
+    );
+    expect(reg.ok).toBe(true);
+    const now = 1000;
+    const postStop = vi.fn().mockResolvedValue(undefined);
+    const client = new FakeClient();
+
+    s.inbox.persist({ commandId: "cmd_real", payload: "payload" });
+    s.gooseInflight.insert({
+      commandId: "cmd_real",
+      sessionId: "gse_real",
+      backendSessionId: "20261015_1",
+      isHonk: true,
+      promptText: "real turn",
+      cleanSuspend: true,
+      createdAt: now,
+      lastAliveAt: now,
+    });
+
+    const registry = new GooseRunnerRegistry({
+      inbox: s.inbox,
+      inflight: s.gooseInflight,
+      createRunner: (session) =>
+        new GooseSessionRunner({ session, client, inflight: s.gooseInflight, postStop, touch: () => {} }),
+    });
+
+    await recoverGooseTurns({ storage: s, gooseRunners: registry, now, postStop });
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(client.prompts).toHaveLength(1);
+    expect(client.promptOptions[0]?.resumeOnly).toBe(true);
+    expect(s.inbox.get("cmd_real")?.status).not.toBe("done");
+
+    client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "reply" });
+    await registry.peek("gse_real")!.settled();
+    expect(postStop).toHaveBeenCalledTimes(1);
+    expect(s.inbox.get("cmd_real")?.status).toBe("done");
   });
 
   it("outbox pre-check: deletes row and marks inbox done if normal notification already exists in outbox", async () => {

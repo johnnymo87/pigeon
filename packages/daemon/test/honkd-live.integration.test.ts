@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, it, expect } from "vitest";
 import {
   GooseAcpClient,
@@ -99,7 +100,7 @@ describe("honkd live integration with real pigeon client", () => {
       const runner = new GooseSessionRunner({
         session: {
           sessionId: `live-sess-${Date.now()}`,
-          backendKind: "goose",
+          backendKind: GOOSE_BACKEND_KIND,
           backendSessionId: backendSid,
         } as SessionRecord,
         client,
@@ -159,7 +160,7 @@ describe("honkd live integration with real pigeon client", () => {
       const runner = new GooseSessionRunner({
         session: {
           sessionId: `live-sess-cancel-${Date.now()}`,
-          backendKind: "goose",
+          backendKind: GOOSE_BACKEND_KIND,
           backendSessionId: backendSid,
         } as SessionRecord,
         client,
@@ -294,7 +295,7 @@ describe("honkd live integration with real pigeon client", () => {
         freshRunner = new GooseSessionRunner({
           session: {
             sessionId: `sess-restart-${Date.now()}`,
-            backendKind: "goose",
+            backendKind: GOOSE_BACKEND_KIND,
             backendSessionId: backendSid,
           } as SessionRecord,
           client: freshClient,
@@ -349,7 +350,7 @@ describe("honkd live integration with real pigeon client", () => {
       const storageA = openStorageDb(dbPath);
       storageA.sessions.upsert({
         sessionId: sessId,
-        backendKind: "goose",
+        backendKind: GOOSE_BACKEND_KIND,
         backendSessionId: backendSid,
         backendEndpoint: HONKD_URL!,
         backendAuthToken: HONKD_TOKEN!,
@@ -491,7 +492,7 @@ describe("honkd live integration with real pigeon client", () => {
       const storageA = openStorageDb(dbPath);
       storageA.sessions.upsert({
         sessionId: sessId,
-        backendKind: "goose",
+        backendKind: GOOSE_BACKEND_KIND,
         backendSessionId: backendSid,
         backendEndpoint: HONKD_URL!,
         backendAuthToken: HONKD_TOKEN!,
@@ -652,7 +653,7 @@ describe("honkd live integration with real pigeon client", () => {
       const storageA = openStorageDb(dbPath);
       storageA.sessions.upsert({
         sessionId: sessId,
-        backendKind: "goose",
+        backendKind: GOOSE_BACKEND_KIND,
         backendSessionId: backendSid,
         backendEndpoint: HONKD_URL!,
         backendAuthToken: HONKD_TOKEN!,

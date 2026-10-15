@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, expect, it, vi } from "vitest";
 import { GooseSessionRunner } from "../src/goose/session-runner";
 import type { SessionRecord } from "../src/storage/types";
@@ -162,7 +163,7 @@ function makeSession(): SessionRecord {
     state: "running",
     ptyPath: null,
     nvimSocket: null,
-    backendKind: "goose",
+    backendKind: GOOSE_BACKEND_KIND,
     backendProtocolVersion: null,
     backendEndpoint: null,
     backendAuthToken: null,

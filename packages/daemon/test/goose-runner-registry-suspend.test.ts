@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, expect, it, vi } from "vitest";
 import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice } from "../src/goose/session-runner";
 import { DisconnectedDuringTurn } from "../src/goose/acp-client";
@@ -147,7 +148,7 @@ function makeSession(id: string): SessionRecord {
     state: "running",
     ptyPath: null,
     nvimSocket: null,
-    backendKind: "goose",
+    backendKind: GOOSE_BACKEND_KIND,
     backendProtocolVersion: null,
     backendEndpoint: null,
     backendAuthToken: null,
