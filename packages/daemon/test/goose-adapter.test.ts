@@ -249,3 +249,41 @@ describe("GooseAcpAdapter refuses goose commands for a pinned session", () => {
     expect(delivered.map((d) => d.text)).toEqual(["/clear"]);
   });
 });
+
+/** Reply-quote context in the goose prompt (eng-agent-platform-555.21). */
+describe("GooseAcpAdapter carries what a message replied to", () => {
+  it("prefixes the replied-to bot message", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    await adapter.deliverCommand(session(), "yes, do it", { ...ctx, inReplyTo: "Shall I rebase #176?" });
+    expect(delivered[0]!.text).toBe('[Replying to your earlier message: "Shall I rebase #176?"]\n\nyes, do it');
+  });
+
+  it("prefers the highlighted part when the human quoted one", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    await adapter.deliverCommand(session(), "this one", {
+      ...ctx,
+      inReplyTo: "Two options: A, rebase. B, merge.",
+      inReplyToQuote: "B, merge.",
+    });
+    expect(delivered[0]!.text).toBe('[Replying to this part of your earlier message: "B, merge."]\n\nthis one');
+  });
+
+  it("caps the context like goose-pull does", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    await adapter.deliverCommand(session(), "ok", { ...ctx, inReplyTo: "x".repeat(5000) });
+    expect(delivered[0]!.text).toBe(`[Replying to your earlier message: "${"x".repeat(500)}"]\n\nok`);
+  });
+
+  it("sends the text alone when there is nothing, or only whitespace, to carry", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    await adapter.deliverCommand(session(), "hi", ctx);
+    await adapter.deliverCommand(session(), "hi", { ...ctx, inReplyTo: "  ", inReplyToQuote: "" });
+    expect(delivered.map((d) => d.text)).toEqual(["hi", "hi"]);
+  });
+
+  it("leaves a goose command untouched on an unpinned session, so it still runs as one", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    await adapter.deliverCommand(session(), "/goal ship it", { ...ctx, inReplyTo: "What next?" });
+    expect(delivered[0]!.text).toBe("/goal ship it");
+  });
+});

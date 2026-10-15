@@ -35,6 +35,7 @@ import type {
   CommandDeliveryResult,
 } from "../adapters/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import { IN_REPLY_TO_MAX_CHARS } from "../adapters/goose-pull.js";
 import { gooseCommandIn, pinnedCommandRefusal } from "./builtin-commands.js";
 import { classifyReachability, type Reachability } from "./preflight.js";
 import type { GooseSessionRunner } from "./session-runner.js";
@@ -151,11 +152,43 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     }
 
     const runner = this.opts.runnerFor(session);
-    return runner.deliver(context.commandId, command);
+    return runner.deliver(context.commandId, withReplyContext(command, context));
   }
 
   // deliverQuestionReply is deliberately NOT implemented. The question-reply path
   // still string-classifies failures and throws independently of failurePolicy,
   // so a "surface" adapter must not offer it until that path is gated too --
   // stated as a precondition in adapters/types.ts.
+}
+
+/**
+ * The prompt text for a Telegram message, carrying what it replied to
+ * (eng-agent-platform-555.21).
+ *
+ * A swipe-reply in Telegram says "this, about THAT", and the THAT is otherwise
+ * lost: goose sees only the human's words, so "yes, do it" answers whichever
+ * question the model last asked rather than the one the human picked. The
+ * worker forwards the bot message's text (and the part of it the human
+ * highlighted, when they did), both capped; they are capped again here, as
+ * goose-pull does, so a skewed worker cannot inflate a prompt.
+ *
+ * A message goose would run as a command is passed through untouched: a
+ * preamble would turn it into prose (and `/goal x` would swallow the preamble
+ * as its argument). Pinned sessions never get that far; see builtin-commands.
+ *
+ * Deterministic in its inputs, so a redelivered command produces the same text.
+ */
+export function withReplyContext(command: string, context: CommandDeliveryContext): string {
+  if (gooseCommandIn(command)) return command;
+  const cap = (s: string | undefined) => {
+    const t = s?.trim();
+    return t ? t.slice(0, IN_REPLY_TO_MAX_CHARS) : null;
+  };
+  const quote = cap(context.inReplyToQuote);
+  const replied = cap(context.inReplyTo);
+  if (!quote && !replied) return command;
+  const lines = quote
+    ? [`[Replying to this part of your earlier message: "${quote}"]`]
+    : [`[Replying to your earlier message: "${replied}"]`];
+  return `${lines.join("\n")}\n\n${command}`;
 }

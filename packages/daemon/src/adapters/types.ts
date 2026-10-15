@@ -18,7 +18,7 @@ export interface CommandDeliveryContext {
   modelOverride?: string;
   /**
    * Telegram-side facts about the message, forwarded by the worker. Only the
-   * pull adapter reads them today; opencode adapters ignore them.
+   * pull and goose-acp adapters read them; opencode adapters ignore them.
    *   senderId   the Telegram user id that sent it (absent for a button tap)
    *   forwarded  the message was forwarded, so its author is someone else
    *   inReplyTo  text of the BOT message the human replied to, if any
