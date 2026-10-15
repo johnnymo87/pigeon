@@ -24,8 +24,9 @@ export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
   createAdapter?: (session: SessionRecord) => CommandDeliveryAdapter | null;
   /**
-   * Telegram user ids allowed to bank for a pull-mode session. Absent or empty
-   * means pull sessions get no adapter (the "not reachable" reply).
+   * The owner's Telegram user ids: allowed to bank for a pull-mode session and
+   * to prompt a goose-acp session. Absent or empty means pull sessions get no
+   * adapter (the "not reachable" reply); see GooseAcpAdapterOptions for goose.
    */
   pullAllowedSenderIds?: ReadonlySet<string>;
   /**
@@ -156,8 +157,17 @@ export function selectAdapter(
   // (i.e. goose is configured). Falling through to `null` otherwise is the right
   // failure: the no-adapter path below tells the human the session cannot be
   // reached, rather than silently trying the opencode machinery on it.
+  //
+  //
+  // `pull` carries the owner allowlist both kinds share (555.19). Unlike a pull
+  // session, an empty list does NOT mean no adapter: devbox and macOS run goose
+  // sessions without the list configured, and the adapter applies it (strictly
+  // for a session bound to a topic) and says what is wrong when it refuses.
   if (session.backendKind === GOOSE_BACKEND_KIND && gooseRunnerFor) {
-    return new GooseAcpAdapter({ runnerFor: gooseRunnerFor });
+    return new GooseAcpAdapter({
+      runnerFor: gooseRunnerFor,
+      allowedSenderIds: pull?.allowedSenderIds ?? new Set<string>(),
+    });
   }
 
   if (session.nvimSocket && session.ptyPath) {

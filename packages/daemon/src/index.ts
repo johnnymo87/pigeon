@@ -422,11 +422,13 @@ const workerHealthMonitor = new WorkerHealthMonitor({
     console.warn(`[worker-health] ${msg}`, fields ? JSON.stringify(fields) : ""),
 });
 
-// Who may bank a message for a pull-mode session. Empty (the default) means
-// nobody, and pull sessions answer "not reachable" exactly as before.
+// The owner's Telegram ids: who may bank a message for a pull-mode session, and
+// who may prompt a goose-acp session (555.19). Empty (the default) means pull
+// sessions answer "not reachable", goose sessions bound to a topic accept no
+// prompts, and unbound goose sessions accept any sender the worker admits.
 const pullAllowedSenderIds: ReadonlySet<string> = new Set(config.pullAllowedUserIds);
 if (pullAllowedSenderIds.size === 0) {
-  console.log("[pull-inbox] PIGEON_PULL_ALLOWED_USER_IDS is empty: pull sessions will not bank inbound");
+  console.log("[pull-inbox] PIGEON_PULL_ALLOWED_USER_IDS is empty: pull sessions will not bank inbound, topic-bound goose sessions will accept no prompts, and unbound goose sessions accept any sender");
 }
 
 const poller = config.workerUrl && config.workerApiKey && config.machineId

@@ -35,12 +35,23 @@ import type {
   CommandDeliveryResult,
 } from "../adapters/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import { IN_REPLY_TO_MAX_CHARS } from "../adapters/goose-pull.js";
+import { gooseCommandIn, pinnedCommandRefusal } from "./builtin-commands.js";
 import { classifyReachability, type Reachability } from "./preflight.js";
 import type { GooseSessionRunner } from "./session-runner.js";
 
 export interface GooseAcpAdapterOptions {
   /** Resolves (creating if needed) the long-lived runner for this session. */
   runnerFor: (session: SessionRecord) => GooseSessionRunner;
+  /**
+   * Telegram user ids allowed to prompt a goose session: the owner's
+   * (`PIGEON_PULL_ALLOWED_USER_IDS`, the same set goose-pull uses). When it is
+   * non-empty, only those senders get through. When it is empty, a session
+   * bound to a topic refuses everyone (that is the case the list exists for),
+   * and an unbound one accepts any sender the worker admitted, as before: the
+   * list is not configured on devbox or macOS, which run goose sessions.
+   */
+  allowedSenderIds: ReadonlySet<string>;
   /** Injected for tests; defaults to the real HTTP probe. */
   reachability?: (url: string, token: string) => Promise<Reachability>;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
@@ -62,6 +73,47 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     command: string,
     context: CommandDeliveryContext,
   ): Promise<CommandDeliveryResult> {
+    // WHO, first (eng-agent-platform-555.19), and the same rule goose-pull
+    // applies. A goose session has a shell and runs as the owner, while the
+    // worker's chat allowlist admits every member of an allowed group chat. A
+    // missing sender id fails closed: a button tap or an older worker produces
+    // it, and neither is evidence of the owner.
+    const allowed = this.opts.allowedSenderIds;
+    if (allowed.size > 0) {
+      const senderId = context.senderId;
+      if (!senderId || !allowed.has(senderId)) {
+        return {
+          ok: false,
+          error: "this session only accepts messages from its owner's Telegram account",
+        };
+      }
+    } else if (session.boundTopicKey) {
+      return {
+        ok: false,
+        error:
+          "this session is bound to its topic and accepts only its owner's messages, but this machine "
+          + "has no owner configured (PIGEON_PULL_ALLOWED_USER_IDS is empty), so it accepts none",
+      };
+    }
+    // The allowlist proves who SENT a message, not who wrote it. Refused even
+    // without a list: a forwarded prompt is someone else's words either way.
+    if (context.forwarded) {
+      return {
+        ok: false,
+        error: "forwarded messages are not accepted by this session; type the message yourself",
+      };
+    }
+
+    // A session bound to its topic (a stall-watch coordinator) gets no goose
+    // commands from Telegram: one stray /clear would wipe its conversation
+    // (555.22, see builtin-commands.ts). Unbound goose sessions are unchanged.
+    if (session.boundTopicKey) {
+      const gooseCommand = gooseCommandIn(command);
+      if (gooseCommand) {
+        return { ok: false, error: pinnedCommandRefusal(gooseCommand) };
+      }
+    }
+
     const endpoint = session.backendEndpoint;
     if (!endpoint) {
       return {
@@ -113,11 +165,47 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     }
 
     const runner = this.opts.runnerFor(session);
-    return runner.deliver(context.commandId, command);
+    return runner.deliver(context.commandId, withReplyContext(command, context));
   }
 
   // deliverQuestionReply is deliberately NOT implemented. The question-reply path
   // still string-classifies failures and throws independently of failurePolicy,
   // so a "surface" adapter must not offer it until that path is gated too --
   // stated as a precondition in adapters/types.ts.
+}
+
+/**
+ * The prompt text for a Telegram message, carrying what it replied to
+ * (eng-agent-platform-555.21).
+ *
+ * A swipe-reply in Telegram says "this, about THAT", and the THAT is otherwise
+ * lost: goose sees only the human's words, so "yes, do it" answers whichever
+ * question the model last asked rather than the one the human picked. The
+ * worker forwards the bot message's text (and the part of it the human
+ * highlighted, when they did), both capped; they are capped again here, as
+ * goose-pull does, so a skewed worker cannot inflate a prompt.
+ *
+ * A message goose would run as a command is passed through untouched: a
+ * preamble would turn it into prose (and `/goal x` would swallow the preamble
+ * as its argument). Pinned sessions never get that far; see builtin-commands.
+ *
+ * The wording does not say who wrote that message: the bot also posts digests,
+ * alerts and pigeon's own replies into a topic, and telling the model it wrote
+ * one of those invites it to adopt the content as its own plan.
+ *
+ * Deterministic in its inputs, so a redelivered command produces the same text.
+ */
+export function withReplyContext(command: string, context: CommandDeliveryContext): string {
+  if (gooseCommandIn(command)) return command;
+  const cap = (s: string | undefined) => {
+    const t = s?.trim();
+    return t ? t.slice(0, IN_REPLY_TO_MAX_CHARS) : null;
+  };
+  const quote = cap(context.inReplyToQuote);
+  const replied = cap(context.inReplyTo);
+  if (!quote && !replied) return command;
+  const lines = quote
+    ? [`[Replying to this part of an earlier message in the topic: "${quote}"]`]
+    : [`[Replying to this earlier message in the topic: "${replied}"]`];
+  return `${lines.join("\n")}\n\n${command}`;
 }

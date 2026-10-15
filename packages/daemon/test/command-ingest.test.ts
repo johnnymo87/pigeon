@@ -5621,10 +5621,26 @@ describe("goose sessions in the delivery machinery", () => {
       } as never,
       undefined,
       () => ({ deliver: async () => ({ ok: true }) }) as never,
+      { storage: null as never, allowedSenderIds: new Set(["1001"]) },
     );
 
     expect(adapter?.name).toBe("goose-acp");
     expect(adapter?.failurePolicy).toBe("surface");
+  });
+
+  it("still selects the goose adapter when no owner allowlist is configured (555.19)", () => {
+    // Unlike a pull session. devbox and macOS run goose sessions without the
+    // list; the adapter applies it, strictly for bound sessions, and its
+    // refusal names the setting instead of the misleading "not reachable".
+    const rec = {
+      sessionId: "goose-1",
+      backendKind: "goose-acp",
+      backendEndpoint: "ws://127.0.0.1:38910/acp",
+      backendAuthToken: "tok",
+    } as never;
+    const runners = () => ({ deliver: async () => ({ ok: true }) }) as never;
+    expect(selectAdapter(rec, undefined, runners)?.name).toBe("goose-acp");
+    expect(selectAdapter(rec, undefined, runners, { storage: null as never, allowedSenderIds: new Set() })?.name).toBe("goose-acp");
   });
 
   it("does NOT delete the session when delivery fails with a connection-shaped error", async () => {
@@ -5687,6 +5703,7 @@ describe("goose sessions in the delivery machinery", () => {
       } as never,
       undefined,
       () => ({ deliver: async () => ({ ok: true }) }) as never,
+      { storage: null as never, allowedSenderIds: new Set(["1001"]) },
     );
     expect(adapter?.name).toBe("goose-acp");
   });
