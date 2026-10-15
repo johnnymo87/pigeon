@@ -39,13 +39,16 @@ function makeAdapter(reach: Reachability, deliverImpl?: () => Promise<unknown>) 
   } as unknown as GooseSessionRunner;
   const adapter = new GooseAcpAdapter({
     runnerFor: () => runner,
+    allowedSenderIds: OWNERS,
     reachability: async () => reach,
     log: () => {},
   });
   return { adapter, delivered };
 }
 
-const ctx = { commandId: "c1" };
+const OWNER = "1001";
+const OWNERS: ReadonlySet<string> = new Set([OWNER]);
+const ctx = { commandId: "c1", senderId: OWNER };
 
 describe("GooseAcpAdapter delivery contract", () => {
   it("declares failurePolicy surface", () => {
@@ -111,6 +114,7 @@ describe("GooseAcpAdapter delivery contract", () => {
     const { adapter, delivered } = makeAdapter({ kind: "ok" });
     const res = await adapter.deliverCommand(session(), "look at this", {
       commandId: "c1",
+      senderId: OWNER,
       media: { mime: "image/png", filename: "a.png", url: "data:image/png;base64,AA" },
     });
     expect(res.ok).toBe(false);
@@ -123,13 +127,64 @@ describe("GooseAcpAdapter delivery contract", () => {
     const runner = { deliver: async () => ({ ok: true }) } as unknown as GooseSessionRunner;
     const adapter = new GooseAcpAdapter({
       runnerFor: () => runner,
+      allowedSenderIds: OWNERS,
       reachability: async () => {
         calls++;
         return { kind: "ok" };
       },
     });
-    await adapter.deliverCommand(session(), "a", { commandId: "c1" });
-    await adapter.deliverCommand(session(), "b", { commandId: "c2" });
+    await adapter.deliverCommand(session(), "a", { commandId: "c1", senderId: OWNER });
+    await adapter.deliverCommand(session(), "b", { commandId: "c2", senderId: OWNER });
     expect(calls).toBe(2);
+  });
+});
+
+/**
+ * Sender allowlist (eng-agent-platform-555.19), the same rule goose-pull applies.
+ *
+ * A goose session has a shell. The worker's chat allowlist admits every member
+ * of an allowed group chat, so without this anyone in the forum could type a
+ * prompt into a coordinator that runs commands as the owner.
+ */
+describe("GooseAcpAdapter sender allowlist", () => {
+  it("refuses a sender who is not the owner, before probing or prompting", async () => {
+    let probed = false;
+    const delivered: string[] = [];
+    const adapter = new GooseAcpAdapter({
+      runnerFor: () => ({ deliver: async (_c: string, t: string) => { delivered.push(t); return { ok: true }; } }) as unknown as GooseSessionRunner,
+      allowedSenderIds: OWNERS,
+      reachability: async () => { probed = true; return { kind: "ok" }; },
+    });
+    const res = await adapter.deliverCommand(session(), "rm -rf", { commandId: "c1", senderId: "2002" });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/owner/i);
+    expect(probed).toBe(false);
+    expect(delivered).toEqual([]);
+  });
+
+  it("fails closed when the sender id is missing", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1" });
+    expect(res.ok).toBe(false);
+    expect(delivered).toEqual([]);
+  });
+
+  it("refuses a forwarded message even from the owner", async () => {
+    // The allowlist proves who SENT it, not who wrote it.
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1", senderId: OWNER, forwarded: true });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/forwarded/i);
+    expect(delivered).toEqual([]);
+  });
+
+  it("refuses everyone when the allowlist is empty", async () => {
+    const adapter = new GooseAcpAdapter({
+      runnerFor: () => ({ deliver: async () => ({ ok: true }) }) as unknown as GooseSessionRunner,
+      allowedSenderIds: new Set(),
+      reachability: async () => ({ kind: "ok" }),
+    });
+    const res = await adapter.deliverCommand(session(), "x", { commandId: "c1", senderId: OWNER });
+    expect(res.ok).toBe(false);
   });
 });

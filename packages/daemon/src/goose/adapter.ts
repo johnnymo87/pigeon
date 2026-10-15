@@ -41,6 +41,13 @@ import type { GooseSessionRunner } from "./session-runner.js";
 export interface GooseAcpAdapterOptions {
   /** Resolves (creating if needed) the long-lived runner for this session. */
   runnerFor: (session: SessionRecord) => GooseSessionRunner;
+  /**
+   * Telegram user ids allowed to prompt a goose session: the owner's
+   * (`PIGEON_PULL_ALLOWED_USER_IDS`, the same set goose-pull uses). Required,
+   * and an empty set refuses everyone; `selectAdapter` returns no adapter at
+   * all in that case.
+   */
+  allowedSenderIds: ReadonlySet<string>;
   /** Injected for tests; defaults to the real HTTP probe. */
   reachability?: (url: string, token: string) => Promise<Reachability>;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
@@ -62,6 +69,26 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     command: string,
     context: CommandDeliveryContext,
   ): Promise<CommandDeliveryResult> {
+    // WHO, first (eng-agent-platform-555.19), and the same rule goose-pull
+    // applies. A goose session has a shell and runs as the owner, while the
+    // worker's chat allowlist admits every member of an allowed group chat. A
+    // missing sender id fails closed: a button tap or an older worker produces
+    // it, and neither is evidence of the owner.
+    const senderId = context.senderId;
+    if (!senderId || !this.opts.allowedSenderIds.has(senderId)) {
+      return {
+        ok: false,
+        error: "this session only accepts messages from its owner's Telegram account",
+      };
+    }
+    // The allowlist proves who SENT a message, not who wrote it.
+    if (context.forwarded) {
+      return {
+        ok: false,
+        error: "forwarded messages are not accepted by this session; type the message yourself",
+      };
+    }
+
     const endpoint = session.backendEndpoint;
     if (!endpoint) {
       return {

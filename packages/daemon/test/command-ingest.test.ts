@@ -5621,10 +5621,26 @@ describe("goose sessions in the delivery machinery", () => {
       } as never,
       undefined,
       () => ({ deliver: async () => ({ ok: true }) }) as never,
+      { storage: null as never, allowedSenderIds: new Set(["1001"]) },
     );
 
     expect(adapter?.name).toBe("goose-acp");
     expect(adapter?.failurePolicy).toBe("surface");
+  });
+
+  it("is unroutable when no owner allowlist is configured (555.19)", () => {
+    // Same rule as a pull session: with nobody allowed to prompt it, a goose
+    // session is exactly as reachable as one with no backend, and says so the
+    // same way, instead of accepting text from anyone in the group.
+    const rec = {
+      sessionId: "goose-1",
+      backendKind: "goose-acp",
+      backendEndpoint: "ws://127.0.0.1:38910/acp",
+      backendAuthToken: "tok",
+    } as never;
+    const runners = () => ({ deliver: async () => ({ ok: true }) }) as never;
+    expect(selectAdapter(rec, undefined, runners)).toBeNull();
+    expect(selectAdapter(rec, undefined, runners, { storage: null as never, allowedSenderIds: new Set() })).toBeNull();
   });
 
   it("does NOT delete the session when delivery fails with a connection-shaped error", async () => {
@@ -5687,6 +5703,7 @@ describe("goose sessions in the delivery machinery", () => {
       } as never,
       undefined,
       () => ({ deliver: async () => ({ ok: true }) }) as never,
+      { storage: null as never, allowedSenderIds: new Set(["1001"]) },
     );
     expect(adapter?.name).toBe("goose-acp");
   });
