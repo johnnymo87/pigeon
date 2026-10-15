@@ -35,6 +35,7 @@ import type {
   CommandDeliveryResult,
 } from "../adapters/types.js";
 import type { SessionRecord } from "../storage/types.js";
+import { gooseCommandIn, pinnedCommandRefusal } from "./builtin-commands.js";
 import { classifyReachability, type Reachability } from "./preflight.js";
 import type { GooseSessionRunner } from "./session-runner.js";
 
@@ -87,6 +88,16 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
         ok: false,
         error: "forwarded messages are not accepted by this session; type the message yourself",
       };
+    }
+
+    // A session bound to its topic (a stall-watch coordinator) gets no goose
+    // commands from Telegram: one stray /clear would wipe its conversation
+    // (555.22, see builtin-commands.ts). Unbound goose sessions are unchanged.
+    if (session.boundTopicKey) {
+      const gooseCommand = gooseCommandIn(command);
+      if (gooseCommand) {
+        return { ok: false, error: pinnedCommandRefusal(gooseCommand) };
+      }
     }
 
     const endpoint = session.backendEndpoint;

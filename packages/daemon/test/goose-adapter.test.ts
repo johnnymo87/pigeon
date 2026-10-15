@@ -188,3 +188,64 @@ describe("GooseAcpAdapter sender allowlist", () => {
     expect(res.ok).toBe(false);
   });
 });
+
+/**
+ * goose commands typed into a pinned session's topic (eng-agent-platform-555.22).
+ */
+describe("GooseAcpAdapter refuses goose commands for a pinned session", () => {
+  const pinned = () => session({ boundTopicKey: "stallwatch:mono" });
+
+  for (const text of [
+    "/clear",
+    "  /clear  ",
+    "/compact",
+    "/summarize",
+    "/goal ship it",
+    "/grind off",
+    "/prompt foo --info",
+    "/prompts",
+    "/skills",
+    "/doctor",
+    "/status",
+    "/sw delta",
+    "Please compact this conversation",
+    "please compact this conversation.",
+  ]) {
+    it(`refuses ${JSON.stringify(text)} without probing or prompting`, async () => {
+      let probed = false;
+      const delivered: string[] = [];
+      const adapter = new GooseAcpAdapter({
+        runnerFor: () => ({ deliver: async (_c: string, t: string) => { delivered.push(t); return { ok: true }; } }) as unknown as GooseSessionRunner,
+        allowedSenderIds: OWNERS,
+        reachability: async () => { probed = true; return { kind: "ok" }; },
+      });
+      const res = await adapter.deliverCommand(pinned(), text, ctx);
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/Not sent/);
+      expect(probed).toBe(false);
+      expect(delivered).toEqual([]);
+    });
+  }
+
+  for (const text of [
+    "status?",
+    "/tmp/foo is full, look",
+    "what does /clear do?",
+    "\"/clear\"",
+    "please compact this conversation when you get a chance",
+  ]) {
+    it(`delivers the ordinary prompt ${JSON.stringify(text)}`, async () => {
+      const { adapter, delivered } = makeAdapter({ kind: "ok" });
+      const res = await adapter.deliverCommand(pinned(), text, ctx);
+      expect(res.ok).toBe(true);
+      expect(delivered.map((d) => d.text)).toEqual([text]);
+    });
+  }
+
+  it("leaves an unpinned goose session alone: /clear still reaches it", async () => {
+    const { adapter, delivered } = makeAdapter({ kind: "ok" });
+    const res = await adapter.deliverCommand(session(), "/clear", ctx);
+    expect(res.ok).toBe(true);
+    expect(delivered.map((d) => d.text)).toEqual(["/clear"]);
+  });
+});
