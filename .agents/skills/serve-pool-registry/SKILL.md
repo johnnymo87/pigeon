@@ -190,5 +190,5 @@ Don't trust this table over `bd ready` — it rots, the graph doesn't.
 | `pigeon-h21` | closed — `sendPrompt` timeout. Its timeouts must **not** feed a health verdict. |
 | `pigeon-ntk` | closed — verification receipts for the 886 design. |
 | `pigeon-zjv` | closed as **FALSIFIED**. Read its correction note before re-proposing a self-probe in self-heal. |
-- workstation `.opencode/skills/monitoring-serve-pool` — the canary that restarts a
+- workstation `.agents/skills/monitoring-serve-pool` — the canary that restarts a
   wedged instance (1-min timer, 7-failure threshold).

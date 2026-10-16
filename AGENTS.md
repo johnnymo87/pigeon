@@ -1,6 +1,6 @@
 # Pigeon Agent Guide
 
-This repo uses agent skills in `.opencode/skills`.
+This repo uses agent skills in `.agents/skills`.
 
 Use this file as the quickstart and table of contents for agent-facing docs.
 
@@ -17,7 +17,7 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
 - Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
-- Deploy daemon/plugin: `git pull`, then **separately** `npm install`, then restart service per machine (see [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md)). Two bash calls, not one — see below.
+- Deploy daemon/plugin: `git pull`, then **separately** `npm install`, then restart service per machine (see [cross-device-deployment](.agents/skills/cross-device-deployment/SKILL.md)). Two bash calls, not one — see below.
 
 ### Heavy commands and your serve's memory cgroup
 
@@ -64,7 +64,7 @@ ExecStart=... node .../tsx/dist/cli.mjs /home/dev/projects/pigeon/packages/daemo
 ```
 
 Whatever is checked out at that root is what runs at the next restart, and the
-documented deploy procedure ([cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md))
+documented deploy procedure ([cross-device-deployment](.agents/skills/cross-device-deployment/SKILL.md))
 is `git pull` there followed by a service restart. So an uncommitted edit or an
 unpushed commit at the root is not untidiness — it is a change to production
 that nobody reviewed, waiting for the next deploy to pick it up.
@@ -450,53 +450,53 @@ Health check URLs are listed in the Quickstart section above.
 
 ### Worker
 
-- [worker-architecture](.opencode/skills/worker-architecture/SKILL.md)
+- [worker-architecture](.agents/skills/worker-architecture/SKILL.md)
   - Use when you need endpoint, table, and flow-level system understanding.
-- [worker-deployment](.opencode/skills/worker-deployment/SKILL.md)
+- [worker-deployment](.agents/skills/worker-deployment/SKILL.md)
   - Use when deploying to Cloudflare and validating production health/auth.
 - [telegram-forum-migration](docs/runbooks/telegram-forum-migration.md)
   - Runbook for Telegram Forum Topics supergroup migration and rollback steps.
-- [worker-operations](.opencode/skills/worker-operations/SKILL.md)
+- [worker-operations](.agents/skills/worker-operations/SKILL.md)
   - Use for incident triage, log tailing, quick diagnostics, and rollback steps.
-- [worker-troubleshooting](.opencode/skills/worker-troubleshooting/SKILL.md)
+- [worker-troubleshooting](.agents/skills/worker-troubleshooting/SKILL.md)
   - Use when notifications, webhook auth, or command routing are failing.
-- [worker-parity-checks](.opencode/skills/worker-parity-checks/SKILL.md)
+- [worker-parity-checks](.agents/skills/worker-parity-checks/SKILL.md)
   - Use for authenticated parity verification, including notification+reply flow.
 
 ### Daemon
 
-- [daemon-architecture](.opencode/skills/daemon-architecture/SKILL.md)
+- [daemon-architecture](.agents/skills/daemon-architecture/SKILL.md)
   - Use for daemon module boundaries, storage model, and worker integration flow.
-- [daemon-development](.opencode/skills/daemon-development/SKILL.md)
+- [daemon-development](.agents/skills/daemon-development/SKILL.md)
   - Use when implementing or testing daemon routes/services/adapters.
-- [daemon-operations](.opencode/skills/daemon-operations/SKILL.md)
+- [daemon-operations](.agents/skills/daemon-operations/SKILL.md)
   - Use for daemon service health checks, restarts, logs, and burn-in checks.
-- [daemon-troubleshooting](.opencode/skills/daemon-troubleshooting/SKILL.md)
+- [daemon-troubleshooting](.agents/skills/daemon-troubleshooting/SKILL.md)
   - Use when daemon notifications, command ingest, or injections fail.
-- [daemon-cutover-burnin](.opencode/skills/daemon-cutover-burnin/SKILL.md)
+- [daemon-cutover-burnin](.agents/skills/daemon-cutover-burnin/SKILL.md)
   - Use for systemd cutover/revert steps and production stabilization checks.
 
 ### OpenCode Plugin
 
-- [opencode-plugin-architecture](.opencode/skills/opencode-plugin-architecture/SKILL.md)
+- [opencode-plugin-architecture](.agents/skills/opencode-plugin-architecture/SKILL.md)
   - Use for plugin event lifecycle, session state, and daemon contract understanding.
-- [opencode-plugin-development](.opencode/skills/opencode-plugin-development/SKILL.md)
+- [opencode-plugin-development](.agents/skills/opencode-plugin-development/SKILL.md)
   - Use when changing plugin handlers, tests, or daemon payload fields.
-- [opencode-plugin-deployment](.opencode/skills/opencode-plugin-deployment/SKILL.md)
+- [opencode-plugin-deployment](.agents/skills/opencode-plugin-deployment/SKILL.md)
   - Use when deploying or updating the OpenCode plugin on devbox or via Nix.
 
 ### Swarm IPC
 
-- [swarm-architecture](.opencode/skills/swarm-architecture/SKILL.md)
+- [swarm-architecture](.agents/skills/swarm-architecture/SKILL.md)
   - Use for swarm tables, routes, the per-target arbiter, the session→directory registry, and the wire envelope.
-- [swarm-development](.opencode/skills/swarm-development/SKILL.md)
+- [swarm-development](.agents/skills/swarm-development/SKILL.md)
   - Use when adding swarm features (kinds, channels, plugin tools, schema changes) with TDD.
-- [swarm-operations](.opencode/skills/swarm-operations/SKILL.md)
+- [swarm-operations](.agents/skills/swarm-operations/SKILL.md)
   - Use for swarm health checks, inspecting messages, debugging stuck deliveries, and reading the arbiter log.
 
 ### Serve Pool / Routing Registry
 
-- [serve-pool-registry](.opencode/skills/serve-pool-registry/SKILL.md)
+- [serve-pool-registry](.agents/skills/serve-pool-registry/SKILL.md)
   - **Read before spawning ANY `opencode serve`** (directly, from a script, or
     transitively via a test harness) — your bash env carries a live pool identity.
     Also for diagnosing a slot pointing at a dead port, stuck draining, or 500ing
@@ -504,11 +504,11 @@ Health check URLs are listed in the Quickstart section above.
 
 ### Cross-Cutting
 
-- [secrets-and-auth](.opencode/skills/secrets-and-auth/SKILL.md)
+- [secrets-and-auth](.agents/skills/secrets-and-auth/SKILL.md)
   - Use for sops secret flow, token sources, and auth boundaries.
-- [machine-setup-devbox](.opencode/skills/machine-setup-devbox/SKILL.md)
+- [machine-setup-devbox](.agents/skills/machine-setup-devbox/SKILL.md)
   - Use when onboarding or repairing devbox/macOS machine configuration.
-- [cross-device-deployment](.opencode/skills/cross-device-deployment/SKILL.md)
+- [cross-device-deployment](.agents/skills/cross-device-deployment/SKILL.md)
   - Use when deploying pigeon code changes across all machines after merging to main.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
