@@ -2615,6 +2615,119 @@ describe("GooseSessionRunner liveness probing", () => {
       // c1 should never have been started
       expect(client.prompts).toEqual(["turn 0"]);
     });
+
+    it("runState stuck 'running', fallback tick probes: prompt sent; busy again -> re-queued at front, no duplicate notice; next tick probes again", async () => {
+      const { runner, client, stops, inflight } = makeRunner({ drainFallbackIntervalMs: 50 });
+      client.isHonk = true;
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      // Queue an item c1
+      await runner.deliver("c0", "turn 0");
+      await runner.deliver("c1", "queued probe test");
+      expect(stops.filter((s) => s.event === "Queued")).toHaveLength(1);
+
+      client.finishTurn(); // c0 finishes
+      await runner.settled();
+
+      // Client says runState is still "running", but c0 finished and queue has c1
+      expect(client.prompts).toEqual(["turn 0"]);
+
+      // Wait 70ms for fallback timer tick
+      await new Promise((r) => setTimeout(r, 70));
+
+      // Fallback tick should have probed by starting c1 despite runState="running"!
+      expect(client.prompts).toEqual(["turn 0", "queued probe test"]);
+
+      // Prompt returns busy again
+      client.finishBusy("run_still_busy");
+      await runner.settled();
+
+      // Re-queued at front, NO duplicate notice
+      expect(inflight.get("c1")?.state).toBe("queued");
+      expect(stops.filter((s) => s.event === "Queued")).toHaveLength(1);
+
+      // Next tick (after another 70ms) probes again
+      await new Promise((r) => setTimeout(r, 70));
+      expect(client.prompts).toEqual(["turn 0", "queued probe test", "queued probe test"]);
+    });
+
+    it("steer unconsumed arriving BEFORE steer() promise resolves enqueues with too-late notice", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      client.ownership = "own";
+      client.setRunId("20260918_1", "run_1");
+
+      let resolveSteer: (v: unknown) => void;
+      const steerPromise = new Promise((r) => {
+        resolveSteer = r;
+      });
+      client.steerImpl = () => steerPromise;
+
+      await runner.deliver("c1", "first");
+      const deliverSteerPromise = runner.deliver("c2", "steer text");
+
+      // Now unconsumed notification arrives BEFORE steer promise resolves!
+      runner.onSteerUnconsumed("steer_race_msg");
+
+      // Now steer promise resolves with messageId matching the unconsumed message
+      resolveSteer!({ kind: "steered", runId: "run_1", messageId: "steer_race_msg" });
+      const res = await deliverSteerPromise;
+
+      expect(res.ok).toBe(true);
+      expect(res.meta?.mode).toBe("queued");
+      expect(inflight.get("c2")?.state).toBe("queued");
+
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(1);
+      expect(queuedStops[0]!.notification_id).toBe(`s:${runner.sessionId}:c2:queued`);
+      expect(queuedStops[0]!.message).toBe("your message reached goose too late for the turn it was added to; queued");
+    });
+
+    it("drain starts a turn while deliver is awaiting connect -> deliver's message is queued, only one prompt in flight", async () => {
+      const { runner, client, inflight } = makeRunner();
+      client.isHonk = true;
+
+      // Disconnect so next deliver must connect
+      client.close();
+      let resolveConnect: () => void;
+      const connectPromise = new Promise<void>((r) => {
+        resolveConnect = r;
+      });
+      client.connectImpl = () => connectPromise;
+
+      // Deliver c_user: begins ensureConnected and awaits connectPromise
+      const deliverPromise = runner.deliver("c_user", "user text");
+
+      // While deliver is awaiting connect, enqueue a recovered turn and start it
+      const row: GooseInflightRecord = {
+        commandId: "c_drain",
+        sessionId: "20260918_1",
+        backendSessionId: "20260918_1",
+        isHonk: true,
+        promptText: "drain prompt",
+        recoveryAttempts: 0,
+        createdAt: 100,
+        updatedAt: 100,
+        lastAliveAt: 100,
+        cleanSuspend: true,
+        state: "queued",
+      };
+      inflight.insert(row);
+      runner.enqueueRecovered(row);
+
+      // Now connect succeeds: drain starts c_drain as turn
+      resolveConnect!();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const deliverRes = await deliverPromise;
+      expect(deliverRes.ok).toBe(true);
+      expect(deliverRes.meta?.mode).toBe("queued");
+
+      // Only c_drain is in flight, NOT c_user
+      expect(client.prompts).toEqual(["drain prompt"]);
+      expect(runner.isBusy()).toBe(true);
+      expect(inflight.get("c_user")?.state).toBe("queued");
+    });
   });
 
   describe("bead eng-agent-platform-555.18: permission deferred notice", () => {
@@ -2633,7 +2746,7 @@ describe("GooseSessionRunner liveness probing", () => {
         notification_id: "s:20260918_1:cmd-perm-1:permission",
         event: "Permission",
         message:
-          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat, or /kill to cancel the turn.",
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat.",
       });
 
       // Deferred again in the same turn -> no second notice
@@ -2647,6 +2760,16 @@ describe("GooseSessionRunner liveness probing", () => {
 
       await runner.onPermissionDeferred({ held: false, ownership: "foreign" });
       expect(stops).toHaveLength(0);
+    });
+
+    it("does not post notice when detail.held is false even with a pigeon turn in flight", async () => {
+      const { runner, stops } = makeRunner();
+      await runner.deliver("cmd-perm-foreign-defer", "do work");
+      expect(runner.isBusy()).toBe(true);
+
+      // Foreign deferral (held is false)
+      await runner.onPermissionDeferred({ held: false, ownership: "foreign" });
+      expect(stops.filter((s) => s.event === "Permission")).toHaveLength(0);
     });
   });
 });

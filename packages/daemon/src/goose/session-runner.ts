@@ -220,6 +220,9 @@ const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
 const DEFAULT_DRAIN_FALLBACK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes (Item 6)
 const QUEUED_NOTICE_MESSAGE =
   "goose is busy with a turn pigeon did not start (or cannot yet confirm is its own), so this was not added to it. It is queued and will be sent as a new turn when that turn ends.";
+const UNCONSUMED_STEER_TTL_MS = 30 * 1000; // ~30s
+const SENT_STEER_TTL_MS = 5 * 60 * 1000; // ~5 minutes
+const MAX_UNCONSUMED_STEER_IDS = 100;
 
 const BUSY_NOT_DELIVERED_TEXT =
   "goose was already running a turn and pigeon could not add this message to it. "
@@ -311,7 +314,8 @@ export class GooseSessionRunner {
   private suspended = false;
   private drainHeld = false;
   private queue: QueuedItem[] = [];
-  private sentSteers = new Map<string, { commandId: string; text: string }>();
+  private sentSteers = new Map<string, { commandId: string; text: string; createdAt: number }>();
+  private unconsumedSteerIds = new Map<string, number>();
   private draining = false;
   private drainFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryResolvedOrAttached: Promise<void> | undefined;
@@ -374,7 +378,10 @@ export class GooseSessionRunner {
     this.scheduleDrain();
   }
 
-  async onPermissionDeferred(_detail: { held: boolean; ownership: RunOwnership }): Promise<void> {
+  async onPermissionDeferred(detail: { held: boolean; ownership: RunOwnership }): Promise<void> {
+    if (!detail.held) {
+      return;
+    }
     const turn = this.turn;
     if (!turn) {
       return;
@@ -388,7 +395,7 @@ export class GooseSessionRunner {
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:permission`,
         message:
-          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat, or /kill to cancel the turn.",
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat.",
         event: "Permission",
       });
     } catch (err) {
@@ -400,9 +407,35 @@ export class GooseSessionRunner {
     }
   }
 
+  private pruneSentSteers(now: number = Date.now()): void {
+    for (const [id, entry] of this.sentSteers) {
+      if (now - entry.createdAt > SENT_STEER_TTL_MS) {
+        this.sentSteers.delete(id);
+      }
+    }
+  }
+
+  private pruneUnconsumedSteerIds(now: number = Date.now()): void {
+    for (const [id, ts] of this.unconsumedSteerIds) {
+      if (now - ts > UNCONSUMED_STEER_TTL_MS) {
+        this.unconsumedSteerIds.delete(id);
+      }
+    }
+  }
+
   onSteerUnconsumed(messageId: string): void {
+    this.pruneSentSteers();
+    this.pruneUnconsumedSteerIds();
+
     const steer = this.sentSteers.get(messageId);
-    if (!steer) return;
+    if (!steer) {
+      if (this.unconsumedSteerIds.size >= MAX_UNCONSUMED_STEER_IDS) {
+        const oldest = this.unconsumedSteerIds.keys().next().value;
+        if (oldest !== undefined) this.unconsumedSteerIds.delete(oldest);
+      }
+      this.unconsumedSteerIds.set(messageId, Date.now());
+      return;
+    }
     this.sentSteers.delete(messageId);
 
     void this.enqueue(
@@ -468,7 +501,7 @@ export class GooseSessionRunner {
       recovered: true,
     };
     this.turn = turn;
-    this.sentSteers.clear();
+    this.pruneSentSteers();
     this.opts.touch(this.sessionId);
     this.armIdleTimer(turn);
 
@@ -685,8 +718,19 @@ export class GooseSessionRunner {
       }
       if (outcome?.kind === "steered") {
         this.opts.touch(this.sessionId);
-        if (outcome.messageId) {
-          this.sentSteers.set(outcome.messageId, { commandId, text });
+        const messageId = outcome.messageId;
+        if (messageId) {
+          this.pruneUnconsumedSteerIds();
+          if (this.unconsumedSteerIds.has(messageId)) {
+            this.unconsumedSteerIds.delete(messageId);
+            return this.enqueue(
+              commandId,
+              text,
+              "your message reached goose too late for the turn it was added to; queued",
+            );
+          }
+          this.pruneSentSteers();
+          this.sentSteers.set(messageId, { commandId, text, createdAt: Date.now() });
         }
         return { ok: true, meta: { mode: "steered", runId } };
       }
@@ -708,6 +752,9 @@ export class GooseSessionRunner {
 
     // 3e. otherwise ensureConnected + startTurn as today.
     await this.ensureConnected();
+    if (this.turn || this.queue.length > 0) {
+      return this.enqueue(commandId, text);
+    }
     return this.startTurn(commandId, text);
   }
 
@@ -747,9 +794,9 @@ export class GooseSessionRunner {
     return { ok: true, meta: { mode: "queued" } };
   }
 
-  private scheduleDrain(): void {
+  private scheduleDrain(opts?: { probe?: boolean }): void {
     queueMicrotask(() => {
-      void this.maybeDrain().catch((err: unknown) => {
+      void this.maybeDrain(opts).catch((err: unknown) => {
         this.log("goose runner: maybeDrain unhandled error", {
           sessionId: this.sessionId,
           error: err instanceof Error ? err.message : String(err),
@@ -758,14 +805,15 @@ export class GooseSessionRunner {
     });
   }
 
-  async maybeDrain(): Promise<void> {
+  async maybeDrain(opts?: { probe?: boolean }): Promise<void> {
     if (this.draining) return;
     if (this.closed || this.suspended || this.drainHeld) return;
     if (this.turn) return;
     if (this.queue.length === 0) return;
 
+    const isProbe = opts?.probe === true;
     const runState = this.opts.client.runState?.(this.backendSessionId);
-    if (runState === "running") {
+    if (!isProbe && runState === "running") {
       this.armDrainFallbackTimer();
       return;
     }
@@ -834,7 +882,7 @@ export class GooseSessionRunner {
     const interval = this.opts.drainFallbackIntervalMs ?? DEFAULT_DRAIN_FALLBACK_INTERVAL_MS;
     this.drainFallbackTimer = setTimeout(() => {
       this.drainFallbackTimer = undefined;
-      this.scheduleDrain();
+      this.scheduleDrain({ probe: true });
       if (this.queue.length > 0 && !this.turn) {
         this.armDrainFallbackTimer();
       }
@@ -857,7 +905,7 @@ export class GooseSessionRunner {
    * That is what makes "throw means nothing was sent" true for callers.
    */
   private startTurn(commandId: string, text: string, options?: { fromQueue?: boolean }): DeliverOutcome {
-    this.sentSteers.clear();
+    this.pruneSentSteers();
     this.clearIdleSocketTimer();
     this.clearDrainFallbackTimer();
 
