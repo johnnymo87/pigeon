@@ -1,3 +1,8 @@
+---
+name: opencode-plugin-deployment
+description: Use when deploying or updating the OpenCode plugin on devbox or via Nix
+---
+
 # OpenCode Plugin Deployment
 
 ## Overview
