@@ -728,4 +728,207 @@ describe("recoverGooseTurns (Commit 2)", () => {
     expect(s.inbox.get("cmd_r1")?.status).toBe("done");
     expect(s.inbox.get("cmd_r2")?.status).toBe("done");
   });
+
+  describe("Queued rows recovery (Spec bead eng-agent-platform-555.17)", () => {
+    it("recovers sent rows first, then hands queued rows in created order to runner.enqueueRecovered without waiting to settle", async () => {
+      const s = newStorage();
+      const session = createSession(s, "ses_q_rec");
+      const client = new FakeClient();
+      const registry = new GooseRunnerRegistry({
+        inbox: s.inbox,
+        inflight: s.gooseInflight,
+        createRunner: (sess) =>
+          new GooseSessionRunner({
+            session: sess,
+            client,
+            inflight: s.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+
+      // Insert 1 sent row and 2 queued rows
+      s.gooseInflight.insert({
+        commandId: "cmd_sent_1",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "sent turn",
+        createdAt: 100,
+        state: "sent",
+      });
+      s.gooseInflight.insert({
+        commandId: "cmd_q_1",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "queued turn 1",
+        createdAt: 200,
+        state: "queued",
+      });
+      s.gooseInflight.insert({
+        commandId: "cmd_q_2",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "queued turn 2",
+        createdAt: 300,
+        state: "queued",
+      });
+
+      const runner = registry.get(session);
+      const enqueueRecoveredSpy = vi.spyOn(runner, "enqueueRecovered");
+
+      // Run recovery
+      const recoverPromise = recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now: 1000,
+      });
+
+      // Settle the sent row
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(1));
+      expect(client.prompts[0]).toBe("sent turn");
+      client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "sent answer" });
+
+      await runner.settled();
+      await vi.waitFor(() => expect(enqueueRecoveredSpy).toHaveBeenCalledTimes(2));
+
+      // Both queued rows handed to enqueueRecovered in created order
+      expect(enqueueRecoveredSpy.mock.calls[0]![0].commandId).toBe("cmd_q_1");
+      expect(enqueueRecoveredSpy.mock.calls[1]![0].commandId).toBe("cmd_q_2");
+    });
+
+    it("posts notice and deletes queued row older than 24h", async () => {
+      const s = newStorage();
+      const session = createSession(s, "ses_q_stale");
+      const client = new FakeClient();
+      const registry = new GooseRunnerRegistry({
+        inbox: s.inbox,
+        inflight: s.gooseInflight,
+        createRunner: (sess) =>
+          new GooseSessionRunner({
+            session: sess,
+            client,
+            inflight: s.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+
+      const now = 200_000_000;
+      s.gooseInflight.insert({
+        commandId: "cmd_q_stale",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "stale queued turn",
+        createdAt: now - (25 * 60 * 60 * 1000), // 25h old
+        state: "queued",
+      });
+      s.inbox.persist({
+        commandId: "cmd_q_stale",
+        payload: "stale queued turn",
+      });
+
+      const notices: Array<Record<string, unknown>> = [];
+      await recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now,
+        postStop: async (body) => {
+          notices.push(body);
+        },
+      });
+
+      // Row deleted and inbox marked done
+      expect(s.gooseInflight.get("cmd_q_stale")).toBeUndefined();
+      expect(s.inbox.get("cmd_q_stale")?.status).toBe("done");
+
+      // Stale notice posted
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.notification_id).toBe(`s:${session.sessionId}:cmd_q_stale`);
+      expect(notices[0]!.message).toBe("pigeon queued this message more than 24h ago and never sent it; nothing was sent");
+    });
+
+    it("a deliver() during a resumed turn queues behind the recovered queued row, and nothing drains before the sent rows are processed", async () => {
+      const s = newStorage();
+      const session = createSession(s, "ses_q_order");
+      const client = new FakeClient();
+      const registry = new GooseRunnerRegistry({
+        inbox: s.inbox,
+        inflight: s.gooseInflight,
+        createRunner: (sess) =>
+          new GooseSessionRunner({
+            session: sess,
+            client,
+            inflight: s.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+
+      const now = 1000;
+      // 1 sent row and 1 queued row
+      s.gooseInflight.insert({
+        commandId: "cmd_sent",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "sent prompt",
+        createdAt: 100,
+        state: "sent",
+      });
+      s.gooseInflight.insert({
+        commandId: "cmd_queued",
+        sessionId: session.sessionId,
+        backendSessionId: "b1",
+        isHonk: true,
+        promptText: "queued prompt",
+        createdAt: 200,
+        state: "queued",
+      });
+
+      const runner = registry.get(session);
+
+      // Start recovery in background
+      void recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now,
+      });
+
+      // Wait for resumed sent row to start
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(1));
+      expect(client.prompts[0]).toBe("sent prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_sent");
+
+      // While cmd_sent is active, poller delivers cmd_poller
+      const deliverRes = await runner.deliver("cmd_poller", "poller prompt");
+      expect(deliverRes.ok).toBe(true);
+      expect(deliverRes.meta?.mode).toBe("queued");
+
+      // Nothing drains before the sent rows are processed
+      await new Promise((r) => setTimeout(r, 20));
+      expect(client.prompts).toHaveLength(1);
+
+      // Settle sent row
+      client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "sent answer" });
+      await runner.settled();
+
+      // Now queued row should drain FIRST (before cmd_poller)
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(2));
+      expect(client.prompts[1]).toBe("queued prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_queued");
+
+      // Settle queued row
+      client.turns.shift()?.resolve({ kind: "receipt", stopReason: "end_turn", text: "queued answer" });
+      await runner.settled();
+
+      // Finally poller row drains
+      await vi.waitFor(() => expect(client.prompts).toHaveLength(3));
+      expect(client.prompts[2]).toBe("poller prompt");
+      expect(runner.activeTurn?.commandId).toBe("cmd_poller");
+    });
+  });
 });

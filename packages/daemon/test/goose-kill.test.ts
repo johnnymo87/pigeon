@@ -2,6 +2,30 @@ import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, it, expect, vi } from "vitest";
 import { executeGooseKill, pickKillReply, type GooseKillDeps } from "../src/goose/kill-control.js";
 import type { SessionRecord } from "../src/storage/types.js";
+import { openStorageDb } from "../src/storage/database.js";
+import { GooseRunnerRegistry, GooseSessionRunner } from "../src/goose/session-runner.js";
+
+class RealFakeClient {
+  connected = true;
+  closed = false;
+  isHonk = true;
+  prompts: string[] = [];
+  ownership = "own";
+  runOwnership = () => this.ownership as "own" | "pending" | "foreign" | "unknown";
+  runStateValue = "idle";
+  runState = () => this.runStateValue as "unknown" | "idle" | "running";
+  activeRunId = () => undefined;
+  async connect() { this.connected = true; }
+  isClosed() { return this.closed; }
+  async ping() {}
+  async prompt(_sid: string, text: string) {
+    this.prompts.push(text);
+    return new Promise(() => {});
+  }
+  async steer() { return { kind: "steered" }; }
+  cancel() {}
+  close() { this.closed = true; }
+}
 
 describe("pickKillReply", () => {
   it("honk + sent: says asked honkd to cancel, not cancelled", () => {
@@ -76,6 +100,7 @@ describe("executeGooseKill", () => {
     let cancelOutcome: "sent" | "no-connection" | "failed" = "sent";
     let isHonk = false;
     let isHonkKnown = true;
+    let queuedCount = 0;
 
     const fakeRunner = {
       get isHonk() { return isHonk; },
@@ -83,6 +108,10 @@ describe("executeGooseKill", () => {
       cancel: vi.fn(async () => {
         events.push("cancel");
         return cancelOutcome;
+      }),
+      dropQueued: vi.fn(() => {
+        events.push("dropQueued");
+        return queuedCount;
       }),
     };
 
@@ -129,6 +158,7 @@ describe("executeGooseKill", () => {
       fakeRunner,
       setCancelOutcome: (o: "sent" | "no-connection" | "failed") => { cancelOutcome = o; },
       setIsHonk: (h: boolean, known = true) => { isHonk = h; isHonkKnown = known; },
+      setQueuedCount: (n: number) => { queuedCount = n; },
     };
   }
 
@@ -140,6 +170,7 @@ describe("executeGooseKill", () => {
     expect(events).toEqual([
       "sessions.get:gse_123",
       "gooseRunners.get",
+      "dropQueued",
       "cancel",
       "gooseRunners.drop:gse_123",
       "sessions.delete:gse_123",
@@ -273,5 +304,83 @@ describe("executeGooseKill", () => {
     expect(events).toContain("poller.unregisterSession:gse_123");
     expect(deps.reply).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+
+  it("calls runner.dropQueued() before drop and appends discarded count to reply when >0", async () => {
+    const { deps, events, setQueuedCount } = makeDeps();
+    setQueuedCount(3);
+
+    await executeGooseKill("gse_123", deps);
+
+    const dropQueuedIdx = events.indexOf("dropQueued");
+    const dropRunnerIdx = events.indexOf("gooseRunners.drop:gse_123");
+    expect(dropQueuedIdx).toBeGreaterThanOrEqual(0);
+    expect(dropRunnerIdx).toBeGreaterThan(dropQueuedIdx);
+
+    expect(deps.reply).toHaveBeenCalledWith(
+      expect.stringMatching(/ 3 queued message\(s\) were discarded\.$/),
+    );
+  });
+
+  it("kills a session with a real GooseSessionRunner holding an active turn and queued message", async () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      storage.sessions.upsert({
+        sessionId: "gse_real_1",
+        cwd: "/tmp",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:38910/acp",
+        backendAuthToken: "tok",
+        backendProtocolVersion: 1,
+      });
+
+      const fakeClient = new RealFakeClient();
+      fakeClient.isHonk = true;
+
+      const registry = new GooseRunnerRegistry({
+        inbox: storage.inbox,
+        inflight: storage.gooseInflight,
+        createRunner: (sess) =>
+          new GooseSessionRunner({
+            session: sess,
+            client: fakeClient as never,
+            inflight: storage.gooseInflight,
+            postStop: async () => {},
+            touch: () => {},
+          }),
+      });
+
+      const runner = registry.get(storage.sessions.get("gse_real_1")!);
+
+      // Start an active turn c0
+      await runner.deliver("c0", "turn 0");
+      fakeClient.runStateValue = "running";
+      fakeClient.ownership = "foreign";
+
+      // Queue message c1
+      await runner.deliver("c1", "turn 1");
+      expect(storage.gooseInflight.get("c1")?.state).toBe("queued");
+
+      const replied: string[] = [];
+      const deps: GooseKillDeps = {
+        storage,
+        gooseRunners: registry,
+        reply: async (text) => {
+          replied.push(text);
+        },
+      };
+
+      await executeGooseKill("gse_real_1", deps);
+
+      // No new prompt is sent (only turn 0 was prompted)
+      expect(fakeClient.prompts).toEqual(["turn 0"]);
+      // Queued row is deleted from inflight store
+      expect(storage.gooseInflight.get("c1")).toBeUndefined();
+      // Reply reports the count
+      expect(replied).toHaveLength(1);
+      expect(replied[0]).toContain("1 queued message(s) were discarded.");
+    } finally {
+      storage.db.close();
+    }
   });
 });

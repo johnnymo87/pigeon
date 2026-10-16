@@ -5,8 +5,12 @@ import {
   DEFAULT_SESSION_EXTENSIONS,
   DEFAULT_SERVE_FLOOR,
   DisconnectedDuringTurn,
+  ownRunPolicy,
+  refuse,
+  MEASURED_GOOSE_PERMISSION_OPTIONS,
   type AcpTransport,
   type AcpTransportFactory,
+  type GooseAcpClientOptions,
 } from "../src/goose/acp-client.js";
 
 /**
@@ -102,7 +106,7 @@ function autoHandshake(
   };
 }
 
-function makeClient(peer: FakePeer, opts: Record<string, unknown> = {}) {
+function makeClient(peer: FakePeer, opts: Partial<GooseAcpClientOptions> = {}) {
   const factory: AcpTransportFactory = () => peer;
   return new GooseAcpClient({
     url: "ws://fake/acp",
@@ -422,6 +426,891 @@ describe("GooseAcpClient", () => {
       expect(peer.sent.find((m) => m.id === "perm-b")!.result).toEqual({
         outcome: { outcome: "selected", optionId: "allow_once" },
       });
+    });
+  });
+
+  describe("bead eng-agent-platform-1o9: permission options and allow_always guard", () => {
+    it("refuse() picks reject_once from the measured option set", () => {
+      expect(refuse(MEASURED_GOOSE_PERMISSION_OPTIONS)).toBe("reject_once");
+    });
+
+    it("refuse() tolerates non-array options and returns undefined", () => {
+      expect(refuse(undefined as any)).toBeUndefined();
+      expect(refuse(null as any)).toBeUndefined();
+      expect(refuse({} as any)).toBeUndefined();
+    });
+
+    it("ownRunPolicy in an own run picks allow_once from the measured option set", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "own", isHonk: true },
+      );
+      expect(decision).toEqual({ answer: "allow_once" });
+    });
+
+    it("bare goose treats as own regardless of ownership and picks allow_once", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "foreign", isHonk: false },
+      );
+      expect(decision).toEqual({ answer: "allow_once" });
+    });
+
+    it("ownRunPolicy defers on honk for foreign runs", () => {
+      const decision = ownRunPolicy(
+        { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        { ownership: "foreign", isHonk: true },
+      );
+      expect(decision).toEqual({ defer: true });
+    });
+
+    it("ownRunPolicy defers on honk for pending or unknown runs", () => {
+      expect(
+        ownRunPolicy(
+          { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+          { ownership: "pending", isHonk: true },
+        ),
+      ).toEqual({ defer: true });
+      expect(
+        ownRunPolicy(
+          { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+          { ownership: "unknown", isHonk: true },
+        ),
+      ).toEqual({ defer: true });
+    });
+
+    it("nothing ever picks allow_always (a policy that tries is converted to refusal and logged)", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const logs: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: () => ({ answer: "allow_always" }),
+        log: (msg, fields) => logs.push({ msg, fields }),
+      });
+      await client.connect();
+      void client.prompt("sess-1", "x").catch(() => {});
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-always",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-always");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
+      expect(logs.some((l) => l.msg.includes("allow_always"))).toBe(true);
+    });
+  });
+
+  describe("bead eng-agent-platform-555.18: answer goose permission requests only in pigeon's own runs", () => {
+    it("own honk run -> allow_once answered", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      const promptPromise = client.prompt("sess-1", "hello", { clientReqId: "crid-own" });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-own",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-own" } } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_own_1" } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-own",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-own");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await promptPromise;
+    });
+
+    it("foreign honk run -> no answer frame sent at all", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_foreign_1" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-foreign",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-foreign");
+      expect(answer).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: false, ownership: "foreign" } },
+      ]);
+    });
+
+    it("pending -> held, then echo makes it own -> answered once with allow_once", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      const promptPromise = client.prompt("sess-1", "hello", { clientReqId: "crid-pending" });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pending_1" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-pending",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-pending")).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: true, ownership: "pending" } },
+      ]);
+
+      // Synth echo arrives for our clientReqId -> makes ownership own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-pending",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-pending" } } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      const answer = peer.sent.find((m) => m.id === "perm-pending");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+      const answersCount = peer.sent.filter((m) => m.id === "perm-pending").length;
+      expect(answersCount).toBe(1);
+
+      // Finish turn
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await promptPromise;
+
+      // Ensure never answered twice
+      expect(peer.sent.filter((m) => m.id === "perm-pending").length).toBe(1);
+    });
+
+    it("unknown -> held, run ends (null) -> dropped, never answered", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: { held: boolean; ownership: string } }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-unk",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-unk")).toBeUndefined();
+      expect(deferred).toEqual([
+        { sessionId: "sess-1", detail: { held: true, ownership: "unknown" } },
+      ]);
+
+      // Run ends (activeRunId: null) -> dropped
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: null } },
+          },
+        },
+      });
+
+      // Later run becomes own -> perm-unk was dropped and must not be answered
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_new_1" } },
+          },
+        },
+      });
+
+      expect(peer.sent.find((m) => m.id === "perm-unk")).toBeUndefined();
+    });
+
+    it("socket close drops held", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-close",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(peer.sent.find((m) => m.id === "perm-close")).toBeUndefined();
+
+      // Socket drops
+      peer.drop();
+      await client.connect();
+
+      // Run becomes own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_after_close" } },
+          },
+        },
+      });
+
+      expect(peer.sent.find((m) => m.id === "perm-close")).toBeUndefined();
+    });
+
+    it("bare goose -> allow_once regardless of ownership", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer); // bare goose: initialize without _meta.honk
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      // Session ownership is unknown
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-bare",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const answer = peer.sent.find((m) => m.id === "perm-bare");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+    });
+
+    it("throwing policy on honk non-own -> no answer, on bare -> refusal", async () => {
+      const honkPeer = new FakePeer();
+      honkPeer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const honkClient = makeClient(honkPeer, {
+        permissionPolicy: () => {
+          throw new Error("policy explosion");
+        },
+      });
+      await honkClient.connect();
+
+      // Non-own run on honk
+      honkPeer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_honk_foreign" } },
+          },
+        },
+      });
+      expect(honkClient.runOwnership("sess-1")).toBe("foreign");
+
+      honkPeer.emit({
+        jsonrpc: "2.0",
+        id: "perm-honk-throw",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Honk non-own: no answer frame sent
+      expect(honkPeer.sent.find((m) => m.id === "perm-honk-throw")).toBeUndefined();
+
+      // Bare goose peer
+      const barePeer = new FakePeer();
+      autoHandshake(barePeer);
+      const bareClient = makeClient(barePeer, {
+        permissionPolicy: () => {
+          throw new Error("bare policy explosion");
+        },
+      });
+      await bareClient.connect();
+
+      barePeer.emit({
+        jsonrpc: "2.0",
+        id: "perm-bare-throw",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Bare goose: falls back to refusal
+      const bareAnswer = barePeer.sent.find((m) => m.id === "perm-bare-throw");
+      expect(bareAnswer).toBeDefined();
+      expect(bareAnswer!.result).toEqual({ outcome: { outcome: "selected", optionId: "reject_once" } });
+    });
+
+    it("only calls onPermissionDeferred for method === session/request_permission", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const deferred: Array<{ sessionId: string; detail: unknown }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onPermissionDeferred: (sessionId, detail) => deferred.push({ sessionId, detail }),
+      });
+      await client.connect();
+
+      // Send another method server request
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "req-other",
+        method: "other/server_request",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(deferred).toHaveLength(0);
+    });
+
+    it("onHonkReset drops held requests for that session", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-before-reset",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+
+      // _honk/reset arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/reset",
+        params: { sessionId: "sess-1" },
+      });
+      await Promise.resolve();
+
+      // Replay finishes and run becomes own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/replay_done",
+        params: { sessionId: "sess-1" },
+      });
+      await Promise.resolve();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_reset_1" } },
+          },
+        },
+      });
+      await Promise.resolve();
+
+      // The held request before reset must NOT have been answered
+      expect(peer.sent.find((m) => m.id === "perm-before-reset")).toBeUndefined();
+    });
+
+    it("tracks run state through replay: request held during replay → echo + run start → answered at replay_done", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const updates: Array<Record<string, unknown>> = [];
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onSessionUpdate: (_sid, u) => updates.push(u),
+        onRunStateChange: (sessionId, state) => stateChanges.push({ sessionId, ...state }),
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-replay-own" });
+
+      // honk resets for replay
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/reset",
+        params: { sessionId: "sess-1" },
+      });
+
+      // Request arrives and is held during replay
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-during-replay",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      // Not answered mid-replay
+      expect(peer.sent.find((m) => m.id === "perm-during-replay")).toBeUndefined();
+
+      // Replay frames arrive: echo for our crid, then activeRunId, plus text chunks
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-replay-own",
+            _meta: { honk: { source: { client_req_id: "crid-replay-own" } } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_replay_own" } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "replayed text" },
+          },
+        },
+      });
+
+      // Still replaying: chunks must NOT be forwarded to onSessionUpdate, and stateChanges not fired
+      expect(updates).toHaveLength(0);
+      expect(stateChanges).toHaveLength(0);
+      expect(peer.sent.find((m) => m.id === "perm-during-replay")).toBeUndefined();
+
+      // Now replay_done arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/replay_done",
+        params: { sessionId: "sess-1" },
+      });
+      await Promise.resolve();
+
+      // State change fired with the resulting view
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_replay_own", ownership: "own" },
+      ]);
+      // And held request is answered allow_once!
+      const answer = peer.sent.find((m) => m.id === "perm-during-replay");
+      expect(answer).toBeDefined();
+      expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("tracks run state through replay: replay of old foreign run then null → idle, nothing answered", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        onRunStateChange: (sessionId, state) => stateChanges.push({ sessionId, ...state }),
+      });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/reset",
+        params: { sessionId: "sess-1" },
+      });
+
+      // Replay contains foreign run start then null
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_old_foreign" } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: null } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/replay_done",
+        params: { sessionId: "sess-1" },
+      });
+      await Promise.resolve();
+
+      expect(client.runState("sess-1")).toBe("idle");
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "idle", runId: undefined, ownership: "unknown" },
+      ]);
+    });
+
+    it("drops held requests when pending run transitions to foreign", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-my-turn" });
+
+      // Run starts in pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pending_1" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      // Permission request held
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-pending-to-foreign",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+      expect(peer.sent.find((m) => m.id === "perm-pending-to-foreign")).toBeUndefined();
+
+      // Foreign echo arrives -> changes ownership to foreign
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-other",
+            _meta: { honk: { source: { client_req_id: "crid-other" } } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+
+      // Later our echo arrives in next run or state becomes own -> perm-pending-to-foreign was dropped!
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-my-turn",
+            _meta: { honk: { source: { client_req_id: "crid-my-turn" } } },
+          },
+        },
+      });
+
+      expect(peer.sent.find((m) => m.id === "perm-pending-to-foreign")).toBeUndefined();
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("drops held requests when runId changes to a different run", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+      await client.connect();
+
+      void client.prompt("sess-1", "hello", { clientReqId: "crid-1" }).catch(() => {});
+
+      // Run 1 starts in pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_1" } },
+          },
+        },
+      });
+
+      // Held in run 1
+      peer.emit({
+        jsonrpc: "2.0",
+        id: "perm-run-1",
+        method: "session/request_permission",
+        params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+      });
+      await Promise.resolve();
+
+      // runId changes to run_2 while still pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_2" } },
+          },
+        },
+      });
+
+      // Echo arrives for crid-1
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-1",
+            _meta: { honk: { source: { client_req_id: "crid-1" } } },
+          },
+        },
+      });
+
+      // perm-run-1 was dropped when runId changed, so it is never answered
+      expect(peer.sent.find((m) => m.id === "perm-run-1")).toBeUndefined();
+    });
+
+    it("caps held requests per session at 50, evicting the oldest with a log", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const logs: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+      const client = makeClient(peer, {
+        permissionPolicy: ownRunPolicy,
+        log: (msg, fields) => logs.push({ msg, fields }),
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-cap" });
+
+      // Pending run
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_cap" } },
+          },
+        },
+      });
+
+      // Send 51 permission requests
+      for (let i = 1; i <= 51; i++) {
+        peer.emit({
+          jsonrpc: "2.0",
+          id: `perm-req-${i}`,
+          method: "session/request_permission",
+          params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        });
+      }
+      await Promise.resolve();
+
+      // Check log: oldest was evicted
+      expect(logs.some((l) => l.msg.includes("evict") && l.fields?.id === "perm-req-1")).toBe(true);
+
+      // Now echo arrives making it own
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-cap",
+            _meta: { honk: { source: { client_req_id: "crid-cap" } } },
+          },
+        },
+      });
+
+      // perm-req-1 was evicted, so it was NOT answered
+      expect(peer.sent.find((m) => m.id === "perm-req-1")).toBeUndefined();
+      // perm-req-2 through 51 were answered
+      expect(peer.sent.find((m) => m.id === "perm-req-2")).toBeDefined();
+      expect(peer.sent.find((m) => m.id === "perm-req-51")).toBeDefined();
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
     });
   });
 
@@ -1238,4 +2127,1044 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       });
     });
   });
+
+  describe("honkd viewer and run ownership tracking (bead 555.16)", () => {
+    it("initialize carries _meta.honk on connect and ping", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            _meta: { honk: { protocol: 1 } },
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const connectInit = peer.sent.find((m) => m.method === "initialize")!;
+      expect(connectInit.params).toEqual({
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        _meta: { honk: {} },
+      });
+
+      await client.ping();
+      const pingInit = peer.sent.filter((m) => m.method === "initialize")[1]!;
+      expect(pingInit.params).toEqual({
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        _meta: { honk: {} },
+      });
+    });
+
+    it("untracked session reports state unknown, ownership unknown, and activeRunId undefined", () => {
+      const peer = new FakePeer();
+      const client = makeClient(peer);
+      expect(client.runState("sess-none")).toBe("unknown");
+      expect(client.runOwnership("sess-none")).toBe("unknown");
+      expect(client.activeRunId("sess-none")).toBeUndefined();
+    });
+
+    it("own run (echo ours then activeRunId)", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      // Start prompt with our clientReqId
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-own" });
+
+      // 1. Honkd sends synthesized echo for our prompt
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-own",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-own" } } },
+          },
+        },
+      });
+      // Echo alone did not change state to running
+      expect(client.runState("sess-1")).toBe("unknown");
+
+      // 2. Active run id arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_own_1" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_own_1");
+      expect(client.runOwnership("sess-1")).toBe("own");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_own_1", ownership: "own" },
+      ]);
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("echo after run start upgrades pending→own", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-delay" });
+
+      // Active run id arrives FIRST (delayed echo)
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_delay_1" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_delay_1");
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      // Echo arrives AFTER run start
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-delay",
+            content: { type: "text", text: "hello" },
+            _meta: { honk: { source: { client_req_id: "crid-delay" } } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_delay_1");
+      expect(client.runOwnership("sess-1")).toBe("own");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_delay_1", ownership: "pending" },
+        { sessionId: "sess-1", state: "running", runId: "run_delay_1", ownership: "own" },
+      ]);
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("foreign echo → foreign", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-mine" });
+
+      // Foreign echo arrives before run start
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-other",
+            content: { type: "text", text: "other prompt" },
+            _meta: { honk: { source: { client_req_id: "crid-other" } } },
+          },
+        },
+      });
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_foreign_1" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_foreign_1");
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("no echo with our prompt outstanding → pending", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-pending" });
+
+      // No echo arrives, activeRunId arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pend_1" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_pend_1");
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("no prompt outstanding → foreign", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      // No prompt issued by us
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_unsolicited" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_unsolicited");
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+    });
+
+    it("repeated same activeRunId keeps ownership", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const changes: number[] = [];
+      const client = makeClient(peer, {
+        onRunStateChange: () => {
+          changes.push(Date.now());
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "hello", { clientReqId: "crid-repeat" });
+
+      // Run starts with no echo -> pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_rep_1" } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("pending");
+      expect(changes.length).toBe(1);
+
+      // Repeat activeRunId frame
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_rep_1" } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("pending");
+      expect(changes.length).toBe(1); // No new change event emitted
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("activeRunId null clears run id and ownership (regression for the ignored-null bug)", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      // Start run
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_null_test" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_null_test");
+
+      // activeRunId: null arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: null } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("idle");
+      expect(client.activeRunId("sess-1")).toBeUndefined();
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_null_test", ownership: "foreign" },
+        { sessionId: "sess-1", state: "idle", runId: undefined, ownership: "unknown" },
+      ]);
+    });
+
+    it("busy → foreign with run id", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "try it");
+      const req = peer.lastOf("session/prompt")!;
+      peer.replyError(req.id, -32603, "internal error", "session already has active run `run_from_busy`");
+
+      const res = await p;
+      expect(res).toEqual({ kind: "busy", runId: "run_from_busy" });
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_from_busy");
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_from_busy", ownership: "foreign" },
+      ]);
+    });
+
+    it("busy does not downgrade if already running r as own", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      // First prompt runs as own
+      const p1 = client.prompt("sess-1", "first", { clientReqId: "crid-own" });
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-own",
+            content: { type: "text", text: "first" },
+            _meta: { honk: { source: { client_req_id: "crid-own" } } },
+          },
+        },
+      });
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_own_busy" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      // Concurrent prompt gets busy naming the same run
+      const p2 = client.prompt("sess-1", "second");
+      const req2 = peer.sent.filter((m) => m.method === "session/prompt")[1]!;
+      peer.replyError(req2.id, -32603, "internal error", "session already has active run `run_own_busy`");
+      await p2;
+
+      // Ownership should NOT have downgraded to foreign
+      expect(client.runOwnership("sess-1")).toBe("own");
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_own_busy");
+
+      const req1 = peer.sent.filter((m) => m.method === "session/prompt")[0]!;
+      peer.reply(req1.id, { stopReason: "end_turn" });
+      await p1;
+    });
+
+    it("honk receipt does not reset a run that started (next parked prompt's echo+run arriving before our reply)", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p1 = client.prompt("sess-1", "prompt 1", { clientReqId: "crid-1" });
+      const req1 = peer.lastOf("session/prompt")!;
+
+      // Next parked prompt's echo + activeRunId arrives BEFORE prompt 1's reply
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-parked",
+            content: { type: "text", text: "prompt 2" },
+            _meta: { honk: { source: { client_req_id: "crid-parked" } } },
+          },
+        },
+      });
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_parked_2" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_parked_2");
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+
+      // Now prompt 1's reply arrives with receipt
+      peer.reply(req1.id, { stopReason: "end_turn" });
+      await p1;
+
+      // For a honk peer, receipt must NOT reset run state!
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_parked_2");
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+    });
+
+    it("bare-goose (no _meta.honk in initialize response) run during our prompt → own, receipt → idle", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+      expect(client.isHonk).toBe(false);
+
+      const p = client.prompt("sess-1", "prompt bare");
+
+      // activeRunId arrives during our prompt (no echo exists in bare goose)
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_bare_1" } },
+          },
+        },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_bare_1");
+      expect(client.runOwnership("sess-1")).toBe("own");
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+
+      // Bare goose: receipt resets state to idle, runId undefined, ownership unknown
+      expect(client.runState("sess-1")).toBe("idle");
+      expect(client.activeRunId("sess-1")).toBeUndefined();
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+    });
+
+    it("replay between _honk/reset and _honk/replay_done is not forwarded to onSessionUpdate and leaves state unknown", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const updates1: unknown[] = [];
+      const updates2: unknown[] = [];
+      const stateChanges: Array<Record<string, unknown>> = [];
+
+      const client = makeClient(peer, {
+        onSessionUpdate: (sessionId, update) => {
+          if (sessionId === "sess-1") updates1.push(update);
+          if (sessionId === "sess-2") updates2.push(update);
+        },
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      // _honk/reset for sess-1
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/reset",
+        params: { sessionId: "sess-1" },
+      });
+
+      // Frames during replay for sess-1
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_old_history" } },
+          },
+        },
+      });
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: { sessionUpdate: "agent_message_chunk", text: "old history" },
+        },
+      });
+
+      // sess-2 frame (unaffected)
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-2",
+          update: { sessionUpdate: "agent_message_chunk", text: "live for sess-2" },
+        },
+      });
+
+      expect(updates1).toEqual([]);
+      expect(updates2.length).toBe(1);
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_old_history");
+
+      // _honk/replay_done for sess-1
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/replay_done",
+        params: { sessionId: "sess-1" },
+      });
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_old_history", ownership: "foreign" },
+      ]);
+
+      // After replay_done, new live frames for sess-1 ARE forwarded
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: { sessionUpdate: "agent_message_chunk", text: "live chunk" },
+        },
+      });
+      expect(updates1.length).toBe(1);
+    });
+
+    it("steer_unconsumed callback fires on _honk/steer_unconsumed notification", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const unconsumed: Array<{ sessionId: string; messageId: string }> = [];
+      const client = makeClient(peer, {
+        onSteerUnconsumed: (sessionId, messageId) => {
+          unconsumed.push({ sessionId, messageId });
+        },
+      });
+      await client.connect();
+
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/steer_unconsumed",
+        params: { sessionId: "sess-1", messageId: "steer-msg-42" },
+      });
+
+      expect(unconsumed).toEqual([
+        { sessionId: "sess-1", messageId: "steer-msg-42" },
+      ]);
+    });
+
+    it("reconnect/close resets to unknown and DisconnectedDuringTurn still names the run id", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "in flight turn");
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_disconnect_test" } },
+          },
+        },
+      });
+      expect(client.activeRunId("sess-1")).toBe("run_disconnect_test");
+
+      // Socket drops
+      peer.drop();
+
+      await expect(p).rejects.toSatisfy((err: unknown) => {
+        expect(err).toBeInstanceOf(DisconnectedDuringTurn);
+        const dt = err as DisconnectedDuringTurn;
+        expect(dt.sessionId).toBe("sess-1");
+        expect(dt.runId).toBe("run_disconnect_test");
+        return true;
+      });
+
+      // After drop, state is reset to unknown
+      expect(client.runState("sess-1")).toBe("unknown");
+      expect(client.activeRunId("sess-1")).toBeUndefined();
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+      expect(stateChanges).toContainEqual({
+        sessionId: "sess-1",
+        state: "unknown",
+        runId: undefined,
+        ownership: "unknown",
+      });
+    });
+
+    it("a throwing onRunStateChange does not break frame handling", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, {
+        onRunStateChange: () => {
+          throw new Error("subscriber exploded");
+        },
+      });
+      await client.connect();
+
+      // Delivering a frame that triggers onRunStateChange does NOT throw
+      expect(() => {
+        peer.emit({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "sess-1",
+            update: {
+              sessionUpdate: "session_info_update",
+              _meta: { goose: { activeRunId: "run_throw_test" } },
+            },
+          },
+        });
+      }).not.toThrow();
+
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_throw_test");
+    });
+
+    it("honk prompt without clientReqId mints crid, sends it, and matches echo to own", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+      expect(client.isHonk).toBe(true);
+
+      const p = client.prompt("sess-1", "auto crid prompt");
+      const req = peer.lastOf("session/prompt")!;
+      const mintedCrid = (req.params as any)?._meta?.honk?.client_req_id;
+      expect(typeof mintedCrid).toBe("string");
+      expect(mintedCrid).toMatch(/^pigeon-[0-9a-f-]+/);
+
+      // Honkd echoes the minted crid
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: `synth_${mintedCrid}`,
+            content: { type: "text", text: "auto crid prompt" },
+            _meta: { honk: { source: { client_req_id: mintedCrid } } },
+          },
+        },
+      });
+
+      // activeRunId arrives
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_minted_1" } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("own");
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_minted_1");
+
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+
+    it("socket close during replay notifies onRunStateChange to unknown if previously non-unknown", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      // Session starts running (subscriber notified of running state)
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_replay_test" } },
+          },
+        },
+      });
+      expect(client.runState("sess-1")).toBe("running");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_replay_test", ownership: "foreign" },
+      ]);
+
+      // _honk/reset arrives (enters replay, resets track without notifying)
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "_honk/reset",
+        params: { sessionId: "sess-1" },
+      });
+
+      // Socket drops mid-replay!
+      peer.drop();
+
+      // Subscriber must be notified that sess-1 is unknown!
+      expect(stateChanges).toContainEqual({
+        sessionId: "sess-1",
+        state: "unknown",
+        runId: undefined,
+        ownership: "unknown",
+      });
+      expect(client.runState("sess-1")).toBe("unknown");
+    });
+
+    it("throwing onTurnLost in onClose does not prevent other rejections or track reset", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const client = makeClient(peer, {
+        onTurnLost: () => {
+          throw new Error("onTurnLost crashed");
+        },
+      });
+      await client.connect();
+
+      const p1 = client.prompt("sess-1", "prompt 1");
+      const p2 = client.prompt("sess-2", "prompt 2");
+
+      // Drop socket
+      peer.drop();
+
+      // Both promises must still reject
+      await expect(p1).rejects.toBeInstanceOf(DisconnectedDuringTurn);
+      await expect(p2).rejects.toBeInstanceOf(DisconnectedDuringTurn);
+
+      // Tracks must still be reset
+      expect(client.runState("sess-1")).toBe("unknown");
+      expect(client.runState("sess-2")).toBe("unknown");
+    });
+
+    it("pending ownership downgrades to foreign when our prompt fails with non-busy error", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "failing prompt", { clientReqId: "crid-fail" });
+
+      // Run starts before echo -> pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pending_then_fail" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      // Server returns error (not busy)
+      const req = peer.lastOf("session/prompt")!;
+      peer.replyError(req.id, -32603, "internal server error");
+
+      await expect(p).rejects.toThrow(/internal server error/);
+
+      // Ownership should downgrade to foreign because our prompt is no longer outstanding!
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+      expect(client.runState("sess-1")).toBe("running");
+      expect(client.activeRunId("sess-1")).toBe("run_pending_then_fail");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_pending_then_fail", ownership: "pending" },
+        { sessionId: "sess-1", state: "running", runId: "run_pending_then_fail", ownership: "foreign" },
+      ]);
+    });
+
+    it("steer 'no active run' result leaves runState idle and ownership unknown", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      // Session is running
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_steer_target" } },
+          },
+        },
+      });
+      expect(client.runState("sess-1")).toBe("running");
+
+      // Steer gets no-active-run error
+      const steerPromise = client.steer("sess-1", "run_steer_target", "more instructions");
+      const req = peer.lastOf("_goose/unstable/session/steer")!;
+      peer.replyError(req.id, -32602, "invalid params", "no active run to steer");
+
+      const res = await steerPromise;
+      expect(res).toEqual({ kind: "no-active-run" });
+
+      expect(client.runState("sess-1")).toBe("idle");
+      expect(client.activeRunId("sess-1")).toBeUndefined();
+      expect(client.runOwnership("sess-1")).toBe("unknown");
+      expect(stateChanges).toContainEqual({
+        sessionId: "sess-1",
+        state: "idle",
+        runId: undefined,
+        ownership: "unknown",
+      });
+    });
+
+    it("running+pending with foreign echo downgrades ownership to foreign", async () => {
+      const peer = new FakePeer();
+      peer.onRequest = (msg, p) => {
+        if (msg.method === "initialize") {
+          p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+        }
+      };
+      const stateChanges: Array<Record<string, unknown>> = [];
+      const client = makeClient(peer, {
+        onRunStateChange: (sessionId, state) => {
+          stateChanges.push({ sessionId, ...state });
+        },
+      });
+      await client.connect();
+
+      const p = client.prompt("sess-1", "mine", { clientReqId: "crid-mine" });
+
+      // Run starts before echo -> pending
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: { goose: { activeRunId: "run_pend_foreign_echo" } },
+          },
+        },
+      });
+      expect(client.runOwnership("sess-1")).toBe("pending");
+
+      // Echo arrives with a foreign crid
+      peer.emit({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            messageId: "synth_crid-other-echo",
+            content: { type: "text", text: "other prompt" },
+            _meta: { honk: { source: { client_req_id: "crid-other-echo" } } },
+          },
+        },
+      });
+
+      expect(client.runOwnership("sess-1")).toBe("foreign");
+      expect(client.runState("sess-1")).toBe("running");
+      expect(stateChanges).toEqual([
+        { sessionId: "sess-1", state: "running", runId: "run_pend_foreign_echo", ownership: "pending" },
+        { sessionId: "sess-1", state: "running", runId: "run_pend_foreign_echo", ownership: "foreign" },
+      ]);
+
+      const req = peer.lastOf("session/prompt")!;
+      peer.reply(req.id, { stopReason: "end_turn" });
+      await p;
+    });
+  });
 });
+
+

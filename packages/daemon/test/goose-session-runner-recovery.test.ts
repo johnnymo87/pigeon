@@ -27,7 +27,26 @@ class FakeInflightStore implements GooseInflightStore {
       updatedAt: input.updatedAt ?? now,
       lastAliveAt: input.lastAliveAt ?? now,
       cleanSuspend: input.cleanSuspend ?? false,
+      state: input.state ?? "sent",
     });
+  }
+
+  markSent(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "sent";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markQueued(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "queued";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
   }
 
   delete(commandId: string): boolean {
@@ -202,6 +221,7 @@ function makeInflightRow(over: Partial<GooseInflightRecord> = {}): GooseInflight
     updatedAt: 1000,
     lastAliveAt: 1000,
     cleanSuspend: true,
+    state: "sent",
     ...over,
   };
 }
@@ -835,7 +855,7 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     expect(postStop).toHaveBeenCalledTimes(1);
   });
 
-  it("R3: deliver() awaits recovery resolution when turn is recovered and has no runId, then starts fresh if recovery settles", async () => {
+  it("R3: deliver() enqueues immediately during recovered turn and drains when recovered turn settles", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
     const postStop = vi.fn().mockResolvedValue(undefined);
@@ -855,23 +875,22 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(client.prompts).toHaveLength(1);
 
-    // Human sends a new message while recovered turn is settling
-    const newDeliverPromise = runner.deliver("cmd_new", "human message");
+    // Human sends a new message while recovered turn is active -> queued immediately
+    const outcome = await runner.deliver("cmd_new", "human message");
+    expect(outcome.ok).toBe(true);
+    expect(outcome.meta?.mode).toBe("queued");
 
     // Settle the recovered turn
     client.finishTurn("end_turn", { text: "recovery reply" });
+    await runner.settled();
 
-    // The new deliver should now start fresh!
-    const outcome = await newDeliverPromise;
-    expect(outcome.ok).toBe(true);
-    expect(outcome.meta?.mode).toBe("prompt");
-    expect(outcome.meta?.commandId).toBe("cmd_new");
-
+    // The queued message should now drain!
+    await new Promise((r) => setTimeout(r, 20));
     expect(client.prompts).toHaveLength(2);
     expect(client.prompts[1]).toBe("human message");
   });
 
-  it("R3: deliver() awaits recovery attach, then steers when runId becomes known", async () => {
+  it("deliver() during a recovered turn enqueues and does not steer (R3 wait removed)", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeRecoveryClient();
     const postStop = vi.fn().mockResolvedValue(undefined);
@@ -891,23 +910,12 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(client.prompts).toHaveLength(1);
 
-    // Deliver new message
-    const deliverPromise = runner.deliver("cmd_new_steer", "steer text");
+    // Deliver new message while recovered turn is active
+    const outcome = await runner.deliver("cmd_new_steer", "steer text");
 
-    // Active runId arrives via onSessionUpdate
-    client.runIds.set("20261012_rec", "run_active_123");
-    runner.onUpdate({
-      sessionUpdate: "session_info_update",
-      _meta: { goose: { activeRunId: "run_active_123" } },
-    });
-
-    const outcome = await deliverPromise;
     expect(outcome.ok).toBe(true);
-    expect(outcome.meta?.mode).toBe("steered");
-    expect(client.steers).toHaveLength(1);
-    expect(client.steers[0]).toEqual({
-      runId: "run_active_123",
-      text: "steer text",
-    });
+    expect(outcome.meta?.mode).toBe("queued");
+    expect(client.steers).toHaveLength(0);
+    expect(inflight.get("cmd_new_steer")?.state).toBe("queued");
   });
 });

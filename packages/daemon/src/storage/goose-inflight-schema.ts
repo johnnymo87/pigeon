@@ -1,4 +1,5 @@
 import type BetterSqlite3 from "better-sqlite3";
+import { isDuplicateColumnError } from "./schema.js";
 
 export function initGooseInflightSchema(db: BetterSqlite3.Database): void {
   db.exec(`
@@ -12,10 +13,17 @@ export function initGooseInflightSchema(db: BetterSqlite3.Database): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       last_alive_at INTEGER NOT NULL,
-      clean_suspend INTEGER NOT NULL DEFAULT 0
+      clean_suspend INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL DEFAULT 'sent'
     );
 
     CREATE INDEX IF NOT EXISTS idx_goose_inflight_session
       ON goose_inflight_turns(session_id);
   `);
+
+  try {
+    db.exec("ALTER TABLE goose_inflight_turns ADD COLUMN state TEXT NOT NULL DEFAULT 'sent'");
+  } catch (err) {
+    if (!isDuplicateColumnError(err)) throw err;
+  }
 }

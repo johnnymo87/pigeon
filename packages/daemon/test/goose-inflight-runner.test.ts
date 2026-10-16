@@ -29,7 +29,26 @@ class FakeInflightStore implements GooseInflightStore {
       updatedAt: input.updatedAt ?? now,
       lastAliveAt: input.lastAliveAt ?? now,
       cleanSuspend: input.cleanSuspend ?? false,
+      state: input.state ?? "sent",
     });
+  }
+
+  markSent(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "sent";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markQueued(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "queued";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
   }
 
   delete(commandId: string): boolean {
@@ -199,6 +218,7 @@ describe("GooseSessionRunner Inflight Lifecycle", () => {
       backendSessionId: "20261012_1",
       isHonk: false,
       promptText: "test prompt",
+      state: "sent",
     });
     expect(inflight.get("cmd_1")).toBeDefined();
     expect(client.prompts).toHaveLength(1);

@@ -141,6 +141,8 @@ const EVENT_EMOJIS: Record<string, string> = {
   SubagentStop: "🔧",
   Question: "❓",
   Notification: "🔔",
+  Queued: "⏳",
+  Permission: "🔐",
 };
 
 function eventEmoji(event: string): string {

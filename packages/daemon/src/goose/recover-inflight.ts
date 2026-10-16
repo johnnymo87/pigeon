@@ -53,68 +53,168 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
   }
 
   async function processSessionRows(sessionId: string, rows: GooseInflightRecord[]): Promise<void> {
-    for (const row of rows) {
-      const commandId = row.commandId;
-      const sanitisedCmd = sanitiseIdPart(commandId);
+    const sentRows = rows.filter((r) => r.state === "sent");
+    const queuedRows = rows.filter((r) => r.state === "queued");
 
-      // Check 1: R9 - rows older than 24h deleted with log line, no notice
-      if (now - row.createdAt > staleCutoffMs) {
-        log("row older than 24h, deleting without notice (R9)", {
-          commandId,
-          sessionId,
-          createdAt: row.createdAt,
-        });
-        opts.storage.gooseInflight.delete(commandId);
-        opts.storage.inbox.markDone(commandId);
-        continue;
-      }
+    const session = opts.storage.sessions.get(sessionId);
+    let runner: GooseSessionRunner | undefined;
 
-      // Check 2: Session missing or not goose
-      const session = opts.storage.sessions.get(sessionId);
-      if (!session || session.backendKind !== GOOSE_BACKEND_KIND) {
-        log("session missing or not goose, deleting row without notice", {
-          commandId,
-          sessionId,
-        });
-        opts.storage.gooseInflight.delete(commandId);
-        opts.storage.inbox.markDone(commandId);
-        continue;
-      }
+    // Filter queued rows through checks (Item 5/9)
+    const validQueuedRows: GooseInflightRecord[] = [];
+    if (queuedRows.length > 0) {
+      for (const row of queuedRows) {
+        const commandId = row.commandId;
+        const sanitisedCmd = sanitiseIdPart(commandId);
+        const normalNotifId = `s:${sessionId}:${sanitisedCmd}`;
+        const stalledNotifId = `s:${sessionId}:${sanitisedCmd}:stalled`;
 
-      // Check 3: Outbox pre-check for s:sid:cmd and s:sid:cmd:stalled
-      const normalNotifId = `s:${sessionId}:${sanitisedCmd}`;
-      const stalledNotifId = `s:${sessionId}:${sanitisedCmd}:stalled`;
-      if (
-        opts.storage.outbox.getByNotificationId(normalNotifId) ||
-        opts.storage.outbox.getByNotificationId(stalledNotifId)
-      ) {
-        log("notification already in outbox, deleting row without resending", {
-          commandId,
-          sessionId,
-        });
-        opts.storage.gooseInflight.delete(commandId);
-        opts.storage.inbox.markDone(commandId);
-        continue;
-      }
-
-      // Check 4: Attempts check (poison guard)
-      // Attempts bumped only for rows without clean_suspend (crash)
-      if (!row.cleanSuspend) {
-        const attempts = opts.storage.gooseInflight.bumpAttempts(commandId, now);
-        if (attempts > maxAttempts) {
-          log("recovery attempts exceeded (>3), posting give-up notice", {
+        // Check 1: 24h stale check posts notice and deletes row
+        if (now - row.createdAt > staleCutoffMs) {
+          log("queued row older than 24h, posting stale notice and deleting", {
             commandId,
             sessionId,
-            attempts,
+            createdAt: row.createdAt,
+          });
+          if (session) {
+            void sendPostStop(
+              {
+                session_id: sessionId,
+                notification_id: normalNotifId,
+                message:
+                  "pigeon queued this message more than 24h ago and never sent it; nothing was sent",
+                event: "Error",
+                error_kind: "goose-queued-stale",
+              },
+              session,
+            );
+          }
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 2: Session missing or not goose
+        if (!session || session.backendKind !== GOOSE_BACKEND_KIND) {
+          log("session missing or not goose, deleting queued row without notice", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 3: Outbox pre-check for s:sid:cmd and s:sid:cmd:stalled
+        if (
+          opts.storage.outbox.getByNotificationId(normalNotifId) ||
+          opts.storage.outbox.getByNotificationId(stalledNotifId)
+        ) {
+          log("notification already in outbox, deleting queued row without enqueuing", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        validQueuedRows.push(row);
+      }
+    }
+
+    // Hand valid queued rows to runner up front and hold drain
+    if (validQueuedRows.length > 0 && session && session.backendKind === GOOSE_BACKEND_KIND) {
+      runner = opts.gooseRunners.get(session);
+      runner.holdDrain();
+      for (const row of validQueuedRows) {
+        runner.enqueueRecovered(row);
+      }
+    }
+
+    try {
+      for (const row of sentRows) {
+        const commandId = row.commandId;
+        const sanitisedCmd = sanitiseIdPart(commandId);
+
+        // Check 1: R9 - rows older than 24h deleted with log line, no notice
+        if (now - row.createdAt > staleCutoffMs) {
+          log("row older than 24h, deleting without notice (R9)", {
+            commandId,
+            sessionId,
+            createdAt: row.createdAt,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 2: Session missing or not goose
+        if (!session || session.backendKind !== GOOSE_BACKEND_KIND) {
+          log("session missing or not goose, deleting row without notice", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 3: Outbox pre-check for s:sid:cmd and s:sid:cmd:stalled
+        const normalNotifId = `s:${sessionId}:${sanitisedCmd}`;
+        const stalledNotifId = `s:${sessionId}:${sanitisedCmd}:stalled`;
+        if (
+          opts.storage.outbox.getByNotificationId(normalNotifId) ||
+          opts.storage.outbox.getByNotificationId(stalledNotifId)
+        ) {
+          log("notification already in outbox, deleting row without resending", {
+            commandId,
+            sessionId,
+          });
+          opts.storage.gooseInflight.delete(commandId);
+          opts.storage.inbox.markDone(commandId);
+          continue;
+        }
+
+        // Check 4: Attempts check (poison guard)
+        // Attempts bumped only for rows without clean_suspend (crash)
+        if (!row.cleanSuspend) {
+          const attempts = opts.storage.gooseInflight.bumpAttempts(commandId, now);
+          if (attempts > maxAttempts) {
+            log("recovery attempts exceeded (>3), posting give-up notice", {
+              commandId,
+              sessionId,
+              attempts,
+            });
+            void sendPostStop(
+              {
+                session_id: sessionId,
+                notification_id: normalNotifId,
+                message:
+                  "pigeon failed repeatedly while processing this turn; giving up to prevent crash loop. Check the session before resending.",
+                event: "Error",
+                error_kind: "goose-recovery-exhausted",
+              },
+              session,
+            );
+            opts.storage.gooseInflight.delete(commandId);
+            opts.storage.inbox.markDone(commandId);
+            continue;
+          }
+        }
+
+        // Check 5: Bare goose (is_honk = 0)
+        if (!row.isHonk) {
+          log("bare goose turn cancelled by restart, posting notice", {
+            commandId,
+            sessionId,
           });
           void sendPostStop(
             {
               session_id: sessionId,
               notification_id: normalNotifId,
-              message:
-                "pigeon failed repeatedly while processing this turn; giving up to prevent crash loop. Check the session before resending.",
+              message: gooseShutdownNotice(sessionId, false),
               event: "Error",
-              error_kind: "goose-recovery-exhausted",
+              error_kind: "goose-turn-cancelled-by-restart",
             },
             session,
           );
@@ -122,67 +222,51 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           opts.storage.inbox.markDone(commandId);
           continue;
         }
-      }
 
-      // Check 5: Bare goose (is_honk = 0)
-      if (!row.isHonk) {
-        log("bare goose turn cancelled by restart, posting notice", {
-          commandId,
-          sessionId,
-        });
-        void sendPostStop(
-          {
-            session_id: sessionId,
-            notification_id: normalNotifId,
-            message: gooseShutdownNotice(sessionId, false),
-            event: "Error",
-            error_kind: "goose-turn-cancelled-by-restart",
-          },
-          session,
-        );
-        opts.storage.gooseInflight.delete(commandId);
-        opts.storage.inbox.markDone(commandId);
-        continue;
-      }
-
-      // Check 6: Downtime cutoff (R1)
-      if (now - row.lastAliveAt > maxDowntimeMs) {
-        log("downtime cutoff exceeded (>6h), posting cutoff notice", {
-          commandId,
-          sessionId,
-          lastAliveAt: row.lastAliveAt,
-        });
-        void sendPostStop(
-          {
-            session_id: sessionId,
-            notification_id: normalNotifId,
-            message:
-              "pigeon was down too long (>6h) to safely collect the reply from honkd; nothing was resent. Check the session before asking again.",
-            event: "Error",
-            error_kind: "goose-recovery-cutoff",
-          },
-          session,
-        );
-        opts.storage.gooseInflight.delete(commandId);
-        opts.storage.inbox.markDone(commandId);
-        continue;
-      }
-
-      // Check 7: Valid honk row to resume!
-      const runner = opts.gooseRunners.get(session);
-
-      // Wait while the runner is busy before resuming this row
-      while (runner.isBusy()) {
-        await runner.settled();
-      }
-
-      const resumed = runner.resume(row);
-      if (resumed) {
-        // Wait for turn to settle before processing any subsequent row for the same session (R5)
-        await runner.settled().finally(() => {
+        // Check 6: Downtime cutoff (R1)
+        if (now - row.lastAliveAt > maxDowntimeMs) {
+          log("downtime cutoff exceeded (>6h), posting cutoff notice", {
+            commandId,
+            sessionId,
+            lastAliveAt: row.lastAliveAt,
+          });
+          void sendPostStop(
+            {
+              session_id: sessionId,
+              notification_id: normalNotifId,
+              message:
+                "pigeon was down too long (>6h) to safely collect the reply from honkd; nothing was resent. Check the session before asking again.",
+              event: "Error",
+              error_kind: "goose-recovery-cutoff",
+            },
+            session,
+          );
+          opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
-        });
+          continue;
+        }
+
+        // Check 7: Valid honk row to resume!
+        if (!runner && session) {
+          runner = opts.gooseRunners.get(session);
+        }
+        if (!runner) continue;
+
+        // Wait while the runner is busy before resuming this row
+        while (runner.isBusy()) {
+          await runner.settled();
+        }
+
+        const resumed = runner.resume(row);
+        if (resumed) {
+          // Wait for turn to settle before processing any subsequent row for the same session (R5)
+          await runner.settled().finally(() => {
+            opts.storage.inbox.markDone(commandId);
+          });
+        }
       }
+    } finally {
+      runner?.releaseDrain();
     }
   }
 

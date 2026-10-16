@@ -26,7 +26,26 @@ class FakeInflightStore implements GooseInflightStore {
       updatedAt: input.updatedAt ?? now,
       lastAliveAt: input.lastAliveAt ?? now,
       cleanSuspend: input.cleanSuspend ?? false,
+      state: input.state ?? "sent",
     });
+  }
+
+  markSent(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "sent";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
+  }
+
+  markQueued(commandId: string, now: number = Date.now()): void {
+    const row = this.rows.get(commandId);
+    if (row) {
+      row.state = "queued";
+      row.lastAliveAt = now;
+      row.updatedAt = now;
+    }
   }
 
   delete(commandId: string): boolean {
