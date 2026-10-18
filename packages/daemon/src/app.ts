@@ -521,10 +521,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // a blank turn has no renderable box, so an anchor on it cannot be scrolled to,
     // and recording it would replace a usable older anchor with one that resolves
     // to nothing -- landing the reader at the bottom, the failure this removes.
-    const shouldSetAnchor =
-      mirrorOpts?.setAnchor !== false &&
-      body.setAnchor !== false &&
-      body.anchor !== false;
+    const shouldSetAnchor = mirrorOpts?.setAnchor !== false;
     if (text.trim() && shouldSetAnchor) {
       storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
     }
@@ -617,7 +614,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     return Response.json({ mirrored: true });
   }
 
-  async function handleStopBody(body: Record<string, unknown>): Promise<Response> {
+  async function handleStopBody(
+    body: Record<string, unknown>,
+    stopOpts?: { afterNotificationId?: string | null },
+  ): Promise<Response> {
     const sessionId = typeof body.session_id === "string" ? body.session_id : "";
     if (!sessionId) {
       console.log(`[stop] rejected: missing session_id`);
@@ -732,10 +732,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       threaded: true,
     };
 
-    const afterNotificationId =
-      typeof body.after_notification_id === "string" && body.after_notification_id
-        ? body.after_notification_id
-        : null;
+    const afterNotificationId = stopOpts?.afterNotificationId ?? null;
 
     // Queue in outbox — OutboxSender will deliver with retry
     storage.outbox.upsert({
@@ -1820,14 +1817,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         if (body.type === "turn.ended") {
           const r = renderHookTurn(body as HookTurnEndedEvent);
-          const res = await handleStopBody({
-            session_id: row.sessionId,
-            notification_id: `s:${row.sessionId}:h-${id}`,
-            event: r.event,
-            message: r.message,
-            ...(r.errorKind ? { error_kind: r.errorKind } : {}),
-            after_notification_id: `m:${row.sessionId}:h-${id}`,
-          });
+          const res = await handleStopBody(
+            {
+              session_id: row.sessionId,
+              notification_id: `s:${row.sessionId}:h-${id}`,
+              event: r.event,
+              message: r.message,
+              ...(r.errorKind ? { error_kind: r.errorKind } : {}),
+            },
+            { afterNotificationId: `m:${row.sessionId}:h-${id}` },
+          );
           const outcome = res.status === 202 || res.status === 200 ? "queued" : `error_${res.status}`;
           console.log(
             `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,

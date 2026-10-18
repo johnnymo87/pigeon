@@ -630,5 +630,65 @@ describe("POST /goose/turn-event", () => {
       expect(ready[0]!.notificationId).toBe("s:sess-regular:msg1");
       expect(ready[0]!.afterNotificationId).toBeNull();
     });
+
+    it("mirror row marked failed -> hook stop is ready", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.started",
+        session_id: "goose-sess-1",
+        upstream_id: "hk3_7-failed",
+        prompt_text: "prompt failed",
+      });
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-sess-1",
+        upstream_id: "hk3_7-failed",
+        stop_reason: "end_turn",
+        final_text: "reply after failed prompt",
+      });
+
+      // Mark the mirror row as permanently failed
+      storage!.outbox.markFailed(`m:${gseId}:h-hk3_7-failed`, 1_000, "permanent drop");
+
+      // Stop row should now be ready (not blocked by failed mirror)
+      const ready = storage!.outbox.getReady(1_000);
+      expect(ready).toHaveLength(1);
+      expect(ready[0]!.notificationId).toBe(`s:${gseId}:h-hk3_7-failed`);
+    });
+
+    it("POST /stop with after_notification_id in the body -> row has afterNotificationId null", async () => {
+      const app = newApp(1_000);
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: "sess-body-inject", notify: true }),
+        }),
+      );
+
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-body-inject",
+            event: "Stop",
+            message: "Body inject attempt",
+            notification_id: "s:sess-body-inject:msg1",
+            after_notification_id: "m:sess-body-inject:fake",
+          }),
+        }),
+      );
+      expect(stopRes.status).toBe(202);
+
+      const row = storage!.outbox.getByNotificationId("s:sess-body-inject:msg1");
+      expect(row).not.toBeNull();
+      expect(row!.afterNotificationId).toBeNull();
+    });
   });
 });

@@ -166,7 +166,7 @@ export class OutboxRepository {
            AND (after_notification_id IS NULL OR NOT EXISTS (
              SELECT 1 FROM outbox dep
              WHERE dep.notification_id = outbox.after_notification_id
-               AND dep.state != 'sent'
+               AND dep.state IN ('queued', 'sending')
            ))
          ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
