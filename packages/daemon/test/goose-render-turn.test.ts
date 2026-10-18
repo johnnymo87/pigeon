@@ -272,4 +272,45 @@ describe("renderHookTurn", () => {
     expect(res.event).toBe("Stop");
     expect(res.message).toBe("a".repeat(DEFAULT_MAX_TRANSCRIPT_BYTES) + TRUNCATION_NOTICE);
   });
+
+  it("appends TRUNCATION_NOTICE exactly once when text is over cap and final_text_truncated is true", () => {
+    const longText = "a".repeat(DEFAULT_MAX_TRANSCRIPT_BYTES + 100);
+    const res = renderHookTurn({
+      stop_reason: "end_turn",
+      final_text: longText,
+      final_text_truncated: true,
+    });
+    expect(res.event).toBe("Stop");
+    expect(res.message).toBe("a".repeat(DEFAULT_MAX_TRANSCRIPT_BYTES) + TRUNCATION_NOTICE);
+    const occurrences = res.message.split(TRUNCATION_NOTICE).length - 1;
+    expect(occurrences).toBe(1);
+  });
+
+  it("joins upstream_restart and error with \\n\\n, event Error, errorKind goose-turn-failed", () => {
+    const res = renderHookTurn({
+      stop_reason: "cancelled",
+      honk_reason: "upstream_restart",
+      error: "JSON-RPC error: connection reset",
+      final_text: null,
+    });
+    expect(res).toEqual({
+      message:
+        "goose restarted and the turn was cancelled.\n\nJSON-RPC error: connection reset",
+      event: "Error",
+      errorKind: "goose-turn-failed",
+    });
+
+    const resWithText = renderHookTurn({
+      stop_reason: "cancelled",
+      honk_reason: "upstream_restart",
+      error: "JSON-RPC error: connection reset",
+      final_text: "Partial response",
+    });
+    expect(resWithText).toEqual({
+      message:
+        "Partial response\n\ngoose restarted and the turn was cancelled.\n\nJSON-RPC error: connection reset",
+      event: "Error",
+      errorKind: "goose-turn-failed",
+    });
+  });
 });

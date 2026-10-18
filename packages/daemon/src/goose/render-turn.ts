@@ -82,6 +82,13 @@ export interface RenderedHookTurn {
   errorKind?: string;
 }
 
+function formatCappedBody(text: string, truncated?: boolean | null): string {
+  const capped = capText(text, DEFAULT_MAX_TRANSCRIPT_BYTES);
+  return capped.truncated || Boolean(truncated)
+    ? capped.text + TRUNCATION_NOTICE
+    : capped.text;
+}
+
 /**
  * Renders a honkd turn.ended event into a notification payload for pigeon's stop route.
  */
@@ -90,22 +97,14 @@ export function renderHookTurn(ev: HookTurnEndedEvent): RenderedHookTurn {
     ev.honk_reason === "cancelled" || (ev.stop_reason === "cancelled" && !ev.honk_reason);
 
   const hasText = typeof ev.final_text === "string" && ev.final_text !== "";
+  const body = hasText ? formatCappedBody(ev.final_text!, ev.final_text_truncated) : undefined;
   const detail = honkReasonDetail(ev.stop_reason, ev.honk_reason);
   const errText = typeof ev.error === "string" && ev.error !== "" ? ev.error : undefined;
 
   let message: string;
   if (isCancelled) {
-    if (hasText) {
-      const capped = capText(ev.final_text!, DEFAULT_MAX_TRANSCRIPT_BYTES);
-      let body = capped.text;
-      if (capped.truncated || Boolean(ev.final_text_truncated)) {
-        body += TRUNCATION_NOTICE;
-      }
-      message = `${body}\n\n(cancelled)`;
-    } else {
-      message = "Turn cancelled.";
-    }
-  } else if (!hasText) {
+    message = body !== undefined ? `${body}\n\n(cancelled)` : "Turn cancelled.";
+  } else if (body === undefined) {
     if (detail) {
       message = errText ? `${detail}\n\n${errText}` : detail;
     } else if (errText) {
@@ -114,11 +113,6 @@ export function renderHookTurn(ev: HookTurnEndedEvent): RenderedHookTurn {
       message = emptyReplyText(ev.stop_reason);
     }
   } else {
-    const capped = capText(ev.final_text!, DEFAULT_MAX_TRANSCRIPT_BYTES);
-    let body = capped.text;
-    if (capped.truncated || Boolean(ev.final_text_truncated)) {
-      body += TRUNCATION_NOTICE;
-    }
     message = body;
     if (detail) {
       message += `\n\n${detail}`;
