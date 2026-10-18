@@ -461,6 +461,23 @@ describe("POST /goose/turn-event", () => {
     expect(storage!.outbox.getByNotificationId(`m:${gseId}:h-hk3_7-ws`)).toBeNull();
   });
 
+  it("an envelope prompt > 4096 chars with its close tag at the end is not mirrored", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    const longEnvelopePrompt = `<swarm_message v="1" from="ses_a" to="ses_b" msg_id="m1" priority="normal">\n${"x".repeat(5000)}\n</swarm_message>`;
+    const res = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-swarm-long",
+      prompt_text: longEnvelopePrompt,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ mirrored: false });
+    expect(storage!.outbox.getByNotificationId(`m:${gseId}:h-hk3_7-swarm-long`)).toBeNull();
+  });
+
   it("duplicate turn.started -> one mirror row", async () => {
     const app = newApp();
     const gseId = await registerGoose(app, "goose-sess-1");

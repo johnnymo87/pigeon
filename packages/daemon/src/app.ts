@@ -1783,7 +1783,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const id = sanitiseIdPart(body.upstream_id);
 
         if (body.type === "turn.started") {
-          let promptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          const rawPromptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          if (payloadHasCloseTag(rawPromptText)) {
+            console.log(
+              `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=not_mirrored`,
+            );
+            return Response.json({ mirrored: false });
+          }
+          let promptText = rawPromptText;
           const capped = capText(promptText, 4096);
           if (capped.truncated) {
             promptText = `${capped.text}\n\n[... prompt truncated]`;
