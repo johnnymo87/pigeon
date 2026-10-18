@@ -59,6 +59,11 @@ import {
   honkReasonDetail,
   TRUNCATION_NOTICE,
 } from "./render-turn.js";
+import {
+  formatGooseUsageFooter,
+  parseGooseUsage,
+  type GooseUsage,
+} from "./usage-footer.js";
 
 export { DEFAULT_MAX_TRANSCRIPT_BYTES, TRUNCATION_NOTICE };
 
@@ -215,6 +220,7 @@ interface Turn {
   queuedNoticeSent?: boolean;
   fromQueue?: boolean;
   permissionNoticePosted?: boolean;
+  usage?: GooseUsage;
 }
 
 interface QueuedItem {
@@ -506,6 +512,7 @@ export class GooseSessionRunner {
       idleTimer: undefined,
       resent: true,
       recovered: true,
+      usage: undefined,
     };
     this.turn = turn;
     this.pruneSentSteers();
@@ -943,6 +950,7 @@ export class GooseSessionRunner {
       idleTimer: undefined,
       queuedNoticeSent: options?.fromQueue ?? false,
       fromQueue: options?.fromQueue ?? false,
+      usage: undefined,
     };
     this.turn = turn;
     this.opts.touch(this.sessionId);
@@ -1332,6 +1340,13 @@ export class GooseSessionRunner {
       }
     }
 
+    if (update.sessionUpdate === "usage_update") {
+      const parsed = parseGooseUsage(update);
+      if (parsed !== undefined) {
+        turn.usage = parsed;
+      }
+    }
+
     if (update.sessionUpdate !== "agent_message_chunk") return;
 
     const text = (update.content as { text?: unknown } | undefined)?.text;
@@ -1612,6 +1627,13 @@ export class GooseSessionRunner {
           // run, a refusal). Saying so beats an empty Telegram message, which the
           // human cannot distinguish from a bug in this code.
           message = `goose finished the turn with no message (stopReason: ${stopReason ?? "unknown"}).`;
+        }
+      }
+
+      if (turn.usage) {
+        const footer = formatGooseUsageFooter(turn.usage);
+        if (footer) {
+          message += `\n\n${footer}`;
         }
       }
 

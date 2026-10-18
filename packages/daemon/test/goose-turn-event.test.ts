@@ -205,6 +205,36 @@ describe("POST /goose/turn-event", () => {
     expect(count).toBe(1);
   });
 
+  it("turn.ended with usage -> stop outbox payload message ends with usage footer", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    const eventBody = {
+      v: 1,
+      type: "turn.ended",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-14",
+      stop_reason: "end_turn",
+      final_text: "Task completed successfully.",
+      usage: {
+        used: 45231,
+        size: 200000,
+        cost: { amount: 1.84, currency: "USD" },
+      },
+    };
+
+    const res = await postTurnEvent(app, eventBody);
+    expect(res.status).toBe(202);
+    const expectedNotificationId = `s:${gseId}:h-hk3_7-14`;
+
+    const stopRow = storage!.outbox.getByNotificationId(expectedNotificationId);
+    expect(stopRow).not.toBeNull();
+    const payload = JSON.parse(stopRow!.payload);
+    expect(payload.messages[0].text).toContain(
+      "Task completed successfully.\n\n📊 45.2K tokens · 23% · $1.84",
+    );
+  });
+
   it("cancelled -> Stop with '(cancelled)'; upstream_restart -> Error", async () => {
     const app = newApp();
     const gseId = await registerGoose(app, "goose-sess-1");

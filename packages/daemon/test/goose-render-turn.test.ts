@@ -313,4 +313,85 @@ describe("renderHookTurn", () => {
       errorKind: "goose-turn-failed",
     });
   });
+
+  describe("usage footer in renderHookTurn", () => {
+    it("appends usage footer to a normal Stop turn", () => {
+      const res = renderHookTurn({
+        stop_reason: "end_turn",
+        final_text: "Task completed successfully.",
+        usage: {
+          used: 45231,
+          size: 200000,
+          cost: { amount: 1.84, currency: "USD" },
+        },
+      });
+      expect(res).toEqual({
+        message: "Task completed successfully.\n\n📊 45.2K tokens · 23% · $1.84",
+        event: "Stop",
+        errorKind: undefined,
+      });
+    });
+
+    it("appends usage footer to an Error turn (stop_reason: max_tokens)", () => {
+      const res = renderHookTurn({
+        stop_reason: "max_tokens",
+        final_text: "Reached token limit...",
+        usage: {
+          used: 200000,
+          size: 200000,
+        },
+      });
+      expect(res).toEqual({
+        message: "Reached token limit...\n\n📊 200.0K tokens · 100%",
+        event: "Error",
+        errorKind: "goose-stop-max_tokens",
+      });
+    });
+
+    it("appends usage footer to a cancelled turn", () => {
+      const res = renderHookTurn({
+        stop_reason: "cancelled",
+        honk_reason: "cancelled",
+        final_text: "Partial text before cancel",
+        usage: {
+          used: 12300,
+          size: 200000,
+        },
+      });
+      expect(res).toEqual({
+        message: "Partial text before cancel\n\n(cancelled)\n\n📊 12.3K tokens · 6%",
+        event: "Stop",
+        errorKind: undefined,
+      });
+    });
+
+    it("appends usage footer to a synthesized turn", () => {
+      const res = renderHookTurn({
+        stop_reason: "end_turn",
+        honk_reason: "synthesized",
+        final_text: "Synthesized text",
+        usage: {
+          used: 812,
+          size: 0,
+        },
+      });
+      expect(res).toEqual({
+        message: "Synthesized text\n\n📊 812 tokens",
+        event: "Stop",
+        errorKind: undefined,
+      });
+    });
+
+    it("leaves message unchanged when usage is absent or invalid or used is 0", () => {
+      const base = {
+        stop_reason: "end_turn",
+        final_text: "Normal text",
+      };
+      expect(renderHookTurn(base).message).toBe("Normal text");
+      expect(renderHookTurn({ ...base, usage: null }).message).toBe("Normal text");
+      expect(renderHookTurn({ ...base, usage: "invalid" }).message).toBe("Normal text");
+      expect(renderHookTurn({ ...base, usage: { used: "many" } }).message).toBe("Normal text");
+      expect(renderHookTurn({ ...base, usage: { used: 0 } }).message).toBe("Normal text");
+    });
+  });
 });
