@@ -503,7 +503,36 @@ describe("GooseSessionRunner failure containment", () => {
     client.finishTurn();
     await runner.settled();
 
-    expect(stops[0]!.message).toBe("answer");
+    expect(stops[0]!.message).toBe("answer\n\n📊 12 tokens");
+  });
+
+  it("usage_update frames during a turn -> postStop message ends with footer using last valid usage frame", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "x");
+    runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } });
+    runner.onUpdate({ sessionUpdate: "usage_update", used: 10000, size: 200000 });
+    runner.onUpdate({
+      sessionUpdate: "usage_update",
+      used: 45231,
+      size: 200000,
+      cost: { amount: 1.84, currency: "USD" },
+    });
+    // Invalid usage_update: ignored, last valid one wins
+    runner.onUpdate({ sessionUpdate: "usage_update", used: -1 });
+    client.finishTurn();
+    await runner.settled();
+
+    expect(stops[0]!.message).toBe("Hello world\n\n📊 45.2K tokens · 23% · $1.84");
+  });
+
+  it("no usage frames -> message unchanged", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "x");
+    runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } });
+    client.finishTurn();
+    await runner.settled();
+
+    expect(stops[0]!.message).toBe("Hello world");
   });
 
   it("reports a turn that produced no text at all rather than sending an empty message", async () => {

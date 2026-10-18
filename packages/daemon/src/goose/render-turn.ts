@@ -6,6 +6,8 @@
  * - POST /goose/turn-event (rendering honkd turn.ended hook events)
  */
 
+import { formatGooseUsageFooter, parseGooseUsage } from "./usage-footer.js";
+
 export const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 export const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
 
@@ -73,6 +75,7 @@ export interface HookTurnEndedEvent {
   final_text?: string | null;
   final_text_truncated?: boolean | null;
   error?: string | null;
+  usage?: unknown;
   [key: string]: unknown;
 }
 
@@ -119,6 +122,16 @@ export function renderHookTurn(ev: HookTurnEndedEvent): RenderedHookTurn {
     }
     if (errText) {
       message += `\n\n${errText}`;
+    }
+  }
+
+  if (ev.usage !== undefined) {
+    const parsed = parseGooseUsage(ev.usage);
+    if (parsed) {
+      const footer = formatGooseUsageFooter(parsed);
+      if (footer) {
+        message += `\n\n${footer}`;
+      }
     }
   }
 
