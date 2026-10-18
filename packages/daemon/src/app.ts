@@ -438,7 +438,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     return { bound: true };
   }
 
-  async function handleMirrorBody(body: Record<string, unknown>): Promise<Response> {
+  async function handleMirrorBody(
+    body: Record<string, unknown>,
+    mirrorOpts?: { setAnchor?: boolean },
+  ): Promise<Response> {
     const sessionId =
       typeof body.sessionId === "string" && body.sessionId
         ? body.sessionId
@@ -518,7 +521,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // a blank turn has no renderable box, so an anchor on it cannot be scrolled to,
     // and recording it would replace a usable older anchor with one that resolves
     // to nothing -- landing the reader at the bottom, the failure this removes.
-    if (text.trim()) {
+    const shouldSetAnchor =
+      mirrorOpts?.setAnchor !== false &&
+      body.setAnchor !== false &&
+      body.anchor !== false;
+    if (text.trim() && shouldSetAnchor) {
       storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
     }
 
@@ -1778,11 +1785,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           if (capped.truncated) {
             promptText = `${capped.text}\n\n[... prompt truncated]`;
           }
-          const res = await handleMirrorBody({
-            sessionId: row.sessionId,
-            messageId: `h-${id}`,
-            text: promptText,
-          });
+          const res = await handleMirrorBody(
+            {
+              sessionId: row.sessionId,
+              messageId: `h-${id}`,
+              text: promptText,
+            },
+            { setAnchor: false },
+          );
           let outcome = "mirrored";
           if (res.status === 200) {
             try {

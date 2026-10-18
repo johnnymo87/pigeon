@@ -117,7 +117,25 @@ describe("POST /goose/turn-event", () => {
     expect(payload.messages[0].text).toContain("Please fix the failing tests.");
 
     const sessionRow = storage!.sessions.get(gseId);
-    expect(sessionRow?.lastHumanMsgId).toBe("h-hk3_7-12");
+    expect(sessionRow?.lastHumanMsgId).toBeNull();
+  });
+
+  it("turn.started does not change lastHumanMsgId", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+    storage!.sessions.setLastHumanMsgId(gseId, "a_prior", 1_000);
+
+    const res = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-anchor",
+      prompt_text: "do not move anchor",
+    });
+    expect(res.status).toBe(200);
+
+    const sessionRow = storage!.sessions.get(gseId);
+    expect(sessionRow?.lastHumanMsgId).toBe("a_prior");
   });
 
   it("caps mirrored hook prompt_text at 4096 UTF-16 units with truncation notice", async () => {
