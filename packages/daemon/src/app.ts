@@ -3,7 +3,6 @@ import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, type HookTurnEndedEvent } from "./goose/render-turn.js";
-import type { GooseInflightStore } from "./storage/goose-inflight-repo.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -319,7 +318,6 @@ export interface TagLookup {
 
 interface AppOptions {
   nowFn?: () => number;
-  inflight?: GooseInflightStore;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
@@ -1732,11 +1730,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         const clientReqIds = Array.isArray(body.client_req_ids) ? (body.client_req_ids as unknown[]) : [];
-        const inflightStore = opts.inflight ?? storage.gooseInflight;
         let isOwnTurn = false;
         for (const rawCrid of clientReqIds) {
           if (typeof rawCrid !== "string" || !rawCrid) continue;
-          if (inflightStore?.get(rawCrid)) {
+          if (storage.gooseInflight.get(rawCrid)) {
             isOwnTurn = true;
             break;
           }
