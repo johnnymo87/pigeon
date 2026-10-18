@@ -268,6 +268,27 @@ describe("POST /goose/turn-event", () => {
   it("validates request payload (400)", async () => {
     const app = newApp();
 
+    // Malformed JSON (syntax error)
+    const resMalformed = await app(
+      new Request("http://localhost/goose/turn-event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{ not valid json",
+      }),
+    );
+    expect(resMalformed.status).toBe(400);
+    expect(await resMalformed.json()).toEqual({ error: "invalid JSON body" });
+
+    // Null body
+    const resNull = await postTurnEvent(app, null);
+    expect(resNull.status).toBe(400);
+    expect(await resNull.json()).toEqual({ error: "body must be an object" });
+
+    // Array body
+    const resArray = await postTurnEvent(app, [1, 2]);
+    expect(resArray.status).toBe(400);
+    expect(await resArray.json()).toEqual({ error: "body must be an object" });
+
     // Missing/invalid v
     const resBadV = await postTurnEvent(app, {
       v: 2,
@@ -319,6 +340,80 @@ describe("POST /goose/turn-event", () => {
       upstream_id: "",
     });
     expect(resEmptyUpstream.status).toBe(400);
+  });
+
+  it("non-array client_req_ids and non-string elements are tolerated", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    // Non-array client_req_ids (e.g. string, number, null) is tolerated
+    const resNonArray = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-nonarray",
+      client_req_ids: "not-an-array",
+      prompt_text: "hello non-array",
+    });
+    expect(resNonArray.status).toBe(200);
+    expect(await resNonArray.json()).toEqual({ mirrored: true });
+
+    // Non-string elements in client_req_ids are tolerated
+    const resNonString = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-nonstring",
+      client_req_ids: [123, null, {}, "crid-foreign"],
+      prompt_text: "hello non-string",
+    });
+    expect(resNonString.status).toBe(200);
+    expect(await resNonString.json()).toEqual({ mirrored: true });
+  });
+
+  it("whitespace-only prompt_text -> not mirrored", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    const res = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-ws",
+      prompt_text: "   \n\t  ",
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual({ mirrored: false });
+    expect(storage!.outbox.getByNotificationId(`m:${gseId}:h-hk3_7-ws`)).toBeNull();
+  });
+
+  it("duplicate turn.started -> one mirror row", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    const body = {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-dup",
+      prompt_text: "duplicate prompt",
+    };
+
+    const res1 = await postTurnEvent(app, body);
+    expect(res1.status).toBe(200);
+    expect(await res1.json()).toEqual({ mirrored: true });
+
+    const res2 = await postTurnEvent(app, body);
+    expect(res2.status).toBe(200);
+    expect(await res2.json()).toEqual({ mirrored: true });
+
+    const count = (
+      storage!.db
+        .prepare("SELECT COUNT(*) as c FROM outbox WHERE notification_id = ?")
+        .get(`m:${gseId}:h-hk3_7-dup`) as { c: number }
+    ).c;
+    expect(count).toBe(1);
   });
 
   it("auth: with authToken set, no bearer -> 401; with bearer -> ok", async () => {

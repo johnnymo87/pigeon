@@ -1709,16 +1709,35 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       }
 
       if (request.method === "POST" && url.pathname === "/goose/turn-event") {
-        const body = await readJsonBody(request);
-        if (
-          body.v !== 1 ||
-          (body.type !== "turn.started" && body.type !== "turn.ended") ||
-          typeof body.session_id !== "string" ||
-          !body.session_id ||
-          typeof body.upstream_id !== "string" ||
-          !body.upstream_id
-        ) {
-          return Response.json({ error: "invalid turn event payload" }, { status: 400 });
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(request);
+        } catch {
+          console.log("[goose-turn-event] rejected: invalid JSON body");
+          return Response.json({ error: "invalid JSON body" }, { status: 400 });
+        }
+
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+          console.log("[goose-turn-event] rejected: body must be an object");
+          return Response.json({ error: "body must be an object" }, { status: 400 });
+        }
+
+        const body = rawBody as Record<string, unknown>;
+        if (body.v !== 1) {
+          console.log(`[goose-turn-event] rejected: invalid version v=${body.v}`);
+          return Response.json({ error: "v must be 1" }, { status: 400 });
+        }
+        if (body.type !== "turn.started" && body.type !== "turn.ended") {
+          console.log(`[goose-turn-event] rejected: invalid type type=${body.type}`);
+          return Response.json({ error: "type must be turn.started or turn.ended" }, { status: 400 });
+        }
+        if (typeof body.session_id !== "string" || !body.session_id) {
+          console.log("[goose-turn-event] rejected: missing session_id");
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        if (typeof body.upstream_id !== "string" || !body.upstream_id) {
+          console.log("[goose-turn-event] rejected: missing upstream_id");
+          return Response.json({ error: "upstream_id is required" }, { status: 400 });
         }
 
         const row = storage.sessions.getByBackendSessionId(body.session_id);
@@ -1760,7 +1779,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             messageId: `h-${id}`,
             text: promptText,
           });
-          const outcome = res.status === 200 ? "mirrored" : `error_${res.status}`;
+          let outcome = "mirrored";
+          if (res.status === 200) {
+            try {
+              const data = (await res.clone().json()) as { mirrored?: boolean; reason?: string };
+              if (!data.mirrored) {
+                outcome = data.reason ?? "not_mirrored";
+              }
+            } catch {
+              // ignore
+            }
+          } else {
+            outcome = `error_${res.status}`;
+          }
           console.log(
             `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,
           );
