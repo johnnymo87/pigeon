@@ -60,15 +60,16 @@ honkd -> receiver, `POST <turn-hook-url>`, `Content-Type: application/json`, `Au
 
 ## Pigeon's Handling (`POST /goose/turn-event`)
 
-1. **Authentication**: Authenticated via the global daemon bearer token check (`checkAuth`).
+1. **Authentication**: Authenticated via the global daemon bearer token check (`checkAuth`). A wrong or missing token returns 401, which honkd treats as a permanent 4xx error, causing honkd to drop every turn event (visible only as warnings in honkd logs).
 2. **Validation**: Rejects invalid JSON or non-object bodies with HTTP 400 (`{ error: ... }`). Requires `v === 1`, `type` in `turn.started` | `turn.ended`, and non-empty `session_id` and `upstream_id`.
-3. **Session Resolution**: Looks up `storage.sessions.getByBackendSessionId(session_id)`. If missing or `backendKind !== "goose-acp"`, returns `200 { ok: true, ignored: "unregistered" }`.
+3. **Session Resolution**: Looks up `storage.sessions.getByBackendSessionId(session_id)`. If missing or `backendKind !== "goose-acp"`, returns `200 { ok: true, ignored: "unregistered" }`. Legacy goose session rows with NULL `backend_session_id` are not matched and are treated as unregistered.
 4. **Own-Turn Skip**: For each `crid` in `client_req_ids`, checks if `storage.gooseInflight.get(crid)` exists or an outbox entry `s:<sessionId>:<sanitiseIdPart(crid)>` exists. If either exists, the turn was initiated by pigeon's own goose runner, so pigeon returns `200 { ok: true, ignored: "own_turn" }` to prevent duplicate mirror/stop postings.
+   - Note on stalled turns: When a runner turn is abandoned by pigeon as stalled (the runner emits a `s:<sessionId>:<crid>:stalled` notice and retires its in-flight row), the in-flight row is gone and no un-suffixed stop entry exists. When honkd later reports `turn.ended` for that turn, the hook does NOT skip it and posts the real reply under `s:<sessionId>:h-<id>`. This is intended: the eventual reply reaches the topic rather than being lost.
 5. **Key Derivation**: Computes `id = sanitiseIdPart(upstream_id)` (where `sanitiseIdPart` restricts characters to `[A-Za-z0-9_.-]`, capped at 64 characters).
-6. **`turn.started` Processing**: Invokes `handleMirrorBody({ sessionId: row.sessionId, messageId: \`h-${id}\`, text: prompt_text ?? "" })`. Enqueues an outbox entry with `kind='mirror'` and `notificationId` `m:<sessionId>:h-<id>`. Updates session `lastHumanMsgId` to `h-<id>`.
-7. **`turn.ended` Processing**: Renders notification message and status via `renderHookTurn(body)`. Invokes `handleStopBody({ session_id: row.sessionId, notification_id: \`s:${row.sessionId}:h-${id}\`, event: r.event, message: r.message, ...(r.errorKind ? { error_kind: r.errorKind } : {}) })` without passing `title` or `label`. Enqueues an outbox entry with `kind='stop'` and `notificationId` `s:<sessionId>:h-<id>`.
+6. **`turn.started` Processing**: Caps `prompt_text` at 4096 UTF-16 code units (appending `\n\n[... prompt truncated]` if cut). Invokes `handleMirrorBody({ sessionId: row.sessionId, messageId: \`h-${id}\`, text: prompt_text ?? "" }, { setAnchor: false })`. Passing `{ setAnchor: false }` leaves `lastHumanMsgId` untouched so human navigation anchors are not frozen by upstream turn IDs. Enqueues an outbox entry with `kind='mirror'` and `notificationId` `m:<sessionId>:h-<id>`.
+7. **`turn.ended` Processing**: Renders notification message and status via `renderHookTurn(body)`. Invokes `handleStopBody({ session_id: row.sessionId, notification_id: \`s:${row.sessionId}:h-${id}\`, event: r.event, message: r.message, ...(r.errorKind ? { error_kind: r.errorKind } : {}), after_notification_id: \`m:${row.sessionId}:h-${id}\` })` without passing `title` or `label`. Setting `after_notification_id` guarantees that outbox delivery holds the stop reply until the prompt mirror row is sent, eliminating reply-before-prompt races within the turn.
 8. **Idempotency**: Because outbox records are primary-keyed on `notificationId` (`m:<sessionId>:h-<id>` for mirror and `s:<sessionId>:h-<id>` for stop), duplicate delivery of `turn.started` or `turn.ended` events is idempotent and produces no duplicate Telegram messages.
-9. **Deploy Order**: Deploy pigeon with this route enabled before starting honkd with `--turn-hook-url`. If honkd sends events before pigeon has this route deployed, pigeon returns 404, which honkd treats as a permanent 4xx error and drops.
+9. **Deploy Order**: Deploy pigeon with this route enabled before starting honkd with `--turn-hook-url`. If honkd sends events before pigeon has this route deployed, pigeon returns 404, which honkd treats as a permanent 4xx error and drops without retrying.
 
 ---
 
@@ -76,5 +77,4 @@ honkd -> receiver, `POST <turn-hook-url>`, `Content-Type: application/json`, `Au
 
 - **Steer messages**: Steer messages typed into a running turn are not mirrored.
 - **Bypassed runs**: Runs a client starts by talking to goose directly (bypassing honkd) are not seen by the turn hook.
-- **Outbox ordering race**: A turn that finishes faster than pigeon's outbox drains its mirror row can show its reply above its prompt in Telegram, because pigeon's outbox prioritizes `stop` before `mirror` within a session.
 - **Crash/downtime event loss**: An event can be lost if honkd crashes between a turn ending and the POST, or if pigeon is unreachable for longer than honkd's retry window (20 minutes).

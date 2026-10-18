@@ -306,6 +306,36 @@ describe("POST /goose/turn-event", () => {
     const jsonForeign = await resForeign.json();
     expect(jsonForeign).toEqual({ mirrored: true });
     expect(storage!.outbox.getByNotificationId(`m:${gseId}:h-hk3_7-17`)).not.toBeNull();
+
+    // 4. Stalled turn: in-flight row absent, outbox has only :stalled -> NOT skipped, real reply posted
+    storage!.outbox.upsert(
+      {
+        notificationId: `s:${gseId}:crid-pigeon-stalled:stalled`,
+        sessionId: gseId,
+        requestId: "req-crid-stalled",
+        kind: "stop",
+        payload: JSON.stringify({ messages: [{ text: "Turn stalled" }] }),
+        token: "",
+      },
+      1_000,
+    );
+
+    const resStalled = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.ended",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-stalled-reply",
+      client_req_ids: ["crid-pigeon-stalled"],
+      stop_reason: "end_turn",
+      final_text: "Delayed reply that finished after stall",
+    });
+    expect(resStalled.status).toBe(202);
+    expect(await resStalled.json()).toEqual({
+      ok: true,
+      deliveryState: "queued",
+      notificationId: `s:${gseId}:h-hk3_7-stalled-reply`,
+    });
+    expect(storage!.outbox.getByNotificationId(`s:${gseId}:h-hk3_7-stalled-reply`)).not.toBeNull();
   });
 
   it("validates request payload (400)", async () => {
