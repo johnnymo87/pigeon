@@ -33,21 +33,142 @@ describe("parseGooseUsage", () => {
     });
   });
 
-  it("treats missing size as 0", () => {
-    const raw = { used: 812 };
-    expect(parseGooseUsage(raw)).toEqual({
+  it("treats missing, null, or invalid size as 0", () => {
+    expect(parseGooseUsage({ used: 812 })).toEqual({
       used: 812,
       size: 0,
-      cost: undefined,
+    });
+    expect(parseGooseUsage({ used: 812, size: null })).toEqual({
+      used: 812,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: -5 })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: "200000" })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: NaN })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: Infinity })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: -Infinity })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: {} })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: [] })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, size: true })).toEqual({
+      used: 100,
+      size: 0,
     });
   });
 
-  it("omits cost when cost is absent", () => {
-    const raw = { used: 12300, size: 200000 };
-    expect(parseGooseUsage(raw)).toEqual({
+  it("omits cost when absent, null, or malformed, keeping token count and size", () => {
+    expect(parseGooseUsage({ used: 12300, size: 200000 })).toEqual({
       used: 12300,
       size: 200000,
-      cost: undefined,
+    });
+    expect(parseGooseUsage({ used: 100, size: 200, cost: null })).toEqual({
+      used: 100,
+      size: 200,
+    });
+    expect(parseGooseUsage({ used: 100, cost: "free" })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, cost: 123 })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, cost: true })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, cost: [] })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, cost: { currency: "USD" } })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: "1.84", currency: "USD" } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: NaN, currency: "USD" } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: Infinity, currency: "USD" } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: -Infinity, currency: "USD" } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(parseGooseUsage({ used: 100, cost: { amount: 1.84 } })).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: 1.84, currency: "" } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+    expect(
+      parseGooseUsage({ used: 100, cost: { amount: 1.84, currency: 123 } }),
+    ).toEqual({
+      used: 100,
+      size: 0,
+    });
+  });
+
+  it("keeps valid cost even if size is null or invalid", () => {
+    expect(
+      parseGooseUsage({
+        used: 500,
+        size: null,
+        cost: { amount: 0.05, currency: "USD" },
+      }),
+    ).toEqual({
+      used: 500,
+      size: 0,
+      cost: { amount: 0.05, currency: "USD" },
+    });
+    expect(
+      parseGooseUsage({
+        used: 500,
+        size: -10,
+        cost: { amount: 0.05, currency: "USD" },
+      }),
+    ).toEqual({
+      used: 500,
+      size: 0,
+      cost: { amount: 0.05, currency: "USD" },
     });
   });
 
@@ -66,23 +187,10 @@ describe("parseGooseUsage", () => {
     expect(parseGooseUsage({ used: -1, size: 1000 })).toBeUndefined();
     expect(parseGooseUsage({ used: NaN, size: 1000 })).toBeUndefined();
     expect(parseGooseUsage({ used: Infinity, size: 1000 })).toBeUndefined();
-  });
-
-  it("returns undefined when size is invalid (negative, string, NaN, non-finite)", () => {
-    expect(parseGooseUsage({ used: 100, size: -5 })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, size: "200000" })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, size: NaN })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, size: Infinity })).toBeUndefined();
-  });
-
-  it("returns undefined when cost is present but invalid", () => {
-    expect(parseGooseUsage({ used: 100, cost: null })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: "free" })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: { amount: "1.84", currency: "USD" } })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: { amount: NaN, currency: "USD" } })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: { amount: 1.84, currency: "" } })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: { amount: 1.84 } })).toBeUndefined();
-    expect(parseGooseUsage({ used: 100, cost: { currency: "USD" } })).toBeUndefined();
+    expect(parseGooseUsage({ used: -Infinity, size: 1000 })).toBeUndefined();
+    expect(parseGooseUsage({ used: null })).toBeUndefined();
+    expect(parseGooseUsage({ used: undefined })).toBeUndefined();
+    expect(parseGooseUsage({ used: {} })).toBeUndefined();
   });
 });
 

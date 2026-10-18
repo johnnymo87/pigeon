@@ -37,26 +37,21 @@ export function parseGooseUsage(x: unknown): GooseUsage | undefined {
   }
 
   let size = 0;
-  if (obj.size !== undefined) {
-    if (typeof obj.size !== "number" || !Number.isFinite(obj.size) || obj.size < 0) {
-      return undefined;
-    }
+  if (typeof obj.size === "number" && Number.isFinite(obj.size) && obj.size >= 0) {
     size = obj.size;
   }
 
   let cost: GooseUsageCost | undefined;
-  if (obj.cost !== undefined) {
-    if (typeof obj.cost !== "object" || obj.cost === null || Array.isArray(obj.cost)) {
-      return undefined;
-    }
+  if (typeof obj.cost === "object" && obj.cost !== null && !Array.isArray(obj.cost)) {
     const c = obj.cost as Record<string, unknown>;
-    if (typeof c.amount !== "number" || !Number.isFinite(c.amount)) {
-      return undefined;
+    if (
+      typeof c.amount === "number" &&
+      Number.isFinite(c.amount) &&
+      typeof c.currency === "string" &&
+      c.currency.length > 0
+    ) {
+      cost = { amount: c.amount, currency: c.currency };
     }
-    if (typeof c.currency !== "string" || c.currency.length === 0) {
-      return undefined;
-    }
-    cost = { amount: c.amount, currency: c.currency };
   }
 
   return {
