@@ -25,6 +25,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `GET /session-origin?session_id=` -- ops read: "why is this session silent?". A 404 means no row: the deliver-default applies.
 - `DELETE /session-origin?session_id=` -- ops hard reset, idempotent. Clears provenance so the session returns to default delivery policy. Afterwards declared writers may re-quiet the session later, but with no title layer, DELETE now makes a session louder, full stop.
 - `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`
+- `POST /goose/turn-event` -- receive `turn.started` and `turn.ended` events from honkd turn hooks for goose sessions. Mirrors prompts to Telegram (`kind='mirror'`) and posts completion receipts (`kind='stop'`). Skips own turns via in-flight/outbox records; idempotent on `h-<upstream_id>`.
 - `POST /stop`
 - `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers Telegram notification with inline option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question

@@ -83,6 +83,10 @@ export const additiveColumns = [
   // seeing it, and reaping it would silently unbind its topic. Written only by
   // pinTopicKey/setBoundTopicKey; `sessions.upsert` leaves it alone.
   "ALTER TABLE sessions ADD COLUMN bound_topic_key TEXT DEFAULT NULL",
+  // Per-row dependency ordering for notification delivery. When set, getReady
+  // holds this row until the dependent notification_id has been sent. Used by
+  // hook turn.ended to prevent replies overtaking prompts.
+  "ALTER TABLE outbox ADD COLUMN after_notification_id TEXT DEFAULT NULL",
 ];
 
 export function runAdditiveMigrations(

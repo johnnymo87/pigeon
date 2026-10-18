@@ -52,6 +52,15 @@ import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
 import type { GooseInflightRecord, GooseInflightStore } from "../storage/goose-inflight-repo.js";
 import { DisconnectedDuringTurn, type RunOwnership, type RunState, type RunStateInfo } from "./acp-client.js";
+import {
+  capText,
+  DEFAULT_MAX_TRANSCRIPT_BYTES,
+  emptyReplyText,
+  honkReasonDetail,
+  TRUNCATION_NOTICE,
+} from "./render-turn.js";
+
+export { DEFAULT_MAX_TRANSCRIPT_BYTES, TRUNCATION_NOTICE };
 
 /**
  * What the human is told when the daemon shuts down with a goose turn in flight.
@@ -214,8 +223,6 @@ interface QueuedItem {
   queuedNoticeSent?: boolean;
 }
 
-const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
-const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
 const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
 const DEFAULT_DRAIN_FALLBACK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes (Item 6)
 const QUEUED_NOTICE_MESSAGE =
@@ -1553,16 +1560,8 @@ export class GooseSessionRunner {
       const accumulated = turn.text.join("");
 
       if (typeof receipt?.text === "string" && receipt.text !== "") {
-        if (receipt.text.length > cap) {
-          let sliceEnd = cap;
-          const c = receipt.text.charCodeAt(sliceEnd - 1);
-          if (c >= 0xd800 && c <= 0xdbff) {
-            sliceEnd = cap - 1;
-          }
-          message = receipt.text.slice(0, sliceEnd) + TRUNCATION_NOTICE;
-        } else {
-          message = receipt.text;
-        }
+        const capped = capText(receipt.text, cap);
+        message = capped.truncated ? capped.text + TRUNCATION_NOTICE : capped.text;
       } else if (receipt?.text === "") {
         // Honkd says goose ended the turn with no reply text.
         // On a recovered turn, honkd's "" is authoritative over post-restart chunks.
@@ -1579,9 +1578,7 @@ export class GooseSessionRunner {
           }
         } else {
           emptyReceipt = true;
-          message = stopReason && stopReason !== "end_turn"
-            ? `goose ended the turn without a reply (stopReason: ${stopReason}).`
-            : "goose ended the turn without a reply.";
+          message = emptyReplyText(stopReason);
         }
       } else if (turn.recovered) {
         message = accumulated
@@ -1606,20 +1603,16 @@ export class GooseSessionRunner {
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
         message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
-      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "not_delivered") {
-        const detail = "The message was not delivered; please send it again.";
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
-      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "upstream_restart") {
-        const detail = "goose restarted and the turn was cancelled.";
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
-      } else if (receipt?.stopReason === "cancelled" && receipt.honkReason === "delivery_unknown") {
-        const detail = "honkd could not confirm goose received this message; check the session before resending.";
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
-      } else if (message === "") {
-        // A turn that ends with no assistant text is a real outcome (a pure tool
-        // run, a refusal). Saying so beats an empty Telegram message, which the
-        // human cannot distinguish from a bug in this code.
-        message = `goose finished the turn with no message (stopReason: ${stopReason ?? "unknown"}).`;
+      } else {
+        const detail = honkReasonDetail(receipt?.stopReason, receipt?.honkReason);
+        if (detail !== undefined) {
+          message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+        } else if (message === "") {
+          // A turn that ends with no assistant text is a real outcome (a pure tool
+          // run, a refusal). Saying so beats an empty Telegram message, which the
+          // human cannot distinguish from a bug in this code.
+          message = `goose finished the turn with no message (stopReason: ${stopReason ?? "unknown"}).`;
+        }
       }
 
       await this.opts.postStop({

@@ -1,6 +1,8 @@
 import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
+import { sanitiseIdPart } from "./goose/session-runner.js";
+import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -434,6 +436,332 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     }
     if (pin) storage.sessions.setBoundTopicKey(sessionId, topic.key, nowFn());
     return { bound: true };
+  }
+
+  async function handleMirrorBody(
+    body: Record<string, unknown>,
+    mirrorOpts?: { setAnchor?: boolean },
+  ): Promise<Response> {
+    const sessionId =
+      typeof body.sessionId === "string" && body.sessionId
+        ? body.sessionId
+        : typeof body.session_id === "string"
+          ? body.session_id
+          : "";
+    if (!sessionId) {
+      return Response.json({ error: "sessionId is required" }, { status: 400 });
+    }
+
+    const messageId =
+      typeof body.messageId === "string" && body.messageId
+        ? body.messageId
+        : typeof body.message_id === "string"
+          ? body.message_id
+          : "";
+    if (!messageId) {
+      return Response.json({ error: "messageId is required" }, { status: 400 });
+    }
+
+    const text = typeof body.text === "string" ? body.text : "";
+    const now = nowFn();
+    const hash = hashPrompt(text);
+
+    // Consume BEFORE the whitespace check, so that "an injected prompt is consumed exactly
+    // once" holds for every text shape rather than every text shape except whitespace.
+    //
+    // This is hygiene, not a bug fix, and the distinction was corrected after review. It is
+    // tempting to say the leaked count "suppresses a later identical prompt for 15 minutes",
+    // and pigeon-pre9 and the first version of this comment both said so — but hashPrompt is
+    // a raw sha256 with no normalisation, so a later prompt with the same hash is also
+    // whitespace-only and is dropped by the !text.trim() check regardless of any count. A
+    // whitespace-hash count can never change a mirroring decision. What the reorder actually
+    // buys is that the row is freed when its echo arrives instead of lingering to the TTL
+    // sweep, and that a future caller of consume() cannot inherit a shape-dependent rule.
+    //
+    // payloadHasCloseTag is a BACKSTOP, not the primary test. injected_prompts is
+    // authoritative and hash-exact; the envelope catches the one case it misses --
+    // a record that expired (INJECTED_PROMPTS_TTL_MS, 15 min) before the echo
+    // arrived, where consume() returns false past the cutoff. How often that
+    // happens is UNQUANTIFIED and deliberately not asserted here: it depends on
+    // whether opencode creates the user-message row at prompt_async receipt or at
+    // turn dequeue, which is not knowable from this repo. The envelope boundary
+    // cannot be forged by payload content (envelope.ts rejects a close tag at both
+    // enqueue and render), so it is safe to trust.
+    //
+    // This also closes a latent mirror leak: such a turn previously posted to
+    // Telegram as a 🧑 human message. Pinned by the "neither clears nor mirrors an
+    // enveloped turn" test.
+    //
+    // Residual: a human who pastes a literal close tag into a prompt gets neither
+    // mirror nor clear. Self-heals on their next turn.
+    const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
+
+    // ANCHOR EVERY USER TURN, injected or not, ABOVE the early return below.
+    //
+    // This used to sit under that return, next to markAllRead, on the reasoning
+    // that an injected prompt is not evidence a human was present. That reasoning
+    // is sound and it is about the WRONG QUESTION. Presence decides whether to
+    // CLEAR a badge; an anchor answers "where does this turn begin", and an
+    // injected turn begins somewhere just as surely as a typed one.
+    //
+    // The cost of conflating them was measured on the live daemon: opencode-launch
+    // records its own launch prompt as injected, sendPrompt records every Telegram
+    // reply, and swarm messages carry an envelope -- so a headless worker's every
+    // turn was excluded and it could never be jumped to at all. 155 of 239 sessions
+    // with unread had no anchor, and the largest single group were sessions whose
+    // only turns arrived by exactly these routes.
+    //
+    // PLACEMENT IS LOAD-BEARING, and now in the opposite direction from the clear:
+    //  - ABOVE the early return, or injected turns get no anchor (the bug).
+    //  - markAllRead must STAY BELOW it. Hoisting the two together would mark a
+    //    badge read that no human saw, and the watermark is a MAX() upsert, so it
+    //    cannot be walked back. Pinned by the two "still does/does NOT clear" tests.
+    //
+    // Whitespace-only turns are still excluded, for a different reason than before:
+    // a blank turn has no renderable box, so an anchor on it cannot be scrolled to,
+    // and recording it would replace a usable older anchor with one that resolves
+    // to nothing -- landing the reader at the bottom, the failure this removes.
+    const shouldSetAnchor = mirrorOpts?.setAnchor !== false;
+    if (text.trim() && shouldSetAnchor) {
+      storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
+    }
+
+    if (wasInjected || !text.trim() || payloadHasCloseTag(text)) {
+      return Response.json({ mirrored: false });
+    }
+
+    // A user-role turn the daemon did not inject. Authoring a turn is evidence of
+    // having read what preceded it, so advance the read watermark.
+    //
+    // SAY WHAT THIS ACTUALLY ESTABLISHES, which is provenance, not presence.
+    // It is tempting to write "a human typed this into the TUI"; ancillary-gate.ts
+    // refutes that in terms, and it is the same trap that let lgtm's launch prompt
+    // mirror into Telegram: /mirror sees any user-role message absent from
+    // injected_prompts, and a session started outside the daemon (opencode-launch,
+    // `opencode run`, a peer driving the serve API) produces exactly that.
+    // Residual, accepted: such a turn clears a badge no human saw. It is bounded
+    // to sessions that ALREADY have unread events -- a launch prompt is normally a
+    // session's first event, where markAllRead no-ops on the empty ledger -- and it
+    // costs a bookmark, not content.
+    //
+    // PLACEMENT IS LOAD-BEARING, in both directions:
+    //  - BELOW the early-return above, or injected prompts would clear.
+    //  - ABOVE shouldEmitAncillaryFor, or a session with notify-policy
+    //    'none'/'errors-only' would never clear. Badge state and Telegram delivery
+    //    policy are unrelated concerns and must not be coupled.
+    // Both directions are pinned by tests in mirror-route.test.ts.
+    //
+    // The Telegram half of this behaviour is NOT here -- it lives at
+    // poller.dispatch (#125), which fires for every DISPATCHABLE command before its
+    // handler runs (unknown command types return earlier without clearing, so
+    // version skew does not clear). Do not add a second Telegram clear here.
+    storage.sessionEvents.markAllRead(sessionId, now);
+
+    // A session declared quiet (lgtm's automated reviews) must not mirror its
+    // prompts. Without this, lgtm's own launch prompt -- a user-role message the
+    // daemon never injected and so never suppressed -- posts into Telegram AND
+    // creates the topic, defeating the Stop suppression it sits beside.
+    if (!shouldEmitAncillaryFor(storage, sessionId, now)) {
+      console.log(`[mirror] quieted sessionId=${sessionId} reason=origin`);
+      return Response.json({ mirrored: false, reason: "quiet_origin" });
+    }
+
+    const session = storage.sessions.get(sessionId);
+    if (session) {
+      storage.sessions.touch(sessionId, now);
+    }
+
+    const label = displayName({
+      title: session?.title,
+      label: session?.label,
+      sessionId,
+    });
+
+    const header = new TgMessageBuilder().append(`🧑 ${label}`).build();
+    const bodyMsg = new TgMessageBuilder().append(text).build();
+    const footer = new TgMessageBuilder().build();
+
+    const chunks = splitTelegramMessage(header, bodyMsg, footer);
+    const notificationId = `m:${sessionId}:${messageId}`;
+    const notificationPayload = {
+      messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
+      replyMarkup: undefined,
+      notificationId,
+      title: session?.title ?? undefined,
+      dir: session?.cwd ?? undefined,
+      threaded: true,
+    };
+
+    storage.outbox.upsert(
+      {
+        notificationId,
+        sessionId,
+        requestId: `mirror-${sessionId}-${messageId}`,
+        kind: "mirror",
+        payload: JSON.stringify(notificationPayload),
+        token: "",
+        // This turn IS its own anchor. `mirror` is uncounted, so this row is
+        // never the badge's oldest-uncleared -- but it is still written, both
+        // for uniformity and because a mirror row DOES sit above the watermark
+        // (markAllRead ran above, before this row exists), so a phase-2 query
+        // that forgets the kind filter would otherwise find a null anchor.
+        anchorMsgId: messageId,
+        excerpt: excerptOf(text),
+      },
+      now,
+    );
+
+    return Response.json({ mirrored: true });
+  }
+
+  async function handleStopBody(
+    body: Record<string, unknown>,
+    stopOpts?: { afterNotificationId?: string | null },
+  ): Promise<Response> {
+    const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+    if (!sessionId) {
+      console.log(`[stop] rejected: missing session_id`);
+      return Response.json({ error: "session_id is required" }, { status: 400 });
+    }
+
+    const session = storage.sessions.get(sessionId);
+    if (!session) {
+      console.log(`[stop] rejected: session not found sessionId=${sessionId}`);
+      return Response.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    // Idempotency FIRST, before any side effect. A retry carries the payload it was
+    // enqueued with, so re-running touch/setTitle/policy below would let a stale
+    // payload move session state (and would re-read a policy that may have flipped
+    // since the first attempt). Answering a retry is a pure read.
+    const clientNotificationId = parseStopNotificationId(body.notification_id, sessionId);
+    if (clientNotificationId) {
+      const already = storage.outbox.getByNotificationId(clientNotificationId);
+      if (already) {
+        console.log(
+          `[stop] already queued sessionId=${sessionId} notificationId=${clientNotificationId}`,
+        );
+        return Response.json(
+          {
+            ok: true,
+            deliveryState: already.state === "sent" ? "sent" : "queued",
+            notificationId: clientNotificationId,
+          },
+          { status: already.state === "sent" ? 200 : 202 },
+        );
+      }
+    }
+
+    storage.sessions.touch(sessionId, nowFn());
+
+    if (!session.notify) {
+      console.log(`[stop] skipped: notify=false sessionId=${sessionId}`);
+      return Response.json({ ok: true, notified: false, reason: "notify=false" });
+    }
+
+    const message = typeof body.message === "string" ? body.message : null;
+    const summary = typeof body.summary === "string" ? body.summary : null;
+    const event = typeof body.event === "string" ? body.event : "Stop";
+    const label = typeof body.label === "string" ? body.label : null;
+    const requestTitle = parseTitle(body.title);
+    const errorKind = typeof body.error_kind === "string" ? body.error_kind : null;
+
+    if (requestTitle !== undefined) {
+      storage.sessions.setTitle(sessionId, requestTitle, nowFn());
+    }
+    const effectiveTitle = requestTitle ?? session.title;
+
+    const resolved = resolveEffectivePolicy(storage, sessionId, nowFn(), "stop");
+    const effectivePolicy = resolved.policy;
+
+    let decision: NotifyDecision;
+    try {
+      decision = decideNotify({
+        event,
+        policy: effectivePolicy,
+        title: effectiveTitle,
+        errorKind,
+      });
+    } catch (err) {
+      console.error(`[stop] notify decision failed sessionId=${sessionId}, delivering:`, err);
+      decision = { deliver: true, layer: "default" };
+    }
+
+    if (!decision.deliver) {
+      console.log(
+        `[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}" ` +
+        `layer=${decision.layer} origin=${resolved.origin ?? "-"}`,
+      );
+      return Response.json({ ok: true, notified: false, reason: `quiet_${decision.layer}` });
+    }
+
+    const now = nowFn();
+    // Server-minted fallback. It dedupes with nothing (the timestamp differs on every
+    // request), which is exactly why a client key exists -- keep this only for a
+    // plugin too old to send one, or one whose key failed validation.
+    const notificationId = clientNotificationId ?? `s:${sessionId}:${now}`;
+
+    // Generate token for reply routing
+    const token = generateToken();
+    storage.sessionTokens.mint({
+      token,
+      sessionId,
+      chatId: opts.chatId ?? "",
+      context: { event, summary: (message || summary || "Task completed").slice(0, 200) },
+    }, now);
+
+    // Format notification for the outbox
+    const notification = formatTelegramNotification({
+      event,
+      tag: opts.tagLookup?.get(sessionId) ?? null,
+      label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
+      summary: message || summary || "Task completed",
+      cwd: session.cwd,
+      token,
+      machineId: opts.machineId,
+      sessionId,
+    });
+
+    const chunks = splitTelegramMessage(notification.header, notification.body, notification.footer);
+    const notificationPayload = {
+      messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
+      replyMarkup: notification.replyMarkup,
+      notificationId,
+      title: effectiveTitle ?? undefined,
+      dir: session.cwd ?? undefined,
+      threaded: true,
+    };
+
+    const afterNotificationId = stopOpts?.afterNotificationId ?? null;
+
+    // Queue in outbox — OutboxSender will deliver with retry
+    storage.outbox.upsert({
+      notificationId,
+      sessionId,
+      requestId: `stop-${now}`,
+      kind: "stop",
+      payload: JSON.stringify(notificationPayload),
+      token,
+      anchorMsgId: session.lastHumanMsgId ?? null,
+      // Precedence MUST match what the notification actually renders, a few
+      // lines above: `message || summary || "Task completed"`. An excerpt that
+      // disagrees would make the drill-down show different text than the
+      // Telegram message it refers to.
+      excerpt: excerptOf(message || summary || "Task completed"),
+      afterNotificationId,
+    }, now);
+
+    // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
+    // here, a DELIVERY from a session carrying a quiet policy is ambiguous in the logs
+    // between "a genuine non-abort Error, which errors-only delivers by design" and "a Stop leaked
+    // past the origin layer" -- and the origin layer is now the ONLY suppression layer, so this
+    // line is the sole audit trail for that distinction. Do not drop these fields: the
+    // quiet-title soak they were added for is over, but the leak question they answer is
+    // permanent. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
+    // policy=all here and is explained by the `automated quiet expired` line above.
+    // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
+    console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${resolved.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
+    return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
   }
 
   return async function handleRequest(request: Request): Promise<Response> {
@@ -1390,6 +1718,130 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/goose/turn-event") {
+        let rawBody: unknown;
+        try {
+          rawBody = await readJsonBody(request);
+        } catch {
+          console.log("[goose-turn-event] rejected: invalid JSON body");
+          return Response.json({ error: "invalid JSON body" }, { status: 400 });
+        }
+
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+          console.log("[goose-turn-event] rejected: body must be an object");
+          return Response.json({ error: "body must be an object" }, { status: 400 });
+        }
+
+        const body = rawBody as Record<string, unknown>;
+        if (body.v !== 1) {
+          console.log(`[goose-turn-event] rejected: invalid version v=${body.v}`);
+          return Response.json({ error: "v must be 1" }, { status: 400 });
+        }
+        if (body.type !== "turn.started" && body.type !== "turn.ended") {
+          console.log(`[goose-turn-event] rejected: invalid type type=${body.type}`);
+          return Response.json({ error: "type must be turn.started or turn.ended" }, { status: 400 });
+        }
+        if (typeof body.session_id !== "string" || !body.session_id) {
+          console.log("[goose-turn-event] rejected: missing session_id");
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        if (typeof body.upstream_id !== "string" || !body.upstream_id) {
+          console.log("[goose-turn-event] rejected: missing upstream_id");
+          return Response.json({ error: "upstream_id is required" }, { status: 400 });
+        }
+
+        const row = storage.sessions.getByBackendSessionId(body.session_id);
+        if (!row || row.backendKind !== GOOSE_BACKEND_KIND) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${body.session_id} upstream=${body.upstream_id} outcome=unregistered`,
+          );
+          return Response.json({ ok: true, ignored: "unregistered" });
+        }
+
+        const clientReqIds = Array.isArray(body.client_req_ids) ? (body.client_req_ids as unknown[]) : [];
+        let isOwnTurn = false;
+        for (const rawCrid of clientReqIds) {
+          if (typeof rawCrid !== "string" || !rawCrid) continue;
+          if (storage.gooseInflight.get(rawCrid)) {
+            isOwnTurn = true;
+            break;
+          }
+          const stopId = `s:${row.sessionId}:${sanitiseIdPart(rawCrid)}`;
+          if (storage.outbox.getByNotificationId(stopId)) {
+            isOwnTurn = true;
+            break;
+          }
+        }
+
+        if (isOwnTurn) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=own_turn`,
+          );
+          return Response.json({ ok: true, ignored: "own_turn" });
+        }
+
+        const id = sanitiseIdPart(body.upstream_id);
+
+        if (body.type === "turn.started") {
+          const rawPromptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          if (payloadHasCloseTag(rawPromptText)) {
+            console.log(
+              `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=not_mirrored`,
+            );
+            return Response.json({ mirrored: false });
+          }
+          let promptText = rawPromptText;
+          const capped = capText(promptText, 4096);
+          if (capped.truncated) {
+            promptText = `${capped.text}\n\n[... prompt truncated]`;
+          }
+          const res = await handleMirrorBody(
+            {
+              sessionId: row.sessionId,
+              messageId: `h-${id}`,
+              text: promptText,
+            },
+            { setAnchor: false },
+          );
+          let outcome = "mirrored";
+          if (res.status === 200) {
+            try {
+              const data = (await res.clone().json()) as { mirrored?: boolean; reason?: string };
+              if (!data.mirrored) {
+                outcome = data.reason ?? "not_mirrored";
+              }
+            } catch {
+              // ignore
+            }
+          } else {
+            outcome = `error_${res.status}`;
+          }
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,
+          );
+          return res;
+        }
+
+        if (body.type === "turn.ended") {
+          const r = renderHookTurn(body as HookTurnEndedEvent);
+          const res = await handleStopBody(
+            {
+              session_id: row.sessionId,
+              notification_id: `s:${row.sessionId}:h-${id}`,
+              event: r.event,
+              message: r.message,
+              ...(r.errorKind ? { error_kind: r.errorKind } : {}),
+            },
+            { afterNotificationId: `m:${row.sessionId}:h-${id}` },
+          );
+          const outcome = res.status === 202 || res.status === 200 ? "queued" : `error_${res.status}`;
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,
+          );
+          return res;
+        }
+      }
+
       if (request.method === "GET" && url.pathname === "/sessions") {
         const active = url.searchParams.get("active") === "true";
         const notify = url.searchParams.get("notify") === "true";
@@ -1433,320 +1885,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
       if (request.method === "POST" && url.pathname === "/mirror") {
         const body = await readJsonBody(request);
-        const sessionId =
-          typeof body.sessionId === "string" && body.sessionId
-            ? body.sessionId
-            : typeof body.session_id === "string"
-              ? body.session_id
-              : "";
-        if (!sessionId) {
-          return Response.json({ error: "sessionId is required" }, { status: 400 });
-        }
-
-        const messageId =
-          typeof body.messageId === "string" && body.messageId
-            ? body.messageId
-            : typeof body.message_id === "string"
-              ? body.message_id
-              : "";
-        if (!messageId) {
-          return Response.json({ error: "messageId is required" }, { status: 400 });
-        }
-
-        const text = typeof body.text === "string" ? body.text : "";
-        const now = nowFn();
-        const hash = hashPrompt(text);
-
-        // Consume BEFORE the whitespace check, so that "an injected prompt is consumed exactly
-        // once" holds for every text shape rather than every text shape except whitespace.
-        //
-        // This is hygiene, not a bug fix, and the distinction was corrected after review. It is
-        // tempting to say the leaked count "suppresses a later identical prompt for 15 minutes",
-        // and pigeon-pre9 and the first version of this comment both said so — but hashPrompt is
-        // a raw sha256 with no normalisation, so a later prompt with the same hash is also
-        // whitespace-only and is dropped by the !text.trim() check regardless of any count. A
-        // whitespace-hash count can never change a mirroring decision. What the reorder actually
-        // buys is that the row is freed when its echo arrives instead of lingering to the TTL
-        // sweep, and that a future caller of consume() cannot inherit a shape-dependent rule.
-        //
-        // payloadHasCloseTag is a BACKSTOP, not the primary test. injected_prompts is
-        // authoritative and hash-exact; the envelope catches the one case it misses --
-        // a record that expired (INJECTED_PROMPTS_TTL_MS, 15 min) before the echo
-        // arrived, where consume() returns false past the cutoff. How often that
-        // happens is UNQUANTIFIED and deliberately not asserted here: it depends on
-        // whether opencode creates the user-message row at prompt_async receipt or at
-        // turn dequeue, which is not knowable from this repo. The envelope boundary
-        // cannot be forged by payload content (envelope.ts rejects a close tag at both
-        // enqueue and render), so it is safe to trust.
-        //
-        // This also closes a latent mirror leak: such a turn previously posted to
-        // Telegram as a 🧑 human message. Pinned by the "neither clears nor mirrors an
-        // enveloped turn" test.
-        //
-        // Residual: a human who pastes a literal close tag into a prompt gets neither
-        // mirror nor clear. Self-heals on their next turn.
-        const wasInjected = storage.injectedPrompts.consume(sessionId, hash, now);
-
-        // ANCHOR EVERY USER TURN, injected or not, ABOVE the early return below.
-        //
-        // This used to sit under that return, next to markAllRead, on the reasoning
-        // that an injected prompt is not evidence a human was present. That reasoning
-        // is sound and it is about the WRONG QUESTION. Presence decides whether to
-        // CLEAR a badge; an anchor answers "where does this turn begin", and an
-        // injected turn begins somewhere just as surely as a typed one.
-        //
-        // The cost of conflating them was measured on the live daemon: opencode-launch
-        // records its own launch prompt as injected, sendPrompt records every Telegram
-        // reply, and swarm messages carry an envelope -- so a headless worker's every
-        // turn was excluded and it could never be jumped to at all. 155 of 239 sessions
-        // with unread had no anchor, and the largest single group were sessions whose
-        // only turns arrived by exactly these routes.
-        //
-        // PLACEMENT IS LOAD-BEARING, and now in the opposite direction from the clear:
-        //  - ABOVE the early return, or injected turns get no anchor (the bug).
-        //  - markAllRead must STAY BELOW it. Hoisting the two together would mark a
-        //    badge read that no human saw, and the watermark is a MAX() upsert, so it
-        //    cannot be walked back. Pinned by the two "still does/does NOT clear" tests.
-        //
-        // Whitespace-only turns are still excluded, for a different reason than before:
-        // a blank turn has no renderable box, so an anchor on it cannot be scrolled to,
-        // and recording it would replace a usable older anchor with one that resolves
-        // to nothing -- landing the reader at the bottom, the failure this removes.
-        if (text.trim()) {
-          storage.sessions.setLastHumanMsgId(sessionId, messageId, now);
-        }
-
-        if (wasInjected || !text.trim() || payloadHasCloseTag(text)) {
-          return Response.json({ mirrored: false });
-        }
-
-        // A user-role turn the daemon did not inject. Authoring a turn is evidence of
-        // having read what preceded it, so advance the read watermark.
-        //
-        // SAY WHAT THIS ACTUALLY ESTABLISHES, which is provenance, not presence.
-        // It is tempting to write "a human typed this into the TUI"; ancillary-gate.ts
-        // refutes that in terms, and it is the same trap that let lgtm's launch prompt
-        // mirror into Telegram: /mirror sees any user-role message absent from
-        // injected_prompts, and a session started outside the daemon (opencode-launch,
-        // `opencode run`, a peer driving the serve API) produces exactly that.
-        // Residual, accepted: such a turn clears a badge no human saw. It is bounded
-        // to sessions that ALREADY have unread events -- a launch prompt is normally a
-        // session's first event, where markAllRead no-ops on the empty ledger -- and it
-        // costs a bookmark, not content.
-        //
-        // PLACEMENT IS LOAD-BEARING, in both directions:
-        //  - BELOW the early-return above, or injected prompts would clear.
-        //  - ABOVE shouldEmitAncillaryFor, or a session with notify-policy
-        //    'none'/'errors-only' would never clear. Badge state and Telegram delivery
-        //    policy are unrelated concerns and must not be coupled.
-        // Both directions are pinned by tests in mirror-route.test.ts.
-        //
-        // The Telegram half of this behaviour is NOT here -- it lives at
-        // poller.dispatch (#125), which fires for every DISPATCHABLE command before its
-        // handler runs (unknown command types return earlier without clearing, so
-        // version skew does not clear). Do not add a second Telegram clear here.
-        storage.sessionEvents.markAllRead(sessionId, now);
-
-        // A session declared quiet (lgtm's automated reviews) must not mirror its
-        // prompts. Without this, lgtm's own launch prompt -- a user-role message the
-        // daemon never injected and so never suppressed -- posts into Telegram AND
-        // creates the topic, defeating the Stop suppression it sits beside.
-        if (!shouldEmitAncillaryFor(storage, sessionId, now)) {
-          console.log(`[mirror] quieted sessionId=${sessionId} reason=origin`);
-          return Response.json({ mirrored: false, reason: "quiet_origin" });
-        }
-
-        const session = storage.sessions.get(sessionId);
-        if (session) {
-          storage.sessions.touch(sessionId, now);
-        }
-
-        const label = displayName({
-          title: session?.title,
-          label: session?.label,
-          sessionId,
-        });
-
-        const header = new TgMessageBuilder().append(`🧑 ${label}`).build();
-        const bodyMsg = new TgMessageBuilder().append(text).build();
-        const footer = new TgMessageBuilder().build();
-
-        const chunks = splitTelegramMessage(header, bodyMsg, footer);
-        const notificationId = `m:${sessionId}:${messageId}`;
-        const notificationPayload = {
-          messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
-          replyMarkup: undefined,
-          notificationId,
-          title: session?.title ?? undefined,
-          dir: session?.cwd ?? undefined,
-          threaded: true,
-        };
-
-        storage.outbox.upsert(
-          {
-            notificationId,
-            sessionId,
-            requestId: `mirror-${sessionId}-${messageId}`,
-            kind: "mirror",
-            payload: JSON.stringify(notificationPayload),
-            token: "",
-            // This turn IS its own anchor. `mirror` is uncounted, so this row is
-            // never the badge's oldest-uncleared -- but it is still written, both
-            // for uniformity and because a mirror row DOES sit above the watermark
-            // (markAllRead ran above, before this row exists), so a phase-2 query
-            // that forgets the kind filter would otherwise find a null anchor.
-            anchorMsgId: messageId,
-            excerpt: excerptOf(text),
-          },
-          now,
-        );
-
-        return Response.json({ mirrored: true });
+        return handleMirrorBody(body);
       }
 
       if (request.method === "POST" && url.pathname === "/stop") {
         const body = await readJsonBody(request);
-        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
-        if (!sessionId) {
-          console.log(`[stop] rejected: missing session_id`);
-          return Response.json({ error: "session_id is required" }, { status: 400 });
-        }
-
-        const session = storage.sessions.get(sessionId);
-        if (!session) {
-          console.log(`[stop] rejected: session not found sessionId=${sessionId}`);
-          return Response.json({ error: "Session not found" }, { status: 404 });
-        }
-
-        // Idempotency FIRST, before any side effect. A retry carries the payload it was
-        // enqueued with, so re-running touch/setTitle/policy below would let a stale
-        // payload move session state (and would re-read a policy that may have flipped
-        // since the first attempt). Answering a retry is a pure read.
-        const clientNotificationId = parseStopNotificationId(body.notification_id, sessionId);
-        if (clientNotificationId) {
-          const already = storage.outbox.getByNotificationId(clientNotificationId);
-          if (already) {
-            console.log(
-              `[stop] already queued sessionId=${sessionId} notificationId=${clientNotificationId}`,
-            );
-            return Response.json(
-              {
-                ok: true,
-                deliveryState: already.state === "sent" ? "sent" : "queued",
-                notificationId: clientNotificationId,
-              },
-              { status: already.state === "sent" ? 200 : 202 },
-            );
-          }
-        }
-
-        storage.sessions.touch(sessionId, nowFn());
-
-        if (!session.notify) {
-          console.log(`[stop] skipped: notify=false sessionId=${sessionId}`);
-          return Response.json({ ok: true, notified: false, reason: "notify=false" });
-        }
-
-        const message = typeof body.message === "string" ? body.message : null;
-        const summary = typeof body.summary === "string" ? body.summary : null;
-        const event = typeof body.event === "string" ? body.event : "Stop";
-        const label = typeof body.label === "string" ? body.label : null;
-        const requestTitle = parseTitle(body.title);
-        const errorKind = typeof body.error_kind === "string" ? body.error_kind : null;
-
-        if (requestTitle !== undefined) {
-          storage.sessions.setTitle(sessionId, requestTitle, nowFn());
-        }
-        const effectiveTitle = requestTitle ?? session.title;
-
-        const resolved = resolveEffectivePolicy(storage, sessionId, nowFn(), "stop");
-        const effectivePolicy = resolved.policy;
-
-        let decision: NotifyDecision;
-        try {
-          decision = decideNotify({
-            event,
-            policy: effectivePolicy,
-            title: effectiveTitle,
-            errorKind,
-          });
-        } catch (err) {
-          console.error(`[stop] notify decision failed sessionId=${sessionId}, delivering:`, err);
-          decision = { deliver: true, layer: "default" };
-        }
-
-        if (!decision.deliver) {
-          console.log(
-            `[stop] quieted sessionId=${sessionId} event=${event} title="${effectiveTitle}" ` +
-            `layer=${decision.layer} origin=${resolved.origin ?? "-"}`,
-          );
-          return Response.json({ ok: true, notified: false, reason: `quiet_${decision.layer}` });
-        }
-
-        const now = nowFn();
-        // Server-minted fallback. It dedupes with nothing (the timestamp differs on every
-        // request), which is exactly why a client key exists -- keep this only for a
-        // plugin too old to send one, or one whose key failed validation.
-        const notificationId = clientNotificationId ?? `s:${sessionId}:${now}`;
-
-        // Generate token for reply routing
-        const token = generateToken();
-        storage.sessionTokens.mint({
-          token,
-          sessionId,
-          chatId: opts.chatId ?? "",
-          context: { event, summary: (message || summary || "Task completed").slice(0, 200) },
-        }, now);
-
-        // Format notification for the outbox
-        const notification = formatTelegramNotification({
-          event,
-          tag: opts.tagLookup?.get(sessionId) ?? null,
-          label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
-          summary: message || summary || "Task completed",
-          cwd: session.cwd,
-          token,
-          machineId: opts.machineId,
-          sessionId,
-        });
-
-        const chunks = splitTelegramMessage(notification.header, notification.body, notification.footer);
-        const notificationPayload = {
-          messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
-          replyMarkup: notification.replyMarkup,
-          notificationId,
-          title: effectiveTitle ?? undefined,
-          dir: session.cwd ?? undefined,
-          threaded: true,
-        };
-
-        // Queue in outbox — OutboxSender will deliver with retry
-        storage.outbox.upsert({
-          notificationId,
-          sessionId,
-          requestId: `stop-${now}`,
-          kind: "stop",
-          payload: JSON.stringify(notificationPayload),
-          token,
-          anchorMsgId: session.lastHumanMsgId ?? null,
-          // Precedence MUST match what the notification actually renders, a few
-          // lines above: `message || summary || "Task completed"`. An excerpt that
-          // disagrees would make the drill-down show different text than the
-          // Telegram message it refers to.
-          excerpt: excerptOf(message || summary || "Task completed"),
-        }, now);
-
-        // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
-        // here, a DELIVERY from a session carrying a quiet policy is ambiguous in the logs
-        // between "a genuine non-abort Error, which errors-only delivers by design" and "a Stop leaked
-        // past the origin layer" -- and the origin layer is now the ONLY suppression layer, so this
-        // line is the sole audit trail for that distinction. Do not drop these fields: the
-        // quiet-title soak they were added for is over, but the leak question they answer is
-        // permanent. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
-        // policy=all here and is explained by the `automated quiet expired` line above.
-        // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
-        console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${resolved.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
-        return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
+        return handleStopBody(body);
       }
 
       if (request.method === "POST" && url.pathname === "/question-asked") {
