@@ -2,7 +2,7 @@ import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
-import { renderHookTurn, type HookTurnEndedEvent } from "./goose/render-turn.js";
+import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -1773,7 +1773,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const id = sanitiseIdPart(body.upstream_id);
 
         if (body.type === "turn.started") {
-          const promptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          let promptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          const capped = capText(promptText, 4096);
+          if (capped.truncated) {
+            promptText = `${capped.text}\n\n[... prompt truncated]`;
+          }
           const res = await handleMirrorBody({
             sessionId: row.sessionId,
             messageId: `h-${id}`,

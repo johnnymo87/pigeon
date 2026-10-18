@@ -120,6 +120,31 @@ describe("POST /goose/turn-event", () => {
     expect(sessionRow?.lastHumanMsgId).toBe("h-hk3_7-12");
   });
 
+  it("caps mirrored hook prompt_text at 4096 UTF-16 units with truncation notice", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+
+    const longPrompt = "x".repeat(5000);
+    const res = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.started",
+      session_id: "goose-sess-1",
+      upstream_id: "hk3_7-long",
+      prompt_text: longPrompt,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ mirrored: true });
+
+    const mirrorRow = storage!.outbox.getByNotificationId(`m:${gseId}:h-hk3_7-long`);
+    expect(mirrorRow).not.toBeNull();
+    const payload = JSON.parse(mirrorRow!.payload);
+    const allText = payload.messages.map((m: { text: string }) => m.text).join("");
+    expect(allText).toContain("\n\n[... prompt truncated]");
+    const xCount = (allText.match(/x/g) || []).length;
+    expect(xCount).toBe(4096);
+  });
+
   it("turn.ended -> one stop row s:<gse>:h-<id>, payload text contains final; repeat with same body -> idempotent", async () => {
     const app = newApp();
     const gseId = await registerGoose(app, "goose-sess-1");
