@@ -10,6 +10,11 @@ export interface OutboxRecord {
   /** Phase 1b: scroll anchor and drill-down excerpt, fixed at first enqueue. */
   anchorMsgId: string | null;
   excerpt: string | null;
+  /**
+   * Notification ID that must reach 'sent' state before this entry becomes
+   * ready. Null means no predecessor constraint.
+   */
+  afterNotificationId: string | null;
   state: string;
   payload: string;
   token: string;
@@ -43,6 +48,7 @@ export interface UpsertOutboxInput {
    */
   anchorMsgId?: string | null;
   excerpt?: string | null;
+  afterNotificationId?: string | null;
 }
 
 function asOutbox(row: SqlRow): OutboxRecord {
@@ -53,6 +59,7 @@ function asOutbox(row: SqlRow): OutboxRecord {
     kind: String(row.kind),
     anchorMsgId: row.anchor_msg_id === null || row.anchor_msg_id === undefined ? null : String(row.anchor_msg_id),
     excerpt: row.excerpt === null || row.excerpt === undefined ? null : String(row.excerpt),
+    afterNotificationId: row.after_notification_id === null || row.after_notification_id === undefined ? null : String(row.after_notification_id),
     state: String(row.state),
     payload: String(row.payload),
     token: String(row.token),
@@ -81,8 +88,8 @@ export class OutboxRepository {
         `INSERT INTO outbox
            (notification_id, session_id, request_id, kind, state, payload, token,
             attempts, retry_count, next_retry_at, created_at, updated_at,
-            anchor_msg_id, excerpt)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?, ?, ?)
+            anchor_msg_id, excerpt, after_notification_id)
+         VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 0, NULL, ?, ?, ?, ?, ?)
          -- The conflict arm resets DELIVERY STATE only. It does not touch
          -- payload, and for the same reason it must never touch anchor_msg_id
          -- or excerpt: a requeue re-sends the ORIGINAL content, so pairing it
@@ -121,6 +128,7 @@ export class OutboxRepository {
         now,
         input.anchorMsgId ?? null,
         input.excerpt ?? null,
+        input.afterNotificationId ?? null,
       );
   }
 
@@ -155,6 +163,11 @@ export class OutboxRepository {
         `SELECT * FROM outbox
          WHERE state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+           AND (after_notification_id IS NULL OR NOT EXISTS (
+             SELECT 1 FROM outbox dep
+             WHERE dep.notification_id = outbox.after_notification_id
+               AND dep.state != 'sent'
+           ))
          ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
                   (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 1 WHEN 'card' THEN 1 ELSE 2 END) ASC,

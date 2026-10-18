@@ -489,4 +489,116 @@ describe("POST /goose/turn-event", () => {
     );
     expect(resAuth.status).toBe(200);
   });
+
+  describe("reply-before-prompt ordering", () => {
+    it("with mirror queued, getReady returns mirror before the hook stop", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.started",
+        session_id: "goose-sess-1",
+        upstream_id: "hk3_7-order1",
+        prompt_text: "prompt 1",
+      });
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-sess-1",
+        upstream_id: "hk3_7-order1",
+        stop_reason: "end_turn",
+        final_text: "reply 1",
+      });
+
+      // Initially, mirror is queued and stop is queued.
+      // getReady must return mirror FIRST (stop is blocked until mirror is sent).
+      const readyFirst = storage!.outbox.getReady(1_000);
+      expect(readyFirst).toHaveLength(1);
+      expect(readyFirst[0]!.notificationId).toBe(`m:${gseId}:h-hk3_7-order1`);
+
+      // Once mirror is marked sent, stop becomes ready
+      storage!.outbox.markSent(`m:${gseId}:h-hk3_7-order1`, 1_000);
+      const readySecond = storage!.outbox.getReady(1_000);
+      expect(readySecond).toHaveLength(1);
+      expect(readySecond[0]!.notificationId).toBe(`s:${gseId}:h-hk3_7-order1`);
+    });
+
+    it("burst of 3 turns ends started/ended interleaved in order A-prompt, A-reply, B-prompt...", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+
+      const turns = ["turn-A", "turn-B", "turn-C"];
+      let clock = 1_000;
+      for (const t of turns) {
+        await postTurnEvent(app, {
+          v: 1,
+          type: "turn.started",
+          session_id: "goose-sess-1",
+          upstream_id: t,
+          prompt_text: `prompt ${t}`,
+        });
+        await postTurnEvent(app, {
+          v: 1,
+          type: "turn.ended",
+          session_id: "goose-sess-1",
+          upstream_id: t,
+          stop_reason: "end_turn",
+          final_text: `reply ${t}`,
+        });
+      }
+
+      // Simulate the sender draining one ready row at a time and marking it sent
+      const delivered: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const ready = storage!.outbox.getReady(clock);
+        expect(ready.length).toBeGreaterThan(0);
+        const next = ready[0]!;
+        delivered.push(next.notificationId);
+        storage!.outbox.markSent(next.notificationId, clock);
+        clock += 10;
+      }
+
+      expect(delivered).toEqual([
+        `m:${gseId}:h-turn-A`,
+        `s:${gseId}:h-turn-A`,
+        `m:${gseId}:h-turn-B`,
+        `s:${gseId}:h-turn-B`,
+        `m:${gseId}:h-turn-C`,
+        `s:${gseId}:h-turn-C`,
+      ]);
+    });
+
+    it("non-hook stops unaffected", async () => {
+      const app = newApp(1_000);
+      await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: "sess-regular", notify: true }),
+        }),
+      );
+
+      // Enqueue a non-hook stop
+      const stopRes = await app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: "sess-regular",
+            event: "Stop",
+            message: "Regular stop",
+            notification_id: "s:sess-regular:msg1",
+          }),
+        }),
+      );
+      expect(stopRes.status).toBe(202);
+
+      const ready = storage!.outbox.getReady(1_000);
+      expect(ready).toHaveLength(1);
+      expect(ready[0]!.notificationId).toBe("s:sess-regular:msg1");
+      expect(ready[0]!.afterNotificationId).toBeNull();
+    });
+  });
 });

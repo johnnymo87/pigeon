@@ -732,6 +732,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       threaded: true,
     };
 
+    const afterNotificationId =
+      typeof body.after_notification_id === "string" && body.after_notification_id
+        ? body.after_notification_id
+        : null;
+
     // Queue in outbox — OutboxSender will deliver with retry
     storage.outbox.upsert({
       notificationId,
@@ -746,6 +751,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       // disagrees would make the drill-down show different text than the
       // Telegram message it refers to.
       excerpt: excerptOf(message || summary || "Task completed"),
+      afterNotificationId,
     }, now);
 
     // Mirrors the `[stop] quieted` line above on purpose. Without event/origin/policy
@@ -1820,6 +1826,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             event: r.event,
             message: r.message,
             ...(r.errorKind ? { error_kind: r.errorKind } : {}),
+            after_notification_id: `m:${row.sessionId}:h-${id}`,
           });
           const outcome = res.status === 202 || res.status === 200 ? "queued" : `error_${res.status}`;
           console.log(
