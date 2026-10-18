@@ -1,6 +1,9 @@
 import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
+import { sanitiseIdPart } from "./goose/session-runner.js";
+import { renderHookTurn, type HookTurnEndedEvent } from "./goose/render-turn.js";
+import type { GooseInflightStore } from "./storage/goose-inflight-repo.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -316,6 +319,7 @@ export interface TagLookup {
 
 interface AppOptions {
   nowFn?: () => number;
+  inflight?: GooseInflightStore;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
@@ -1704,6 +1708,83 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           backend_session_id: sessionId,
           backend: GOOSE_BACKEND_KIND,
         });
+      }
+
+      if (request.method === "POST" && url.pathname === "/goose/turn-event") {
+        const body = await readJsonBody(request);
+        if (
+          body.v !== 1 ||
+          (body.type !== "turn.started" && body.type !== "turn.ended") ||
+          typeof body.session_id !== "string" ||
+          !body.session_id ||
+          typeof body.upstream_id !== "string" ||
+          !body.upstream_id
+        ) {
+          return Response.json({ error: "invalid turn event payload" }, { status: 400 });
+        }
+
+        const row = storage.sessions.getByBackendSessionId(body.session_id);
+        if (!row || row.backendKind !== GOOSE_BACKEND_KIND) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${body.session_id} upstream=${body.upstream_id} outcome=unregistered`,
+          );
+          return Response.json({ ok: true, ignored: "unregistered" });
+        }
+
+        const clientReqIds = Array.isArray(body.client_req_ids) ? (body.client_req_ids as unknown[]) : [];
+        const inflightStore = opts.inflight ?? storage.gooseInflight;
+        let isOwnTurn = false;
+        for (const rawCrid of clientReqIds) {
+          if (typeof rawCrid !== "string" || !rawCrid) continue;
+          if (inflightStore?.get(rawCrid)) {
+            isOwnTurn = true;
+            break;
+          }
+          const stopId = `s:${row.sessionId}:${sanitiseIdPart(rawCrid)}`;
+          if (storage.outbox.getByNotificationId(stopId)) {
+            isOwnTurn = true;
+            break;
+          }
+        }
+
+        if (isOwnTurn) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=own_turn`,
+          );
+          return Response.json({ ok: true, ignored: "own_turn" });
+        }
+
+        const id = sanitiseIdPart(body.upstream_id);
+
+        if (body.type === "turn.started") {
+          const promptText = typeof body.prompt_text === "string" ? body.prompt_text : "";
+          const res = await handleMirrorBody({
+            sessionId: row.sessionId,
+            messageId: `h-${id}`,
+            text: promptText,
+          });
+          const outcome = res.status === 200 ? "mirrored" : `error_${res.status}`;
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,
+          );
+          return res;
+        }
+
+        if (body.type === "turn.ended") {
+          const r = renderHookTurn(body as HookTurnEndedEvent);
+          const res = await handleStopBody({
+            session_id: row.sessionId,
+            notification_id: `s:${row.sessionId}:h-${id}`,
+            event: r.event,
+            message: r.message,
+            ...(r.errorKind ? { error_kind: r.errorKind } : {}),
+          });
+          const outcome = res.status === 202 || res.status === 200 ? "queued" : `error_${res.status}`;
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=${outcome}`,
+          );
+          return res;
+        }
       }
 
       if (request.method === "GET" && url.pathname === "/sessions") {
