@@ -8,6 +8,7 @@
 
 import type { StorageDb } from "../storage/database";
 import type { OutboxRecord } from "../storage/outbox-repo";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, WorkerResult } from "./poller";
 import {
@@ -395,12 +396,21 @@ export class OutboxSender {
           continue;
         }
 
+        // Defence in depth: an outbox entry whose session is a goose-acp row with
+        // notify: false is dropped terminally (notify_false_goose) before any send
+        // or re-register, so no future producer can create a topic for a --no-telegram session.
+        const sessionRow = this.storage.sessions.get(entry.sessionId);
+        if (sessionRow && sessionRow.backendKind === GOOSE_BACKEND_KIND && !sessionRow.notify) {
+          this.markTerminal(entry, now, "notify_false_goose");
+          continue;
+        }
+
         // pigeon-qioa: see SWARM_LOCAL_SESSION_GRACE_MS. Checked before parsing and
         // before any budget is consumed, so a held notice costs nothing.
         if (
           this.gateSwarmOnLocalSession &&
           entry.kind === "swarm" &&
-          this.storage.sessions.get(entry.sessionId) === null
+          sessionRow === null
         ) {
           if (age < SWARM_LOCAL_SESSION_GRACE_MS) {
             // Uncounted: waiting for a row is not a delivery failure.

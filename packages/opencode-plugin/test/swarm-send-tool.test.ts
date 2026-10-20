@@ -131,6 +131,20 @@ describe("swarmSend (pure helper)", () => {
     })
   })
 
+  test("captures banked: true from response when returned", async () => {
+    const { fetchFn } = capturingFetch(() =>
+      new Response(JSON.stringify({ accepted: true, msg_id: "msg_banked", banked: true }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    )
+    const result = await swarmSend(
+      { daemonBaseUrl: "http://daemon.test", sessionId: "ses_sender", fetchFn },
+      { to: "gse_target", message: "hi" },
+    )
+    expect(result.banked).toBe(true)
+  })
+
   test("applies kind, priority, and reply_to when provided", async () => {
     const { fetchFn, seen } = capturingFetch(() => ok202())
 
@@ -682,9 +696,24 @@ describe("formatSendResult", () => {
     )
     expect(out).not.toMatch(/attempts/)
   })
+
+  test("renders banked message waiting in mailbox note when banked: true", () => {
+    const out = formatSendResult(
+      { msg_id: "msg_abc", to: "gse_target", kind: "chat", priority: "normal", banked: true },
+      11,
+    )
+    expect(out).toContain("waiting in gse_target's mailbox; it is read when that session calls swarm_read.")
+    expect(out).not.toContain("Delivery is async.")
+  })
 })
 
 describe("createSwarmSendTool", () => {
+  test("to arg description mentions gse_ (goose session, reached via its mailbox)", () => {
+    const def = createSwarmSendTool("http://127.0.0.1:4731")
+    expect(def.args.to.description).toContain("gse_")
+    expect(def.args.to.description).toMatch(/mailbox/i)
+  })
+
   test("builds a ToolDefinition with description + to/message args", () => {
     const def = createSwarmSendTool("http://127.0.0.1:4731")
     expect(typeof def.description).toBe("string")

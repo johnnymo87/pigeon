@@ -1,6 +1,7 @@
 import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
+import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
@@ -50,6 +51,7 @@ interface LegacySession {
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
   backend_session_id: string | null;
+  pull_sources: string[];
   created_at: number;
   updated_at: number;
   last_seen: number;
@@ -72,6 +74,7 @@ function toLegacySession(session: {
   backendEndpoint: string | null;
   backendAuthToken: string | null;
   backendSessionId: string | null;
+  pullSources: string[];
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -98,6 +101,7 @@ function toLegacySession(session: {
     // has gone wrong. NULL for opencode sessions and for legacy goose rows,
     // where the two ids are the same thing.
     backend_session_id: session.backendSessionId,
+    pull_sources: session.pullSources,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     last_seen: session.lastSeen,
@@ -207,11 +211,11 @@ export function parseSwarmSendBody(
   if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
   if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
   if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };
-  if (to && !/^ses_[A-Za-z0-9_-]+$/.test(to)) {
+  if (to && !/^(ses|gse)_[A-Za-z0-9_-]+$/.test(to)) {
     return {
       ok: false,
       response: Response.json(
-        { error: "to must be a session id starting with 'ses_'" },
+        { error: "to must be a session id starting with 'ses_' or 'gse_'" },
         { status: 400 },
       ),
     };
@@ -1208,12 +1212,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // adapter selected: its replies go back to being dropped as unreachable
         // while every drain returns a truthful, healthy zero. This turns that
         // state into a failure at the one moment the client is listening.
-        if (session.backendKind !== PULL_BACKEND_KIND) {
+        if (session.backendKind !== PULL_BACKEND_KIND && session.backendKind !== GOOSE_BACKEND_KIND) {
           return Response.json(
             {
               error:
                 `session ${sessionId} is registered with backend_kind=` +
-                `${session.backendKind ?? "null"}, not ${PULL_BACKEND_KIND}; ` +
+                `${session.backendKind ?? "null"}, not ${PULL_BACKEND_KIND} or ${GOOSE_BACKEND_KIND}; ` +
                 `nothing is banking inbound for it`,
               backend_kind: session.backendKind,
             },
@@ -1718,6 +1722,38 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/goose/swarm-mailbox") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+        const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+        if (!sessionId || !endpoint) {
+          return Response.json(
+            { error: "session_id and endpoint are required" },
+            { status: 400 },
+          );
+        }
+        const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : null;
+        const label = typeof body.label === "string" && body.label ? body.label : null;
+        const token = typeof body.auth_token === "string" && body.auth_token ? body.auth_token : null;
+
+        const result = ensureGooseSwarmMailbox(
+          storage.sessions,
+          { backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
+          nowFn(),
+        );
+        if (!result.ok) {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        return Response.json({
+          ok: true,
+          session_id: result.sessionId,
+          backend_session_id: result.backendSessionId,
+          created: result.created,
+          notify: result.notify,
+        });
+      }
+
       if (request.method === "POST" && url.pathname === "/goose/turn-event") {
         let rawBody: unknown;
         try {
@@ -1756,6 +1792,14 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             `[goose-turn-event] type=${body.type} sessionId=${body.session_id} upstream=${body.upstream_id} outcome=unregistered`,
           );
           return Response.json({ ok: true, ignored: "unregistered" });
+        }
+
+        if (!row.notify) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=notify=false`,
+          );
+          storage.sessions.touch(row.sessionId, nowFn());
+          return Response.json({ ok: true, ignored: "notify=false" });
         }
 
         const clientReqIds = Array.isArray(body.client_req_ids) ? (body.client_req_ids as unknown[]) : [];
