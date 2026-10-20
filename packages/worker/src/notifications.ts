@@ -413,7 +413,19 @@ export async function handleSendNotification(
         ? await getBindingForSession(db, sessionId)
         : null;
 
-    if (bound) {
+    if (bound && bound.chat_id !== String(chatId)) {
+      // The session's named topic lives in another chat (pigeon-533h): its thread id means
+      // nothing here. Post unthreaded into the requested chat rather than into a foreign thread
+      // id, and do not fall through to resolveTopic -- a bound session never gets a topic of its
+      // own. `bound` stays set so the T2.7 recovery below cannot run either.
+      console.warn("[worker] session's named topic is in another chat, notification will go to General", {
+        sessionId,
+        requestedChatId: String(chatId),
+        topicChatId: bound.chat_id,
+        reason: "bound_topic_in_other_chat",
+      });
+      relocationReason = "bound_topic_in_other_chat";
+    } else if (bound) {
       messageThreadId = bound.message_thread_id;
       intendedThreadId = bound.message_thread_id;
     } else if (topicsEnabled(env) && threaded !== false) {
@@ -463,8 +475,10 @@ export async function handleSendNotification(
       threaded !== false &&
       !bound
     ) {
-      // Delete stale finalized topic row from D1
-      await deleteTopicBySession(db, sessionId, messageThreadId);
+      // Delete stale finalized topic row from D1. Chat-scoped: messageThreadId came from a row
+      // in THIS chat (resolveTopic refuses other chats' rows), and the delete must not be able
+      // to reach a row that has since moved to another chat (pigeon-533h).
+      await deleteTopicBySession(db, sessionId, String(chatId), messageThreadId);
 
       // Recreate topic (resolve topic again)
       const retryTopicRes = await resolveTopic(db, {

@@ -121,8 +121,30 @@ export async function resolveTopic(
     }
   }
 
+  /**
+   * The session's row lives in a different chat from the one this notification targets
+   * (pigeon-533h). A thread id means nothing outside its own chat, so the row can be neither used
+   * nor repaired from here: posting into its thread id fails "thread not found", and treating that
+   * as an out-of-band deletion is exactly how a healthy topic lost its row. Leave the row alone and
+   * let the caller post unthreaded into its own chat. One row per session (`topics` is keyed by
+   * session_id), and the chat that created it keeps it.
+   */
+  function topicInOtherChat(row: TopicRow): ResolveTopicResult {
+    console.warn("[worker] session's topic is in another chat, notification will go to General", {
+      sessionId: opts.sessionId,
+      requestedChatId: opts.chatId,
+      topicChatId: row.chat_id,
+      messageThreadId: row.message_thread_id,
+      reason: "topic_in_other_chat",
+    });
+    return { ok: true, messageThreadId: null, reason: "topic_in_other_chat" };
+  }
+
   // 1. Existing topic lookup
   let existing = await getBySession(db, opts.sessionId);
+  if (existing && existing.chat_id !== opts.chatId) {
+    return topicInOtherChat(existing);
+  }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
       const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
@@ -144,7 +166,7 @@ export async function resolveTopic(
         }
         if (reopenRes.kind === "thread_not_found") {
           // Closed topic was deleted out-of-band in Telegram -> delete stale D1 row and fall through to recreate
-          await deleteTopicBySession(db, opts.sessionId, existing.message_thread_id);
+          await deleteTopicBySession(db, opts.sessionId, opts.chatId, existing.message_thread_id);
         } else if (reopenRes.kind === "topic_not_modified") {
           // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
           await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
@@ -264,6 +286,9 @@ export async function resolveTopic(
 
     // Re-read and use winner's row
     const winnerRow = await getBySession(db, opts.sessionId);
+    if (winnerRow && winnerRow.chat_id !== opts.chatId) {
+      return topicInOtherChat(winnerRow);
+    }
     if (winnerRow && winnerRow.message_thread_id !== null) {
       return { ok: true, messageThreadId: winnerRow.message_thread_id };
     }
@@ -288,8 +313,11 @@ export async function resolveTopic(
     return runCreatorFlow();
   }
 
-  // 3. Loser path
+  // 3. Loser path. The row that beat our reserve may belong to another chat (pigeon-533h).
   existing = await getBySession(db, opts.sessionId);
+  if (existing && existing.chat_id !== opts.chatId) {
+    return topicInOtherChat(existing);
+  }
   if (existing && existing.message_thread_id !== null) {
     return { ok: true, messageThreadId: existing.message_thread_id };
   }
@@ -298,6 +326,9 @@ export async function resolveTopic(
   for (let i = 0; i < pollAttempts; i++) {
     await delay(pollIntervalMs);
     existing = await getBySession(db, opts.sessionId);
+    if (existing && existing.chat_id !== opts.chatId) {
+      return topicInOtherChat(existing);
+    }
     if (existing && existing.message_thread_id !== null) {
       return { ok: true, messageThreadId: existing.message_thread_id };
     }
@@ -316,6 +347,7 @@ export async function resolveTopic(
       sessionId: opts.sessionId,
       machineId: opts.machineId,
       expiredBefore,
+      chatId: opts.chatId,
       now: currentNow,
     });
 

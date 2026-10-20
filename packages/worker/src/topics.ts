@@ -137,6 +137,10 @@ export function topicName(dir: string, title: string): string {
 
 /**
  * Retrieve a topic record by session_id.
+ *
+ * NOT chat-scoped: the row may live in a different chat from the one a caller is about to send
+ * into. Anything that posts into, reopens or deletes the row's thread must first check
+ * `row.chat_id` against its own chat (pigeon-533h); `resolveTopic` does.
  */
 export async function getBySession(
   db: D1Database,
@@ -368,15 +372,20 @@ export async function deleteBySession(
  * Uses `IS` for NULL-safe comparison (handles reservation rows where message_thread_id IS NULL).
  * Note: `deleteBySession` remains CAS-guarded on `message_thread_id IS NULL` to protect
  * topic creation reservation races from deleting finalized rows.
+ *
+ * Also scoped to `chat_id` (pigeon-533h). A thread id is only meaningful inside its own chat, so
+ * "thread T was not found" observed in chat B says nothing about a row whose thread T lives in
+ * chat A. Without this a send into the wrong chat deleted a healthy topic's row.
  */
 export async function deleteTopicBySession(
   db: D1Database,
   sessionId: string,
+  chatId: string,
   messageThreadId: number | null,
 ): Promise<boolean> {
   const res = await db
-    .prepare("DELETE FROM topics WHERE session_id = ? AND message_thread_id IS ?")
-    .bind(sessionId, messageThreadId)
+    .prepare("DELETE FROM topics WHERE session_id = ? AND chat_id = ? AND message_thread_id IS ?")
+    .bind(sessionId, chatId, messageThreadId)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }
@@ -391,17 +400,22 @@ export async function stealReservation(
     sessionId: string;
     machineId: string | null;
     expiredBefore: number;
+    /** When given, only a reservation in this chat is stolen (pigeon-533h). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const chatClause = opts.chatId !== undefined ? " AND chat_id = ?" : "";
+  const binds: unknown[] = [now, opts.machineId, opts.sessionId, opts.expiredBefore];
+  if (opts.chatId !== undefined) binds.push(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET updated_at = ?, machine_id = ?
-       WHERE session_id = ? AND message_thread_id IS NULL AND updated_at < ?`,
+       WHERE session_id = ? AND message_thread_id IS NULL AND updated_at < ?${chatClause}`,
     )
-    .bind(now, opts.machineId, opts.sessionId, opts.expiredBefore)
+    .bind(...binds)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }
