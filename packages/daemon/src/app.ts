@@ -207,11 +207,11 @@ export function parseSwarmSendBody(
   if (!from) return { ok: false, response: Response.json({ error: "from is required" }, { status: 400 }) };
   if (!to && !channel) return { ok: false, response: Response.json({ error: "to or channel is required" }, { status: 400 }) };
   if (to && channel) return { ok: false, response: Response.json({ error: "exactly one of to or channel must be set" }, { status: 400 }) };
-  if (to && !/^ses_[A-Za-z0-9_-]+$/.test(to)) {
+  if (to && !/^(ses|gse)_[A-Za-z0-9_-]+$/.test(to)) {
     return {
       ok: false,
       response: Response.json(
-        { error: "to must be a session id starting with 'ses_'" },
+        { error: "to must be a session id starting with 'ses_' or 'gse_'" },
         { status: 400 },
       ),
     };

@@ -1,6 +1,7 @@
 import type { StorageDb } from "../storage/database";
 import type { Priority } from "../storage/swarm-repo";
 import { isPullBackend } from "../adapters/goose-pull";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { enqueueSwarmTelegramNotice } from "./telegram-notice";
 
 export interface BankOrInsertInput {
@@ -30,7 +31,7 @@ export type BankOrInsertResult =
     }
   | {
       status: "refused";
-      reason: "scheduled" | "payload_too_large";
+      reason: "scheduled" | "payload_too_large" | "no_mailbox" | "no_session";
       error: string;
       statusCode: 409 | 413;
     };
@@ -50,12 +51,31 @@ export function bankOrInsertSwarmMessage(
   input: BankOrInsertInput,
   now = Date.now(),
 ): BankOrInsertResult {
-  // Check if target is a pull session that opted in to swarm banking.
+  // Check if target is a pull session or goose-acp session that opted in to swarm banking.
   const hasSessionTarget = Boolean(input.toSession && !input.channel);
   const targetSession = hasSessionTarget && input.toSession ? storage.sessions.get(input.toSession) : null;
+
+  if (Boolean(input.toSession?.startsWith("gse_")) && !targetSession) {
+    return {
+      status: "refused",
+      reason: "no_session",
+      error: `no goose session ${input.toSession} on this machine`,
+      statusCode: 409,
+    };
+  }
+
+  if (targetSession && targetSession.backendKind === GOOSE_BACKEND_KIND && !targetSession.pullSources.includes("swarm")) {
+    return {
+      status: "refused",
+      reason: "no_mailbox",
+      error: `goose session ${input.toSession} has no swarm mailbox`,
+      statusCode: 409,
+    };
+  }
+
   const wouldBank = Boolean(
     targetSession &&
-      isPullBackend(targetSession) &&
+      (isPullBackend(targetSession) || targetSession.backendKind === GOOSE_BACKEND_KIND) &&
       targetSession.pullSources.includes("swarm"),
   );
 
