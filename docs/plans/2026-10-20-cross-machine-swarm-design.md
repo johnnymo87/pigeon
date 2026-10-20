@@ -437,7 +437,8 @@ permanent, so the status change is safe.
 - **Filing beads:** under `pigeon-k0qn.13`, once eng-agent-platform agrees.
 
 **What pigeon needs back from eng-agent-platform:**
-- whether a goose-acp mailbox banks by default (slice 1, item 3);
+- that the goose MCP server will opt its session's mailbox in (slice 1, item 3), and settle the
+  extension-process hazard #152 names, before pigeon builds slice 1;
 - push admission: default-accept with opt-out, or opt-in (slice 2, item 7);
 - confirmation that the slice 2 requirements above match its intent.
 
