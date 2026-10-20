@@ -126,7 +126,7 @@ export async function reapTopics(
 
   for (const row of rows) {
     if (row.message_thread_id === null) {
-      const deleted = await deleteTopicBySession(db, row.session_id, null);
+      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, null);
       if (deleted) reaped++;
       continue;
     }
@@ -137,7 +137,7 @@ export async function reapTopics(
     });
 
     if (res.ok || res.kind === "thread_not_found") {
-      const deleted = await deleteTopicBySession(db, row.session_id, row.message_thread_id);
+      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
       if (deleted) reaped++;
     } else if (res.kind === "rate_limited") {
       return { reaped, rateLimited: true };

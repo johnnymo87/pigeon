@@ -7698,7 +7698,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: newThreadId, now });
 
       // Late caller B observed stale thread T1 and attempts to delete it
-      const deleted = await deleteTopicBySession(env.DB, sessionId, staleThreadId);
+      const deleted = await deleteTopicBySession(env.DB, sessionId, chatId, staleThreadId);
       expect(deleted).toBe(false);
 
       // Finalized T2 row must still exist in D1
@@ -7715,7 +7715,7 @@ describe("topics module and topicName", () => {
       await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "normal topic", now });
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
 
-      const deleted = await deleteTopicBySession(env.DB, sessionId, threadId);
+      const deleted = await deleteTopicBySession(env.DB, sessionId, chatId, threadId);
       expect(deleted).toBe(true);
 
       const row = await getBySession(env.DB, sessionId);
@@ -7729,7 +7729,7 @@ describe("topics module and topicName", () => {
       // Reservation row with message_thread_id IS NULL
       await reserve(env.DB, { sessionId, machineId: "devbox", chatId, name: "reservation topic", now });
 
-      const deleted = await deleteTopicBySession(env.DB, sessionId, null);
+      const deleted = await deleteTopicBySession(env.DB, sessionId, chatId, null);
       expect(deleted).toBe(true);
 
       const row = await getBySession(env.DB, sessionId);
@@ -8856,6 +8856,203 @@ describe("topics module and topicName", () => {
 
       expect(res.status).toBe(200); // Falls back to General and delivers
       expect(createTopicCalls).toBe(1); // Exactly 1 recreate attempt
+    });
+  });
+
+  // pigeon-533h: a topics row lives in ONE chat. On 2026-10-20 the macOS daemon pushed a swarm
+  // notice for a cloudbox session carrying the Mac's chat; the chat-agnostic lookup handed back
+  // the cloudbox thread id, Telegram said "thread not found" (it does not exist in the Mac chat),
+  // and the stale-thread recovery deleted the cloudbox row and minted a topic in the Mac chat. The
+  // next cloudbox notification then did the same in reverse. Net: the original topic lost its row.
+  describe("cross-chat notifications never touch another chat's topic (pigeon-533h)", () => {
+    const CLOUDBOX_CHAT = "-1004391832753";
+    const MAC_CHAT = "-1003983501132";
+    const ALERT_CHAT = "8248645256";
+    const testEnv = {
+      ...env,
+      TELEGRAM_TOPICS_ENABLED: "true",
+      // First entry is where relocation alerts go (alertRelocation), kept apart from both chats.
+      ALLOWED_CHAT_IDS: `${ALERT_CHAT},${CLOUDBOX_CHAT},${MAC_CHAT}`,
+    } as Env;
+
+    /**
+     * A Telegram that knows which threads exist in which chat, so that sending into a thread id
+     * from another chat fails exactly the way it did in production.
+     */
+    function fakeTelegram(threads: Record<string, Set<number>>) {
+      const sends: Array<{ chat_id: string; message_thread_id?: number }> = [];
+      const created: Array<{ chat_id: string; thread: number }> = [];
+      const reopens: Array<{ chat_id: string; message_thread_id: number }> = [];
+      let nextThread = 90_000;
+      let nextMessage = 50_000_000 + Math.floor(Math.random() * 1_000_000_000);
+      const parse = (opts: any) =>
+        JSON.parse(typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body));
+      const json = (data: unknown) => ({
+        statusCode: 200,
+        data: JSON.stringify(data),
+        responseOptions: { headers: { "Content-Type": "application/json" } },
+      });
+      const tg = fetchMock.get("https://api.telegram.org");
+      tg.intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = parse(opts);
+          const chat = String(body.chat_id);
+          sends.push({ chat_id: chat, message_thread_id: body.message_thread_id });
+          if (body.message_thread_id !== undefined && !threads[chat]?.has(body.message_thread_id)) {
+            return json({ ok: false, error_code: 400, description: "Bad Request: message thread not found" });
+          }
+          return json({ ok: true, result: { message_id: nextMessage++ } });
+        })
+        .persist();
+      tg.intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply((opts: any) => {
+          const body = parse(opts);
+          const chat = String(body.chat_id);
+          const thread = nextThread++;
+          (threads[chat] ??= new Set()).add(thread);
+          created.push({ chat_id: chat, thread });
+          return json({ ok: true, result: { message_thread_id: thread, name: body.name } });
+        })
+        .persist();
+      tg.intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
+        .reply((opts: any) => {
+          const body = parse(opts);
+          const chat = String(body.chat_id);
+          reopens.push({ chat_id: chat, message_thread_id: body.message_thread_id });
+          if (!threads[chat]?.has(body.message_thread_id)) {
+            return json({ ok: false, error_code: 400, description: "Bad Request: message thread not found" });
+          }
+          return json({ ok: true, result: true });
+        })
+        .persist();
+      tg.intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(() => json({ ok: true, result: true }))
+        .persist();
+      return { sends, created, reopens };
+    }
+
+    function send(sessionId: string, chatId: string, notificationId: string) {
+      return handleSendNotification(
+        env.DB,
+        testEnv,
+        new Request("https://worker/notifications/send", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            sessionId,
+            chatId,
+            text: `notice ${notificationId}`,
+            notificationId,
+            title: "SCCM node development scoping",
+            dir: "/home/dev/projects/mono",
+            threaded: true,
+          }),
+        }),
+      );
+    }
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+    });
+
+    it("reproduces the incident: a Mac-chat push and a cloudbox-chat push leave the cloudbox row intact", async () => {
+      const sessionId = `ses_cross_chat_${Date.now()}`;
+      await registerSession(sessionId, "cloudbox", "mono");
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "SCCM · ~/projects/mono", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 32082, now });
+
+      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32082]), [MAC_CHAT]: new Set() });
+
+      // 1. The Mac's push. It must not be threaded into a thread id that belongs to another
+      //    chat, and must neither delete the row nor create a topic in the Mac chat.
+      const macRes = await send(sessionId, MAC_CHAT, `w:mac_${sessionId}`);
+      expect(macRes.status).toBe(200);
+      expect(tg.created).toEqual([]);
+      const macSends = tg.sends.filter((s) => s.chat_id === MAC_CHAT);
+      expect(macSends).toEqual([{ chat_id: MAC_CHAT, message_thread_id: undefined }]);
+
+      // The cross-chat push is anomalous, so it is reported like any other relocation.
+      expect(tg.sends.filter((s) => s.chat_id === ALERT_CHAT)).toHaveLength(1);
+
+      let row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
+      expect(row?.message_thread_id).toBe(32082);
+
+      // 2. The owner's next push still lands in the original topic, with no new topic anywhere.
+      const cbRes = await send(sessionId, CLOUDBOX_CHAT, `s:cb_${sessionId}`);
+      expect(cbRes.status).toBe(200);
+      expect(tg.created).toEqual([]);
+      expect(tg.sends.filter((s) => s.chat_id === CLOUDBOX_CHAT)).toEqual([
+        { chat_id: CLOUDBOX_CHAT, message_thread_id: 32082 },
+      ]);
+
+      row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
+      expect(row?.message_thread_id).toBe(32082);
+    });
+
+    it("a closed topic in another chat is neither reopened nor deleted by a cross-chat push", async () => {
+      const sessionId = `ses_cross_chat_closed_${Date.now()}`;
+      await registerSession(sessionId, "cloudbox", "mono");
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "closed", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 32083, now });
+      await markClosed(env.DB, { sessionId, now });
+
+      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32083]), [MAC_CHAT]: new Set() });
+
+      const res = await send(sessionId, MAC_CHAT, `w:mac_closed_${sessionId}`);
+      expect(res.status).toBe(200);
+      expect(tg.reopens).toEqual([]);
+      expect(tg.created).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
+      expect(row?.message_thread_id).toBe(32083);
+      expect(row?.state).toBe("closed");
+    });
+
+    it("a named-topic binding in another chat is not used for a cross-chat push", async () => {
+      const sessionId = `ses_cross_chat_bound_${Date.now()}`;
+      const key = `test:cross-chat-${Date.now()}`;
+      await registerSession(sessionId, "cloudbox", "mono");
+      const now = Date.now();
+      await env.DB.prepare(
+        "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Digest', ?, ?)",
+      ).bind(CLOUDBOX_CHAT, key, 32090, now, now).run();
+      await env.DB.prepare(
+        "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+      ).bind(CLOUDBOX_CHAT, key, sessionId, now).run();
+
+      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32090]), [MAC_CHAT]: new Set() });
+
+      const res = await send(sessionId, MAC_CHAT, `w:mac_bound_${sessionId}`);
+      expect(res.status).toBe(200);
+      expect(tg.sends.filter((s) => s.chat_id !== ALERT_CHAT)).toEqual([
+        { chat_id: MAC_CHAT, message_thread_id: undefined },
+      ]);
+      expect(tg.created).toEqual([]);
+      const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+      expect(topicRow).toBeNull();
+    });
+
+    it("deleteTopicBySession is scoped to the chat: the same thread id in another chat is not deleted", async () => {
+      const sessionId = `ses_cross_chat_delete_${Date.now()}`;
+      const now = Date.now();
+      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "x", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 650, now });
+
+      expect(await deleteTopicBySession(env.DB, sessionId, MAC_CHAT, 650)).toBe(false);
+      expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(650);
+      expect(await deleteTopicBySession(env.DB, sessionId, CLOUDBOX_CHAT, 650)).toBe(true);
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
     });
   });
 
