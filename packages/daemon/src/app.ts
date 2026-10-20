@@ -1791,6 +1791,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           return Response.json({ ok: true, ignored: "unregistered" });
         }
 
+        if (!row.notify) {
+          console.log(
+            `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=notify=false`,
+          );
+          return Response.json({ ok: true, ignored: "notify=false" });
+        }
+
         const clientReqIds = Array.isArray(body.client_req_ids) ? (body.client_req_ids as unknown[]) : [];
         let isOwnTurn = false;
         for (const rawCrid of clientReqIds) {

@@ -424,3 +424,135 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(onSessionStart).not.toHaveBeenCalled();
   });
 });
+
+describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
+  let storage: StorageDb | null = null;
+
+  afterEach(() => {
+    if (storage) {
+      storage.db.close();
+      storage = null;
+    }
+  });
+
+  function newApp(now = 1_000, opts: Record<string, unknown> = {}) {
+    storage = openStorageDb(":memory:");
+    return {
+      app: createApp(storage, { nowFn: () => now, ...opts }),
+      storage,
+    };
+  }
+
+  it("turn-event turn.started and turn.ended for a notify: false goose row return ignored: 'notify=false' and write no outbox row", async () => {
+    const { app, storage: s } = newApp(1_000);
+    // Create notify: false goose row via mailbox route
+    await app(
+      new Request("http://localhost/goose/swarm-mailbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "20261020_silent",
+          endpoint: "ws://127.0.0.1:4080/acp",
+        }),
+      }),
+    );
+
+    const startedRes = await app(
+      new Request("http://localhost/goose/turn-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          v: 1,
+          type: "turn.started",
+          session_id: "20261020_silent",
+          upstream_id: "up_1",
+          prompt_text: "do something",
+        }),
+      }),
+    );
+    expect(startedRes.status).toBe(200);
+    expect(await startedRes.json()).toEqual({ ok: true, ignored: "notify=false" });
+
+    const endedRes = await app(
+      new Request("http://localhost/goose/turn-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          v: 1,
+          type: "turn.ended",
+          session_id: "20261020_silent",
+          upstream_id: "up_1",
+        }),
+      }),
+    );
+    expect(endedRes.status).toBe(200);
+    expect(await endedRes.json()).toEqual({ ok: true, ignored: "notify=false" });
+
+    // Assert no outbox row was written
+    const count = s.db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number };
+    expect(count.n).toBe(0);
+  });
+
+  it("bank into a notify: false goose row writes no w: outbox row", async () => {
+    const { app, storage: s } = newApp(1_000);
+    const mailboxRes = await (await app(
+      new Request("http://localhost/goose/swarm-mailbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "20261020_silent_bank",
+          endpoint: "ws://127.0.0.1:4080/acp",
+        }),
+      }),
+    )).json() as { session_id: string };
+
+    const sendRes = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: mailboxRes.session_id,
+          kind: "chat",
+          payload: "hello silent goose",
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(202);
+    const body = (await sendRes.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
+    expect(body.banked).toBe(true);
+
+    // No w:<msg_id> in outbox
+    expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).toBeNull();
+  });
+
+  it("bank into an opencode session with notify: false still writes a w: outbox row (unchanged behaviour)", async () => {
+    const { app, storage: s } = newApp(1_000);
+    s.sessions.upsert(
+      {
+        sessionId: "ses_opencode_notify_false",
+        backendKind: "opencode-plugin-direct",
+        notify: false,
+      },
+      1_000,
+    );
+
+    const sendRes = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: "ses_opencode_notify_false",
+          kind: "chat",
+          payload: "hello opencode",
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(202);
+    const body = (await sendRes.json()) as { accepted: boolean; msg_id: string };
+
+    // w:<msg_id> IS in outbox for opencode notify: false
+    expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).not.toBeNull();
+  });
+});

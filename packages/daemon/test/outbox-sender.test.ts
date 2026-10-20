@@ -3097,4 +3097,42 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
     await s.processOnce();
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  it("drops an entry for a notify: false goose-acp row terminally with reason notify_false_goose", async () => {
+    storage.sessions.upsert(
+      {
+        sessionId: "gse_silent",
+        backendKind: "goose-acp",
+        notify: false,
+      },
+      1_000,
+    );
+    storage.outbox.upsert(
+      {
+        ...BASE_OUTBOX_INPUT,
+        notificationId: "w:gse_silent_msg",
+        sessionId: "gse_silent",
+        kind: "swarm",
+        payload: JSON.stringify({ messages: [{ text: "swarm" }], notificationId: "w:gse_silent_msg" }),
+      },
+      1_000,
+    );
+    const send = makeSendNotification({ ok: true });
+    const registerSession = vi.fn<RegisterSessionFn>();
+    const s = new OutboxSender({
+      storage,
+      sendNotification: send,
+      registerSession,
+      chatId: "c",
+      nowFn: () => 2_000,
+    });
+
+    await s.processOnce();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(registerSession).not.toHaveBeenCalled();
+    const row = storage.outbox.getByNotificationId("w:gse_silent_msg")!;
+    expect(row.state).toBe("failed");
+    expect(row.failedReason).toBe("notify_false_goose");
+  });
 });

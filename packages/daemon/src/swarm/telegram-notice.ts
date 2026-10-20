@@ -1,5 +1,6 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { excerptOf } from "../text";
 import {
   displayName,
@@ -43,6 +44,12 @@ export function enqueueSwarmTelegramNotice(
     }
 
     const target = storage.sessions.get(record.toSession);
+    if (target && target.backendKind === GOOSE_BACKEND_KIND && !target.notify) {
+      console.log(
+        `[swarm-notice] quieted msgId=${record.msgId} sessionId=${record.toSession} reason=goose_notify_false`,
+      );
+      return;
+    }
     const sender = storage.sessions.get(record.fromSession);
 
     const notification = formatSwarmNotification({
