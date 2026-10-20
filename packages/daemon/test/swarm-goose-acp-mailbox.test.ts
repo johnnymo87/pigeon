@@ -276,7 +276,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(row!.pullSources).toEqual(["telegram-reply", "swarm"]);
   });
 
-  it("legacy row (pigeon id == goose id, NULL backend id) is reused, not duplicated, and touch is applied", async () => {
+  it("refuses a legacy row (pigeon id == goose id, NULL backend id) with 409 directing to re-register", async () => {
     const { app, storage: s } = newApp(1_000);
     s.sessions.upsert(
       { sessionId: "20260918_1", backendKind: GOOSE_BACKEND_KIND, backendEndpoint: "ws://old/acp", notify: true },
@@ -290,26 +290,17 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
       endpoint: "ws://new/acp",
     });
 
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      ok: boolean;
-      session_id: string;
-      backend_session_id: string;
-      created: boolean;
-      notify: boolean;
-    };
-    expect(body.session_id).toBe("20260918_1");
-    expect(body.created).toBe(false);
-    expect(body.notify).toBe(true);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe(
+      "goose session 20260918_1 has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. `honk telegram 20260918_1 --force`) before using swarm",
+    );
 
-    // Endpoint NOT overwritten on existing row!
+    // Existing row left untouched (endpoint and lastSeen unchanged, pullSources not modified)
     const row = s.sessions.get("20260918_1")!;
     expect(row.backendEndpoint).toBe("ws://old/acp");
-    // pullSources gains "swarm"
-    expect(row.pullSources).toEqual(["telegram-reply", "swarm"]);
-    // lastSeen touched to 1_000
-    expect(row.lastSeen).toBe(1_000);
-    expect(row.updatedAt).toBe(1_000);
+    expect(row.lastSeen).toBe(500);
+    expect(row.pullSources).toEqual(["telegram-reply"]);
   });
 
   it("present row registered via /goose/sessions -> created: false, notify: true, endpoint/label untouched, swarm added", async () => {
@@ -492,6 +483,44 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     // Assert no outbox row was written
     const count = s.db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number };
     expect(count.n).toBe(0);
+  });
+
+  it("last_seen advances for a notify=false goose row on turn-event", async () => {
+    let now = 1_000;
+    const { app, storage: s } = newApp(now, { nowFn: () => now });
+    await app(
+      new Request("http://localhost/goose/swarm-mailbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "20261020_touch",
+          endpoint: "ws://127.0.0.1:4080/acp",
+        }),
+      }),
+    );
+
+    const initial = s.sessions.getByBackendSessionId("20261020_touch")!;
+    expect(initial.lastSeen).toBe(1_000);
+
+    now = 5_000;
+    const res = await app(
+      new Request("http://localhost/goose/turn-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          v: 1,
+          type: "turn.started",
+          session_id: "20261020_touch",
+          upstream_id: "up_touch_1",
+          prompt_text: "advance time",
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, ignored: "notify=false" });
+
+    const touched = s.sessions.getByBackendSessionId("20261020_touch")!;
+    expect(touched.lastSeen).toBe(5_000);
   });
 
   it("bank into a notify: false goose row writes no w: outbox row", async () => {

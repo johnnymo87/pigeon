@@ -30,12 +30,12 @@ Spec: `docs/plans/2026-10-20-cross-machine-swarm-design.md` §4.1 (slice 1). Bea
      first honkd turn hook would create a Telegram topic the human said they did not want.
    - The new route is **create-if-absent**: with no row it creates a `notify: false` goose-acp row
      (endpoint and honkd token supplied by the caller, so slice 2 can push); with a row it never
-     touches anything but `pull_sources` and its liveness (`touch`). It only ever **adds** `swarm`
-     to `pull_sources`. It uses the same lookup as `registerGooseSession`
-     (`getByBackendSessionId ?? get`, so a legacy row whose pigeon id is goose's id is reused, not
-     duplicated). It is idempotent, synchronous (no `await` between lookup and upsert), and the MCP
-     server calls it **lazily**, on `swarm_send` / `swarm_read` only — never at start-up — so only
-     sessions that actually use swarm get a mailbox.
+      touches anything but `pull_sources` and its liveness (`touch`). It only ever **adds** `swarm`
+      to `pull_sources`. A legacy row whose pigeon id is goose's id (backend_session_id NULL) is
+      refused with 409 directing the caller to re-register via `/goose/sessions` first, because its
+      non-`gse_` id cannot receive swarm replies. It is idempotent, synchronous (no `await` between
+      lookup and upsert), and the MCP server calls it **lazily**, on `swarm_send` / `swarm_read` only
+      — never at start-up — so only sessions that actually use swarm get a mailbox.
    - A later `/goose/sessions` (honk telegram) upgrades the row to `notify: true` and keeps
      `pull_sources` (the upsert already leaves it alone).
    - Closing a mailbox is not built (YAGNI): disabling the `swarm` extension leaves it open; banked
@@ -111,8 +111,8 @@ Body `{session_id: <goose id>, endpoint, auth_token?, cwd?, label?}`; `session_i
 required (400). A `gse_` in `session_id` → 400 (same refusal as `registerGooseSession`). A
 non-goose row at that key → 409.
 
-Tests: legacy row (pigeon id == goose id, NULL backend id) is reused, not duplicated; `touch` is
-applied (last_seen advances); absent → creates `notify: false` row with endpoint/token/backend id, `pull_sources`
+Tests: legacy row (pigeon id == goose id, NULL backend id) returns 409 directing to re-register;
+absent → creates `notify: false` row with endpoint/token/backend id, `pull_sources`
 `["telegram-reply","swarm"]`, returns `{ok, session_id: gse_…, backend_session_id, created: true,
 notify: false}`; present (registered via `/goose/sessions`) → `created: false`, `notify: true`,
 endpoint/token/label untouched, `swarm` added; repeat call idempotent; a later `/goose/sessions`

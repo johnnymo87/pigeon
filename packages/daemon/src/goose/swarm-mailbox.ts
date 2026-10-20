@@ -42,7 +42,8 @@ export type EnsureGooseSwarmMailboxResult =
  *    with pull_sources ["telegram-reply", "swarm"].
  *  - With an existing row: never downgrades notify or overwrites endpoint, token,
  *    label, or cwd. Adds "swarm" to pull_sources and touches liveness (touch).
- *  - Refuses gse_ in session_id (400) and non-goose existing rows (409).
+ *  - Refuses gse_ in session_id (400), non-goose existing rows (409), and legacy
+ *    goose rows where pigeon id == goose id (409).
  */
 export function ensureGooseSwarmMailbox(
   sessions: GooseSwarmMailboxStore,
@@ -79,9 +80,21 @@ export function ensureGooseSwarmMailbox(
     };
   }
 
-  const existing =
-    sessions.getByBackendSessionId(input.backendSessionId) ??
-    (atPrimaryKey && atPrimaryKey.backendKind === GOOSE_BACKEND_KIND ? atPrimaryKey : null);
+  const byBackend = sessions.getByBackendSessionId(input.backendSessionId);
+  if (
+    !byBackend &&
+    atPrimaryKey &&
+    atPrimaryKey.backendKind === GOOSE_BACKEND_KIND &&
+    atPrimaryKey.backendSessionId === null
+  ) {
+    return {
+      ok: false,
+      error: `goose session ${input.backendSessionId} has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. \`honk telegram ${input.backendSessionId} --force\`) before using swarm`,
+      statusCode: 409,
+    };
+  }
+
+  const existing = byBackend;
 
   if (existing) {
     const existingPullSources = existing.pullSources ?? ["telegram-reply"];

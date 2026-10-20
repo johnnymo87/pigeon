@@ -1798,6 +1798,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           console.log(
             `[goose-turn-event] type=${body.type} sessionId=${row.sessionId} upstream=${body.upstream_id} outcome=notify=false`,
           );
+          storage.sessions.touch(row.sessionId, nowFn());
           return Response.json({ ok: true, ignored: "notify=false" });
         }
 
