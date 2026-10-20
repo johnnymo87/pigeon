@@ -62,14 +62,21 @@ export interface OutboxSenderOptions {
  * 2026-10-20, pigeon-533h), or not registered here. But a local session can gain
  * its row moments AFTER the notice is enqueued -- a session reaped after 7 idle
  * days is revived by the very swarm message the notice describes, and its plugin
- * re-registers within seconds of the arbiter's delivery. Deciding at insert time
- * would drop that notice; deciding here, after a grace, does not. A foreign session
+ * re-registers within seconds of the arbiter's delivery -- provided the serve has
+ * restarted since the reap (the nightly pool restart makes that the normal case;
+ * otherwise the plugin still thinks it is registered and the row returns only at
+ * end of turn, possibly after the grace). Deciding at insert time would always
+ * drop that notice; deciding here, after a grace, normally does not. A foreign session
  * never gains a row, so its notice is always dropped.
  */
 export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
 
-/** Re-check interval while a swarm notice waits for its local row. */
-const SWARM_LOCAL_SESSION_RECHECK_MS = 5_000;
+/**
+ * Re-check interval while a swarm notice waits for its local row. Not shorter: a
+ * held swarm row ranks ahead of mirror rows in `getReady`, so frequent rechecks of
+ * a burst of foreign notices would crowd the 5-entry batch.
+ */
+const SWARM_LOCAL_SESSION_RECHECK_MS = 15_000;
 
 /**
  * Maximum number of attempts allowed for deterministic per-message failures.

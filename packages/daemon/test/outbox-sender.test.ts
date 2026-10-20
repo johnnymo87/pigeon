@@ -3066,7 +3066,7 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
     expect(send).not.toHaveBeenCalled();
 
     storage.sessions.upsert({ sessionId: "ses_revived" }, 3_000);
-    now = 10_000;
+    now = 20_000; // past the 15s recheck, inside the 60s grace
     await s.processOnce();
     expect(send).toHaveBeenCalledTimes(1);
     expect(storage.outbox.getByNotificationId("w:ses_revived")!.state).toBe("sent");

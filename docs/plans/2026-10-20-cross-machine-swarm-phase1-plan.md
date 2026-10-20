@@ -7,9 +7,9 @@ Beads in this PR: `pigeon-qioa`, `pigeon-k0qn.1`, `pigeon-k0qn.2`, `pigeon-k0qn.
 
 Decided at outbox SEND time, not insert time: `OutboxSender` option `gateSwarmOnLocalSession`
 (on in `index.ts`) holds a `kind='swarm'` entry while its session has no local `sessions` row
-(uncounted retry every 5s) and drops it as `no_local_session` after 60s. An insert-time skip
+(uncounted retry every 15s) and drops it as `no_local_session` after 60s. An insert-time skip
 (the first draft) would also drop the notice for a session reaped after 7 idle days and revived
-by the very message, whose plugin re-registers seconds after delivery; review caught it. A
+by the very message, whose plugin normally re-registers seconds after delivery (when its serve has restarted since the reap); review caught it. A
 foreign session never gains a row, so its notice is never posted. Cancels (`wc:`) are swarm
 entries too and follow the same rule.
 
