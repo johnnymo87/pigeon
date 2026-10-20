@@ -269,14 +269,13 @@ worker route listing sessions on *other* machines with `updated_at` in the last 
 | goose-pull receive | works when opted in (`pull_sources: ["swarm"]`) | cross-machine only with the separate `"swarm-remote"` opt-in (§3.3) |
 | goose-pull send | works via the lane wrapper | relays like any other sender |
 | goose-acp receive | **does not work**: `gse_` fails `^ses_` (`app.ts:210`); the arbiter only knows `prompt_async` | unchanged by the relay; needs its own track (below), after which cross-machine follows from §3.3 |
-| goose-acp send | not offered: SDD §5 "inbound yes, outbound no", narrowed by §13.6 to "neither, until a sender has an identity" | policy owned by eng-agent-platform, not a pigeon task |
+| goose-acp send | not offered: SDD §5 "inbound yes, outbound no", narrowed by §13.6 to "neither, until a sender has an identity" | superseded: see §4.1 (the lane sends since 2026-10-06; eng-agent-platform #152 proposes a goose MCP `swarm_send`) |
 
 The goose-acp receive track is independent of the relay, roughly the same size, and starts with a
 spike: accepting `gse_` targets; a delivery path through `GooseSessionRunner` instead of
 `prompt_async`, including what happens when a turn is already running; and an explicit per-session
 opt-in, because goose-acp's trust model is built on Telegram sender ids, which a swarm message does
-not have. SDD §13.6 currently says "neither", so the spike's first output is an agreed position
-with eng-agent-platform, not code.
+not have. The spike's output is §4.1.
 
 ### §4.1 goose sessions as swarm targets: pigeon's side of eng-agent-platform #152 (PROPOSED)
 
@@ -316,7 +315,8 @@ in each slice, including the defects a pigeon-side review found in a naive slice
   readable shared token.
 - **The owner-only gate guards intent, not identity.** `goose/adapter.ts:81-105` keeps Telegram
   strangers out. Any `dev` process can already prompt a goose-acp session directly through honkd,
-  with no envelope at all; stall-watch does (`honk_transport.py`). Swarm therefore adds no new
+  with no envelope at all; stall-watch does (eng-agent-platform
+  `stallwatch/honk_transport.py`). Swarm therefore adds no new
   hostile-process capability. What it adds is volume and influence from *well-meaning agents*,
   which is what the mitigations below bound.
 
@@ -335,9 +335,15 @@ in each slice, including the defects a pigeon-side review found in a naive slice
      they serve pull sessions.
    - The Telegram-reply rows that a bound goose-acp session already receives through honkd are
      *not* moved into this mailbox. Only swarm rows bank.
-   - Whether a goose-acp row needs an explicit `pull_sources`-style opt-in, or banks by default, is
-     the first admission question for eng-agent-platform. Banking is inert until the session
-     drains, so this proposal defaults it **on**.
+   - **Banking is opt-in, set by the reader.** A goose-acp mailbox banks only after something that
+     will drain it says so. The natural place is the goose MCP server, on first start: it sends
+     `pull_sources: ["swarm"]` on `POST /goose/sessions`, reset when absent, as for goose-pull.
+     Without the opt-in, a `gse_` target gets an immediate refusal
+     (`409 goose-acp session ses… has no swarm mailbox`), not a 202.
+   - **Why not default-on.** Today's honk chat and `/launch --backend goose` sessions have no
+     reader. Default-on would answer `202 banked:true` and then stay silent for the 7-day expiry.
+     That is worse than today's immediate 400, and it is the failure pigeon's pull design already
+     avoided ("non-opted-in pull sessions fail loudly").
 4. **`delivery.failed` reaches `gse_` senders.** `notifySenderOfFailure` sends only to `ses_`
    senders today (`swarm/notify-sender.ts:140`). It is widened to bank the notice in a local `gse_`
    sender's mailbox through the same helper. Without this, a goose sender never learns that a
@@ -360,8 +366,7 @@ fails in specific ways, so these are requirements, not options:
 2. **Queue-only, on every path.** A swarm item is never steered into a running turn. Steering would
    give a peer's text the weight of a human interjection. This covers:
    - the `deliver` steer branch (`:708-749`);
-   - the busy re-queue (`:1257`);
-   - the busy path for recovered turns.
+   - the bare-goose busy steer, which item 1 already excludes.
 3. **The human never gets runner notices about a swarm item.**
    - **Which notices.** These posts all address the human about a message the human did not send:
      - "Queued" (`:789`) and its busy twin;
@@ -375,27 +380,26 @@ fails in specific ways, so these are requirements, not options:
      `w:<msgId>` notice. It carries the full payload labelled with the sender
      (`telegram-notice.ts:47-60`). The turn hook's skip of enveloped prompts (`app.ts:1787-1791`)
      therefore loses nothing.
-4. **Handed off at turn start, by in-process callback.**
-   - **Turn start, not enqueue.** If the row were marked handed off at enqueue, the receipt-grace
-     watchdog (`DEFAULT_RECEIPT_GRACE_MS`, 10 min, measured from `handed_off_at`) would falsely fail
-     any message queued behind a long turn. That would alert Jonathan, and a resend would run twice.
-   - **The runner's callback, not the turn hook.** The runner calls back when it starts the
-     `sw:<msgId>` turn, and *that* marks the row handed off with family `receipt`
-     (`verify-family.ts` already maps `goose-acp`).
+4. **Handed off at enqueue; verified at turn start, by in-process callback.**
+   - **Arbiter.** The arbiter marks the row handed off with family `receipt` when the runner accepts
+     it (`verify-family.ts` already maps `goose-acp`). Its job ends there, so it never re-picks a
+     queued item and never spends attempts on `already-queued`.
+   - **Pending check.** `isReceiptPending(msgId)` is true while a `goose_inflight` row for
+     `sw:<msgId>` exists. That row is persisted, so the check survives a restart.
+     `isReceiptPending` is not wired today (`delivery-watchdog.ts:545` defaults it to false). With
+     it wired, a message queued behind a long turn is never failed by the 10-minute receipt grace
+     (`DEFAULT_RECEIPT_GRACE_MS`).
+   - **Verification.** When the runner starts the `sw:<msgId>` turn, its in-process callback calls
+     `markVerified`, guarded on `to_session` and `state = 'handed_off'`. The row is therefore
+     verified before its inflight row retires.
    - **Not `/goose/turn-event`.** Any token holder can post `client_req_ids: ["sw:<any msgId>"]`
-     there. That is the forgery primitive SDD §13.2 describes.
-   - **The hook as a fallback.** If the hook is ever used as corroboration, it must match
-     `msg_id` **and** `to_session` **and** `state = 'handed_off'` **and** an existing inflight row
-     for that session. Even then it can only suppress, never forge.
-   - **Wiring needed.** `isReceiptPending` is not wired today (`delivery-watchdog.ts:545` defaults
-     it to false). It must be backed by the persisted `goose_inflight` row, not by memory, so that it
-     survives a restart.
-5. **Idempotent on `msg_id`.**
-   - **The gap.** The runner's dedupe covers only items still queued or running. A crash between
-     the inflight insert and the arbiter's bookkeeping, followed by redelivery after that turn has
-     retired, would start a second turn.
-   - **The fix.** Before delivering, check `goose_inflight` and the outbox `s:<sid>:sw:<msgId>`, as
-     the turn hook's own-turn check already does.
+     there, which is the forgery primitive SDD §13.2 describes. If the hook is ever used to
+     corroborate, it must match `msg_id`, `to_session`, `state = 'handed_off'` and an existing
+     inflight row for that session. Even then it can only suppress, never forge.
+5. **Idempotent on `msg_id`.** With item 4, the only window is a crash between the runner's
+   inflight insert and the arbiter's `markHandedOff`. On redelivery, the arbiter first checks for a
+   `goose_inflight` row for `sw:<msgId>` or an outbox `s:<sid>:sw:<msgId>`, as the turn hook's
+   own-turn check already does. It treats either as already handed off.
 6. **The envelope is the first character, and the adapter is skipped deliberately.**
    - **The envelope invariant.** The pushed text is always the `<swarm_message …>` envelope
      (`swarm/envelope.ts`). Its first character is `<`, so `goose/builtin-commands.ts` can never run
