@@ -13,7 +13,7 @@ Use this before changing the swarm tables, routes, arbiter scheduling, envelope 
 
 OpenCode serve's `POST /session/<id>/prompt_async` has a race: concurrent requests targeting the same session from **different** `x-opencode-directory` headers bypass the per-session busy guard, producing parallel LLM turns and 400 "does not support assistant message prefill" from Anthropic. This bit us in COPS-6107 when a swarm of 5 sessions tried to message each other directly.
 
-The swarm subsystem fixes the race **architecturally** by making the daemon the single writer to opencode serve for cross-session messages: every `pigeon-send` call POSTs to the daemon, the daemon persists durably, and a per-target arbiter ensures at most one `prompt_async` is in flight per target session at any time.
+The swarm subsystem fixes the race **architecturally** by making the daemon the single writer to opencode serve for cross-session messages: every `swarm_send` call POSTs to the daemon, the daemon persists durably, and a per-target arbiter ensures at most one `prompt_async` is in flight per target session at any time.
 
 It also gives us durable delivery, retry with backoff, replay via inbox, and an in-transcript `<swarm_message>` envelope that lets receiving agents distinguish swarm traffic from user prompts.
 
@@ -200,13 +200,28 @@ The inbox does **not** return `queued` or `failed` messages — it's an inbox, n
   1. `storage.swarm.listTargetsWithReady(now)` — find every distinct target with at least one `queued` message whose `next_retry_at <= now`.
   2. For each target in parallel: `drainTarget(target)`.
 - **`drainTarget`** uses an in-process `Map<target, Promise>` to ensure at most one in-flight `prompt_async` per target. Concurrent calls collapse onto the same promise.
-- **`drainTargetInner`** loops: pull one ready msg, resolve directory via the registry, render envelope, `opencodeClient.sendPrompt(target, directory, prompt)`. On success: `markHandedOff`. On failure: `markRetry` with backoff (or `markFailed` after `MAX_ATTEMPTS=10`). Failure stops the inner loop for this target until the next tick (so a stuck target doesn't burn CPU).
+- **`drainTargetInner`** loops: pull one ready msg, **decide locality** (below), resolve directory via the registry, render envelope, `opencodeClient.sendPrompt(target, directory, prompt)`. On success: `markHandedOff`. On failure: `markRetry` with backoff (or `markFailed` after `MAX_ATTEMPTS=10`). Failure stops the inner loop for this target until the next tick (so a stuck target doesn't burn CPU).
+
+**Locality (`pigeon-k0qn.2`)** — `routing/locality.ts`, injected as `localityOf`, runs before `clientForSession`:
+
+| Target | Verdict |
+|---|---|
+| has a local `sessions` row | local |
+| `gse_…` with no row | remote (never probed: an opencode serve answers 500 for `gse_`) |
+| serve `GET /session/<id>` → 200 (any base: route, `OPENCODE_URL`, `PIGEON_SERVE_ENDPOINTS`) | local (subagents, not-yet-registered sessions) |
+| → 404 | remote (all serves on a machine read one `opencode.db`) |
+| anything else on every base | unknown |
+
+- **remote** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender, `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
+- **unknown** → `TargetUnavailableError` (outage class: retried; never a remote verdict).
+- Must precede `clientForSession`: for an id with no local row that path reaches `ensureRouted`, which writes a `session_assignment` + lease (the general unknown-id case is `pigeon-8dhq`).
+- Not cached; re-evaluated every attempt.
 
 Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~15min.
 
 **The race-fix property**: at most one `prompt_async` to the same target at any time. Proven both by integration test (`test/swarm-routes.integration.test.ts` — fires 4 concurrent POSTs and asserts no overlap via timestamps) and by live smoke (10 concurrent → arbiter events strictly 500ms apart, see `2026-04-21-swarm-ipc-plan.md` Task 12 results).
 
-**Why a single in-flight per target is enough**: opencode serve's race occurs when two `prompt_async` calls land on the same session id from different `x-opencode-directory` headers. Since the daemon is the single writer and uses the registry to canonicalize the directory, all daemon-routed traffic always uses the same directory header. The race is gone for daemon-routed traffic. (`opencode-send --direct` bypasses the daemon and re-introduces the race; that's why Task 13 exists as a defense-in-depth follow-up.)
+**Why a single in-flight per target is enough**: opencode serve's race occurs when two `prompt_async` calls land on the same session id from different `x-opencode-directory` headers. Since the daemon is the single writer and uses the registry to canonicalize the directory, all daemon-routed traffic always uses the same directory header. The race is gone for daemon-routed traffic. (Anything that calls `prompt_async` directly, bypassing the daemon, re-introduces the race.)
 
 ## Turn-Preemption Policy (pigeon-0gxy)
 
@@ -280,7 +295,7 @@ covered by policy and review, not by a test.
 - `resolve(sessionId)`: returns cached directory if not expired; else `GET <baseUrl>/session/<id>`, parses `body.directory`, caches with TTL.
 - `invalidate(sessionId)`: drops cache entry. Not currently called by the arbiter (a stale entry will be invalidated by the next 404 from `prompt_async` indirectly, since the next `getReadyForTarget` will likely re-resolve after retry backoff).
 
-The registry is what makes the daemon "the canonical source of `directory` for a session" — `pigeon-send` callers don't pass `--cwd`; the daemon looks it up. This is the core of the protocol simplification (no more "remember to pass `--cwd <target's-own-dir>`").
+The registry is what makes the daemon "the canonical source of `directory` for a session" — `swarm_send` callers don't pass a directory; the daemon looks it up. This is the core of the protocol simplification (no more "remember to pass `--cwd <target's-own-dir>`").
 
 ### Two hazards before you build any pre-flight gate
 
@@ -329,6 +344,7 @@ Every swarm IPC message is mirrored to the **receiver's** Telegram forum topic t
 - **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a Telegram post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
 - **Fault isolation**: The `enqueueSwarmTelegramNotice` helper (`packages/daemon/src/swarm/telegram-notice.ts`) is wrapped in an internal `try/catch`. A Telegram/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
 - **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).
+- **No local session row**: Skipped (`pigeon-qioa`, logged `reason=no-local-session`). The target is either another machine's session, whose topic lives in another chat, or unregistered here (subagent, reaped), which the worker would 404. Every path that registers with the worker writes the local row first.
 
 ### Notification Outbox & Rate Governance
 - **Outbox Kind & IDs**: Outbox `kind='swarm'` (24h expiry; `mirror` reserved for Phase 2). IDs are `w:<msg_id>` for posts and `wc:<msg_id>` for retractions. Multi-chunk posts suffix earlier chunks via `chunkNotificationId` (`w:<msg_id>:c0`, etc.).
@@ -363,11 +379,9 @@ The arbiter is opt-in: a daemon configured without `opencodeUrl` (e.g. a worker-
 
 The plugin registers `swarm.read` as an opencode tool that calls `GET /swarm/inbox` on behalf of the calling session. See `opencode-plugin-architecture` for the tool registration mechanism. The pure helper (`swarmRead()`) and the factory (`createSwarmReadTool(daemonBaseUrl)`) live in `packages/opencode-plugin/src/swarm-tool.ts`.
 
-## Sender CLI
+## Senders
 
-Senders use `~/.local/bin/pigeon-send` (provisioned by workstation `users/dev/home.base.nix`). The wrapper POSTs to `/swarm/send` and pulls `--from` from `$OPENCODE_SESSION_ID` by default. The legacy `~/.local/bin/opencode-send` auto-routes to `pigeon-send` when the target matches `^ses_` and the daemon `/health` returns 2xx (with `--direct` as the escape hatch).
-
-See workstation `assets/opencode/skills/swarm-messaging/` and `opencode-send/` for the user-facing skill docs.
+Agents send with the plugin's `swarm_send` tool (`packages/opencode-plugin/src/`), which POSTs to `/swarm/send` with the calling session as `from`. The `pigeon-send` / `opencode-send` CLIs no longer exist (removed in workstation `91d1a91`). User-facing guidance is the workstation `assets/opencode/skills/swarm-messaging/` skill.
 
 ## Verify
 

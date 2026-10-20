@@ -103,7 +103,7 @@ The `onQuestionReply` handler uses `internalFetch` (with a `new Request(...)`) t
 
 ## Swarm IPC Tool (`swarm.read`)
 
-The plugin registers `swarm.read` as an opencode tool the LLM can call to fetch its swarm inbox from the local pigeon daemon. This is the receiver side of the swarm IPC subsystem (sender side is `pigeon-send`; full subsystem in `swarm-architecture`).
+The plugin registers `swarm.read` as an opencode tool the LLM can call to fetch its swarm inbox from the local pigeon daemon. This is the receiver side of the swarm IPC subsystem (sender side is the `swarm_send` tool; full subsystem in `swarm-architecture`).
 
 - `packages/opencode-plugin/src/swarm-tool.ts`:
   - `swarmRead({daemonBaseUrl, sessionId, fetchFn?}, since?)` -- pure helper. `GET /swarm/inbox?session=<id>[&since=<msg_id>]`. Returns the parsed messages array.

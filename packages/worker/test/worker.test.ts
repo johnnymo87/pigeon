@@ -402,6 +402,55 @@ describe("session endpoints: auth", () => {
   });
 });
 
+// ─── Session Owner (pigeon-k0qn.1) ─────────────────────────────────────
+
+describe("GET /sessions/:id/owner", () => {
+  test("returns the owning machine and last_seen", async () => {
+    await registerSession("sess-owner", "cloudbox");
+    const row = await env.DB.prepare("SELECT updated_at FROM sessions WHERE session_id = ?")
+      .bind("sess-owner")
+      .first<{ updated_at: number }>();
+
+    const res = await SELF.fetch("https://worker/sessions/sess-owner/owner", { headers: authHeaders });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ machine_id: "cloudbox", last_seen: row!.updated_at });
+  });
+
+  test("returns 404 for an unknown session", async () => {
+    const res = await SELF.fetch("https://worker/sessions/sess-nobody/owner", { headers: authHeaders });
+    expect(res.status).toBe(404);
+  });
+
+  test("requires auth", async () => {
+    await registerSession("sess-owner-auth", "cloudbox");
+    const res = await SELF.fetch("https://worker/sessions/sess-owner-auth/owner");
+    expect(res.status).toBe(401);
+  });
+
+  test("decodes a percent-encoded id", async () => {
+    await registerSession("ses_a b", "devbox");
+    const res = await SELF.fetch(`https://worker/sessions/${encodeURIComponent("ses_a b")}/owner`, {
+      headers: authHeaders,
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { machine_id: string }).machine_id).toBe("devbox");
+  });
+
+  test("does not touch updated_at (read-only)", async () => {
+    await registerSession("sess-owner-ro", "cloudbox");
+    await env.DB.prepare("UPDATE sessions SET updated_at = 1 WHERE session_id = ?").bind("sess-owner-ro").run();
+
+    const res = await SELF.fetch("https://worker/sessions/sess-owner-ro/owner", { headers: authHeaders });
+
+    expect(((await res.json()) as { last_seen: number }).last_seen).toBe(1);
+    const row = await env.DB.prepare("SELECT updated_at FROM sessions WHERE session_id = ?")
+      .bind("sess-owner-ro")
+      .first<{ updated_at: number }>();
+    expect(row!.updated_at).toBe(1);
+  });
+});
+
 // ─── Session Registration ──────────────────────────────────────────────
 
 describe("POST /sessions/register", () => {

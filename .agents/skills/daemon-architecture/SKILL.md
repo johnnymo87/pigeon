@@ -150,7 +150,7 @@ Boots conditionally on `opencodeClient && config.opencodeUrl` in `index.ts`. Wit
 
 The opencode-plugin exposes a companion tool (`swarm.read`) that calls `GET /swarm/inbox` on behalf of the calling session — see `opencode-plugin-architecture`.
 
-Senders use `~/.local/bin/pigeon-send` (provisioned by workstation `users/dev/home.base.nix`); the legacy `~/.local/bin/opencode-send` auto-routes `ses_*` targets through `pigeon-send` with `--direct` as the escape hatch.
+Senders use the plugin's `swarm_send` tool (the `pigeon-send` / `opencode-send` CLIs were removed in workstation `91d1a91`). Targets are same-machine only: a target on another machine fails on the first attempt with an owner-naming `delivery.failed` (`swarm-architecture`, Arbiter → Locality).
 
 Full details in the `swarm-architecture` skill (schema columns, route bodies, arbiter algorithm, race-fix proof).
 
@@ -190,14 +190,14 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
 
 ### Swarm Send Flow
 
-1. Sender (some `bash` shell, often a sub-shell of an opencode session) runs `pigeon-send <to> <payload>` (or `opencode-send <ses_*> <payload>` which auto-routes).
-2. `pigeon-send` POSTs to daemon `/swarm/send` with `{from, to, kind, priority, payload, [reply_to], [msg_id]}`.
+1. Sender (an opencode session) calls the plugin's `swarm_send` tool.
+2. The tool POSTs to daemon `/swarm/send` with `{from, to, kind, priority, payload, [reply_to], [msg_id]}`.
 3. Daemon validates, mints `msg_id` if not caller-supplied, and routes insertion through `bankOrInsertSwarmMessage(...)`:
    - **Banked pull session**: if the target is a pull-mode session (`goose-pull`) that opted into swarm banking (`pull_sources` contains `"swarm"`), the message is banked in `pull_inbox` (`source: 'swarm'`), Telegram topic notice is enqueued, and the daemon returns HTTP 202 `{accepted: true, msg_id, banked: true}` immediately. Delivery bypasses `SwarmArbiter` entirely. (Payloads over 4000 code points are refused with 413).
    - **Standard session**: calls `storage.swarm.insert(...)`, enqueues best-effort Telegram topic mirror notice (outbox `kind='swarm'`, `w:<msg_id>`), and returns HTTP 202 `{accepted: true, msg_id}` immediately.
 4. For standard sessions, background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
 5. For each ready target (in parallel), `drainTarget` collapses concurrent calls onto a single in-flight promise (the at-most-one-in-flight invariant per target).
-6. Inside the per-target drain: pop one ready msg → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
+6. Inside the per-target drain: pop one ready msg → `localityOf(target)` (remote → fail now, unknown → retry) → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
 7. On failure: `storage.swarm.markRetry` with exponential backoff (or `markFailed` after MAX_ATTEMPTS=10).
 8. Receiver agent sees the next user-message turn as the `<swarm_message>` XML envelope. It can also call the `swarm.read` opencode tool to fetch its full inbox (`GET /swarm/inbox?session=<own-id>[&since=<msg_id>]`).
 

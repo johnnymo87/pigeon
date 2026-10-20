@@ -205,6 +205,46 @@ async function unregisterSession(
 }
 
 /**
+ * `GET /sessions/:id/owner` (pigeon-k0qn.1): which machine a session is registered
+ * to, and when it last registered. A daemon that finds a swarm target is not on its
+ * own machine uses this to NAME the owner in the sender's delivery.failed. That use is
+ * decoration, so this stays a single read: it never touches `updated_at`, and
+ * `machine_id` is returned as stored (last registrant wins).
+ */
+export async function handleSessionOwner(
+  db: D1Database,
+  env: Env,
+  request: Request,
+  sessionId: string,
+): Promise<Response> {
+  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+    return unauthorized();
+  }
+  try {
+    const row = await withD1(
+      "sessionOwner",
+      db
+        .prepare("SELECT machine_id, updated_at FROM sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first<{ machine_id: string; updated_at: number }>(),
+    );
+    if (!row) {
+      return Response.json({ error: "session not found" }, { status: 404 });
+    }
+    return Response.json({ machine_id: row.machine_id, last_seen: row.updated_at });
+  } catch (err) {
+    if (err instanceof StorageError) {
+      console.error("[worker] storage error", { op: err.op, error: err.message });
+      return Response.json(
+        { error: "storage_error", store: "d1", op: err.op },
+        { status: 503 },
+      );
+    }
+    throw err;
+  }
+}
+
+/**
  * Look up which machine a session belongs to.
  */
 export async function getSessionMachine(

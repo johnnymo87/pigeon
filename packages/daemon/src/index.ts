@@ -65,6 +65,7 @@ import { OpencodeClientFactory } from "./routing/client-factory";
 import { isOpencodeRoutable, makeClientForSession } from "./routing/opencode-routable";
 import { ServeOutcomeSensor } from "./routing/serve-outcome";
 import { makeDirectoryResolver } from "./routing/directory-resolver";
+import { makeLocalityResolver } from "./routing/locality";
 
 const ALERT_ABANDON_MS = 72 * 60 * 60 * 1000;
 const ALERT_SENT_RETENTION_MS = 1 * 60 * 60 * 1000;
@@ -773,6 +774,18 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       storage,
       clientForSession,
       directoryForSession,
+      // pigeon-k0qn.2: decide local/remote/unknown read-only, before any client
+      // is built, so a session on another machine fails fast and is never placed.
+      localityOf: makeLocalityResolver({
+        hasLocalSession: (id) => storage.sessions.get(id) !== null,
+        baseUrlsFor: (id) => [
+          ...(ingressRouter ? [ingressRouter.resolveRoute(id, Date.now())?.apiBase] : []),
+          config.opencodeUrl,
+          ...config.serveEndpoints,
+        ].filter((u): u is string => typeof u === "string" && u.length > 0),
+      }),
+      ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
+      selfMachineId: config.machineId,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })

@@ -31,6 +31,20 @@ export function enqueueSwarmTelegramNotice(
       return;
     }
 
+    // No local session row -> no notice (pigeon-qioa). Such a target is either
+    // owned by ANOTHER machine, whose topic lives in another forum chat (posting
+    // into ours is what destroyed a topic mapping on 2026-10-20, pigeon-533h), or
+    // is unregistered here (a subagent, a reaped session), which the worker 404s
+    // and the outbox then compensates away. Every path that registers a session
+    // with the worker writes this row first, so nothing deliverable is lost.
+    const target = storage.sessions.get(record.toSession);
+    if (!target) {
+      console.log(
+        `[swarm-notice] skipped msgId=${record.msgId} sessionId=${record.toSession} reason=no-local-session`,
+      );
+      return;
+    }
+
     // A session declared quiet suppresses its swarm feed too. lgtm re-prompts its
     // review sessions via /swarm/send on every reawaken, so without this the feed
     // reinstates exactly the noise the origin policy exists to remove -- and can
@@ -42,7 +56,6 @@ export function enqueueSwarmTelegramNotice(
       return;
     }
 
-    const target = storage.sessions.get(record.toSession);
     const sender = storage.sessions.get(record.fromSession);
 
     const notification = formatSwarmNotification({

@@ -676,6 +676,34 @@ export class Poller {
   }
 
   /**
+   * `GET /sessions/:id/owner` (pigeon-k0qn.2): which machine the worker has a
+   * session registered to. null on 404 (and on an old worker, which 404s the
+   * route). Throws on anything else; the arbiter treats every failure as "owner
+   * unknown". Decoration only, so like `lookupTopics` it is not recorded in the
+   * worker-health monitor.
+   */
+  async lookupSessionOwner(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<{ machineId: string; lastSeen: number } | null> {
+    const response = await this.fetchFn(
+      `${this.config.workerUrl}/sessions/${encodeURIComponent(sessionId)}/owner`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.config.apiKey}` },
+        ...(signal ? { signal } : {}),
+      },
+    );
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`sessions/owner returned ${response.status}`);
+    const body = (await response.json()) as { machine_id?: unknown; last_seen?: unknown };
+    if (typeof body.machine_id !== "string" || typeof body.last_seen !== "number") {
+      throw new Error("sessions/owner returned a malformed body");
+    }
+    return { machineId: body.machine_id, lastSeen: body.last_seen };
+  }
+
+  /**
    * Find-or-create a caller-keyed forum topic (`POST /topics/named`) in this
    * daemon's chat, for `POST /alert` `topic`. Throws on any failure; the caller
    * (`resolveAlertTopic`) fails open to General. Like `lookupTopics`, not

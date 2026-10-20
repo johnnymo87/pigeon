@@ -121,6 +121,17 @@ describe("enqueueSwarmTelegramNotice", () => {
     expect(upsertCalls).toHaveLength(0);
   });
 
+  // pigeon-qioa: a target with no local session row is either owned by another
+  // machine (whose topic lives in another chat -- posting there is what destroyed a
+  // topic mapping on 2026-10-20) or unregistered here, which the worker 404s anyway.
+  it("skips targets with no local session row", () => {
+    const { storage, upsertCalls } = mockStorage({ targetSession: null });
+
+    enqueueSwarmTelegramNotice(storage, makeRecord(), Date.now());
+
+    expect(upsertCalls).toHaveLength(0);
+  });
+
   it("does not throw when outbox upsert throws", () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -240,6 +251,8 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
   it("notifySenderOfFailure enqueues a Telegram notice to original sender in outbox", () => {
     const storage = openStorageDb(":memory:");
     try {
+      // The notice needs a local row for its recipient (pigeon-qioa).
+      storage.sessions.upsert({ sessionId: "ses_sender_1", notify: true });
       const failedRecord = makeRecord({
         msgId: "msg_original_1",
         fromSession: "ses_sender_1",
@@ -306,6 +319,7 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
     const storage = openStorageDb(":memory:");
     try {
       const now = 100_000;
+      storage.sessions.upsert({ sessionId: "ses_b", notify: true });
       storage.swarm.insert({
         msgId: "m_handed_off",
         fromSession: "ses_a",
