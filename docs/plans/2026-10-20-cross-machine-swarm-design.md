@@ -2,7 +2,7 @@
 
 Status: proposed, 2026-10-20. Phase 1 approved to build; Phase 2 waits on a human decision
 (§0). Adversarially reviewed at plan time; the review's required changes are folded in.
-Tracking: epic in beads (see "Tracking").
+Tracking: epic `pigeon-k0qn` in beads.
 
 ## Problem
 
@@ -77,7 +77,7 @@ Rules:
   sick serve cannot push local traffic off the machine.
 - **Read-only.** The check runs before `clientForSession`, so a remote id never reaches
   `ensureRouted` and never gets a phantom placement. (The same phantom-placement hazard for
-  *unknown local* ids is a separate bug, filed outside this epic.)
+  *unknown local* ids is a separate bug, `pigeon-8dhq`, outside this epic.)
 - **Not cached across ticks.** A session can come back (a reaped row revived), and a stale
   "remote" verdict would misroute it.
 - Implementation must confirm the shared-data-dir assumption on devbox and macOS, not only
@@ -313,5 +313,5 @@ Phase 2:
 
 ## Tracking
 
-Epic `pigeon-<epic>` in beads. `bd ready --parent=<epic>` is the only answer to "what next"; the
+Epic `pigeon-k0qn` in beads. `bd ready --parent=pigeon-k0qn` is the only answer to "what next"; the
 epic's design field is the runbook. Children cite this document by section.
