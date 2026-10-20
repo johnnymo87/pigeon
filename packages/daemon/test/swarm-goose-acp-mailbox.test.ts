@@ -3,6 +3,7 @@ import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { registerGooseSession } from "../src/goose/register-session";
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
+import { notifySenderOfFailure } from "../src/swarm/notify-sender";
 
 describe("goose-acp swarm mailbox (Task A1)", () => {
   let storage: StorageDb | null = null;
@@ -673,5 +674,117 @@ describe("Task A4: goose-acp may drain its mailbox", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("nothing is banking inbound for it");
+  });
+});
+
+describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sessions", () => {
+  let storage: StorageDb | null = null;
+
+  afterEach(() => {
+    if (storage) {
+      storage.db.close();
+      storage = null;
+    }
+  });
+
+  function newApp(now = 1_000, opts: Record<string, unknown> = {}) {
+    storage = openStorageDb(":memory:");
+    return {
+      app: createApp(storage, { nowFn: () => now, ...opts }),
+      storage,
+    };
+  }
+
+  it("a failure for a message from an opted-in gse_ sender banks delivery.failed into its mailbox", async () => {
+    const { storage: s } = newApp(1_000);
+    registerGooseSession(
+      s.sessions,
+      { backendSessionId: "20261020_sender", endpoint: "ws://127.0.0.1:4080/acp" },
+      1_000,
+      () => "gse_sender",
+    );
+    s.sessions.setPullSources("gse_sender", ["telegram-reply", "swarm"]);
+
+    notifySenderOfFailure(
+      s,
+      {
+        msgId: "msg_orig_123",
+        fromSession: "gse_sender",
+        toSession: "ses_unreachable",
+        channel: null,
+        kind: "chat",
+        handedOffAt: null,
+      },
+      "expired",
+      2_000,
+    );
+
+    // It should be banked in pull_inbox for gse_sender
+    const claimed = s.pullInbox.claim("gse_sender", 3_000);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]!.kind).toBe("delivery.failed");
+    expect(claimed[0]!.source).toBe("swarm");
+    expect(claimed[0]!.senderId).toBe("pigeon");
+    expect(claimed[0]!.replyTo).toBe("msg_orig_123");
+
+    // Nothing in swarm_messages
+    const countSwarm = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages").get() as { n: number };
+    expect(countSwarm.n).toBe(0);
+  });
+
+  it("a failure for a message from a non-opted-in gse_ sender is refused and logged, nothing inserted", async () => {
+    const { storage: s } = newApp(1_000);
+    registerGooseSession(
+      s.sessions,
+      { backendSessionId: "20261020_sender2", endpoint: "ws://127.0.0.1:4080/acp" },
+      1_000,
+      () => "gse_sender_no_optin",
+    );
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    notifySenderOfFailure(
+      s,
+      {
+        msgId: "msg_orig_456",
+        fromSession: "gse_sender_no_optin",
+        toSession: "ses_unreachable",
+        channel: null,
+        kind: "chat",
+        handedOffAt: null,
+      },
+      "expired",
+      2_000,
+    );
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("delivery.failed refused for gse_sender_no_optin"));
+    warnSpy.mockRestore();
+
+    // Nothing stored in pull_inbox or swarm_messages
+    expect(s.pullInbox.pendingCount("gse_sender_no_optin", 3_000)).toBe(0);
+    const countSwarm = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages").get() as { n: number };
+    expect(countSwarm.n).toBe(0);
+  });
+
+  it("GET /sessions rows carry pull_sources", async () => {
+    const { app, storage: s } = newApp(1_000);
+    // Create an opencode session with explicit pullSources
+    s.sessions.upsert({ sessionId: "ses_with_sources", notify: true }, 1_000);
+    s.sessions.setPullSources("ses_with_sources", ["telegram-reply", "swarm"]);
+
+    // Create an opencode session with default pullSources (NULL in DB)
+    s.sessions.upsert({ sessionId: "ses_default_sources", notify: true }, 1_000);
+
+    const res = await app(new Request("http://localhost/sessions"));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessions: Array<{ session_id: string; pull_sources: string[] }> };
+
+    const withSources = body.sessions.find((sess) => sess.session_id === "ses_with_sources");
+    expect(withSources).toBeDefined();
+    expect(withSources!.pull_sources).toEqual(["telegram-reply", "swarm"]);
+
+    const defaultSources = body.sessions.find((sess) => sess.session_id === "ses_default_sources");
+    expect(defaultSources).toBeDefined();
+    expect(defaultSources!.pull_sources).toEqual(["telegram-reply"]);
   });
 });

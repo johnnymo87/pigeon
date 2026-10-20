@@ -51,6 +51,7 @@ interface LegacySession {
   backend_protocol_version: number | null;
   backend_endpoint: string | null;
   backend_session_id: string | null;
+  pull_sources: string[];
   created_at: number;
   updated_at: number;
   last_seen: number;
@@ -73,6 +74,7 @@ function toLegacySession(session: {
   backendEndpoint: string | null;
   backendAuthToken: string | null;
   backendSessionId: string | null;
+  pullSources: string[];
   createdAt: number;
   updatedAt: number;
   lastSeen: number;
@@ -99,6 +101,7 @@ function toLegacySession(session: {
     // has gone wrong. NULL for opencode sessions and for legacy goose rows,
     // where the two ids are the same thing.
     backend_session_id: session.backendSessionId,
+    pull_sources: session.pullSources,
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     last_seen: session.lastSeen,

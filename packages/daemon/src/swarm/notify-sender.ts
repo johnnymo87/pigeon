@@ -136,8 +136,8 @@ export function notifySenderOfFailure(
   if (failed.kind === DELIVERY_FAILED_KIND) return;
   // Only route notifications to a real session sender. `from` is not
   // guaranteed to be a session id (channels, coordinators), and a
-  // non-ses_ target is unroutable anyway.
-  if (!/^ses_[A-Za-z0-9_-]+$/.test(failed.fromSession)) return;
+  // non-ses_ / non-gse_ target is unroutable anyway.
+  if (!/^(ses|gse)_[A-Za-z0-9_-]+$/.test(failed.fromSession)) return;
 
   const target = failed.toSession ?? failed.channel ?? "(unknown target)";
   const payload =
