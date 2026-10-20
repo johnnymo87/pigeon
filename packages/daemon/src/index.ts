@@ -750,6 +750,8 @@ const outboxSender = poller && config.telegramChatId
       registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
       unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
       chatId: config.telegramChatId,
+      // pigeon-qioa: never post a swarm notice for a session this machine does not have.
+      gateSwarmOnLocalSession: true,
       log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
     })
   : undefined;

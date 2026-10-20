@@ -75,11 +75,24 @@ describe("makeLocalityResolver", () => {
     }
   });
 
-  it("falls through a failing serve to the next base; first definitive answer wins", async () => {
+  it("falls through a failing serve; a 200 from any base wins, so 404 alone needs every base", async () => {
     const fetchFn = vi.fn(async (url: string) => (url.startsWith("http://a") ? res(503) : res(404)));
     const { resolve } = build({ fetchFn: fetchFn as unknown as typeof fetch, bases: ["http://a", "http://b", "http://c"] });
     expect(await resolve("ses_x")).toBe("remote");
-    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+  });
+
+  it("one serve answering 404 (e.g. a stray serve on another data dir) cannot override a 200 elsewhere", async () => {
+    const fetchFn = vi.fn(async (url: string) => (url.startsWith("http://a") ? res(404) : res(200)));
+    const { resolve } = build({ fetchFn: fetchFn as unknown as typeof fetch, bases: ["http://a", "http://b"] });
+    expect(await resolve("ses_x")).toBe("local");
+  });
+
+  it("stops probing at the first 200", async () => {
+    const fetchFn = vi.fn(async () => res(200));
+    const { resolve } = build({ fetchFn: fetchFn as unknown as typeof fetch, bases: ["http://a", "http://b"] });
+    expect(await resolve("ses_x")).toBe("local");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it("deduplicates bases", async () => {

@@ -5,14 +5,13 @@ Beads in this PR: `pigeon-qioa`, `pigeon-k0qn.1`, `pigeon-k0qn.2`, `pigeon-k0qn.
 
 ## 1. No foreign Telegram notice (`pigeon-qioa`)
 
-`daemon/src/swarm/telegram-notice.ts` `enqueueSwarmTelegramNotice`: return early (logged,
-`reason=no-local-session`) when `storage.sessions.get(toSession)` is null. Placed before the
-ancillary gate. The cancel notice needs no change: it already follows the fate of the `w:` row.
-
-Residual, accepted: a message sent to a local session in the seconds before its plugin's
-`/session-start` posts no notice. Before this change that notice reached the outbox, which
-re-registered from a null local row and then compensated it away (`outbox-sender.ts:540-563`),
-so it did not land either.
+Decided at outbox SEND time, not insert time: `OutboxSender` option `gateSwarmOnLocalSession`
+(on in `index.ts`) holds a `kind='swarm'` entry while its session has no local `sessions` row
+(uncounted retry every 5s) and drops it as `no_local_session` after 60s. An insert-time skip
+(the first draft) would also drop the notice for a session reaped after 7 idle days and revived
+by the very message, whose plugin re-registers seconds after delivery; review caught it. A
+foreign session never gains a row, so its notice is never posted. Cancels (`wc:`) are swarm
+entries too and follow the same rule.
 
 ## 2. Worker `GET /sessions/:id/owner` (`pigeon-k0qn.1`)
 
@@ -28,15 +27,18 @@ timeoutMs})` → `(id) => Promise<"local"|"remote"|"unknown">`.
 - local row → `local`; `gse_` without row → `remote` (never probe: serve answers 500).
 - otherwise GET `<base>/session/<id>` (no directory header, serve auth header if configured) over
   candidate bases in order — `ingressRouter.resolveRoute(id)?.apiBase` (read-only), then
-  `config.opencodeUrl`, then `config.serveEndpoints`, deduped. First definitive answer wins:
-  200 → local, 404 → remote. Any other status / timeout / transport error → try next; none
-  definitive → `unknown`. Each probe bounded (3s). No cache.
+  `config.opencodeUrl`, then `config.serveEndpoints`, deduped. A 200 from any base → local
+  (stop). Otherwise at least one 404 → remote; otherwise → `unknown`. Requiring every base
+  keeps one stray serve on another data dir from failing a local session. Each probe bounded
+  (3s). No cache.
 
 `daemon/src/swarm/arbiter.ts` `drainTargetInner`: before `clientForSession` (so a remote or
 unknown id never reaches `ensureRouted`):
 
 - `remote` → `RemoteTargetError extends PermanentDeliveryError` → existing permanent path (failed
-  on first attempt, `notifySenderOfFailure`, wake alert). Reason from `ownerOf(id)` bounded 2s,
+  on first attempt, `notifySenderOfFailure`, wake alert), with a custom notice
+  (`formatRemoteFailureNotice`) — the default one ends "safe to resend", and a resend fails
+  identically. Reason from `ownerOf(id)` bounded 2s,
   decoration only: names the owning machine and last-seen when known; when the worker names THIS
   machine (stale D1 row) it says "not found on this machine" without claiming a remote owner.
 - `unknown` → `TargetUnavailableError` (outage class: retried, never treated as remote).
@@ -46,8 +48,10 @@ unknown id never reaches `ensureRouted`):
 Daemon `Poller.lookupSessionOwner(id, signal)` → `GET /sessions/:id/owner`; 404 → null; not
 recorded in worker-health (decoration). Wired in `index.ts`.
 
-Shared-`opencode.db` assumption: only cloudbox runs a serve pool (workstation `hosts/cloudbox`
-`servePool`); devbox and macOS run one serve, so one DB trivially. Recorded on the bead.
+Shared-`opencode.db` assumption: every host's serves (cloudbox K=4, devbox and darwin K=2 via
+workstation `serve-pool.nix`) are pinned to one file by `OPENCODE_DB` +
+`OPENCODE_DISABLE_CHANNEL_DB` (verified live on cloudbox via `/proc/<pid>/environ`; devbox
+`home.devbox.nix`, darwin `home.darwin.nix`). Recorded on the bead.
 
 ## 4. Docs (`pigeon-k0qn.3`)
 

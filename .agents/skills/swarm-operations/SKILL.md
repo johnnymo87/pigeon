@@ -133,7 +133,7 @@ Fix: set `opencodeUrl` in the daemon config and restart.
 
 ### Repeated `retry scheduled` with `session lookup failed: 404`
 
-Since `pigeon-k0qn.2` a 404 from the locality check fails the row at once (above), so this now only appears if the session vanished between the locality check and the directory lookup.
+Since `pigeon-k0qn.2` a target with no local `sessions` row that every serve 404s fails at once (above). This retry loop is what remains: a target that still has a local `sessions` row (the locality check trusts the row and does not probe) but whose opencode session was deleted.
 
 Cause: target session doesn't exist in opencode serve (probably never existed, or was killed).
 
@@ -148,7 +148,7 @@ If the target session was supposed to exist, check that opencode serve is up and
 
 ### `failed (permanent)` with `is not on this machine`
 
-Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox`). Cross-machine delivery is not supported; this is the intended outcome, not a fault.
+Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). Cross-machine delivery is not supported; this is the intended outcome, not a fault.
 
 If the target *should* be local, check the id, then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4096/session/ses_X`. A 404 there means no serve on this machine has the session.
 

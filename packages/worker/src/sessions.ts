@@ -206,10 +206,12 @@ async function unregisterSession(
 
 /**
  * `GET /sessions/:id/owner` (pigeon-k0qn.1): which machine a session is registered
- * to, and when it last registered. A daemon that finds a swarm target is not on its
- * own machine uses this to NAME the owner in the sender's delivery.failed. That use is
- * decoration, so this stays a single read: it never touches `updated_at`, and
- * `machine_id` is returned as stored (last registrant wins).
+ * to, and `last_seen` = the row's `updated_at` (bumped by registration, notifications
+ * and Telegram routing, so "last active", not "last registered"). A daemon that
+ * finds a swarm target is not on its own machine uses this to NAME the owner in the
+ * sender's delivery.failed. That use is decoration, so this stays a single read: it
+ * never touches `updated_at`, and `machine_id` is returned as stored (last registrant
+ * wins).
  */
 export async function handleSessionOwner(
   db: D1Database,

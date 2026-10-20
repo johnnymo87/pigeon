@@ -31,8 +31,26 @@ export { DELIVERY_FAILED_KIND };
 /** The worker's record of which machine a session is registered to. */
 export interface SessionOwner {
   machineId: string;
-  /** Epoch ms of the session's last registration with the worker. */
+  /**
+   * Epoch ms of the worker row's `updated_at`: bumped by registration and also by
+   * notifications and Telegram routing, from any machine. "Last active", not
+   * "last registered".
+   */
   lastSeen: number;
+}
+
+/**
+ * The sender-facing notice for a remote target. Not `formatFailureNotice`: its
+ * not-received branch ends "safe to resend", and a resend fails identically, so
+ * an agent following it burns a turn per retry. Keeps NOT RECEIVED (true: nothing
+ * was written anywhere) and says what to do instead.
+ */
+export function formatRemoteFailureNotice(msgId: string, target: string, reason: string): string {
+  return (
+    `DELIVERY FAILED: your swarm message ${msgId} to ${target} was NOT received. ` +
+    `Reason: ${reason}. Do not resend it via swarm; it will fail the same way. ` +
+    `Reach the target another way.`
+  );
 }
 
 /** Bound on the owner lookup. It runs inside the target's in-flight slot. */
@@ -67,12 +85,12 @@ export function formatRemoteTargetReason(
     // a deleted or stale session, not a cross-machine one.
     return (
       `target ${target} was not found on ${here}; the worker still lists it here ` +
-      `(last registered ${new Date(owner.lastSeen).toISOString()}), so it was probably deleted`
+      `(last active ${new Date(owner.lastSeen).toISOString()}), so it was probably deleted`
     );
   }
   const where = owner
     ? `; the worker has it registered to ${owner.machineId} ` +
-      `(last registered ${new Date(owner.lastSeen).toISOString()})`
+      `(last active ${new Date(owner.lastSeen).toISOString()})`
     : "";
   return (
     `target ${target} is not on ${here}${where}. ` +
@@ -520,7 +538,16 @@ export class SwarmArbiter {
           this.storage.db.transaction(() => {
             if (!this.storage.swarm.markFailed(next.msgId, now)) return;
             marked = true;
-            notifySenderOfFailure(this.storage, next, String(err), now);
+            notifySenderOfFailure(
+              this.storage,
+              next,
+              String(err),
+              now,
+              "unobserved",
+              err instanceof RemoteTargetError
+                ? formatRemoteFailureNotice(next.msgId, target, err.message)
+                : undefined,
+            );
             if (isSuppressedFromRecovery(next)) {
               this.storage.alerts.enqueue({
                 source: "wake-permanent",

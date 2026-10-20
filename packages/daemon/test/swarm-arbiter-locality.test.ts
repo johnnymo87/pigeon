@@ -81,6 +81,10 @@ describe("SwarmArbiter target locality (pigeon-k0qn.2)", () => {
     expect(n!.payload).toContain("2026-10-20T12:00:00.000Z");
     expect(n!.payload).toContain("macbook");
     expect(n!.payload).toMatch(/cross-machine swarm delivery is not supported/i);
+    expect(n!.payload).toMatch(/NOT received/);
+    expect(n!.payload).toMatch(/Do not resend it via swarm/);
+    expect(n!.payload).not.toMatch(/safe to resend/);
+    expect(n!.payload).not.toMatch(/RemoteTargetError/);
   });
 
   it("remote with no owner known (404 / old worker / error): still fails at once, names no machine", async () => {

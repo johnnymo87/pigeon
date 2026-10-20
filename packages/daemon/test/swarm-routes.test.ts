@@ -224,7 +224,6 @@ describe("POST /swarm/send", () => {
 
   it("enqueues a Telegram notice to the receiver when a send is accepted", async () => {
     const { app, storage: s } = newApp();
-    s.sessions.upsert({ sessionId: "ses_b", notify: true }); // notices need a local recipient row (pigeon-qioa)
     const res = await app(
       new Request("http://localhost/swarm/send", {
         method: "POST",
@@ -248,7 +247,6 @@ describe("POST /swarm/send", () => {
 
   it("enqueues exactly one notice when the same caller-supplied msg_id is sent twice", async () => {
     const { app, storage: s } = newApp();
-    s.sessions.upsert({ sessionId: "ses_b", notify: true }); // notices need a local recipient row (pigeon-qioa)
     for (let i = 0; i < 2; i++) {
       const res = await app(
         new Request("http://localhost/swarm/send", {
@@ -779,7 +777,6 @@ describe("POST /swarm/schedule", () => {
 
   it("enqueues a Telegram notice to the receiver when a schedule is accepted", async () => {
     const { app, storage: s } = newApp();
-    s.sessions.upsert({ sessionId: "ses_b", notify: true }); // notices need a local recipient row (pigeon-qioa)
     const res = await app(
       new Request("http://localhost/swarm/schedule", {
         method: "POST",
@@ -1355,7 +1352,6 @@ describe("POST /swarm/scheduled/:msg_id/cancel", () => {
 
   it("enqueues a cancellation notice (wc:) in outbox when a scheduled message is cancelled", async () => {
     const { app, storage: s } = newApp(1_000);
-    s.sessions.upsert({ sessionId: "ses_b", notify: true }); // notices need a local recipient row (pigeon-qioa)
 
     const schedRes = await app(
       new Request("http://localhost/swarm/schedule", {

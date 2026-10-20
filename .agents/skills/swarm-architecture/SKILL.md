@@ -209,10 +209,10 @@ The inbox does **not** return `queued` or `failed` messages — it's an inbox, n
 | has a local `sessions` row | local |
 | `gse_…` with no row | remote (never probed: an opencode serve answers 500 for `gse_`) |
 | serve `GET /session/<id>` → 200 (any base: route, `OPENCODE_URL`, `PIGEON_SERVE_ENDPOINTS`) | local (subagents, not-yet-registered sessions) |
-| → 404 | remote (all serves on a machine read one `opencode.db`) |
+| no 200 anywhere, at least one 404 | remote (all serves on a machine read one `opencode.db`, pinned by `OPENCODE_DB` + `OPENCODE_DISABLE_CHANNEL_DB`; requiring every base keeps one stray serve from failing a local session) |
 | anything else on every base | unknown |
 
-- **remote** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender, `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
+- **remote** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender (`formatRemoteFailureNotice`: NOT received, do not resend via swarm), `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
 - **unknown** → `TargetUnavailableError` (outage class: retried; never a remote verdict).
 - Must precede `clientForSession`: for an id with no local row that path reaches `ensureRouted`, which writes a `session_assignment` + lease (the general unknown-id case is `pigeon-8dhq`).
 - Not cached; re-evaluated every attempt.
@@ -344,7 +344,7 @@ Every swarm IPC message is mirrored to the **receiver's** Telegram forum topic t
 - **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a Telegram post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
 - **Fault isolation**: The `enqueueSwarmTelegramNotice` helper (`packages/daemon/src/swarm/telegram-notice.ts`) is wrapped in an internal `try/catch`. A Telegram/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
 - **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).
-- **No local session row**: Skipped (`pigeon-qioa`, logged `reason=no-local-session`). The target is either another machine's session, whose topic lives in another chat, or unregistered here (subagent, reaped), which the worker would 404. Every path that registers with the worker writes the local row first.
+- **No local session row** (`pigeon-qioa`): enqueued as usual, but the outbox (`gateSwarmOnLocalSession`) holds a `kind='swarm'` entry while its session has no local `sessions` row, re-checking every 5s, and drops it (`no_local_session`) after `SWARM_LOCAL_SESSION_GRACE_MS` (60s). A foreign session never gains a row, so its notice, which would land in the wrong chat, is never posted; a reaped session revived by the message re-registers within the grace and still gets its notice.
 
 ### Notification Outbox & Rate Governance
 - **Outbox Kind & IDs**: Outbox `kind='swarm'` (24h expiry; `mirror` reserved for Phase 2). IDs are `w:<msg_id>` for posts and `wc:<msg_id>` for retractions. Multi-chunk posts suffix earlier chunks via `chunkNotificationId` (`w:<msg_id>:c0`, etc.).

@@ -37,9 +37,10 @@ export interface LocalityResolverOptions {
  *    authoritative, and an opencode serve answers `GET /session/gse_…` with 500,
  *    which would leave every remote goose target "unknown" forever;
  *  - otherwise `GET <serve>/session/<id>`, no directory header. All serves on a
- *    machine read one opencode.db, so one serve's answer speaks for the machine:
- *    200 -> local (includes subagents, which never register), 404 -> remote.
- *    Anything else tries the next base; no definitive answer -> unknown.
+ *    machine read one opencode.db (pinned by OPENCODE_DB and
+ *    OPENCODE_DISABLE_CHANNEL_DB on every host): a 200 from any base -> local
+ *    (includes subagents, which never register); otherwise at least one 404 ->
+ *    remote; otherwise unknown.
  *
  * Not cached: a session can come back (a reaped row revived), and a stale
  * "remote" would fail it permanently.
@@ -87,6 +88,11 @@ export function makeLocalityResolver(
     if (opts.hasLocalSession(sessionId)) return "local";
     if (sessionId.startsWith("gse_")) return "remote";
 
+    // A 200 from ANY base is local. "remote" needs a 404 and no 200 anywhere, so
+    // one stray serve on a different data dir (a hijacked pool slot, a channel-
+    // suffixed DB) cannot turn a local session into a permanent failure. The
+    // extra probes run only on the remote path, against localhost.
+    let sawNotFound = false;
     const seen = new Set<string>();
     for (const raw of opts.baseUrlsFor(sessionId)) {
       const base = raw.replace(/\/+$/, "");
@@ -94,8 +100,8 @@ export function makeLocalityResolver(
       seen.add(base);
       const status = await probe(base, sessionId);
       if (status === 200) return "local";
-      if (status === 404) return "remote";
+      if (status === 404) sawNotFound = true;
     }
-    return "unknown";
+    return sawNotFound ? "remote" : "unknown";
   };
 }
