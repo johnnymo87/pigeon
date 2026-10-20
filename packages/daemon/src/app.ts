@@ -1,6 +1,7 @@
 import type { StorageDb } from "./storage/database";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
+import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
@@ -1715,6 +1716,38 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           // response rather than silent.
           backend_session_id: sessionId,
           backend: GOOSE_BACKEND_KIND,
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/goose/swarm-mailbox") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+        const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+        if (!sessionId || !endpoint) {
+          return Response.json(
+            { error: "session_id and endpoint are required" },
+            { status: 400 },
+          );
+        }
+        const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : null;
+        const label = typeof body.label === "string" && body.label ? body.label : null;
+        const token = typeof body.auth_token === "string" && body.auth_token ? body.auth_token : null;
+
+        const result = ensureGooseSwarmMailbox(
+          storage.sessions,
+          { backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
+          nowFn(),
+        );
+        if (!result.ok) {
+          return Response.json({ error: result.error }, { status: result.statusCode });
+        }
+
+        return Response.json({
+          ok: true,
+          session_id: result.sessionId,
+          backend_session_id: result.backendSessionId,
+          created: result.created,
+          notify: result.notify,
         });
       }
 
