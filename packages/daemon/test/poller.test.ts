@@ -1565,3 +1565,33 @@ describe("Poller dispatch — tag commands", () => {
     poller.stop();
   });
 });
+
+describe("Poller.lookupSessionOwner() (pigeon-k0qn.2)", () => {
+  const mk = (res: Response) => {
+    const fetchFn = vi.fn().mockResolvedValue(res);
+    return { fetchFn, poller: new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch }) };
+  };
+
+  it("GETs /sessions/:id/owner with auth and the caller's signal", async () => {
+    const { fetchFn, poller } = mk(new Response(JSON.stringify({ machine_id: "cloudbox", last_seen: 42 }), { status: 200 }));
+    const signal = new AbortController().signal;
+    expect(await poller.lookupSessionOwner("ses_a b", signal)).toEqual({ machineId: "cloudbox", lastSeen: 42 });
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/sessions/ses_a%20b/owner");
+    expect(init.method).toBe("GET");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
+    expect(init.signal).toBe(signal);
+  });
+
+  it("404 (unknown session, or an old worker without the route) -> null", async () => {
+    const { poller } = mk(new Response("nope", { status: 404 }));
+    expect(await poller.lookupSessionOwner("ses_x")).toBeNull();
+  });
+
+  it("throws on other non-2xx and on a malformed body", async () => {
+    await expect(mk(new Response("x", { status: 503 })).poller.lookupSessionOwner("ses_x")).rejects.toThrow(/503/);
+    await expect(
+      mk(new Response(JSON.stringify({ machine_id: 1 }), { status: 200 })).poller.lookupSessionOwner("ses_x"),
+    ).rejects.toThrow(/malformed/);
+  });
+});

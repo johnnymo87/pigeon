@@ -16,6 +16,7 @@ export interface ArbiterClient {
 }
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
 import { isOpencodeRoutable } from "../routing/opencode-routable";
+import type { Locality } from "../routing/locality";
 import { directoryMissing } from "./directory-check";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
@@ -27,6 +28,76 @@ import {
 
 export { DELIVERY_FAILED_KIND };
 
+/** The worker's record of which machine a session is registered to. */
+export interface SessionOwner {
+  machineId: string;
+  /**
+   * Epoch ms of the worker row's `updated_at`: bumped by registration and also by
+   * notifications and Telegram routing, from any machine. "Last active", not
+   * "last registered".
+   */
+  lastSeen: number;
+}
+
+/**
+ * The sender-facing notice for a remote target. Not `formatFailureNotice`: its
+ * not-received branch ends "safe to resend", and a resend fails identically, so
+ * an agent following it burns a turn per retry. Keeps NOT RECEIVED (true: nothing
+ * was written anywhere) and says what to do instead.
+ */
+export function formatRemoteFailureNotice(msgId: string, target: string, reason: string): string {
+  return (
+    `DELIVERY FAILED: your swarm message ${msgId} to ${target} was NOT received. ` +
+    `Reason: ${reason}. Do not resend it via swarm; it will fail the same way. ` +
+    `Reach the target another way.`
+  );
+}
+
+/** Bound on the owner lookup. It runs inside the target's in-flight slot. */
+export const OWNER_LOOKUP_TIMEOUT_MS = 2_000;
+
+/**
+ * A swarm target this machine provably does not have (pigeon-k0qn.2). Permanent:
+ * retrying cannot make another machine's session local, and the retry loop it
+ * replaces spent minutes failing against a session no serve here has heard of.
+ */
+export class RemoteTargetError extends PermanentDeliveryError {
+  constructor(message: string) {
+    super(message);
+    this.name = "RemoteTargetError";
+  }
+}
+
+/**
+ * Sender-facing reason for a remote target. The owner is DECORATION: it comes from
+ * the worker's last-registrant-wins row and may be absent or stale, so the wording
+ * claims only what the locality check proved (not on this machine) and attributes
+ * the rest to the worker.
+ */
+export function formatRemoteTargetReason(
+  target: string,
+  selfMachineId: string | undefined,
+  owner: SessionOwner | null,
+): string {
+  const here = selfMachineId ? `this machine (${selfMachineId})` : "this machine";
+  if (owner && selfMachineId && owner.machineId === selfMachineId) {
+    // The worker still lists the session under us, but no serve here has it:
+    // a deleted or stale session, not a cross-machine one.
+    return (
+      `target ${target} was not found on ${here}; the worker still lists it here ` +
+      `(last active ${new Date(owner.lastSeen).toISOString()}), so it was probably deleted`
+    );
+  }
+  const where = owner
+    ? `; the worker has it registered to ${owner.machineId} ` +
+      `(last active ${new Date(owner.lastSeen).toISOString()})`
+    : "";
+  return (
+    `target ${target} is not on ${here}${where}. ` +
+    `Cross-machine swarm delivery is not supported`
+  );
+}
+
 export interface ArbiterOptions {
   storage: StorageDb;
   clientForSession: (sessionId: string) => ArbiterClient | undefined;   // replaces opencodeClient
@@ -37,6 +108,15 @@ export interface ArbiterOptions {
    * filesystem: pass `() => false` and the preflight disappears.
    */
   directoryMissing?: (dir: string) => boolean;
+  /**
+   * Tri-state target locality (pigeon-k0qn.2), evaluated BEFORE
+   * `clientForSession`. Absent = every target is local (the old behaviour).
+   */
+  localityOf?: (sessionId: string) => Promise<Locality>;
+  /** Owner lookup for the remote-failure text. Decoration; bounded; may be absent. */
+  ownerOf?: (sessionId: string, signal?: AbortSignal) => Promise<SessionOwner | null>;
+  /** This daemon's machine id, for the remote-failure text. */
+  selfMachineId?: string;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -64,6 +144,11 @@ export class SwarmArbiter {
   private readonly clientForSession: (sessionId: string) => ArbiterClient | undefined;
   private readonly directoryForSession: (sessionId: string) => Promise<string | undefined>;
   private readonly directoryMissing: (dir: string) => boolean;
+  private readonly localityOf: ((sessionId: string) => Promise<Locality>) | undefined;
+  private readonly ownerOf:
+    | ((sessionId: string, signal?: AbortSignal) => Promise<SessionOwner | null>)
+    | undefined;
+  private readonly selfMachineId: string | undefined;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -88,6 +173,9 @@ export class SwarmArbiter {
     this.clientForSession = opts.clientForSession;
     this.directoryForSession = opts.directoryForSession;
     this.directoryMissing = opts.directoryMissing ?? directoryMissing;
+    this.localityOf = opts.localityOf;
+    this.ownerOf = opts.ownerOf;
+    this.selfMachineId = opts.selfMachineId;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
@@ -246,6 +334,32 @@ export class SwarmArbiter {
     return work;
   }
 
+  /** Owner for the failure text, or null. Never throws, never exceeds the bound. */
+  private async lookupOwner(target: string): Promise<SessionOwner | null> {
+    if (!this.ownerOf) return null;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve(null);
+      }, OWNER_LOOKUP_TIMEOUT_MS);
+    });
+    try {
+      // Raced as well as signalled: a lookup that ignores its signal must not
+      // hold the target's in-flight slot.
+      let lookup: Promise<SessionOwner | null>;
+      try {
+        lookup = this.ownerOf(target, controller.signal).catch(() => null);
+      } catch {
+        return null;
+      }
+      return await Promise.race([lookup, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async drainTargetInner(target: string): Promise<void> {
     while (true) {
       // Shutting down: leave the remaining backlog `queued` for the next
@@ -269,6 +383,24 @@ export class SwarmArbiter {
       }
 
       try {
+        // LOCALITY FIRST (pigeon-k0qn.2). Must precede clientForSession: for an id
+        // with no local row that call reaches the router's ensureRouted, which
+        // WRITES a session_assignment and lease for it. A remote id must never get
+        // that far. "unknown" is an outage (retried), never a remote verdict.
+        if (this.localityOf) {
+          const locality = await this.localityOf(target);
+          if (locality === "remote") {
+            throw new RemoteTargetError(
+              formatRemoteTargetReason(target, this.selfMachineId, await this.lookupOwner(target)),
+            );
+          }
+          if (locality === "unknown") {
+            throw new TargetUnavailableError(
+              `target ${target} locality unknown: no serve on this machine answered the session lookup`,
+            );
+          }
+        }
+
         const client = this.clientForSession(target);
         if (!client) {
           // clientForSession also refuses sessions the opencode pool must not
@@ -406,7 +538,16 @@ export class SwarmArbiter {
           this.storage.db.transaction(() => {
             if (!this.storage.swarm.markFailed(next.msgId, now)) return;
             marked = true;
-            notifySenderOfFailure(this.storage, next, String(err), now);
+            notifySenderOfFailure(
+              this.storage,
+              next,
+              String(err),
+              now,
+              "unobserved",
+              err instanceof RemoteTargetError
+                ? formatRemoteFailureNotice(next.msgId, target, err.message)
+                : undefined,
+            );
             if (isSuppressedFromRecovery(next)) {
               this.storage.alerts.enqueue({
                 source: "wake-permanent",

@@ -1,4 +1,4 @@
-import { handleSessionRequest } from "./sessions";
+import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
@@ -44,6 +44,16 @@ export default {
         }
         if (path === "/sessions/unregister" && method === "POST") {
           return handleSessionRequest(db, env, request, "unregister");
+        }
+        const ownerMatch = path.match(/^\/sessions\/([^/]+)\/owner$/);
+        if (ownerMatch && method === "GET") {
+          let sessionId: string;
+          try {
+            sessionId = decodeURIComponent(ownerMatch[1]!);
+          } catch {
+            return Response.json({ error: "invalid session id" }, { status: 400 });
+          }
+          return handleSessionOwner(db, env, request, sessionId);
         }
 
         // Topics (read-only)

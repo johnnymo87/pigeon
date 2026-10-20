@@ -133,6 +133,8 @@ Fix: set `opencodeUrl` in the daemon config and restart.
 
 ### Repeated `retry scheduled` with `session lookup failed: 404`
 
+Since `pigeon-k0qn.2` a target with no local `sessions` row that every serve 404s fails at once (above). This retry loop is what remains: a target that still has a local `sessions` row (the locality check trusts the row and does not probe) but whose opencode session was deleted.
+
 Cause: target session doesn't exist in opencode serve (probably never existed, or was killed).
 
 Verify:
@@ -144,10 +146,20 @@ curl -s "http://127.0.0.1:4096/session/ses_X" | jq .
 
 If the target session was supposed to exist, check that opencode serve is up and the session id is correct. If the target was killed and the messages should be discarded, force-fail (below).
 
+### `failed (permanent)` with `is not on this machine`
+
+Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). Cross-machine delivery is not supported; this is the intended outcome, not a fault.
+
+If the target *should* be local, check the id, then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4096/session/ses_X`. A 404 there means no serve on this machine has the session.
+
+### Repeated `retry scheduled` with `locality unknown`
+
+Cause: no serve answered the read-only session lookup with 200 or 404 (all down, 5xx, or timing out). Treated as an outage and retried; it is never turned into a remote verdict. Check the serves' `/global/health`.
+
 ### Repeated `retry scheduled` with prefill 400
 
 Cause: opencode serve race somehow re-emerged. This should be impossible for daemon-routed traffic (the arbiter ensures single-writer per target). If it happens, suspect:
-- Someone is calling `prompt_async` from outside the daemon at the same time (e.g. an `opencode-send --direct ses_X` race).
+- Someone is calling `prompt_async` from outside the daemon at the same time (a script POSTing to a serve directly).
 - The `inflight` map was bypassed by a code change.
 
 Check:
@@ -207,8 +219,11 @@ End-to-end smoke from a shell:
 
 ```bash
 SENTINEL="OPS-SMOKE-$(uuidgen | head -c 8)"
-~/.local/bin/pigeon-send --from ses_ops_smoke ses_target "$SENTINEL: hello"
-# expect: "Queued msg_... -> ses_target ..."
+curl -s -X POST -H 'content-type: application/json' \
+  -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" \
+  http://127.0.0.1:4731/swarm/send \
+  -d "{\"from\":\"ses_ops_smoke\",\"to\":\"ses_target\",\"payload\":\"$SENTINEL: hello\"}"
+# expect: {"accepted":true,"msg_id":"msg_..."}
 
 # Wait one arbiter tick, then:
 curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 'http://127.0.0.1:4731/swarm/inbox?session=ses_target' \

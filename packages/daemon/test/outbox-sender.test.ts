@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
 import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
-import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET } from "../src/worker/outbox-sender";
+import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET, SWARM_LOCAL_SESSION_GRACE_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -3013,5 +3013,88 @@ describe("commitDelivery: the guard and the ledger row are one unit", () => {
   it("writes nothing at all for an entry that is not in the outbox", () => {
     commitDelivery(storage, { ...entry, notificationId: "ghost" }, 5_000, 1, noop);
     expect(storage.sessionEvents.unreadBySession().size).toBe(0);
+  });
+});
+
+
+describe("swarm notices need a local session row (pigeon-qioa)", () => {
+  let storage: StorageDb;
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+  afterEach(() => storage.db.close());
+
+  const swarmEntry = (sessionId: string, createdAt: number) =>
+    storage.outbox.upsert(
+      {
+        ...BASE_OUTBOX_INPUT,
+        notificationId: `w:${sessionId}`,
+        sessionId,
+        kind: "swarm",
+        payload: JSON.stringify({ messages: [{ text: "swarm" }], notificationId: `w:${sessionId}` }),
+      },
+      createdAt,
+    );
+  const sender = (now: () => number, send = makeSendNotification({ ok: true })) => ({
+    send,
+    s: new OutboxSender({ storage, sendNotification: send, chatId: "c", nowFn: now, gateSwarmOnLocalSession: true }),
+  });
+
+  it("a foreign session's notice is never sent, and is dropped after the grace", async () => {
+    let now = 1_000;
+    swarmEntry("ses_foreign", 1_000);
+    const { send, s } = sender(() => now);
+
+    await s.processOnce();
+    expect(send).not.toHaveBeenCalled();
+    const held = storage.outbox.getByNotificationId("w:ses_foreign")!;
+    expect(held.state).toBe("queued");
+    expect(held.attempts).toBe(0);
+
+    now = 1_000 + SWARM_LOCAL_SESSION_GRACE_MS + 1;
+    await s.processOnce();
+    expect(send).not.toHaveBeenCalled();
+    expect(storage.outbox.getByNotificationId("w:ses_foreign")!.state).not.toBe("queued");
+  });
+
+  it("a session whose row appears within the grace (revived after reaping) still gets its notice", async () => {
+    let now = 1_000;
+    swarmEntry("ses_revived", 1_000);
+    const { send, s } = sender(() => now);
+
+    await s.processOnce();
+    expect(send).not.toHaveBeenCalled();
+
+    storage.sessions.upsert({ sessionId: "ses_revived" }, 3_000);
+    now = 20_000; // past the 15s recheck, inside the 60s grace
+    await s.processOnce();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("w:ses_revived")!.state).toBe("sent");
+  });
+
+  it("a held notice does not block other sessions' entries", async () => {
+    swarmEntry("ses_foreign", 1_000);
+    storage.sessions.upsert({ sessionId: "ses_local" }, 1_000);
+    swarmEntry("ses_local", 1_001);
+    const { send, s } = sender(() => 2_000);
+
+    await s.processOnce();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("w:ses_local")!.state).toBe("sent");
+  });
+
+  it("only swarm entries are gated", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "q1", sessionId: "ses_none" }, 1_000);
+    const { send, s } = sender(() => 2_000);
+    await s.processOnce();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("off by default", async () => {
+    swarmEntry("ses_foreign", 1_000);
+    const send = makeSendNotification({ ok: true });
+    const s = new OutboxSender({ storage, sendNotification: send, chatId: "c", nowFn: () => 2_000 });
+    await s.processOnce();
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });

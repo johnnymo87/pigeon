@@ -43,7 +43,40 @@ export interface OutboxSenderOptions {
   chatId?: string;
   nowFn?: () => number;
   log?: LogFn;
+  /**
+   * Hold `kind='swarm'` entries whose session has no local `sessions` row, and drop
+   * them once {@link SWARM_LOCAL_SESSION_GRACE_MS} has passed (pigeon-qioa).
+   * Production turns this on; absent = off, so fixtures without session rows keep
+   * exercising the plain send path.
+   */
+  gateSwarmOnLocalSession?: boolean;
 }
+
+/**
+ * How long a swarm notice waits for its session's local row before it is dropped
+ * (pigeon-qioa).
+ *
+ * WHY AT SEND TIME, NOT INSERT TIME. A swarm notice for a session this daemon has
+ * no row for must not be posted: the session is either another machine's, whose
+ * topic lives in another chat (posting into ours destroyed a topic mapping on
+ * 2026-10-20, pigeon-533h), or not registered here. But a local session can gain
+ * its row moments AFTER the notice is enqueued -- a session reaped after 7 idle
+ * days is revived by the very swarm message the notice describes, and its plugin
+ * re-registers within seconds of the arbiter's delivery -- provided the serve has
+ * restarted since the reap (the nightly pool restart makes that the normal case;
+ * otherwise the plugin still thinks it is registered and the row returns only at
+ * end of turn, possibly after the grace). Deciding at insert time would always
+ * drop that notice; deciding here, after a grace, normally does not. A foreign session
+ * never gains a row, so its notice is always dropped.
+ */
+export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
+
+/**
+ * Re-check interval while a swarm notice waits for its local row. Not shorter: a
+ * held swarm row ranks ahead of mirror rows in `getReady`, so frequent rechecks of
+ * a burst of foreign notices would crowd the 5-entry batch.
+ */
+const SWARM_LOCAL_SESSION_RECHECK_MS = 15_000;
 
 /**
  * Maximum number of attempts allowed for deterministic per-message failures.
@@ -204,6 +237,7 @@ export class OutboxSender {
   private readonly sendNotification: SendNotificationFn;
   private readonly registerSession: RegisterSessionFn | undefined;
   private readonly unregisterSession: UnregisterSessionFn | undefined;
+  private readonly gateSwarmOnLocalSession: boolean;
   private readonly chatId: string | undefined;
   private readonly nowFn: () => number;
   private readonly log: LogFn;
@@ -240,6 +274,7 @@ export class OutboxSender {
     this.sendNotification = opts.sendNotification;
     this.registerSession = opts.registerSession;
     this.unregisterSession = opts.unregisterSession;
+    this.gateSwarmOnLocalSession = opts.gateSwarmOnLocalSession ?? false;
     this.chatId = opts.chatId;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log = opts.log ?? ((msg, fields) => {
@@ -357,6 +392,28 @@ export class OutboxSender {
 
         if (age > expiryMs) {
           this.markTerminal(entry, now, "expired", undefined, { expiryMs });
+          continue;
+        }
+
+        // pigeon-qioa: see SWARM_LOCAL_SESSION_GRACE_MS. Checked before parsing and
+        // before any budget is consumed, so a held notice costs nothing.
+        if (
+          this.gateSwarmOnLocalSession &&
+          entry.kind === "swarm" &&
+          this.storage.sessions.get(entry.sessionId) === null
+        ) {
+          if (age < SWARM_LOCAL_SESSION_GRACE_MS) {
+            // Uncounted: waiting for a row is not a delivery failure.
+            this.storage.outbox.markRetry(
+              entry.notificationId,
+              now,
+              SWARM_LOCAL_SESSION_RECHECK_MS,
+              undefined,
+              false,
+            );
+          } else {
+            this.markTerminal(entry, now, "no_local_session");
+          }
           continue;
         }
 
