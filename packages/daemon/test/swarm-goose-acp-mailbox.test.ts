@@ -556,3 +556,122 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).not.toBeNull();
   });
 });
+
+describe("Task A4: goose-acp may drain its mailbox", () => {
+  let storage: StorageDb | null = null;
+
+  afterEach(() => {
+    if (storage) {
+      storage.db.close();
+      storage = null;
+    }
+  });
+
+  function newApp(now = 1_000, opts: Record<string, unknown> = {}) {
+    storage = openStorageDb(":memory:");
+    return {
+      app: createApp(storage, { nowFn: () => now, ...opts }),
+      storage,
+    };
+  }
+
+  it("drain and ack for an opted-in goose-acp session returns and acks the banked swarm rows", async () => {
+    const { app, storage: s } = newApp(1_000);
+    const mailboxRes = (await (await app(
+      new Request("http://localhost/goose/swarm-mailbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "20261020_drain",
+          endpoint: "ws://127.0.0.1:4080/acp",
+        }),
+      }),
+    )).json()) as { session_id: string };
+
+    // Bank a swarm message into this goose mailbox
+    const sendRes = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: mailboxRes.session_id,
+          kind: "chat",
+          payload: "task for goose",
+        }),
+      }),
+    );
+    expect(sendRes.status).toBe(202);
+    const sendBody = (await sendRes.json()) as { msg_id: string; banked?: boolean };
+    expect(sendBody.banked).toBe(true);
+
+    // Drain the mailbox via POST /pull/drain
+    const drainRes = await app(
+      new Request("http://localhost/pull/drain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: mailboxRes.session_id,
+        }),
+      }),
+    );
+    expect(drainRes.status).toBe(200);
+    const drainBody = (await drainRes.json()) as {
+      ok: boolean;
+      pending_total: number;
+      messages: Array<{ msg_id: string; source: string; payload: string; sender_id: string }>;
+    };
+    expect(drainBody.ok).toBe(true);
+    expect(drainBody.pending_total).toBe(1);
+    expect(drainBody.messages).toHaveLength(1);
+    expect(drainBody.messages[0]!.msg_id).toBe(sendBody.msg_id);
+    expect(drainBody.messages[0]!.source).toBe("swarm");
+    expect(drainBody.messages[0]!.payload).toBe("task for goose");
+    expect(drainBody.messages[0]!.sender_id).toBe("ses_sender");
+
+    // Ack the drained message via POST /pull/ack
+    const ackRes = await app(
+      new Request("http://localhost/pull/ack", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: mailboxRes.session_id,
+          msg_ids: [sendBody.msg_id],
+        }),
+      }),
+    );
+    expect(ackRes.status).toBe(200);
+    const ackBody = (await ackRes.json()) as { ok: boolean; acked: string[]; rejected: string[] };
+    expect(ackBody.acked).toEqual([sendBody.msg_id]);
+    expect(ackBody.rejected).toEqual([]);
+
+    // Mailbox is now empty
+    expect(s.pullInbox.pendingCount(mailboxRes.session_id, 2_000)).toBe(0);
+  });
+
+  it("drain for an opencode session still 409s", async () => {
+    const { app } = newApp(1_000);
+    const { storage: s } = { storage };
+    s!.sessions.upsert(
+      {
+        sessionId: "ses_opencode_user",
+        backendKind: "opencode-plugin-direct",
+        notify: true,
+      },
+      1_000,
+    );
+
+    const res = await app(
+      new Request("http://localhost/pull/drain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "ses_opencode_user",
+        }),
+      }),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("nothing is banking inbound for it");
+  });
+});

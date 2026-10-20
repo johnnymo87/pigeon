@@ -1209,12 +1209,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // adapter selected: its replies go back to being dropped as unreachable
         // while every drain returns a truthful, healthy zero. This turns that
         // state into a failure at the one moment the client is listening.
-        if (session.backendKind !== PULL_BACKEND_KIND) {
+        if (session.backendKind !== PULL_BACKEND_KIND && session.backendKind !== GOOSE_BACKEND_KIND) {
           return Response.json(
             {
               error:
                 `session ${sessionId} is registered with backend_kind=` +
-                `${session.backendKind ?? "null"}, not ${PULL_BACKEND_KIND}; ` +
+                `${session.backendKind ?? "null"}, not ${PULL_BACKEND_KIND} or ${GOOSE_BACKEND_KIND}; ` +
                 `nothing is banking inbound for it`,
               backend_kind: session.backendKind,
             },
