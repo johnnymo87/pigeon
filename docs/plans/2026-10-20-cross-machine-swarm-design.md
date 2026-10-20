@@ -35,11 +35,17 @@ Phase 2 waits on a human decision because:
 
 - **Demand is unmeasured.** Production D1 holds ~770 cloudbox, ~45 devbox and ~10 macbook
   sessions. Phase 1's failures will show how often cross-machine sends are attempted.
-  *Measured on 2026-10-20 (cloudbox journal, ~70 days back):* 10 swarm sends failed on an
-  unresolvable target. 8 provably were not cross-machine: truncated ids of local sessions, local
-  sessions, a test id, and a goose-pull lane. 2 are unprovable either way, because the worker
-  sweeps rows after 14 days. devbox and macbook were not measured. The method and the ids are in
-  a `bd` note on `pigeon-k0qn.4`.
+  *Measured on 2026-10-20 (cloudbox journal, ~70 days back):* 7 swarm sends failed terminally on an
+  unresolvable target.
+  - **5 were provably not cross-machine:** three truncated ids of local sessions, a test id, and a
+    goose-pull lane.
+  - **2 are unprovable either way.** They are absent from cloudbox's opencode DB, and the worker
+    sweeps its rows after 14 days.
+
+  Since Phase 1 deployed, the only remote failures have been the deploy's own smoke tests. This is a
+  lower bound on demand: agents have been told swarm is same-machine only, so wanted sends that
+  were never attempted are invisible. devbox and macbook were not measured. The method and the ids
+  are in a `bd` note on `pigeon-k0qn.4`.
 - **It changes what the shared key can do.** Today `CCR_API_KEY` cannot inject a prompt into any
   session: only the Telegram webhook creates `execute` commands. A relay would let any holder of
   the key, on any machine, prompt sessions on every machine that accepts relays. The key is on
@@ -272,114 +278,164 @@ opt-in, because goose-acp's trust model is built on Telegram sender ids, which a
 not have. SDD §13.6 currently says "neither", so the spike's first output is an agreed position
 with eng-agent-platform, not code.
 
-### §4.1 goose-acp as a swarm target — PROPOSED, pending eng-agent-platform agreement
+### §4.1 goose sessions as swarm targets: pigeon's side of eng-agent-platform #152 (PROPOSED)
 
-*Spike output for `pigeon-k0qn.12`, 2026-10-20. Nothing here is built. The policy decision belongs
-to eng-agent-platform. Pigeon's job here is to say what it would build and what that would cost.*
+*Spike output for `pigeon-k0qn.12`, 2026-10-20. Nothing here is built. It is proposed pending
+eng-agent-platform's agreement on the pigeon-side specifics below, especially the slice 2 admission
+policy.*
 
-**What eng-agent-platform already decided.** SDD
-`eng-agent-platform/docs/plans/2026-08-23-555-goose-pigeon-integration-sdd.md` §5 decided
-"inbound yes, outbound no". §13.6 then narrowed it to *"neither, until a sender has an identity"*,
-because a single shared bearer token gives `/swarm/send` "no principal at all", and the receiver is
-an unattended `GOOSE_MODE=auto` agent with merge and push authority. §13.9 and §13.13 record that
-swarm inbound was not built. The 2026-09-29 two-way lane design (§6.1, §10) withdrew another part
-of §13.6, the "data, may not obey" rule for Telegram replies. It kept the sender rule: *"`/swarm/send`
-to the lane stays undelivered"*. Human input instead goes through a fail-closed
-`PIGEON_PULL_ALLOWED_USER_IDS` allowlist. The SDD discusses goose-pull lanes, but goose-acp
-coordinators (`555.20`) inherit the same owner-only rule (`goose/adapter.ts:81-105`).
+**Where policy stands.** The §4 table quotes SDD 555 §5 and §13.6
+(`eng-agent-platform/docs/plans/2026-08-23-555-goose-pigeon-integration-sdd.md`): "neither, until a
+sender has an identity". That position has been superseded:
 
-**What pigeon can and cannot offer on identity.** Pigeon cannot authenticate a swarm sender, and
-this design does not pretend to:
+- **Superseded for the lane on 2026-10-06** (`2026-10-06-lane-swarm-design.md` §1). Jonathan
+  decided the lane sends and receives swarm, and accepted that pigeon has one shared token and does
+  not check `from`. Pigeon built the receiving half as `pull_sources: ["swarm"]` banking.
+- **General capability, 2026-10-20.** eng-agent-platform's research doc
+  `docs/research/2026-10-20-opencode-goose-pigeon-messaging.md` (#152, bead
+  `eng-agent-platform-skai`) treats messaging as a general capability. It recommends:
+  - `gse_` as the canonical address;
+  - **slice 1**, a pull mailbox with no push, plus a goose MCP server offering `swarm_send`,
+    `swarm_read` and `swarm_list`;
+  - **slice 2**, push into goose-acp sessions;
+  - **slice 3**, schedule, skills, and widening the lane's checks.
 
-- **`from` is self-asserted.** `auth.ts` checks one shared token, and `from` must only be non-empty
-  and not `pigeon` (`app.ts:197,207`). The plugin fills it in honestly
-  (`swarm-send-tool.ts:40`), but the daemon cannot tell an honest plugin from any other process.
-- **A per-session capability token would not fix this.** The plugin would hold it inside
-  `opencode serve`. Agents' bash runs as the same uid, as descendants of that process, so they can
-  read it. That is the same-uid argument SDD §13.2 makes about `markVerified`.
-- **The most pigeon can check is existence.** It can confirm that `from` names a session that
-  exists on this machine (a `ses_` id that a local serve answers 200 for). That rules out typos
-  and synthetic senders. It does not establish who wrote the text.
+  It is explicitly *not* for stall-watch: worker replies must not wake coordinators.
 
-So the §13.6 bar cannot be met by any change confined to pigeon. That leaves eng-agent-platform two
-honest options.
+This section does not reopen that policy. It adopts #152's slicing and specifies what pigeon builds
+in each slice, including the defects a pigeon-side review found in a naive slice 2.
 
-**Option A, recommended by default: keep "neither", and say so at send time.** Pigeon makes the
-refusal explicit instead of incidental. Today a `gse_` target gets
-`400 to must be a session id starting with 'ses_'` (`app.ts:210`), which reads like a typo. If a
-row were ever created, it would also burn ten attempts against
-`TargetUnavailableError: no opencode backend` (`arbiter.ts:404-414`). Under A:
+**What pigeon can and cannot offer on identity.** Nothing in this section authenticates a sender:
 
-- `/swarm/send` and `/swarm/schedule` answer a `gse_` target with
-  `409 {"error": "goose-acp sessions do not accept swarm messages (eng-agent-platform SDD 555 §13.6)"}`.
-- The arbiter turns a row aimed at a goose-acp session into a `PermanentDeliveryError` that says
-  the same thing.
-- Sessions that need a goose coordinator to hear something keep using the coordinator's Telegram
-  topic. That channel has a real principal.
+- **`from` is self-asserted.** The daemon checks one shared token (`auth.ts`). `from` need only be
+  non-empty and not `pigeon` (`app.ts:197,207`).
+- **The plugin fills in `from` honestly, but only for its own tool calls.** It sets it from
+  `ctx.sessionID` (`swarm-send-tool.ts`), so the model cannot forge it there. Any process holding
+  the token can still forge it.
+- **A per-session capability token would not help** while issuing that token is gated by the same
+  readable shared token.
+- **The owner-only gate guards intent, not identity.** `goose/adapter.ts:81-105` keeps Telegram
+  strangers out. Any `dev` process can already prompt a goose-acp session directly through honkd,
+  with no envelope at all; stall-watch does (`honk_transport.py`). Swarm therefore adds no new
+  hostile-process capability. What it adds is volume and influence from *well-meaning agents*,
+  which is what the mitigations below bound.
 
-This is a small pigeon-only change, and it needs eng-agent-platform's agreement only in the sense of
-"yes, still neither".
+**Slice 1: pull mailbox for goose-acp targets.** Pigeon changes:
 
-**Option B: per-session opt-in, delivered as attributed peer data.** If eng-agent-platform decides
-that some goose-acp sessions should hear peers (for example, a coordinator with no merge or push
-authority, which would let swarm workers report to it), pigeon would build exactly this:
+1. **Accept `^gse_` as `to`** in `/swarm/send` (`app.ts:210`).
+   - A `gse_` id with a local `goose-acp` row is banked through `bankOrInsertSwarmMessage` into
+     `pull_inbox`, exactly as for an opted-in goose-pull session. That means `source: "swarm"`, the
+     4000-code-point cap, and a `banked: true` response. The arbiter, watchdog and runner do not
+     change, so nothing pushes and nothing can be falsely failed.
+   - A `gse_` id with no local row keeps Phase 1's behaviour: an immediate remote failure.
+2. **Refuse `/swarm/schedule` to `gse_`** with the existing pull 409. A wake that wakes nothing is
+   worse than no wake.
+3. **Let a goose-acp session drain its own mailbox.**
+   - `/pull/drain`, `/pull/ack` and `/pull/pending` gain `goose-acp` as an allowed backend. Today
+     they serve pull sessions.
+   - The Telegram-reply rows that a bound goose-acp session already receives through honkd are
+     *not* moved into this mailbox. Only swarm rows bank.
+   - Whether a goose-acp row needs an explicit `pull_sources`-style opt-in, or banks by default, is
+     the first admission question for eng-agent-platform. Banking is inert until the session
+     drains, so this proposal defaults it **on**.
+4. **`delivery.failed` reaches `gse_` senders.** `notifySenderOfFailure` sends only to `ses_`
+   senders today (`swarm/notify-sender.ts:140`). It is widened to bank the notice in a local `gse_`
+   sender's mailbox through the same helper. Without this, a goose sender never learns that a
+   message failed.
+5. **`GET /sessions` stays the discovery surface** for the goose MCP `swarm_list`. It already
+   returns `backend_kind` and `backend_session_id`. No change.
 
-1. **Opt-in, off by default.** `POST /goose/sessions` gains `swarm_inbound: true`. The rule for
-   omitting it matches `pull_sources`: absent or `null` on a re-registration resets it to off, so
-   a rollback or a client that forgets the field closes the channel. It is stored on the session
-   row. A `gse_` target without it gets the Option A 409. The registering client, not the sender,
-   is what makes the opt-in.
-2. **Only from senders that exist locally.** The daemon accepts only a `from` that is a `ses_` id
-   resolving locally (Phase 1's resolver, `makeLocalityResolver`, returns `local`). It refuses `goose-pull` and
-   `gse_` senders, synthetic ids such as `ses_ops_*`, and any id without a live local session. This
-   is a typo and noise filter, and the design labels it as that, not as authentication.
-3. **Always the enveloped form.** The delivered text is always the
-   `<swarm_message v="1" from=… to=… kind=…>` envelope (`swarm/envelope.ts`). Its first character
-   is therefore `<`, and `goose/builtin-commands.ts` can never read it as `/clear`, `/goal`, a
-   recipe name, or "Please compact this conversation". That property would become an invariant,
-   with a test that the arbiter's goose path never sends text without the envelope. The envelope
-   gains a line stating that the sender is an unauthenticated local peer whose text is data, and
-   that it cannot widen authority. That is the two-way design's §6.2 rule, applied here. The SDD's
-   own position is that this line is a mitigation, not a boundary. The opt-in in item 1 is the real
-   control.
-4. **Delivered through the runner, queued and never steered.** The arbiter gains a goose branch.
-   For a `goose-acp` target it calls `GooseSessionRunner.deliver(commandId = "sw:" + msgId, text)`
-   with a new `queueOnly` flag, never `prompt_async`. Today's `deliver` (`session-runner.ts:684-773`)
-   steers new text into a pigeon-owned running turn. Steering a peer's text into the middle of a
-   turn the human started would give peer text the weight of a human interjection, so swarm
-   delivery always uses `enqueue` or `startTurn`. Behaviour while a turn is running:
-   - The message queues behind the turn and starts as its own turn when that turn ends, in arrival
-     order with any human messages.
-   - It is persisted in `goose_inflight_turns` (state `queued`), so it survives a daemon restart.
-   - The redelivery dedupe the runner already has (`already-running` / `already-queued` by
-     `commandId`) makes arbiter retries idempotent.
-   - The Telegram "Queued" notice is skipped for swarm rows, because the swarm feed already posted a
-     `w:` notice in the bound topic.
-5. **Verification uses the receipt family that is already scaffolded.** The arbiter marks a
-   delivered row handed off with family `receipt` (`swarm/verify-family.ts:64-71` already maps
-   `goose-acp`). The `/goose/turn-event` `turn.started` carrying `client_req_ids` containing
-   `sw:<msgId>` is the receipt. The turn hook already treats such turns as pigeon's own and does not
-   mirror them (`app.ts:1761-1791`). A queued row with no receipt follows the watchdog's existing
-   receipt grace rule (`DEFAULT_RECEIPT_GRACE_MS`, 10 min).
-6. **No reply channel.** Outbound stays "no" (SDD §5). The goose session cannot answer by swarm,
-   so the sender's 202 gains `"reply_channel": "none"`, and the docs say a goose recipient answers,
-   if at all, in its Telegram topic.
-7. **Same machine only at first.** Cross-machine delivery would come only from Phase 2 §3.3, which
-   requires its own separate `"swarm-remote"` opt-in, and only after the Phase 2 decision
-   (`pigeon-k0qn.4`).
+The goose MCP server, its `AGENT_SESSION_ID` → `gse_` resolution, and the per-session-vs-per-agent
+extension-process hazard #152 names all belong to eng-agent-platform/honk, not pigeon.
 
-Residual risk that eng-agent-platform would be accepting under B: any process running as `dev` on
-the host can put text in front of an opted-in goose session, as data, in its own turn. The opt-in
-should therefore be granted only to sessions whose authority that cannot widen in any way that
-matters. Which sessions qualify is eng-agent-platform's call. Pigeon cannot tell.
+**Slice 2: push into goose-acp sessions.** The four parts ship together (#152). A naive version
+fails in specific ways, so these are requirements, not options:
 
-**Size.** A is about a day, including tests. B is roughly the size the §4 table predicts: the arbiter
-goose branch, `queueOnly` in the runner, registration and storage for the opt-in, a sender
-existence check, the receipt wiring, and docs. It is several beads under `pigeon-k0qn.13`, which
-would be filed only after eng-agent-platform picks B.
+1. **Arbiter branch, honkd sessions only.**
+   - **Path.** For a `goose-acp` target, the arbiter calls `GooseSessionRunner.deliver` with
+     `commandId = "sw:" + msgId`, never `prompt_async`.
+   - **Why honkd only.** On a bare goose (non-honk) runner, the busy path *steers* into the foreign
+     run (`session-runner.ts:1271-1290`), and nothing signals when that run ends.
+   - **Non-honkd targets.** They stay slice 1 (banked).
+2. **Queue-only, on every path.** A swarm item is never steered into a running turn. Steering would
+   give a peer's text the weight of a human interjection. This covers:
+   - the `deliver` steer branch (`:708-749`);
+   - the busy re-queue (`:1257`);
+   - the busy path for recovered turns.
+3. **The human never gets runner notices about a swarm item.**
+   - **Which notices.** These posts all address the human about a message the human did not send:
+     - "Queued" (`:789`) and its busy twin;
+     - busy-recovered (`:1202`);
+     - recovery-unsupported (`:563`);
+     - unknown-request (`:1173`);
+     - the 24h-stale notice (`recover-inflight.ts:83`).
+   - **Where they go instead.** The inflight row records swarm origin. Every terminal path for such a
+     row goes to `markFailed` and `notifySenderOfFailure`, so the *sender* learns the fate.
+   - **What the human sees.** The human's view of what a peer made their session do is the
+     `w:<msgId>` notice. It carries the full payload labelled with the sender
+     (`telegram-notice.ts:47-60`). The turn hook's skip of enveloped prompts (`app.ts:1787-1791`)
+     therefore loses nothing.
+4. **Handed off at turn start, by in-process callback.**
+   - **Turn start, not enqueue.** If the row were marked handed off at enqueue, the receipt-grace
+     watchdog (`DEFAULT_RECEIPT_GRACE_MS`, 10 min, measured from `handed_off_at`) would falsely fail
+     any message queued behind a long turn. That would alert Jonathan, and a resend would run twice.
+   - **The runner's callback, not the turn hook.** The runner calls back when it starts the
+     `sw:<msgId>` turn, and *that* marks the row handed off with family `receipt`
+     (`verify-family.ts` already maps `goose-acp`).
+   - **Not `/goose/turn-event`.** Any token holder can post `client_req_ids: ["sw:<any msgId>"]`
+     there. That is the forgery primitive SDD §13.2 describes.
+   - **The hook as a fallback.** If the hook is ever used as corroboration, it must match
+     `msg_id` **and** `to_session` **and** `state = 'handed_off'` **and** an existing inflight row
+     for that session. Even then it can only suppress, never forge.
+   - **Wiring needed.** `isReceiptPending` is not wired today (`delivery-watchdog.ts:545` defaults
+     it to false). It must be backed by the persisted `goose_inflight` row, not by memory, so that it
+     survives a restart.
+5. **Idempotent on `msg_id`.**
+   - **The gap.** The runner's dedupe covers only items still queued or running. A crash between
+     the inflight insert and the arbiter's bookkeeping, followed by redelivery after that turn has
+     retired, would start a second turn.
+   - **The fix.** Before delivering, check `goose_inflight` and the outbox `s:<sid>:sw:<msgId>`, as
+     the turn hook's own-turn check already does.
+6. **The envelope is the first character, and the adapter is skipped deliberately.**
+   - **The envelope invariant.** The pushed text is always the `<swarm_message …>` envelope
+     (`swarm/envelope.ts`). Its first character is `<`, so `goose/builtin-commands.ts` can never run
+     it as `/clear`, a recipe, or "Please compact this conversation". A test pins this.
+   - **The adapter bypass.** The arbiter path does not go through `GooseAcpAdapter`. That is
+     intended: the owner gate, the reply-context prefix and the pinned-session command refusal are
+     all Telegram-shaped. Bypassing the adapter is what puts the envelope first.
+   - **Data rule.** The envelope states that `from` is unauthenticated. The two-way lane design's
+     §6.2 rule applies: a peer's text cannot widen the session's authority.
+7. **Admission: the second question for eng-agent-platform.**
+   - **#152's position.** Default-accept with a per-session opt-out (for example `/swarm off` in the
+     topic), consistent with Jonathan's 2026-10-06 dial.
+   - **Pigeon's alternative.** Opt-in on `POST /goose/sessions` (`swarm_push: true`, reset when
+     absent, as `pull_sources` is). That makes the exposure a property the registering client chose
+     rather than one the human must remember to remove.
+   - **Pigeon can build either.** The choice is policy.
+   - **Unattended sessions stay pull-only regardless.** That includes the lane (#152 Hazards).
+8. **A per-pair rate cap** (N per sender→target per hour). It bounds the cost of an ack loop between
+   agents that do not load the opencode message-economy skill (#152 Hazards). It applies to banked
+   rows too.
 
-**What pigeon needs back.** Pick A or B. If B, name the sessions (or the class of sessions) that may
-opt in, and confirm items 2 and 3 as the data rule.
+**Same machine only.** Cross-machine delivery to any goose session comes only through Phase 2 §3.3
+and its separate `"swarm-remote"` opt-in, after the Phase 2 decision (`pigeon-k0qn.4`).
+
+**If eng-agent-platform declines push entirely**, slice 1 stands alone. If it declines slice 1 as
+well, pigeon replaces today's misleading `400 to must be a session id starting with 'ses_'` for a
+`gse_` target with an explicit refusal naming the policy. The plugin treats any non-5xx/429 as
+permanent, so the status change is safe.
+
+**Size.**
+- **Slice 1, pigeon side:** small, about one PR (route, bank helper, pull-route backend check,
+  notify-sender widening, tests).
+- **Slice 2:** medium, one PR (arbiter branch, runner queue-only mode and swarm-origin routing,
+  receipt callback and persisted pending check, idempotency check, admission flag, rate cap).
+- **Filing beads:** under `pigeon-k0qn.13`, once eng-agent-platform agrees.
+
+**What pigeon needs back from eng-agent-platform:**
+- whether a goose-acp mailbox banks by default (slice 1, item 3);
+- push admission: default-accept with opt-out, or opt-in (slice 2, item 7);
+- confirmation that the slice 2 requirements above match its intent.
 
 ## §5. Rejected alternatives
 
