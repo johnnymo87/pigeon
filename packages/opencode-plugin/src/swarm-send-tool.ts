@@ -61,6 +61,7 @@ export interface SwarmSendResult {
   to: string
   kind: string
   priority: string
+  banked?: boolean
   /** Number of POST attempts that were made (1 = succeeded on the first try). */
   attempts?: number
 }
@@ -186,8 +187,8 @@ export async function swarmSend(
     }
 
     if (res.ok) {
-      const data = (await res.json()) as { accepted: boolean; msg_id: string }
-      return { msg_id: data.msg_id, to: args.to, kind, priority, attempts: attempt }
+      const data = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean }
+      return { msg_id: data.msg_id, to: args.to, kind, priority, banked: data.banked, attempts: attempt }
     }
 
     // `let`, not `const`: the 401 re-auth branch below REPLACES `res`, and every
@@ -213,8 +214,8 @@ export async function swarmSend(
           body: bodyJson,
         })
         if (res.ok) {
-          const data = (await res.json()) as { accepted: boolean; msg_id: string }
-          return { msg_id: data.msg_id, to: args.to, kind, priority, attempts: attempt }
+          const data = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean }
+          return { msg_id: data.msg_id, to: args.to, kind, priority, banked: data.banked, attempts: attempt }
         }
         // Re-auth did not cure it. Adopt THIS response's body so the status and
         // the text below describe the same response.
@@ -280,10 +281,13 @@ export function formatSendResult(
   result: SwarmSendResult,
   charCount: number,
 ): string {
+  const deliveryStatus = result.banked
+    ? `waiting in ${result.to}'s mailbox; it is read when that session calls swarm_read.`
+    : `Delivery is async.`
   const base =
     `Queued ${result.msg_id} -> ${result.to} ` +
     `(kind=${result.kind} priority=${result.priority}, ${charCount} chars). ` +
-    `Delivery is async.`
+    deliveryStatus
   if (result.attempts && result.attempts > 1) {
     return (
       `${base} (Accepted after ${result.attempts} attempts — transient ` +
@@ -312,7 +316,7 @@ export function createSwarmSendTool(daemonBaseUrl: string): ToolDefinition {
       to: tool.schema
         .string()
         .describe(
-          "Recipient opencode session id (starts with 'ses_').",
+          "Recipient session id (starts with 'ses_', or 'gse_' for a goose session reached via its mailbox).",
         ),
       message: tool.schema
         .string()

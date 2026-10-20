@@ -442,6 +442,14 @@ permanent, so the status change is safe.
 - push admission: default-accept with opt-out, or opt-in (slice 2, item 7);
 - confirmation that the slice 2 requirements above match its intent.
 
+**As built (slice 1).** Implemented per `docs/plans/2026-10-20-goose-swarm-slice1-plan.md` with these deviations:
+- Opt-in uses a dedicated create-if-absent route (`POST /goose/swarm-mailbox`), called lazily by the MCP server, rather than `pull_sources` on `POST /goose/sessions` with reset-when-absent.
+- `notify: false` goose-acp rows are completely Telegram-silent (turn-event mirror/stop and bank `w:` notice suppressed for goose-acp rows only).
+- `GET /sessions` exposes `pull_sources` so `swarm_list` can detect mailbox availability without attempting sends.
+- `gse_` targets with no local row are refused synchronously (409) rather than accepted and failed later by the arbiter.
+- Outbox sender drops entries for `notify: false` goose-acp rows terminally with reason `notify_false_goose` as defence in depth.
+- Opencode plugin renders `banked: true` as "waiting in <to>'s mailbox; it is read when that session calls swarm_read" instead of "Delivery is async".
+
 ## §5. Rejected alternatives
 
 - **Reuse `execute`.** `command-ingest` lets a pending question capture plain text as its answer
