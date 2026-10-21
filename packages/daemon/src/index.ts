@@ -1,3 +1,4 @@
+import { describeWorkerIdentity, formatPollAuthAlert } from "./worker/worker-identity";
 import { createApp } from "./app";
 import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
@@ -723,7 +724,18 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           await sendReply(msg.chatId, "/tag dir was removed; tag sessions individually.");
         },
       },
-      { healthMonitor: workerHealthMonitor },
+      {
+        healthMonitor: workerHealthMonitor,
+        // pigeon-k0qn.8: a rotated key the worker refuses would otherwise fail every poll
+        // with only a warn line. The alert goes straight to Telegram, not via the worker.
+        onPollAuthRejected: (status, consecutive) => {
+          storage.alerts.enqueue({
+            source: "worker-auth",
+            text: formatPollAuthAlert(config.machineId!, status, consecutive),
+            severity: "error",
+          });
+        },
+      },
     )
   : undefined;
 
@@ -738,6 +750,11 @@ if (gooseRunners) {
 
 if (poller) {
   poller.start();
+  // The runbook's "which machine does the worker think we are" check (pigeon-k0qn.8).
+  void poller.whoami(AbortSignal.timeout(5_000)).then((identity) => {
+    const { level, text } = describeWorkerIdentity(identity, config.machineId!);
+    console[level](text);
+  });
 }
 
 const outboxSender = poller && config.telegramChatId

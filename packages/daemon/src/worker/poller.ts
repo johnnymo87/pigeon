@@ -392,7 +392,26 @@ export interface PollerDeps {
    * session-start registration in index.ts, which an outbox-side hook would miss entirely.
    */
   healthMonitor?: WorkerHealthObserver;
+  /**
+   * Called once when polls have been refused (401/403) `POLL_AUTH_ALERT_THRESHOLD` times in a
+   * row, and again only after a successful poll has reset the count (pigeon-k0qn.8). A
+   * rotated credential that the worker does not know, or one registered to a different
+   * machine, otherwise fails every 5s with nothing but a warn line: on an idle machine
+   * nobody would notice that Telegram commands had stopped arriving.
+   */
+  onPollAuthRejected?: (status: number, consecutive: number) => void;
 }
+
+/** Consecutive refused polls before `onPollAuthRejected` fires: about one minute at 5s. */
+export const POLL_AUTH_ALERT_THRESHOLD = 12;
+
+/** What the worker says this daemon's credential is (`GET /whoami`, pigeon-k0qn.8). */
+export type WorkerIdentity =
+  | { kind: "machine"; machineId: string }
+  | { kind: "shared" }
+  | { kind: "rejected"; status: number }
+  | { kind: "unsupported" }
+  | { kind: "unknown"; error: string };
 
 export class Poller {
   private readonly fetchFn: typeof fetch;
@@ -400,6 +419,8 @@ export class Poller {
   private readonly pollIntervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
+  private readonly onPollAuthRejected: ((status: number, consecutive: number) => void) | undefined;
+  private pollAuthRejections = 0;
 
   constructor(
     private readonly config: PollerConfig,
@@ -408,6 +429,7 @@ export class Poller {
   ) {
     this.fetchFn = deps.fetchFn ?? fetch;
     this.healthMonitor = deps.healthMonitor;
+    this.onPollAuthRejected = deps.onPollAuthRejected;
     this.pollIntervalMs = config.pollIntervalMs ?? 5000;
   }
 
@@ -460,6 +482,19 @@ export class Poller {
       },
     });
 
+    if (response.status === 401 || response.status === 403) {
+      this.pollAuthRejections++;
+      if (this.pollAuthRejections === POLL_AUTH_ALERT_THRESHOLD) {
+        try {
+          this.onPollAuthRejected?.(response.status, this.pollAuthRejections);
+        } catch (err) {
+          console.warn("[poller] onPollAuthRejected threw:", err instanceof Error ? err.message : String(err));
+        }
+      }
+    } else if (response.ok) {
+      this.pollAuthRejections = 0;
+    }
+
     if (response.status === 204) {
       return null;
     }
@@ -469,6 +504,32 @@ export class Poller {
     }
 
     return await response.json() as WorkerMessage;
+  }
+
+  /**
+   * Ask the worker which principal this daemon's credential resolves to. Never throws. An
+   * older worker without the route answers 404, reported as `unsupported`.
+   */
+  async whoami(signal?: AbortSignal): Promise<WorkerIdentity> {
+    try {
+      const response = await this.fetchFn(`${this.config.workerUrl}/whoami`, {
+        headers: { Authorization: `Bearer ${this.config.apiKey}` },
+        ...(signal ? { signal } : {}),
+      });
+      if (response.status === 404) return { kind: "unsupported" };
+      if (response.status === 401 || response.status === 403) {
+        return { kind: "rejected", status: response.status };
+      }
+      if (!response.ok) return { kind: "unknown", error: `status ${response.status}` };
+      const body = (await response.json()) as { credential?: unknown; machine_id?: unknown };
+      if (body.credential === "machine" && typeof body.machine_id === "string") {
+        return { kind: "machine", machineId: body.machine_id };
+      }
+      if (body.credential === "shared") return { kind: "shared" };
+      return { kind: "unknown", error: "unrecognised whoami body" };
+    } catch (err) {
+      return { kind: "unknown", error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** Send a command ack to the worker. */
