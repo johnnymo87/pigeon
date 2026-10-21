@@ -472,7 +472,9 @@ allowlists should not pair devbox with the work machines.
 **Built (pigeon-k0qn.8):** per-machine keys hashed in D1 `machine_credentials`, enforcement on
 poll/ack/register/unregister, `GET /whoami`, and shared-key retirement via
 `SHARED_KEY_REFUSED_MACHINES`. Design `docs/plans/2026-10-21-per-machine-credentials.md`,
-runbook `docs/runbooks/per-machine-credentials.md`.
+runbook `docs/runbooks/per-machine-credentials.md`. **The gate on receive is retirement, not
+rotation:** until machine M is in `SHARED_KEY_REFUSED_MACHINES`, a shared-key holder can still
+re-register M's sessions to itself, so receive on M requires M to be retired.
 
 ## §7. Known limits (accepted)
 

@@ -108,8 +108,21 @@ else
 fi
 ```
 
-On the Mac it is the same shape, with `security find-generic-password -s pigeon-worker-key -w`
-in place of the file. Workstation changes go through a branch and PR. Apply with
+On the Mac, in the daemon wrapper in `users/dev/home.darwin.nix` (keep its existing `$SEC`
+variable):
+
+```sh
+k="$($SEC find-generic-password -s pigeon-worker-key -w 2>/dev/null || true)"
+if [ -n "$k" ] && [ ! -e "$HOME/.config/pigeon/use-shared-worker-key" ]; then
+  export CCR_API_KEY="$k"
+else
+  export CCR_API_KEY="$($SEC find-generic-password -s pigeon-ccr-api-key -w)"
+fi
+unset k
+```
+
+The emptiness check matters: with an empty `CCR_API_KEY` the daemon starts no poller at all,
+so there is neither a `[worker-identity]` line nor a refused-poll alert. Workstation changes go through a branch and PR. Apply with
 `sudo nixos-rebuild switch --flake .#<host>` or `darwin-rebuild switch --flake .#<mac>`, then
 delete `~/pigeon-worker-key.<m>`.
 
@@ -118,7 +131,8 @@ delete `~/pigeon-worker-key.<m>`.
 - Linux: `sudo systemctl restart pigeon-daemon.service`, then
   `journalctl --namespace=pigeon -u pigeon-daemon.service -n 80 --no-pager | grep -E 'worker-identity|Poll failed'`.
 - Mac: `launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon`,
-  then `grep -E 'worker-identity|Poll failed' ~/Library/Logs/pigeon-daemon.err.log | tail`.
+  then `grep -hE 'worker-identity|Poll failed' ~/Library/Logs/pigeon-daemon.out.log ~/Library/Logs/pigeon-daemon.err.log | tail`.
+  The success line goes to `out.log` and warnings to `err.log`, so read both.
 
 Expect `[worker-identity] credential=machine machine=<m>` and no `Poll failed: 401/403`.
 Then send a Telegram message to a session on that machine and confirm it arrives. Only then
@@ -130,7 +144,15 @@ move on to the next machine.
 2. Restart the daemon (as above) and check for `[worker-identity] credential=shared`.
 
 This works only while the shared key is not retired for that machine. If it is listed in
-`SHARED_KEY_REFUSED_MACHINES`, remove it from the var and redeploy the worker first.
+`SHARED_KEY_REFUSED_MACHINES`, first set the var to the list **without** that machine (or to
+`""`) and redeploy the worker. Never delete the line instead: `wrangler.toml` has
+`keep_vars = true`, so a var missing from the file keeps its deployed value and the machine
+stays retired. Confirm the deployed value (Cloudflare dashboard, or `npx wrangler versions view`
+on the new version) before restarting the daemon on the shared key.
+
+**Worker rollback.** Rolling the worker back to a version before per-machine keys makes every
+machine key fail with 401 everywhere. Before such a rollback, put every machine-keyed daemon
+on the shared key with the marker file above.
 
 ## Revoking or rotating a machine key
 
@@ -148,8 +170,13 @@ then revoke the old one. Never `UPDATE machine_id` on a row: revoke it and mint 
 
 ## Retiring the shared key
 
-Ask the human first. Do it only after all three daemons have been verified on their own keys
-and stable for a while (rollback via the marker file stops working for a retired machine).
+**Retirement is what makes the keys protect anything.** Until machine M is listed in
+`SHARED_KEY_REFUSED_MACHINES`, a shared-key holder (any machine, any shell) can still
+re-register M's sessions to itself and then collect them with its own key. So Phase 2
+*receive* must not be enabled on M before M is retired (spec §6).
+
+Ask the human first. Do it after all three daemons have been verified on their own keys and
+stable for a while, because rollback via the marker file stops working for a retired machine.
 
 1. In `packages/worker/wrangler.toml` `[vars]`, set
    `SHARED_KEY_REFUSED_MACHINES = "cloudbox,devbox,macbook"` and deploy the worker. The
@@ -168,6 +195,7 @@ retired.
 |---|---|
 | `/whoami` 401 with the new key | not registered, registered without `--remote`, revoked, or the file holds something else (`machine-key.mjs hash` checks the format) |
 | `machine_mismatch` (403) on poll | the key is registered to a different machine than `CCR_MACHINE_ID` |
-| `owned_by_other_machine` (409) on register | another machine holds that session and has been active within 7 days; it must unregister it first |
+| `owned_by_other_machine` (409) on register | another machine holds that session and has been active within 7 days; it must unregister it first. Fixed ids registered from more than one machine (pull lanes, `ses_stallwatch_*`) hit this once both machines use their own keys |
+| no `[worker-identity]` line at all | `CCR_API_KEY` is empty, so no poller started: the start script's secret read failed |
 | `[worker-identity] credential=shared` after switching | the start script did not pick up the machine key: the secret is missing or the rollback marker exists |
-| Telegram alert "the worker has refused its last 12 polls" | any of the above, or the machine was retired from the shared key while still using it |
+| Telegram alert "the worker has refused its last 12 polls" | any of the above, the machine was retired from the shared key while still using it, or the worker was rolled back |

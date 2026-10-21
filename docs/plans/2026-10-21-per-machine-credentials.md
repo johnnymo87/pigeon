@@ -52,6 +52,12 @@ behaviour until it is retired.
 hand-out will refuse the shared key outright, so `from_machine` can never be asserted by a
 shared-key holder, whether or not the shared key has been retired.
 
+**Rotation alone protects nothing; retirement does.** While M is not in
+`SHARED_KEY_REFUSED_MACHINES`, a shared-key holder can re-register M's sessions to itself and
+collect them with its own key. So Phase 2 receive on M requires M to be retired, and `.5`
+should enforce that mechanically (refuse to queue relays for a `to_machine` that is not in
+the refused set) rather than rely on the runbook.
+
 **Retiring the shared key.** The worker var `SHARED_KEY_REFUSED_MACHINES` (CSV) makes the
 shared key fail with 401 on the three machine-scoped routes above for the listed machines.
 That stops a shared-key holder impersonating those daemons without breaking the other consumers
@@ -96,8 +102,16 @@ one local registered session starts with the given id, the notice names it ("did
 ## Not in scope
 
 - Other routes that carry an identity stay unenforced: `/topics/named/bind` (a key holder can
-  bind a topic to its own session), `/notifications/send` (post into any session's topic) and
+  bind a topic to its own session), `/notifications/send` (post into any session's topic),
+  `/notifications/edit` (rewrite another machine's message text and buttons) and
   `GET /media/*` (read any media). None of them prompts a session; they are follow-ups.
+- First-registrant claim: a session that never registers with the worker (a quiet,
+  `notify=false` session) can be claimed by whichever machine key registers its id first, and
+  its real owner then gets `409` and cannot recover. Harmless until relays route by
+  `sessions.machine_id`; `.5` must close it (register every main session for ownership, or
+  refuse to relay to an owner row its owner never wrote).
+- Register is read-then-upsert, so a takeover racing an owner's refresh can still win. Worth
+  making the upsert conditional once the first-registrant claim is closed.
 - Relay routes and hand-out are `.5`, with these rules carried forward: derive `from_machine`
   from the principal; `/swarm/relay/ack` and `/swarm/relay/fail` require `to_machine` to be
   the principal; hand-out and the accept-set write require a machine principal.

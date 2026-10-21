@@ -238,6 +238,27 @@ describe("SwarmArbiter incomplete target ids (pigeon-k0qn.14)", () => {
     expect(n!.payload).not.toMatch(/incomplete/);
   });
 
+  it("a truncated gse_ id is incomplete; a whole gse_ uuid is not", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    s.insert("m1", { toSession: "gse_0f6c1a2b-3c4d" });
+    s.insert("m2", { toSession: "gse_0f6c1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b", msgId: "m2" } as any);
+    await s.arbiter.processOnce();
+    const byReply = Object.fromEntries(s.notices().map((n) => [n.reply_to, n.payload]));
+    expect(byReply.m1).toMatch(/not a complete gse_<uuid> id/);
+    expect(byReply.m1).not.toMatch(/Do not resend/);
+    expect(byReply.m2).toMatch(/Do not resend it via swarm/);
+  });
+
+  it("a well-formed id never gets a did-you-mean, even with a local look-alike", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    registerLocal(s.storage, "ses_lane_maven_renovate_two");
+    s.insert("m1", { toSession: "ses_lane_maven_renovate" });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).not.toMatch(/Did you mean/);
+    expect(n!.payload).toMatch(/Do not resend it via swarm/);
+  });
+
   it("a full-length id nobody owns keeps the remote wording", async () => {
     s = setup({ locality: "remote", ownerOf: async () => null });
     s.insert("m1", { toSession: FULL_ID });

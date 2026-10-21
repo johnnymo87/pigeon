@@ -56,14 +56,19 @@ export function formatRemoteFailureNotice(msgId: string, target: string, reason:
 /** Length of an opencode session id: `ses_` + 26 alphanumerics. */
 export const OPENCODE_SESSION_ID_LENGTH = 30;
 
+const GSE_ID = /^gse_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /**
- * Does `target` look like a mangled opencode id rather than a real one (pigeon-k0qn.14)?
- * True for `ses_` + alphanumerics of the wrong length, which is what truncating or
- * over-copying a real id produces. Ids with other characters (fixed pull-lane ids such as
- * `ses_lane_maven_renovate`) are not opencode ids and are never called incomplete on shape.
+ * Does `target` look like a mangled id rather than a real one (pigeon-k0qn.14)? True for
+ * `ses_` + alphanumerics of the wrong length, and for `gse_` + hex/dashes that is not a whole
+ * uuid, which is what truncating or over-copying a real id produces. Ids with other
+ * characters (fixed pull-lane ids such as `ses_lane_maven_renovate`) are never called
+ * incomplete.
  */
-export function looksLikeIncompleteOpencodeId(target: string): boolean {
-  return /^ses_[A-Za-z0-9]+$/.test(target) && target.length !== OPENCODE_SESSION_ID_LENGTH;
+export function looksLikeIncompleteId(target: string): boolean {
+  if (/^ses_[A-Za-z0-9]+$/.test(target)) return target.length !== OPENCODE_SESSION_ID_LENGTH;
+  if (/^gse_[0-9a-f-]+$/.test(target)) return !GSE_ID.test(target);
+  return false;
 }
 
 /**
@@ -84,10 +89,9 @@ export function formatIncompleteTargetReason(
   candidates: string[],
 ): string {
   const here = selfMachineId ? `this machine (${selfMachineId})` : "this machine";
-  const shape =
-    target.length === OPENCODE_SESSION_ID_LENGTH
-      ? ""
-      : `; it is ${target.length} characters long and an opencode session id is ${OPENCODE_SESSION_ID_LENGTH}`;
+  const shape = target.startsWith("gse_")
+    ? "; it is not a complete gse_<uuid> id"
+    : `; it is ${target.length} characters long and an opencode session id is ${OPENCODE_SESSION_ID_LENGTH}`;
   // Named, never delivered to: a guessed target is a misroute, which is worse than a failure.
   const hint =
     candidates.length === 1
@@ -446,13 +450,17 @@ export class SwarmArbiter {
           const locality = await this.localityOf(target);
           if (locality === "remote") {
             const owner = await this.lookupOwner(target);
-            if (!owner) {
-              const candidates = this.storage.sessions.idsWithPrefix(target);
-              if (candidates.length > 0 || looksLikeIncompleteOpencodeId(target)) {
-                throw new IncompleteTargetIdError(
-                  formatIncompleteTargetReason(target, this.selfMachineId, candidates),
-                );
-              }
+            // Shape first, and only then a "did you mean": a well-formed id with no known owner
+            // may simply be on a machine the worker could not be asked about, and pointing its
+            // sender at a local look-alike would invite a misroute.
+            if (!owner && looksLikeIncompleteId(target)) {
+              throw new IncompleteTargetIdError(
+                formatIncompleteTargetReason(
+                  target,
+                  this.selfMachineId,
+                  this.storage.sessions.idsWithPrefix(target),
+                ),
+              );
             }
             throw new RemoteTargetError(formatRemoteTargetReason(target, this.selfMachineId, owner));
           }

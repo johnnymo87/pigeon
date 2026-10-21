@@ -51,7 +51,8 @@ export function formatPollAuthAlert(machineId: string, status: number, consecuti
     `(HTTP ${status}). Telegram commands for this machine are not being delivered. ` +
     (status === 403
       ? "The credential is registered to a different machine than CCR_MACHINE_ID. "
-      : "The credential is unknown, revoked, or the shared key has been retired for this machine. ") +
+      : "The credential is unknown or revoked, the shared key has been retired for this machine, " +
+        "or the worker was rolled back to a version without per-machine keys. ") +
     "See docs/runbooks/per-machine-credentials.md (rollback), and check the daemon's " +
     "[worker-identity] log line."
   );

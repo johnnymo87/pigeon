@@ -81,7 +81,10 @@ Use rollback if:
 
 Then:
 
-1. Roll back worker using Cloudflare tooling.
+1. Roll back worker using Cloudflare tooling. **Not past pigeon-k0qn.8 (per-machine
+   credentials) while any daemon uses its own `pgk_` key**: an older worker refuses those keys
+   on every route. Move those daemons to the shared key first (marker file in
+   `docs/runbooks/per-machine-credentials.md`, "Rollback").
 2. Re-run quick operational checks.
 3. Capture incident notes and root-cause breadcrumbs before re-deploy.
 
