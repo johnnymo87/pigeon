@@ -15,7 +15,8 @@
  * three without a single special case in their queries.
  */
 
-import { verifyApiKey, unauthorized } from "./auth";
+import { unauthorized } from "./auth";
+import { authenticate } from "./credentials";
 import { isAllowedChatId } from "./notifications";
 import { topicsEnabled } from "./topics";
 import { createTelegramClient, getTelegramErrorDetails, type TelegramClient } from "./telegram";
@@ -191,7 +192,7 @@ export async function handleNamedTopic(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) return unauthorized();
+  if (!(await authenticate(request, env))) return unauthorized();
 
   let body: Record<string, unknown>;
   try {
@@ -344,7 +345,7 @@ export async function handleNamedTopicBind(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) return unauthorized();
+  if (!(await authenticate(request, env))) return unauthorized();
 
   let body: Record<string, unknown>;
   try {
@@ -427,7 +428,7 @@ export async function handleNamedTopicUnbind(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) return unauthorized();
+  if (!(await authenticate(request, env))) return unauthorized();
 
   let body: Record<string, unknown>;
   try {

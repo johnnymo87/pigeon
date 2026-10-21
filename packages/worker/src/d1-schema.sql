@@ -111,3 +111,16 @@ CREATE TABLE IF NOT EXISTS named_topic_bindings (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_named_topic_bindings_session
   ON named_topic_bindings(session_id);
+
+-- Per-machine worker credentials (pigeon-k0qn.8, runbook docs/runbooks/per-machine-credentials.md).
+-- Only the SHA-256 of a key is stored. Several rows per machine are allowed so a key can be
+-- rotated with overlap. Never UPDATE machine_id on a row: revoke it and mint a new key.
+CREATE TABLE IF NOT EXISTS machine_credentials (
+  key_sha256  TEXT PRIMARY KEY,
+  machine_id  TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  revoked_at  INTEGER,
+  note        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_machine_credentials_machine
+  ON machine_credentials(machine_id);

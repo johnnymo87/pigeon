@@ -1,4 +1,5 @@
-import { verifyApiKey, unauthorized } from "./auth";
+import { unauthorized } from "./auth";
+import { authenticate } from "./credentials";
 import { createTelegramClient, getTelegramErrorDetails, TelegramClient, TgResult } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
@@ -336,7 +337,7 @@ export async function handleSendNotification(
   request: Request,
 ): Promise<Response> {
   try {
-    if (!verifyApiKey(request, env.CCR_API_KEY)) {
+    if (!(await authenticate(request, env))) {
       return unauthorized();
     }
 
@@ -721,7 +722,7 @@ export async function handleEditNotification(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  if (!(await authenticate(request, env))) {
     return unauthorized();
   }
 

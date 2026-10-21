@@ -6,6 +6,7 @@ import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
+import { handleWhoami } from "./credentials";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
@@ -21,6 +22,11 @@ export default {
         // Health
         if (path === "/health") {
           return new Response("ok");
+        }
+
+        // Which principal this request's credential resolves to (pigeon-k0qn.8)
+        if (path === "/whoami" && method === "GET") {
+          return handleWhoami(request, env);
         }
 
         // Poll: GET /machines/:id/next

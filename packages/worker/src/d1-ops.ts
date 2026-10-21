@@ -184,15 +184,26 @@ export async function ackCommand(
   db: D1Database,
   commandId: string,
   now: number = Date.now(),
+  /** When set, only a command addressed to this machine is acked (pigeon-k0qn.8). */
+  machineId?: string,
 ): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `UPDATE commands
-       SET status = 'acked', acked_at = ?
-       WHERE command_id = ?`,
-    )
-    .bind(now, commandId)
-    .run();
+  const result = machineId === undefined
+    ? await db
+        .prepare(
+          `UPDATE commands
+           SET status = 'acked', acked_at = ?
+           WHERE command_id = ?`,
+        )
+        .bind(now, commandId)
+        .run()
+    : await db
+        .prepare(
+          `UPDATE commands
+           SET status = 'acked', acked_at = ?
+           WHERE command_id = ? AND machine_id = ?`,
+        )
+        .bind(now, commandId, machineId)
+        .run();
 
   return (result.meta.rows_written ?? 0) > 0;
 }

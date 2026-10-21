@@ -1,9 +1,17 @@
-import { verifyApiKey, unauthorized } from "./auth";
+import { unauthorized } from "./auth";
+import { authenticate, checkActsAs, type Principal } from "./credentials";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 import { withD1, StorageError } from "./d1";
 
 export const MAX_SESSIONS = 5000;
+
+/**
+ * A row idle this long may be taken over by another machine's credential (pigeon-k0qn.8).
+ * Matches the daemon reaper's SESSION_TTL_MS: a session that old has been abandoned by its
+ * owner, which would have unregistered it.
+ */
+export const REGISTER_TAKEOVER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type SessionAction = "list" | "register" | "unregister";
 
@@ -30,7 +38,8 @@ export async function handleSessionRequest(
   action: SessionAction,
   opts?: SessionRequestOptions,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  const principal = await authenticate(request, env);
+  if (!principal) {
     return unauthorized();
   }
 
@@ -38,9 +47,9 @@ export async function handleSessionRequest(
     case "list":
       return listSessions(db);
     case "register":
-      return registerSession(db, env, request, opts);
+      return registerSession(db, env, request, principal, opts);
     case "unregister":
-      return unregisterSession(db, env, request);
+      return unregisterSession(db, env, request, principal);
   }
 }
 
@@ -53,6 +62,7 @@ async function registerSession(
   db: D1Database,
   env: Env,
   request: Request,
+  principal: Principal,
   opts?: SessionRequestOptions,
 ): Promise<Response> {
   try {
@@ -74,10 +84,33 @@ async function registerSession(
     const existing = await withD1(
       "registerSession.existing",
       db
-        .prepare("SELECT session_id FROM sessions WHERE session_id = ?")
+        .prepare("SELECT session_id, machine_id, updated_at FROM sessions WHERE session_id = ?")
         .bind(sessionId)
-        .first<{ session_id: string }>(),
+        .first<{ session_id: string; machine_id: string; updated_at: number }>(),
     );
+
+    // Identity (pigeon-k0qn.8). A machine credential may register only as its own machine,
+    // and may not take over a session another machine holds: without that, any key holder
+    // could re-point a session at itself and collect its relays and Telegram commands. A row
+    // idle for REGISTER_TAKEOVER_STALE_MS (the daemon reaper's TTL) is abandoned and may be
+    // taken over; a live move needs the old owner to unregister first. The shared key keeps
+    // last-registrant-wins, except as or over a machine it has been retired for.
+    const claimed = checkActsAs(principal, env, machineId);
+    if (claimed) return claimed;
+    if (existing && existing.machine_id !== machineId) {
+      if (principal.kind === "shared") {
+        const over = checkActsAs(principal, env, existing.machine_id);
+        if (over) return over;
+      } else if (Date.now() - existing.updated_at < REGISTER_TAKEOVER_STALE_MS) {
+        return Response.json(
+          {
+            error: "owned_by_other_machine",
+            detail: `${sessionId} is registered to ${existing.machine_id}; it must unregister it first`,
+          },
+          { status: 409 },
+        );
+      }
+    }
 
     if (!existing) {
       const countResult = await withD1(
@@ -126,6 +159,7 @@ async function unregisterSession(
   db: D1Database,
   env: Env,
   request: Request,
+  principal: Principal,
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const sessionId = body.sessionId as string | undefined;
@@ -155,6 +189,25 @@ async function unregisterSession(
 
   if (!sessionId) {
     return Response.json({ error: "sessionId required" }, { status: 400 });
+  }
+
+  // Identity (pigeon-k0qn.8): only the owner may remove a session's routing, or unregister
+  // followed by register would be a two-step takeover. Another machine's row is left alone
+  // and answered 200, because every caller is janitorial (reaper, dead-session cleanup, the
+  // outbox's compensating unregister) and "it is not mine to delete" is not a failure for
+  // any of them. With no row there is nothing to protect; the deletes below are no-ops.
+  if (principal.kind === "machine" || (env.SHARED_KEY_REFUSED_MACHINES ?? "").trim()) {
+    const owner = await db
+      .prepare("SELECT machine_id FROM sessions WHERE session_id = ?")
+      .bind(sessionId)
+      .first<{ machine_id: string }>();
+    if (owner) {
+      if (principal.kind === "machine" && owner.machine_id !== principal.machineId) {
+        return Response.json({ ok: true, skipped: "not_owner" });
+      }
+      const refused = checkActsAs(principal, env, owner.machine_id);
+      if (refused) return refused;
+    }
   }
 
   await db.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
@@ -219,7 +272,7 @@ export async function handleSessionOwner(
   request: Request,
   sessionId: string,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  if (!(await authenticate(request, env))) {
     return unauthorized();
   }
   try {

@@ -1,4 +1,5 @@
-import { verifyApiKey, unauthorized } from "./auth";
+import { unauthorized } from "./auth";
+import { authenticate } from "./credentials";
 
 export interface MediaRef {
   key: string;
@@ -20,7 +21,7 @@ export async function handleMediaUpload(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  if (!(await authenticate(request, env))) {
     return unauthorized();
   }
 
@@ -83,7 +84,7 @@ export async function handleMediaGet(
   request: Request,
   key: string,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  if (!(await authenticate(request, env))) {
     return unauthorized();
   }
 

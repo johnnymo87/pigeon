@@ -12558,7 +12558,7 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
 
       const failingDb = createFailingDb(
         env.DB,
-        (sql) => sql.includes("SELECT session_id FROM sessions"),
+        (sql) => sql.includes("SELECT session_id, machine_id, updated_at FROM sessions"),
         "D1 unavailable on existing check",
       );
       const testEnv = { ...env, DB: failingDb };

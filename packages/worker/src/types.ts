@@ -7,6 +7,8 @@ declare global {
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_WEBHOOK_SECRET: string;
     CCR_API_KEY: string;
+    /** Retire the shared key: CSV of machine ids it may no longer act as, or `*` (pigeon-k0qn.8). */
+    SHARED_KEY_REFUSED_MACHINES?: string;
     ALLOWED_CHAT_IDS: string;
     ALLOWED_USER_IDS?: string;
     TELEGRAM_TOPICS_ENABLED?: string;

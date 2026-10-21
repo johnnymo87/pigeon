@@ -53,6 +53,61 @@ export function formatRemoteFailureNotice(msgId: string, target: string, reason:
   );
 }
 
+/** Length of an opencode session id: `ses_` + 26 alphanumerics. */
+export const OPENCODE_SESSION_ID_LENGTH = 30;
+
+/**
+ * Does `target` look like a mangled opencode id rather than a real one (pigeon-k0qn.14)?
+ * True for `ses_` + alphanumerics of the wrong length, which is what truncating or
+ * over-copying a real id produces. Ids with other characters (fixed pull-lane ids such as
+ * `ses_lane_maven_renovate`) are not opencode ids and are never called incomplete on shape.
+ */
+export function looksLikeIncompleteOpencodeId(target: string): boolean {
+  return /^ses_[A-Za-z0-9]+$/.test(target) && target.length !== OPENCODE_SESSION_ID_LENGTH;
+}
+
+/**
+ * A target nobody has: no serve here knows it, the worker has no owner for it, and either its
+ * shape is wrong or a local session id starts with it (pigeon-k0qn.14). Unlike a remote
+ * target, resending with the right id WORKS, so the notice must not say "do not resend".
+ */
+export class IncompleteTargetIdError extends PermanentDeliveryError {
+  constructor(message: string) {
+    super(message);
+    this.name = "IncompleteTargetIdError";
+  }
+}
+
+export function formatIncompleteTargetReason(
+  target: string,
+  selfMachineId: string | undefined,
+  candidates: string[],
+): string {
+  const here = selfMachineId ? `this machine (${selfMachineId})` : "this machine";
+  const shape =
+    target.length === OPENCODE_SESSION_ID_LENGTH
+      ? ""
+      : `; it is ${target.length} characters long and an opencode session id is ${OPENCODE_SESSION_ID_LENGTH}`;
+  // Named, never delivered to: a guessed target is a misroute, which is worse than a failure.
+  const hint =
+    candidates.length === 1
+      ? `. Did you mean ${candidates[0]}? It is a session on ${here} whose id starts with ${target}`
+      : candidates.length > 1
+        ? `. ${candidates.length >= 3 ? "3 or more" : candidates.length} sessions on ${here} start with it`
+        : "";
+  return (
+    `no session ${target} exists on ${here} and the worker has no record of it (or could not be asked)` +
+    `${shape}, so the id is probably incomplete${hint}`
+  );
+}
+
+export function formatIncompleteTargetNotice(msgId: string, target: string, reason: string): string {
+  return (
+    `DELIVERY FAILED: your swarm message ${msgId} to ${target} was NOT received. ` +
+    `Reason: ${reason}. Check the id and resend with the complete one.`
+  );
+}
+
 /** Bound on the owner lookup. It runs inside the target's in-flight slot. */
 export const OWNER_LOOKUP_TIMEOUT_MS = 2_000;
 
@@ -390,9 +445,16 @@ export class SwarmArbiter {
         if (this.localityOf) {
           const locality = await this.localityOf(target);
           if (locality === "remote") {
-            throw new RemoteTargetError(
-              formatRemoteTargetReason(target, this.selfMachineId, await this.lookupOwner(target)),
-            );
+            const owner = await this.lookupOwner(target);
+            if (!owner) {
+              const candidates = this.storage.sessions.idsWithPrefix(target);
+              if (candidates.length > 0 || looksLikeIncompleteOpencodeId(target)) {
+                throw new IncompleteTargetIdError(
+                  formatIncompleteTargetReason(target, this.selfMachineId, candidates),
+                );
+              }
+            }
+            throw new RemoteTargetError(formatRemoteTargetReason(target, this.selfMachineId, owner));
           }
           if (locality === "unknown") {
             throw new TargetUnavailableError(
@@ -546,7 +608,9 @@ export class SwarmArbiter {
               "unobserved",
               err instanceof RemoteTargetError
                 ? formatRemoteFailureNotice(next.msgId, target, err.message)
-                : undefined,
+                : err instanceof IncompleteTargetIdError
+                  ? formatIncompleteTargetNotice(next.msgId, target, err.message)
+                  : undefined,
             );
             if (isSuppressedFromRecovery(next)) {
               this.storage.alerts.enqueue({

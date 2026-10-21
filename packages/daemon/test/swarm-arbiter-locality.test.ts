@@ -51,6 +51,9 @@ function setup(opts: {
   return { storage, arbiter, clientForSession, sendPrompt, localityOf, insert, notices };
 }
 
+/** A well-formed opencode id: `ses_` + 26 alphanumerics. */
+const FULL_ID = "ses_ea4db4ccfffeH9sjJbP76NdLmp";
+
 describe("SwarmArbiter target locality (pigeon-k0qn.2)", () => {
   let s: ReturnType<typeof setup> | null = null;
   afterEach(() => {
@@ -91,7 +94,7 @@ describe("SwarmArbiter target locality (pigeon-k0qn.2)", () => {
     for (const ownerOf of [async () => null, async () => { throw new Error("worker down"); }, undefined]) {
       s?.storage.db.close();
       s = setup({ locality: "remote", ownerOf });
-      s.insert("m1");
+      s.insert("m1", { toSession: FULL_ID });
       await s.arbiter.processOnce();
       expect(s.storage.swarm.getByMsgId("m1")!.state).toBe("failed");
       const [n] = s.notices();
@@ -166,5 +169,80 @@ describe("SwarmArbiter target locality (pigeon-k0qn.2)", () => {
     await s.arbiter.processOnce();
     expect(s.storage.swarm.getByMsgId("m1")!.state).toBe("handed_off");
     expect(s.localityOf).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("SwarmArbiter incomplete target ids (pigeon-k0qn.14)", () => {
+  let s: ReturnType<typeof setup> | null = null;
+  afterEach(() => {
+    s?.storage.db.close();
+    s = null;
+  });
+
+  const registerLocal = (storage: StorageDb, id: string) =>
+    storage.sessions.upsert({ sessionId: id, notify: false }, 1);
+
+  it("a truncated id nobody owns is reported as probably incomplete, NOT as do-not-resend", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    s.insert("m1", { toSession: "ses_ea4db4ccfffe" });
+    await s.arbiter.processOnce();
+    expect(s.storage.swarm.getByMsgId("m1")!.state).toBe("failed");
+    const [n] = s.notices();
+    expect(n!.kind).toBe("delivery.failed");
+    expect(n!.payload).toMatch(/NOT received/);
+    expect(n!.payload).toMatch(/16 characters/);
+    expect(n!.payload).toMatch(/30/);
+    expect(n!.payload).toMatch(/resend/i);
+    expect(n!.payload).not.toMatch(/Do not resend/);
+    expect(n!.payload).not.toMatch(/cross-machine/i);
+  });
+
+  it("names a unique local session the id is a prefix of, without delivering to it", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    registerLocal(s.storage, FULL_ID);
+    s.insert("m1", { toSession: "ses_ea4db4ccfffe" });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).toContain(`Did you mean ${FULL_ID}`);
+    expect(s.clientForSession).not.toHaveBeenCalled();
+    expect(s.sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("names no candidate when the prefix is ambiguous", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    registerLocal(s.storage, "ses_ea4db4ccfffeAAAAAAAAAAAAAA");
+    registerLocal(s.storage, "ses_ea4db4ccfffeBBBBBBBBBBBBBB");
+    s.insert("m1", { toSession: "ses_ea4db4ccfffe" });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).not.toMatch(/Did you mean/);
+    expect(n!.payload).toMatch(/2 sessions on this machine \(macbook\) start with it/);
+  });
+
+  it("a malformed id the worker DOES own keeps the remote wording", async () => {
+    s = setup({
+      locality: "remote",
+      ownerOf: async () => ({ machineId: "cloudbox", lastSeen: 5 }),
+    });
+    s.insert("m1", { toSession: "ses_lane_maven_renovate" });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).toMatch(/registered to cloudbox/);
+  });
+
+  it("a lane-style id nobody owns is not called incomplete", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    s.insert("m1", { toSession: "ses_lane_maven_renovate" });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).not.toMatch(/incomplete/);
+  });
+
+  it("a full-length id nobody owns keeps the remote wording", async () => {
+    s = setup({ locality: "remote", ownerOf: async () => null });
+    s.insert("m1", { toSession: FULL_ID });
+    await s.arbiter.processOnce();
+    const [n] = s.notices();
+    expect(n!.payload).toMatch(/Do not resend it via swarm/);
   });
 });

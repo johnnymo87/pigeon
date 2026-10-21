@@ -1,4 +1,5 @@
-import { verifyApiKey, unauthorized } from "./auth";
+import { unauthorized } from "./auth";
+import { authenticate, checkActsAs } from "./credentials";
 import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled } from "./topics";
@@ -101,9 +102,15 @@ export async function handlePollNext(
   request: Request,
   machineId: string,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  const principal = await authenticate(request, env);
+  if (!principal) {
     return unauthorized();
   }
+  // Before touchMachine, deliberately (pigeon-k0qn.8): a refused poll must not keep the
+  // machine looking online, or `/launch` would queue commands for a daemon that can never
+  // collect them.
+  const refused = checkActsAs(principal, env, machineId);
+  if (refused) return refused;
 
   await touchMachine(db, machineId);
 
@@ -330,8 +337,34 @@ export async function handleAckCommand(
   request: Request,
   commandId: string,
 ): Promise<Response> {
-  if (!verifyApiKey(request, env.CCR_API_KEY)) {
+  const principal = await authenticate(request, env);
+  if (!principal) {
     return unauthorized();
+  }
+
+  if (principal.kind === "shared") {
+    // Only consult the owner when the shared key has been retired for some machine, so the
+    // common path stays one statement.
+    if ((env.SHARED_KEY_REFUSED_MACHINES ?? "").trim()) {
+      const row = await db
+        .prepare("SELECT machine_id FROM commands WHERE command_id = ?")
+        .bind(commandId)
+        .first<{ machine_id: string }>();
+      const refused = row ? checkActsAs(principal, env, row.machine_id) : null;
+      if (refused) return refused;
+    }
+  } else {
+    // Ownership is checked in the UPDATE itself, so there is no read-then-write window.
+    const found = await ackCommand(db, commandId, Date.now(), principal.machineId);
+    if (found) return Response.json({ ok: true });
+    const row = await db
+      .prepare("SELECT machine_id FROM commands WHERE command_id = ?")
+      .bind(commandId)
+      .first<{ machine_id: string }>();
+    if (row && row.machine_id !== principal.machineId) {
+      return checkActsAs(principal, env, row.machine_id)!;
+    }
+    return Response.json({ error: "Command not found" }, { status: 404 });
   }
 
   const found = await ackCommand(db, commandId);

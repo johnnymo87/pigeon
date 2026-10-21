@@ -15,7 +15,8 @@ Use this for secret setup, auth failures, or token rotation.
 
 ## Core Secrets
 
-- `CCR_API_KEY`
+- `CCR_API_KEY` (shared worker key; still accepted, see below)
+- `pigeon_worker_key` / Keychain `pigeon-worker-key` (per-machine worker key, once rotated)
 - `PIGEON_DAEMON_AUTH_TOKEN`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
@@ -24,8 +25,10 @@ Use this for secret setup, auth failures, or token rotation.
 
 ## Auth Boundaries
 
-- worker API routes require bearer `CCR_API_KEY` (poll, ack, sessions, notifications, media)
-- daemon poller authenticates via `Authorization: Bearer CCR_API_KEY` header
+- worker API routes require a bearer that is either the shared `CCR_API_KEY` or a **per-machine key** (`pgk_...`, pigeon-k0qn.8). Per-machine keys are stored hashed in D1 `machine_credentials`; with one, poll, command ack, session register and unregister refuse to act as any other machine. The shared key keeps last-registrant-wins behaviour until it is retired per machine via the worker var `SHARED_KEY_REFUSED_MACHINES`. Phase 2 relay routes will accept only per-machine keys.
+- `GET /whoami` on the worker says which principal a key resolves to; the daemon logs it at startup as `[worker-identity] ...`
+- daemon poller authenticates via `Authorization: Bearer $CCR_API_KEY`; the daemon's start script decides whether that variable holds the shared key or the machine key
+- Minting, registering, rotating, revoking and retiring: **`docs/runbooks/per-machine-credentials.md`**. Never print a key; `packages/worker/scripts/machine-key.mjs` writes keys to a 0600 file and prints only the hash.
 - daemon API routes (`http://127.0.0.1:4731`): require `Authorization: Bearer <PIGEON_DAEMON_AUTH_TOKEN>` when `PIGEON_DAEMON_AUTH_TOKEN` is set, EXCEPT `GET /health` which remains anonymous by design
 - Telegram webhook requires `X-Telegram-Bot-Api-Secret-Token`
 - `ALLOWED_USER_IDS` (optional): comma-separated Telegram user IDs. If set, only these users can interact with the bot within allowed chats. If unset, all users in allowed chats are permitted.

@@ -171,6 +171,22 @@ export class SessionRepository {
   }
 
   /**
+   * Ids of sessions that START WITH `prefix` and are longer than it (pigeon-k0qn.14), so a
+   * sender who truncated an id can be told which one it probably meant. `substr`, not
+   * `LIKE`: `_` is a LIKE wildcard and every session id contains one.
+   */
+  idsWithPrefix(prefix: string, limit = 3): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT session_id FROM sessions
+         WHERE substr(session_id, 1, ?) = ? AND length(session_id) > ?
+         ORDER BY session_id LIMIT ?`,
+      )
+      .all(prefix.length, prefix, prefix.length, limit) as Array<{ session_id: string }>;
+    return rows.map((r) => r.session_id);
+  }
+
+  /**
    * Finds a session by the id its BACKEND knows it by.
    *
    * Exists so registering the same goose session twice reuses one pigeon row
