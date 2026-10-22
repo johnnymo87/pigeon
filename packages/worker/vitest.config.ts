@@ -14,6 +14,9 @@ export default defineWorkersConfig({
             TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret",
             ALLOWED_CHAT_IDS: "8248645256",
             TELEGRAM_TOPICS_ENABLED: "false",
+            // Production retires the shared key for the real machine ids, which the suite also
+            // uses with the shared test key. Tests that cover retirement set it per request.
+            SHARED_KEY_REFUSED_MACHINES: "",
           },
         },
       },

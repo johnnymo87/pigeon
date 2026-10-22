@@ -19,6 +19,12 @@ crons = ["0 * * * *"]
 ALLOWED_CHAT_IDS = "8248645256,-1004391832753,-1004232934695,-1003983501132"
 TELEGRAM_TOPICS_ENABLED = "true"
 TELEGRAM_BOT_USERNAME = "mohrbacher_01_bot"
+# Retire the shared CCR_API_KEY for these machines (pigeon-k0qn.8): it can no longer poll, ack,
+# register or unregister as them, which only their own per-machine keys may do. Other routes
+# still accept it. To un-retire a machine, EDIT this list and redeploy; never delete the line,
+# because keep_vars = true would keep the deployed value. Runbook:
+# docs/runbooks/per-machine-credentials.md.
+SHARED_KEY_REFUSED_MACHINES = "cloudbox,devbox,macbook"
 
 [observability]
 enabled = true
