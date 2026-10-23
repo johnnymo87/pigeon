@@ -553,9 +553,8 @@ export class OutboxSender {
               this.lowPrioritySendTimestamps.push(this.nowFn());
             }
             const holdStarted = this.topicHoldStartedAt.get(entry.notificationId);
-            const now = this.nowFn();
             const onTopicUnavailable: "retry" | "general" =
-              holdStarted === undefined || now - holdStarted < TOPIC_HOLD_WINDOW_MS
+              holdStarted === undefined || this.nowFn() - holdStarted < TOPIC_HOLD_WINDOW_MS
                 ? "retry"
                 : "general";
             const result = await this.sendNotification({
@@ -580,13 +579,14 @@ export class OutboxSender {
                 typeof result.body === "object" &&
                 (result.body as { error?: unknown }).error === "topic_unavailable"
               ) {
-                const now = this.nowFn();
+                const heldAt = this.nowFn();
                 if (!this.topicHoldStartedAt.has(entry.notificationId)) {
-                  this.topicHoldStartedAt.set(entry.notificationId, now);
+                  this.topicHoldStartedAt.set(entry.notificationId, heldAt);
                 }
+                // pigeon-81p ordering: a later entry for this session must neither overtake the
+                // held one nor re-hit the same (possibly hung) createForumTopic in this batch.
                 deferredSessions.add(entry.sessionId);
-                const holdStarted = this.topicHoldStartedAt.get(entry.notificationId)!;
-                const heldForMs = now - holdStarted;
+                const heldForMs = heldAt - this.topicHoldStartedAt.get(entry.notificationId)!;
                 const reason = (result.body as { reason?: unknown }).reason;
                 this.log("outbox entry held for topic", {
                   notificationId: entry.notificationId,
