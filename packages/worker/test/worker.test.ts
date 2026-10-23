@@ -7967,7 +7967,7 @@ describe("topics module and topicName", () => {
       });
 
       expect(pollCount).toBe(5);
-      expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted" });
+      expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted", transient: true });
     });
 
     // pigeon-bit4 / S2: reachable without an isolate race -- finalize's CAS also returns false
@@ -8008,7 +8008,7 @@ describe("topics module and topicName", () => {
           tgClient: mockTgClient,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "finalize_lost_no_winner" });
+        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "finalize_lost_no_winner", transient: true });
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -8046,7 +8046,7 @@ describe("topics module and topicName", () => {
           pollAttempts: 2,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted" });
+        expect(res).toEqual({ ok: true, messageThreadId: null, reason: "poll_exhausted", transient: true });
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -8075,7 +8075,13 @@ describe("topics module and topicName", () => {
         botToken,
       });
 
-      expect(res1).toEqual({ ok: true, messageThreadId: null, reason: "create_failed" });
+      expect(res1).toEqual({
+        ok: true,
+        messageThreadId: null,
+        reason: "create_failed",
+        transient: false,
+        createError: { ok: false, error_code: 400, description: "Bad Request: chat not found" },
+      });
       // Reservation row was conditional-deleted
       expect(await getBySession(env.DB, sessionId)).toBeNull();
 
@@ -8096,6 +8102,89 @@ describe("topics module and topicName", () => {
 
       expect(res2).toEqual({ ok: true, messageThreadId: 303, created: true });
       expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
+    });
+
+    it("create rejects with Telegram 5xx (520) -> transient true, createError carries error_code", async () => {
+      const sessionId = "ses_topic_create_520";
+      const botToken = "fake-bot-token";
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "err520",
+        botToken,
+      });
+
+      expect(res).toEqual({
+        ok: true,
+        messageThreadId: null,
+        reason: "create_failed",
+        transient: true,
+        createError: { ok: false, error_code: 520, description: "Unknown Error" },
+      });
+    });
+
+    it("create rejects with 4xx (400 not enough rights) -> transient false, createError carries error_code", async () => {
+      const sessionId = "ses_topic_create_400_rights";
+      const botToken = "fake-bot-token";
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
+        .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to create a topic" });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "err400",
+        botToken,
+      });
+
+      expect(res).toEqual({
+        ok: true,
+        messageThreadId: null,
+        reason: "create_failed",
+        transient: false,
+        createError: { ok: false, error_code: 400, description: "Bad Request: not enough rights to create a topic" },
+      });
+    });
+
+    it("topic_in_other_chat -> transient false", async () => {
+      const sessionId = "ses_topic_in_other_chat";
+      const now = Date.now();
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: "-1009999999999", // different chat
+        name: "pigeon · other",
+        now,
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: 777, now });
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        dir: "pigeon",
+        title: "other",
+        botToken: "fake-bot-token",
+      });
+
+      expect(res).toEqual({
+        ok: true,
+        messageThreadId: null,
+        reason: "topic_in_other_chat",
+        transient: false,
+      });
     });
 
     it("create returns 429 -> reservation gone and rate_limited propagated with retryAfter", async () => {
@@ -10046,6 +10135,473 @@ describe("topics module and topicName", () => {
       expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
       expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
     });
+  });
+
+  describe("pigeon-iqpd: hold transiently-unresolvable topics for retry (onTopicUnavailable)", () => {
+    const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+
+    beforeEach(() => {
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+      fetchMock.get("https://api.telegram.org").cleanMocks();
+    });
+
+    afterEach(() => {
+      fetchMock.deactivate();
+      delete (env as any).TELEGRAM_TOPICS_ENABLED;
+    });
+
+    it("first notification, createForumTopic returns 520, onTopicUnavailable:'retry' -> 502 topic_unavailable, no sendMessage, no alert, no messages row, no retryAfter/details", async () => {
+      const sessionId = "ses_iqpd_first_520_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(520, { ok: false, error_code: 520, description: "Web server is returning an unknown error" });
+
+      let sendMessageCalled = false;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, () => {
+          sendMessageCalled = true;
+          return { ok: true, result: { message_id: 1111 } };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "First notification to hold",
+          title: "first520",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+
+      expect(res.status).toBe(502);
+      expect(res.headers.get("Retry-After")).toBeNull();
+
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.error).toBe("topic_unavailable");
+      expect(json.reason).toBe("create_failed");
+      expect(json).not.toHaveProperty("retryAfter");
+      expect(json).not.toHaveProperty("details");
+      expect(json.createError).toEqual({
+        ok: false,
+        error_code: 520,
+        description: "Web server is returning an unknown error",
+      });
+
+      expect(sendMessageCalled).toBe(false);
+
+      const msgRow = await env.DB.prepare("SELECT * FROM messages WHERE session_id = ?")
+        .bind(sessionId)
+        .first();
+      expect(msgRow).toBeNull();
+    });
+
+    it("createForumTopic returns 520, onTopicUnavailable absent -> relocates to General (200)", async () => {
+      const sessionId = "ses_iqpd_first_520_absent";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
+
+      let sentThreadId: number | undefined = 99;
+      // 1st sendMessage: actual notification to General
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 2221 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+      // 2nd sendMessage: relocation alert
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, { ok: true, result: { message_id: 2222 } });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification without flag",
+          title: "absent",
+          dir: "pigeon",
+          threaded: true,
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(200);
+      expect(sentThreadId).toBeUndefined(); // Posted to General
+    });
+
+    it("createForumTopic returns 520, onTopicUnavailable 'general' -> relocates to General (200)", async () => {
+      const sessionId = "ses_iqpd_first_520_general";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
+
+      let sentThreadId: number | undefined = 99;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 2223 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+      // Relocation alert
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, { ok: true, result: { message_id: 2224 } });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification with general flag",
+          title: "general",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "general",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(200);
+      expect(sentThreadId).toBeUndefined();
+    });
+
+    it("4xx create failure with onTopicUnavailable:'retry' -> relocates as today", async () => {
+      const sessionId = "ses_iqpd_create_400_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, { ok: false, error_code: 400, description: "Bad Request: FORUM_CLOSED" });
+
+      let sentThreadId: number | undefined = 99;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 3331 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+      // Relocation alert
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, { ok: true, result: { message_id: 3332 } });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification with permanent 400 create error",
+          title: "perm400",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(200);
+      expect(sentThreadId).toBeUndefined(); // Relocated to General
+    });
+
+    it("topic_in_other_chat with onTopicUnavailable:'retry' -> relocates as today", async () => {
+      const sessionId = "ses_iqpd_other_chat_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: "-1009999999999", // Different chat
+        name: "pigeon · other chat",
+        now,
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: 444, now });
+
+      let sentThreadId: number | undefined = 99;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 4441 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+      // Relocation alert
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(200, { ok: true, result: { message_id: 4442 } });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Notification when topic in other chat",
+          title: "other chat",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(200);
+      expect(sentThreadId).toBeUndefined(); // Relocated to General
+    });
+
+    it("T2.7 recreate path: createForumTopic 5xx with onTopicUnavailable:'retry' -> 502 topic_unavailable, only one failed sendMessage made", async () => {
+      const sessionId = "ses_iqpd_recreate_5xx_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      const now = Date.now();
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "devbox",
+        chatId: topicChatId,
+        name: "pigeon · recreate5xx",
+        now,
+      });
+      await finalize(env.DB, { sessionId, messageThreadId: 555, now });
+
+      let sendMessageCalls = 0;
+      // 1st send -> thread not found (400)
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(() => {
+          sendMessageCalls++;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      // T2.7 recreate -> createForumTopic fails with 520
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(520, { ok: false, error_code: 520, description: "Bad Gateway" });
+
+      // If a second sendMessage were called, intercept it to fail or record
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply(() => {
+          sendMessageCalls++;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 5552 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Recreation fails 520 with retry",
+          title: "recreate5xx",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(502);
+
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.error).toBe("topic_unavailable");
+      expect(json.reason).toBe("recreate_failed:create_failed");
+      expect(json.createError).toEqual({
+        ok: false,
+        error_code: 520,
+        description: "Bad Gateway",
+      });
+      expect(json).not.toHaveProperty("retryAfter");
+      expect(json).not.toHaveProperty("details");
+
+      // Crucial: only the one failed sendMessage was made
+      expect(sendMessageCalls).toBe(1);
+
+      const msgRow = await env.DB.prepare("SELECT * FROM messages WHERE session_id = ?")
+        .bind(sessionId)
+        .first();
+      expect(msgRow).toBeNull();
+    });
+
+    it("after a held 502, subsequent request whose createForumTopic succeeds posts into the new topic", async () => {
+      const sessionId = "ses_iqpd_retry_after_held";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      // 1st request: createForumTopic returns 520
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
+
+      const req1 = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Attempt 1: held",
+          title: "retry_after_held",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res1 = await handleSendNotification(env.DB, testEnv, req1);
+      expect(res1.status).toBe(502);
+
+      // Verify reservation row was cleaned up so next attempt can reserve and create
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
+
+      // 2nd request: createForumTopic succeeds with thread 789
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
+        .reply(200, {
+          ok: true,
+          result: { message_thread_id: 789, name: "pigeon · retry_after_held", icon_color: 7322096 },
+        });
+
+      let sentThreadId: number | undefined;
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .reply((opts: any) => {
+          const body = JSON.parse(opts.body as string);
+          sentThreadId = body.message_thread_id;
+          return {
+            statusCode: 200,
+            data: JSON.stringify({ ok: true, result: { message_id: 998877 } }),
+            responseOptions: { headers: { "Content-Type": "application/json" } },
+          };
+        });
+
+      // Unpin call after create
+      fetchMock
+        .get("https://api.telegram.org")
+        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
+        .reply(200, { ok: true, result: true });
+
+      const req2 = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Attempt 2: succeeds",
+          title: "retry_after_held",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res2 = await handleSendNotification(env.DB, testEnv, req2);
+      expect(res2.status).toBe(200);
+      expect(sentThreadId).toBe(789); // Posted into the newly created topic!
+    });
+
+    it("poll_exhausted with onTopicUnavailable:'retry' -> 502 topic_unavailable", async () => {
+      const sessionId = "ses_iqpd_poll_exhausted_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      // Reserve the session row so this caller is not the winner
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "another-machine",
+        chatId: topicChatId,
+        name: "pigeon · exhausted",
+        now: Date.now(),
+      });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Poll exhausted",
+          title: "exhausted",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(502);
+
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.error).toBe("topic_unavailable");
+      expect(json.reason).toBe("poll_exhausted");
+      expect(json).not.toHaveProperty("retryAfter");
+      expect(json).not.toHaveProperty("details");
+    });
+
+    // Note: finalize_lost_no_winner under handleSendNotification requires racing an async D1 delete
+    // inside synchronous fetchMock interceptors; covered by resolveTopic unit test at line 7977.
   });
 
   describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {

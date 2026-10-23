@@ -111,6 +111,39 @@ export function getTelegramErrorDetails(result: TgResult<unknown>): unknown {
 }
 
 /**
+ * Is a failed topic send PERMANENT — i.e. is the topic itself unusable, such that retrying into
+ * it can only fail again?
+ *
+ * Only a permanent failure justifies relocating a notification to General. A transient one
+ * (5xx, or an outcome we cannot classify) must surface as a 502 so the daemon's outbox retries
+ * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
+ * General and was never seen (pigeon-bit4).
+ *
+ * `errorCode === undefined` means a 200 whose body did not parse (telegram.ts parseTgResponse),
+ * which most likely means Telegram PROCESSED the send. Treating it as transient risks a
+ * duplicate in the correct topic; treating it as permanent guarantees a misfiled copy. The
+ * duplicate is the better-placed risk.
+ */
+export function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
+  if (result.ok) return false;
+  switch (result.kind) {
+    case "rate_limited":
+      // Never reached (callers exclude it first), but 429 is explicitly transient.
+      return false;
+    case "error":
+      return (
+        typeof result.errorCode === "number" &&
+        result.errorCode >= 400 &&
+        result.errorCode < 500
+      );
+    default:
+      // thread_not_found reaching the fallback means the recreate-and-retry above already
+      // failed; topic_not_modified cannot come from sendMessage. Both are 4xx-class.
+      return true;
+  }
+}
+
+/**
  * A Telegram call at or above this many milliseconds is logged at `warn` rather than `log`.
  *
  * Not a timeout and not a behaviour change — nothing is aborted at this boundary. It exists

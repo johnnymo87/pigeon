@@ -262,6 +262,19 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     if (getTelegramErrorCode(result.body) === 400) {
       return "neutral";
     }
+    // A 502 with error "topic_unavailable" (pigeon-iqpd) is the worker holding a transient
+    // topic-resolution failure (Telegram createForumTopic 5xx / poll_exhausted) for outbox retry.
+    // One held entry produces 5 samples over ~105s and would otherwise page "Worker
+    // /notifications/send is failing" and then a recovery, both naming the wrong component.
+    // The relocation alert after the hold window is the human-facing signal; the existing
+    // "worker 5xx not counted" journal line still records it.
+    if (
+      result.body &&
+      typeof result.body === "object" &&
+      (result.body as { error?: unknown }).error === "topic_unavailable"
+    ) {
+      return "neutral";
+    }
     return "server_error";
   }
   // No per-status cases in the 4xx range, and that is the point: 401 from a rotated token,
@@ -361,8 +374,8 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
         // quiet, so it is also the one case that would otherwise leave no trace at all.
         // Leave a journal line: "no durable record" is what made the outage that motivated
         // this alarm undiagnosable. Since pigeon-5typ the samples reaching here are the
-        // carved-out 502, the unreachable app_rejection, and an http_error below 400 —
-        // an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
+        // carved-out 502 (Telegram 400 or topic_unavailable), the unreachable app_rejection,
+        // and an http_error below 400 — an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
         // any other non-ok response. That last one stays silent even here, since the guard
         // below is deliberately 5xx-only; it is remote enough not to be worth a line.
         if (result.kind === "http_error" && result.status >= 500) {

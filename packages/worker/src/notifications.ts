@@ -1,6 +1,6 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
-import { createTelegramClient, getTelegramErrorDetails, TelegramClient, TgResult } from "./telegram";
+import { createTelegramClient, getTelegramErrorDetails, isPermanentTopicFailure, TelegramClient, TgResult } from "./telegram";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { getBindingForSession } from "./named-topics";
@@ -17,6 +17,7 @@ interface SendNotificationBody {
   title?: string;
   dir?: string;
   threaded?: boolean;
+  onTopicUnavailable?: "retry" | "general";
 }
 
 interface SessionRow {
@@ -34,39 +35,6 @@ interface MessageRow {
   token: string;
   notification_id: string | null;
   created_at: number;
-}
-
-/**
- * Is a failed topic send PERMANENT — i.e. is the topic itself unusable, such that retrying into
- * it can only fail again?
- *
- * Only a permanent failure justifies relocating a notification to General. A transient one
- * (5xx, or an outcome we cannot classify) must surface as a 502 so the daemon's outbox retries
- * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
- * General and was never seen (pigeon-bit4).
- *
- * `errorCode === undefined` means a 200 whose body did not parse (telegram.ts parseTgResponse),
- * which most likely means Telegram PROCESSED the send. Treating it as transient risks a
- * duplicate in the correct topic; treating it as permanent guarantees a misfiled copy. The
- * duplicate is the better-placed risk.
- */
-function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
-  if (result.ok) return false;
-  switch (result.kind) {
-    case "rate_limited":
-      // Never reached (callers exclude it first), but 429 is explicitly transient.
-      return false;
-    case "error":
-      return (
-        typeof result.errorCode === "number" &&
-        result.errorCode >= 400 &&
-        result.errorCode < 500
-      );
-    default:
-      // thread_not_found reaching the fallback means the recreate-and-retry above already
-      // failed; topic_not_modified cannot come from sendMessage. Both are 4xx-class.
-      return true;
-  }
 }
 
 /**
@@ -137,7 +105,9 @@ const json = (body: unknown, status = 200) =>
  * in particular is the per-session, transient, silent case that arises under precisely the
  * Telegram latency that produced the pigeon-bit4 incident. An hourly count would have slept
  * through it. Working from the reason instead of the columns covers all five paths and needs
- * no window, no watermark, and no new state.
+ * no window, no watermark, and no new state. Note: with `onTopicUnavailable: "retry"`,
+ * transient topic-resolution failures are held for retry (returning 502) without relocating
+ * or alerting; this alert only fires when a notification actually relocates to General (pigeon-iqpd).
  *
  * Destination is the first entry of ALLOWED_CHAT_IDS, matching `checkSessionHighWaterAlert`.
  * In production that is a private chat with the bot, so the alert does not land in the very
@@ -344,6 +314,7 @@ export async function handleSendNotification(
     const body = (await request.json()) as SendNotificationBody;
     const { sessionId, chatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
     const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
+    const holdForTopic = body.onTopicUnavailable === "retry";
 
     // Validate required fields
     if (!sessionId || !chatId || !text) {
@@ -447,6 +418,27 @@ export async function handleSendNotification(
         return json({ error: "rate_limited", retryAfter: topicRes.retryAfter }, 429);
       }
 
+      // pigeon-iqpd: transient topic-resolution failures must be retried into the right topic
+      // like the send path's pigeon-bit4 rule; the daemon bounds the hold by time, so the worker
+      // only obeys the flag; absent flag = legacy behaviour for version skew since the worker
+      // deploys centrally and daemons per-machine.
+      if (topicRes.ok && topicRes.messageThreadId === null && topicRes.transient && holdForTopic) {
+        const reason = topicRes.reason ?? "no_topic";
+        console.warn("[worker] topic unavailable, holding notification for retry", {
+          sessionId,
+          reason,
+          createError: topicRes.createError,
+        });
+        const payload: { error: string; reason: string; createError?: unknown } = {
+          error: "topic_unavailable",
+          reason,
+        };
+        if (topicRes.createError !== undefined) {
+          payload.createError = topicRes.createError;
+        }
+        return json(payload, 502);
+      }
+
       if (topicRes.ok && topicRes.messageThreadId !== null) {
         messageThreadId = topicRes.messageThreadId;
         intendedThreadId = topicRes.messageThreadId;
@@ -493,6 +485,29 @@ export async function handleSendNotification(
 
       if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
         return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
+      }
+
+      if (
+        retryTopicRes.ok &&
+        retryTopicRes.messageThreadId === null &&
+        retryTopicRes.transient &&
+        holdForTopic
+      ) {
+        const innerReason = retryTopicRes.reason;
+        const reason = innerReason ? `recreate_failed:${innerReason}` : "recreate_failed";
+        console.warn("[worker] topic unavailable, holding notification for retry", {
+          sessionId,
+          reason,
+          createError: retryTopicRes.createError,
+        });
+        const payload: { error: string; reason: string; createError?: unknown } = {
+          error: "topic_unavailable",
+          reason,
+        };
+        if (retryTopicRes.createError !== undefined) {
+          payload.createError = retryTopicRes.createError;
+        }
+        return json(payload, 502);
       }
 
       // Adopt the recreated thread for EVERYTHING downstream, not just this retry.

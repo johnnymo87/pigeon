@@ -200,6 +200,24 @@ describe("OutboxRepository", () => {
     storage.db.close();
   });
 
+  it("reschedule updates next_retry_at and updated_at without touching attempts, retry_count, or last_error", () => {
+    const storage = createStorage();
+    const now = 10_000;
+
+    storage.outbox.upsert(BASE_INPUT, now);
+    storage.outbox.reschedule("notif-1", now, 15_000);
+
+    const record = storage.outbox.getByNotificationId("notif-1");
+    expect(record!.state).toBe("queued");
+    expect(record!.attempts).toBe(0);
+    expect(record!.retryCount).toBe(0);
+    expect(record!.nextRetryAt).toBe(now + 15_000);
+    expect(record!.updatedAt).toBe(now);
+    expect(record!.lastError).toBeNull();
+
+    storage.db.close();
+  });
+
   it("resets failed entries (including failedReason and lastError) to queued on re-upsert and updates created_at", () => {
     const storage = createStorage();
 

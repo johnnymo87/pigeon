@@ -1,5 +1,5 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { createTelegramClient, getTelegramErrorDetails, type TelegramClient } from "./telegram";
+import { createTelegramClient, getTelegramErrorDetails, isPermanentTopicFailure, type TelegramClient } from "./telegram";
 import {
   deleteBySession,
   deleteTopicBySession,
@@ -23,9 +23,20 @@ export type ResolveTopicResult =
   // clear Telegram's auto-pin of the first message posted into a new topic (pigeon-ud6s).
   | { ok: true; messageThreadId: number; created?: boolean }
   // `reason` names WHY no topic was resolved, so the caller can report the fallback instead of
-  // only logging it. These three paths write no intended_thread_id, which is exactly why the
+  // only logging it. These paths write no intended_thread_id, which is exactly why the
   // messages column pair cannot see them (pigeon-t5bd).
-  | { ok: true; messageThreadId: null; created?: boolean; reason?: string }
+  // `transient` indicates whether the resolution failure is transient (true) or permanent (false).
+  // When the caller requests `onTopicUnavailable: "retry"`, transient failures are held for retry
+  // (returning 502) rather than relocating to General (pigeon-iqpd).
+  // `createError` carries the underlying Telegram error details when topic creation failed.
+  | {
+      ok: true;
+      messageThreadId: null;
+      created?: boolean;
+      reason?: string;
+      transient: boolean;
+      createError?: unknown;
+    }
   | { ok: false; kind: "rate_limited"; retryAfter: number };
 
 export interface ResolveTopicOptions {
@@ -43,7 +54,7 @@ export interface ResolveTopicOptions {
   tgClient?: TelegramClient;
 }
 
-export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations
+export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
 
 /**
  * Resolves a Telegram forum topic for a session using a reservation protocol with TTL,
@@ -137,7 +148,7 @@ export async function resolveTopic(
       messageThreadId: row.message_thread_id,
       reason: "topic_in_other_chat",
     });
-    return { ok: true, messageThreadId: null, reason: "topic_in_other_chat" };
+    return { ok: true, messageThreadId: null, reason: "topic_in_other_chat", transient: false };
   }
 
   // 1. Existing topic lookup
@@ -245,13 +256,22 @@ export async function resolveTopic(
           retryAfter: createRes.retryAfter,
         };
       }
-      // Non-429 failure -> fall back to General (pigeon-bit4: say so; this was silent)
-      console.warn("[worker] topic creation failed, notification will go to General", {
+      const transient = !isPermanentTopicFailure(createRes);
+      const createError = getTelegramErrorDetails(createRes);
+      // Non-429 failure -> topic resolution failed (pigeon-bit4: say so; this was silent)
+      console.warn("[worker] topic creation failed", {
         sessionId: opts.sessionId,
         reason: "create_failed",
-        details: getTelegramErrorDetails(createRes),
+        transient,
+        details: createError,
       });
-      return { ok: true, messageThreadId: null, reason: "create_failed" };
+      return {
+        ok: true,
+        messageThreadId: null,
+        reason: "create_failed",
+        transient,
+        createError,
+      };
     }
 
     const threadId = createRes.result.message_thread_id;
@@ -293,11 +313,12 @@ export async function resolveTopic(
       return { ok: true, messageThreadId: winnerRow.message_thread_id };
     }
     // Lost the CAS and the winner's row is gone or still unfinalized (pigeon-bit4: was silent).
-    console.warn("[worker] no topic resolved, notification will go to General", {
+    console.warn("[worker] no topic resolved", {
       sessionId: opts.sessionId,
       reason: "finalize_lost_no_winner",
+      transient: true,
     });
-    return { ok: true, messageThreadId: null, reason: "finalize_lost_no_winner" };
+    return { ok: true, messageThreadId: null, reason: "finalize_lost_no_winner", transient: true };
   }
 
   // 2. Reserve
@@ -356,12 +377,11 @@ export async function resolveTopic(
     }
   }
 
-  // Fall back to General. Reached when the bounded poll expired without the winner finalizing
-  // and the reservation is not yet stale enough to steal -- plausible under exactly the load
-  // that produced the pigeon-bit4 incident, and previously silent.
-  console.warn("[worker] no topic resolved, notification will go to General", {
+  // Bounded poll expired without the winner finalizing and the reservation is not yet stale enough to steal.
+  console.warn("[worker] no topic resolved", {
     sessionId: opts.sessionId,
     reason: "poll_exhausted",
+    transient: true,
   });
-  return { ok: true, messageThreadId: null, reason: "poll_exhausted" };
+  return { ok: true, messageThreadId: null, reason: "poll_exhausted", transient: true };
 }
