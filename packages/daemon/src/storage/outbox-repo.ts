@@ -223,6 +223,23 @@ export class OutboxRepository {
       .run(countAttempt ? 1 : 0, now + backoffMs, lastError ?? null, now, id);
   }
 
+  /**
+   * Reschedule an entry to run after delayMs without modifying attempts,
+   * retry_count, or last_error. Used when an entry is deferred (e.g. waiting
+   * behind a session topic hold).
+   */
+  reschedule(id: string, now = Date.now(), delayMs: number): void {
+    this.db
+      .prepare(
+        `UPDATE outbox
+         SET state = 'queued',
+             next_retry_at = ?,
+             updated_at = ?
+         WHERE notification_id = ?`,
+      )
+      .run(now + delayMs, now, id);
+  }
+
   markFailed(id: string, now = Date.now(), reason?: string, lastError?: string): void {
     this.db
       .prepare(

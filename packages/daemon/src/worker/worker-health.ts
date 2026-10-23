@@ -374,8 +374,8 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
         // quiet, so it is also the one case that would otherwise leave no trace at all.
         // Leave a journal line: "no durable record" is what made the outage that motivated
         // this alarm undiagnosable. Since pigeon-5typ the samples reaching here are the
-        // carved-out 502, the unreachable app_rejection, and an http_error below 400 —
-        // an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
+        // carved-out 502 (Telegram 400 or topic_unavailable), the unreachable app_rejection,
+        // and an http_error below 400 — an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
         // any other non-ok response. That last one stays silent even here, since the guard
         // below is deliberately 5xx-only; it is remote enough not to be worth a line.
         if (result.kind === "http_error" && result.status >= 500) {
