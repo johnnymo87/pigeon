@@ -20,6 +20,7 @@ export interface SendNotificationInput {
   title?: string;
   dir?: string;
   threaded?: boolean;
+  onTopicUnavailable?: "retry" | "general";
 }
 
 export type WorkerResultSuccess<T = unknown> = {
@@ -863,7 +864,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded } = input;
+    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -882,6 +883,7 @@ export class Poller {
           ...(title ? { title } : {}),
           ...(dir ? { dir } : {}),
           ...(threaded !== undefined ? { threaded } : {}),
+          ...(onTopicUnavailable !== undefined ? { onTopicUnavailable } : {}),
         }),
       }),
     );

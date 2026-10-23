@@ -614,6 +614,43 @@ describe("Poller.sendNotification()", () => {
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.media).toBeUndefined();
   });
+
+  it("includes onTopicUnavailable in POST body when provided", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    ) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    await poller.sendNotification({
+      sessionId: "sess-1",
+      chatId: "chat-123",
+      text: "Hello!",
+      replyMarkup: { inline_keyboard: [] },
+      onTopicUnavailable: "retry",
+    });
+
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.onTopicUnavailable).toBe("retry");
+  });
+
+  it("omits onTopicUnavailable field when undefined", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    ) as unknown as typeof fetch;
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+
+    await poller.sendNotification({
+      sessionId: "sess-1",
+      chatId: "chat-123",
+      text: "Hello!",
+      replyMarkup: { inline_keyboard: [] },
+    });
+
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.onTopicUnavailable).toBeUndefined();
+  });
 });
 
 describe("Poller.uploadMedia()", () => {

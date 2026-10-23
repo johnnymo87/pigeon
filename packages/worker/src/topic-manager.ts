@@ -54,7 +54,7 @@ export interface ResolveTopicOptions {
   tgClient?: TelegramClient;
 }
 
-export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations
+export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
 
 /**
  * Resolves a Telegram forum topic for a session using a reservation protocol with TTL,

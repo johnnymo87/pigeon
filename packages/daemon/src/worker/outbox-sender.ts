@@ -73,6 +73,17 @@ export interface OutboxSenderOptions {
 export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
 
 /**
+ * How long an outbox entry transiently held on topic resolution failure (HTTP 502 topic_unavailable)
+ * will pass onTopicUnavailable="retry" before falling back to onTopicUnavailable="general" (relocating to General).
+ *
+ * It must exceed the worker's RESERVATION_TTL_MS (120s, packages/worker/src/topic-manager.ts)
+ * because a reservation stranded by a dead request yields poll_exhausted until it is stealable at 120s;
+ * the cost is that during a real createForumTopic outage a notification can be ~2.5 min late before
+ * it falls back to General.
+ */
+export const TOPIC_HOLD_WINDOW_MS = 150_000;
+
+/**
  * Re-check interval while a swarm notice waits for its local row. Not shorter: a
  * held swarm row ranks ahead of mirror rows in `getReady`, so frequent rechecks of
  * a burst of foreign notices would crowd the 5-entry batch.
@@ -270,6 +281,16 @@ export class OutboxSender {
    */
   private reregisteredEntries = new Set<string>();
 
+  /**
+   * Tracks when a topic hold window began for an outbox entry, keyed by notificationId.
+   * If a transient topic resolution failure occurs (HTTP 502 topic_unavailable), the entry
+   * is held with onTopicUnavailable="retry" for up to TOPIC_HOLD_WINDOW_MS. Once the window
+   * has elapsed since the first hold, subsequent attempts pass "general" to relocate to General
+   * rather than holding until outbox TTL (which would terminally drop the message).
+   * Kept in-memory: losing the map on daemon restart only grants a fresh window — acceptable.
+   */
+  private topicHoldStartedAt = new Map<string, number>();
+
   constructor(opts: OutboxSenderOptions) {
     this.storage = opts.storage;
     this.sendNotification = opts.sendNotification;
@@ -297,6 +318,7 @@ export class OutboxSender {
   ): void {
     this.storage.outbox.markFailed(entry.notificationId, now, reason, lastError);
     this.reregisteredEntries.delete(entry.notificationId);
+    this.topicHoldStartedAt.delete(entry.notificationId);
     const ageMs = now - entry.createdAt;
     this.log("outbox terminal drop", {
       notificationId: entry.notificationId,
@@ -530,6 +552,12 @@ export class OutboxSender {
             if (LOW_PRIORITY_KINDS.has(entry.kind)) {
               this.lowPrioritySendTimestamps.push(this.nowFn());
             }
+            const holdStarted = this.topicHoldStartedAt.get(entry.notificationId);
+            const now = this.nowFn();
+            const onTopicUnavailable: "retry" | "general" =
+              holdStarted === undefined || now - holdStarted < TOPIC_HOLD_WINDOW_MS
+                ? "retry"
+                : "general";
             const result = await this.sendNotification({
               sessionId: entry.sessionId,
               chatId: this.chatId,
@@ -540,10 +568,34 @@ export class OutboxSender {
               title,
               dir,
               threaded,
+              onTopicUnavailable,
             });
 
             if (!result.ok) {
               allOk = false;
+              if (
+                result.kind === "http_error" &&
+                result.status === 502 &&
+                result.body &&
+                typeof result.body === "object" &&
+                (result.body as { error?: unknown }).error === "topic_unavailable"
+              ) {
+                const now = this.nowFn();
+                if (!this.topicHoldStartedAt.has(entry.notificationId)) {
+                  this.topicHoldStartedAt.set(entry.notificationId, now);
+                }
+                deferredSessions.add(entry.sessionId);
+                const holdStarted = this.topicHoldStartedAt.get(entry.notificationId)!;
+                const heldForMs = now - holdStarted;
+                const reason = (result.body as { reason?: unknown }).reason;
+                this.log("outbox entry held for topic", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  reason,
+                  heldForMs,
+                });
+              }
+
               const localSession = this.storage.sessions.get(entry.sessionId);
               const hasLocalSession = localSession !== null;
               const alreadyReregistered = this.reregisteredEntries.has(entry.notificationId);
@@ -748,6 +800,7 @@ export class OutboxSender {
           if (allOk) {
             commitDelivery(this.storage, entry, now, messages.length, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
+            this.topicHoldStartedAt.delete(entry.notificationId);
           }
         } catch (err) {
           const backoff = getBackoff(entry.retryCount);

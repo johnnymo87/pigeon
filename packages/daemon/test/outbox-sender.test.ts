@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb } from "../src/storage/database";
 import type { StorageDb } from "../src/storage/database";
 import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
-import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET, SWARM_LOCAL_SESSION_GRACE_MS } from "../src/worker/outbox-sender";
+import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET, SWARM_LOCAL_SESSION_GRACE_MS, TOPIC_HOLD_WINDOW_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
 
@@ -51,6 +51,7 @@ describe("OutboxSender.processOnce()", () => {
       replyMarkup: { inline_keyboard: [] },
       notificationId: "notif-1",
       entities: [{ offset: 0, length: 5, type: "bold" }],
+      onTopicUnavailable: "retry",
     });
 
     const record = storage.outbox.getByNotificationId("notif-1");
@@ -95,6 +96,7 @@ describe("OutboxSender.processOnce()", () => {
       replyMarkup: { inline_keyboard: [] },
       notificationId: "notif-entities-1",
       entities,
+      onTopicUnavailable: "retry",
     });
   });
 
@@ -135,6 +137,7 @@ describe("OutboxSender.processOnce()", () => {
       title: "Fix bug",
       dir: "/home/dev/pigeon",
       threaded: true,
+      onTopicUnavailable: "retry",
     });
   });
 
@@ -3134,5 +3137,276 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
     const row = storage.outbox.getByNotificationId("w:gse_silent_msg")!;
     expect(row.state).toBe("failed");
     expect(row.failedReason).toBe("notify_false_goose");
+  });
+});
+
+describe("topic hold window (pigeon-iqpd)", () => {
+  let storage: StorageDb;
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  it("first send passes onTopicUnavailable: 'retry'", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(sendNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        onTopicUnavailable: "retry",
+      }),
+    );
+  });
+
+  it("a topic_unavailable 502 schedules a retry, does not count an attempt, does NOT pause the outbox", async () => {
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "n-held", sessionId: "s-1" }, 1_000);
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { error: "topic_unavailable", reason: "poll_exhausted" },
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    await sender.processOnce();
+
+    const record = storage.outbox.getByNotificationId("n-held")!;
+    expect(record.state).toBe("queued");
+    expect(record.attempts).toBe(0);
+    expect(record.retryCount).toBe(1);
+    expect((sender as any).pausedUntil).toBe(0);
+
+    // Another session queued in the next tick is processed without pause
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "n-other", sessionId: "s-2" }, 5_100);
+    now = 5_200;
+    (sendNotification as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, kind: "success", status: 200, body: {} });
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId("n-other")!.state).toBe("sent");
+  });
+
+  it("passes 'retry' within the window, and 'general' after TOPIC_HOLD_WINDOW_MS has elapsed", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sendCalls: SendNotificationInput[] = [];
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      sendCalls.push(input);
+      return {
+        ok: false,
+        kind: "http_error",
+        status: 502,
+        body: { error: "topic_unavailable", reason: "create_failed" },
+      };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Send 1 (at t=5_000): first attempt, no hold started yet -> passes "retry"
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]!.onTopicUnavailable).toBe("retry");
+
+    // Send 2 (at t=5_000 + 10_000): within TOPIC_HOLD_WINDOW_MS (150s) -> passes "retry"
+    now += 10_000;
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(2);
+    expect(sendCalls[1]!.onTopicUnavailable).toBe("retry");
+
+    // Send 3 (at t=5_000 + TOPIC_HOLD_WINDOW_MS + 1): window elapsed -> passes "general"
+    now = 5_000 + TOPIC_HOLD_WINDOW_MS + 1;
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(3);
+    expect(sendCalls[2]!.onTopicUnavailable).toBe("general");
+  });
+
+  it("after a held 502, a later entry for the SAME session in the same batch is deferred; a DIFFERENT session is sent", async () => {
+    const makePayload = (id: string) =>
+      JSON.stringify({ message: { text: "msg" }, replyMarkup: { inline_keyboard: [] }, notificationId: id });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "n-s1-first", sessionId: "sess-1", payload: makePayload("n-s1-first") }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "n-s1-second", sessionId: "sess-1", payload: makePayload("n-s1-second") }, 1_001);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "n-s2-entry", sessionId: "sess-2", payload: makePayload("n-s2-entry") }, 1_002);
+
+    const sentNotificationIds: (string | undefined)[] = [];
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      sentNotificationIds.push(input.notificationId);
+      if (input.sessionId === "sess-1") {
+        return {
+          ok: false,
+          kind: "http_error",
+          status: 502,
+          body: { error: "topic_unavailable", reason: "poll_exhausted" },
+        };
+      }
+      return { ok: true, kind: "success", status: 200, body: {} };
+    }) as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    // n-s1-first attempted and held; n-s1-second deferred (not sent); n-s2-entry sent successfully
+    expect(sentNotificationIds).toEqual(["n-s1-first", "n-s2-entry"]);
+    expect(storage.outbox.getByNotificationId("n-s1-first")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("n-s1-second")!.state).toBe("queued");
+    expect(storage.outbox.getByNotificationId("n-s2-entry")!.state).toBe("sent");
+  });
+
+  it("a swarm entry that went through local-session grace hold still gets 'retry' on its first real send", async () => {
+    storage.outbox.upsert({
+      ...BASE_OUTBOX_INPUT,
+      notificationId: "w:ses_grace",
+      sessionId: "ses_grace",
+      kind: "swarm",
+      payload: JSON.stringify({ messages: [{ text: "swarm payload" }], notificationId: "w:ses_grace" }),
+    }, 1_000);
+
+    const sentInputs: SendNotificationInput[] = [];
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      sentInputs.push(input);
+      return { ok: true, kind: "success", status: 200, body: {} };
+    }) as SendNotificationFn;
+
+    let now = 1_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+      gateSwarmOnLocalSession: true,
+    });
+
+    // Grace tick 1: session not found, uncounted markRetry
+    await sender.processOnce();
+    expect(sendNotification).not.toHaveBeenCalled();
+    expect(storage.outbox.getByNotificationId("w:ses_grace")!.retryCount).toBe(1);
+
+    // Grace tick 2: still no session row
+    now += 16_000;
+    await sender.processOnce();
+    expect(sendNotification).not.toHaveBeenCalled();
+    expect(storage.outbox.getByNotificationId("w:ses_grace")!.retryCount).toBe(2);
+
+    // Session row created before grace expires
+    storage.sessions.upsert({ sessionId: "ses_grace" }, now);
+    now += 16_000;
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    expect(sentInputs[0]!.onTopicUnavailable).toBe("retry");
+    expect(storage.outbox.getByNotificationId("w:ses_grace")!.state).toBe("sent");
+  });
+
+  it("clears map entry on successful delivery", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    let attempt = 0;
+    const sendNotification = vi.fn().mockImplementation(async () => {
+      attempt++;
+      if (attempt === 1) {
+        return {
+          ok: false,
+          kind: "http_error",
+          status: 502,
+          body: { error: "topic_unavailable", reason: "poll_exhausted" },
+        };
+      }
+      return { ok: true, kind: "success", status: 200, body: {} };
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Attempt 1: 502 topic_unavailable -> map has entry
+    await sender.processOnce();
+    expect((sender as any).topicHoldStartedAt.has(BASE_OUTBOX_INPUT.notificationId)).toBe(true);
+
+    // Attempt 2: success -> map entry deleted
+    now += 10_000;
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId(BASE_OUTBOX_INPUT.notificationId)!.state).toBe("sent");
+    expect((sender as any).topicHoldStartedAt.has(BASE_OUTBOX_INPUT.notificationId)).toBe(false);
+  });
+
+  it("clears map entry on terminal drop", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { error: "topic_unavailable", reason: "poll_exhausted" },
+    }) as SendNotificationFn;
+
+    let now = 5_000;
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => now,
+    });
+
+    // Attempt 1: 502 topic_unavailable -> map has entry
+    await sender.processOnce();
+    expect((sender as any).topicHoldStartedAt.has(BASE_OUTBOX_INPUT.notificationId)).toBe(true);
+
+    // Advance time past expiryForKind ("question" = PENDING_QUESTION_TTL_MS = 4h)
+    now = 1_000 + 4 * 60 * 60 * 1000 + 10;
+    await sender.processOnce();
+    expect(storage.outbox.getByNotificationId(BASE_OUTBOX_INPUT.notificationId)!.state).toBe("failed");
+    expect((sender as any).topicHoldStartedAt.has(BASE_OUTBOX_INPUT.notificationId)).toBe(false);
+  });
+
+  it("a non-topic 502 does not start a hold", async () => {
+    storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
+    const sendNotification = vi.fn().mockResolvedValue({
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { error: "Telegram API error", details: "Bad Gateway" },
+    }) as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(storage.outbox.getByNotificationId(BASE_OUTBOX_INPUT.notificationId)!.state).toBe("queued");
+    expect((sender as any).topicHoldStartedAt.has(BASE_OUTBOX_INPUT.notificationId)).toBe(false);
   });
 });
