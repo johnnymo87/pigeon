@@ -262,6 +262,19 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     if (getTelegramErrorCode(result.body) === 400) {
       return "neutral";
     }
+    // A 502 with error "topic_unavailable" (pigeon-iqpd) is the worker holding a transient
+    // topic-resolution failure (Telegram createForumTopic 5xx / poll_exhausted) for outbox retry.
+    // One held entry produces 5 samples over ~105s and would otherwise page "Worker
+    // /notifications/send is failing" and then a recovery, both naming the wrong component.
+    // The relocation alert after the hold window is the human-facing signal; the existing
+    // "worker 5xx not counted" journal line still records it.
+    if (
+      result.body &&
+      typeof result.body === "object" &&
+      (result.body as { error?: unknown }).error === "topic_unavailable"
+    ) {
+      return "neutral";
+    }
     return "server_error";
   }
   // No per-status cases in the 4xx range, and that is the point: 401 from a rotated token,

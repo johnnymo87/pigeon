@@ -177,6 +177,19 @@ describe("classifyWorkerHealthSample", () => {
     ).toBe("neutral");
   });
 
+  it("treats a 502 with error 'topic_unavailable' as neutral, not a server error (pigeon-iqpd)", () => {
+    expect(
+      classifyWorkerHealthSample(
+        serverError(502, { error: "topic_unavailable", reason: "create_failed", createError: { error_code: 520 } }),
+      ),
+    ).toBe("neutral");
+    expect(
+      classifyWorkerHealthSample(
+        serverError(502, { error: "topic_unavailable", reason: "poll_exhausted" }),
+      ),
+    ).toBe("neutral");
+  });
+
   /**
    * The exclusion is exactly 400 and nothing wider. The worker relays EVERY Telegram
    * error as 502 carrying that code (worker/telegram.ts getTelegramErrorDetails), so a

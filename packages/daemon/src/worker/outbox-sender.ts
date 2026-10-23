@@ -73,13 +73,18 @@ export interface OutboxSenderOptions {
 export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
 
 /**
- * How long an outbox entry transiently held on topic resolution failure (HTTP 502 topic_unavailable)
- * will pass onTopicUnavailable="retry" before falling back to onTopicUnavailable="general" (relocating to General).
+ * How long a session's topic hold window lasts upon transient topic resolution failure
+ * (HTTP 502 topic_unavailable) before falling back to onTopicUnavailable="general" (relocating to General).
+ *
+ * Keyed per session: sibling entries wait uncounted across ticks until the hold resolves so
+ * two stops never appear reversed and each does not probe createForumTopic during a hang outage.
+ * Holder retry backoffs within the window are clamped to this edge so fallback lands near 150s.
+ *
+ * Latency: fallback occurs on the first attempt at or after 150s from the initial hold, plus
+ * however long the Telegram call itself takes (e.g. a 57s hang).
  *
  * It must exceed the worker's RESERVATION_TTL_MS (120s, packages/worker/src/topic-manager.ts)
- * because a reservation stranded by a dead request yields poll_exhausted until it is stealable at 120s;
- * the cost is that during a real createForumTopic outage a notification can be ~2.5 min late before
- * it falls back to General.
+ * because a reservation stranded by a dead request yields poll_exhausted until it is stealable at 120s.
  */
 export const TOPIC_HOLD_WINDOW_MS = 150_000;
 
@@ -282,14 +287,16 @@ export class OutboxSender {
   private reregisteredEntries = new Set<string>();
 
   /**
-   * Tracks when a topic hold window began for an outbox entry, keyed by notificationId.
-   * If a transient topic resolution failure occurs (HTTP 502 topic_unavailable), the entry
-   * is held with onTopicUnavailable="retry" for up to TOPIC_HOLD_WINDOW_MS. Once the window
-   * has elapsed since the first hold, subsequent attempts pass "general" to relocate to General
-   * rather than holding until outbox TTL (which would terminally drop the message).
+   * Tracks topic hold windows per session, keyed by sessionId.
+   *
+   * Sibling entries must not overtake a held entry across ticks (two stops would appear
+   * reversed) and must not each start their own 150s window and createForumTopic probes
+   * (during a hang outage each probe stalls the serial outbox ~57s). A holder that vanishes
+   * (deleted elsewhere) blocks siblings for at most one window.
+   *
    * Kept in-memory: losing the map on daemon restart only grants a fresh window — acceptable.
    */
-  private topicHoldStartedAt = new Map<string, number>();
+  private topicHolds = new Map<string, { startedAt: number; holderId: string }>();
 
   constructor(opts: OutboxSenderOptions) {
     this.storage = opts.storage;
@@ -318,7 +325,10 @@ export class OutboxSender {
   ): void {
     this.storage.outbox.markFailed(entry.notificationId, now, reason, lastError);
     this.reregisteredEntries.delete(entry.notificationId);
-    this.topicHoldStartedAt.delete(entry.notificationId);
+    const hold = this.topicHolds.get(entry.sessionId);
+    if (hold && hold.holderId === entry.notificationId) {
+      this.topicHolds.delete(entry.sessionId);
+    }
     const ageMs = now - entry.createdAt;
     this.log("outbox terminal drop", {
       notificationId: entry.notificationId,
@@ -374,6 +384,7 @@ export class OutboxSender {
       const entries = this.storage.outbox.getReady(now, 5);
       const deferredSessions = new Set<string>();
       const deferredLowPrioritySessions = new Set<string>();
+      let loggedTopicHoldDeferral = false;
       let loggedSubBudgetDeferral = false;
       let loggedGovernorChunkDeferral = false;
 
@@ -415,6 +426,37 @@ export class OutboxSender {
 
         if (age > expiryMs) {
           this.markTerminal(entry, now, "expired", undefined, { expiryMs });
+          continue;
+        }
+
+        // Sibling ordering across ticks (pigeon-iqpd): siblings of a session whose topic
+        // is currently held must wait behind the holder rather than sending concurrently or
+        // overtaking it across ticks. Placed after terminal checks so an expired entry is
+        // terminally dropped rather than repeatedly rescheduled. Placed before governor/parsing checks
+        // so waiting siblings consume no send window budget or parse effort.
+        const sessionHold = this.topicHolds.get(entry.sessionId);
+        if (
+          sessionHold &&
+          entry.notificationId !== sessionHold.holderId &&
+          now - sessionHold.startedAt < TOPIC_HOLD_WINDOW_MS
+        ) {
+          const delayMs = Math.max(
+            1_000,
+            Math.min(15_000, sessionHold.startedAt + TOPIC_HOLD_WINDOW_MS - now),
+          );
+          // Uncounted: waiting for holder topic resolution is not a delivery failure.
+          this.storage.outbox.markRetry(entry.notificationId, now, delayMs, undefined, false);
+          deferredSessions.add(entry.sessionId);
+          if (!loggedTopicHoldDeferral) {
+            this.log("outbox entry waiting behind topic hold", {
+              notificationId: entry.notificationId,
+              sessionId: entry.sessionId,
+              holderId: sessionHold.holderId,
+              holdAgeMs: now - sessionHold.startedAt,
+              retryInMs: delayMs,
+            });
+            loggedTopicHoldDeferral = true;
+          }
           continue;
         }
 
@@ -552,11 +594,11 @@ export class OutboxSender {
             if (LOW_PRIORITY_KINDS.has(entry.kind)) {
               this.lowPrioritySendTimestamps.push(this.nowFn());
             }
-            const holdStarted = this.topicHoldStartedAt.get(entry.notificationId);
+            const sessionHold = this.topicHolds.get(entry.sessionId);
             const onTopicUnavailable: "retry" | "general" =
-              holdStarted === undefined || this.nowFn() - holdStarted < TOPIC_HOLD_WINDOW_MS
-                ? "retry"
-                : "general";
+              sessionHold && this.nowFn() - sessionHold.startedAt >= TOPIC_HOLD_WINDOW_MS
+                ? "general"
+                : "retry";
             const result = await this.sendNotification({
               sessionId: entry.sessionId,
               chatId: this.chatId,
@@ -572,6 +614,7 @@ export class OutboxSender {
 
             if (!result.ok) {
               allOk = false;
+              let topicHoldBackoffCap: number | undefined;
               if (
                 result.kind === "http_error" &&
                 result.status === 502 &&
@@ -580,13 +623,18 @@ export class OutboxSender {
                 (result.body as { error?: unknown }).error === "topic_unavailable"
               ) {
                 const heldAt = this.nowFn();
-                if (!this.topicHoldStartedAt.has(entry.notificationId)) {
-                  this.topicHoldStartedAt.set(entry.notificationId, heldAt);
+                let hold = this.topicHolds.get(entry.sessionId);
+                if (!hold) {
+                  hold = { startedAt: heldAt, holderId: entry.notificationId };
+                  this.topicHolds.set(entry.sessionId, hold);
                 }
                 // pigeon-81p ordering: a later entry for this session must neither overtake the
                 // held one nor re-hit the same (possibly hung) createForumTopic in this batch.
                 deferredSessions.add(entry.sessionId);
-                const heldForMs = heldAt - this.topicHoldStartedAt.get(entry.notificationId)!;
+                const heldForMs = heldAt - hold.startedAt;
+                if (heldForMs < TOPIC_HOLD_WINDOW_MS) {
+                  topicHoldBackoffCap = hold.startedAt + TOPIC_HOLD_WINDOW_MS - heldAt;
+                }
                 const reason = (result.body as { reason?: unknown }).reason;
                 this.log("outbox entry held for topic", {
                   notificationId: entry.notificationId,
@@ -781,7 +829,10 @@ export class OutboxSender {
               }
 
               // Default retry arm (action.action === "retry")
-              const backoff = getBackoff(entry.retryCount);
+              let backoff = getBackoff(entry.retryCount);
+              if (topicHoldBackoffCap !== undefined) {
+                backoff = Math.max(1_000, Math.min(backoff, topicHoldBackoffCap));
+              }
               const countAttempt = !isTransportFailure(result);
               this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), countAttempt);
               this.log("outbox entry delivery failed, scheduling retry", {
@@ -800,7 +851,7 @@ export class OutboxSender {
           if (allOk) {
             commitDelivery(this.storage, entry, now, messages.length, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
-            this.topicHoldStartedAt.delete(entry.notificationId);
+            this.topicHolds.delete(entry.sessionId);
           }
         } catch (err) {
           const backoff = getBackoff(entry.retryCount);

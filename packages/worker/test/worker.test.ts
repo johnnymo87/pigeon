@@ -10562,6 +10562,46 @@ describe("topics module and topicName", () => {
       expect(res2.status).toBe(200);
       expect(sentThreadId).toBe(789); // Posted into the newly created topic!
     });
+
+    it("poll_exhausted with onTopicUnavailable:'retry' -> 502 topic_unavailable", async () => {
+      const sessionId = "ses_iqpd_poll_exhausted_retry";
+      await registerSession(sessionId, "devbox", "pigeon");
+
+      // Reserve the session row so this caller is not the winner
+      await reserve(env.DB, {
+        sessionId,
+        machineId: "another-machine",
+        chatId: topicChatId,
+        name: "pigeon · exhausted",
+        now: Date.now(),
+      });
+
+      const request = new Request("https://worker/notifications/send", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          sessionId,
+          chatId: topicChatId,
+          text: "Poll exhausted",
+          title: "exhausted",
+          dir: "pigeon",
+          threaded: true,
+          onTopicUnavailable: "retry",
+        }),
+      });
+
+      const res = await handleSendNotification(env.DB, testEnv, request);
+      expect(res.status).toBe(502);
+
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.error).toBe("topic_unavailable");
+      expect(json.reason).toBe("poll_exhausted");
+      expect(json).not.toHaveProperty("retryAfter");
+      expect(json).not.toHaveProperty("details");
+    });
+
+    // Note: finalize_lost_no_winner under handleSendNotification requires racing an async D1 delete
+    // inside synchronous fetchMock interceptors; covered by resolveTopic unit test at line 7977.
   });
 
   describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {

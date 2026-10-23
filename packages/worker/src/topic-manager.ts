@@ -258,8 +258,8 @@ export async function resolveTopic(
       }
       const transient = !isPermanentTopicFailure(createRes);
       const createError = getTelegramErrorDetails(createRes);
-      // Non-429 failure -> fall back to General (pigeon-bit4: say so; this was silent)
-      console.warn("[worker] topic creation failed, notification will go to General", {
+      // Non-429 failure -> topic resolution failed (pigeon-bit4: say so; this was silent)
+      console.warn("[worker] topic creation failed", {
         sessionId: opts.sessionId,
         reason: "create_failed",
         transient,
@@ -313,9 +313,10 @@ export async function resolveTopic(
       return { ok: true, messageThreadId: winnerRow.message_thread_id };
     }
     // Lost the CAS and the winner's row is gone or still unfinalized (pigeon-bit4: was silent).
-    console.warn("[worker] no topic resolved, notification will go to General", {
+    console.warn("[worker] no topic resolved", {
       sessionId: opts.sessionId,
       reason: "finalize_lost_no_winner",
+      transient: true,
     });
     return { ok: true, messageThreadId: null, reason: "finalize_lost_no_winner", transient: true };
   }
@@ -376,12 +377,11 @@ export async function resolveTopic(
     }
   }
 
-  // Fall back to General. Reached when the bounded poll expired without the winner finalizing
-  // and the reservation is not yet stale enough to steal -- plausible under exactly the load
-  // that produced the pigeon-bit4 incident, and previously silent.
-  console.warn("[worker] no topic resolved, notification will go to General", {
+  // Bounded poll expired without the winner finalizing and the reservation is not yet stale enough to steal.
+  console.warn("[worker] no topic resolved", {
     sessionId: opts.sessionId,
     reason: "poll_exhausted",
+    transient: true,
   });
   return { ok: true, messageThreadId: null, reason: "poll_exhausted", transient: true };
 }
