@@ -303,13 +303,24 @@ export class OutboxSender {
    * (during a hang outage each probe stalls the serial outbox ~57s).
    *
    * If the holder fails terminally, markTerminal deletes the hold immediately. If the window
-   * elapses, the hold transitions to "general" mode and lingers for TOPIC_HOLD_LINGER_MS,
-   * allowing queued siblings to drain to General without starting fresh windows, before
-   * expiring so later notifications can attempt topic creation again.
+   * elapses, the hold transitions to "general" mode and lingers for TOPIC_HOLD_LINGER_MS
+   * (extended after each "general" send), allowing queued siblings to drain to General
+   * without starting fresh windows, before expiring so later notifications can attempt
+   * topic creation again.
    *
    * Kept in-memory: losing the map on daemon restart only grants a fresh window — acceptable.
    */
-  private topicHolds = new Map<string, { startedAt: number; holderId: string }>();
+  private topicHolds = new Map<
+    string,
+    { startedAt: number; holderId: string; lingerUntil: number }
+  >();
+
+  /**
+   * Set of notificationIds that have sent any chunk under onTopicUnavailable="general".
+   * Makes the "general" mode sticky for all subsequent chunks and retry attempts of that
+   * entry, even if the session hold subsequently expires.
+   */
+  private entriesSentUnderGeneral = new Set<string>();
 
   /**
    * Retrieves an active topic hold for a session, automatically expiring and deleting
@@ -318,10 +329,10 @@ export class OutboxSender {
   private getTopicHold(
     sessionId: string,
     now: number,
-  ): { startedAt: number; holderId: string } | undefined {
+  ): { startedAt: number; holderId: string; lingerUntil: number } | undefined {
     const hold = this.topicHolds.get(sessionId);
     if (!hold) return undefined;
-    if (now - hold.startedAt >= TOPIC_HOLD_WINDOW_MS + TOPIC_HOLD_LINGER_MS) {
+    if (now >= hold.lingerUntil) {
       this.topicHolds.delete(sessionId);
       return undefined;
     }
@@ -355,6 +366,7 @@ export class OutboxSender {
   ): void {
     this.storage.outbox.markFailed(entry.notificationId, now, reason, lastError);
     this.reregisteredEntries.delete(entry.notificationId);
+    this.entriesSentUnderGeneral.delete(entry.notificationId);
     const hold = this.getTopicHold(entry.sessionId, now);
     if (hold && hold.holderId === entry.notificationId) {
       this.topicHolds.delete(entry.sessionId);
@@ -624,12 +636,14 @@ export class OutboxSender {
             if (LOW_PRIORITY_KINDS.has(entry.kind)) {
               this.lowPrioritySendTimestamps.push(this.nowFn());
             }
+            const isStickyGeneral = this.entriesSentUnderGeneral.has(entry.notificationId);
             const sessionHold = this.getTopicHold(entry.sessionId, this.nowFn());
             const onTopicUnavailable: "retry" | "general" =
-              sessionHold && this.nowFn() - sessionHold.startedAt >= TOPIC_HOLD_WINDOW_MS
+              isStickyGeneral || (sessionHold && this.nowFn() - sessionHold.startedAt >= TOPIC_HOLD_WINDOW_MS)
                 ? "general"
                 : "retry";
             if (onTopicUnavailable === "general") {
+              this.entriesSentUnderGeneral.add(entry.notificationId);
               sentUnderGeneral = true;
             }
             const result = await this.sendNotification({
@@ -645,6 +659,13 @@ export class OutboxSender {
               onTopicUnavailable,
             });
 
+            if (onTopicUnavailable === "general") {
+              const hold = this.topicHolds.get(entry.sessionId);
+              if (hold) {
+                hold.lingerUntil = Math.max(hold.lingerUntil, this.nowFn() + TOPIC_HOLD_LINGER_MS);
+              }
+            }
+
             if (!result.ok) {
               allOk = false;
               let topicHoldBackoffCap: number | undefined;
@@ -658,7 +679,11 @@ export class OutboxSender {
                 const heldAt = this.nowFn();
                 let hold = this.getTopicHold(entry.sessionId, heldAt);
                 if (!hold) {
-                  hold = { startedAt: heldAt, holderId: entry.notificationId };
+                  hold = {
+                    startedAt: heldAt,
+                    holderId: entry.notificationId,
+                    lingerUntil: heldAt + TOPIC_HOLD_WINDOW_MS + TOPIC_HOLD_LINGER_MS,
+                  };
                   this.topicHolds.set(entry.sessionId, hold);
                 }
                 // pigeon-81p ordering: a later entry for this session must neither overtake the
@@ -884,6 +909,7 @@ export class OutboxSender {
           if (allOk) {
             commitDelivery(this.storage, entry, now, messages.length, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
+            this.entriesSentUnderGeneral.delete(entry.notificationId);
             if (!sentUnderGeneral) {
               this.topicHolds.delete(entry.sessionId);
             }

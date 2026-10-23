@@ -3898,4 +3898,140 @@ describe("topic hold window (pigeon-iqpd)", () => {
     expect((sender as any).getTopicHold(BASE_OUTBOX_INPUT.sessionId, now)).toBeUndefined();
     expect((sender as any).topicHolds.has(BASE_OUTBOX_INPUT.sessionId)).toBe(false);
   });
+
+  it("extends linger after each 'general' send so hang latency does not eat the linger and cause a fresh window", async () => {
+    const makePayload = (id: string, text: string) =>
+      JSON.stringify({ message: { text }, replyMarkup: { inline_keyboard: [] }, notificationId: id });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "entry-hang-1", sessionId: "sess-1", payload: makePayload("entry-hang-1", "Msg 1") }, 1_000);
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "entry-hang-2", sessionId: "sess-1", payload: makePayload("entry-hang-2", "Msg 2") }, 1_100);
+
+    let currentTime = 5_000;
+    const sendCalls: SendNotificationInput[] = [];
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      sendCalls.push(input);
+      // Simulate 57s Telegram call latency inside each send
+      currentTime += 57_000;
+      if (input.onTopicUnavailable === "general") {
+        return { ok: true, kind: "success", status: 200, body: {} };
+      }
+      return {
+        ok: false,
+        kind: "http_error",
+        status: 502,
+        body: { error: "topic_unavailable", reason: "create_failed" },
+      };
+    }) as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => currentTime,
+    });
+
+    // Tick 1 (at t=5_000): entry-hang-1 starts hold. Call takes 57s, so after send currentTime=62_000.
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]!.notificationId).toBe("entry-hang-1");
+    expect(sendCalls[0]!.onTopicUnavailable).toBe("retry");
+
+    // Advance to window edge: t = 62_000 + TOPIC_HOLD_WINDOW_MS + 10 = 212_010.
+    currentTime = 62_000 + TOPIC_HOLD_WINDOW_MS + 10;
+    sendCalls.length = 0;
+
+    // Reschedule entry-hang-2 so it is not ready until t=270_000 (after entry-hang-1's 57s send)
+    storage.outbox.reschedule("entry-hang-2", 0, 270_000);
+
+    // Tick 2: entry-hang-1 sends under "general", taking 57s.
+    // currentTime becomes 212_010 + 57_000 = 269_010.
+    // Without extending linger from return time, static linger would have ended at 62_000 + 150_000 + 60_000 = 272_000.
+    // When next tick runs at t=274_010, static linger would have expired!
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]!.notificationId).toBe("entry-hang-1");
+    expect(sendCalls[0]!.onTopicUnavailable).toBe("general");
+
+    // Advance clock by 5s to next tick (currentTime = 274_010).
+    currentTime = 274_010;
+    sendCalls.length = 0;
+
+    // Tick 3: entry-hang-2 sends: must still send with "general", NOT "retry"!
+    await sender.processOnce();
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0]!.notificationId).toBe("entry-hang-2");
+    expect(sendCalls[0]!.onTopicUnavailable).toBe("general");
+    expect(storage.outbox.getByNotificationId("entry-hang-2")!.state).toBe("sent");
+  });
+
+  it("mode is sticky per entry: once any chunk sends under 'general', later chunks and retries use 'general'", async () => {
+    const payload = JSON.stringify({
+      messages: [{ text: "Chunk 0" }, { text: "Chunk 1" }],
+      replyMarkup: { inline_keyboard: [] },
+      notificationId: "notif-2chunk",
+    });
+    storage.outbox.upsert({ ...BASE_OUTBOX_INPUT, notificationId: "notif-2chunk", sessionId: "sess-1", payload }, 1_000);
+
+    let currentTime = 5_000;
+    const sendCalls: SendNotificationInput[] = [];
+    let chunk1Attempt = 0;
+    const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
+      sendCalls.push(input);
+      // Chunk 0 succeeds under "general"
+      if (input.text === "Chunk 0") {
+        return { ok: true, kind: "success", status: 200, body: {} };
+      }
+      // Chunk 1 fails transiently on first try
+      if (input.text === "Chunk 1") {
+        chunk1Attempt++;
+        if (chunk1Attempt === 1) {
+          return { ok: false, kind: "transport_error", error: "network hiccup" };
+        }
+        return { ok: true, kind: "success", status: 200, body: {} };
+      }
+      return { ok: true, kind: "success", status: 200, body: {} };
+    }) as SendNotificationFn;
+
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      chatId: "chat-123",
+      nowFn: () => currentTime,
+    });
+
+    // Set a topic hold that is already past window
+    (sender as any).topicHolds.set("sess-1", {
+      startedAt: 5_000,
+      holderId: "other-holder",
+      lingerUntil: 5_000 + TOPIC_HOLD_WINDOW_MS + 10_000,
+    });
+
+    // Advance to past window so chunk 0 sends under "general"
+    currentTime = 5_000 + TOPIC_HOLD_WINDOW_MS + 1_000;
+    await sender.processOnce();
+
+    expect(sendCalls).toHaveLength(2);
+    expect(sendCalls[0]!.text).toBe("Chunk 0");
+    expect(sendCalls[0]!.onTopicUnavailable).toBe("general");
+    expect(sendCalls[1]!.text).toBe("Chunk 1");
+    expect(sendCalls[1]!.onTopicUnavailable).toBe("general");
+
+    // Chunk 1 failed transiently, so entry was rescheduled for retry
+    expect(storage.outbox.getByNotificationId("notif-2chunk")!.state).toBe("queued");
+
+    // Advance clock so linger expires completely and hold is gone
+    currentTime = 5_000 + TOPIC_HOLD_WINDOW_MS + 200_000;
+    (sender as any).topicHolds.clear(); // Ensure no hold exists
+    sendCalls.length = 0;
+
+    // Retry the entry
+    await sender.processOnce();
+
+    // Both chunks on retry must be sent with "general" because mode is sticky per entry!
+    expect(sendCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of sendCalls) {
+      expect(call.onTopicUnavailable).toBe("general");
+    }
+    expect(storage.outbox.getByNotificationId("notif-2chunk")!.state).toBe("sent");
+    expect((sender as any).entriesSentUnderGeneral?.has("notif-2chunk")).toBeFalsy();
+  });
 });
