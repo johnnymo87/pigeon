@@ -16,7 +16,16 @@ interface ReapDeps {
    * daemon that loses its state stops refreshing and its rows are swept as
    * before. Optional so a host without a worker connection still reaps.
    */
-  registerSession?: (sessionId: string, label?: string) => Promise<unknown>;
+  registerSession?: (sessionId: string, label?: string, signal?: AbortSignal) => Promise<unknown>;
+  /**
+   * Ownership-refresh state (pigeon-k0qn.5): when each local session last re-registered
+   * successfully. In memory on purpose: after a restart every session is refreshed again,
+   * spread over the next cycles by OWNERSHIP_REFRESH_PER_CYCLE, which costs a few hundred
+   * registers and buys not having to persist anything.
+   */
+  ownership?: OwnershipRefreshState;
+  /** Plain Telegram alert, for a session this daemon holds whose worker row another machine owns. */
+  alert?: (text: string) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string) => void;
 }
@@ -27,6 +36,35 @@ interface ReapResult {
   orphanedQuestions: number;
   expiredInjectedPrompts: number;
   refreshedPinned: number;
+  refreshedOwnership: number;
+}
+
+/** A session is re-registered once its last successful registration is this old. */
+export const OWNERSHIP_REFRESH_AGE_MS = 20 * 60 * 60 * 1000;
+/** Registers per hourly cycle, so a restart's full refresh is spread over several cycles. */
+export const OWNERSHIP_REFRESH_PER_CYCLE = 100;
+/** Bound on one register call; a slow worker must not stall the hourly cycle. */
+export const OWNERSHIP_REFRESH_TIMEOUT_MS = 10_000;
+
+export interface OwnershipRefreshState {
+  lastRefreshed: Map<string, number>;
+  /** Sessions already alerted as owned elsewhere, so each alerts once per daemon lifetime. */
+  alerted: Set<string>;
+}
+
+export function newOwnershipRefreshState(): OwnershipRefreshState {
+  return { lastRefreshed: new Map(), alerted: new Set() };
+}
+
+function isOwnedElsewhere(r: unknown): boolean {
+  if (!r || typeof r !== "object") return false;
+  const o = r as { ok?: unknown; status?: unknown; body?: unknown };
+  const body = o.body as { error?: unknown } | undefined;
+  return o.ok === false && o.status === 409 && body?.error === "owned_by_other_machine";
+}
+
+function isTransportFailure(r: unknown): boolean {
+  return !!r && typeof r === "object" && (r as { kind?: unknown }).kind === "transport_error";
 }
 
 export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
@@ -68,6 +106,64 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     }
   }
 
+  // Ownership refresh (pigeon-k0qn.5). The worker's session row is what the cross-machine relay
+  // routes by, and its `updated_at` moves only on register, notifications and Telegram routing.
+  // A quiet session never notifies, so without this its row goes stale: another machine's
+  // credential may take it over after 7 days, and the worker sweeps it at 14 and anyone may
+  // claim it fresh. Re-registering each live session about once a day keeps the row owned and
+  // retries a first registration that failed. Pinned sessions are refreshed every cycle above.
+  let refreshedOwnership = 0;
+  if (deps.registerSession && deps.ownership) {
+    const state = deps.ownership;
+    const live = deps.storage.sessions.list();
+    const liveIds = new Set(live.map((x) => x.sessionId));
+    for (const id of state.lastRefreshed.keys()) if (!liveIds.has(id)) state.lastRefreshed.delete(id);
+    const due = live
+      .filter((x) => !x.boundTopicKey && now - (state.lastRefreshed.get(x.sessionId) ?? 0) >= OWNERSHIP_REFRESH_AGE_MS)
+      .sort((a, b) => (state.lastRefreshed.get(a.sessionId) ?? 0) - (state.lastRefreshed.get(b.sessionId) ?? 0))
+      .slice(0, OWNERSHIP_REFRESH_PER_CYCLE);
+    for (const session of due) {
+      let r: unknown;
+      try {
+        r = await deps.registerSession(
+          session.sessionId,
+          session.label ?? undefined,
+          AbortSignal.timeout(OWNERSHIP_REFRESH_TIMEOUT_MS),
+        );
+      } catch (err) {
+        r = { ok: false, kind: "transport_error", error: String(err) };
+      }
+      if (r && typeof r === "object" && (r as { ok?: unknown }).ok === false) {
+        if (isTransportFailure(r)) {
+          // The worker is unreachable; the rest would fail the same way. Next cycle retries.
+          log(`ownership refresh stopped: worker unreachable (${session.sessionId})`);
+          break;
+        }
+        if (isOwnedElsewhere(r) && !state.alerted.has(session.sessionId)) {
+          state.alerted.add(session.sessionId);
+          const detail = String(((r as { body?: { detail?: unknown } }).body?.detail) ?? "");
+          log(`ownership refresh: ${session.sessionId} is registered to another machine: ${detail}`);
+          try {
+            await deps.alert?.(
+              `Session ${session.sessionId}${session.label ? ` (${session.label})` : ""} runs on this machine, ` +
+                `but the worker has it registered to another machine, which now receives its cross-machine ` +
+                `swarm messages and Telegram commands. ${detail}`,
+            );
+          } catch {
+            // Best-effort; the log line above stands.
+          }
+        }
+        // Any other rejection waits for the next day like a success does: retrying it every
+        // cycle would feed the worker-health monitor a 409 an hour and raise a false
+        // "register is failing" alarm. Only a transport failure (above) leaves it due.
+        state.lastRefreshed.set(session.sessionId, now);
+        continue;
+      }
+      state.lastRefreshed.set(session.sessionId, now);
+      refreshedOwnership++;
+    }
+  }
+
   const expired = deps.storage.sessions.cleanupExpired(now);
   if (expired > 0) {
     log(`cleaned ${expired} expired session records`);
@@ -87,7 +183,7 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     log(`cleaned ${expiredInjectedPrompts} expired injected prompt records`);
   }
 
-  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts, refreshedPinned };
+  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts, refreshedPinned, refreshedOwnership };
 }
 
 interface StartReaperDeps extends ReapDeps {
@@ -96,6 +192,7 @@ interface StartReaperDeps extends ReapDeps {
 
 export function startSessionReaper(deps: StartReaperDeps): { stop: () => void } {
   const intervalMs = deps.intervalMs ?? 60 * 60 * 1000;
+  if (deps.registerSession && !deps.ownership) deps = { ...deps, ownership: newOwnershipRefreshState() };
   let processing = false;
 
   const timer = setInterval(async () => {

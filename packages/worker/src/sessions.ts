@@ -1,5 +1,5 @@
 import { unauthorized } from "./auth";
-import { authenticate, checkActsAs, type Principal } from "./credentials";
+import { authenticate, checkActsAs, refusedCsvForSql, type Principal } from "./credentials";
 import { createTelegramClient } from "./telegram";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 import { withD1, StorageError } from "./d1";
@@ -126,21 +126,69 @@ async function registerSession(
       }
     }
 
+    // The ownership rule above is re-asserted INSIDE the upsert (pigeon-k0qn.5, rule 4 of the
+    // .8 review), so a register racing between that read and this write cannot overwrite a
+    // row it was not allowed to: the DO UPDATE applies only when the row is still ours, is
+    // stale, or (shared key) is not owned by a retired machine. Zero changes means we lost.
     const now = Date.now();
-    await withD1(
-      "registerSession.upsert",
-      db
-        .prepare(
-          `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET
-             machine_id = excluded.machine_id,
-             label = excluded.label,
-             updated_at = excluded.updated_at`,
-        )
-        .bind(sessionId, machineId, label, now, now)
-        .run(),
-    );
+    const upsert =
+      principal.kind === "machine"
+        ? db
+            .prepare(
+              `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 machine_id = excluded.machine_id,
+                 label = excluded.label,
+                 updated_at = excluded.updated_at
+               WHERE sessions.machine_id = excluded.machine_id OR sessions.updated_at < ?`,
+            )
+            .bind(sessionId, machineId, label, now, now, now - REGISTER_TAKEOVER_STALE_MS)
+        : db
+            .prepare(
+              `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 machine_id = excluded.machine_id,
+                 label = excluded.label,
+                 updated_at = excluded.updated_at
+               WHERE sessions.machine_id = excluded.machine_id
+                  OR instr(?, ',' || sessions.machine_id || ',') = 0`,
+            )
+            .bind(sessionId, machineId, label, now, now, refusedCsvForSql(env));
+    const result = await withD1("registerSession.upsert", upsert.run());
+    if (!result.meta.changes) {
+      const owner = await withD1(
+        "registerSession.owner",
+        db
+          .prepare("SELECT machine_id FROM sessions WHERE session_id = ?")
+          .bind(sessionId)
+          .first<{ machine_id: string }>(),
+      );
+      const holder = owner?.machine_id ?? "another machine";
+      if (principal.kind === "shared" && owner) {
+        const refused = checkActsAs(principal, env, owner.machine_id);
+        if (refused) return refused;
+      }
+      return Response.json(
+        {
+          error: "owned_by_other_machine",
+          detail: `${sessionId} is registered to ${holder}; it must unregister it first`,
+        },
+        { status: 409 },
+      );
+    }
+    // Real opencode and goose ids never legitimately move between machines; only fixed lane
+    // ids do. A takeover is therefore worth a line in the log every time.
+    if (existing && existing.machine_id !== machineId) {
+      console.error("[sessions] register moved a session to another machine", {
+        sessionId,
+        from: existing.machine_id,
+        to: machineId,
+        idleMs: now - existing.updated_at,
+        credential: principal.kind,
+      });
+    }
 
     return Response.json({ ok: true, sessionId, machineId });
   } catch (err) {

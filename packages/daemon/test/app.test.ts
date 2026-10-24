@@ -124,7 +124,8 @@ describe("createApp", () => {
     expect(single.status).toBe(200);
     const singleBody = (await single.json()) as { ok: boolean; session: { session_id: string } };
     expect(singleBody.session.session_id).toBe("sess-1");
-    expect(started).toEqual([]);
+    // A quiet session still registers: the worker row is its ownership claim (pigeon-k0qn.5).
+    expect(started).toEqual([{ sessionId: "sess-1", notify: false, label: "Session One" }]);
   });
 
   it("supports /session-start with plugin-direct backend_kind parity", async () => {

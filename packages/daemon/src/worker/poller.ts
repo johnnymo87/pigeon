@@ -642,10 +642,11 @@ export class Poller {
   // HTTP methods preserved from MachineAgent (already HTTP)
   // -------------------------------------------------------------------------
 
-  async registerSession(sessionId: string, label?: string): Promise<WorkerResult> {
+  async registerSession(sessionId: string, label?: string, signal?: AbortSignal): Promise<WorkerResult> {
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/sessions/register`, {
         method: "POST",
+        ...(signal ? { signal } : {}),
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
           "Content-Type": "application/json",

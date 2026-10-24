@@ -86,6 +86,21 @@ function refusedSet(env: Env): { all: boolean; machines: Set<string> } {
 }
 
 /**
+ * Is the shared key retired for `machineId`? The relay (pigeon-k0qn.5) refuses to queue for a
+ * machine that is not: until it is, a shared-key holder can re-register that machine's
+ * sessions to itself and collect what is queued for them.
+ */
+export function isSharedKeyRetiredFor(env: Env, machineId: string): boolean {
+  const refused = refusedSet(env);
+  return refused.all || refused.machines.has(machineId);
+}
+
+/** The refused set as `,a,b,` for an SQL `instr` membership test (`,,` when empty). */
+export function refusedCsvForSql(env: Env): string {
+  return `,${[...refusedSet(env).machines].join(",")},`;
+}
+
+/**
  * Resolve the request's principal, or null for a 401.
  *
  * A D1 failure other than a missing table THROWS (and becomes a 500): reporting it as a 401

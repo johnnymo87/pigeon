@@ -2,6 +2,7 @@ import { unauthorized } from "./auth";
 import { authenticate, checkActsAs } from "./credentials";
 import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
 import { createTelegramClient } from "./telegram";
+import { handOutRelayItems, SWARM_RELAY_HEADER, type HandOutItem } from "./relay";
 import { topicsEnabled } from "./topics";
 
 /**
@@ -95,6 +96,10 @@ function parseMetadata(metadataJson: string | null | undefined): Record<string, 
  * Returns 204 if no commands available.
  * Returns JSON command payload if a command is available.
  * Updates machine last_poll_at for online detection.
+ *
+ * With a machine credential and `X-Pigeon-Swarm-Relay`, also hands out cross-machine relay
+ * items as `swarm: [...]` on whichever response the command step returns; a 204 then becomes
+ * `200 {swarm}` (pigeon-k0qn.5, relay.ts). A daemon that never sends the header never sees it.
  */
 export async function handlePollNext(
   db: D1Database,
@@ -114,6 +119,39 @@ export async function handlePollNext(
 
   await touchMachine(db, machineId);
 
+  // Relay items (pigeon-k0qn.5) are claimed once, before the command loop, and attached to
+  // whichever response it returns. Machine credentials only: the shared key can never collect
+  // relays. handOutRelayItems never throws.
+  const swarm: HandOutItem[] =
+    principal.kind === "machine"
+      ? await handOutRelayItems(db, machineId, request.headers.get(SWARM_RELAY_HEADER))
+      : [];
+  if (swarm.length === 0) return nextCommand(db, env, request, machineId);
+
+  let response: Response;
+  try {
+    response = await nextCommand(db, env, request, machineId);
+  } catch (err) {
+    // The command stays leased and is retried after its lease, exactly as with the 500 this
+    // would otherwise be; the relay items must not ride that 500 into a 60s re-lease.
+    console.error("[poll] command step failed; returning relay items only", {
+      machineId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    response = new Response(null, { status: 204 });
+  }
+  if (response.status === 204) return Response.json({ swarm });
+  const body = (await response.json()) as Record<string, unknown>;
+  return Response.json({ ...body, swarm }, { status: response.status });
+}
+
+/** The command half of the poll: today's behaviour, unchanged. */
+async function nextCommand(
+  db: D1Database,
+  env: Env,
+  request: Request,
+  machineId: string,
+): Promise<Response> {
   const rawHeader = request.headers.get(BACKENDS_HEADER);
   const advertised = parseAdvertisedBackends(rawHeader);
 

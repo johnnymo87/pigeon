@@ -902,7 +902,9 @@ if (poller) {
       gooseRunners?.drop(sessionId);
       return poller.unregisterSession(sessionId);
     },
-    registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
+    registerSession: (sessionId, label, signal) => poller.registerSession(sessionId, label, signal),
+    // A session held here whose worker row another machine owns (pigeon-k0qn.5).
+    alert: notifier?.sendPlainAlert ? (text) => notifier.sendPlainAlert!(text, "warning") : undefined,
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
 }
@@ -1095,8 +1097,10 @@ const app = createApp(storage, {
   bindNamedTopic: poller ? (req, signal) => poller.bindNamedTopic(req, signal) : undefined,
   // Unbind named topic for POST /session-unbind. Absent without a worker.
   unbindNamedTopic: poller ? (sessionId, signal) => poller.unbindNamedTopic(sessionId, signal) : undefined,
-  onSessionStart: async (sessionId, notify, label) => {
-    if (notify && poller) {
+  // Registers whatever `notify` says: the worker row is the session's ownership claim for
+  // cross-machine relays (pigeon-k0qn.5), not only its notification route.
+  onSessionStart: async (sessionId, _notify, label) => {
+    if (poller) {
       return await poller.registerSession(sessionId, label ?? undefined);
     }
   },
