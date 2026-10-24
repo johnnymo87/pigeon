@@ -68,7 +68,9 @@ export async function processRelayItems(deps: RelayReceiverDeps, items: unknown)
   if (!Array.isArray(items)) return acks;
 
   // Locality of every sender, probed in parallel BEFORE the synchronous pass, so a poll's worth
-  // of items costs one probe round (about 3s at worst) inside the serialised tick, not one each.
+  // of items costs one probe round inside the serialised tick, not one per item. A round tries a
+  // sender's serve bases one after another at up to 3s each, so the worst case against hung serves
+  // is (bases x 3s): well inside the 60s lease at today's base counts.
   const localSenders = new Set<string>();
   if (deps.localityOf) {
     const froms = new Set<string>();
@@ -160,13 +162,9 @@ function receiveMessage(
     const msgId = it.msg_id as string;
     const to = it.to;
 
-    // 3. The worker refuses a REGISTERED sender owned by another machine; this is the airtight
-    //    half, against a remote machine speaking as one of our own sessions.
-    if (storage.sessions.get(f.from) || localSenders.has(f.from)) {
-      throw new Refusal("from_is_local", `${f.from} is a session on this machine`);
-    }
-
-    // 4. Same msg_id already here. A duplicate only if WE recorded it as this very relay; any
+    // 3. Same msg_id already here, checked before anything that can change between hand-outs
+    //    (sender locality, target opt-in), so a re-handout of an inserted message is acked.
+    //    A duplicate only if WE recorded it as this very relay; any
     //    other holder of the id is a conflict, including a local row with a reused id.
     const inbound = storage.relayInbound.get(msgId);
     const localRow = storage.swarm.getByMsgId(msgId);
@@ -181,6 +179,13 @@ function receiveMessage(
         (storedPayload === undefined || storedPayload === f.payload);
       if (same) return { outcome: "delivered" };
       throw new Refusal("msg_id_conflict", `msg_id ${msgId} is already used here by a different message`);
+    }
+
+    // 4. The worker refuses a REGISTERED sender owned by another machine; this is the receiver's
+    //    half, against a remote machine speaking as one of our own sessions (a sessions row, or
+    //    the locality probe above).
+    if (storage.sessions.get(f.from) || localSenders.has(f.from)) {
+      throw new Refusal("from_is_local", `${f.from} is a session on this machine`);
     }
 
     // 5. `swarm` in pull_sources was a local-trust decision; remote senders need `swarm-remote`.

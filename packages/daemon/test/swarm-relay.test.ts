@@ -150,6 +150,16 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     expect(s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages").get()).toEqual({ n: 1 });
   });
 
+  it("acks a re-handout as delivered even if the sender's locality changed since the first copy", async () => {
+    const s = db();
+    (await receive(s, [message()]));
+    const acks = await processRelayItems(
+      { storage: s, selfMachineId: "cloudbox", acceptFrom: ["devbox"], localityOf: async () => "local", log: () => {} },
+      [message()],
+    );
+    expect(acks[0]!.outcome).toBe("delivered");
+  });
+
   it("refuses the same msg_id with a different payload, or from a different machine", async () => {
     const s = db();
     (await receive(s, [message()], ["devbox", "macbook"]));

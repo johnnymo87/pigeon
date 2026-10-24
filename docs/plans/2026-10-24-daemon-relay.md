@@ -60,18 +60,19 @@ Per message item, in order (first refusal wins, acked `refused` with the code):
 2. Shape: `parseSwarmSendBody` (rejects `from='pigeon'`, reserved kinds, `:` in msg_id, close
    tag), plus `from` must be `ses_`, priority valid, `deliver_at`/`expires_at` number-or-null →
    `invalid`.
-3. `from` is a session on this machine → `from_is_local`. That covers two cases:
+3. `msg_id` already exists here, in either table, or in the inbound records. It is a duplicate
+   (a re-handout after a lost ack, acked `delivered`) only if an inbound record exists with the
+   same `from_machine`, `from` and `to`, and the stored payload is the same. Anything else is
+   `msg_id_conflict`, including a local row with a reused caller-supplied id.
+   Checked before steps 4 and 5, whose inputs can change between hand-outs.
+4. `from` is a session on this machine → `from_is_local`. That covers two cases:
    - it has a `sessions` row;
    - the arbiter's locality check answers `local`. This catches subagents and reaped sessions,
      which have no row. Replies route by id, so they would otherwise reach our own session.
 
    Senders are probed in parallel before the synchronous pass, so a batch costs one round of
-   probes (about 3 seconds at worst). `unknown` passes, so that a sick serve does not hold relays
+   probes (about 3 seconds per serve base at worst). `unknown` passes, so that a sick serve does not hold relays
    hostage and expire them as "unconfirmed".
-4. `msg_id` already exists here, in either table, or in the inbound records. It is a duplicate
-   (a re-handout after a lost ack, acked `delivered`) only if an inbound record exists with the
-   same `from_machine`, `from` and `to`, and the stored payload is the same. Anything else is
-   `msg_id_conflict`, including a local row with a reused caller-supplied id.
 5. Target is a pull or goose session that lacks either `swarm` or `swarm-remote` in
    `pull_sources` → `remote_not_accepted`. `swarm-remote` alone banks nothing, because banking
    keys on `swarm`.
