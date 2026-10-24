@@ -445,6 +445,17 @@ if (pullAllowedSenderIds.size === 0) {
   console.log("[pull-inbox] PIGEON_PULL_ALLOWED_USER_IDS is empty: pull sessions will not bank inbound, topic-bound goose sessions will accept no prompts, and unbound goose sessions accept any sender");
 }
 
+// Tri-state session locality (pigeon-k0qn.2): read-only, never places a session. Shared by the
+// arbiter (remote targets) and the relay receiver (a relayed `from` that is really ours).
+const sessionLocality = makeLocalityResolver({
+  hasLocalSession: (id) => storage.sessions.get(id) !== null,
+  baseUrlsFor: (id) => [
+    ...(ingressRouter ? [ingressRouter.resolveRoute(id, Date.now())?.apiBase] : []),
+    config.opencodeUrl,
+    ...config.serveEndpoints,
+  ].filter((u): u is string => typeof u === "string" && u.length > 0),
+});
+
 // Cross-machine swarm relay (pigeon-k0qn.6/.7). Both halves are off unless configured; the poll
 // header still carries `failures=1` so a machine that relayed and then turned sending off keeps
 // hearing about failures it is owed (they live 24h at the worker).
@@ -484,8 +495,13 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
       {
         // Relay items: inserted and acked before this poll's command is dispatched.
         onRelayItems: async (items) => {
-          const acks = processRelayItems(
-            { storage, selfMachineId: config.machineId!, acceptFrom: config.swarmRelayAcceptFrom },
+          const acks = await processRelayItems(
+            {
+              storage,
+              selfMachineId: config.machineId!,
+              acceptFrom: config.swarmRelayAcceptFrom,
+              localityOf: sessionLocality,
+            },
             items,
           );
           await relayClient?.ack(acks);
@@ -819,14 +835,7 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       directoryForSession,
       // pigeon-k0qn.2: decide local/remote/unknown read-only, before any client
       // is built, so a session on another machine fails fast and is never placed.
-      localityOf: makeLocalityResolver({
-        hasLocalSession: (id) => storage.sessions.get(id) !== null,
-        baseUrlsFor: (id) => [
-          ...(ingressRouter ? [ingressRouter.resolveRoute(id, Date.now())?.apiBase] : []),
-          config.opencodeUrl,
-          ...config.serveEndpoints,
-        ].filter((u): u is string => typeof u === "string" && u.length > 0),
-      }),
+      localityOf: sessionLocality,
       ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
       selfMachineId: config.machineId,
       relay: config.swarmRelaySend && relayClient ? (body) => relayClient.relay(body) : undefined,
@@ -896,6 +905,7 @@ setInterval(() => {
   if (swarmCleaned > 0) console.log(`[swarm] cleaned ${swarmCleaned} old messages`);
 
   // 8 days: the worker forgets a relay row after 7, so an older record can route nothing back.
+  // Kept while its message row lives, though: the hop rule and the /fail diversion read it.
   const relayInboundCleaned = storage.relayInbound.pruneOlderThan(now - 8 * 24 * 60 * 60 * 1000);
   if (relayInboundCleaned > 0) console.log(`[relay] pruned ${relayInboundCleaned} inbound records`);
 

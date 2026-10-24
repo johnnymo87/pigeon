@@ -22,22 +22,32 @@ import { bankOrInsertSwarmMessage } from "./bank-or-insert";
 import { notifySenderOfFailure } from "./notify-sender";
 import { formatRelayFailureNotice, isReasonCode } from "./relay-notice";
 import { formatWakePayloadAlert, isSuppressedFromRecovery } from "./delivery-policy";
+import type { Locality } from "../routing/locality";
 
 const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
 const MACHINE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const PRIORITIES = new Set(["urgent", "normal", "low"]);
 
 /**
- * TTL for a relayed message banked in a pull inbox. Under the worker's 7-day retention of the
- * relay row, so an expiry here can still be reported back through `/swarm/relay/fail`.
+ * TTL for a relayed message banked in a pull inbox. The worker keeps the relay row 7 days from
+ * when it was RELAYED, and the message may have waited up to 24h there before being banked, so
+ * 5 days leaves an expiry here time to be reported back through `/swarm/relay/fail`.
  */
-export const RELAYED_PULL_TTL_MS = 6 * 24 * 60 * 60 * 1000;
+export const RELAYED_PULL_TTL_MS = 5 * 24 * 60 * 60 * 1000;
 
 export interface RelayReceiverDeps {
   storage: StorageDb;
   selfMachineId: string;
   /** Machines whose messages this daemon accepts (`PIGEON_SWARM_RELAY_ACCEPT_FROM`). */
   acceptFrom: readonly string[];
+  /**
+   * The arbiter's locality check, used to refuse a `from` that is a session on THIS machine but
+   * has no `sessions` row (subagents never register; idle sessions are reaped). Replies route by
+   * id, so such a message would have its replies delivered to our own session. "unknown" (a sick
+   * serve) passes: the sessions-table check still applies, and holding every relay hostage to
+   * serve health would expire them as "unconfirmed" when nothing was written.
+   */
+  localityOf?: (sessionId: string) => Promise<Locality>;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -52,10 +62,31 @@ function isNumOrNull(v: unknown): v is number | null {
   return v === null || (typeof v === "number" && Number.isFinite(v));
 }
 
-export function processRelayItems(deps: RelayReceiverDeps, items: unknown): RelayAckItem[] {
+export async function processRelayItems(deps: RelayReceiverDeps, items: unknown): Promise<RelayAckItem[]> {
   const log = deps.log ?? ((m, f) => console.log(`[relay-receiver] ${m}`, f ?? ""));
   const acks: RelayAckItem[] = [];
   if (!Array.isArray(items)) return acks;
+
+  // Locality of every sender, probed in parallel BEFORE the synchronous pass, so a poll's worth
+  // of items costs one probe round (about 3s at worst) inside the serialised tick, not one each.
+  const localSenders = new Set<string>();
+  if (deps.localityOf) {
+    const froms = new Set<string>();
+    for (const raw of items) {
+      const it = raw as Record<string, unknown> | null;
+      if (it?.item === "message" && typeof it.from === "string" && SENDER_ID.test(it.from)) froms.add(it.from);
+    }
+    await Promise.all(
+      [...froms].map(async (from) => {
+        try {
+          if ((await deps.localityOf!(from)) === "local") localSenders.add(from);
+        } catch {
+          // Fail open, as for "unknown".
+        }
+      }),
+    );
+  }
+
   for (const raw of items) {
     const it = raw as Record<string, unknown> | null;
     if (!it || typeof it !== "object" || typeof it.from_machine !== "string" || typeof it.msg_id !== "string") {
@@ -68,7 +99,7 @@ export function processRelayItems(deps: RelayReceiverDeps, items: unknown): Rela
       if (it.item === "failure") {
         acks.push({ ...key, ...receiveFailure(deps, it, log) });
       } else if (it.item === "message") {
-        acks.push({ ...key, ...receiveMessage(deps, it, log) });
+        acks.push({ ...key, ...receiveMessage(deps, it, log, localSenders) });
       } else {
         acks.push({ ...key, outcome: "refused", reason: "invalid" });
       }
@@ -89,6 +120,7 @@ function receiveMessage(
   deps: RelayReceiverDeps,
   it: Record<string, unknown>,
   log: NonNullable<RelayReceiverDeps["log"]>,
+  localSenders: ReadonlySet<string>,
 ): Outcome {
   const { storage } = deps;
   const now = (deps.nowFn ?? Date.now)();
@@ -130,7 +162,7 @@ function receiveMessage(
 
     // 3. The worker refuses a REGISTERED sender owned by another machine; this is the airtight
     //    half, against a remote machine speaking as one of our own sessions.
-    if (storage.sessions.get(f.from)) {
+    if (storage.sessions.get(f.from) || localSenders.has(f.from)) {
       throw new Refusal("from_is_local", `${f.from} is a session on this machine`);
     }
 
@@ -214,10 +246,19 @@ function receiveFailure(
   const now = (deps.nowFn ?? Date.now)();
   const originalId = typeof it.original_msg_id === "string" ? it.original_msg_id : "";
   const row = originalId ? storage.swarm.getByMsgId(originalId) : null;
+  // A row still `queued` is accepted too: a relay whose 202 was lost (timeout) leaves the row
+  // queued while the worker holds the message, and the receiver can refuse it before our retry
+  // learns it was stored. The failure item is the worker's proof that this machine relayed it,
+  // so it is authoritative for a queued row as well. (Without this the retry's `202 duplicate`
+  // would then stamp the row relayed and the sender would never hear of the refusal.)
+  const relayed = row?.verifyFamily === "relayed" && row.state === "handed_off";
+  const queued = row?.state === "queued";
+  // Already failed (an earlier copy of this item, or the arbiter's own budget): ack, change nothing.
+  const settled = row?.state === "failed";
   if (
     it.from_machine !== deps.selfMachineId ||
     !row ||
-    row.verifyFamily !== "relayed" ||
+    !(relayed || queued || settled) ||
     row.fromSession !== it.from ||
     row.toSession !== it.to
   ) {
@@ -231,7 +272,8 @@ function receiveFailure(
   const code = isReasonCode(it.reason) ? it.reason : "unrecognised";
   const machine = typeof it.machine === "string" && MACHINE_ID.test(it.machine) ? it.machine : "another machine";
   storage.db.transaction(() => {
-    if (!storage.swarm.markRelayFailed(row.msgId, now)) return;
+    const changed = queued ? storage.swarm.markFailed(row.msgId, now) : storage.swarm.markRelayFailed(row.msgId, now);
+    if (!changed) return;
     const target = row.toSession ?? "(unknown target)";
     notifySenderOfFailure(
       storage,

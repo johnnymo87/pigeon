@@ -86,6 +86,9 @@ interface World {
   cloudPoller: Poller;
   cloudFails: RelayFailSender;
   sendPrompt: ReturnType<typeof vi.fn>;
+  /** Test hooks: lose the next relay response (the POST still lands), or the next cloudbox ack. */
+  loseNextRelayResponse: boolean;
+  dropNextCloudAck: boolean;
 }
 
 let worlds: World[] = [];
@@ -147,7 +150,12 @@ async function world(): Promise<World> {
     directoryMissing: () => false,
     localityOf: async (id) => (devbox.sessions.get(id) ? "local" : "remote"),
     selfMachineId: "devbox",
-    relay: (body) => devClient.relay(body),
+    relay: async (body) => {
+      const answer = await devClient.relay(body);
+      if (!w.loseNextRelayResponse) return answer;
+      w.loseNextRelayResponse = false;
+      return { kind: "transient", detail: "relay request failed: The operation was aborted due to timeout" };
+    },
     log: quiet,
   });
   const cloudArbiter = new SwarmArbiter({
@@ -165,13 +173,20 @@ async function world(): Promise<World> {
       { workerUrl: "https://worker", apiKey: key, machineId: machine, relayHeader: relayPollHeader(accept, true) },
       {
         onRelayItems: async (items: unknown[]) => {
-          await client.ack(processRelayItems({ storage, selfMachineId: machine, acceptFrom: accept, log: quiet }, items));
+          const acks = await processRelayItems({ storage, selfMachineId: machine, acceptFrom: accept, log: quiet }, items);
+          if (machine === "cloudbox" && w.dropNextCloudAck) {
+            w.dropNextCloudAck = false;
+            return;
+          }
+          await client.ack(acks);
         },
       } as never,
       { fetchFn },
     );
 
-  const w: World = {
+  // eslint-disable-next-line prefer-const
+  let w: World;
+  w = {
     worker: workerDb,
     devbox,
     cloudbox,
@@ -181,6 +196,8 @@ async function world(): Promise<World> {
     cloudPoller: poller(cloudbox, "cloudbox", KEY_CLOUDBOX, ["devbox"], cloudClient),
     cloudFails: new RelayFailSender(cloudbox, cloudClient),
     sendPrompt,
+    loseNextRelayResponse: false,
+    dropNextCloudAck: false,
   };
   worlds.push(w);
   return w;
@@ -284,5 +301,38 @@ describe("cross-machine relay end to end", () => {
     await w.devArbiter.processOnce();
     expect(w.devbox.swarm.getByMsgId("msg_e2e_4")!.state).toBe("failed");
     expect(devNotices(w)[0]!.payload).toContain("does not accept cross-machine messages from this machine");
+  });
+
+  it("a lost 202 followed by a fast receiver refusal still tells the sender", async () => {
+    const w = await world();
+    await tick(w.cloudPoller);
+    w.loseNextRelayResponse = true;
+    send(w, "msg_e2e_5", PULL_TARGET);
+    await w.devArbiter.processOnce();
+    // The worker stored it; devbox thinks the attempt failed and will retry.
+    expect(w.devbox.swarm.getByMsgId("msg_e2e_5")).toMatchObject({ state: "queued", attempts: 1 });
+
+    await tick(w.cloudPoller); // cloudbox refuses (remote_not_accepted) before devbox retries
+    await tick(w.devPoller); // the failure item reaches devbox while its row is still queued
+
+    expect(w.devbox.swarm.getByMsgId("msg_e2e_5")!.state).toBe("failed");
+    expect(devNotices(w)).toHaveLength(1);
+    expect(devNotices(w)[0]!.payload).toContain("accepts swarm messages from its own machine only");
+  });
+
+  it("a lost ack is re-handed after the lease and acked as a duplicate, without a second row", async () => {
+    const w = await world();
+    await tick(w.cloudPoller);
+    send(w, "msg_e2e_6", TARGET);
+    await w.devArbiter.processOnce();
+    w.dropNextCloudAck = true;
+    await tick(w.cloudPoller);
+    expect(relayRow(w, "msg_e2e_6")).toEqual({ status: "leased", reason: null });
+
+    w.worker.prepare("UPDATE swarm_relay SET leased_at = leased_at - 61000 WHERE msg_id = ?").run("msg_e2e_6");
+    await tick(w.cloudPoller);
+
+    expect(relayRow(w, "msg_e2e_6")).toEqual({ status: "delivered", reason: null });
+    expect(w.cloudbox.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE msg_id = 'msg_e2e_6'").get()).toEqual({ n: 1 });
   });
 });

@@ -143,6 +143,12 @@ export class RelayRefusedError extends RemoteTargetError {
 
 /** A sender id the worker's relay route accepts. Byte-exact with the worker's SENDER_ID. */
 const RELAY_SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+/**
+ * A target id the worker's relay route accepts (its TARGET_ID). Anything else would come back
+ * `400 invalid`; it keeps the Phase 1 path instead, whose incomplete-id check gives the sender the
+ * right advice ("check the id and resend") for a short, truncated id.
+ */
+const RELAY_TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 
 /**
  * Sender-facing reason for a remote target. The owner is DECORATION: it comes from
@@ -539,7 +545,7 @@ export class SwarmArbiter {
             }
             // `pigeon` notices and goose senders cannot be relayed (the worker's validator takes
             // ses_ senders only); they keep the Phase 1 failure.
-            if (this.relay && RELAY_SENDER_ID.test(next.fromSession)) {
+            if (this.relay && RELAY_SENDER_ID.test(next.fromSession) && RELAY_TARGET_ID.test(target)) {
               await this.relayRow(next, target);
               continue;
             }

@@ -259,9 +259,10 @@ adds no extra request.
 - **Re-validate.** Items arrive by a second entry point that bypasses `/swarm/send`'s validator
   (`app.ts:141-246`); run the same validation (which rejects `from='pigeon'`), plus the hop rule
   (§3.1).
-  - Refuse an item whose `from` is one of this machine's own sessions (`from_is_local`). The worker
-    checks only registered senders, so this is the airtight check against a remote machine
-    speaking as a local session. Failure items take the receipt path in §3.2 instead.
+  - Refuse an item whose `from` is one of this machine's own sessions (`from_is_local`): a
+    `sessions` row, or the locality check (§1) answering `local`, which covers subagents and
+    reaped sessions. The worker checks only registered senders, so this is the check against a
+    remote machine speaking as a local session. It fails open when a serve cannot answer. Failure items take the receipt path in §3.2 instead.
 - **Order within a poll.** Insert and ack every relay item *before* dispatching a command from the
   same response: `tick()` is serialised behind `polling`, and a launch can block 20s or more, which
   would let items outlive their 60s lease and be handed out again.

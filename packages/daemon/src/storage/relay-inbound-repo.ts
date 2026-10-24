@@ -121,11 +121,20 @@ export class RelayInboundRepository {
   }
 
   /**
-   * Prunes records received before `cutoff`. Pass 8 days: the worker keeps a settled relay row
+   * Prunes records received before `cutoff` whose message is gone from both tables. Pass 8 days: the worker keeps a settled relay row
    * for 7 (`RELAY_RETENTION_MS`), after which `/swarm/relay/fail` is a no-op anyway, so a record
    * kept longer could route nothing.
    */
   pruneOlderThan(cutoff: number): number {
-    return this.db.prepare("DELETE FROM swarm_relay_inbound WHERE received_at < ?").run(cutoff).changes;
+    // Never while the message itself is still here: the arbiter's hop rule and the /fail
+    // diversion read this record, and an old relayed row can still be requeued by the watchdog.
+    return this.db
+      .prepare(
+        `DELETE FROM swarm_relay_inbound
+         WHERE received_at < ?
+           AND NOT EXISTS (SELECT 1 FROM swarm_messages m WHERE m.msg_id = swarm_relay_inbound.msg_id)
+           AND NOT EXISTS (SELECT 1 FROM pull_inbox p WHERE p.msg_id = swarm_relay_inbound.msg_id)`,
+      )
+      .run(cutoff).changes;
   }
 }

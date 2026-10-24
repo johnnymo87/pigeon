@@ -34,9 +34,10 @@ Failure reason codes sent by the receiver are derived the same way `formatFailur
 
 Retention is bounded by the worker. It forgets a settled relay row 7 days after it was relayed
 (`RELAY_RETENTION_MS`), after which `/swarm/relay/fail` answers a no-op. So:
-- inbound records are pruned at 8 days;
-- a relayed message banked in a pull inbox gets a 6-day TTL instead of 7, so that expiry can still
-  be reported;
+- inbound records are pruned at 8 days, but only once their message is gone from both tables,
+  because the hop rule and the `/fail` diversion read them;
+- a relayed message banked in a pull inbox gets a 5-day TTL instead of 7. It may have waited up
+  to 24 hours at the worker before being banked, and its expiry must still be reportable;
 - a `noop` or a 4xx from `/fail` is final and logged as "its sender will not be told".
 
 ## Receiving (`.6`)
@@ -59,7 +60,14 @@ Per message item, in order (first refusal wins, acked `refused` with the code):
 2. Shape: `parseSwarmSendBody` (rejects `from='pigeon'`, reserved kinds, `:` in msg_id, close
    tag), plus `from` must be `ses_`, priority valid, `deliver_at`/`expires_at` number-or-null →
    `invalid`.
-3. `from` has a row in this daemon's `sessions` → `from_is_local`.
+3. `from` is a session on this machine → `from_is_local`. That covers two cases:
+   - it has a `sessions` row;
+   - the arbiter's locality check answers `local`. This catches subagents and reaped sessions,
+     which have no row. Replies route by id, so they would otherwise reach our own session.
+
+   Senders are probed in parallel before the synchronous pass, so a batch costs one round of
+   probes (about 3 seconds at worst). `unknown` passes, so that a sick serve does not hold relays
+   hostage and expire them as "unconfirmed".
 4. `msg_id` already exists here, in either table, or in the inbound records. It is a duplicate
    (a re-handout after a lost ack, acked `delivered`) only if an inbound record exists with the
    same `from_machine`, `from` and `to`, and the stored payload is the same. Anything else is
@@ -84,8 +92,9 @@ local session row for it. `swarm-remote` joins `ALLOWED_PULL_SOURCES`.
 In the arbiter, on a `remote` verdict with relay enabled:
 
 - The row has an inbound record (hop rule) → the existing remote failure.
-- The sender is not `ses_` (a `pigeon` notice, a goose sender) → the existing remote failure.
-  The worker would answer 400.
+- The sender is not `ses_` (a `pigeon` notice, a goose sender), or the target fails the
+  worker's `TARGET_ID` (`ses_abc`) → the existing remote failure. The worker would answer 400,
+  and for a short id the Phase 1 path gives the right "check the id" advice.
 - Otherwise POST `/swarm/relay`:
   - Any 202, duplicate or not → `markRelayed`: `handed_off` + `verified_at` +
     `verify_family='relayed'`, in one statement.
@@ -103,11 +112,17 @@ A cancel that lands during the POST loses: the row is stamped relayed from `canc
 **Failure items** (`item: "failure"`), received in the same poll. Accepted only if:
 
 - `from_machine` is this machine;
-- the original row exists with `verify_family='relayed'`;
-- the row's `from` and `to` match the item's.
+- the row's `from` and `to` match the item's;
+- the original row is in one of these states:
+  - `relayed` and `handed_off`;
+  - still `queued`. A relay whose 202 was lost leaves the row queued while the worker holds the
+    message, and the receiver can refuse it before the retry's `202 duplicate`. The item is the
+    worker's proof that we relayed it.
+  - already `failed`. This is acked with no change.
 
-Accepting transitions the row `handed_off → failed` with its own guarded method (`markFailed`
-refuses verified rows), so a re-handout is a no-op that is still acked `delivered`. It then calls
+Accepting moves the row to `failed`. A relayed row goes through its own guarded method, because
+`markFailed` refuses verified rows; a queued row goes through `markFailed`. A re-handout is a no-op
+that is still acked `delivered`. It then calls
 `notifySenderOfFailure` with text rendered from the reason code only. An unrecognised code is
 named as a code, never as prose. A non-matching item is acked `refused`
 (`no_matching_relay`), which the worker logs and drops.
@@ -131,6 +146,10 @@ analogue of `wake-permanent`.
   row is at least unverified. A relayed sender's row is verified at handoff, so that sender hears
   nothing at all.
 - **Failures after 7 days are lost** (retention above).
+- **An ambiguous relay can mislead after a timeout.** If a relay timed out after the worker had
+  stored it, every later attempt hits a transient error, and the receiver never answers, then the
+  attempt budget ends with "NOT received, safe to resend" while the worker still holds the
+  message. If the receiver *does* answer, it is handled (the queued-row case above).
 - **Remote `gse_` targets are unreachable.** `/swarm/send` on the sender refuses a `gse_` id with
   no local row (`bank-or-insert.ts`, `no_session`), so a goose session cannot be a cross-machine
   target. Goose swarm targets are `pigeon-k0qn.13`'s scope.
