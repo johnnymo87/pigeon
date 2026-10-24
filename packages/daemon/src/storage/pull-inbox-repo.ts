@@ -111,6 +111,14 @@ export class PullInboxRepository {
    * retry after a partially-completed ingest must not put a second copy of the
    * human's message in front of the agent.
    */
+  /** The identity of a banked row, for the relay receiver's duplicate check. */
+  getIdentity(msgId: string): { sessionId: string; senderId: string | null; payload: string } | null {
+    const row = this.db
+      .prepare("SELECT session_id, sender_id, payload FROM pull_inbox WHERE msg_id = ?")
+      .get(msgId) as { session_id: string; sender_id: string | null; payload: string } | undefined;
+    return row ? { sessionId: row.session_id, senderId: row.sender_id, payload: row.payload } : null;
+  }
+
   bank(input: BankPullMessageInput, now = Date.now()): boolean {
     const result = this.db
       .prepare(

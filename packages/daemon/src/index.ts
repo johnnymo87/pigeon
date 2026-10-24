@@ -2,6 +2,9 @@ import { describeWorkerIdentity, formatPollAuthAlert } from "./worker/worker-ide
 import { createApp } from "./app";
 import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
+import { RelayClient, relayPollHeader } from "./worker/relay-client";
+import { processRelayItems } from "./swarm/relay-receiver";
+import { RelayFailSender } from "./swarm/relay-fail-sender";
 import {
   TelegramNotificationService,
   generateToken,
@@ -442,6 +445,29 @@ if (pullAllowedSenderIds.size === 0) {
   console.log("[pull-inbox] PIGEON_PULL_ALLOWED_USER_IDS is empty: pull sessions will not bank inbound, topic-bound goose sessions will accept no prompts, and unbound goose sessions accept any sender");
 }
 
+// Tri-state session locality (pigeon-k0qn.2): read-only, never places a session. Shared by the
+// arbiter (remote targets) and the relay receiver (a relayed `from` that is really ours).
+const sessionLocality = makeLocalityResolver({
+  hasLocalSession: (id) => storage.sessions.get(id) !== null,
+  baseUrlsFor: (id) => [
+    ...(ingressRouter ? [ingressRouter.resolveRoute(id, Date.now())?.apiBase] : []),
+    config.opencodeUrl,
+    ...config.serveEndpoints,
+  ].filter((u): u is string => typeof u === "string" && u.length > 0),
+});
+
+// Cross-machine swarm relay (pigeon-k0qn.6/.7). Both halves are off unless configured; the poll
+// header still carries `failures=1` so a machine that relayed and then turned sending off keeps
+// hearing about failures it is owed (they live 24h at the worker).
+const relayClient = config.workerUrl && config.workerApiKey
+  ? new RelayClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
+  : undefined;
+if (config.swarmRelayAcceptFrom.length > 0 || config.swarmRelaySend) {
+  console.log(
+    `[relay] accept_from=${config.swarmRelayAcceptFrom.join(",") || "(none)"} send=${config.swarmRelaySend ? "on" : "off"}`,
+  );
+}
+
 const poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
@@ -464,8 +490,22 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           opencode: Boolean(opencodeClient),
           goose: canLaunchGoose,
         }),
+        relayHeader: relayPollHeader(config.swarmRelayAcceptFrom, true),
       },
       {
+        // Relay items: inserted and acked before this poll's command is dispatched.
+        onRelayItems: async (items) => {
+          const acks = await processRelayItems(
+            {
+              storage,
+              selfMachineId: config.machineId!,
+              acceptFrom: config.swarmRelayAcceptFrom,
+              localityOf: sessionLocality,
+            },
+            items,
+          );
+          await relayClient?.ack(acks);
+        },
         // Any inbound action on a session means the user is looking at it, so the
         // unread badge clears. This is the single boundary every Telegram-originated
         // command crosses -- a typed reply and a question-card callback both arrive
@@ -795,20 +835,19 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       directoryForSession,
       // pigeon-k0qn.2: decide local/remote/unknown read-only, before any client
       // is built, so a session on another machine fails fast and is never placed.
-      localityOf: makeLocalityResolver({
-        hasLocalSession: (id) => storage.sessions.get(id) !== null,
-        baseUrlsFor: (id) => [
-          ...(ingressRouter ? [ingressRouter.resolveRoute(id, Date.now())?.apiBase] : []),
-          config.opencodeUrl,
-          ...config.serveEndpoints,
-        ].filter((u): u is string => typeof u === "string" && u.length > 0),
-      }),
+      localityOf: sessionLocality,
       ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
       selfMachineId: config.machineId,
+      relay: config.swarmRelaySend && relayClient ? (body) => relayClient.relay(body) : undefined,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
   : undefined;
+
+// Reports late failures of relayed-in messages back through the worker. Runs whether or not
+// receiving is on now: a report queued before a config change is still owed.
+const relayFailSender = relayClient ? new RelayFailSender(storage, relayClient) : undefined;
+relayFailSender?.start(5_000);
 
 if (swarmArbiter) {
   swarmArbiter.start(500);
@@ -864,6 +903,11 @@ setInterval(() => {
 
   const swarmCleaned = storage.swarm.cleanupOlderThan(now - SWARM_RETENTION_MS);
   if (swarmCleaned > 0) console.log(`[swarm] cleaned ${swarmCleaned} old messages`);
+
+  // 8 days: the worker forgets a relay row after 7, so an older record can route nothing back.
+  // Kept while its message row lives, though: the hop rule and the /fail diversion read it.
+  const relayInboundCleaned = storage.relayInbound.pruneOlderThan(now - 8 * 24 * 60 * 60 * 1000);
+  if (relayInboundCleaned > 0) console.log(`[relay] pruned ${relayInboundCleaned} inbound records`);
 
   // Unlike the swarm cleanup above, which spares 'queued' rows, every ledger row is
   // prunable: a row exists only because delivery already succeeded, so there is no

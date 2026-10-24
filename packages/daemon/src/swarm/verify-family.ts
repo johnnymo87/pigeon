@@ -40,7 +40,14 @@
  * deploy ordering is load-bearing: this gate must be everywhere before anything
  * writes a non-null family.
  */
-export const VERIFY_FAMILIES = ["transcript", "receipt"] as const;
+export const VERIFY_FAMILIES = ["transcript", "receipt", "relayed"] as const;
+
+/*
+ * `relayed` — handed to the worker for another machine (pigeon-k0qn.7). Nothing on this machine
+ *   can confirm it, so it is stamped verified at handoff and never reaches the watchdog; a late
+ *   failure comes back as a failure item. The watchdog refuses it loudly if it ever does arrive
+ *   unverified, rather than running transcript remedies against a session that is not here.
+ */
 
 export type VerifyFamily = (typeof VERIFY_FAMILIES)[number];
 

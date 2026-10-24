@@ -852,7 +852,10 @@ export class DeliveryWatchdog {
       if (!target) continue;
 
       const family = resolveVerifyFamily(row.verifyFamily);
-      if (family === null) {
+      // `relayed` rows are verified at handoff, so one here is a bug: refuse it like an unknown
+      // family rather than fetching a transcript for a session on another machine (whose 404
+      // would read as "confirmed gone" and tell the sender to resend).
+      if (family === null || family === "relayed") {
         counts.skipped++;
         this.log("skipped", {
           msgId: row.msgId,
@@ -864,8 +867,8 @@ export class DeliveryWatchdog {
           counts.alerted++;
           await this.alert(
             "error",
-            `delivery watchdog: msg ${row.msgId} to ${target} carries an ` +
-              `unrecognised verify_family=${JSON.stringify(row.verifyFamily)}, so it ` +
+            `delivery watchdog: msg ${row.msgId} to ${target} carries ` +
+              `verify_family=${JSON.stringify(row.verifyFamily)}, which it cannot verify, so it ` +
               `is being left alone rather than verified. Guessing would either ` +
               `strand the message or run opencode's transcript and 404 remedies ` +
               `against a backend that has neither. This column is written only by ` +

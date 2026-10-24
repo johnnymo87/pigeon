@@ -83,6 +83,9 @@ export function runPullInboxMaintenance(deps: PullInboxMaintenanceDeps): void {
         now,
         "unobserved",
         payload,
+        // Relayed in: a collected-but-unconfirmed row may have been acted on, which the
+        // derived code ("not delivered", safe to resend) would deny.
+        row.claimCount > 0 ? "unconfirmed_on_receiver" : "not_delivered_on_receiver",
       );
       log(`expired unread msg=${row.msgId} session=${row.sessionId}`);
       return;

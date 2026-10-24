@@ -50,18 +50,18 @@ export type DeliveryEvidence = "absent" | "present" | "unobserved";
  * ambiguity documented on findSilentInFlight). It stays an internal recovery
  * trigger and is never asserted to a sender.
  */
+/** Did the payload reach the target? The rule {@link formatFailureNotice} words its notice by. */
+export function payloadLanded(evidence: DeliveryEvidence, handedOffAt: number | null): boolean {
+  return evidence === "present" ? true : evidence === "absent" ? false : handedOffAt !== null;
+}
+
 export function formatFailureNotice(
   failed: Pick<SwarmMessageRecord, "msgId" | "handedOffAt">,
   target: string,
   reason: string,
   evidence: DeliveryEvidence = "unobserved",
 ): string {
-  const landed =
-    evidence === "present"
-      ? true
-      : evidence === "absent"
-        ? false
-        : failed.handedOffAt !== null;
+  const landed = payloadLanded(evidence, failed.handedOffAt);
   if (!landed) {
     return (
       `DELIVERY FAILED: your swarm message ${failed.msgId} to ${target} ` +
@@ -131,7 +131,34 @@ export function notifySenderOfFailure(
   now: number,
   evidence: DeliveryEvidence = "unobserved",
   customPayload?: string,
+  /**
+   * The reason code reported to the worker when `failed` arrived by relay. Omitted, it is
+   * derived from whether the payload landed. Pass it where that derivation would be wrong: a
+   * target that is not on this machine at all (`not_on_receiver`), or a pull row collected but
+   * never confirmed (`unconfirmed_on_receiver`).
+   */
+  relayReason?: string,
 ): void {
+  // RELAYED IN (pigeon-k0qn.6), and FIRST, before both guards below: the sender is on another
+  // machine, so a local `from='pigeon'` row addressed to it could only be relayed, which the
+  // relay route refuses. The worker mints the sender's failure item instead. This must precede
+  // the delivery.failed loop guard because that guard is about notices WE minted; a relayed
+  // message may carry any kind, and the worker never answers its own failure items.
+  // Matched on from and to as well as msg_id: pull_inbox and swarm_messages are separate
+  // tables, so a local row could reuse a relayed row's id.
+  const inbound = storage.relayInbound.get(failed.msgId);
+  if (inbound && inbound.fromSession === failed.fromSession && inbound.toSession === (failed.toSession ?? null)) {
+    const code =
+      relayReason ??
+      (payloadLanded(evidence, failed.handedOffAt ?? null) ? "unconfirmed_on_receiver" : "not_delivered_on_receiver");
+    if (storage.relayInbound.queueFailure(failed.msgId, code, now)) {
+      console.warn(
+        `[notify-sender] relayed message ${failed.msgId} from ${inbound.fromMachine} failed here (${code}); reporting to the worker`,
+      );
+    }
+    return;
+  }
+
   // Loop guard: a failed delivery.failed notification must not spawn another.
   if (failed.kind === DELIVERY_FAILED_KIND) return;
   // Only route notifications to a real session sender. `from` is not

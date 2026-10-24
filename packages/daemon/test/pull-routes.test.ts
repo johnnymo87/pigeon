@@ -523,7 +523,7 @@ describe("pull routes", () => {
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid")).toBeNull();
       }
 
@@ -535,7 +535,7 @@ describe("pull routes", () => {
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid2")).toBeNull();
       }
 
@@ -547,7 +547,7 @@ describe("pull routes", () => {
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm");
+        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid3")).toBeNull();
       }
 

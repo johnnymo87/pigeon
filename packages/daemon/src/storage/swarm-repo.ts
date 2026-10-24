@@ -210,6 +210,46 @@ export class SwarmRepository {
     return result.changes > 0;
   }
 
+  /**
+   * Commits a successful cross-machine relay (pigeon-k0qn.7): handed off AND verified, family
+   * `relayed`, in one statement.
+   *
+   * Verified at once because this daemon can never confirm the delivery itself: the target's
+   * transcript is on another machine. Left unverified, the watchdog would fetch it here, get a
+   * 404, read that as "confirmed gone" and tell the sender "safe to resend" -- a duplicate prompt.
+   * A late failure arrives instead as a failure item from the worker ({@link markRelayFailed}).
+   *
+   * `fromCancelled` covers a cancel that landed while the relay POST was in flight: the message
+   * was relayed regardless, so the row must say so (and carry the family, or every later failure
+   * item for it would be refused as unmatched).
+   */
+  markRelayed(msgId: string, now: number, fromCancelled = false): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages
+         SET state = 'handed_off', handed_off_at = ?, verified_at = ?, updated_at = ?,
+             next_retry_at = NULL, verify_family = 'relayed'
+         WHERE msg_id = ? AND state = ?`,
+      )
+      .run(now, now, now, msgId, fromCancelled ? "cancelled" : "queued");
+    return result.changes > 0;
+  }
+
+  /**
+   * A relayed row the worker reports as not delivered (a failure item). Its own method because
+   * {@link markFailed} refuses verified rows, and a relayed row is verified at handoff. Guarded on
+   * family and state, so a failure item handed out twice changes the row once.
+   */
+  markRelayFailed(msgId: string, now: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE swarm_messages SET state = 'failed', updated_at = ?
+         WHERE msg_id = ? AND state = 'handed_off' AND verify_family = 'relayed'`,
+      )
+      .run(now, msgId);
+    return result.changes > 0;
+  }
+
   markCancelled(msgId: string, now = Date.now()): boolean {
     const result = this.db
       .prepare(

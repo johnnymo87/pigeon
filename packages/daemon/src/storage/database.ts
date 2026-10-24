@@ -26,6 +26,7 @@ import { initPullInboxSchema } from "./pull-inbox-schema";
 import { PullInboxRepository } from "./pull-inbox-repo";
 import { initGooseInflightSchema } from "./goose-inflight-schema";
 import { GooseInflightRepository } from "./goose-inflight-repo";
+import { initRelayInboundSchema, RelayInboundRepository } from "./relay-inbound-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -45,6 +46,8 @@ export interface StorageDb {
   pullInbox: PullInboxRepository;
   /** Persisted in-flight goose turns for crash recovery (honk-znj.10). */
   gooseInflight: GooseInflightRepository;
+  /** Messages that arrived by cross-machine relay (pigeon-k0qn.6). See relay-inbound-repo.ts. */
+  relayInbound: RelayInboundRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
@@ -67,6 +70,7 @@ export function openStorageDb(path: string): StorageDb {
   initInjectedPromptsSchema(db);
   initPullInboxSchema(db);
   initGooseInflightSchema(db);
+  initRelayInboundSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
@@ -88,6 +92,7 @@ export function openStorageDb(path: string): StorageDb {
     injectedPrompts: new InjectedPromptsRepository(db),
     pullInbox: new PullInboxRepository(db),
     gooseInflight: new GooseInflightRepository(db),
+    relayInbound: new RelayInboundRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),

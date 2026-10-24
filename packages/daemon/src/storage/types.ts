@@ -1,5 +1,9 @@
 export const DEFAULT_PULL_SOURCES: readonly string[] = ["telegram-reply"];
-export const ALLOWED_PULL_SOURCES = ["telegram-reply", "swarm"] as const;
+/**
+ * `swarm-remote` (pigeon-k0qn.6): also accept swarm messages relayed from another machine.
+ * Meaningful only alongside `swarm`; `swarm` alone was a local-trust decision.
+ */
+export const ALLOWED_PULL_SOURCES = ["telegram-reply", "swarm", "swarm-remote"] as const;
 export type PullSource = (typeof ALLOWED_PULL_SOURCES)[number];
 
 export interface SessionRecord {

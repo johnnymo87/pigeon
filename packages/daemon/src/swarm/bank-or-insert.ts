@@ -16,6 +16,10 @@ export interface BankOrInsertInput {
   deliverAt?: number | null;
   expiresAt?: number | null;
   ref?: string | null;
+  /** Telegram notice name for a sender with no local row (a relayed message). */
+  remoteSenderName?: string | null;
+  /** Pull-inbox TTL override (a relayed message must expire while the worker still has it). */
+  pullTtlMs?: number;
 }
 
 export type BankOrInsertResult =
@@ -113,6 +117,7 @@ export function bankOrInsertSwarmMessage(
         senderId: input.fromSession,
         kind: input.kind,
         replyTo: input.replyTo,
+        ...(input.pullTtlMs !== undefined ? { ttlMs: input.pullTtlMs } : {}),
       },
       now,
     );
@@ -130,6 +135,7 @@ export function bankOrInsertSwarmMessage(
           payload: input.payload,
           createdAt: now,
           deliverAt: null,
+          remoteSenderName: input.remoteSenderName ?? null,
         },
         now,
       );
@@ -163,7 +169,7 @@ export function bankOrInsertSwarmMessage(
   if (inserted) {
     const record = storage.swarm.getByMsgId(input.msgId);
     if (record) {
-      enqueueSwarmTelegramNotice(storage, record, now);
+      enqueueSwarmTelegramNotice(storage, { ...record, remoteSenderName: input.remoteSenderName ?? null }, now);
     }
   }
 

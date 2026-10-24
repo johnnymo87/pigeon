@@ -38,6 +38,13 @@ export interface DaemonConfig {
   stuckAbortSilenceMs: number;
   maxRequeues: number;
   /**
+   * Machines whose relayed swarm messages this daemon accepts (pigeon-k0qn.6,
+   * `PIGEON_SWARM_RELAY_ACCEPT_FROM`, comma separated). Empty, the default: receive nothing.
+   */
+  swarmRelayAcceptFrom: string[];
+  /** Relay swarm messages for sessions on other machines (pigeon-k0qn.7, `PIGEON_SWARM_RELAY_SEND=1`). */
+  swarmRelaySend: boolean;
+  /**
    * The goose `serve` ACP endpoint, e.g. `ws://127.0.0.1:3400/acp`. Absent means
    * goose is not configured on this machine, which makes goose sessions
    * correctly unroutable rather than half-routable.
@@ -99,6 +106,16 @@ export function parseIdList(value: string | undefined): string[] {
     .filter((id) => id.length > 0);
 }
 
+/** Comma-separated machine ids, deduped and sorted, `self` dropped. */
+export function parseMachineList(value: string | undefined, self: string | undefined): string[] {
+  if (!value) return [];
+  const ids = value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z0-9_-]{1,64}$/.test(s) && s !== self);
+  return [...new Set(ids)].sort();
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): DaemonConfig {
   const defaultDbPath = `${process.cwd()}/data/pigeon-daemon.db`;
   const opencodeUrl = env.OPENCODE_URL?.trim() || undefined;
@@ -134,5 +151,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gooseAcpToken: env.PIGEON_GOOSE_ACP_TOKEN?.trim() || undefined,
     pullAllowedUserIds: parseIdList(env.PIGEON_PULL_ALLOWED_USER_IDS),
     maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
+    swarmRelayAcceptFrom: parseMachineList(env.PIGEON_SWARM_RELAY_ACCEPT_FROM, env.CCR_MACHINE_ID?.trim()),
+    swarmRelaySend: env.PIGEON_SWARM_RELAY_SEND?.trim() === "1",
   };
 }
