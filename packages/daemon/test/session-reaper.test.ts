@@ -100,8 +100,12 @@ describe("ownership refresh (pigeon-k0qn.5)", () => {
       body: { error: "owned_by_other_machine", detail: "ses_squatted is registered to devbox" },
     }));
     await run(registerSession, now, { ownership, alert });
+    // Not retried within the day: an hourly 409 would trip the worker-health alarm.
     storage.sessions.touch("ses_squatted", now + 3_600_000 - 1_000);
     await run(registerSession, now + 3_600_000, { ownership, alert });
+    expect(registerSession).toHaveBeenCalledTimes(1);
+    storage.sessions.touch("ses_squatted", now + OWNERSHIP_REFRESH_AGE_MS);
+    await run(registerSession, now + OWNERSHIP_REFRESH_AGE_MS, { ownership, alert });
     expect(registerSession).toHaveBeenCalledTimes(2);
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert.mock.calls[0]![0]).toContain("ses_squatted");

@@ -153,6 +153,10 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
             // Best-effort; the log line above stands.
           }
         }
+        // Any other rejection waits for the next day like a success does: retrying it every
+        // cycle would feed the worker-health monitor a 409 an hour and raise a false
+        // "register is failing" alarm. Only a transport failure (above) leaves it due.
+        state.lastRefreshed.set(session.sessionId, now);
         continue;
       }
       state.lastRefreshed.set(session.sessionId, now);

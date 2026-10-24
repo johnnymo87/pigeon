@@ -152,11 +152,6 @@ export function validateRelayBody(body: Record<string, unknown>, now: number): M
   if (!("deliver_at" in body) || !optNumber(deliver_at)) return bad("deliver_at is required (a number or null)");
   if (!("ref" in body) || !optString(ref)) return bad("ref is required (a string or null)");
   if (expires_at !== undefined && !optNumber(expires_at)) return bad("expires_at must be a number or null");
-  // Its own code, not 400: a scheduled send retried until it expires lands here in the normal
-  // course of things (design §7), and so does clock skew. It is not a sender bug.
-  if (typeof expires_at === "number" && expires_at <= now) {
-    return Response.json({ error: "expired", detail: "expires_at has passed" }, { status: 410 });
-  }
   if (from_label !== undefined && !optString(from_label)) return bad("from_label must be a string or null");
   return {
     msg_id,
@@ -216,6 +211,14 @@ export async function handleRelay(db: D1Database, env: Env, request: Request, no
     const hash = await contentHash(msg);
     const existing = await getRow(db, fromMachine, msg.msg_id);
     if (existing) return duplicateOrConflict(existing, hash);
+
+    // After the duplicate check: a retry of a row already stored must still answer 202, or a
+    // first attempt whose response was lost would be reported failed while it is delivered.
+    // Its own code, not 400: a scheduled send retried until it expires lands here in the normal
+    // course of things (design §7), and so does clock skew. It is not a sender bug.
+    if (msg.expires_at !== null && msg.expires_at <= now) {
+      return Response.json({ error: "expired", detail: "expires_at has passed" }, { status: 410 });
+    }
 
     // `from` is what agents reply to. A registered sender must be registered to the machine
     // relaying for it, or one machine could speak as another's session (or as a session local

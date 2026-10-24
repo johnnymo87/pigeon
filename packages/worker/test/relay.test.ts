@@ -179,6 +179,17 @@ describe("POST /swarm/relay", () => {
     expect(await res.json()).toMatchObject({ error: "expired" });
   });
 
+  it("still answers 202 duplicate for a retry of a stored row whose expires_at has since passed", async () => {
+    const exp = Date.now() + 60_000;
+    expect((await relay(KEY_A, { expires_at: exp })).status).toBe(202);
+    const res = await call("/swarm/relay", KEY_A, { method: "POST", body: relayBody({ expires_at: exp }) });
+    expect(res.status).toBe(202);
+    // The clock passing expiry, simulated: same content (so same hash), expiry now in the past.
+    const late = await relay(KEY_A, { expires_at: Date.now() - 1 });
+    expect(late.status).toBe(202);
+    expect(await late.json()).toMatchObject({ duplicate: true });
+  });
+
   it("refuses a from registered to another machine, and lets an unregistered from through", async () => {
     await seedSession("ses_rlySenderOnC01", C);
     const res = await relay(KEY_A, { from: "ses_rlySenderOnC01" });
