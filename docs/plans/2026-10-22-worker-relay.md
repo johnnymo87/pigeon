@@ -16,7 +16,11 @@ Worker:
 - An hourly expiry step that mints failure items and prunes terminal rows.
 - Register's read-then-upsert made conditional.
 
-Daemon, one line: a session registers with the worker whatever its `notify` flag (rule 2).
+Daemon (rule 2):
+
+- A session registers with the worker whatever its `notify` flag.
+- The hourly reaper re-registers each live session about once a day.
+- The reaper alerts when the worker says another machine owns a session held here.
 
 Out of scope: the daemon's send side (`.7`) and receive side (`.6`). Nothing here changes
 behaviour until a daemon sends `X-Pigeon-Swarm-Relay`. No daemon does yet.
@@ -27,11 +31,24 @@ behaviour until a daemon sends `X-Pigeon-Swarm-Relay`. No daemon does yet.
    owner is not in `SHARED_KEY_REFUSED_MACHINES` (`*` counts). Until it is, a shared-key holder
    can re-register the owner's sessions to itself and collect what is queued for them.
 2. **First-registrant claim.** The worker cannot tell an owner's row from a squatter's: both are
-   written by a machine credential, each as its own machine. So the fix belongs to the owner. The
-   daemon now registers every session at `/session-start`, not only `notify=true` ones, so an
-   owner's row exists before anyone else can claim the id. Today only 1 of 676 local sessions on
-   cloudbox has `notify=0`, so the cost is negligible. Sessions that never reach `/session-start`
-   (subagents) are not registered, and relays to them answer `404 unknown_session`, as designed.
+   written by a machine credential, each as its own machine. So the fix belongs to the owner.
+   - **Register everything.** `/session-start` now registers every session, not only `notify=true`
+     ones. The opencode plugin already sends `notify: true`, so this changes few sessions today
+     (1 of 676 on cloudbox).
+   - **Keep rows fresh.** A worker row's `updated_at` moves only on register, notifications and
+     Telegram routing. A session that never notifies would go stale: another machine could take it
+     over after 7 days, and the worker sweep deletes it at 14. So the reaper re-registers every
+     live, unpinned session once its last successful registration is 20 h old.
+     - State is in memory; a restart refreshes everything again.
+     - At most 100 per hourly cycle, 10 s per call.
+     - The cycle stops at the first transport failure.
+   - **Detect a squat.** A `409 owned_by_other_machine` during the refresh means another machine
+     holds a session this daemon runs. The reaper sends a plain alert, once per session per daemon
+     lifetime.
+   - **What remains** is a session idle 7 days or more, which the daemon reaper unregisters. It is
+     recorded in the design's §7.
+   - Subagents never reach `/session-start` and are not registered. Relays to them answer
+     `404 unknown_session`, as designed.
 3. **Machine principal everywhere.** All three relay routes use `requireMachinePrincipal`. The
    hand-out and the accept-set write run only for a machine principal.
    - `from_machine` is the principal. A body naming a different one gets `403 machine_mismatch`.
@@ -54,12 +71,15 @@ behaviour until a daemon sends `X-Pigeon-Swarm-Relay`. No daemon does yet.
      - Identical hash → `202 {duplicate: true}`, without re-running the checks below: the first
        attempt already passed them.
      - Different hash → `409 msg_id_conflict`.
-  3. Owner (`404 unknown_session`).
-  4. Same machine (`409 same_machine`).
-  5. Retirement (`403 receiver_not_retired`).
-  6. Accept set: no row or not listed → `403 not_accepted`; stale → `503 target_offline`.
-  7. Cap (`429`).
-  8. `INSERT ... ON CONFLICT DO NOTHING`. If it lost a race, re-read and apply step 2.
+  3. Sender: a `from` registered to another machine gets `403 sender_not_yours`. An unregistered
+     `from`, such as a subagent, passes.
+  4. Owner (`404 unknown_session`).
+  5. Same machine (`409 same_machine`).
+  6. Retirement (`403 receiver_not_retired`).
+  7. Accept set: no row or not listed → `403 not_accepted`. Owner's last poll older than 60 s →
+     `503 target_offline`.
+  8. Cap (`429`).
+  9. `INSERT ... ON CONFLICT DO NOTHING`. If it lost a race, re-read and apply step 2.
 - **Validation.**
   - `to` is `ses_`/`gse_` plus at least 8 id characters.
   - `from` is `ses_` plus the same.
@@ -68,9 +88,13 @@ behaviour until a daemon sends `X-Pigeon-Swarm-Relay`. No daemon does yet.
   - The `payload` is a string of at most 64 KiB in UTF-8. That bounds the D1 row; the pull-session
     limit stays with the receiver.
   - `deliver_at` and `ref` must be present, either value or null.
-  - `expires_at` is null or in the future.
+  - `expires_at` is null or in the future. A past value gets `410 expired`, not 400, because a
+    scheduled send retried to its end lands there normally.
   - `from='pigeon'` fails the `ses_` rule.
-- **Expiry.** `expires_at` is the sender's value capped at now + 24 h, or now + 24 h when null. The
+- **Expiry.** The worker's deadline is the sender's `expires_at` capped at now + 24 h, or now + 24 h
+  when null. It is stored in the column and handed out as `relay_expires_at`. The item's
+  `expires_at` stays the sender's value, null included, because the receiver's arbiter picks its
+  retry policy by whether a row has one. The
   hand-out skips expired rows. The hourly step turns them into failure items:
   - queued → `never_collected`;
   - leased → `unconfirmed`.

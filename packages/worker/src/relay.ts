@@ -64,6 +64,16 @@ interface MessageBody {
   from_label: string | null;
 }
 
+/**
+ * A message as stored and handed out. `expires_at` is the SENDER's value, null included: the
+ * receiver's arbiter chooses its retry policy by whether a row has an expiry at all
+ * (`arbiter.ts` skipBudget), so a capped value would make every ordinary send retry like a
+ * scheduled one. The worker's own deadline travels separately as `relay_expires_at`.
+ */
+interface StoredMessage extends MessageBody {
+  relay_expires_at: number;
+}
+
 interface FailureBody {
   original_msg_id: string;
   from: string;
@@ -142,7 +152,11 @@ export function validateRelayBody(body: Record<string, unknown>, now: number): M
   if (!("deliver_at" in body) || !optNumber(deliver_at)) return bad("deliver_at is required (a number or null)");
   if (!("ref" in body) || !optString(ref)) return bad("ref is required (a string or null)");
   if (expires_at !== undefined && !optNumber(expires_at)) return bad("expires_at must be a number or null");
-  if (typeof expires_at === "number" && expires_at <= now) return bad("expires_at is in the past");
+  // Its own code, not 400: a scheduled send retried until it expires lands here in the normal
+  // course of things (design §7), and so does clock skew. It is not a sender bug.
+  if (typeof expires_at === "number" && expires_at <= now) {
+    return Response.json({ error: "expired", detail: "expires_at has passed" }, { status: 410 });
+  }
   if (from_label !== undefined && !optString(from_label)) return bad("from_label must be a string or null");
   return {
     msg_id,
@@ -203,6 +217,21 @@ export async function handleRelay(db: D1Database, env: Env, request: Request, no
     const existing = await getRow(db, fromMachine, msg.msg_id);
     if (existing) return duplicateOrConflict(existing, hash);
 
+    // `from` is what agents reply to. A registered sender must be registered to the machine
+    // relaying for it, or one machine could speak as another's session (or as a session local
+    // to the receiver). Unregistered senders, such as subagents, pass: the receiver shows
+    // from_machine, and refuses a `from` that is one of its own sessions (design §3.3).
+    const sender = await db
+      .prepare("SELECT machine_id FROM sessions WHERE session_id = ?")
+      .bind(msg.from)
+      .first<{ machine_id: string }>();
+    if (sender && sender.machine_id !== fromMachine) {
+      return Response.json(
+        { error: "sender_not_yours", detail: `${msg.from} is registered to ${sender.machine_id}, not ${fromMachine}` },
+        { status: 403 },
+      );
+    }
+
     const owner = await db
       .prepare("SELECT machine_id FROM sessions WHERE session_id = ?")
       .bind(msg.to)
@@ -251,7 +280,7 @@ export async function handleRelay(db: D1Database, env: Env, request: Request, no
     }
 
     const expiresAt = Math.min(msg.expires_at ?? Number.POSITIVE_INFINITY, now + RELAY_MAX_TTL_MS);
-    const stored: MessageBody = { ...msg, expires_at: expiresAt };
+    const stored: StoredMessage = { ...msg, relay_expires_at: expiresAt };
     const result = await db
       .prepare(
         `INSERT INTO swarm_relay (from_machine, msg_id, item_kind, to_machine, to_session, from_session,
@@ -440,7 +469,7 @@ export function parseRelayHeader(value: string | null): { accept: string[]; fail
 
 /** One item in the `swarm` array of a poll response. */
 export type HandOutItem =
-  | ({ item: "message"; from_machine: string } & MessageBody)
+  | ({ item: "message"; from_machine: string } & StoredMessage)
   | ({ item: "failure"; from_machine: string; msg_id: string } & FailureBody);
 
 /**
@@ -506,10 +535,10 @@ export async function handOutRelayItems(
     return [...results]
       .sort((a, b) => a.created_at - b.created_at || a.msg_id.localeCompare(b.msg_id))
       .map((r) => {
-        const body = JSON.parse(r.body_json) as MessageBody | FailureBody;
+        const body = JSON.parse(r.body_json) as StoredMessage | FailureBody;
         return r.item_kind === "failure"
           ? ({ item: "failure", from_machine: r.from_machine, msg_id: r.msg_id, ...(body as FailureBody) } as HandOutItem)
-          : ({ item: "message", from_machine: r.from_machine, ...(body as MessageBody) } as HandOutItem);
+          : ({ item: "message", from_machine: r.from_machine, ...(body as StoredMessage) } as HandOutItem);
       });
   } catch (err) {
     if (!isMissingTable(err)) {

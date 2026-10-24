@@ -165,13 +165,29 @@ describe("POST /swarm/relay", () => {
     ["a bad priority", { priority: "high" }],
     ["a missing deliver_at", { deliver_at: undefined }],
     ["a missing ref", { ref: undefined }],
-    ["an expires_at in the past", { expires_at: 1 }],
     ["a payload over the bound", { payload: "x".repeat(64 * 1024 + 1) }],
   ])("answers 400 for %s", async (_label, over) => {
     const body = relayBody(over);
     for (const [k, v] of Object.entries(over)) if (v === undefined) delete body[k];
     const res = await call("/swarm/relay", KEY_A, { method: "POST", body });
     expect(res.status).toBe(400);
+  });
+
+  it("answers 410 expired, not 400, for an expires_at that has passed", async () => {
+    const res = await relay(KEY_A, { expires_at: Date.now() - 1 });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toMatchObject({ error: "expired" });
+  });
+
+  it("refuses a from registered to another machine, and lets an unregistered from through", async () => {
+    await seedSession("ses_rlySenderOnC01", C);
+    const res = await relay(KEY_A, { from: "ses_rlySenderOnC01" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "sender_not_yours" });
+    // A session local to the receiver, too.
+    expect((await relay(KEY_A, { from: S_ON_B })).status).toBe(403);
+    await seedSession(SENDER, A);
+    expect((await relay(KEY_A)).status).toBe(202);
   });
 
   it("is idempotent for an identical retry, even with a changed label, and 409s a different message on the same id", async () => {
@@ -232,12 +248,20 @@ describe("POST /swarm/relay", () => {
     expect((await relay(KEY_A, { msg_id: "msg_cap_over" })).status).toBe(429);
   });
 
-  it("caps a message's expiry at 24h", async () => {
-    const before = Date.now();
-    await relay(KEY_A, { expires_at: before + 10 * RELAY_MAX_TTL_MS });
+  it("caps the worker's deadline at 24h but hands the receiver the sender's own expires_at, null included", async () => {
+    const far = Date.now() + 10 * RELAY_MAX_TTL_MS;
+    await relay(KEY_A, { expires_at: far });
     const r = await row(A, "msg_rly_0001");
     expect(Number(r!.expires_at)).toBeLessThanOrEqual(Date.now() + RELAY_MAX_TTL_MS);
-    expect(JSON.parse(String(r!.body_json)).expires_at).toBe(r!.expires_at);
+    const body = JSON.parse(String(r!.body_json));
+    expect(body.expires_at).toBe(far);
+    expect(body.relay_expires_at).toBe(r!.expires_at);
+
+    await relay(KEY_A, { msg_id: "msg_null_exp" });
+    const items = await swarmOf(await poll(KEY_B, B, `accept=${A}`));
+    const nullOne = items.find((i) => i.msg_id === "msg_null_exp")!;
+    expect(nullOne.expires_at).toBeNull();
+    expect(typeof nullOne.relay_expires_at).toBe("number");
   });
 
   it("answers 503 relay_unavailable before the schema is applied", async () => {

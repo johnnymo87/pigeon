@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { startSessionReaper, reapStaleSessions, ownershipRefreshSlot } from "../src/session-reaper";
+import {
+  startSessionReaper,
+  reapStaleSessions,
+  newOwnershipRefreshState,
+  OWNERSHIP_REFRESH_AGE_MS,
+  OWNERSHIP_REFRESH_PER_CYCLE,
+} from "../src/session-reaper";
 import { SESSION_TTL_MS } from "../src/storage/schema";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import type { QuestionReplyInput } from "../src/adapters/types";
@@ -11,40 +17,95 @@ describe("ownership refresh (pigeon-k0qn.5)", () => {
     storage?.db.close();
     storage = null;
   });
-
-  it("re-registers each live, unpinned session once a day, in its own hourly slot, quiet ones included", async () => {
-    storage = openStorageDb(":memory:");
-    const day = Date.UTC(2026, 9, 22);
-    const now = day + SESSION_TTL_MS;
-    const ids = Array.from({ length: 48 }, (_, i) => `ses_refresh_${i}`);
-    for (const id of ids) storage.sessions.upsert({ sessionId: id, notify: false, label: id }, now - 1_000);
-
-    const calls: string[] = [];
-    const registerSession = vi.fn(async (id: string) => {
-      calls.push(id);
-      return { ok: true };
+  const ok = { ok: true, kind: "success", status: 200, body: {} };
+  const run = (registerSession: (...a: never[]) => Promise<unknown>, now: number, extra: Record<string, unknown> = {}) =>
+    reapStaleSessions({
+      storage: storage!,
+      unregisterSession: vi.fn(),
+      registerSession: registerSession as never,
+      ownership: extra.ownership as never,
+      alert: extra.alert as never,
+      nowFn: () => now,
+      log: () => {},
     });
-    for (let hour = 0; hour < 24; hour++) {
-      const at = now - (now % 86_400_000) + hour * 3_600_000 + 1;
-      for (const id of ids) storage.sessions.touch(id, at - 1_000);
-      const r = await reapStaleSessions({ storage, unregisterSession: vi.fn(), registerSession, nowFn: () => at });
-      expect(r.refreshedOwnership).toBe(ids.filter((id) => ownershipRefreshSlot(id) === hour).length);
-    }
-    expect([...calls].sort()).toEqual([...ids].sort());
-  });
 
-  it("skips pinned sessions, which the pinned refresh already covers every cycle", async () => {
+  it("re-registers every live, unpinned session, quiet ones included, then not again until it is due", async () => {
     storage = openStorageDb(":memory:");
     const now = SESSION_TTL_MS + 50_000;
-    const id = "ses_pinned_refresh";
-    storage.sessions.upsert({ sessionId: id, notify: true }, now - 1_000);
-    storage.sessions.setBoundTopicKey(id, "k", now);
-    const registerSession = vi.fn(async () => ({ ok: true }));
-    const at = now - (now % 3_600_000) + ((ownershipRefreshSlot(id) - new Date(now).getUTCHours() + 24) % 24) * 3_600_000;
-    const r = await reapStaleSessions({ storage, unregisterSession: vi.fn(), registerSession, nowFn: () => at });
-    expect(r.refreshedPinned).toBe(1);
-    expect(r.refreshedOwnership).toBe(0);
+    storage.sessions.upsert({ sessionId: "ses_quiet", notify: false, label: "q" }, now - 1_000);
+    storage.sessions.upsert({ sessionId: "ses_loud", notify: true }, now - 1_000);
+    storage.sessions.upsert({ sessionId: "ses_pinned", notify: true }, now - 1_000);
+    storage.sessions.setBoundTopicKey("ses_pinned", "k", now - 1_000);
+    const ownership = newOwnershipRefreshState();
+    const registerSession = vi.fn(async () => ok);
+
+    const first = await run(registerSession, now, { ownership });
+    expect(first.refreshedOwnership).toBe(2);
+    expect(first.refreshedPinned).toBe(1);
+    expect(registerSession.mock.calls.map((c) => (c as unknown[])[0]).sort()).toEqual(["ses_loud", "ses_pinned", "ses_quiet"]);
+    // Bounded per call.
+    expect((registerSession.mock.calls.find((c) => (c as unknown[])[0] === "ses_quiet") as unknown[])[2]).toBeInstanceOf(AbortSignal);
+
+    registerSession.mockClear();
+    for (const id of ["ses_quiet", "ses_loud", "ses_pinned"]) storage.sessions.touch(id, now + 3_600_000 - 1_000);
+    expect((await run(registerSession, now + 3_600_000, { ownership })).refreshedOwnership).toBe(0);
+    for (const id of ["ses_quiet", "ses_loud", "ses_pinned"]) storage.sessions.touch(id, now + OWNERSHIP_REFRESH_AGE_MS);
+    expect((await run(registerSession, now + OWNERSHIP_REFRESH_AGE_MS, { ownership })).refreshedOwnership).toBe(2);
+  });
+
+  it("does nothing without refresh state (a caller that did not opt in)", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+    storage.sessions.upsert({ sessionId: "ses_a", notify: false }, now - 1_000);
+    const registerSession = vi.fn(async () => ok);
+    expect((await run(registerSession, now)).refreshedOwnership).toBe(0);
+    expect(registerSession).not.toHaveBeenCalled();
+  });
+
+  it("caps registers per cycle and does the never-refreshed first", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+    for (let i = 0; i < OWNERSHIP_REFRESH_PER_CYCLE + 5; i++) {
+      storage.sessions.upsert({ sessionId: `ses_cap_${i}`, notify: true }, now - 1_000);
+    }
+    const ownership = newOwnershipRefreshState();
+    const registerSession = vi.fn(async () => ok);
+    expect((await run(registerSession, now, { ownership })).refreshedOwnership).toBe(OWNERSHIP_REFRESH_PER_CYCLE);
+    for (let i = 0; i < OWNERSHIP_REFRESH_PER_CYCLE + 5; i++) storage.sessions.touch(`ses_cap_${i}`, now + 3_600_000 - 1_000);
+    expect((await run(registerSession, now + 3_600_000, { ownership })).refreshedOwnership).toBe(5);
+  });
+
+  it("stops the cycle at the first transport failure, and retries next cycle", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+    storage.sessions.upsert({ sessionId: "ses_t1", notify: true }, now - 1_000);
+    storage.sessions.upsert({ sessionId: "ses_t2", notify: true }, now - 1_000);
+    const ownership = newOwnershipRefreshState();
+    const registerSession = vi.fn(async () => ({ ok: false, kind: "transport_error", error: "timeout" }));
+    expect((await run(registerSession, now, { ownership })).refreshedOwnership).toBe(0);
     expect(registerSession).toHaveBeenCalledTimes(1);
+    expect(ownership.lastRefreshed.size).toBe(0);
+  });
+
+  it("alerts once when the worker says another machine owns a session held here", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+    storage.sessions.upsert({ sessionId: "ses_squatted", notify: false, label: "mine" }, now - 1_000);
+    const ownership = newOwnershipRefreshState();
+    const alert = vi.fn(async (_text: string) => {});
+    const registerSession = vi.fn(async () => ({
+      ok: false,
+      kind: "http_error",
+      status: 409,
+      body: { error: "owned_by_other_machine", detail: "ses_squatted is registered to devbox" },
+    }));
+    await run(registerSession, now, { ownership, alert });
+    storage.sessions.touch("ses_squatted", now + 3_600_000 - 1_000);
+    await run(registerSession, now + 3_600_000, { ownership, alert });
+    expect(registerSession).toHaveBeenCalledTimes(2);
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0]![0]).toContain("ses_squatted");
+    expect(alert.mock.calls[0]![0]).toContain("registered to devbox");
   });
 });
 

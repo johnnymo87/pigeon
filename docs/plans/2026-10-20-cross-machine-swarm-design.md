@@ -163,6 +163,8 @@ adds no extra request.
   | `404 unknown_session` | nobody owns it | permanent → `delivery.failed` |
   | `409 same_machine` | D1 says it is ours | permanent; log loudly (locality and D1 disagree) |
   | `403 receiver_not_retired` | the owner still accepts the shared key (§6) | permanent |
+  | `403 sender_not_yours` | `from` is registered to another machine | permanent; log loudly |
+  | `410 expired` | the row's `expires_at` passed (a scheduled send retried to its end, or clock skew) | permanent, as for local expiry |
   | `403 not_accepted` | owner does not accept relays from us | permanent |
   | `409 msg_id_conflict` | that id is taken by a different message | permanent |
   | `503 target_offline` | owner not polling | transient |
@@ -214,8 +216,10 @@ adds no extra request.
   at most 5 times in all; after that the item expires as `unconfirmed`.
 - **Item shapes** (the `swarm` array):
   - Message: `{item: "message", from_machine, msg_id, from, to, kind, priority, reply_to, payload,
-    deliver_at, expires_at, ref, from_label}`. Here `expires_at` is the worker's effective expiry:
-    the sender's value capped at 24 h.
+    deliver_at, expires_at, ref, from_label, relay_expires_at}`.
+    - `expires_at` is the sender's own value, null included. The receiver inserts it unchanged:
+      its arbiter picks a retry policy by whether a row has an expiry at all.
+    - `relay_expires_at` is the worker's deadline, capped at 24 h. The receiver need not use it.
   - Failure: `{item: "failure", from_machine, msg_id: "f:<original>", original_msg_id, from, to,
     reason, machine}`, where `machine` is the receiver that did not take the message.
   - Ack either shape by its own `(from_machine, msg_id)`.
@@ -252,7 +256,10 @@ adds no extra request.
   wrong or old.
 - **Re-validate.** Items arrive by a second entry point that bypasses `/swarm/send`'s validator
   (`app.ts:141-246`); run the same validation (which rejects `from='pigeon'`), plus the hop rule
-  (§3.1). Failure items take the receipt path in §3.2 instead.
+  (§3.1).
+  - Refuse an item whose `from` is one of this machine's own sessions (`from_is_local`). The worker
+    checks only registered senders, so this is the airtight check against a remote machine
+    speaking as a local session. Failure items take the receipt path in §3.2 instead.
 - **Order within a poll.** Insert and ack every relay item *before* dispatching a command from the
   same response: `tick()` is serialised behind `polling`, and a launch can block 20s or more, which
   would let items outlive their 60s lease and be handed out again.
@@ -512,8 +519,9 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
     logged by the worker.
 - A sleeping Mac answers `target_offline`: ordinary sends fail when their attempts run out,
   scheduled sends retry until they expire.
-- Fixed pull-lane ids (`ses_lane_maven_renovate`, `ses_stallwatch_*`) follow the last machine that
-  registered them; if a lane ever runs on two machines, relays go to whichever registered last.
+- Fixed pull-lane ids (`ses_lane_maven_renovate`, `ses_stallwatch_*`) stay with the machine that
+  registered them first. A second machine gets `409 owned_by_other_machine` (and its daemon raises
+  an alert) until the first unregisters or its row has been idle 7 days.
 - Channels/broadcast are not delivered even locally (`pigeon-web`) and are not relayed.
 
 ## §8. Deployment order

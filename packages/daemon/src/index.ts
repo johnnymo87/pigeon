@@ -902,7 +902,9 @@ if (poller) {
       gooseRunners?.drop(sessionId);
       return poller.unregisterSession(sessionId);
     },
-    registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
+    registerSession: (sessionId, label, signal) => poller.registerSession(sessionId, label, signal),
+    // A session held here whose worker row another machine owns (pigeon-k0qn.5).
+    alert: notifier?.sendPlainAlert ? (text) => notifier.sendPlainAlert!(text, "warning") : undefined,
     log: (msg) => console.log(`[reaper] ${msg}`),
   });
 }
