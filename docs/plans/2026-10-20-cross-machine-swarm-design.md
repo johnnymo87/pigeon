@@ -162,10 +162,16 @@ adds no extra request.
   | `202` | stored for the owner | handed off (`relayed`) |
   | `404 unknown_session` | nobody owns it | permanent → `delivery.failed` |
   | `409 same_machine` | D1 says it is ours | permanent; log loudly (locality and D1 disagree) |
+  | `403 receiver_not_retired` | the owner still accepts the shared key (§6) | permanent |
   | `403 not_accepted` | owner does not accept relays from us | permanent |
   | `409 msg_id_conflict` | that id is taken by a different message | permanent |
   | `503 target_offline` | owner not polling | transient |
-  | `429` / 5xx / transport | worker trouble or cap | transient |
+  | `429 queue_full` / 5xx / transport | worker trouble or cap (`503 relay_unavailable`: schema not applied) | transient |
+  | `400 invalid` | the row fails the worker's validator | permanent; log loudly (a sender bug) |
+  | `401` | no machine credential (the shared key is never accepted here) | transient; the daemon's worker-identity alarm reports it |
+
+  A `202` may carry `duplicate: true`, meaning an identical earlier attempt was already stored.
+  Treat it like any other `202`.
 
 ### §3.2 Worker
 
@@ -182,12 +188,14 @@ adds no extra request.
   (`delivery-policy.ts:52-56`) flips, making a scheduled non-`wake` row eligible for watchdog
   redelivery — duplicate injection. Checks, in order: validate ids (`ses_`/`gse_` target, `msg_id`
   without `:`, `from` is `ses_…`); owner from
-  `sessions.machine_id` (absent → 404); owner = `from_machine` → 409; owner's accept set lacks
-  `from_machine` → 403, or was last reported more than the 60s online threshold ago → 503;
+  `sessions.machine_id` (absent → 404); owner = `from_machine` → 409; owner not retired from the shared key → 403 `receiver_not_retired`; owner's accept set lacks
+  `from_machine` → 403, or the owner's last poll is older than the 60s online threshold → 503;
   per-target-machine cap (50 queued) → 429. `from='pigeon'` is **not** accepted on this route:
   failure notices are minted by the worker itself (below), never by a caller.
 - **Accept set storage.** `CREATE TABLE IF NOT EXISTS machine_relay_accept (machine_id PRIMARY KEY,
-  accept_csv, seen_at)`, written from each poll's header. The relay route reads it, so a sender
+  accept_csv, updated_at)`, written from the poll's header *only when it changes*. A machine poll
+  without the header clears it. Liveness for the `503` check is `machines.last_poll_at`, so it
+  costs no extra write per poll. The relay route reads it, so a sender
   learns at once that the owner does not accept it; hand-out re-checks the live request header, so
   a rolled-back receiver stops receiving immediately.
 - **Hand-out.** `GET /machines/:id/next` keeps its body and status codes; when the request carries
@@ -202,7 +210,19 @@ adds no extra request.
   passed (the expiry cron runs hourly). An old daemon never sends the header, so never sees the
   field.
 - **Ack.** `POST /swarm/relay/ack` `{items: [{from_machine, msg_id, outcome}]}`, outcome
-  `delivered` or `refused` with a reason. Leased items not acked within 60s are handed out again.
+  `delivered` or `refused` with a reason. Leased items not acked within 60s are handed out again,
+  at most 5 times in all; after that the item expires as `unconfirmed`.
+- **Item shapes** (the `swarm` array):
+  - Message: `{item: "message", from_machine, msg_id, from, to, kind, priority, reply_to, payload,
+    deliver_at, expires_at, ref, from_label}`. Here `expires_at` is the worker's effective expiry:
+    the sender's value capped at 24 h.
+  - Failure: `{item: "failure", from_machine, msg_id: "f:<original>", original_msg_id, from, to,
+    reason, machine}`, where `machine` is the receiver that did not take the message.
+  - Ack either shape by its own `(from_machine, msg_id)`.
+- **Ownership is what routes a relay.** Every main session registers with the worker at
+  `/session-start`, quiet ones included, and the daemon re-registers each live session once a day.
+  A session that never registered could otherwise be claimed first by any machine's credential.
+  §7 has the residue.
 - **No silent loss.** Every message item ends in a state the sender hears about. An item that
   expires (`expires_at`, or 24h for unscheduled rows) or is refused, by the worker or by the
   receiver, becomes a **failure item**: `kind='delivery.failed'`, addressed to the original
@@ -484,6 +504,12 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
 
 - A session idle for more than 7 days is unregistered from D1 by its daemon's reaper, so remote
   sends to it fail with `unknown_session` while local sends still work.
+  - Its id is not secret: `GET /sessions` lists every id to any credential holder.
+  - Once its row is gone or stale, another machine's credential can register it as its own and
+    collect relays addressed to it.
+  - Live sessions are protected by the daily ownership refresh (§3.2). This exposure is accepted,
+    because a session idle that long rarely receives relays. Every cross-machine takeover is
+    logged by the worker.
 - A sleeping Mac answers `target_offline`: ordinary sends fail when their attempts run out,
   scheduled sends retry until they expire.
 - Fixed pull-lane ids (`ses_lane_maven_renovate`, `ses_stallwatch_*`) follow the last machine that

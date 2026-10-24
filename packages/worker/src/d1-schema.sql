@@ -124,3 +124,38 @@ CREATE TABLE IF NOT EXISTS machine_credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_machine_credentials_machine
   ON machine_credentials(machine_id);
+
+-- Cross-machine swarm relay (pigeon-k0qn.5, design docs/plans/2026-10-20-cross-machine-swarm-design.md
+-- §3.2, decisions docs/plans/2026-10-22-worker-relay.md). One row per relayed message, plus one
+-- failure item ('f:' || msg_id, to_machine = the original sender) per message that did not arrive.
+-- New tables rather than columns on `commands`: see the design's "Why a separate table".
+CREATE TABLE IF NOT EXISTS swarm_relay (
+  from_machine    TEXT NOT NULL,
+  msg_id          TEXT NOT NULL,
+  item_kind       TEXT NOT NULL,              -- 'message' | 'failure'
+  to_machine      TEXT NOT NULL,
+  to_session      TEXT NOT NULL,
+  from_session    TEXT NOT NULL,
+  body_json       TEXT NOT NULL,
+  payload_sha256  TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'queued', -- queued | leased | delivered | refused | expired
+  reason          TEXT,
+  lease_count     INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL,
+  leased_at       INTEGER,
+  settled_at      INTEGER,
+  expires_at      INTEGER NOT NULL,
+  PRIMARY KEY (from_machine, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_swarm_relay_handout
+  ON swarm_relay(to_machine, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_swarm_relay_expiry
+  ON swarm_relay(status, expires_at);
+
+-- Which senders a machine accepts relays from, as last advertised in its poll header
+-- (X-Pigeon-Swarm-Relay). Written only when it changes. Liveness comes from machines.last_poll_at.
+CREATE TABLE IF NOT EXISTS machine_relay_accept (
+  machine_id  TEXT PRIMARY KEY,
+  accept_csv  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);

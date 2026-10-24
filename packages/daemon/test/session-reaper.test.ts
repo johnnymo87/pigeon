@@ -1,9 +1,52 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { startSessionReaper, reapStaleSessions } from "../src/session-reaper";
+import { startSessionReaper, reapStaleSessions, ownershipRefreshSlot } from "../src/session-reaper";
 import { SESSION_TTL_MS } from "../src/storage/schema";
 import { ingestWorkerCommand } from "../src/worker/command-ingest";
 import type { QuestionReplyInput } from "../src/adapters/types";
+
+describe("ownership refresh (pigeon-k0qn.5)", () => {
+  let storage: StorageDb | null = null;
+  afterEach(() => {
+    storage?.db.close();
+    storage = null;
+  });
+
+  it("re-registers each live, unpinned session once a day, in its own hourly slot, quiet ones included", async () => {
+    storage = openStorageDb(":memory:");
+    const day = Date.UTC(2026, 9, 22);
+    const now = day + SESSION_TTL_MS;
+    const ids = Array.from({ length: 48 }, (_, i) => `ses_refresh_${i}`);
+    for (const id of ids) storage.sessions.upsert({ sessionId: id, notify: false, label: id }, now - 1_000);
+
+    const calls: string[] = [];
+    const registerSession = vi.fn(async (id: string) => {
+      calls.push(id);
+      return { ok: true };
+    });
+    for (let hour = 0; hour < 24; hour++) {
+      const at = now - (now % 86_400_000) + hour * 3_600_000 + 1;
+      for (const id of ids) storage.sessions.touch(id, at - 1_000);
+      const r = await reapStaleSessions({ storage, unregisterSession: vi.fn(), registerSession, nowFn: () => at });
+      expect(r.refreshedOwnership).toBe(ids.filter((id) => ownershipRefreshSlot(id) === hour).length);
+    }
+    expect([...calls].sort()).toEqual([...ids].sort());
+  });
+
+  it("skips pinned sessions, which the pinned refresh already covers every cycle", async () => {
+    storage = openStorageDb(":memory:");
+    const now = SESSION_TTL_MS + 50_000;
+    const id = "ses_pinned_refresh";
+    storage.sessions.upsert({ sessionId: id, notify: true }, now - 1_000);
+    storage.sessions.setBoundTopicKey(id, "k", now);
+    const registerSession = vi.fn(async () => ({ ok: true }));
+    const at = now - (now % 3_600_000) + ((ownershipRefreshSlot(id) - new Date(now).getUTCHours() + 24) % 24) * 3_600_000;
+    const r = await reapStaleSessions({ storage, unregisterSession: vi.fn(), registerSession, nowFn: () => at });
+    expect(r.refreshedPinned).toBe(1);
+    expect(r.refreshedOwnership).toBe(0);
+    expect(registerSession).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("reapStaleSessions", () => {
   let storage: StorageDb | null = null;

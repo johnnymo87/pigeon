@@ -71,11 +71,15 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `messages`: Telegram message mapping for reply routing. Includes `notification_id TEXT` (nullable, unique index where not null) for idempotent notification delivery -- if a `notificationId` is provided on `/notifications/send` and already exists in this table, the request is deduplicated without calling Telegram again.
 - `seen_updates`: Telegram update deduplication
 - `machines`: daemon last-poll-at tracking for online detection
+- `machine_credentials`: hashed per-machine keys (pigeon-k0qn.8)
+- `swarm_relay`: cross-machine swarm relay items, message and failure (pigeon-k0qn.5)
+- `machine_relay_accept`: which senders each machine accepts relays from, from its poll header
 
 ## Endpoint Contracts
 
 - `GET /health` -> `ok`
-- `GET /machines/:id/next` (Bearer `CCR_API_KEY`) -> poll for next command (204 if none, JSON if available)
+- `GET /machines/:id/next` (Bearer) -> poll for next command (204 if none, JSON if available). With a machine credential and `X-Pigeon-Swarm-Relay: accept=<machine,...>; failures=1`, the response also carries `swarm: [...]` relay items (a 204 becomes `200 {swarm}`).
+- `POST /swarm/relay`, `/swarm/relay/ack`, `/swarm/relay/fail` (machine credential only) -> cross-machine swarm relay. Contract: design §3.2 (`docs/plans/2026-10-20-cross-machine-swarm-design.md`), decisions `docs/plans/2026-10-22-worker-relay.md`.
 - `POST /commands/:id/ack` (Bearer) -> acknowledge a command (mark done)
 - `GET /sessions` (Bearer) -> JSON list of session rows
 - `POST /sessions/register` (Bearer) -> upsert session

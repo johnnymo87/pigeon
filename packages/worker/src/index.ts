@@ -7,6 +7,7 @@ import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepS
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
+import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
@@ -39,6 +40,17 @@ export default {
         const ackMatch = path.match(/^\/commands\/([^/]+)\/ack$/);
         if (ackMatch && method === "POST") {
           return handleAckCommand(db, env, request, ackMatch[1]!);
+        }
+
+        // Cross-machine swarm relay (pigeon-k0qn.5). Machine credentials only.
+        if (path === "/swarm/relay" && method === "POST") {
+          return handleRelay(db, env, request);
+        }
+        if (path === "/swarm/relay/ack" && method === "POST") {
+          return handleRelayAck(db, env, request);
+        }
+        if (path === "/swarm/relay/fail" && method === "POST") {
+          return handleRelayFail(db, env, request);
         }
 
         // Sessions
@@ -155,6 +167,13 @@ export default {
     // visible to it on this same tick. Note that the orphan half only acts during the daily
     // close window (see shouldCloseOrphans), and closes at most DEFAULT_ORPHAN_CAP (30) per
     // tick, so a bulk sweep's topics beyond the cap drain on following days' ticks.
+    try {
+      // Expired relays become failure items for their senders; settled rows past retention go.
+      const relay = await runRelayExpiry(env.DB);
+      if (relay.expired > 0) console.log("[relay] expiry", relay);
+    } catch (err) {
+      console.error("Relay expiry failed:", err);
+    }
     try {
       await sweepStaleSessions(env.DB);
     } catch (err) {

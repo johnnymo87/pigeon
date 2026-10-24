@@ -1449,11 +1449,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const effectiveNotify = ((body.notify as boolean | undefined) ?? existing?.notify ?? false);
         let workerRegOk = true;
-        if (onSessionStart && effectiveNotify) {
+        // Every session registers with the worker, quiet ones included (pigeon-k0qn.5). The
+        // registration is also the OWNERSHIP claim the cross-machine relay routes by: a session
+        // that never registered could be claimed first by any other machine's credential, which
+        // would then collect relays addressed to it, and the real owner would get 409.
+        if (onSessionStart) {
           try {
             const regResult = await onSessionStart(
               sessionId,
-              true,
+              effectiveNotify,
               (typeof body.label === "string" ? body.label : null) ?? existing?.label,
             );
             if (regResult && typeof regResult === "object" && "ok" in regResult && regResult.ok === false) {

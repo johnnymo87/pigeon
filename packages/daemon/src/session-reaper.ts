@@ -27,6 +27,17 @@ interface ReapResult {
   orphanedQuestions: number;
   expiredInjectedPrompts: number;
   refreshedPinned: number;
+  refreshedOwnership: number;
+}
+
+/**
+ * Which hourly slot (0-23) re-registers a session. Spreads the daily ownership refresh over
+ * the day instead of firing every session's register in one burst.
+ */
+export function ownershipRefreshSlot(sessionId: string): number {
+  let h = 0;
+  for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) >>> 0;
+  return h % 24;
 }
 
 export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
@@ -68,6 +79,31 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     }
   }
 
+  // Ownership refresh (pigeon-k0qn.5). The worker's session row is what the cross-machine relay
+  // routes by, and its `updated_at` moves only on register, notifications and Telegram routing.
+  // A quiet session never notifies, so without this its row goes stale: another machine's
+  // credential may take it over after 7 days, and the worker sweeps it at 14 and anyone may
+  // claim it fresh. Re-registering each live session once a day (its hourly slot) keeps the row
+  // owned and also retries a first registration that failed. Pinned sessions are refreshed
+  // every cycle above, so they are skipped here.
+  let refreshedOwnership = 0;
+  if (deps.registerSession) {
+    const slot = new Date(now).getUTCHours();
+    for (const session of deps.storage.sessions.list()) {
+      if (session.boundTopicKey || ownershipRefreshSlot(session.sessionId) !== slot) continue;
+      try {
+        const r = await deps.registerSession(session.sessionId, session.label ?? undefined);
+        if (r && typeof r === "object" && "ok" in r && r.ok === false) {
+          log(`ownership refresh failed for ${session.sessionId}: ${JSON.stringify(r).slice(0, 200)}`);
+        } else {
+          refreshedOwnership++;
+        }
+      } catch {
+        // Best-effort; tomorrow's slot tries again, well inside 7 days.
+      }
+    }
+  }
+
   const expired = deps.storage.sessions.cleanupExpired(now);
   if (expired > 0) {
     log(`cleaned ${expired} expired session records`);
@@ -87,7 +123,7 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
     log(`cleaned ${expiredInjectedPrompts} expired injected prompt records`);
   }
 
-  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts, refreshedPinned };
+  return { reaped, expired, orphanedQuestions, expiredInjectedPrompts, refreshedPinned, refreshedOwnership };
 }
 
 interface StartReaperDeps extends ReapDeps {
