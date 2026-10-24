@@ -204,7 +204,8 @@ adds no extra request.
   `X-Pigeon-Swarm-Relay: accept=<machine,…>` the response gains `swarm: [...]`, up to 20 queued
   items for that machine from senders in that list. The gate is the *request's* header, read at
   hand-out time, so a rolled-back daemon stops receiving at once and its items expire (below). The
-  same header carries `failures=1` whenever the daemon has relay *sending* enabled: failure items
+  same header carries `failures=1` (the daemon sends it always, so that turning sending off does
+  not strand failure items already owed, which live 24h): failure items
   addressed to this machine are handed out whatever the accept list says, so a send-only machine
   still hears about its failures. A 204 today becomes a 200 with only `swarm` when there is no
   command; `handlePollNext` must attach `swarm` on every return path, including the 204s inside the
@@ -251,7 +252,8 @@ adds no extra request.
 ### §3.3 Receiving daemon
 
 - **Opt-in per machine, off by default.** `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` (empty →
-  the header is not sent and nothing is relayed here). The daemon also rejects, on receipt, any
+  the header's accept list is empty and no messages are relayed here; the header itself is still
+  sent, for `failures=1`). The daemon also rejects, on receipt, any
   item whose `from_machine` is not in its list — defence in depth, since the worker could be
   wrong or old.
 - **Re-validate.** Items arrive by a second entry point that bypasses `/swarm/send`'s validator
@@ -265,7 +267,9 @@ adds no extra request.
   would let items outlive their 60s lease and be handed out again.
 - **Pull sessions need a separate opt-in for remote senders.** `pull_sources: ["swarm"]` was a
   local-trust decision (eng-agent-platform `2026-10-06-lane-swarm-design.md:19`); remote senders
-  require `"swarm-remote"`. Without it the item is refused → `delivery.failed` back.
+  require `"swarm-remote"` as well as `"swarm"` (banking keys on `"swarm"`, so `"swarm-remote"`
+  alone banks nothing). Without both the item is refused (`remote_not_accepted`) →
+  `delivery.failed` back.
 - **Insert** with the original `msg_id`, `from`, `kind`, `priority`, `reply_to`, `payload`,
   `deliver_at`, `expires_at`, `ref`, and record `from_machine` / `from_label`. On `ON CONFLICT`,
   compare `from` and the payload hash with the existing row; a mismatch is refused
@@ -523,6 +527,17 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
   registered them first. A second machine gets `409 owned_by_other_machine` (and its daemon raises
   an alert) until the first unregisters or its row has been idle 7 days.
 - Channels/broadcast are not delivered even locally (`pigeon-web`) and are not relayed.
+- A relayed message is verified on the sender at handoff, so a relayed-in row that reaches none
+  of the receiver's terminal states reports nothing back. Those are the watchdog's non-terminal
+  states: blocked behind a turn, silent in flight, no healthy serve, a 404 with no second
+  opinion. A local send in the same state is equally silent, but its row at least stays
+  unverified (`2026-10-24-daemon-relay.md`).
+- Failures more than 7 days after a relay are not reported: the worker has forgotten the row, so
+  `/swarm/relay/fail` is a no-op. Relayed messages banked for pull sessions therefore expire
+  after 6 days rather than 7.
+- Goose sessions are neither remote targets nor relaying senders. `/swarm/send` refuses a
+  `gse_` id with no local row, and the relay takes `ses_` senders only. `pigeon-k0qn.13` owns
+  goose swarm targets.
 
 ## §8. Deployment order
 

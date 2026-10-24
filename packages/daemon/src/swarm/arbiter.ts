@@ -18,6 +18,9 @@ import { renderEnvelope, PermanentDeliveryError } from "./envelope";
 import { isOpencodeRoutable } from "../routing/opencode-routable";
 import type { Locality } from "../routing/locality";
 import { directoryMissing } from "./directory-check";
+import type { RelayMessageBody, RelaySendAnswer } from "../worker/relay-client";
+import { formatRelayRefusalReason } from "./relay-notice";
+import { displayName } from "../notification-service";
 import { DELIVERY_FAILED_KIND, notifySenderOfFailure } from "./notify-sender";
 import {
   isOutageFailure,
@@ -128,6 +131,20 @@ export class RemoteTargetError extends PermanentDeliveryError {
 }
 
 /**
+ * The worker refused a relay permanently (pigeon-k0qn.7). A RemoteTargetError, so the sender
+ * gets the same "do not resend via swarm" notice: every permanent answer fails identically again.
+ */
+export class RelayRefusedError extends RemoteTargetError {
+  constructor(message: string, readonly code: string) {
+    super(message);
+    this.name = "RelayRefusedError";
+  }
+}
+
+/** A sender id the worker's relay route accepts. Byte-exact with the worker's SENDER_ID. */
+const RELAY_SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+
+/**
  * Sender-facing reason for a remote target. The owner is DECORATION: it comes from
  * the worker's last-registrant-wins row and may be absent or stale, so the wording
  * claims only what the locality check proved (not on this machine) and attributes
@@ -176,6 +193,11 @@ export interface ArbiterOptions {
   ownerOf?: (sessionId: string, signal?: AbortSignal) => Promise<SessionOwner | null>;
   /** This daemon's machine id, for the remote-failure text. */
   selfMachineId?: string;
+  /**
+   * Cross-machine relay (pigeon-k0qn.7, `PIGEON_SWARM_RELAY_SEND=1`). Present: a remote target
+   * is POSTed to the worker instead of failed. Absent: Phase 1 behaviour.
+   */
+  relay?: (body: RelayMessageBody) => Promise<RelaySendAnswer>;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -208,6 +230,7 @@ export class SwarmArbiter {
     | ((sessionId: string, signal?: AbortSignal) => Promise<SessionOwner | null>)
     | undefined;
   private readonly selfMachineId: string | undefined;
+  private readonly relay: ((body: RelayMessageBody) => Promise<RelaySendAnswer>) | undefined;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -235,6 +258,7 @@ export class SwarmArbiter {
     this.localityOf = opts.localityOf;
     this.ownerOf = opts.ownerOf;
     this.selfMachineId = opts.selfMachineId;
+    this.relay = opts.relay;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
@@ -419,6 +443,61 @@ export class SwarmArbiter {
     }
   }
 
+  /** The relay record for a row that arrived by relay, matched on sender and target too. */
+  private inboundFor(row: SwarmMessageRecord) {
+    const inbound = this.storage.relayInbound.get(row.msgId);
+    return inbound && inbound.fromSession === row.fromSession && inbound.toSession === row.toSession ? inbound : null;
+  }
+
+  /**
+   * POSTs one row to the worker for the machine that owns its target (design §3.1). Returns on
+   * success; throws the arbiter's own error types otherwise, so the existing permanent/transient
+   * handling and retry budget apply unchanged.
+   */
+  private async relayRow(row: SwarmMessageRecord, target: string): Promise<void> {
+    const sender = this.storage.sessions.get(row.fromSession);
+    const answer = await this.relay!({
+      msg_id: row.msgId,
+      from: row.fromSession,
+      to: target,
+      kind: row.kind,
+      priority: row.priority,
+      reply_to: row.replyTo,
+      payload: row.payload,
+      deliver_at: row.deliverAt,
+      expires_at: row.expiresAt,
+      ref: row.ref,
+      from_label: sender
+        ? displayName({ title: sender.title, label: sender.label, sessionId: row.fromSession })
+        : null,
+    });
+    if (answer.kind === "accepted") {
+      const now = this.nowFn();
+      let marked = this.storage.swarm.markRelayed(row.msgId, now);
+      if (!marked && this.storage.swarm.getByMsgId(row.msgId)?.state === "cancelled") {
+        // A cancel landed during the POST and lost: the message WAS relayed.
+        marked = this.storage.swarm.markRelayed(row.msgId, now, true);
+        this.log("relayed mid-flight race (cancel lost to relay)", { msgId: row.msgId, target });
+      }
+      this.log("relayed", { msgId: row.msgId, target, toMachine: answer.toMachine, duplicate: answer.duplicate, marked });
+      return;
+    }
+    if (answer.kind === "transient") {
+      throw new TargetUnavailableError(`relay of ${row.msgId} to ${target} not accepted yet: ${answer.detail}`);
+    }
+    if (answer.code === "same_machine" || answer.code === "sender_not_yours" || answer.code === "invalid") {
+      // Each means two of our own views disagree (locality vs D1, session registry vs D1, our
+      // body vs the worker's validator). Worth a loud line, not only the sender's notice.
+      console.error(`[swarm-arbiter] relay refused (${answer.code}) for ${row.msgId} to ${target}: ${answer.detail}`);
+    }
+    if (answer.code === "unknown_session" && looksLikeIncompleteId(target)) {
+      throw new IncompleteTargetIdError(
+        formatIncompleteTargetReason(target, this.selfMachineId, this.storage.sessions.idsWithPrefix(target)),
+      );
+    }
+    throw new RelayRefusedError(formatRelayRefusalReason(target, answer.code, answer.detail), answer.code);
+  }
+
   private async drainTargetInner(target: string): Promise<void> {
     while (true) {
       // Shutting down: leave the remaining backlog `queued` for the next
@@ -449,6 +528,21 @@ export class SwarmArbiter {
         if (this.localityOf) {
           const locality = await this.localityOf(target);
           if (locality === "remote") {
+            // HOP RULE, absolute (design §3.1): a row that ARRIVED by relay is never relayed
+            // again. It fails here, and notifySenderOfFailure reports it back to the worker.
+            const inbound = this.inboundFor(next);
+            if (inbound) {
+              throw new RemoteTargetError(
+                `target ${target} is not on this machine (${this.selfMachineId ?? "unknown"}); ` +
+                  `the message was relayed here from ${inbound.fromMachine}, and relayed messages are never relayed again`,
+              );
+            }
+            // `pigeon` notices and goose senders cannot be relayed (the worker's validator takes
+            // ses_ senders only); they keep the Phase 1 failure.
+            if (this.relay && RELAY_SENDER_ID.test(next.fromSession)) {
+              await this.relayRow(next, target);
+              continue;
+            }
             const owner = await this.lookupOwner(target);
             // Shape first, and only then a "did you mean": a well-formed id with no known owner
             // may simply be on a machine the worker could not be asked about, and pointing its
@@ -503,6 +597,7 @@ export class SwarmArbiter {
                 ? Math.max(0, now - next.deliverAt)
                 : null,
             ref: next.ref,
+            fromMachine: this.inboundFor(next)?.fromMachine ?? null,
           },
           next.payload,
         );
@@ -619,6 +714,8 @@ export class SwarmArbiter {
                 : err instanceof IncompleteTargetIdError
                   ? formatIncompleteTargetNotice(next.msgId, target, err.message)
                   : undefined,
+              // Only consulted for a row that arrived by relay (the hop rule above).
+              err instanceof RemoteTargetError ? "not_on_receiver" : undefined,
             );
             if (isSuppressedFromRecovery(next)) {
               this.storage.alerts.enqueue({

@@ -171,7 +171,19 @@ describe("fail-closed backend gate", () => {
     expect(f.row("msg_alien")?.state).toBe("handed_off");
     expect(f.row("msg_alien")?.verifiedAt).toBeNull();
     expect(f.sendPlainAlert).toHaveBeenCalledTimes(1);
-    expect(f.sendPlainAlert.mock.calls[0]?.[0] ?? "").toContain("unrecognised verify_family");
+    expect(f.sendPlainAlert.mock.calls[0]?.[0] ?? "").toContain("which it cannot verify");
+  });
+
+  it("refuses an unverified relayed row loudly instead of fetching a transcript (pigeon-k0qn.7)", async () => {
+    const f = makeFixture();
+    f.insertHandedOff({ msgId: "msg_relayed", family: "relayed" });
+    f.setNow(1_000 + GRACE + 1);
+
+    await f.watchdog.processOnce();
+
+    expect(f.resolveClients).not.toHaveBeenCalled();
+    expect(f.row("msg_relayed")?.state).toBe("handed_off");
+    expect(f.sendPlainAlert).toHaveBeenCalledTimes(1);
   });
 
   it("does not re-alert the same unrecognised row every cycle", async () => {

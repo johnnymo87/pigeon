@@ -19,6 +19,11 @@ export interface SwarmNoticeTarget {
   payload: string;
   createdAt: number;
   deliverAt?: number | null;
+  /**
+   * How to name a sender this machine has no session row for: a relayed message's
+   * `<from_label> (<from_machine>)` (pigeon-k0qn.6). Ignored when the sender has a row.
+   */
+  remoteSenderName?: string | null;
 }
 
 export function enqueueSwarmTelegramNotice(
@@ -55,11 +60,14 @@ export function enqueueSwarmTelegramNotice(
     const notification = formatSwarmNotification({
       kind: record.kind,
       priority: record.priority,
-      fromLabel: displayName({
-        title: sender?.title,
-        label: sender?.label,
-        sessionId: record.fromSession,
-      }),
+      fromLabel:
+        !sender && record.remoteSenderName
+          ? record.remoteSenderName
+          : displayName({
+              title: sender?.title,
+              label: sender?.label,
+              sessionId: record.fromSession,
+            }),
       toSessionId: record.toSession,
       msgId: record.msgId,
       payload: record.payload.toWellFormed(),

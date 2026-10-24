@@ -5,6 +5,7 @@
  * callbacks, and acks via POST /commands/:id/ack after successful dispatch.
  */
 
+import { SWARM_RELAY_HEADER } from "./relay-client";
 import { BACKENDS_HEADER } from "./backends";
 import type { WorkerHealthObserver } from "./worker-health";
 import type { TopicMap } from "../alert-links";
@@ -156,6 +157,11 @@ export interface PollerConfig {
    * production wiring always sets it.
    */
   backends?: string;
+  /**
+   * The `X-Pigeon-Swarm-Relay` value to send on every poll (pigeon-k0qn.6), from
+   * `relayPollHeader`. Absent: no header, so the worker hands this daemon no relay items.
+   */
+  relayHeader?: string | null;
 }
 
 export interface ExecuteMessage {
@@ -380,6 +386,13 @@ export interface PollerCallbacks {
    * Optional so the poller stays usable (and testable) without storage wired in.
    */
   onInboundForSession?: (sessionId: string) => void;
+  /**
+   * Relay items from a poll response (pigeon-k0qn.6), awaited BEFORE that response's command is
+   * dispatched. Must insert AND ack: the tick is serialised, and a slow command (a launch can
+   * take 20s+) would otherwise let the items outlive their 60s lease and be handed out again.
+   * A throw is logged and does not cost the command.
+   */
+  onRelayItems?: (items: unknown[]) => Promise<void>;
 }
 
 export interface PollerDeps {
@@ -457,7 +470,14 @@ export class Poller {
     }
     this.polling = true;
     try {
-      const msg = await this.poll();
+      const { msg, swarm } = await this.pollNext();
+      if (swarm.length > 0 && this.callbacks.onRelayItems) {
+        try {
+          await this.callbacks.onRelayItems(swarm);
+        } catch (err) {
+          console.warn("[poller] relay items failed:", err instanceof Error ? err.message : String(err));
+        }
+      }
       if (msg === null) {
         return;
       }
@@ -471,6 +491,14 @@ export class Poller {
 
   /** Fetch the next command from the worker. Returns null on 204 (no commands). */
   async poll(): Promise<WorkerMessage | null> {
+    return (await this.pollNext()).msg;
+  }
+
+  /**
+   * One poll: the next command (null for none) and any relay items. A relay-aware worker
+   * answers a poll with relay items but no command as 200 `{swarm: [...]}` with no `commandId`.
+   */
+  async pollNext(): Promise<{ msg: WorkerMessage | null; swarm: unknown[] }> {
     const url = `${this.config.workerUrl}/machines/${encodeURIComponent(this.config.machineId)}/next`;
     const response = await this.fetchFn(url, {
       headers: {
@@ -480,6 +508,7 @@ export class Poller {
         // empty value instead would be read as "I can serve nothing" and
         // refuse everything.
         ...(this.config.backends ? { [BACKENDS_HEADER]: this.config.backends } : {}),
+        ...(this.config.relayHeader ? { [SWARM_RELAY_HEADER]: this.config.relayHeader } : {}),
       },
     });
 
@@ -497,14 +526,18 @@ export class Poller {
     }
 
     if (response.status === 204) {
-      return null;
+      return { msg: null, swarm: [] };
     }
 
     if (!response.ok) {
       throw new Error(`Poll failed: ${response.status}`);
     }
 
-    return await response.json() as WorkerMessage;
+    const body = (await response.json()) as Record<string, unknown>;
+    const swarm = Array.isArray(body.swarm) ? (body.swarm as unknown[]) : [];
+    if (typeof body.commandId !== "string") return { msg: null, swarm };
+    const { swarm: _swarm, ...command } = body;
+    return { msg: command as unknown as WorkerMessage, swarm };
   }
 
   /**

@@ -12,6 +12,8 @@ export interface EnvelopeFields {
   scheduledFor?: number | null;
   deliveredLateMs?: number | null;
   ref?: string | null;
+  /** The machine a relayed message came from (pigeon-k0qn.6). Absent for local messages. */
+  fromMachine?: string | null;
 }
 
 function escAttr(value: string): string {
@@ -91,6 +93,9 @@ export function renderEnvelope(
     `kind="${escAttr(fields.kind)}"`,
     `from="${escAttr(fields.from)}"`,
   ];
+  // Right after `from`, which it qualifies: `from` names a session on THAT machine, so a reply
+  // goes back through the relay rather than to a local session.
+  if (fields.fromMachine != null) attrs.push(`from_machine="${escAttr(fields.fromMachine)}"`);
   if (fields.to !== null) attrs.push(`to="${escAttr(fields.to)}"`);
   if (fields.channel !== null)
     attrs.push(`channel="${escAttr(fields.channel)}"`);
