@@ -59,6 +59,16 @@ export interface PullInboxFilterOptions {
   includeSwarm?: boolean;
 }
 
+export interface PendingSwarmRow {
+  msgId: string;
+  senderId: string | null;
+  kind: string | null;
+  replyTo: string | null;
+  createdAt: number;
+  claimedAt: number | null;
+  claimCount: number;
+}
+
 /**
  * How long a banked message survives unread.
  *
@@ -278,6 +288,46 @@ export class PullInboxRepository {
       }
     }
     return { total, bySource };
+  }
+
+  /**
+   * Pending swarm messages for this session, returning envelope metadata
+   * (no payload) up to `limit`. Newest first, so a fresh message is never hidden behind a backlog.
+   *
+   * Matches the predicate pendingCounts uses for `by_source.swarm` so the count
+   * and list agree: unacked (`acked_at IS NULL`), unexpired (`expires_at > now`).
+   * Claimed-unacked rows are included with their `claimedAt` and `claimCount`.
+   */
+  pendingSwarm(
+    sessionId: string,
+    now: number,
+    limit = 50,
+  ): { rows: PendingSwarmRow[]; truncated: boolean } {
+    const rawRows = this.db
+      .prepare(
+        `SELECT msg_id, sender_id, kind, reply_to, created_at, claimed_at, claim_count
+           FROM pull_inbox
+          WHERE session_id = ?
+            AND source = 'swarm'
+            AND acked_at IS NULL
+            AND expires_at > ?
+          ORDER BY created_at DESC, msg_id DESC
+          LIMIT ?`,
+      )
+      .all(sessionId, now, limit + 1) as Row[];
+
+    const truncated = rawRows.length > limit;
+    const rows = (truncated ? rawRows.slice(0, limit) : rawRows).map((r) => ({
+      msgId: String(r.msg_id),
+      senderId: (r.sender_id as string | null) ?? null,
+      kind: (r.kind as string | null) ?? null,
+      replyTo: (r.reply_to as string | null) ?? null,
+      createdAt: Number(r.created_at),
+      claimedAt: (r.claimed_at as number | null) ?? null,
+      claimCount: Number(r.claim_count ?? 0),
+    }));
+
+    return { rows, truncated };
   }
 
   /**

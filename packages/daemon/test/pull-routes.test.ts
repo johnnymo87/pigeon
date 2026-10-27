@@ -376,6 +376,8 @@ describe("pull routes", () => {
           "telegram-reply": 1,
           swarm: 0,
         },
+        swarm_pending: [],
+        swarm_pending_truncated: false,
       });
     });
 
@@ -396,6 +398,155 @@ describe("pull routes", () => {
         "telegram-reply": 1,
         swarm: 1,
       });
+    });
+
+    it("reports swarm_pending with sender ids, metadata, and length equal to by_source.swarm under the limit", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.pullInbox.bank(
+        {
+          msgId: "sw1",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "payload1",
+          senderId: "ses_coord",
+          kind: "task.assign",
+          replyTo: "prev_1",
+        },
+        2_100,
+      );
+      s.pullInbox.bank(
+        {
+          msgId: "sw2",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "payload2",
+          senderId: "ses_worker",
+          kind: "result",
+          replyTo: null,
+        },
+        2_200,
+      );
+
+      // Claim sw1 at 2500 so claimed_at and claim_count are populated
+      s.pullInbox.claim("ses_pull", 2_500, 1);
+
+      const res = await app(new Request("http://localhost/pull/pending?session=ses_pull"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        pending: number;
+        by_source: Record<string, number>;
+        swarm_pending: Array<{
+          msg_id: string;
+          sender_id: string | null;
+          kind: string | null;
+          reply_to: string | null;
+          created_at: number;
+          claimed_at: number | null;
+          claim_count: number;
+        }>;
+        swarm_pending_truncated: boolean;
+      };
+
+      expect(body.by_source.swarm).toBe(2);
+      expect(body.swarm_pending).toHaveLength(body.by_source.swarm ?? 0);
+      expect(body.swarm_pending_truncated).toBe(false);
+      expect(body.swarm_pending).toEqual([
+        {
+          msg_id: "sw2",
+          sender_id: "ses_worker",
+          kind: "result",
+          reply_to: null,
+          created_at: 2_200,
+          claimed_at: null,
+          claim_count: 0,
+        },
+        {
+          msg_id: "sw1",
+          sender_id: "ses_coord",
+          kind: "task.assign",
+          reply_to: "prev_1",
+          created_at: 2_100,
+          claimed_at: 2_500,
+          claim_count: 1,
+        },
+      ]);
+    });
+
+    it("returns empty swarm_pending when swarm is held (session not opted in)", async () => {
+      const { app, storage: s } = newApp();
+      // ses_pull has default pull_sources ["telegram-reply"] (not opted in to swarm)
+      s.pullInbox.bank(
+        {
+          msgId: "sw_held",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "sw",
+          senderId: "ses_coord",
+        },
+        2_100,
+      );
+
+      const res = await app(new Request("http://localhost/pull/pending?session=ses_pull"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        by_source: Record<string, number>;
+        swarm_pending: unknown[];
+        swarm_pending_truncated: boolean;
+      };
+      expect(body.by_source.swarm).toBe(0);
+      expect(body.swarm_pending).toEqual([]);
+      expect(body.swarm_pending_truncated).toBe(false);
+    });
+
+    it("returns empty swarm_pending and truncated=false for unknown session", async () => {
+      const { app } = newApp();
+      const res = await app(new Request("http://localhost/pull/pending?session=ses_ghost"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        session_known: boolean;
+        pending: number;
+        by_source: Record<string, number>;
+        swarm_pending: unknown[];
+        swarm_pending_truncated: boolean;
+      };
+      expect(body.session_known).toBe(false);
+      expect(body.pending).toBe(0);
+      expect(body.by_source).toEqual({
+        "telegram-reply": 0,
+        swarm: 0,
+      });
+      expect(body.swarm_pending).toEqual([]);
+      expect(body.swarm_pending_truncated).toBe(false);
+    });
+
+    it("sets swarm_pending_truncated to true and caps swarm_pending at 50 when more than 50 swarm messages are pending", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      for (let i = 1; i <= 55; i++) {
+        s.pullInbox.bank(
+          {
+            msgId: `sw_${String(i).padStart(3, "0")}`,
+            sessionId: "ses_pull",
+            source: "swarm",
+            payload: `p_${i}`,
+            senderId: `ses_sender_${i}`,
+          },
+          1_000 + i,
+        );
+      }
+
+      const res = await app(new Request("http://localhost/pull/pending?session=ses_pull"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        pending: number;
+        by_source: Record<string, number>;
+        swarm_pending: unknown[];
+        swarm_pending_truncated: boolean;
+      };
+      expect(body.by_source.swarm).toBe(55);
+      expect(body.swarm_pending).toHaveLength(50);
+      expect(body.swarm_pending_truncated).toBe(true);
     });
 
     // Deliberately 200-with-a-flag rather than 404: this is the cheap poll a

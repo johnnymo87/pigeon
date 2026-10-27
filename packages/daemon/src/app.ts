@@ -1291,9 +1291,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Held swarm rows are excluded from counts when the session is not opted in
         // so a wake gate does not spin on mail the client cannot collect.
         const includeSwarm = session ? session.pullSources.includes("swarm") : false;
+        // One clock read for both queries, so an expiry between them cannot make
+        // the list disagree with by_source.swarm.
+        const now = nowFn();
         const counts = session
-          ? storage.pullInbox.pendingCounts(sessionId, nowFn(), { includeSwarm })
+          ? storage.pullInbox.pendingCounts(sessionId, now, { includeSwarm })
           : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
+        const swarmPending = includeSwarm
+          ? storage.pullInbox.pendingSwarm(sessionId, now)
+          : { rows: [], truncated: false };
         return Response.json({
           ok: true,
           session_id: sessionId,
@@ -1301,6 +1307,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           backend_kind: session?.backendKind ?? null,
           pending: counts.total,
           by_source: counts.bySource,
+          swarm_pending: swarmPending.rows.map((r) => ({
+            msg_id: r.msgId,
+            sender_id: r.senderId,
+            kind: r.kind,
+            reply_to: r.replyTo,
+            created_at: r.createdAt,
+            claimed_at: r.claimedAt,
+            claim_count: r.claimCount,
+          })),
+          swarm_pending_truncated: swarmPending.truncated,
         });
       }
 

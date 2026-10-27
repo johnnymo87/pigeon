@@ -412,4 +412,169 @@ describe("PullInboxRepository", () => {
     expect(swarmRow?.replyTo).toBe("m_prev");
     raw.db.close();
   });
+
+  describe("pendingSwarm", () => {
+    it("returns only swarm rows (excludes telegram-reply)", () => {
+      const s = newDb();
+      s.pullInbox.bank(
+        { msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" },
+        1_000,
+      );
+      s.pullInbox.bank(
+        {
+          msgId: "sw1",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "payload",
+          senderId: "ses_peer",
+          kind: "chat",
+          replyTo: "orig_1",
+        },
+        1_000,
+      );
+
+      const result = s.pullInbox.pendingSwarm("ses_pull", 2_000);
+      expect(result.truncated).toBe(false);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]).toEqual({
+        msgId: "sw1",
+        senderId: "ses_peer",
+        kind: "chat",
+        replyTo: "orig_1",
+        createdAt: 1_000,
+        claimedAt: null,
+        claimCount: 0,
+      });
+      // No payload field on PendingSwarmRow
+      expect("payload" in (result.rows[0] ?? {})).toBe(false);
+    });
+
+    it("excludes acked, expired, and other session rows", () => {
+      const s = newDb();
+      // Valid unacked swarm row
+      s.pullInbox.bank(
+        { msgId: "sw_valid", sessionId: "ses_pull", source: "swarm", payload: "p", senderId: "ses_1" },
+        1_000,
+      );
+      // Other session
+      s.pullInbox.bank(
+        { msgId: "sw_other", sessionId: "ses_other", source: "swarm", payload: "p", senderId: "ses_2" },
+        1_000,
+      );
+      // Acked row
+      s.pullInbox.bank(
+        { msgId: "sw_acked", sessionId: "ses_pull", source: "swarm", payload: "p", senderId: "ses_3" },
+        1_000,
+      );
+      s.pullInbox.claim("ses_pull", 1_500);
+      s.pullInbox.ack("ses_pull", ["sw_acked"], 1_600);
+
+      // Expired row (ttl 500ms from 1000 -> expires at 1500)
+      s.pullInbox.bank(
+        {
+          msgId: "sw_expired",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "p",
+          senderId: "ses_4",
+          ttlMs: 500,
+        },
+        1_000,
+      );
+
+      const result = s.pullInbox.pendingSwarm("ses_pull", 2_000);
+      expect(result.rows.map((r) => r.msgId)).toEqual(["sw_valid"]);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("orders newest-first by created_at DESC, then msg_id DESC", () => {
+      const s = newDb();
+      s.pullInbox.bank(
+        { msgId: "sw3", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_500,
+      );
+      s.pullInbox.bank(
+        { msgId: "sw1_b", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_000,
+      );
+      s.pullInbox.bank(
+        { msgId: "sw1_a", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_000,
+      );
+      s.pullInbox.bank(
+        { msgId: "sw2", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_200,
+      );
+
+      const result = s.pullInbox.pendingSwarm("ses_pull", 2_000);
+      expect(result.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2", "sw1_b", "sw1_a"]);
+    });
+
+    it("honours limit and sets truncated flag correctly", () => {
+      const s = newDb();
+      s.pullInbox.bank(
+        { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_000,
+      );
+      s.pullInbox.bank(
+        { msgId: "sw2", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_100,
+      );
+      s.pullInbox.bank(
+        { msgId: "sw3", sessionId: "ses_pull", source: "swarm", payload: "p" },
+        1_200,
+      );
+
+      // Under limit: not truncated
+      const resUnder = s.pullInbox.pendingSwarm("ses_pull", 2_000, 5);
+      expect(resUnder.truncated).toBe(false);
+      expect(resUnder.rows).toHaveLength(3);
+      expect(resUnder.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2", "sw1"]);
+
+      // Exactly at limit: not truncated
+      const resExact = s.pullInbox.pendingSwarm("ses_pull", 2_000, 3);
+      expect(resExact.truncated).toBe(false);
+      expect(resExact.rows).toHaveLength(3);
+
+      // Over limit: truncated
+      const resOver = s.pullInbox.pendingSwarm("ses_pull", 2_000, 2);
+      expect(resOver.truncated).toBe(true);
+      expect(resOver.rows).toHaveLength(2);
+      // The newest rows survive truncation, so a fresh message is never hidden.
+      expect(resOver.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2"]);
+    });
+
+    it("includes claimed-unacked rows with claimedAt and claimCount populated", () => {
+      const s = newDb();
+      s.pullInbox.bank(
+        {
+          msgId: "sw_claimed",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "p",
+          senderId: "ses_coord",
+          kind: "task.assign",
+          replyTo: null,
+        },
+        1_000,
+      );
+
+      // Claim it at now = 1_500
+      const claimed = s.pullInbox.claim("ses_pull", 1_500);
+      expect(claimed).toHaveLength(1);
+
+      // Check pendingSwarm includes it with claimedAt and claimCount populated
+      const result = s.pullInbox.pendingSwarm("ses_pull", 2_000);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]).toEqual({
+        msgId: "sw_claimed",
+        senderId: "ses_coord",
+        kind: "task.assign",
+        replyTo: null,
+        createdAt: 1_000,
+        claimedAt: 1_500,
+        claimCount: 1,
+      });
+    });
+  });
 });
