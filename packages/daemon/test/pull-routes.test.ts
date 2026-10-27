@@ -453,15 +453,6 @@ describe("pull routes", () => {
       expect(body.swarm_pending_truncated).toBe(false);
       expect(body.swarm_pending).toEqual([
         {
-          msg_id: "sw1",
-          sender_id: "ses_coord",
-          kind: "task.assign",
-          reply_to: "prev_1",
-          created_at: 2_100,
-          claimed_at: 2_500,
-          claim_count: 1,
-        },
-        {
           msg_id: "sw2",
           sender_id: "ses_worker",
           kind: "result",
@@ -469,6 +460,15 @@ describe("pull routes", () => {
           created_at: 2_200,
           claimed_at: null,
           claim_count: 0,
+        },
+        {
+          msg_id: "sw1",
+          sender_id: "ses_coord",
+          kind: "task.assign",
+          reply_to: "prev_1",
+          created_at: 2_100,
+          claimed_at: 2_500,
+          claim_count: 1,
         },
       ]);
     });

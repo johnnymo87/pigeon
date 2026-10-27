@@ -487,7 +487,7 @@ describe("PullInboxRepository", () => {
       expect(result.truncated).toBe(false);
     });
 
-    it("orders oldest-first by created_at ASC, then msg_id ASC", () => {
+    it("orders newest-first by created_at DESC, then msg_id DESC", () => {
       const s = newDb();
       s.pullInbox.bank(
         { msgId: "sw3", sessionId: "ses_pull", source: "swarm", payload: "p" },
@@ -507,7 +507,7 @@ describe("PullInboxRepository", () => {
       );
 
       const result = s.pullInbox.pendingSwarm("ses_pull", 2_000);
-      expect(result.rows.map((r) => r.msgId)).toEqual(["sw1_a", "sw1_b", "sw2", "sw3"]);
+      expect(result.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2", "sw1_b", "sw1_a"]);
     });
 
     it("honours limit and sets truncated flag correctly", () => {
@@ -529,7 +529,7 @@ describe("PullInboxRepository", () => {
       const resUnder = s.pullInbox.pendingSwarm("ses_pull", 2_000, 5);
       expect(resUnder.truncated).toBe(false);
       expect(resUnder.rows).toHaveLength(3);
-      expect(resUnder.rows.map((r) => r.msgId)).toEqual(["sw1", "sw2", "sw3"]);
+      expect(resUnder.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2", "sw1"]);
 
       // Exactly at limit: not truncated
       const resExact = s.pullInbox.pendingSwarm("ses_pull", 2_000, 3);
@@ -540,7 +540,8 @@ describe("PullInboxRepository", () => {
       const resOver = s.pullInbox.pendingSwarm("ses_pull", 2_000, 2);
       expect(resOver.truncated).toBe(true);
       expect(resOver.rows).toHaveLength(2);
-      expect(resOver.rows.map((r) => r.msgId)).toEqual(["sw1", "sw2"]);
+      // The newest rows survive truncation, so a fresh message is never hidden.
+      expect(resOver.rows.map((r) => r.msgId)).toEqual(["sw3", "sw2"]);
     });
 
     it("includes claimed-unacked rows with claimedAt and claimCount populated", () => {

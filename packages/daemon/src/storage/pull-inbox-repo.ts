@@ -292,7 +292,7 @@ export class PullInboxRepository {
 
   /**
    * Pending swarm messages for this session, returning envelope metadata
-   * (no payload) up to `limit`. Oldest first.
+   * (no payload) up to `limit`. Newest first, so a fresh message is never hidden behind a backlog.
    *
    * Matches the predicate pendingCounts uses for `by_source.swarm` so the count
    * and list agree: unacked (`acked_at IS NULL`), unexpired (`expires_at > now`).
@@ -311,7 +311,7 @@ export class PullInboxRepository {
             AND source = 'swarm'
             AND acked_at IS NULL
             AND expires_at > ?
-          ORDER BY created_at ASC, msg_id ASC
+          ORDER BY created_at DESC, msg_id DESC
           LIMIT ?`,
       )
       .all(sessionId, now, limit + 1) as Row[];
