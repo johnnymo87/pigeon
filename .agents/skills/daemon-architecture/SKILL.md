@@ -33,7 +33,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `POST /swarm/schedule` -- schedule a swarm message for future delivery. Refuses with 409 if target is an opted-in pull session (pull sessions have no delivery clock).
 - `POST /pull/drain` -- claim and drain unread messages for a pull session. Messages returned ordered `telegram-reply` before `swarm`, then `created_at`, `msg_id`. Each message includes `kind` and `reply_to` (`null` for telegram rows).
 - `POST /pull/ack` -- acknowledge claimed message IDs from `pull_inbox`.
-- `GET /pull/pending?session=<id>` -- check unread message count for a pull session; returns `pending` total and `by_source` breakdown (`{"telegram-reply": n, "swarm": m}`).
+- `GET /pull/pending?session=<id>` -- check unread message count for a pull session; returns `pending` total, `by_source` breakdown (`{"telegram-reply": n, "swarm": m}`), plus additive `swarm_pending` metadata list and `swarm_pending_truncated` flag (consumer: stall-watch's coordinator-mail wake, eng-agent-platform bead g3y2).
 - `GET /swarm/inbox?session=<id>[&since=<msg_id>]` -- read messages already delivered (`state='handed_off'`) to a target session, optionally cursor-paginated.
 - `POST /cleanup`
 

@@ -1294,6 +1294,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const counts = session
           ? storage.pullInbox.pendingCounts(sessionId, nowFn(), { includeSwarm })
           : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
+        const swarmPending = includeSwarm
+          ? storage.pullInbox.pendingSwarm(sessionId, nowFn())
+          : { rows: [], truncated: false };
         return Response.json({
           ok: true,
           session_id: sessionId,
@@ -1301,6 +1304,16 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           backend_kind: session?.backendKind ?? null,
           pending: counts.total,
           by_source: counts.bySource,
+          swarm_pending: swarmPending.rows.map((r) => ({
+            msg_id: r.msgId,
+            sender_id: r.senderId,
+            kind: r.kind,
+            reply_to: r.replyTo,
+            created_at: r.createdAt,
+            claimed_at: r.claimedAt,
+            claim_count: r.claimCount,
+          })),
+          swarm_pending_truncated: swarmPending.truncated,
         });
       }
 
