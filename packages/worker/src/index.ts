@@ -8,6 +8,7 @@ import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
+import { handleRemoteSessions } from "./remote-sessions";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
@@ -56,6 +57,10 @@ export default {
         // Sessions
         if (path === "/sessions" && method === "GET") {
           return handleSessionRequest(db, env, request, "list");
+        }
+        // swarm_list remote discovery (pigeon-k0qn.9). Machine credentials only.
+        if (path === "/sessions/remote" && method === "GET") {
+          return handleRemoteSessions(db, env, request);
         }
         if (path === "/sessions/register" && method === "POST") {
           return handleSessionRequest(db, env, request, "register");

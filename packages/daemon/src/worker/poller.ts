@@ -138,6 +138,18 @@ async function safeExecuteWorkerFetch<T = unknown>(
   };
 }
 
+/** The worker's `GET /sessions/remote` body (pigeon-k0qn.9), passed through as-is. */
+export interface RemoteSessionsListing {
+  machine_id: string;
+  sessions: Array<{ session_id: string; machine_id: string; label: string | null; updated_at: number }>;
+  machines: Array<{ machine_id: string; relay: string; last_poll_at: number | null }>;
+  truncated: boolean;
+}
+
+export type RemoteSessionsResult =
+  | { ok: true; listing: RemoteSessionsListing }
+  | { ok: false; status: number; error: string | null };
+
 export interface PollerConfig {
   workerUrl: string;
   apiKey: string;
@@ -797,6 +809,38 @@ export class Poller {
       throw new Error("sessions/owner returned a malformed body");
     }
     return { machineId: body.machine_id, lastSeen: body.last_seen };
+  }
+
+  /**
+   * `GET /sessions/remote` (pigeon-k0qn.9): sessions registered to OTHER machines, for
+   * swarm_list's remote discovery. A non-2xx is returned as `{ok:false}` with the worker's
+   * status and error code, so the route can say why (an old worker 404s; a daemon still on the
+   * shared key gets 401 `machine_credential_required`). Throws on transport failure and on a
+   * malformed 2xx body. Decoration, so it is not recorded in the worker-health monitor.
+   */
+  async listRemoteSessions(limit: number | undefined, signal?: AbortSignal): Promise<RemoteSessionsResult> {
+    const url = new URL(`${this.config.workerUrl}/sessions/remote`);
+    if (limit !== undefined) url.searchParams.set("limit", String(limit));
+    const response = await this.fetchFn(url.toString(), {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.config.apiKey}` },
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { error?: unknown } | null;
+      return { ok: false, status: response.status, error: typeof body?.error === "string" ? body.error : null };
+    }
+    const body = (await response.json()) as Partial<RemoteSessionsListing> | null;
+    if (
+      !body ||
+      typeof body.machine_id !== "string" ||
+      !Array.isArray(body.sessions) ||
+      !Array.isArray(body.machines) ||
+      typeof body.truncated !== "boolean"
+    ) {
+      throw new Error("sessions/remote returned a malformed body");
+    }
+    return { ok: true, listing: body as RemoteSessionsListing };
   }
 
   /**

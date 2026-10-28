@@ -1141,6 +1141,9 @@ const app = createApp(storage, {
   bindNamedTopic: poller ? (req, signal) => poller.bindNamedTopic(req, signal) : undefined,
   // Unbind named topic for POST /session-unbind. Absent without a worker.
   unbindNamedTopic: poller ? (sessionId, signal) => poller.unbindNamedTopic(sessionId, signal) : undefined,
+  // swarm_list remote discovery (pigeon-k0qn.9). Absent without a worker: 503 no_worker.
+  listRemoteSessions: poller ? (limit, signal) => poller.listRemoteSessions(limit, signal) : undefined,
+  swarmRelaySend: config.swarmRelaySend,
   // Registers whatever `notify` says: the worker row is the session's ownership claim for
   // cross-machine relays (pigeon-k0qn.5), not only its notification route.
   onSessionStart: async (sessionId, _notify, label) => {

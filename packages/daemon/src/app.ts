@@ -31,7 +31,7 @@ import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
-import type { WorkerResult } from "./worker/poller";
+import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
 
 const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
 const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
@@ -363,7 +363,19 @@ interface AppOptions {
     sessionId: string,
     signal?: AbortSignal,
   ) => Promise<{ unbound: number }>;
+  /**
+   * The worker's `GET /sessions/remote`, for `GET /swarm/remote-sessions` (pigeon-k0qn.9).
+   * Absent on a host with no worker connection; the route then answers 503 `no_worker`.
+   */
+  listRemoteSessions?: (limit: number | undefined, signal: AbortSignal) => Promise<RemoteSessionsResult>;
+  /** Bound on `listRemoteSessions`. Test seam; production uses REMOTE_SESSIONS_TIMEOUT_MS. */
+  remoteSessionsTimeoutMs?: number;
+  /** `PIGEON_SWARM_RELAY_SEND=1`: reported by `/swarm/remote-sessions` as `relay_send`. */
+  swarmRelaySend?: boolean;
 }
+
+/** Bound on the worker call behind `GET /swarm/remote-sessions`. An agent is waiting on it. */
+export const REMOTE_SESSIONS_TIMEOUT_MS = 5_000;
 
 /**
  * Bound on binding and unbinding named topics. Distinct from the 3s alert topic budget
@@ -1137,6 +1149,46 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           { status: 409 },
         );
+      }
+
+      // swarm_list remote discovery (pigeon-k0qn.9): sessions on OTHER machines, from the
+      // worker. `relay_send` is added here because only this daemon knows whether it relays;
+      // without it every listed session is one a send cannot reach (Phase 1 fast-fail).
+      if (request.method === "GET" && url.pathname === "/swarm/remote-sessions") {
+        const limitParam = url.searchParams.get("limit");
+        let limit: number | undefined;
+        if (limitParam !== null) {
+          const parsed = Number(limitParam);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            return Response.json({ error: "limit must be a positive integer" }, { status: 400 });
+          }
+          limit = parsed;
+        }
+        if (!opts.listRemoteSessions) {
+          return Response.json(
+            { error: "no_worker", detail: "this daemon has no worker connection, so it cannot see other machines" },
+            { status: 503 },
+          );
+        }
+        let result: RemoteSessionsResult;
+        try {
+          result = await opts.listRemoteSessions(
+            limit,
+            AbortSignal.timeout(opts.remoteSessionsTimeoutMs ?? REMOTE_SESSIONS_TIMEOUT_MS),
+          );
+        } catch (err) {
+          return Response.json(
+            { error: "worker_unreachable", detail: err instanceof Error ? err.message : String(err) },
+            { status: 502 },
+          );
+        }
+        if (!result.ok) {
+          return Response.json(
+            { error: "worker_error", worker_status: result.status, worker_error: result.error },
+            { status: 502 },
+          );
+        }
+        return Response.json({ ...result.listing, relay_send: opts.swarmRelaySend === true });
       }
 
       if (request.method === "GET" && url.pathname === "/swarm/inbox") {
