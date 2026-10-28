@@ -22,6 +22,18 @@ open. Three pieces, one PR.
   `RELAY_ONLINE_MS`), else `available`. A missing `machine_relay_accept` table (schema not
   applied) gives `unknown` rather than failing the listing. This is a snapshot: the relay route
   re-checks on every send.
+- **Rows and labels are untrusted text.** `/sessions/register` validates neither the session id,
+  the label nor (for the shared key) the machine id, and any credential holder can write them,
+  while this listing lands in agents' context on other machines. So only rows whose session id
+  matches the relay's own `ses_` pattern and whose machine id matches `MACHINE_ID_PATTERN` are
+  listed (anything else the relay would refuse anyway), and labels have control characters
+  replaced and are cut to 120 code points; the plugin also JSON-quotes them. Filtering in JS means
+  the query is not `LIMIT`ed; it is bounded by `MAX_SESSIONS`.
+- **`updated_at` means "still held", not "recently active".** The owner's daemon re-registers
+  every live session about once a day, so the plugin's column is `SEEN`. The label is the
+  directory basename; D1 has no title.
+- **"available" is per machine.** A pull lane listed under an available machine can still refuse
+  a remote sender (`remote_not_accepted`, §3.3); the plugin says so.
 - Read-only: it never touches `updated_at`.
 
 Response: `{machine_id, sessions: [{session_id, machine_id, label, updated_at}], machines:

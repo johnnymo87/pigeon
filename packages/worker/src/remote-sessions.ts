@@ -9,8 +9,8 @@
  * is what the relay routes refuse. Read-only; it never touches `updated_at`.
  */
 
-import { requireMachinePrincipal } from "./credentials";
-import { isMissingTable, relayReachability, type RelayReachability } from "./relay";
+import { requireMachinePrincipal, MACHINE_ID_PATTERN } from "./credentials";
+import { isMissingTable, relayReachability, SENDER_ID, type RelayReachability } from "./relay";
 import { REGISTER_TAKEOVER_STALE_MS } from "./sessions";
 import { withD1, StorageError } from "./d1";
 
@@ -23,6 +23,20 @@ export const REMOTE_SESSIONS_MAX_LIMIT = 500;
  * listed session is one its owner still holds.
  */
 export const REMOTE_SESSIONS_HORIZON_MS = REGISTER_TAKEOVER_STALE_MS;
+
+/** Labels are cut to this many code points. */
+export const REMOTE_LABEL_MAX = 120;
+
+/**
+ * `sessions` rows are written by any credential holder and `/sessions/register` validates
+ * neither field, while this listing lands in agents' context on other machines. A newline
+ * would let one machine forge rows (or a relay-status line) in that output, so control
+ * characters become spaces. Design §3.2's "receipts, not prose" rule, applied here.
+ */
+function cleanLabel(label: string | null): string | null {
+  if (label === null) return null;
+  return [...label.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")].slice(0, REMOTE_LABEL_MAX).join("");
+}
 
 interface Row {
   session_id: string;
@@ -52,26 +66,28 @@ export async function handleRemoteSessions(
   }
 
   try {
-    // `gse_` rows are left out: a goose session cannot be a remote target (design §7), so
-    // listing one would only invite a send that fails. One row past the limit says whether
-    // more matched.
+    // Only ids the relay would accept as a target are listed: `gse_` because a goose session
+    // cannot be a remote target (design §7), and anything malformed because the relay would
+    // answer 400 and because ids are unvalidated free text (see cleanLabel). The same goes for
+    // machine ids: the shared key may still register a session as any unretired machine name. The filter is in
+    // JS, so the query is not LIMITed; it is bounded by MAX_SESSIONS (~820 rows today).
     const { results } = await withD1(
       "remoteSessions.list",
       db
         .prepare(
           `SELECT session_id, machine_id, label, updated_at FROM sessions
            WHERE machine_id <> ? AND updated_at >= ? AND substr(session_id, 1, 4) = 'ses_'
-           ORDER BY updated_at DESC, session_id ASC
-           LIMIT ?`,
+           ORDER BY updated_at DESC, session_id ASC`,
         )
-        .bind(caller, now - REMOTE_SESSIONS_HORIZON_MS, limit + 1)
+        .bind(caller, now - REMOTE_SESSIONS_HORIZON_MS)
         .all<Row>(),
     );
-    const truncated = results.length > limit;
-    const sessions = results.slice(0, limit).map((r) => ({
+    const valid = results.filter((r) => SENDER_ID.test(r.session_id) && MACHINE_ID_PATTERN.test(r.machine_id));
+    const truncated = valid.length > limit;
+    const sessions = valid.slice(0, limit).map((r) => ({
       session_id: r.session_id,
       machine_id: r.machine_id,
-      label: r.label,
+      label: cleanLabel(r.label),
       updated_at: r.updated_at,
     }));
 
@@ -85,7 +101,7 @@ export async function handleRemoteSessions(
         const reach = await relayReachability(db, env, caller, id, now);
         machines.push({ machine_id: id, relay: reach.relay, last_poll_at: reach.lastPollAt });
       } catch (err) {
-        if (!isMissingTable(err)) throw err;
+        if (!isMissingTable(err)) throw new StorageError("remoteSessions.reachability", err);
         const poll = await db
           .prepare("SELECT last_poll_at FROM machines WHERE machine_id = ?")
           .bind(id)

@@ -43,7 +43,8 @@ export const RELAY_MAX_ACK_ITEMS = 100;
 export const RELAY_MAX_ACCEPT = 16;
 
 const TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
-const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+/** A `ses_` id the relay accepts, as sender or (with `gse_`, TARGET_ID) as target. */
+export const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
 const MSG_ID = /^[^:\s]{1,128}$/;
 const REASON = /^[a-z0-9_]{1,64}$/;
 const PRIORITIES = new Set(["urgent", "normal", "low"]);

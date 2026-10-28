@@ -98,6 +98,9 @@ export function formatSessions(sessions: SwarmSession[], now: number): string {
   return [header.join("  "), ...rows].join("\n")
 }
 
+/** The worker clamps `limit` to this (REMOTE_SESSIONS_MAX_LIMIT). */
+export const REMOTE_LIMIT_MAX = 500
+
 /** The daemon's `GET /swarm/remote-sessions` body. */
 export interface RemoteSessionsListing {
   /** The machine this daemon runs on, as the worker resolved its credential. */
@@ -167,15 +170,22 @@ export function formatRemoteSessions(listing: RemoteSessionsListing, now: number
   if (listing.sessions.length === 0) {
     return `No sessions on other machines were active in the last 7 days (asked from ${self}).`
   }
-  const header = ["ID", "UPDATED", "MACHINE", "LABEL"]
+  // SEEN, not UPDATED: the worker row is also bumped by the owner's daily re-registration, so
+  // it says the session is still held, not that it was recently active. The label is the
+  // session's directory basename, JSON-quoted because it is free text written by another machine.
+  const header = ["ID", "SEEN", "MACHINE", "LABEL"]
   const rows = listing.sessions.map((s) =>
-    `${s.session_id}  ${relativeAge(s.updated_at, now)}  ${s.machine_id}  ${(s.label ?? "").slice(0, 60)}`.trimEnd(),
+    `${s.session_id}  ${relativeAge(s.updated_at, now)}  ${s.machine_id}  ${s.label ? JSON.stringify(s.label) : ""}`.trimEnd(),
   )
   const out = [`Sessions on machines other than ${self}:`, header.join("  "), ...rows]
   if (listing.truncated) {
-    out.push("(more sessions matched; pass a larger limit to see them)")
+    out.push(`(more sessions matched; pass a larger limit, up to ${REMOTE_LIMIT_MAX}, to see them)`)
   }
-  out.push("", `Relay from ${self} (what swarm_send to each machine would get now):`)
+  out.push(
+    "",
+    `Relay from ${self} (what swarm_send to each machine would get now; "available" means the ` +
+      "worker will queue it, and the receiving session may still refuse it):",
+  )
   for (const m of listing.machines) {
     out.push(`  ${m.machine_id}: ${explainRelay(m.relay, m.machine_id, self)}`)
   }

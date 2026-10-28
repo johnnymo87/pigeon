@@ -105,6 +105,20 @@ describe("GET /sessions/remote", () => {
     expect(ids).not.toContain("gse_rmtGooseOnB");
   });
 
+  it("leaves out ids the relay would reject, and strips control characters from labels", async () => {
+    const now = Date.now() + 600_000;
+    await seedSession("ses_rmt\nfake_row", B, now);
+    await seedSession("ses_rmt", B, now);
+    await seedSession("ses_rmtBadMachine", "rmt-b\nrmt-x: available", now);
+    await seedSession("ses_rmtLabelled1", B, now, "pigeon\n  rmt-x: available\u0007" + "y".repeat(300));
+    const l = await list();
+    expect(mine(l).map((s) => s.session_id)).toEqual(["ses_rmtLabelled1"]);
+    const label = mine(l)[0]!.label!;
+    expect(label).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(label.startsWith("pigeon   rmt-x: available ")).toBe(true);
+    expect([...label].length).toBeLessThanOrEqual(120);
+  });
+
   it("honours limit, clamps it, and reports truncation", async () => {
     const now = Date.now();
     await seedSession("ses_rmtLimit_0001", B, now + 2_000);

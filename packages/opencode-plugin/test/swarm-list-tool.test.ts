@@ -222,7 +222,8 @@ describe("formatRemoteSessions", () => {
 
   test("renders id, age, machine and label, then each machine's relay status", () => {
     const out = formatRemoteSessions(REMOTE, 10_000)
-    expect(out).toMatch(/ses_onDevbox01\s+3s\s+devbox\s+pigeon/)
+    expect(out).toMatch(/ses_onDevbox01\s+3s\s+devbox\s+"pigeon"/)
+    expect(out).toContain("SEEN")
     expect(out).toMatch(/ses_onMac00001\s+6s\s+macbook/)
     expect(out).toMatch(/devbox: available/)
     expect(out).toMatch(/macbook: offline/)
@@ -253,7 +254,7 @@ describe("formatRemoteSessions", () => {
     const out = formatRemoteSessions({ ...REMOTE, relay_send: false, truncated: true }, 10_000)
     expect(out).toMatch(/cloudbox does not relay/)
     expect(out).toMatch(/PIGEON_SWARM_RELAY_SEND/)
-    expect(out).toMatch(/more sessions matched/)
+    expect(out).toMatch(/more sessions matched; pass a larger limit, up to 500/)
   })
 })
 
