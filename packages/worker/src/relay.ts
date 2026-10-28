@@ -43,7 +43,8 @@ export const RELAY_MAX_ACK_ITEMS = 100;
 export const RELAY_MAX_ACCEPT = 16;
 
 const TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
-const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+/** A `ses_` id the relay accepts, as sender or (with `gse_`, TARGET_ID) as target. */
+export const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
 const MSG_ID = /^[^:\s]{1,128}$/;
 const REASON = /^[a-z0-9_]{1,64}$/;
 const PRIORITIES = new Set(["urgent", "normal", "low"]);
@@ -97,7 +98,7 @@ interface RelayRow {
   expires_at: number;
 }
 
-function isMissingTable(err: unknown): boolean {
+export function isMissingTable(err: unknown): boolean {
   return /no such table/i.test(String(err));
 }
 
@@ -193,6 +194,39 @@ function duplicateOrConflict(existing: RelayRow, hash: string): Response {
   );
 }
 
+export type RelayReachability = "available" | "not_retired" | "not_accepted" | "offline";
+
+/**
+ * Whether `toMachine` would take a relay from `fromMachine` right now, short of the queue cap.
+ * The one implementation of these checks, in their load-bearing order: `POST /swarm/relay`
+ * answers from it, and `GET /sessions/remote` (pigeon-k0qn.9) reports it, so discovery cannot
+ * drift from what a send would be told. Throws "no such table" when the relay schema is missing;
+ * each caller decides what that means.
+ */
+export async function relayReachability(
+  db: D1Database,
+  env: Env,
+  fromMachine: string,
+  toMachine: string,
+  now: number,
+): Promise<{ relay: RelayReachability; lastPollAt: number | null }> {
+  const machine = await db
+    .prepare("SELECT last_poll_at FROM machines WHERE machine_id = ?")
+    .bind(toMachine)
+    .first<{ last_poll_at: number }>();
+  const lastPollAt = machine?.last_poll_at ?? null;
+  // Rule 1 from the .8 review: until the owner is retired from the shared key, a shared-key
+  // holder can re-register its sessions to itself and collect what we would queue here.
+  if (!isSharedKeyRetiredFor(env, toMachine)) return { relay: "not_retired", lastPollAt };
+  const accept = await db
+    .prepare("SELECT accept_csv FROM machine_relay_accept WHERE machine_id = ?")
+    .bind(toMachine)
+    .first<{ accept_csv: string }>();
+  if (!accept || !accept.accept_csv.split(",").includes(fromMachine)) return { relay: "not_accepted", lastPollAt };
+  if (lastPollAt === null || now - lastPollAt > RELAY_ONLINE_MS) return { relay: "offline", lastPollAt };
+  return { relay: "available", lastPollAt };
+}
+
 /** `POST /swarm/relay`. Check order is in the decisions note; it is load-bearing for the sender's table. */
 export async function handleRelay(db: D1Database, env: Env, request: Request, now: number = Date.now()): Promise<Response> {
   const principal = await requireMachinePrincipal(request, env);
@@ -247,29 +281,20 @@ export async function handleRelay(db: D1Database, env: Env, request: Request, no
       console.error("[relay] same_machine: the sender's locality check and D1 disagree", { fromMachine, to: msg.to, msgId: msg.msg_id });
       return Response.json({ error: "same_machine", detail: `D1 says ${msg.to} is on ${fromMachine}` }, { status: 409 });
     }
-    // Rule 1 from the .8 review: until the owner is retired from the shared key, a shared-key
-    // holder can re-register its sessions to itself and collect what we would queue here.
-    if (!isSharedKeyRetiredFor(env, toMachine)) {
+    const reach = await relayReachability(db, env, fromMachine, toMachine, now);
+    if (reach.relay === "not_retired") {
       return Response.json(
         { error: "receiver_not_retired", detail: `${toMachine} still accepts the shared worker key, so it cannot receive relays` },
         { status: 403 },
       );
     }
-    const accept = await db
-      .prepare("SELECT accept_csv FROM machine_relay_accept WHERE machine_id = ?")
-      .bind(toMachine)
-      .first<{ accept_csv: string }>();
-    if (!accept || !accept.accept_csv.split(",").includes(fromMachine)) {
+    if (reach.relay === "not_accepted") {
       return Response.json(
         { error: "not_accepted", detail: `${toMachine} does not accept relays from ${fromMachine}` },
         { status: 403 },
       );
     }
-    const machine = await db
-      .prepare("SELECT last_poll_at FROM machines WHERE machine_id = ?")
-      .bind(toMachine)
-      .first<{ last_poll_at: number }>();
-    if (!machine || now - machine.last_poll_at > RELAY_ONLINE_MS) {
+    if (reach.relay === "offline") {
       return Response.json({ error: "target_offline", detail: `${toMachine} is not polling` }, { status: 503 });
     }
     const queued = await db

@@ -445,7 +445,7 @@ const plugin: Plugin = async (ctx) => {
         // See SWARM_READ_TOOL_NAME comment in swarm-tool.ts for history.
         [SWARM_READ_TOOL_NAME]: createSwarmReadTool(daemonUrl),
         [SWARM_SEND_TOOL_NAME]: createSwarmSendTool(daemonUrl),
-        [SWARM_LIST_TOOL_NAME]: createSwarmListTool(String(ctx.serverUrl), internalFetch),
+        [SWARM_LIST_TOOL_NAME]: createSwarmListTool(String(ctx.serverUrl), internalFetch, { daemonBaseUrl: daemonUrl }),
         [SWARM_SCHEDULE_TOOL_NAME]: createSwarmScheduleTool(daemonUrl),
         [SWARM_SCHEDULED_TOOL_NAME]: createSwarmScheduledTool(daemonUrl),
       },

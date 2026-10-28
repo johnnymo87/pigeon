@@ -1632,3 +1632,46 @@ describe("Poller.lookupSessionOwner() (pigeon-k0qn.2)", () => {
     ).rejects.toThrow(/malformed/);
   });
 });
+
+describe("Poller.listRemoteSessions() (pigeon-k0qn.9)", () => {
+  const mk = (res: Response) => {
+    const fetchFn = vi.fn().mockResolvedValue(res);
+    return { fetchFn, poller: new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch }) };
+  };
+  const listing = {
+    machine_id: "cloudbox",
+    sessions: [{ session_id: "ses_onDevbox01", machine_id: "devbox", label: "pigeon", updated_at: 42 }],
+    machines: [{ machine_id: "devbox", relay: "not_accepted", last_poll_at: 40 }],
+    truncated: false,
+  };
+
+  it("GETs /sessions/remote with auth, the limit and the caller's signal, and returns the listing", async () => {
+    const { fetchFn, poller } = mk(new Response(JSON.stringify(listing), { status: 200 }));
+    const signal = new AbortController().signal;
+    expect(await poller.listRemoteSessions(25, signal)).toEqual({ ok: true, listing });
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/sessions/remote?limit=25");
+    expect(init.method).toBe("GET");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
+    expect(init.signal).toBe(signal);
+  });
+
+  it("omits limit when none is given", async () => {
+    const { fetchFn, poller } = mk(new Response(JSON.stringify(listing), { status: 200 }));
+    await poller.listRemoteSessions(undefined);
+    expect((fetchFn.mock.calls[0] as [string])[0]).toBe("http://localhost:8787/sessions/remote");
+  });
+
+  it("reports a non-2xx as {ok:false} with the status and the worker's error code", async () => {
+    const { poller } = mk(new Response(JSON.stringify({ error: "machine_credential_required" }), { status: 401 }));
+    expect(await poller.listRemoteSessions(undefined)).toEqual({ ok: false, status: 401, error: "machine_credential_required" });
+    const old = mk(new Response("Not found", { status: 404 })).poller;
+    expect(await old.listRemoteSessions(undefined)).toEqual({ ok: false, status: 404, error: null });
+  });
+
+  it("throws on a malformed 2xx body", async () => {
+    await expect(
+      mk(new Response(JSON.stringify({ sessions: "x" }), { status: 200 })).poller.listRemoteSessions(undefined),
+    ).rejects.toThrow(/malformed/);
+  });
+});
