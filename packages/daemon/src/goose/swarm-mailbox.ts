@@ -1,8 +1,10 @@
-import { randomUUID } from "crypto";
 import { GOOSE_BACKEND_KIND } from "./backend-kind.js";
 import type { SessionRecord, UpsertSessionInput } from "../storage/types.js";
+import { gooseSessionId } from "./session-id.js";
 
 export interface EnsureGooseSwarmMailboxInput {
+  /** This daemon's machine id, hashed into the pigeon id (see gooseSessionId). */
+  machineId: string | null | undefined;
   backendSessionId: string;
   endpoint: string;
   cwd?: string | null;
@@ -44,12 +46,16 @@ export type EnsureGooseSwarmMailboxResult =
  *    label, or cwd. Adds "swarm" to pull_sources and touches liveness (touch).
  *  - Refuses gse_ in session_id (400), non-goose existing rows (409), and legacy
  *    goose rows where pigeon id == goose id (409).
+ *  - A created row gets the derived id (gooseSessionId), the same one
+ *    registerGooseSession would mint, so a re-created mailbox finds the mail
+ *    banked under it before it was reaped. A row already at that id for another
+ *    goose session is refused (409), never overwritten.
  */
 export function ensureGooseSwarmMailbox(
   sessions: GooseSwarmMailboxStore,
   input: EnsureGooseSwarmMailboxInput,
   now: number,
-  mintId: () => string = () => `gse_${randomUUID()}`,
+  mintId?: () => string,
 ): EnsureGooseSwarmMailboxResult {
   if (input.backendSessionId.startsWith("gse_")) {
     return {
@@ -113,7 +119,15 @@ export function ensureGooseSwarmMailbox(
     };
   }
 
-  const sessionId = mintId();
+  const sessionId = mintId ? mintId() : gooseSessionId(input.machineId, input.backendSessionId);
+  const squatter = sessions.get(sessionId);
+  if (squatter) {
+    return {
+      ok: false,
+      error: `pigeon id ${sessionId} for goose session ${input.backendSessionId} is already taken by goose session ${squatter.backendSessionId ?? squatter.sessionId}; refusing to overwrite it`,
+      statusCode: 409,
+    };
+  }
   sessions.upsert(
     {
       sessionId,

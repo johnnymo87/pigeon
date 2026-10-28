@@ -183,7 +183,7 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
   try {
     const registered = registerGooseSession(
       input.sessions,
-      { backendSessionId, endpoint: acpUrl, cwd: directory, authToken: input.acpToken ?? null },
+      { machineId, backendSessionId, endpoint: acpUrl, cwd: directory, authToken: input.acpToken ?? null },
       now(),
       input.mintPigeonId,
     );

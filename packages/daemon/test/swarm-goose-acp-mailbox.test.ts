@@ -27,7 +27,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     const { app, storage: s } = newApp();
     registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
       () => "gse_target",
     );
@@ -69,7 +69,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     const { app, storage: s } = newApp();
     registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
       () => "gse_no_optin",
     );
@@ -131,7 +131,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     const { app, storage: s } = newApp();
     registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
       () => "gse_sched",
     );
@@ -308,6 +308,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     registerGooseSession(
       s.sessions,
       {
+        machineId: null,
         backendSessionId: "20261020_2",
         endpoint: "ws://orig/acp",
         cwd: "/orig/cwd",
@@ -728,7 +729,7 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
     const { storage: s } = newApp(1_000);
     registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261020_sender", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_sender", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
       () => "gse_sender",
     );
@@ -765,7 +766,7 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
     const { storage: s } = newApp(1_000);
     registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261020_sender2", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_sender2", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
       () => "gse_sender_no_optin",
     );

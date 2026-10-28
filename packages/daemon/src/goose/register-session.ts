@@ -1,6 +1,6 @@
-import { randomUUID } from "crypto";
 import { GOOSE_BACKEND_KIND } from "./backend-kind.js";
 import type { SessionRecord, UpsertSessionInput } from "../storage/types.js";
+import { gooseSessionId } from "./session-id.js";
 
 /**
  * Creating pigeon's row for a goose session, in one place.
@@ -22,12 +22,20 @@ import type { SessionRecord, UpsertSessionInput } from "../storage/types.js";
  *    be driven from Telegram, and with notify=false the `/stop` route returns
  *    early, so the human never hears a turn finish -- indistinguishable from a
  *    broken adapter.
+ *  - **The id is derived, not random** (`gooseSessionId`, pigeon-k0qn.13.4),
+ *    so a row that is reaped or deleted and registered again comes back at the
+ *    same address and reconnects to the mail banked under it.
  *  - **Registering the same goose session twice reuses one row.** The caller
  *    knows only goose's id, so without the backend-id lookup a re-registration
  *    would mint a second pigeon session for one goose session.
  */
 
 export interface RegisterGooseSessionInput {
+  /**
+   * This daemon's machine id, hashed into the pigeon id. Required (not
+   * optional) so a new caller cannot silently mint under a different name.
+   */
+  machineId: string | null | undefined;
   /** The id GOOSE knows the session by, e.g. `20260920_1`. */
   backendSessionId: string;
   endpoint: string;
@@ -47,13 +55,13 @@ export type RegisterGooseSessionResult =
   | { ok: false; conflict: string };
 
 /**
- * @param mintId Injected so tests can pin the id; defaults to a random one.
+ * @param mintId Injected so tests can pin the id; defaults to the derived one.
  */
 export function registerGooseSession(
   sessions: GooseSessionStore,
   input: RegisterGooseSessionInput,
   now: number,
-  mintId: () => string = () => `gse_${randomUUID()}`,
+  mintId?: () => string,
 ): RegisterGooseSessionResult {
   // Refuse to convert an existing session of another kind. Historically this
   // mattered because pigeon's id WAS goose's id and the upsert would rewrite
@@ -96,7 +104,21 @@ export function registerGooseSession(
   // pigeon id IS goose's id (found by primary key, with backendKind already
   // goose -- the other-kind case was refused above).
   const existing = sessions.getByBackendSessionId(input.backendSessionId) ?? atPrimaryKey;
-  const sessionId = existing?.sessionId ?? mintId();
+  const sessionId = existing?.sessionId
+    ?? (mintId ? mintId() : gooseSessionId(input.machineId, input.backendSessionId));
+
+  // A fresh id that is already taken by a row for a DIFFERENT goose session
+  // (a hand-edited row, or a machine id reused from another machine) must not
+  // be upserted over: that would repoint a live session at another conversation.
+  if (!existing) {
+    const squatter = sessions.get(sessionId);
+    if (squatter) {
+      return {
+        ok: false,
+        conflict: `pigeon id ${sessionId} for goose session ${input.backendSessionId} is already taken by goose session ${squatter.backendSessionId ?? squatter.sessionId}; refusing to overwrite it`,
+      };
+    }
+  }
 
   sessions.upsert(
     {
