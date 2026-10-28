@@ -1687,7 +1687,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // and returns that, which is what every later request must use.
         const registered = registerGooseSession(
           storage.sessions,
-          { backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
+          { machineId: opts.machineId, backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
           nowFn(),
         );
         if (!registered.ok) {
@@ -1758,7 +1758,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const result = ensureGooseSwarmMailbox(
           storage.sessions,
-          { backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
+          { machineId: opts.machineId, backendSessionId: sessionId, endpoint, cwd, label, authToken: token },
           nowFn(),
         );
         if (!result.ok) {

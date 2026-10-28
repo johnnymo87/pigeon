@@ -144,7 +144,7 @@ describe("registerGooseSession", () => {
 
     const res = registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260918_1", endpoint: "ws://new/acp" },
+      { machineId: null, backendSessionId: "20260918_1", endpoint: "ws://new/acp" },
       2_000,
     );
 
@@ -168,7 +168,7 @@ describe("registerGooseSession", () => {
     storage = openStorageDb(":memory:");
     const created = registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
       1_000,
       () => "gse_fixed",
     );
@@ -176,7 +176,7 @@ describe("registerGooseSession", () => {
 
     const res = registerGooseSession(
       storage.sessions,
-      { backendSessionId: "gse_fixed", endpoint: "ws://b/acp" },
+      { machineId: null, backendSessionId: "gse_fixed", endpoint: "ws://b/acp" },
       2_000,
     );
 
@@ -197,7 +197,7 @@ describe("registerGooseSession", () => {
     storage = openStorageDb(":memory:");
     registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
       1_000,
       () => "gse_fixed",
     );
@@ -213,7 +213,7 @@ describe("registerGooseSession", () => {
     storage = openStorageDb(":memory:");
     registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
       1_000,
       () => "gse_fixed",
     );
@@ -223,7 +223,7 @@ describe("registerGooseSession", () => {
     // Re-registering through registerGooseSession (e.g. restart or reconnect)
     registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260920_1", endpoint: "ws://b/acp" },
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://b/acp" },
       2_000,
       () => "gse_ignored",
     );
@@ -235,7 +235,7 @@ describe("registerGooseSession", () => {
     storage = openStorageDb(":memory:");
     registerGooseSession(
       storage.sessions,
-      { backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
       1_000,
       () => "gse_fixed",
     );

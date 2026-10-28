@@ -171,7 +171,7 @@ describe("recoverGooseTurns (Commit 2)", () => {
     const s = newStorage();
     const reg = registerGooseSession(
       s.sessions,
-      { backendSessionId: "20261015_1", endpoint: "ws://127.0.0.1:1/acp" },
+      { machineId: null, backendSessionId: "20261015_1", endpoint: "ws://127.0.0.1:1/acp" },
       1000,
       () => "gse_real",
     );
