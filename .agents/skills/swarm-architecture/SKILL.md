@@ -248,7 +248,7 @@ The daemon logs `[relay] accept_from=<list|(none)> send=<on|off>` at boot only w
 
 ### Ownership routes it
 
-The worker sends a relay to the machine in D1 `sessions.machine_id` for the target. Every main session registers at `/session-start`, quiet ones included. The daemon reaper re-registers each live session once its last registration is 20h old: at most 100 per hourly cycle, with the state held in memory. If that refresh hears `409 owned_by_other_machine`, the reaper raises a plain alert, once per session per daemon lifetime. Subagents never register, so a relay to one answers `404 unknown_session`.
+The worker sends a relay to the machine in D1 `sessions.machine_id` for the target. Every main session registers at `/session-start`, quiet ones included. The daemon reaper re-registers each live, unpinned session once the reaper's own record of its last refresh is 20h old: at most 100 per hourly cycle. That record is in memory, so every daemon restart refreshes everything again. If that refresh hears `409 owned_by_other_machine`, the reaper raises a plain alert, once per session per daemon lifetime. Subagents never register, so a relay to one answers `404 unknown_session`.
 
 ### Send side (arbiter)
 
@@ -271,8 +271,8 @@ Permanent answers become a `RelayRefusedError` and a `delivery.failed` worded by
 ### Worker
 
 - `swarm_relay`: primary key `(from_machine, msg_id)`, so two machines' reused caller-supplied ids cannot swallow each other. A same-key retry with the same `payload_sha256` (over `from`, `to`, `kind`, `reply_to`, `payload`) answers `202 duplicate`; a different hash answers `409 msg_id_conflict`.
-- `/swarm/relay` checks, in order: validate; duplicate or conflict; `sender_not_yours`; owner (`unknown_session`); `same_machine`; `receiver_not_retired`; accept set (`not_accepted`), then the owner's last poll within 60s (`target_offline`); 50 queued for that machine (`queue_full`).
-- Expiry: the worker's deadline is the sender's `expires_at` capped at 24h, or 24h when null. An expired item becomes a failure item: `never_collected` if still queued, `unconfirmed` if leased. Leases last 60s. Settled rows are deleted 7 days after creation.
+- `/swarm/relay` checks, in order: validate (`400 invalid`; includes a 64 KiB UTF-8 payload cap, which the sender is told as "will fail the same way" though a shorter payload would go); `expires_at` already past (`410 expired`); duplicate or conflict; `sender_not_yours`; owner (`unknown_session`); `same_machine`; `receiver_not_retired`; accept set (`not_accepted`), then the owner's last poll within 60s (`target_offline`); 50 queued for that machine (`queue_full`).
+- Expiry: the worker's deadline is the sender's `expires_at` capped at 24h, or 24h when null. An expired item becomes a failure item: `never_collected` if still queued, `unconfirmed` if leased. Leases last 60s, at most 5 leases per item; an item never acked within them expires as `unconfirmed`. Settled rows are deleted 7 days after creation.
 - Failure items (`msg_id` `f:<original>`) go to the original `from_machine` recorded on the row, never re-resolved through D1. They live 24h and are never answered: one that expires or is refused is logged and dropped.
 
 ### Receive side (`processRelayItems`, inside `Poller.tick`)
@@ -288,15 +288,15 @@ Per message item, first refusal wins and is acked `refused` with the code. The w
 5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`.
 6. Insert through `bankOrInsertSwarmMessage` with the original fields, plus the `swarm_relay_inbound` record, in one transaction. A `refused` result (`scheduled`, `payload_too_large`, `no_mailbox`, `no_session`) is acked with that code. A relayed message banked in a pull inbox gets a 5-day TTL (`RELAYED_PULL_TTL_MS`), not 7, so its expiry is still reportable while the worker remembers the row.
 
-An item whose processing throws is left unacked, so the worker offers it again; a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its Telegram notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
+An item whose processing throws is left unacked, so the worker offers it again (up to its 5 leases); a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its Telegram notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
 
 **Late failures go back through the worker.** `notifySenderOfFailure` is the one funnel for arbiter expiry, the attempt budget, permanent errors, watchdog terminals and pull-inbox expiry. For a `msg_id` with an inbound record, it does not insert a local `from='pigeon'` row, which would address a remote session. It stamps `fail_reason` on the record instead, once only. `RelayFailSender` then POSTs `/swarm/relay/fail` with backoff. Codes:
 
-- `unconfirmed_on_receiver`: the payload reached the target.
+- `unconfirmed_on_receiver`: the payload may have reached the target (`payloadLanded`: the transcript shows it, or with no transcript evidence the row was handed off; for a banked pull row, it was claimed).
 - `not_delivered_on_receiver`: it did not.
 - `not_on_receiver`: the hop rule.
 
-A `noop` (the worker has forgotten the row) or a 4xx is final, and is logged as "its sender will not be told". Inbound records are pruned at 8 days, once their message is gone from both tables.
+A `noop` (the worker has forgotten the row) or a 400/403 is final, and is logged as "its sender will not be told". Any other failure, 401 and 404 included, keeps retrying with backoff. Inbound records are pruned at 8 days, once their message is gone from both tables.
 
 ### Failure items on the sender
 
@@ -337,7 +337,7 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 - An ambiguous relay can mislead. Suppose the worker stored a relay whose 202 was lost, every retry then hits a transient error, and the receiver never answers. The attempt budget then reports "NOT received, safe to resend" while the worker still holds the message.
 - Goose sessions are neither remote targets nor relaying senders (`pigeon-k0qn.13`). Channels are not relayed.
 
-Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~15min.
+Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~6.5min (2+5+15+6×60s between the 10 attempts). Outage-class failures (`TargetUnavailableError`, transport) on a row with `expires_at` are instead retried every 30s, uncounted, until expiry.
 
 **The race-fix property**: at most one `prompt_async` to the same target at any time. Proven both by integration test (`test/swarm-routes.integration.test.ts` — fires 4 concurrent POSTs and asserts no overlap via timestamps) and by live smoke (10 concurrent → arbiter events strictly 500ms apart, see `2026-04-21-swarm-ipc-plan.md` Task 12 results).
 

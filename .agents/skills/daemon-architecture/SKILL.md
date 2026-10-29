@@ -210,7 +210,7 @@ A background hourly timer (`session-reaper.ts`, started in `index.ts`) cleans up
 1. Lists sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week).
 2. For each: removes it from local storage and unregisters it from the worker. Its opencode transcript is kept: `index.ts` passes no `deleteSession`.
 3. Runs `cleanupExpired` for fully expired session records.
-4. **Ownership refresh (pigeon-k0qn.5).** Re-registers each live, unpinned session with the worker once its last registration is 20h old, at most 100 per cycle. This keeps D1 `sessions.machine_id`, which routes cross-machine relays, from going stale and being claimed by another machine. A `409 owned_by_other_machine` raises a plain alert, once per session per daemon lifetime. Pinned (topic-bound goose-acp) rows are re-registered every cycle instead.
+4. **Ownership refresh (pigeon-k0qn.5).** Re-registers each live, unpinned session with the worker once the reaper's in-memory record of its last refresh is 20h old (a restart refreshes everything), at most 100 per cycle. This keeps D1 `sessions.machine_id`, which routes cross-machine relays, from going stale and being claimed by another machine. A `409 owned_by_other_machine` raises a plain alert, once per session per daemon lifetime. Pinned (topic-bound goose-acp) rows are re-registered every cycle instead.
 
 ### Dead Session Cleanup
 

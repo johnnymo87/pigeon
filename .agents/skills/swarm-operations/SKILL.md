@@ -148,7 +148,7 @@ If the target session was supposed to exist, check that opencode serve is up and
 
 ### `failed (permanent)` with `is not on this machine`
 
-Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). With the relay off on this machine (`PIGEON_SWARM_RELAY_SEND` unset, the default) this is the intended outcome, not a fault. With it on, only rows the relay cannot carry end here: a `pigeon` or goose sender, a `gse_` target, or a row that itself arrived by relay (the text then says "relayed messages are never relayed again"). See "Cross-Machine Relay" below.
+Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). With the relay off on this machine (`PIGEON_SWARM_RELAY_SEND` unset, the default) this is the intended outcome, not a fault. With it on, only rows the relay cannot carry end here: a `pigeon` or goose sender, a malformed target id, or a row that itself arrived by relay (the text then says "relayed messages are never relayed again"). See "Cross-Machine Relay" below.
 
 If the target *should* be local, check the id, then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4096/session/ses_X`. A 404 there means no serve on this machine has the session.
 
@@ -193,8 +193,11 @@ Mechanics are in `swarm-architecture` → "Cross-Machine Relay". Both halves are
 ### Is it on here?
 
 ```bash
-journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since today | grep '\[relay\] accept_from='
-# "[relay] accept_from=cloudbox send=on". No line at all since the last boot means both are off.
+# NixOS hosts (cloudbox, devbox): read the service's configured environment directly.
+systemctl show pigeon-daemon -p Environment | tr ' ' '\n' | grep PIGEON_SWARM_RELAY
+# No output means both are off. (macOS: the env is in the workstation repo's users/dev/home.darwin.nix.)
+# The daemon also logs "[relay] accept_from=<list> send=<on|off>" at boot when either is set;
+# scope a journal grep to the current boot, or an old line will mislead.
 ```
 
 What this machine's sessions would get from `swarm_send` to each other machine right now:
@@ -247,11 +250,11 @@ journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '1 hour ago' \
 | `[swarm-arbiter] relay refused (<code>) …` | Logged only for `same_machine`, `sender_not_yours` and `invalid`: two of our own views disagree with D1 or the worker's validator. Investigate; do not just resend |
 | `[relay-receiver] received {msgId, fromMachine, to}` | Inserted here and acked `delivered` |
 | `[relay-receiver] refused {msgId, fromMachine, reason}` | Acked `refused`; the sender gets a `delivery.failed` for `reason` |
-| `[relay-receiver] item left unacked after an error …` | A transient local error; the worker re-offers it after the 60s lease |
+| `[relay-receiver] item left unacked after an error …` | A transient local error; the worker re-offers it after the 60s lease, at most 5 leases in all, after which it expires as `unconfirmed` |
 | `[relay-receiver] relay failed at the receiver {msgId, machine, reason}` | (On the sender) a failure item matched a row we relayed; the sender was notified |
 | `[relay-receiver] failure item matches no relay of ours; dropped` | A failure item for a row this machine did not relay; acked `no_matching_relay` |
 | `[relay-fail] reported <msg> to <machine> (<reason>)` | A late failure of a relayed-in row went back to the worker |
-| `[relay-fail] … its sender will not be told` | The worker no longer has the row (more than 7 days) or refused the report. Final |
+| `[relay-fail] … its sender will not be told` | The worker no longer has the row (more than 7 days) or answered 400/403. Final. (Other non-2xx answers, including 401, keep retrying with backoff) |
 | `[poller] relay items failed: …` | The relay callback threw. The poll's command still dispatched; unacked items will be re-offered |
 | `[reaper] ownership refresh: <id> is registered to another machine: …` (with an alert) | Another machine holds a session this daemon runs. Relays to it go to that machine |
 
@@ -261,7 +264,7 @@ journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '1 hour ago' \
 - **`delivery.failed` saying the owner "cannot receive cross-machine messages yet (it still accepts the shared worker key)".** That is `receiver_not_retired`: add the owner to the worker's `SHARED_KEY_REFUSED_MACHINES` (`docs/runbooks/per-machine-credentials.md`).
 - **"does not accept cross-machine messages from this machine".** That is `not_accepted`: the owner's `PIGEON_SWARM_RELAY_ACCEPT_FROM` lacks this machine, or its daemon is rolled back or polls without the header. The worker clears a machine's accept set on a header-less poll.
 - **"the worker has no machine registered for it".** That is `unknown_session`: the target never registered (a subagent), or its daemon unregistered it after 7 idle days.
-- **A send retries for ~15 minutes, then reports NOT received.** The owner was `offline` the whole time. For a scheduled row, retries continue until `expires_at`.
+- **A send retries for ~6 minutes, then reports NOT received.** The owner was `offline` (or the worker unreachable) for every attempt; the attempt budget is 10. A scheduled row retries every 30s until its `expires_at`. Once the worker has answered 202 there are no sender retries: if the owner then goes away, the worker holds the item up to 24h and the sender hears `never_collected` or `unconfirmed` from the hourly expiry, up to ~25h later.
 - **The sender heard nothing, but the receiver logged `received`.** The receiver's local delivery is stuck in a watchdog non-terminal state (blocked behind a turn, silent in flight). Relayed senders are verified at handoff, so nothing reports this (spec §7). Inspect the row on the receiver like any local row.
 
 ## Force-Failing A Stuck Retry Loop
