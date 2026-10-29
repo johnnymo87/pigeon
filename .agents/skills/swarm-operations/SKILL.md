@@ -1,6 +1,6 @@
 ---
 name: swarm-operations
-description: Use for day-to-day swarm IPC ops — health checks, inspecting queued/handed-off/failed messages, debugging stuck deliveries, force-failing retry loops, tailing arbiter logs
+description: Use for day-to-day swarm IPC ops — health checks, inspecting queued/handed-off/failed messages, debugging stuck deliveries, force-failing retry loops, tailing arbiter logs, and checking or debugging the cross-machine relay
 ---
 
 # Swarm IPC Operations
@@ -148,7 +148,7 @@ If the target session was supposed to exist, check that opencode serve is up and
 
 ### `failed (permanent)` with `is not on this machine`
 
-Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). Cross-machine delivery is not supported; this is the intended outcome, not a fault.
+Cause: the target is not a session on this machine (`pigeon-k0qn`). The locality check got a 404 from the serve (or the target is a `gse_` id with no local row), so the row failed on its first attempt and the sender got a `delivery.failed`. If the worker knew the owner, the reason names it (`registered to cloudbox (last active …)`). With the relay off on this machine (`PIGEON_SWARM_RELAY_SEND` unset, the default) this is the intended outcome, not a fault. With it on, only rows the relay cannot carry end here: a `pigeon` or goose sender, a malformed target id, or a row that itself arrived by relay (the text then says "relayed messages are never relayed again"). See "Cross-Machine Relay" below.
 
 If the target *should* be local, check the id, then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4096/session/ses_X`. A 404 there means no serve on this machine has the session.
 
@@ -185,6 +185,87 @@ The HTTP inbox only returns `handed_off`. Use the SQLite query to see all states
 
 - Manually: `nix-shell -p sqlite --run "sqlite3 ~/.../pigeon-daemon.db 'DELETE FROM swarm_messages WHERE state IN (\"handed_off\",\"failed\") AND updated_at < <timestamp>;'"`
 - Long-term: schedule `cleanupOlderThan` in `index.ts` alongside the outbox cleanup (every hour, 7d retention).
+
+## Cross-Machine Relay
+
+Mechanics are in `swarm-architecture` → "Cross-Machine Relay". Both halves are off unless the `pigeon-daemon` service sets `PIGEON_SWARM_RELAY_SEND=1` (send) or `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` (receive). The env comes from the workstation repo's host configuration. No machine sets either yet; enabling them is `pigeon-k0qn.11`.
+
+### Is it on here?
+
+```bash
+# NixOS hosts (cloudbox, devbox): read the service's configured environment directly.
+systemctl show pigeon-daemon -p Environment | tr ' ' '\n' | grep PIGEON_SWARM_RELAY
+# No output means both are off. (macOS: the env is in the workstation repo's users/dev/home.darwin.nix.)
+# The daemon also logs "[relay] accept_from=<list> send=<on|off>" at boot when either is set;
+# scope a journal grep to the current boot, or an old line will mislead.
+```
+
+What this machine's sessions would get from `swarm_send` to each other machine right now:
+
+```bash
+curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" \
+  'http://127.0.0.1:4731/swarm/remote-sessions?limit=5' | jq '{relay_send, machines}'
+# relay_send: this daemon's PIGEON_SWARM_RELAY_SEND.
+# machines[].relay: available | not_accepted | not_retired | offline | unknown
+#   not_retired = that machine is not in the worker's SHARED_KEY_REFUSED_MACHINES yet
+#   unknown     = the worker's relay tables are not applied
+# 503 no_worker / 502 worker_error / 502 worker_unreachable: the daemon could not ask the worker.
+# A 401 machine_credential_required inside worker_error: this daemon polls with the shared key, not a pgk_ key.
+```
+
+This is the same data agents get from `swarm_list remote: true`.
+
+### Inspecting relayed rows
+
+On the **sender**, a relayed row is `handed_off` with `verify_family='relayed'`. That means the worker stored it, not that the target read it:
+
+```bash
+nix-shell -p sqlite --run \
+  "sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+   \"SELECT msg_id, to_session, state, datetime(handed_off_at/1000,'unixepoch') \
+     FROM swarm_messages WHERE verify_family='relayed' ORDER BY updated_at DESC LIMIT 20;\""
+```
+
+On the **receiver**, `swarm_relay_inbound` records every `msg_id` that arrived by relay. The message itself is an ordinary `swarm_messages` or `pull_inbox` row with the same `msg_id`. A non-null `fail_reason` means it failed here and is owed back to the sender. `fail_done_at` is set once reported, or once reporting was given up:
+
+```bash
+nix-shell -p sqlite --run \
+  "sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+   \"SELECT msg_id, from_machine, from_session, to_session, fail_reason, fail_attempts, \
+            datetime(received_at/1000,'unixepoch'), datetime(fail_done_at/1000,'unixepoch') \
+     FROM swarm_relay_inbound ORDER BY received_at DESC LIMIT 20;\""
+```
+
+### Log lines
+
+```bash
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '1 hour ago' \
+  | grep -E '\[relay|\[swarm-arbiter\] (relay|retry scheduled.*relay)|\[poller\] relay|ownership refresh'
+```
+
+| Log line | Meaning |
+|---|---|
+| `[swarm-arbiter] relayed {msgId, target, toMachine, duplicate, marked}` | The worker took it (202). `duplicate: true` means an earlier identical attempt was already stored |
+| `[swarm-arbiter] retry scheduled {… "error":"… relay of <msg> to <target> not accepted yet: worker answered 503 target_offline …"}` | Owner not polling (asleep or down); retried like an outage. `429 queue_full`, `503 relay_unavailable` and 5xx look the same. A row with `expires_at` logs `retry scheduled (uncounted)` instead |
+| `[swarm-arbiter] relay refused (<code>) …` | Logged only for `same_machine`, `sender_not_yours` and `invalid`: two of our own views disagree with D1 or the worker's validator. Investigate; do not just resend |
+| `[relay-receiver] received {msgId, fromMachine, to}` | Inserted here and acked `delivered` |
+| `[relay-receiver] refused {msgId, fromMachine, reason}` | Acked `refused`; the sender gets a `delivery.failed` for `reason` |
+| `[relay-receiver] item left unacked after an error …` | A transient local error; the worker re-offers it after the 60s lease, at most 5 leases in all, after which it expires as `unconfirmed` |
+| `[relay-receiver] relay failed at the receiver {msgId, machine, reason}` | (On the sender) a failure item matched a row we relayed; the sender was notified |
+| `[relay-receiver] failure item matches no relay of ours; dropped` | A failure item for a row this machine did not relay; acked `no_matching_relay` |
+| `[relay-fail] reported <msg> to <machine> (<reason>)` | A late failure of a relayed-in row went back to the worker |
+| `[relay-fail] … its sender will not be told` | The worker no longer has the row (more than 7 days) or answered 400/403. Final. (Other non-2xx answers, including 401, keep retrying with backoff) |
+| `[poller] relay items failed: …` | The relay callback threw. The poll's command still dispatched; unacked items will be re-offered |
+| `[reaper] ownership refresh: <id> is registered to another machine: …` (with an alert) | Another machine holds a session this daemon runs. Relays to it go to that machine |
+
+### Failure modes
+
+- **Every cross-machine send fails at once with "Cross-machine swarm delivery is not supported".** Sending is off here. Expected until `pigeon-k0qn.11`.
+- **`delivery.failed` saying the owner "cannot receive cross-machine messages yet (it still accepts the shared worker key)".** That is `receiver_not_retired`: add the owner to the worker's `SHARED_KEY_REFUSED_MACHINES` (`docs/runbooks/per-machine-credentials.md`).
+- **"does not accept cross-machine messages from this machine".** That is `not_accepted`: the owner's `PIGEON_SWARM_RELAY_ACCEPT_FROM` lacks this machine, or its daemon is rolled back or polls without the header. The worker clears a machine's accept set on a header-less poll.
+- **"the worker has no machine registered for it".** That is `unknown_session`: the target never registered (a subagent), or its daemon unregistered it after 7 idle days.
+- **A send retries for ~6 minutes, then reports NOT received.** The owner was `offline` (or the worker unreachable) for every attempt; the attempt budget is 10. A scheduled row retries every 30s until its `expires_at`. Once the worker has answered 202 there are no sender retries: if the owner then goes away, the worker holds the item up to 24h and the sender hears `never_collected` or `unconfirmed` from the hourly expiry, up to ~25h later.
+- **The sender heard nothing, but the receiver logged `received`.** The receiver's local delivery is stuck in a watchdog non-terminal state (blocked behind a turn, silent in flight). Relayed senders are verified at handoff, so nothing reports this (spec §7). Inspect the row on the receiver like any local row.
 
 ## Force-Failing A Stuck Retry Loop
 

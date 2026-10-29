@@ -105,6 +105,8 @@ The `onQuestionReply` handler uses `internalFetch` (with a `new Request(...)`) t
 
 The plugin registers `swarm.read` as an opencode tool the LLM can call to fetch its swarm inbox from the local pigeon daemon. This is the receiver side of the swarm IPC subsystem (sender side is the `swarm_send` tool; full subsystem in `swarm-architecture`).
 
+`swarm_list` (`swarm-list-tool.ts`) lists local sessions from the serve. With `remote: true` it instead calls the daemon's `GET /swarm/remote-sessions` (pigeon-k0qn.9). That lists `ses_` sessions held by other machines in the last 7 days, then each machine's relay status (`available`, `not_accepted`, `not_retired`, `offline`, `unknown`), then a warning when this machine's daemon does not relay (`relay_send: false`). Labels are JSON-quoted because another machine wrote them.
+
 - `packages/opencode-plugin/src/swarm-tool.ts`:
   - `swarmRead({daemonBaseUrl, sessionId, fetchFn?}, since?)` -- pure helper. `GET /swarm/inbox?session=<id>[&since=<msg_id>]`. Returns the parsed messages array.
   - `formatInbox(messages)` -- renders the messages as compact text blocks for the LLM.

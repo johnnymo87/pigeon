@@ -1,6 +1,6 @@
 ---
 name: swarm-architecture
-description: Use when you need to understand the swarm IPC subsystem — tables, routes, the per-target arbiter, the session→directory registry, and the wire envelope — before changing it
+description: Use when you need to understand the swarm IPC subsystem — tables, routes, the per-target arbiter, locality, the cross-machine relay through the worker, the session→directory registry, and the wire envelope — before changing it
 ---
 
 # Swarm IPC Architecture
@@ -31,6 +31,15 @@ It also gives us durable delivery, retry with backoff, replay via inbox, and an 
 | `packages/daemon/src/app.ts` | `POST /swarm/send`, `POST /swarm/schedule`, `GET /swarm/inbox` route blocks (flat `if`-style, mirrors existing routes) |
 | `packages/daemon/src/index.ts` | Boots arbiter conditionally on `opencodeClient && config.opencodeUrl` |
 | `packages/opencode-plugin/src/swarm-tool.ts` | `swarmRead()` helper + `createSwarmReadTool()` factory |
+| `packages/daemon/src/routing/locality.ts` | `makeLocalityResolver` — tri-state local / remote / unknown, read-only (see Arbiter → Locality) |
+| `packages/daemon/src/worker/relay-client.ts` | `RelayClient` — `POST /swarm/relay`, `/ack`, `/fail` to the worker; classifies answers by code; `relayPollHeader()` |
+| `packages/daemon/src/swarm/relay-receiver.ts` | `processRelayItems()` — validates, inserts and acks relay items from a poll; accepts failure items for rows this machine relayed |
+| `packages/daemon/src/swarm/relay-notice.ts` | `formatRelayFailureNotice()` / `formatRelayRefusalReason()` — sender-facing text rendered from a reason code only |
+| `packages/daemon/src/swarm/relay-fail-sender.ts` | `RelayFailSender` — reports late failures of relayed-in rows to the worker's `/swarm/relay/fail` (5s loop, backoff) |
+| `packages/daemon/src/storage/relay-inbound-repo.ts` | `swarm_relay_inbound` — "this `msg_id` arrived by relay" (hop rule, late-failure diversion, envelope `from_machine`) |
+| `packages/worker/src/relay.ts` | Worker side: `swarm_relay` / `machine_relay_accept` tables, relay/ack/fail routes, poll hand-out, hourly expiry. **Source of truth for the wire shapes** |
+| `packages/worker/src/remote-sessions.ts` | `GET /sessions/remote` for `swarm_list remote: true` |
+| `packages/opencode-plugin/src/swarm-list-tool.ts` | `swarm_list`, including `remote: true` (daemon `GET /swarm/remote-sessions`) |
 
 ## Storage Schema
 
@@ -78,6 +87,8 @@ Attributes:
 - `kind`, `from`, `to`, `msg_id`, `priority` — always present.
 - `channel` — present instead of `to` when message originated as a broadcast (v0.5).
 - `reply_to` — only present when set.
+- `scheduled_for` / `delivered_late_ms` / `ref` — scheduled rows only.
+- `from_machine` — only on a row that arrived by cross-machine relay (from `swarm_relay_inbound`). `from` is then a session on that machine. A reply to it is itself a cross-machine send, so it works only if *this* machine relays (`PIGEON_SWARM_RELAY_SEND=1`) and the sender's machine accepts from this one.
 
 The payload is XML-escaped for `&`, `<`, `>` (see `envelope.ts` for the exact encoder).
 
@@ -212,12 +223,121 @@ The inbox does **not** return `queued` or `failed` messages — it's an inbox, n
 | no 200 anywhere, at least one 404 | remote (all serves on a machine read one `opencode.db`, pinned by `OPENCODE_DB` + `OPENCODE_DISABLE_CHANNEL_DB`; requiring every base keeps one stray serve from failing a local session) |
 | anything else on every base | unknown |
 
-- **remote** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender (`formatRemoteFailureNotice`: NOT received, do not resend via swarm), `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
+- **remote, relay on** (`PIGEON_SWARM_RELAY_SEND=1`, a `ses_` sender, a target the worker's validator accepts, and the row did not itself arrive by relay) → relayed through the worker; see "Cross-Machine Relay" below.
+- **remote, otherwise** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender (`formatRemoteFailureNotice`: NOT received, do not resend via swarm), `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
 - **unknown** → `TargetUnavailableError` (outage class: retried; never a remote verdict).
 - Must precede `clientForSession`: for an id with no local row that path reaches `ensureRouted`, which writes a `session_assignment` + lease (the general unknown-id case is `pigeon-8dhq`).
 - Not cached; re-evaluated every attempt.
 
-Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~15min.
+## Cross-Machine Relay (pigeon-k0qn Phase 2)
+
+The machines cannot reach each other (every daemon binds loopback; there is no network link between all pairs), but every daemon already polls the worker. So the worker is the rendezvous. Contract: `docs/plans/2026-10-20-cross-machine-swarm-design.md` §3. Decisions it left open: `2026-10-22-worker-relay.md` (worker) and `2026-10-24-daemon-relay.md` (daemon). Wire shapes: `packages/worker/src/relay.ts`.
+
+**Both halves are off by default, independently, per machine:**
+
+| Env var (pigeon-daemon service) | Effect | Default |
+|---|---|---|
+| `PIGEON_SWARM_RELAY_SEND=1` | A remote target is relayed instead of failed | unset: the relay-off failure above |
+| `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` | Accept relayed messages from these machines (this machine's own id is dropped) | empty: receive nothing |
+
+The daemon logs `[relay] accept_from=<list|(none)> send=<on|off>` at boot only when at least one flag is set. No machine sets either flag yet. Enabling them, pairwise and receive side first, after an end-to-end check, is `pigeon-k0qn.11`. Prerequisites for any pair:
+
+- Both machines poll with a **per-machine worker key** (`pgk_…`). The relay routes answer the shared `CCR_API_KEY` with 401, and the poll hand-out and accept-set write run only for a machine principal.
+- The receiver is listed in the worker's `SHARED_KEY_REFUSED_MACHINES`. Until it is, a shared-key holder could re-register its sessions and collect their relays, so the worker answers `403 receiver_not_retired`.
+- The worker's D1 has the `swarm_relay` and `machine_relay_accept` tables. Without them, the routes answer `503 relay_unavailable` and the poll omits `swarm`.
+
+### Ownership routes it
+
+The worker sends a relay to the machine in D1 `sessions.machine_id` for the target. Every main session registers at `/session-start`, quiet ones included. The daemon reaper re-registers each live, unpinned session once the reaper's own record of its last refresh is 20h old: at most 100 per hourly cycle. That record is in memory, so every daemon restart refreshes everything again. If that refresh hears `409 owned_by_other_machine`, the reaper raises a plain alert, once per session per daemon lifetime. Subagents never register, so a relay to one answers `404 unknown_session`.
+
+### Send side (arbiter)
+
+On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label}` to `POST /swarm/relay`. A scheduled row is relayed at its `deliver_at`, because the arbiter only picks it up then. The answer is classified **by error code, never by status alone**: 403 and 409 each carry both kinds, and an unknown code from a newer worker is safer retried than made permanent.
+
+| Worker answer | Treatment |
+|---|---|
+| `202` (incl. `duplicate: true`) | `markRelayed`: `handed_off` + `verified_at` + `verify_family='relayed'` in one statement. The watchdog never examines it |
+| `404 unknown_session` | permanent. An id shaped like a truncation gets the incomplete-id notice instead |
+| `409 same_machine`, `403 sender_not_yours`, `400 invalid` | permanent, plus a loud `[swarm-arbiter] relay refused (<code>)` line: two of our own views disagree |
+| `403 receiver_not_retired`, `403 not_accepted`, `409 msg_id_conflict`, `410 expired` | permanent |
+| `503 target_offline`, `429 queue_full`, `503 relay_unavailable`, other 5xx, transport, `401` | `TargetUnavailableError`: the normal retry and attempt budget apply |
+
+Permanent answers become a `RelayRefusedError` and a `delivery.failed` worded by `formatRelayRefusalReason`. A wake or scheduled row also raises a `wake-permanent` alert. A cancel that lands during the POST loses: the row is stamped relayed from `cancelled`.
+
+**What `handed_off` means on the sender changes.** For a relayed row it means *the worker stored it*, not that the target saw it. It is verified at handoff, so a rolled-back daemon never examines it, and a transcript check against a remote id, which would 404 and wrongly say "safe to resend", never runs. The sender learns of a later failure only through a failure item.
+
+**Never relayed:** a row with a `swarm_relay_inbound` record (the **hop rule**: it fails with the Phase 1 remote failure, which is routed back to its original sender as below). Nor a `pigeon` or `gse_` sender, nor a target the worker's validator would reject (`ses_`/`gse_` plus at least 8 id characters). All of these keep the Phase 1 failure.
+
+### Worker
+
+- `swarm_relay`: primary key `(from_machine, msg_id)`, so two machines' reused caller-supplied ids cannot swallow each other. A same-key retry with the same `payload_sha256` (over `from`, `to`, `kind`, `reply_to`, `payload`) answers `202 duplicate`; a different hash answers `409 msg_id_conflict`.
+- `/swarm/relay` checks, in order: validate (`400 invalid`; includes a 64 KiB UTF-8 payload cap, which the sender is told as "will fail the same way" though a shorter payload would go); `expires_at` already past (`410 expired`); duplicate or conflict; `sender_not_yours`; owner (`unknown_session`); `same_machine`; `receiver_not_retired`; accept set (`not_accepted`), then the owner's last poll within 60s (`target_offline`); 50 queued for that machine (`queue_full`).
+- Expiry: the worker's deadline is the sender's `expires_at` capped at 24h, or 24h when null. An expired item becomes a failure item: `never_collected` if still queued, `unconfirmed` if leased. Leases last 60s, at most 5 leases per item; an item never acked within them expires as `unconfirmed`. Settled rows are deleted 7 days after creation.
+- Failure items (`msg_id` `f:<original>`) go to the original `from_machine` recorded on the row, never re-resolved through D1. They live 24h and are never answered: one that expires or is refused is logged and dropped.
+
+### Receive side (`processRelayItems`, inside `Poller.tick`)
+
+Every poll with a machine identity sends `X-Pigeon-Swarm-Relay: accept=<csv>; failures=1`. `failures=1` is sent always, so that turning sending off does not strand failure items already owed. Items are processed and acked **before** the same poll's command is dispatched, because a launch can block for longer than the 60s lease. A poll with items and no command is `200 {swarm: [...]}` with no `commandId`.
+
+Per message item, first refusal wins and is acked `refused` with the code. The worker then mints a failure item for the sender.
+
+1. `from_machine` not in `PIGEON_SWARM_RELAY_ACCEPT_FROM` → `not_accepted`. The worker checks this too; the daemon re-checks as defence in depth.
+2. Shape (`parseSwarmSendBody`, which rejects `from='pigeon'`, reserved kinds and the close tag; plus a `ses_` sender) → `invalid`.
+3. `msg_id` already known here: a re-handout after a lost ack (an inbound record with the same machine, sender, target and payload) is acked `delivered`. Anything else → `msg_id_conflict`.
+4. `from` is a session on this machine (a `sessions` row, or locality `local`, which covers subagents and reaped sessions) → `from_is_local`. Locality `unknown` passes, so a sick serve cannot hold relays hostage.
+5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`.
+6. Insert through `bankOrInsertSwarmMessage` with the original fields, plus the `swarm_relay_inbound` record, in one transaction. A `refused` result (`scheduled`, `payload_too_large`, `no_mailbox`, `no_session`) is acked with that code. A relayed message banked in a pull inbox gets a 5-day TTL (`RELAYED_PULL_TTL_MS`), not 7, so its expiry is still reportable while the worker remembers the row.
+
+An item whose processing throws is left unacked, so the worker offers it again (up to its 5 leases); a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its Telegram notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
+
+**Late failures go back through the worker.** `notifySenderOfFailure` is the one funnel for arbiter expiry, the attempt budget, permanent errors, watchdog terminals and pull-inbox expiry. For a `msg_id` with an inbound record, it does not insert a local `from='pigeon'` row, which would address a remote session. It stamps `fail_reason` on the record instead, once only. `RelayFailSender` then POSTs `/swarm/relay/fail` with backoff. Codes:
+
+- `unconfirmed_on_receiver`: the payload may have reached the target (`payloadLanded`: the transcript shows it, or with no transcript evidence the row was handed off; for a banked pull row, it was claimed).
+- `not_delivered_on_receiver`: it did not.
+- `not_on_receiver`: the hop rule.
+
+A `noop` (the worker has forgotten the row) or a 400/403 is final, and is logged as "its sender will not be told". Any other failure, 401 and 404 included, keeps retrying with backoff. Inbound records are pruned at 8 days, once their message is gone from both tables.
+
+### Failure items on the sender
+
+A failure item is accepted only if three things hold:
+
+- its `from_machine` is this machine;
+- the original row's `from` and `to` match the item's;
+- that row is `relayed` + `handed_off`, still `queued` (a 202 that was lost in transit), or already `failed` (a no-op).
+
+Anything else is acked `refused` (`no_matching_relay`), and the worker drops it. An accepted item fails the row, raises `wake-relay-failed` for a wake or scheduled row, and inserts the `delivery.failed`. Its text comes from `formatRelayFailureNotice`, rendered from the **reason code only**, never from text that crossed the wire:
+
+| Code | Sender is told |
+|---|---|
+| `never_collected`, `not_delivered_on_receiver` | NOT received; safe to resend |
+| `unconfirmed` | UNCONFIRMED; resend only if a duplicate is harmless |
+| `unconfirmed_on_receiver` | UNCONFIRMED; resend only if a duplicate is harmless |
+| `not_accepted`, `not_on_receiver`, `from_is_local`, `remote_not_accepted`, `msg_id_conflict`, `invalid`, `scheduled`, `payload_too_large`, `no_mailbox`, `no_session` | NOT received; do not resend via swarm, it will fail the same way |
+| anything else | named as a code, with the "will fail the same way" verb |
+
+### Discovery (`swarm_list remote: true`)
+
+- **Worker `GET /sessions/remote?limit=`**, machine credential only. "Other machines" means other than the caller's principal. It lists rows with a `ses_` id, `updated_at` within 7 days, and a machine id that passes validation, newest first. `limit` defaults to 100, capped at 500. Labels are untrusted text: control characters are replaced, the label is cut to 120 code points, and the plugin JSON-quotes it.
+- **Per machine,** `relay` is what `/swarm/relay` would answer for this caller now: `not_retired`, `not_accepted`, `offline`, or `available`. A missing `machine_relay_accept` table gives `unknown`. Both routes share `relayReachability`, so the two cannot drift.
+- **Daemon `GET /swarm/remote-sessions`** proxies the worker route (5s) and adds `relay_send`, this machine's own flag. Its errors: `503 no_worker`, `502 worker_error`, `502 worker_unreachable`.
+- **The plugin** renders a `SEEN` column. `updated_at` is bumped by the daily re-registration, so it means "still held", not "recently active".
+
+`available` is per machine. A pull session on an available machine can still refuse with `remote_not_accepted`.
+
+### Known limits (spec §7)
+
+- Latency is one poll interval (≤5s) plus round trips, and up to 60s after a receiver crash. Ordering across machines is best-effort.
+- `reply_to` is carried verbatim, but each side's `swarm_read` shows only its own half of a thread.
+- A session idle for more than 7 days is unregistered from D1, so relays to it fail with `unknown_session` while local sends still work. Another machine's credential can then claim it.
+- A sleeping Mac answers `target_offline`. Ordinary sends fail when their attempts run out; scheduled sends retry until they expire.
+- Fixed pull-lane ids stay with the first machine that registered them. A second machine gets `409 owned_by_other_machine`.
+- A relayed-in row stuck in one of the watchdog's non-terminal states reports nothing to its sender: blocked behind a turn, silent in flight, no healthy serve, or a 404 with no second opinion. The sender's row was already verified at handoff.
+- A failure more than 7 days after the relay is not reported, because the worker has forgotten the row.
+- An ambiguous relay can mislead. Suppose the worker stored a relay whose 202 was lost, every retry then hits a transient error, and the receiver never answers. The attempt budget then reports "NOT received, safe to resend" while the worker still holds the message.
+- Goose sessions are neither remote targets nor relaying senders (`pigeon-k0qn.13`). Channels are not relayed.
+
+Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~6.5min (2+5+15+6×60s between the 10 attempts). Outage-class failures (`TargetUnavailableError`, transport) on a row with `expires_at` are instead retried every 30s, uncounted, until expiry.
 
 **The race-fix property**: at most one `prompt_async` to the same target at any time. Proven both by integration test (`test/swarm-routes.integration.test.ts` — fires 4 concurrent POSTs and asserts no overlap via timestamps) and by live smoke (10 concurrent → arbiter events strictly 500ms apart, see `2026-04-21-swarm-ipc-plan.md` Task 12 results).
 
@@ -393,4 +513,5 @@ npm run --workspace @pigeon/daemon test
 Expected:
 
 - typecheck passes
-- swarm tests pass (`swarm-repo`, `swarm-envelope`, `swarm-registry`, `swarm-arbiter`, `swarm-routes`, `swarm-routes.integration`)
+- swarm tests pass (`swarm-repo`, `swarm-envelope`, `swarm-registry`, `swarm-arbiter`, `swarm-routes`, `swarm-routes.integration`, `swarm-arbiter-locality`, `swarm-relay`, `swarm-relay-e2e`, `swarm-remote-sessions-route`)
+- `swarm-relay-e2e` runs two daemons against the worker's real relay and poll handlers over a better-sqlite3 shim of D1 with the production `d1-schema.sql`; extend it rather than mocking the wire when changing the relay contract
