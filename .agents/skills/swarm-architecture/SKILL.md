@@ -240,7 +240,7 @@ The machines cannot reach each other (every daemon binds loopback; there is no n
 | `PIGEON_SWARM_RELAY_SEND=1` | A remote target is relayed instead of failed | unset: the relay-off failure above |
 | `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` | Accept relayed messages from these machines (this machine's own id is dropped) | empty: receive nothing |
 
-The daemon logs `[relay] accept_from=<list|(none)> send=<on|off>` at boot only when at least one flag is set. No machine sets either flag yet. Enabling them, pairwise and receive side first, after an end-to-end check, is `pigeon-k0qn.11`. Prerequisites for any pair:
+The daemon logs `[relay] accept_from=<list|(none)> send=<on|off>` at boot only when at least one flag is set. Since `pigeon-k0qn.11` (2026-10-29) cloudbox, devbox and macbook each set both, accepting from the other two. Prerequisites for any pair, including a machine added later (enable receive side first):
 
 - Both machines poll with a **per-machine worker key** (`pgk_…`). The relay routes answer the shared `CCR_API_KEY` with 401, and the poll hand-out and accept-set write run only for a machine principal.
 - The receiver is listed in the worker's `SHARED_KEY_REFUSED_MACHINES`. Until it is, a shared-key holder could re-register its sessions and collect their relays, so the worker answers `403 receiver_not_retired`.

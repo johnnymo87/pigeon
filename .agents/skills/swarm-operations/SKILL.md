@@ -188,7 +188,7 @@ The HTTP inbox only returns `handed_off`. Use the SQLite query to see all states
 
 ## Cross-Machine Relay
 
-Mechanics are in `swarm-architecture` → "Cross-Machine Relay". Both halves are off unless the `pigeon-daemon` service sets `PIGEON_SWARM_RELAY_SEND=1` (send) or `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` (receive). The env comes from the workstation repo's host configuration. No machine sets either yet; enabling them is `pigeon-k0qn.11`.
+Mechanics are in `swarm-architecture` → "Cross-Machine Relay". Both halves are off unless the `pigeon-daemon` service sets `PIGEON_SWARM_RELAY_SEND=1` (send) or `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` (receive). The env comes from the workstation repo's host configuration. Since `pigeon-k0qn.11` (2026-10-29) cloudbox, devbox and macbook each set both, accepting from the other two.
 
 ### Is it on here?
 
@@ -260,7 +260,7 @@ journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '1 hour ago' \
 
 ### Failure modes
 
-- **Every cross-machine send fails at once with "Cross-machine swarm delivery is not supported".** Sending is off here. Expected until `pigeon-k0qn.11`.
+- **Every cross-machine send fails at once with "Cross-machine swarm delivery is not supported".** Sending is off on this machine: check the flag (above). Expected on a machine that is not one of cloudbox, devbox, macbook.
 - **`delivery.failed` saying the owner "cannot receive cross-machine messages yet (it still accepts the shared worker key)".** That is `receiver_not_retired`: add the owner to the worker's `SHARED_KEY_REFUSED_MACHINES` (`docs/runbooks/per-machine-credentials.md`).
 - **"does not accept cross-machine messages from this machine".** That is `not_accepted`: the owner's `PIGEON_SWARM_RELAY_ACCEPT_FROM` lacks this machine, or its daemon is rolled back or polls without the header. The worker clears a machine's accept set on a header-less poll.
 - **"the worker has no machine registered for it".** That is `unknown_session`: the target never registered (a subagent), or its daemon unregistered it after 7 idle days.
