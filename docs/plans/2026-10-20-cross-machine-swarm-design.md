@@ -1,7 +1,12 @@
 # Cross-machine swarm messaging — design
 
-Status: proposed, 2026-10-20. Phase 1 approved to build; Phase 2 waits on a human decision
-(§0). Adversarially reviewed at plan time; the review's required changes are folded in.
+Status: proposed 2026-10-20. Phase 1 is built and deployed. Phase 2 was approved
+(`pigeon-k0qn.4`) and is built, but it ships dark: no machine sets `PIGEON_SWARM_RELAY_SEND` or
+`PIGEON_SWARM_RELAY_ACCEPT_FROM` until the end-to-end check and pairwise enablement
+(`pigeon-k0qn.11`, §8). Adversarially reviewed at plan time; the review's required changes are
+folded in. Sections stay worded as the design; where the build departed, the decision notes
+(`2026-10-22-worker-relay.md`, `2026-10-24-daemon-relay.md`, `2026-10-28-swarm-list-remote.md`)
+say so and this document was edited to match.
 Tracking: epic `pigeon-k0qn` in beads.
 
 ## Problem
@@ -294,6 +299,12 @@ adds no extra request.
 worker route listing sessions on *other* machines with `updated_at` in the last 7 days (D1 holds
 ~820 rows, many stale). Only main sessions are registered with the worker, which is the right set.
 
+**As built (`pigeon-k0qn.9`, `2026-10-28-swarm-list-remote.md`).** Worker `GET /sessions/remote`
+(machine credential only; `ses_` rows only; labels sanitised) also reports, per listed machine,
+what `POST /swarm/relay` would answer for the caller now (`available`, `not_accepted`,
+`not_retired`, `offline`, or `unknown` when the schema is missing). Daemon
+`GET /swarm/remote-sessions` proxies it and adds `relay_send`, this machine's own flag.
+
 ## §4. goose
 
 | | today, same machine | with Phase 2 |
@@ -535,7 +546,8 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
   unverified (`2026-10-24-daemon-relay.md`).
 - Failures more than 7 days after a relay are not reported: the worker has forgotten the row, so
   `/swarm/relay/fail` is a no-op. Relayed messages banked for pull sessions therefore expire
-  after 6 days rather than 7.
+  after 5 days rather than 7 (`RELAYED_PULL_TTL_MS`: the item may wait up to 24 h at the worker
+  before it is banked).
 - Goose sessions are neither remote targets nor relaying senders. `/swarm/send` refuses a
   `gse_` id with no local row, and the relay takes `ses_` senders only. `pigeon-k0qn.13` owns
   goose swarm targets.

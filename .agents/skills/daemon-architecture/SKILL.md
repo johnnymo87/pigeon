@@ -136,7 +136,7 @@ All are dispatched by the Poller's command-type callbacks. Acking is handled by 
 
 ## Swarm IPC
 
-Cross-session messaging between opencode sessions on the same machine, fixing the prompt_async race architecturally by making the daemon the single writer per target.
+Cross-session messaging between opencode sessions, fixing the prompt_async race architecturally by making the daemon the single writer per target. Delivery is local; a target on another machine is either failed fast or, where switched on, relayed through the worker (below).
 
 - `packages/daemon/src/storage/swarm-schema.ts` -- `swarm_messages` table + indexes
 - `packages/daemon/src/storage/swarm-repo.ts` -- `SwarmRepository`, exposed as `storage.swarm`
@@ -150,7 +150,9 @@ Boots conditionally on `opencodeClient && config.opencodeUrl` in `index.ts`. Wit
 
 The opencode-plugin exposes a companion tool (`swarm.read`) that calls `GET /swarm/inbox` on behalf of the calling session — see `opencode-plugin-architecture`.
 
-Senders use the plugin's `swarm_send` tool (the `pigeon-send` / `opencode-send` CLIs were removed in workstation `91d1a91`). Targets are same-machine only: a target on another machine fails on the first attempt with an owner-naming `delivery.failed` (`swarm-architecture`, Arbiter → Locality).
+Senders use the plugin's `swarm_send` tool (the `pigeon-send` / `opencode-send` CLIs were removed in workstation `91d1a91`). A target on another machine fails on the first attempt with an owner-naming `delivery.failed` (`swarm-architecture`, Arbiter → Locality), unless the cross-machine relay is on.
+
+**Cross-machine relay (pigeon-k0qn Phase 2), off by default.** `PIGEON_SWARM_RELAY_SEND=1` makes the arbiter POST a remote target's row to the worker (`worker/relay-client.ts`) instead of failing it. `PIGEON_SWARM_RELAY_ACCEPT_FROM=<machine,…>` makes the poller accept relayed messages from those machines. They arrive in the poll response's `swarm` array, and `swarm/relay-receiver.ts` inserts and acks them before that poll's command is dispatched. Late failures of relayed-in rows go back through `swarm/relay-fail-sender.ts`, and `storage/relay-inbound-repo.ts` records which rows arrived by relay. The poller also proxies `GET /sessions/remote` for daemon `GET /swarm/remote-sessions` (`swarm_list remote: true`). No machine sets either flag yet (`pigeon-k0qn.11`). Full mechanics: `swarm-architecture` → "Cross-Machine Relay"; ops: `swarm-operations`.
 
 Full details in the `swarm-architecture` skill (schema columns, route bodies, arbiter algorithm, race-fix proof).
 
@@ -197,7 +199,7 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
    - **Standard session**: calls `storage.swarm.insert(...)`, enqueues best-effort Telegram topic mirror notice (outbox `kind='swarm'`, `w:<msg_id>`), and returns HTTP 202 `{accepted: true, msg_id}` immediately.
 4. For standard sessions, background `SwarmArbiter` (500ms tick) finds ready messages: `storage.swarm.listTargetsWithReady(now)`.
 5. For each ready target (in parallel), `drainTarget` collapses concurrent calls onto a single in-flight promise (the at-most-one-in-flight invariant per target).
-6. Inside the per-target drain: pop one ready msg → `localityOf(target)` (remote → fail now, unknown → retry) → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
+6. Inside the per-target drain: pop one ready msg → `localityOf(target)` (remote → relay to the worker if `PIGEON_SWARM_RELAY_SEND=1` and the row is relayable, otherwise fail now; unknown → retry) → `registry.resolve(target)` (cached `sessionId → directory`) → `renderEnvelope(...)` → `opencodeClient.sendPrompt(target, directory, envelopeXml)` → `storage.swarm.markHandedOff(...)`.
 7. On failure: `storage.swarm.markRetry` with exponential backoff (or `markFailed` after MAX_ATTEMPTS=10).
 8. Receiver agent sees the next user-message turn as the `<swarm_message>` XML envelope. It can also call the `swarm.read` opencode tool to fetch its full inbox (`GET /swarm/inbox?session=<own-id>[&since=<msg_id>]`).
 
@@ -206,8 +208,9 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
 A background hourly timer (`session-reaper.ts`, started in `index.ts`) cleans up stale sessions:
 
 1. Lists sessions whose `last_seen` is older than `SESSION_TTL_MS` (1 week).
-2. For each: deletes from opencode serve (`deleteSession`), removes from local storage, unregisters from worker.
+2. For each: removes it from local storage and unregisters it from the worker. Its opencode transcript is kept: `index.ts` passes no `deleteSession`.
 3. Runs `cleanupExpired` for fully expired session records.
+4. **Ownership refresh (pigeon-k0qn.5).** Re-registers each live, unpinned session with the worker once its last registration is 20h old, at most 100 per cycle. This keeps D1 `sessions.machine_id`, which routes cross-machine relays, from going stale and being claimed by another machine. A `409 owned_by_other_machine` raises a plain alert, once per session per daemon lifetime. Pinned (topic-bound goose-acp) rows are re-registered every cycle instead.
 
 ### Dead Session Cleanup
 
