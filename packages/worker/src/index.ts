@@ -8,7 +8,7 @@ import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
-import { handleLaunchRelay, handleLaunchRelayAck } from "./remote-launch";
+import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
@@ -187,6 +187,12 @@ export default {
       if (relay.expired > 0) console.log("[relay] expiry", relay);
     } catch (err) {
       console.error("Relay expiry failed:", err);
+    }
+    try {
+      const launch = await runLaunchExpiry(env.DB);
+      if (launch.expired > 0) console.log("[remote-launch] expiry", launch);
+    } catch (err) {
+      console.error("Launch expiry failed:", err);
     }
     try {
       await sweepStaleSessions(env.DB);

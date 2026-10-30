@@ -74,12 +74,15 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `machine_credentials`: hashed per-machine keys (pigeon-k0qn.8)
 - `swarm_relay`: cross-machine swarm relay items, message and failure (pigeon-k0qn.5)
 - `machine_relay_accept`: which senders each machine accepts relays from, from its poll header
+- `remote_launch`: cross-machine remote launch items and result receipts (pigeon-k0qn.17)
+- `machine_launch_accept`: which machines a target accepts remote launches from, from its poll header
 
 ## Endpoint Contracts
 
 - `GET /health` -> `ok`
-- `GET /machines/:id/next` (Bearer) -> poll for next command (204 if none, JSON if available). With a machine credential and `X-Pigeon-Swarm-Relay: accept=<machine,...>; failures=1`, the response also carries `swarm: [...]` relay items (a 204 becomes `200 {swarm}`).
+- `GET /machines/:id/next` (Bearer) -> poll for next command (204 if none, JSON if available). With a machine credential and `X-Pigeon-Swarm-Relay: accept=<machine,...>; launch=<machine,...>; failures=1`, the response also carries `swarm: [...]` relay items and `launches: [...]` remote launch/result items (a 204 becomes `200 {swarm, launches}`).
 - `POST /swarm/relay`, `/swarm/relay/ack`, `/swarm/relay/fail` (machine credential only) -> cross-machine swarm relay. Contract: design §3.2 (`docs/plans/2026-10-20-cross-machine-swarm-design.md`), decisions `docs/plans/2026-10-22-worker-relay.md`.
+- `POST /launch/relay`, `/launch/relay/ack` (machine credential only) -> cross-machine remote launch queuing, leasing, and settling. Contract: design §2 (`docs/plans/2026-10-29-remote-launch-design.md`).
 - `POST /commands/:id/ack` (Bearer) -> acknowledge a command (mark done)
 - `GET /sessions` (Bearer) -> JSON list of session rows
 - `POST /sessions/register` (Bearer) -> upsert session
@@ -215,6 +218,16 @@ answer the user actually chose.
 - If a leased command is not acked within 60 seconds, it becomes available again (lease expires)
 - Hourly cron cleans up: acked commands older than 1 hour, stuck commands older than 24 hours
 
+## Remote Launch (pigeon-k0qn.17)
+
+Cross-machine remote session launching (`docs/plans/2026-10-29-remote-launch-design.md`).
+
+- **Routes:** `POST /launch/relay` (queue launch) and `POST /launch/relay/ack` (settle launch or result). Machine credentials only.
+- **Tables:** `remote_launch` (launches and result receipts) and `machine_launch_accept` (target's allowed requester list).
+- **Header token:** `X-Pigeon-Swarm-Relay: ...; launch=<machine,...>` configures target accept list.
+- **Poll hand-out:** `GET /machines/:id/next` returns at most 1 launch and up to 20 result rows in `launches: [...]`.
+- **Expiry:** 15-minute TTL. Expired while queued -> `never_collected` (refused result); while leased -> `unconfirmed`. Runs scoped to machine from the requester's and target's poll (`runLaunchExpiry`), with the hourly cron as a backstop. Late `launched` acks atomically correct expired rows. Retention: 7 days.
+
 ## Cron
 
 - Schedule: `0 * * * *` (hourly)
@@ -222,6 +235,8 @@ answer the user actually chose.
   - `cleanupExpiredMedia(env)` -- deletes R2 objects older than 24 hours
   - `cleanupCommands(env.DB)` -- deletes old acked and stuck commands from D1
   - `cleanupSeenUpdates(env.DB)` -- deletes old Telegram dedup entries from D1
+  - `runRelayExpiry(env.DB)` -- expires uncollected relays and prunes past retention
+  - `runLaunchExpiry(env.DB)` -- expires overdue remote launches and prunes past retention
 
 ## Future Improvement: Long Polling
 

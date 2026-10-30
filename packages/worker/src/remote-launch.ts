@@ -347,13 +347,136 @@ export type LaunchHandOut =
       reason: string | null;
     };
 
-/** Task 3 implements expiry; this stub satisfies Task 2's call site. */
+/**
+ * Expire overdue launch rows (minting refusal/unconfirmed results) and result rows,
+ * and prune rows past retention on unscoped runs.
+ *
+ * Scoped to machine on the poll path; unscoped on the hourly cron.
+ */
 export async function runLaunchExpiry(
-  _db: D1Database,
-  _now: number = Date.now(),
-  _opts: { machine?: string; limit?: number } = {},
+  db: D1Database,
+  now: number = Date.now(),
+  opts: { machine?: string; limit?: number } = {},
 ): Promise<{ expired: number; pruned: number }> {
-  return { expired: 0, pruned: 0 };
+  try {
+    const limit = opts.limit ?? 500;
+
+    // 1. Launch rows
+    let launchRows: RemoteLaunchRow[];
+    if (opts.machine) {
+      ({ results: launchRows } = await db
+        .prepare(
+          `SELECT * FROM remote_launch
+           WHERE item_kind = 'launch'
+             AND (from_machine = ? OR to_machine = ?)
+             AND status IN ('queued', 'leased')
+             AND (expires_at <= ? OR (status = 'leased' AND lease_count >= ? AND leased_at < ?))
+           LIMIT ?`,
+        )
+        .bind(opts.machine, opts.machine, now, LAUNCH_MAX_LEASES, now - LAUNCH_LEASE_MS, limit)
+        .all<RemoteLaunchRow>());
+    } else {
+      ({ results: launchRows } = await db
+        .prepare(
+          `SELECT * FROM remote_launch
+           WHERE item_kind = 'launch'
+             AND status IN ('queued', 'leased')
+             AND (expires_at <= ? OR (status = 'leased' AND lease_count >= ? AND leased_at < ?))
+           LIMIT ?`,
+        )
+        .bind(now, LAUNCH_MAX_LEASES, now - LAUNCH_LEASE_MS, limit)
+        .all<RemoteLaunchRow>());
+    }
+
+    let expired = 0;
+    for (const row of launchRows) {
+      const outcome = row.status === "queued" ? "refused" : "unconfirmed";
+      const reason = row.status === "queued" ? "never_collected" : "unconfirmed";
+      const insertStmt = resultInsert(
+        db,
+        row,
+        outcome,
+        null,
+        reason,
+        `r:${row.launch_id}`,
+        now,
+        [row.status],
+      );
+      const settleStmt = db
+        .prepare(
+          `UPDATE remote_launch SET status = 'expired', reason = ?, settled_at = ?
+           WHERE from_machine = ? AND launch_id = ? AND status = ?`,
+        )
+        .bind(reason, now, row.from_machine, row.launch_id, row.status);
+
+      const batchRes = await db.batch([insertStmt, settleStmt]);
+      if ((batchRes[1]?.meta.changes ?? 0) > 0) {
+        expired++;
+      }
+    }
+
+    // 2. Result rows
+    let resultRows: RemoteLaunchRow[];
+    if (opts.machine) {
+      ({ results: resultRows } = await db
+        .prepare(
+          `SELECT * FROM remote_launch
+           WHERE item_kind = 'result'
+             AND to_machine = ?
+             AND status IN ('queued', 'leased')
+             AND (expires_at <= ? OR (status = 'leased' AND lease_count >= ? AND leased_at < ?))
+           LIMIT ?`,
+        )
+        .bind(opts.machine, now, LAUNCH_RESULT_MAX_LEASES, now - LAUNCH_LEASE_MS, limit)
+        .all<RemoteLaunchRow>());
+    } else {
+      ({ results: resultRows } = await db
+        .prepare(
+          `SELECT * FROM remote_launch
+           WHERE item_kind = 'result'
+             AND status IN ('queued', 'leased')
+             AND (expires_at <= ? OR (status = 'leased' AND lease_count >= ? AND leased_at < ?))
+           LIMIT ?`,
+        )
+        .bind(now, LAUNCH_RESULT_MAX_LEASES, now - LAUNCH_LEASE_MS, limit)
+        .all<RemoteLaunchRow>());
+    }
+
+    for (const row of resultRows) {
+      const reason = row.status === "queued" ? "never_collected" : "unconfirmed";
+      const settle = await db
+        .prepare(
+          `UPDATE remote_launch SET status = 'expired', reason = ?, settled_at = ?
+           WHERE from_machine = ? AND launch_id = ? AND status = ?`,
+        )
+        .bind(reason, now, row.from_machine, row.launch_id, row.status)
+        .run();
+      if ((settle.meta.changes ?? 0) > 0) {
+        console.error("[remote-launch] result item expired uncollected; dropped", {
+          toMachine: row.to_machine,
+          resultId: row.launch_id,
+        });
+        expired++;
+      }
+    }
+
+    // 3. Retention (unscoped only)
+    let pruned = 0;
+    if (!opts.machine) {
+      const pruneRes = await db
+        .prepare(
+          "DELETE FROM remote_launch WHERE status NOT IN ('queued', 'leased') AND created_at < ?",
+        )
+        .bind(now - LAUNCH_RETENTION_MS)
+        .run();
+      pruned = pruneRes.meta.changes ?? 0;
+    }
+
+    return { expired, pruned };
+  } catch (err) {
+    if (isMissingTable(err)) return { expired: 0, pruned: 0 };
+    throw err;
+  }
 }
 
 /**

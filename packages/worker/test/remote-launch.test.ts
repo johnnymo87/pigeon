@@ -4,7 +4,7 @@
  * Test harness modeled on test/relay.test.ts. Machine ids are rl-a, rl-b, rl-c,
  * session ids ses_rl... so cleanup cannot touch relay tests.
  */
-import { env } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
 import worker from "../src/index";
@@ -17,6 +17,9 @@ import {
   LAUNCH_RATE_PER_HOUR,
   LAUNCH_LEASE_MS,
   LAUNCH_MAX_LEASES,
+  LAUNCH_RETENTION_MS,
+  LAUNCH_RESULT_MAX_LEASES,
+  runLaunchExpiry,
   processLaunchAckItem,
   type RemoteLaunchRow,
 } from "../src/remote-launch";
@@ -1229,3 +1232,323 @@ describe("POST /launch/relay/ack", () => {
     expect(bodyJson.session_id).toBe("ses_rlRacedFallback01");
   });
 });
+
+describe("runLaunchExpiry", () => {
+  it("queued launch past expiry -> expired/never_collected; A's next poll gets launch_result refused never_collected (B never polls again)", async () => {
+    await launch(KEY_A, { launch_id: "launch_exp_01" });
+    const now = Date.now();
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_exp_01")
+      .run();
+
+    // B NEVER polls. A polls with failures=1.
+    const pollA = await poll(KEY_A, A, "failures=1");
+    expect(pollA.status).toBe(200);
+    const body = (await pollA.json()) as { launches: Array<{ result_id: string; outcome: string; reason: string; session_id: string | null; launch_id: string }> };
+    expect(body.launches).toHaveLength(1);
+    expect(body.launches[0]).toMatchObject({
+      item: "launch_result",
+      from_machine: A,
+      result_id: "r:launch_exp_01",
+      launch_id: "launch_exp_01",
+      machine: B,
+      outcome: "refused",
+      session_id: null,
+      reason: "never_collected",
+    });
+
+    const lRow = await row(A, "launch_exp_01");
+    expect(lRow!.status).toBe("expired");
+    expect(lRow!.reason).toBe("never_collected");
+  });
+
+  it("leased launch past expiry -> result outcome unconfirmed, session_id null, launch row expired/unconfirmed", async () => {
+    await launch(KEY_A, { launch_id: "launch_exp_02" });
+    // B polls to lease it
+    const pollB = await poll(KEY_B, B, `launch=${A}`);
+    expect(pollB.status).toBe(200);
+
+    const now = Date.now();
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_exp_02")
+      .run();
+
+    // A polls with failures=1 (which runs expiry on A)
+    const pollA = await poll(KEY_A, A, "failures=1");
+    expect(pollA.status).toBe(200);
+    const body = (await pollA.json()) as { launches: Array<{ result_id: string; outcome: string; reason: string; session_id: string | null; launch_id: string }> };
+    expect(body.launches).toHaveLength(1);
+    expect(body.launches[0]).toMatchObject({
+      item: "launch_result",
+      from_machine: A,
+      result_id: "r:launch_exp_02",
+      launch_id: "launch_exp_02",
+      machine: B,
+      outcome: "unconfirmed",
+      session_id: null,
+      reason: "unconfirmed",
+    });
+
+    const lRow = await row(A, "launch_exp_02");
+    expect(lRow!.status).toBe("expired");
+    expect(lRow!.reason).toBe("unconfirmed");
+    expect(lRow!.session_id).toBeNull();
+  });
+
+  it("leased 3 times and lapsed (lease_count=3, leased_at old) -> expired unconfirmed before its TTL", async () => {
+    await launch(KEY_A, { launch_id: "launch_exp_03" });
+    const now = Date.now();
+    // leased 3 times, leased_at lapsed, but expires_at is in the future
+    await env.DB.prepare(
+      `UPDATE remote_launch
+       SET status = 'leased', lease_count = ?, leased_at = ?, expires_at = ?
+       WHERE from_machine = ? AND launch_id = ?`,
+    )
+      .bind(LAUNCH_MAX_LEASES, now - LAUNCH_LEASE_MS - 5000, now + LAUNCH_TTL_MS, A, "launch_exp_03")
+      .run();
+
+    const res = await runLaunchExpiry(env.DB, now, { machine: A });
+    expect(res.expired).toBe(1);
+
+    const lRow = await row(A, "launch_exp_03");
+    expect(lRow!.status).toBe("expired");
+    expect(lRow!.reason).toBe("unconfirmed");
+
+    const rRow = await row(A, "r:launch_exp_03");
+    expect(rRow).not.toBeNull();
+    expect(rRow!.status).toBe("queued");
+    const rBody = JSON.parse(String(rRow!.body_json));
+    expect(rBody).toMatchObject({
+      launch_id: "launch_exp_03",
+      machine: B,
+      outcome: "unconfirmed",
+      session_id: null,
+      reason: "unconfirmed",
+    });
+  });
+
+  it("late launched ack after queued expiry -> correction: row launched with session id, A gets launched result", async () => {
+    // 1. Queued launch expires via runLaunchExpiry / requester poll
+    await launch(KEY_A, { launch_id: "launch_exp_04" });
+    const now = Date.now();
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_exp_04")
+      .run();
+
+    await runLaunchExpiry(env.DB, now, { machine: A });
+    const lRowExpired = await row(A, "launch_exp_04");
+    expect(lRowExpired!.status).toBe("expired");
+    expect(lRowExpired!.reason).toBe("never_collected");
+
+    // Late launched ack from B while r:<id> is still queued
+    const ackRes = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_exp_04",
+        outcome: "launched",
+        session_id: "ses_rlLateOk04",
+      },
+    ]);
+    expect(ackRes.status).toBe(200);
+
+    const lRowCorrected = await row(A, "launch_exp_04");
+    expect(lRowCorrected!.status).toBe("launched");
+    expect(lRowCorrected!.session_id).toBe("ses_rlLateOk04");
+
+    // A polls and receives the corrected result in place
+    const pollA = await poll(KEY_A, A, `accept=${B}; failures=1`);
+    expect(pollA.status).toBe(200);
+    const body = (await pollA.json()) as { launches: Array<{ result_id: string; outcome: string; session_id: string | null }> };
+    expect(body.launches).toHaveLength(1);
+    expect(body.launches[0]).toMatchObject({
+      result_id: "r:launch_exp_04",
+      outcome: "launched",
+      session_id: "ses_rlLateOk04",
+    });
+
+    // 2. Also test when r:<id> was already leased before late ack arrives
+    const lRes2 = await launch(KEY_A, { launch_id: "launch_exp_04b" });
+    expect(lRes2.status).toBe(202);
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_exp_04b")
+      .run();
+    await runLaunchExpiry(env.DB, now, { machine: A });
+    // A leases r:launch_exp_04b
+    const pollA2 = await poll(KEY_A, A, `accept=${B}; failures=1`);
+    expect(pollA2.status).toBe(200);
+
+    // Late ack from B arrives after r:launch_exp_04b is leased
+    const ackRes2 = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_exp_04b",
+        outcome: "launched",
+        session_id: "ses_rlLateOk04b",
+      },
+    ]);
+    expect(ackRes2.status).toBe(200);
+
+    // New result row minted r:<id>:launched
+    const rNew = await row(A, "r:launch_exp_04b:launched");
+    expect(rNew).not.toBeNull();
+    expect(rNew!.status).toBe("queued");
+    const rNewBody = JSON.parse(String(rNew!.body_json));
+    expect(rNewBody).toMatchObject({
+      outcome: "launched",
+      session_id: "ses_rlLateOk04b",
+    });
+  });
+
+  it("scoped run for machine C touches nothing of A->B", async () => {
+    await launch(KEY_A, { launch_id: "launch_exp_05" });
+    const now = Date.now();
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_exp_05")
+      .run();
+
+    // Run expiry scoped to C
+    const res = await runLaunchExpiry(env.DB, now, { machine: C });
+    expect(res.expired).toBe(0);
+
+    // A->B launch row is untouched
+    const lRow = await row(A, "launch_exp_05");
+    expect(lRow!.status).toBe("queued");
+    const rRow = await row(A, "r:launch_exp_05");
+    expect(rRow).toBeNull();
+  });
+
+  it("retention prunes settled rows older than 7 days (cron/unscoped only); queued rows never pruned; scoped runs never prune", async () => {
+    const now = Date.now();
+    const oldTime = now - LAUNCH_RETENTION_MS - 10_000;
+
+    // 1. Settled launch row older than 7 days
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at, settled_at)
+       VALUES (?, 'launch_old_settled', 'launch', ?, ?, '{}', '', 'launched', 1, ?, ?, ?)`,
+    )
+      .bind(A, B, SENDER, oldTime, oldTime + LAUNCH_TTL_MS, oldTime + 1000)
+      .run();
+
+    // 2. Queued launch row older than 7 days (must NOT be pruned by retention)
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'launch_old_queued', 'launch', ?, ?, '{}', '', 'queued', 0, ?, ?)`,
+    )
+      .bind(A, B, SENDER, oldTime, now + 100_000)
+      .run();
+
+    // 3. Settled result row older than 7 days
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at, settled_at)
+       VALUES (?, 'r:result_old_settled', 'result', ?, ?, '{}', '', 'delivered', 1, ?, ?, ?)`,
+    )
+      .bind(A, A, SENDER, oldTime, oldTime + 86400000, oldTime + 1000)
+      .run();
+
+    // 4. Settled row recently created (must NOT be pruned)
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at, settled_at)
+       VALUES (?, 'launch_recent_settled', 'launch', ?, ?, '{}', '', 'launched', 1, ?, ?, ?)`,
+    )
+      .bind(A, B, SENDER, now, now + LAUNCH_TTL_MS, now)
+      .run();
+
+    // A scoped run must NEVER prune anything
+    const scopedRes = await runLaunchExpiry(env.DB, now, { machine: A });
+    expect(scopedRes.pruned).toBe(0);
+    expect(await row(A, "launch_old_settled")).not.toBeNull();
+
+    // Unscoped run (cron) prunes settled rows older than 7 days
+    const unscopedRes = await runLaunchExpiry(env.DB, now);
+    expect(unscopedRes.pruned).toBe(2); // launch_old_settled and r:result_old_settled
+    expect(await row(A, "launch_old_settled")).toBeNull();
+    expect(await row(A, "r:result_old_settled")).toBeNull();
+    expect(await row(A, "launch_old_queued")).not.toBeNull();
+    expect(await row(A, "launch_recent_settled")).not.toBeNull();
+  });
+
+  it("result row past its expiry -> expired, not handed out", async () => {
+    const now = Date.now();
+    // 1. Queued result row past expires_at
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:exp_res_01', 'result', ?, ?, ?, '', 'queued', 0, ?, ?)`,
+    )
+      .bind(
+        A,
+        A,
+        SENDER,
+        JSON.stringify({ launch_id: "exp_res_01", machine: B, outcome: "refused", session_id: null, reason: "never_collected" }),
+        now - 2000,
+        now - 1000,
+      )
+      .run();
+
+    // 2. Leased result row hitting max leases and lapsed
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, leased_at, expires_at)
+       VALUES (?, 'r:exp_res_02', 'result', ?, ?, ?, '', 'leased', ?, ?, ?, ?)`,
+    )
+      .bind(
+        A,
+        A,
+        SENDER,
+        JSON.stringify({ launch_id: "exp_res_02", machine: B, outcome: "launched", session_id: "ses_foo", reason: null }),
+        LAUNCH_RESULT_MAX_LEASES,
+        now - 2000,
+        now - LAUNCH_LEASE_MS - 5000,
+        now + 100_000,
+      )
+      .run();
+
+    const res = await runLaunchExpiry(env.DB, now, { machine: A });
+    expect(res.expired).toBe(2);
+
+    const r1 = await row(A, "r:exp_res_01");
+    expect(r1!.status).toBe("expired");
+    const r2 = await row(A, "r:exp_res_02");
+    expect(r2!.status).toBe("expired");
+
+    // A polls with failures=1 -> neither expired result row is handed out
+    const pollA = await poll(KEY_A, A, "failures=1");
+    expect(pollA.status).toBe(204);
+  });
+
+  it("the cron calls runLaunchExpiry via worker.scheduled", async () => {
+    await launch(KEY_A, { launch_id: "launch_cron_01" });
+    const now = Date.now();
+    await env.DB.prepare("UPDATE remote_launch SET expires_at = ? WHERE from_machine = ? AND launch_id = ?")
+      .bind(now - 1000, A, "launch_cron_01")
+      .run();
+
+    const ctx = createExecutionContext();
+    await worker.scheduled(
+      { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    const lRow = await row(A, "launch_cron_01");
+    expect(lRow!.status).toBe("expired");
+    expect(lRow!.reason).toBe("never_collected");
+    const rRow = await row(A, "r:launch_cron_01");
+    expect(rRow).not.toBeNull();
+    expect(rRow!.status).toBe("queued");
+  });
+
+  it("missing table returns { expired: 0, pruned: 0 } without throwing", async () => {
+    await env.DB.prepare("DROP TABLE remote_launch").run();
+    try {
+      const res = await runLaunchExpiry(env.DB);
+      expect(res).toEqual({ expired: 0, pruned: 0 });
+    } finally {
+      for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
+        await env.DB.prepare(statement).run();
+      }
+    }
+  });
+});
+
