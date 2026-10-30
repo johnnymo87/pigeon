@@ -1,6 +1,6 @@
 # Remote launch — design
 
-Status: proposed 2026-10-29, not built. Adversarially reviewed the same day; its fixes are folded in. Bead `pigeon-k0qn.17`, epic `pigeon-k0qn`.
+Status: approved for build 2026-10-29 (adversarial reviewer buy-in after two rounds; fixes folded in, the second round's in §9). Bead `pigeon-k0qn.17`, epic `pigeon-k0qn`.
 
 ## Problem
 
@@ -152,8 +152,9 @@ A separate table, handed out in batches on the poll like relay items, avoids all
   - a `sendPrompt` **timeout** is `unconfirmed` with the session id (`prompt_async` does not dedup,
     and a timeout may mean processed). Only a clear 4xx or connection refusal is `refused`, and then
     the orphan session is deleted best-effort.
-- **Deadline.** The whole launch runs under ~45 s (health check, create, prompt; each already 30 s
-  bounded) so B keeps polling. A launch past it is acked `unconfirmed` with whatever id it has.
+- **Step budgets, not a wall-clock deadline.** Health check 5 s, create 15 s, prompt 20 s (40 s in
+  all, under one lease), passed as per-call timeouts so a step's own timeout always ends the launch
+  and nothing is still running after the ack. `oc-tags set` and the notice run off the tick.
 - **Telegram on B.** After the ack, a notice is enqueued on the durable alerts queue
   (`storage.alerts.enqueue`, drained by `swarm/alert-drainer.ts`) rather than sent directly: a direct
   send fails silently with no bot token (`index.ts:350`) and has no timeout. It goes to B's own chat
@@ -231,3 +232,28 @@ three PRs.
    `PIGEON_REMOTE_LAUNCH_SEND=1`. Precondition: the relay is on in both directions (§2 step 7).
 4. Rollback for one machine: drop its two lines and rebuild. Queued launches for it expire as
    `never_collected`; A's outbound deadlines cover a worker rollback.
+
+## §9. Second review round: binding notes for the plan
+
+1. **Corrective results.** The relay's failure insert is `ON CONFLICT DO NOTHING` (`relay.ts:362`),
+   so a correction cannot reuse `r:<launch_id>`. While the first result row is still `queued`,
+   update it in place; once collected, mint `r:<launch_id>:<outcome>`. A dedups results by result-row
+   id, not `launch_id`, and keeps the outbound row after minting its own deadline `unconfirmed`, so
+   a late real result still matches. (A correction is B's ack of the launch row, so "result items
+   are never answered" still holds.)
+2. **Step budgets** as in §3 (5/15/20 s). If a hard deadline is ever added that does not abort the
+   step, B's inbound outcome may only move `unconfirmed` → `launched`/`refused`, followed by a re-ack.
+3. **Return path on B.** The worker cannot see B's `PIGEON_SWARM_RELAY_SEND` (`relay.ts:206-228`),
+   so B itself refuses a launch item with `no_return_path` when its own relay send is off. Flags
+   that change after the request only lose the launched session's report-back; the launch result
+   still reaches A. The skill says so.
+4. **Status enum.** B's `unconfirmed` ack settles the row as `expired` with reason `unconfirmed`. A
+   late `launched` or `refused` ack may correct an `expired`/`unconfirmed` row (never the reverse).
+5. **Notifier.** The alerts drainer exists only with both `telegramBotToken` and `telegramChatId`
+   (`index.ts:820,864`). Advertise `launch=` only when it exists. Notice `refMsgId` is
+   `rl:<from_machine>:<launch_id>`, so the unique index (`alert-repo.ts:91`) stops a re-handout
+   posting twice.
+6. **Retry classification on A** is by worker error code, not status: `503 target_offline` and
+   `launch_unavailable` are definite refusals. When the daemon's background retry gets a definite
+   refusal after the tool answered `pending`, A mints a local refused `launch.result` at once rather
+   than waiting for the deadline.
