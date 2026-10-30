@@ -27,6 +27,7 @@ import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./not
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
+import type { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { tokenFingerprint } from "./adapters/direct-channel";
@@ -372,6 +373,12 @@ interface AppOptions {
   remoteSessionsTimeoutMs?: number;
   /** `PIGEON_SWARM_RELAY_SEND=1`: reported by `/swarm/remote-sessions` as `relay_send`. */
   swarmRelaySend?: boolean;
+  /**
+   * The remote launch requester (pigeon-k0qn.17) for `POST /swarm/launch`.
+   * Absent on a host with no worker connection or when remote launch is not configured;
+   * the route then answers 503 `no_worker`.
+   */
+  remoteLaunch?: RemoteLaunchRequester;
 }
 
 /** Bound on the worker call behind `GET /swarm/remote-sessions`. An agent is waiting on it. */
@@ -918,6 +925,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           });
         }
         return new Response(null, { status: 204 });
+      }
+
+      if (request.method === "POST" && url.pathname === "/swarm/launch") {
+        if (!opts.remoteLaunch) {
+          return Response.json({ error: "no_worker" }, { status: 503 });
+        }
+        const body = await readJsonBody(request);
+        const result = await opts.remoteLaunch.handleRequest(body);
+        return Response.json(result.body, { status: result.status });
       }
 
       if (request.method === "POST" && url.pathname === "/swarm/send") {
