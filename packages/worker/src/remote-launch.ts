@@ -367,8 +367,8 @@ export async function handOutLaunchItems(
   headerValue: string | null,
   now: number = Date.now(),
 ): Promise<LaunchHandOut[]> {
-  const header = parseRelayHeader(headerValue);
   try {
+    const header = parseRelayHeader(headerValue);
     if (header === null) {
       await db
         .prepare("UPDATE machine_launch_accept SET accept_csv = '', updated_at = ? WHERE machine_id = ? AND accept_csv <> ''")
@@ -423,22 +423,30 @@ export async function handOutLaunchItems(
 
       const sortedLaunches = [...launchRows].sort((a, b) => a.created_at - b.created_at || a.launch_id.localeCompare(b.launch_id));
       for (const r of sortedLaunches) {
-        const body = JSON.parse(r.body_json) as {
-          from: string;
-          directory: string;
-          prompt: string;
-          tag: string | null;
-        };
-        launchItems.push({
-          item: "launch",
-          from_machine: r.from_machine,
-          launch_id: r.launch_id,
-          from: body.from,
-          directory: body.directory,
-          prompt: body.prompt,
-          tag: body.tag ?? null,
-          expires_at: r.expires_at,
-        });
+        try {
+          const body = JSON.parse(r.body_json) as {
+            from: string;
+            directory: string;
+            prompt: string;
+            tag: string | null;
+          };
+          launchItems.push({
+            item: "launch",
+            from_machine: r.from_machine,
+            launch_id: r.launch_id,
+            from: body.from,
+            directory: body.directory,
+            prompt: body.prompt,
+            tag: body.tag ?? null,
+            expires_at: r.expires_at,
+          });
+        } catch (err) {
+          console.error("[remote-launch] corrupt launch row body_json; skipping", {
+            fromMachine: r.from_machine,
+            launchId: r.launch_id,
+            error: String(err),
+          });
+        }
       }
     }
 
@@ -473,23 +481,31 @@ export async function handOutLaunchItems(
 
       const sortedResults = [...resultRows].sort((a, b) => a.created_at - b.created_at || a.launch_id.localeCompare(b.launch_id));
       for (const r of sortedResults) {
-        const body = JSON.parse(r.body_json) as {
-          launch_id: string;
-          machine: string;
-          outcome: "launched" | "refused" | "unconfirmed";
-          session_id: string | null;
-          reason: string | null;
-        };
-        resultItems.push({
-          item: "launch_result",
-          from_machine: r.from_machine,
-          result_id: r.launch_id,
-          launch_id: body.launch_id,
-          machine: body.machine,
-          outcome: body.outcome,
-          session_id: body.session_id ?? null,
-          reason: body.reason ?? null,
-        });
+        try {
+          const body = JSON.parse(r.body_json) as {
+            launch_id: string;
+            machine: string;
+            outcome: "launched" | "refused" | "unconfirmed";
+            session_id: string | null;
+            reason: string | null;
+          };
+          resultItems.push({
+            item: "launch_result",
+            from_machine: r.from_machine,
+            result_id: r.launch_id,
+            launch_id: body.launch_id,
+            machine: body.machine,
+            outcome: body.outcome,
+            session_id: body.session_id ?? null,
+            reason: body.reason ?? null,
+          });
+        } catch (err) {
+          console.error("[remote-launch] corrupt result row body_json; skipping", {
+            fromMachine: r.from_machine,
+            resultId: r.launch_id,
+            error: String(err),
+          });
+        }
       }
     }
 
@@ -546,6 +562,109 @@ function resultInsert(
     );
 }
 
+function correctionBatch(
+  db: D1Database,
+  row: RemoteLaunchRow,
+  outcome: "launched" | "refused" | "unconfirmed",
+  sessionId: string | null,
+  reason: string | null,
+  now: number,
+  principalMachineId: string,
+): D1PreparedStatement[] {
+  const newBody = JSON.stringify({
+    launch_id: row.launch_id,
+    machine: row.to_machine,
+    outcome,
+    session_id: sessionId,
+    reason: reason ?? (outcome === "unconfirmed" ? "unconfirmed" : null),
+  });
+
+  let stmt1: D1PreparedStatement;
+  let correctedStateClause: string;
+  let correctedStateParams: unknown[];
+
+  if (outcome === "launched") {
+    stmt1 = db
+      .prepare(
+        `UPDATE remote_launch SET status = 'launched', session_id = ?, reason = NULL, settled_at = ?
+         WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
+      )
+      .bind(sessionId!, now, row.from_machine, row.launch_id, principalMachineId);
+    correctedStateClause = "status = 'launched' AND session_id = ? AND reason IS NULL";
+    correctedStateParams = [sessionId!];
+  } else if (outcome === "refused") {
+    stmt1 = db
+      .prepare(
+        `UPDATE remote_launch SET status = 'refused', session_id = NULL, reason = ?, settled_at = ?
+         WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
+      )
+      .bind(reason!, now, row.from_machine, row.launch_id, principalMachineId);
+    correctedStateClause = "status = 'refused' AND session_id IS NULL AND reason = ?";
+    correctedStateParams = [reason!];
+  } else {
+    // unconfirmed with sessionId
+    stmt1 = db
+      .prepare(
+        `UPDATE remote_launch SET session_id = ?, settled_at = ?
+         WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired' AND session_id IS NULL`,
+      )
+      .bind(sessionId!, now, row.from_machine, row.launch_id, principalMachineId);
+    correctedStateClause = "status = 'expired' AND reason = 'unconfirmed' AND session_id = ?";
+    correctedStateParams = [sessionId!];
+  }
+
+  const stmt2 = db
+    .prepare(
+      `UPDATE remote_launch SET body_json = ?
+       WHERE from_machine = ? AND launch_id = ? AND status = 'queued'
+         AND EXISTS (
+           SELECT 1 FROM remote_launch
+           WHERE from_machine = ? AND launch_id = ? AND item_kind = 'launch' AND ${correctedStateClause}
+         )`,
+    )
+    .bind(
+      newBody,
+      row.from_machine,
+      `r:${row.launch_id}`,
+      row.from_machine,
+      row.launch_id,
+      ...correctedStateParams,
+    );
+
+  const stmt3 = db
+    .prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session,
+                                  body_json, body_sha256, status, lease_count, created_at, expires_at)
+       SELECT ?, ?, 'result', ?, ?, ?, '', 'queued', 0, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM remote_launch
+         WHERE from_machine = ? AND launch_id = ? AND item_kind = 'launch' AND ${correctedStateClause}
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM remote_launch
+         WHERE from_machine = ? AND launch_id = ? AND body_json = ?
+       )
+       ON CONFLICT (from_machine, launch_id) DO NOTHING`,
+    )
+    .bind(
+      row.from_machine,
+      `r:${row.launch_id}:${outcome}`,
+      row.from_machine,
+      row.from_session,
+      newBody,
+      now,
+      now + LAUNCH_RESULT_TTL_MS,
+      row.from_machine,
+      row.launch_id,
+      ...correctedStateParams,
+      row.from_machine,
+      `r:${row.launch_id}`,
+      newBody,
+    );
+
+  return [stmt1, stmt2, stmt3];
+}
+
 export type LaunchAckItem =
   | {
       kind: "launch";
@@ -562,6 +681,137 @@ export type LaunchAckItem =
       outcome: "delivered" | "refused";
       reason?: string;
     };
+
+export type ProcessAckResult =
+  | { kind: "launch"; from_machine: string; launch_id: string; result: "ok" | "not_found" | "not_yours" }
+  | { kind: "result"; from_machine: string; result_id: string; result: "ok" | "not_found" | "not_yours" };
+
+export async function processLaunchAckItem(
+  db: D1Database,
+  principalMachineId: string,
+  it: LaunchAckItem,
+  now: number,
+  rowOverride?: RemoteLaunchRow,
+): Promise<ProcessAckResult> {
+  if (it.kind === "result") {
+    const row = rowOverride ?? (await getLaunchRow(db, it.from_machine, it.result_id));
+    if (!row || row.item_kind !== "result") {
+      return { kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_found" };
+    }
+    if (row.to_machine !== principalMachineId) {
+      return { kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_yours" };
+    }
+
+    await db
+      .prepare(
+        `UPDATE remote_launch SET status = ?, reason = ?, settled_at = ?
+         WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
+      )
+      .bind(it.outcome, it.reason ?? null, now, row.from_machine, row.launch_id, principalMachineId)
+      .run();
+
+    if (it.outcome === "refused") {
+      console.error("[remote-launch] result item refused by its receiver; dropped", {
+        fromMachine: row.from_machine,
+        resultId: row.launch_id,
+        reason: it.reason,
+      });
+    }
+    return { kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "ok" };
+  }
+
+  // it.kind === "launch"
+  const row = rowOverride ?? (await getLaunchRow(db, it.from_machine, it.launch_id));
+  if (!row || row.item_kind !== "launch") {
+    return { kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_found" };
+  }
+  if (row.to_machine !== principalMachineId) {
+    return { kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_yours" };
+  }
+
+  if (row.status === "queued" || row.status === "leased") {
+    let settleStatus: string;
+    let sessionId: string | null = null;
+    let reason: string | null = null;
+    if (it.outcome === "launched") {
+      settleStatus = "launched";
+      sessionId = it.session_id!;
+    } else if (it.outcome === "refused") {
+      settleStatus = "refused";
+      reason = it.reason!;
+    } else {
+      settleStatus = "expired";
+      reason = "unconfirmed";
+      sessionId = it.session_id ?? null;
+    }
+
+    const insertStmt = resultInsert(
+      db,
+      row,
+      it.outcome,
+      it.session_id ?? null,
+      it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
+      `r:${row.launch_id}`,
+      now,
+      ["queued", "leased"],
+    );
+    const settleStmt = db
+      .prepare(
+        `UPDATE remote_launch SET status = ?, session_id = ?, reason = ?, settled_at = ?
+         WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
+      )
+      .bind(settleStatus, sessionId, reason, now, row.from_machine, row.launch_id, principalMachineId);
+
+    const batchRes = await db.batch([insertStmt, settleStmt]);
+    const settleResult = batchRes[1];
+    if ((settleResult?.meta.changes ?? 0) === 0) {
+      // Race: between getLaunchRow and db.batch, the row was settled (e.g. expired).
+      const freshRow = await getLaunchRow(db, it.from_machine, it.launch_id);
+      if (freshRow && freshRow.status === "expired") {
+        const isAllowed =
+          it.outcome === "launched" ||
+          it.outcome === "refused" ||
+          (it.outcome === "unconfirmed" && Boolean(it.session_id) && freshRow.session_id === null);
+        if (isAllowed) {
+          await db.batch(
+            correctionBatch(
+              db,
+              freshRow,
+              it.outcome,
+              it.session_id ?? null,
+              it.reason ?? null,
+              now,
+              principalMachineId,
+            ),
+          );
+        }
+      }
+    }
+  } else if (row.status === "expired") {
+    // CORRECTION
+    const isAllowed =
+      it.outcome === "launched" ||
+      it.outcome === "refused" ||
+      (it.outcome === "unconfirmed" && Boolean(it.session_id) && row.session_id === null);
+
+    if (isAllowed) {
+      await db.batch(
+        correctionBatch(
+          db,
+          row,
+          it.outcome,
+          it.session_id ?? null,
+          it.reason ?? null,
+          now,
+          principalMachineId,
+        ),
+      );
+    }
+  }
+  // status launched/refused -> no-op (never reverse)
+
+  return { kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "ok" };
+}
 
 /**
  * `POST /launch/relay/ack`: machine key only.
@@ -647,164 +897,10 @@ export async function handleLaunchRelayAck(
   }
 
   return tolerant(async () => {
-    type AckResult =
-      | { kind: "launch"; from_machine: string; launch_id: string; result: "ok" | "not_found" | "not_yours" }
-      | { kind: "result"; from_machine: string; result_id: string; result: "ok" | "not_found" | "not_yours" };
-    const results: AckResult[] = [];
-
+    const results: ProcessAckResult[] = [];
     for (const it of parsed) {
-      if (it.kind === "result") {
-        const row = await getLaunchRow(db, it.from_machine, it.result_id);
-        if (!row || row.item_kind !== "result") {
-          results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_found" });
-          continue;
-        }
-        if (row.to_machine !== principal.machineId) {
-          results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_yours" });
-          continue;
-        }
-
-        await db
-          .prepare(
-            `UPDATE remote_launch SET status = ?, reason = ?, settled_at = ?
-             WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
-          )
-          .bind(it.outcome, it.reason ?? null, now, row.from_machine, row.launch_id, principal.machineId)
-          .run();
-
-        if (it.outcome === "refused") {
-          console.error("[remote-launch] result item refused by its receiver; dropped", {
-            fromMachine: row.from_machine,
-            resultId: row.launch_id,
-            reason: it.reason,
-          });
-        }
-        results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "ok" });
-      } else {
-        // it.kind === "launch"
-        const row = await getLaunchRow(db, it.from_machine, it.launch_id);
-        if (!row || row.item_kind !== "launch") {
-          results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_found" });
-          continue;
-        }
-        if (row.to_machine !== principal.machineId) {
-          results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_yours" });
-          continue;
-        }
-
-        if (row.status === "queued" || row.status === "leased") {
-          let settleStatus: string;
-          let sessionId: string | null = null;
-          let reason: string | null = null;
-          if (it.outcome === "launched") {
-            settleStatus = "launched";
-            sessionId = it.session_id!;
-          } else if (it.outcome === "refused") {
-            settleStatus = "refused";
-            reason = it.reason!;
-          } else {
-            settleStatus = "expired";
-            reason = "unconfirmed";
-            sessionId = it.session_id ?? null;
-          }
-
-          const insertStmt = resultInsert(
-            db,
-            row,
-            it.outcome,
-            it.session_id ?? null,
-            it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
-            `r:${row.launch_id}`,
-            now,
-            ["queued", "leased"],
-          );
-          const settleStmt = db
-            .prepare(
-              `UPDATE remote_launch SET status = ?, session_id = ?, reason = ?, settled_at = ?
-               WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
-            )
-            .bind(settleStatus, sessionId, reason, now, row.from_machine, row.launch_id, principal.machineId);
-
-          await db.batch([insertStmt, settleStmt]);
-        } else if (row.status === "expired") {
-          // CORRECTION
-          const isAllowed =
-            it.outcome === "launched" ||
-            it.outcome === "refused" ||
-            (it.outcome === "unconfirmed" && Boolean(it.session_id) && row.session_id === null);
-
-          if (isAllowed) {
-            let updateRes: D1Response;
-            if (it.outcome === "launched") {
-              updateRes = await db
-                .prepare(
-                  `UPDATE remote_launch SET status = 'launched', session_id = ?, reason = NULL, settled_at = ?
-                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
-                )
-                .bind(it.session_id!, now, row.from_machine, row.launch_id, principal.machineId)
-                .run();
-            } else if (it.outcome === "refused") {
-              updateRes = await db
-                .prepare(
-                  `UPDATE remote_launch SET status = 'refused', session_id = NULL, reason = ?, settled_at = ?
-                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
-                )
-                .bind(it.reason!, now, row.from_machine, row.launch_id, principal.machineId)
-                .run();
-            } else {
-              // unconfirmed with session_id while row.session_id IS NULL
-              updateRes = await db
-                .prepare(
-                  `UPDATE remote_launch SET session_id = ?, settled_at = ?
-                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired' AND session_id IS NULL`,
-                )
-                .bind(it.session_id!, now, row.from_machine, row.launch_id, principal.machineId)
-                .run();
-            }
-
-            if (updateRes.meta.changes > 0) {
-              const existingResult = await getLaunchRow(db, row.from_machine, `r:${row.launch_id}`);
-              const newBody = JSON.stringify({
-                launch_id: row.launch_id,
-                machine: row.to_machine,
-                outcome: it.outcome,
-                session_id: it.session_id ?? null,
-                reason: it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
-              });
-
-              if (existingResult && existingResult.status === "queued") {
-                await db
-                  .prepare("UPDATE remote_launch SET body_json = ? WHERE from_machine = ? AND launch_id = ? AND status = 'queued'")
-                  .bind(newBody, row.from_machine, `r:${row.launch_id}`)
-                  .run();
-              } else {
-                await db
-                  .prepare(
-                    `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session,
-                                                body_json, body_sha256, status, lease_count, created_at, expires_at)
-                     VALUES (?, ?, 'result', ?, ?, ?, '', 'queued', 0, ?, ?)
-                     ON CONFLICT (from_machine, launch_id) DO NOTHING`,
-                  )
-                  .bind(
-                    row.from_machine,
-                    `r:${row.launch_id}:${it.outcome}`,
-                    row.from_machine,
-                    row.from_session,
-                    newBody,
-                    now,
-                    now + LAUNCH_RESULT_TTL_MS,
-                  )
-                  .run();
-              }
-            }
-          }
-        }
-        // status launched/refused -> no-op (never reverse)
-
-        results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "ok" });
-      }
+      results.push(await processLaunchAckItem(db, principal.machineId, it, now));
     }
-
     return Response.json({ ok: true, results });
   });
 }

@@ -17,6 +17,8 @@ import {
   LAUNCH_RATE_PER_HOUR,
   LAUNCH_LEASE_MS,
   LAUNCH_MAX_LEASES,
+  processLaunchAckItem,
+  type RemoteLaunchRow,
 } from "../src/remote-launch";
 
 const SHARED = "test-api-key";
@@ -349,11 +351,11 @@ describe("hand-out on GET /machines/:id/next", () => {
     const t1 = row1!.updated_at;
 
     // 2. unchanged header does not rewrite (check updated_at)
-    await new Promise((r) => setTimeout(r, 5));
+    await env.DB.prepare("UPDATE machine_launch_accept SET updated_at = 1 WHERE machine_id = ?").bind(B).run();
     const res2 = await poll(KEY_B, B, `launch=${A}`);
     expect(res2.status).toBe(204);
     const row2 = await env.DB.prepare("SELECT * FROM machine_launch_accept WHERE machine_id = ?").bind(B).first<{ accept_csv: string; updated_at: number }>();
-    expect(row2!.updated_at).toBe(t1);
+    expect(row2!.updated_at).toBe(1);
 
     // 3. poll without the token clears it
     const res3 = await poll(KEY_B, B, `accept=${A}; failures=1`);
@@ -426,10 +428,11 @@ describe("hand-out on GET /machines/:id/next", () => {
 
   it("only 1 launch per poll even with 3 queued; oldest first", async () => {
     await launch(KEY_A, { launch_id: "launch_1", prompt: "first" });
-    await new Promise((r) => setTimeout(r, 5));
     await launch(KEY_A, { launch_id: "launch_2", prompt: "second" });
-    await new Promise((r) => setTimeout(r, 5));
     await launch(KEY_A, { launch_id: "launch_3", prompt: "third" });
+    await env.DB.prepare("UPDATE remote_launch SET created_at = 1000 WHERE launch_id = 'launch_1'").run();
+    await env.DB.prepare("UPDATE remote_launch SET created_at = 2000 WHERE launch_id = 'launch_2'").run();
+    await env.DB.prepare("UPDATE remote_launch SET created_at = 3000 WHERE launch_id = 'launch_3'").run();
 
     const res = await poll(KEY_B, B, `launch=${A}`);
     expect(res.status).toBe(200);
@@ -492,6 +495,43 @@ describe("hand-out on GET /machines/:id/next", () => {
     expect(bodyCmd.commandId).toBe("cmd_rl_01");
     expect(bodyCmd.command).toBe("echo hello");
     expect((bodyCmd.launches as unknown[])).toHaveLength(1);
+  });
+
+  it("corrupt body_json in a result row is logged and skipped, while valid rows are handed out", async () => {
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:corrupt_01', 'result', ?, ?, 'not json', '', 'queued', 0, 1000, ?)`,
+    )
+      .bind(A, B, SENDER, Date.now() + 100_000)
+      .run();
+
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:valid_02', 'result', ?, ?, ?, '', 'queued', 0, 2000, ?)`,
+    )
+      .bind(
+        A,
+        B,
+        SENDER,
+        JSON.stringify({
+          launch_id: "launch_valid",
+          machine: B,
+          outcome: "launched",
+          session_id: "ses_rlGoodRow01",
+          reason: null,
+        }),
+        Date.now() + 100_000,
+      )
+      .run();
+
+    const res = await poll(KEY_B, B, "failures=1");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { launches: Array<{ result_id: string }> };
+    expect(body.launches).toHaveLength(1);
+    expect(body.launches[0].result_id).toBe("r:valid_02");
+
+    const corruptRow = await env.DB.prepare("SELECT * FROM remote_launch WHERE launch_id = 'r:corrupt_01'").first<Record<string, unknown>>();
+    expect(corruptRow!.status).toBe("leased");
   });
 });
 
@@ -1002,5 +1042,78 @@ describe("POST /launch/relay/ack", () => {
     } finally {
       await env.DB.prepare("ALTER TABLE remote_launch_hidden RENAME TO remote_launch").run();
     }
+  });
+
+  it("a retried identical correction ack creates no extra result rows", async () => {
+    await launch(KEY_A);
+    await poll(KEY_B, B, `launch=${A}`);
+
+    // Settle as unconfirmed
+    await ack(KEY_B, [{ kind: "launch", from_machine: A, launch_id: "launch_rl_0001", outcome: "unconfirmed" }]);
+
+    // First correction ack
+    const ack1 = await ack(KEY_B, [{ kind: "launch", from_machine: A, launch_id: "launch_rl_0001", outcome: "launched", session_id: "ses_rlRetryTest01" }]);
+    expect(ack1.status).toBe(200);
+
+    // Retry identical correction ack
+    const ack2 = await ack(KEY_B, [{ kind: "launch", from_machine: A, launch_id: "launch_rl_0001", outcome: "launched", session_id: "ses_rlRetryTest01" }]);
+    expect(ack2.status).toBe(200);
+
+    // Total result rows for A must still be exactly 1
+    const count = await env.DB.prepare("SELECT COUNT(*) as n FROM remote_launch WHERE from_machine = ? AND item_kind = 'result'").bind(A).first<{ n: number }>();
+    expect(count!.n).toBe(1);
+
+    const r = await row(A, "r:launch_rl_0001");
+    const bodyJson = JSON.parse(String(r!.body_json));
+    expect(bodyJson.session_id).toBe("ses_rlRetryTest01");
+  });
+
+  it("ack vs expiry race fallback: row read as leased but expired before settle runs correction path", async () => {
+    await launch(KEY_A);
+    // Directly set launch row to expired/unconfirmed in DB, and insert queued r:launch_rl_0001
+    await env.DB.prepare("UPDATE remote_launch SET status = 'expired', reason = 'unconfirmed' WHERE launch_id = 'launch_rl_0001'").run();
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:launch_rl_0001', 'result', ?, ?, ?, '', 'queued', 0, ?, ?)`,
+    )
+      .bind(
+        A,
+        A,
+        SENDER,
+        JSON.stringify({ launch_id: "launch_rl_0001", machine: B, outcome: "unconfirmed", session_id: null, reason: "unconfirmed" }),
+        Date.now(),
+        Date.now() + 100_000,
+      )
+      .run();
+
+    // Call processLaunchAckItem with rowOverride status='leased' (simulating it was read as leased before expiry)
+    const staleRow = (await row(A, "launch_rl_0001")) as unknown as RemoteLaunchRow;
+    const res = await processLaunchAckItem(
+      env.DB,
+      B,
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "launched",
+        session_id: "ses_rlRacedFallback01",
+      },
+      Date.now(),
+      { ...staleRow, status: "leased" },
+    );
+
+    expect(res.result).toBe("ok");
+
+    // The launch row in DB should have been updated to 'launched' via correction
+    const updated = await row(A, "launch_rl_0001");
+    expect(updated!.status).toBe("launched");
+    expect(updated!.session_id).toBe("ses_rlRacedFallback01");
+
+    // Result row body_json updated
+    const resRow = await row(A, "r:launch_rl_0001");
+    expect(resRow!.status).toBe("queued");
+    const bodyJson = JSON.parse(String(resRow!.body_json));
+    expect(bodyJson.outcome).toBe("launched");
+    expect(bodyJson.session_id).toBe("ses_rlRacedFallback01");
   });
 });
