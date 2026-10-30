@@ -145,7 +145,6 @@ describe("POST /launch/relay", () => {
   it("valid request -> 202, row queued, to_machine B, expires_at = created_at + LAUNCH_TTL_MS", async () => {
     const res = await launch(KEY_A);
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ accepted: true, launch_id: "launch_rl_0001", to_machine: B });
     const r = await row(A, "launch_rl_0001");
     expect(r).toMatchObject({
       from_machine: A,
@@ -157,6 +156,12 @@ describe("POST /launch/relay", () => {
       lease_count: 0,
     });
     expect(Number(r!.expires_at)).toBe(Number(r!.created_at) + LAUNCH_TTL_MS);
+    expect(await res.json()).toEqual({
+      accepted: true,
+      launch_id: "launch_rl_0001",
+      to_machine: B,
+      expires_at: Number(r!.expires_at),
+    });
     const bodyJson = JSON.parse(String(r!.body_json));
     expect(bodyJson).toEqual({
       from: SENDER,
@@ -340,6 +345,79 @@ describe("POST /launch/relay", () => {
     } finally {
       await env.DB.prepare("ALTER TABLE remote_launch_hidden RENAME TO remote_launch").run();
     }
+  });
+
+  it("non-number expires_at -> 400", async () => {
+    expect((await launch(KEY_A, { expires_at: "not-a-number" })).status).toBe(400);
+    expect((await launch(KEY_A, { expires_at: NaN })).status).toBe(400);
+    expect((await launch(KEY_A, { expires_at: Infinity })).status).toBe(400);
+    expect((await launch(KEY_A, { expires_at: -Infinity })).status).toBe(400);
+    expect((await launch(KEY_A, { expires_at: null })).status).toBe(400);
+  });
+
+  it("expires_at in 10 min -> stored as such, and 202 body carries expires_at", async () => {
+    const targetExpiresAt = Date.now() + 10 * 60_000;
+    const res = await launch(KEY_A, { launch_id: "launch_exp_10m", expires_at: targetExpiresAt });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({
+      accepted: true,
+      launch_id: "launch_exp_10m",
+      to_machine: B,
+      expires_at: targetExpiresAt,
+    });
+    const r = await row(A, "launch_exp_10m");
+    expect(Number(r!.expires_at)).toBe(targetExpiresAt);
+  });
+
+  it("expires_at in 1 hour -> clamped to 15 min, and 202 body carries clamped expires_at", async () => {
+    const targetExpiresAt = Date.now() + 60 * 60_000;
+    const res = await launch(KEY_A, { launch_id: "launch_exp_1h", expires_at: targetExpiresAt });
+    expect(res.status).toBe(202);
+    const r = await row(A, "launch_exp_1h");
+    const expected = Number(r!.created_at) + LAUNCH_TTL_MS;
+    expect(Number(r!.expires_at)).toBe(expected);
+    expect(await res.json()).toEqual({
+      accepted: true,
+      launch_id: "launch_exp_1h",
+      to_machine: B,
+      expires_at: expected,
+    });
+  });
+
+  it("expires_at in 30 s -> 410 expired", async () => {
+    const shortExpiresAt = Date.now() + 30_000;
+    const res = await launch(KEY_A, { launch_id: "launch_exp_30s", expires_at: shortExpiresAt });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toEqual({
+      error: "expired",
+      detail: "fewer than one lease of life left",
+    });
+    const r = await row(A, "launch_exp_30s");
+    expect(r).toBeNull();
+  });
+
+  it("expired value with an existing identical row -> 202 duplicate carrying stored row expires_at", async () => {
+    const targetExpiresAt = Date.now() + 10 * 60_000;
+    const res1 = await launch(KEY_A, { launch_id: "launch_dup_exp", expires_at: targetExpiresAt });
+    expect(res1.status).toBe(202);
+    expect(await res1.json()).toEqual({
+      accepted: true,
+      launch_id: "launch_dup_exp",
+      to_machine: B,
+      expires_at: targetExpiresAt,
+    });
+
+    // Retry with an expired value (< 60s)
+    const shortExpiresAt = Date.now() + 20_000;
+    const res2 = await launch(KEY_A, { launch_id: "launch_dup_exp", expires_at: shortExpiresAt });
+    expect(res2.status).toBe(202);
+    expect(await res2.json()).toEqual({
+      accepted: true,
+      duplicate: true,
+      launch_id: "launch_dup_exp",
+      to_machine: B,
+      expires_at: targetExpiresAt,
+    });
   });
 });
 
@@ -759,6 +837,138 @@ describe("POST /launch/relay/ack", () => {
     }));
     const ack101 = await ack(KEY_B, items101);
     expect(ack101.status).toBe(400);
+
+    // kind launch: invalid reason on launched outcome -> 400
+    const ackLaunchedBadReason = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "launched",
+        session_id: "ses_rlValid0001",
+        reason: "Bad Reason!",
+      },
+    ]);
+    expect(ackLaunchedBadReason.status).toBe(400);
+
+    // kind launch: invalid reason on unconfirmed outcome -> 400
+    const ackUnconfirmedBadReason = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "unconfirmed",
+        reason: "Bad Reason!",
+      },
+    ]);
+    expect(ackUnconfirmedBadReason.status).toBe(400);
+
+    // kind launch: invalid session_id on refused outcome -> 400
+    const ackRefusedBadSession = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "refused",
+        reason: "valid_reason",
+        session_id: "bad_session_id",
+      },
+    ]);
+    expect(ackRefusedBadSession.status).toBe(400);
+
+    // kind launch: invalid session_id on unconfirmed outcome -> 400
+    const ackUnconfirmedBadSession = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "unconfirmed",
+        session_id: "bad_session_id",
+      },
+    ]);
+    expect(ackUnconfirmedBadSession.status).toBe(400);
+
+    // kind result: invalid reason on delivered outcome -> 400
+    const ackResultDeliveredBadReason = await ack(KEY_A, [
+      {
+        kind: "result",
+        from_machine: A,
+        result_id: "r:launch_rl_0001",
+        outcome: "delivered",
+        reason: "Bad Reason!",
+      },
+    ]);
+    expect(ackResultDeliveredBadReason.status).toBe(400);
+
+    // kind result: invalid reason on refused outcome -> 400
+    const ackResultRefusedBadReason = await ack(KEY_A, [
+      {
+        kind: "result",
+        from_machine: A,
+        result_id: "r:launch_rl_0001",
+        outcome: "refused",
+        reason: "Bad Reason!",
+      },
+    ]);
+    expect(ackResultRefusedBadReason.status).toBe(400);
+  });
+
+  it("ack kind launch: outcome refused drops session_id (not stored on launch row, not in result body)", async () => {
+    await launch(KEY_A);
+    await poll(KEY_B, B, `launch=${A}`);
+
+    const ackRes = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "refused",
+        reason: "no_such_directory",
+        session_id: "ses_rlDropped01",
+      },
+    ]);
+    expect(ackRes.status).toBe(200);
+
+    const launchR = await row(A, "launch_rl_0001");
+    expect(launchR!.status).toBe("refused");
+    expect(launchR!.session_id).toBeNull();
+    expect(launchR!.reason).toBe("no_such_directory");
+
+    const resultR = await row(A, "r:launch_rl_0001");
+    expect(resultR!.status).toBe("queued");
+    const bodyJson = JSON.parse(String(resultR!.body_json));
+    expect(bodyJson.session_id).toBeNull();
+    expect(bodyJson.reason).toBe("no_such_directory");
+    expect(bodyJson.outcome).toBe("refused");
+  });
+
+  it("ack kind launch: outcome launched drops reason (not stored on launch row, not in result body)", async () => {
+    await launch(KEY_A);
+    await poll(KEY_B, B, `launch=${A}`);
+
+    const ackRes = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "launched",
+        session_id: "ses_rlKept01",
+        reason: "ignored_reason",
+      },
+    ]);
+    expect(ackRes.status).toBe(200);
+
+    const launchR = await row(A, "launch_rl_0001");
+    expect(launchR!.status).toBe("launched");
+    expect(launchR!.session_id).toBe("ses_rlKept01");
+    expect(launchR!.reason).toBeNull();
+
+    const resultR = await row(A, "r:launch_rl_0001");
+    expect(resultR!.status).toBe("queued");
+    const bodyJson = JSON.parse(String(resultR!.body_json));
+    expect(bodyJson.session_id).toBe("ses_rlKept01");
+    expect(bodyJson.reason).toBeNull();
+    expect(bodyJson.outcome).toBe("launched");
   });
 
   it("correction while r:<id> still queued: set the launch row expired/unconfirmed and insert a queued r:<id> directly (or via the unconfirmed ack), then ack launched -> still exactly one result row for that launch, body now launched with the session id", async () => {

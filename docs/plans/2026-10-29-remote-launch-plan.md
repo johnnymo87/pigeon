@@ -36,14 +36,15 @@ the existing `/launch` code (`daemon/src/worker/launch-ingest.ts`), refactored i
 
 ### `POST /launch/relay` (worker; machine key only)
 
-Request: `{launch_id, from, machine, directory, prompt, tag}` (`tag` string or null).
+Request: `{launch_id, from, machine, directory, prompt, tag, expires_at?}` (`tag` string or null, `expires_at` optional).
 
 | Check (in this order) | Answer |
 |---|---|
 | not a machine key | 401 (from `requireMachinePrincipal`) |
 | body invalid | 400 `{error:"invalid", detail}` |
-| same `(caller, launch_id)` stored, same hash | 202 `{accepted:true, duplicate:true, launch_id, to_machine}` |
+| same `(caller, launch_id)` stored, same hash | 202 `{accepted:true, duplicate:true, launch_id, to_machine, expires_at}` |
 | same key, different hash | 409 `launch_id_conflict` |
+| effective expiry - now < LAUNCH_LEASE_MS | 410 `{error:"expired", detail:"fewer than one lease of life left"}` |
 | `from` registered to another machine | 403 `sender_not_yours` |
 | `machine` = caller | 409 `same_machine` |
 | target not retired (`isSharedKeyRetiredFor`) | 403 `receiver_not_retired` |
@@ -52,13 +53,13 @@ Request: `{launch_id, from, machine, directory, prompt, tag}` (`tag` string or n
 | `relayReachability(db, env, target, caller, now).relay !== "available"` | 409 `no_return_path` |
 | ≥ 10 launches queued/leased for target | 429 `queue_full` |
 | ≥ 30 launches created by caller in the last hour | 429 `rate_limited` |
-| ok | 202 `{accepted:true, launch_id, to_machine}` |
+| ok | 202 `{accepted:true, launch_id, to_machine, expires_at}` |
 | any "no such table" | 503 `launch_unavailable` |
 
 Validation: `launch_id` `^[^:\s]{1,128}$`; `from` `^ses_[A-Za-z0-9_-]{8,128}$`; `machine`
 `MACHINE_ID_PATTERN`; `directory` string, 1–512 chars, no `[\x00-\x1f\x7f]`; `prompt` string,
 1–16000 code points (`[...prompt].length`); `tag` null/absent or `isValidTag` (worker
-`tag-command.ts`). Hash = `sha256Hex(JSON.stringify([machine, from, directory, prompt, tag]))`.
+`tag-command.ts`); `expires_at` optional finite number (epoch ms). Hash = `sha256Hex(JSON.stringify([machine, from, directory, prompt, tag]))`.
 
 ### Poll header
 

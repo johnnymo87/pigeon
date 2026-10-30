@@ -50,6 +50,7 @@ export interface LaunchRequest {
   directory: string;
   prompt: string;
   tag: string | null;
+  expires_at?: number;
 }
 
 export interface RemoteLaunchRow {
@@ -88,7 +89,7 @@ async function tolerant(fn: () => Promise<Response>): Promise<Response> {
 }
 
 export function validateLaunchBody(body: Record<string, unknown>): LaunchRequest | Response {
-  const { launch_id, from, machine, directory, prompt, tag } = body;
+  const { launch_id, from, machine, directory, prompt, tag, expires_at } = body;
   if (typeof launch_id !== "string" || !LAUNCH_ID_PATTERN.test(launch_id)) {
     return bad("launch_id must be 1-128 characters with no ':' or whitespace");
   }
@@ -116,6 +117,11 @@ export function validateLaunchBody(body: Record<string, unknown>): LaunchRequest
   if (tag !== undefined && tag !== null && (typeof tag !== "string" || !isValidTag(tag))) {
     return bad("tag must be null or a valid tag");
   }
+  if (expires_at !== undefined) {
+    if (typeof expires_at !== "number" || !Number.isFinite(expires_at)) {
+      return bad("expires_at must be a finite number");
+    }
+  }
 
   return {
     launch_id,
@@ -124,6 +130,7 @@ export function validateLaunchBody(body: Record<string, unknown>): LaunchRequest
     directory,
     prompt,
     tag: typeof tag === "string" ? tag : null,
+    expires_at: typeof expires_at === "number" ? expires_at : undefined,
   };
 }
 
@@ -145,7 +152,13 @@ async function getLaunchRow(
 function duplicateOrConflict(existing: RemoteLaunchRow, hash: string): Response {
   if (existing.item_kind === "launch" && existing.body_sha256 === hash) {
     return Response.json(
-      { accepted: true, duplicate: true, launch_id: existing.launch_id, to_machine: existing.to_machine },
+      {
+        accepted: true,
+        duplicate: true,
+        launch_id: existing.launch_id,
+        to_machine: existing.to_machine,
+        expires_at: existing.expires_at,
+      },
       { status: 202 },
     );
   }
@@ -182,6 +195,14 @@ export async function handleLaunchRelay(
     // 3. Duplicate check (before offline / other checks, so retries succeed even if target went down)
     const existing = await getLaunchRow(db, fromMachine, req.launch_id);
     if (existing) return duplicateOrConflict(existing, hash);
+
+    const effectiveExpiry = Math.min(req.expires_at ?? Number.POSITIVE_INFINITY, now + LAUNCH_TTL_MS);
+    if (effectiveExpiry - now < LAUNCH_LEASE_MS) {
+      return Response.json(
+        { error: "expired", detail: "fewer than one lease of life left" },
+        { status: 410 },
+      );
+    }
 
     // 4. Sender registration check: unregistered passes; registered to another machine fails
     const sender = await db
@@ -294,7 +315,7 @@ export async function handleLaunchRelay(
     }
 
     // 12. Insert launch row
-    const expiresAt = now + LAUNCH_TTL_MS;
+    const expiresAt = effectiveExpiry;
     const bodyJson = JSON.stringify({
       from: req.from,
       directory: req.directory,
@@ -319,7 +340,7 @@ export async function handleLaunchRelay(
     }
 
     return Response.json(
-      { accepted: true, launch_id: req.launch_id, to_machine: req.machine },
+      { accepted: true, launch_id: req.launch_id, to_machine: req.machine, expires_at: effectiveExpiry },
       { status: 202 },
     );
   });
@@ -694,12 +715,14 @@ function correctionBatch(
   now: number,
   principalMachineId: string,
 ): D1PreparedStatement[] {
+  const effectiveSessionId = outcome === "refused" ? null : sessionId;
+  const effectiveReason = outcome === "launched" ? null : (reason ?? (outcome === "unconfirmed" ? "unconfirmed" : null));
   const newBody = JSON.stringify({
     launch_id: row.launch_id,
     machine: row.to_machine,
     outcome,
-    session_id: sessionId,
-    reason: reason ?? (outcome === "unconfirmed" ? "unconfirmed" : null),
+    session_id: effectiveSessionId,
+    reason: effectiveReason,
   });
 
   let stmt1: D1PreparedStatement;
@@ -712,18 +735,18 @@ function correctionBatch(
         `UPDATE remote_launch SET status = 'launched', session_id = ?, reason = NULL, settled_at = ?
          WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
       )
-      .bind(sessionId!, now, row.from_machine, row.launch_id, principalMachineId);
+      .bind(effectiveSessionId!, now, row.from_machine, row.launch_id, principalMachineId);
     correctedStateClause = "status = 'launched' AND session_id = ? AND reason IS NULL";
-    correctedStateParams = [sessionId!];
+    correctedStateParams = [effectiveSessionId!];
   } else if (outcome === "refused") {
     stmt1 = db
       .prepare(
         `UPDATE remote_launch SET status = 'refused', session_id = NULL, reason = ?, settled_at = ?
          WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
       )
-      .bind(reason!, now, row.from_machine, row.launch_id, principalMachineId);
+      .bind(effectiveReason!, now, row.from_machine, row.launch_id, principalMachineId);
     correctedStateClause = "status = 'refused' AND session_id IS NULL AND reason = ?";
-    correctedStateParams = [reason!];
+    correctedStateParams = [effectiveReason!];
   } else {
     // unconfirmed with sessionId
     stmt1 = db
@@ -731,9 +754,9 @@ function correctionBatch(
         `UPDATE remote_launch SET session_id = ?, reason = 'unconfirmed', settled_at = ?
          WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired' AND session_id IS NULL`,
       )
-      .bind(sessionId!, now, row.from_machine, row.launch_id, principalMachineId);
+      .bind(effectiveSessionId!, now, row.from_machine, row.launch_id, principalMachineId);
     correctedStateClause = "status = 'expired' AND reason = 'unconfirmed' AND session_id = ?";
-    correctedStateParams = [sessionId!];
+    correctedStateParams = [effectiveSessionId!];
   }
 
   const stmt2 = db
@@ -859,8 +882,10 @@ export async function processLaunchAckItem(
     if (it.outcome === "launched") {
       settleStatus = "launched";
       sessionId = it.session_id!;
+      reason = null;
     } else if (it.outcome === "refused") {
       settleStatus = "refused";
+      sessionId = null;
       reason = it.reason!;
     } else {
       settleStatus = "expired";
@@ -872,8 +897,8 @@ export async function processLaunchAckItem(
       db,
       row,
       it.outcome,
-      it.session_id ?? null,
-      it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
+      sessionId,
+      reason,
       `r:${row.launch_id}`,
       now,
       ["queued", "leased"],
@@ -901,8 +926,8 @@ export async function processLaunchAckItem(
               db,
               freshRow,
               it.outcome,
-              it.session_id ?? null,
-              it.reason ?? null,
+              it.outcome === "refused" ? null : (it.session_id ?? null),
+              it.outcome === "launched" ? null : (it.reason ?? null),
               now,
               principalMachineId,
             ),
@@ -923,8 +948,8 @@ export async function processLaunchAckItem(
           db,
           row,
           it.outcome,
-          it.session_id ?? null,
-          it.reason ?? null,
+          it.outcome === "refused" ? null : (it.session_id ?? null),
+          it.outcome === "launched" ? null : (it.reason ?? null),
           now,
           principalMachineId,
         ),
@@ -972,26 +997,32 @@ export async function handleLaunchRelayAck(
         if (typeof o.session_id !== "string" || !SENDER_ID.test(o.session_id)) {
           return bad("launched requires a valid ses_ session_id");
         }
-      } else if (o.outcome === "unconfirmed") {
-        if (
-          o.session_id !== undefined &&
-          o.session_id !== null &&
-          (typeof o.session_id !== "string" || !SENDER_ID.test(o.session_id))
-        ) {
-          return bad("session_id must be a valid ses_ session id if present");
-        }
       } else if (o.outcome === "refused") {
         if (typeof o.reason !== "string" || !REASON.test(o.reason)) {
           return bad("a refusal needs a reason code ([a-z0-9_]{1,64})");
         }
+      }
+      if (
+        o.session_id !== undefined &&
+        o.session_id !== null &&
+        (typeof o.session_id !== "string" || !SENDER_ID.test(o.session_id))
+      ) {
+        return bad("session_id must be a valid ses_ session id if present");
+      }
+      if (
+        o.reason !== undefined &&
+        o.reason !== null &&
+        (typeof o.reason !== "string" || !REASON.test(o.reason))
+      ) {
+        return bad("reason must be a code ([a-z0-9_]{1,64})");
       }
       parsed.push({
         kind: "launch",
         from_machine: o.from_machine,
         launch_id: o.launch_id,
         outcome: o.outcome,
-        session_id: o.session_id as string | undefined,
-        reason: o.reason as string | undefined,
+        session_id: o.outcome === "refused" ? undefined : (o.session_id as string | undefined),
+        reason: o.outcome === "launched" ? undefined : (o.reason as string | undefined),
       });
     } else if (o.kind === "result") {
       if (typeof o.result_id !== "string" || !RESULT_ID_PATTERN.test(o.result_id)) {
