@@ -312,6 +312,19 @@ async function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise
   }
 }
 
+/**
+ * goose's name for a session it has not named yet (acp/server/new_session.rs).
+ * Never reported: Telegram topic names are write-once, so a topic upgraded to
+ * this would keep it for the life of the session.
+ */
+const GOOSE_PLACEHOLDER_TITLE = "New Chat";
+
+function gooseSessionTitle(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const title = raw.trim();
+  return title === "" || title === GOOSE_PLACEHOLDER_TITLE ? undefined : title;
+}
+
 export class GooseSessionRunner {
   private readonly opts: GooseSessionRunnerOptions;
   private turn: Turn | undefined;
@@ -334,8 +347,21 @@ export class GooseSessionRunner {
   private recoveryResolvedOrAttached: Promise<void> | undefined;
   private resolveRecoveryAttached: (() => void) | undefined;
 
+  /**
+   * The name goose gave this session, from its `session_info_update` frames.
+   * Attached to every `/stop` so pigeon stores it and the topic upgrades from
+   * its directory name, the same route opencode titles take.
+   */
+  private title: string | undefined;
+
   constructor(opts: GooseSessionRunnerOptions) {
     this.opts = opts;
+  }
+
+  private postStop(body: Record<string, unknown>): Promise<void> {
+    return this.opts.postStop(
+      this.title !== undefined && body.title === undefined ? { ...body, title: this.title } : body,
+    );
   }
 
   get isClosed(): boolean {
@@ -404,7 +430,7 @@ export class GooseSessionRunner {
     }
     turn.permissionNoticePosted = true;
     try {
-      await this.opts.postStop({
+      await this.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:permission`,
         message:
@@ -557,7 +583,7 @@ export class GooseSessionRunner {
           });
           if (this.turn === turn) this.clearTurn();
           try {
-            await this.opts.postStop({
+            await this.postStop({
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
               message:
@@ -609,7 +635,7 @@ export class GooseSessionRunner {
   }
 
   async postShutdownNotice(commandId: string): Promise<void> {
-    await this.opts.postStop({
+    await this.postStop({
       session_id: this.sessionId,
       notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}`,
       message: gooseShutdownNotice(this.sessionId, false),
@@ -619,7 +645,7 @@ export class GooseSessionRunner {
   }
 
   async postNotice(body: Record<string, unknown>): Promise<void> {
-    await this.opts.postStop(body);
+    await this.postStop(body);
   }
 
   get isHonk(): boolean {
@@ -788,7 +814,7 @@ export class GooseSessionRunner {
 
     const message = customMessage ?? QUEUED_NOTICE_MESSAGE;
     try {
-      await this.opts.postStop({
+      await this.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}:queued`,
         message,
@@ -1049,7 +1075,7 @@ export class GooseSessionRunner {
         if (turn.recovered) {
           if (this.turn === turn) this.clearTurn();
           try {
-            await this.opts.postStop({
+            await this.postStop({
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
               message:
@@ -1168,7 +1194,7 @@ export class GooseSessionRunner {
       });
       if (this.turn === turn) this.clearTurn();
       try {
-        await this.opts.postStop({
+        await this.postStop({
           session_id: this.sessionId,
           notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
           message: "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent.",
@@ -1196,7 +1222,7 @@ export class GooseSessionRunner {
         });
         if (this.turn === turn) this.clearTurn();
         try {
-          await this.opts.postStop({
+          await this.postStop({
             session_id: this.sessionId,
             notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
             message: "your message was not delivered (goose was busy); nothing was resent — send it again.",
@@ -1251,7 +1277,7 @@ export class GooseSessionRunner {
 
         if (!alreadyNoticeSent) {
           try {
-            await this.opts.postStop({
+            await this.postStop({
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:queued`,
               message: QUEUED_NOTICE_MESSAGE,
@@ -1312,6 +1338,11 @@ export class GooseSessionRunner {
 
   /** Feeds a `session/update` frame in. Must not throw: called from a socket callback. */
   onUpdate(update: Record<string, unknown>): void {
+    if (update.sessionUpdate === "session_info_update") {
+      const title = gooseSessionTitle(update.title);
+      if (title !== undefined) this.title = title;
+    }
+
     const turn = this.turn;
     if (!turn) return;
 
@@ -1491,7 +1522,7 @@ export class GooseSessionRunner {
       const bareDetail =
         "goose cancels a turn once it sees its connection close, so do not wait for this one: "
         + `no result is coming here. ${resumeAdvice(turn.resent)}`;
-      await this.opts.postStop({
+      await this.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,
         message:
@@ -1637,7 +1668,7 @@ export class GooseSessionRunner {
         }
       }
 
-      await this.opts.postStop({
+      await this.postStop({
         session_id: this.sessionId,
         // The `/stop` route requires this exact prefix and a restricted charset;
         // an id failing either is dropped, silently taking idempotency with it.

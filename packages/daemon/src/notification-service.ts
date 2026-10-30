@@ -46,14 +46,21 @@ function appendTag(b: TgMessageBuilder, tag: string | null | undefined): void {
   b.append(` · 🏷 ${t.length > MAX_TAG_CHARS ? `${t.slice(0, MAX_TAG_CHARS - 1)}…` : t}`);
 }
 
+/**
+ * A session bound to a named topic (a stall-watch coordinator, `📋 <tag>`) was
+ * named on purpose by whoever bound it, so its label outranks the title the
+ * agent generated.
+ */
 export function displayName(input: {
   title?: string | null;
   label?: string | null;
+  boundTopicKey?: string | null;
   sessionId: string;
 }): string {
   const title = input.title?.trim();
-  if (title) return title;
   const label = input.label?.trim();
+  if (label && input.boundTopicKey) return label;
+  if (title) return title;
   if (label) return label;
   return input.sessionId.slice(0, 8);
 }

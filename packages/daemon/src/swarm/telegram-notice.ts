@@ -66,6 +66,7 @@ export function enqueueSwarmTelegramNotice(
           : displayName({
               title: sender?.title,
               label: sender?.label,
+              boundTopicKey: sender?.boundTopicKey,
               sessionId: record.fromSession,
             }),
       toSessionId: record.toSession,

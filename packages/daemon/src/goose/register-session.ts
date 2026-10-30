@@ -125,6 +125,10 @@ export function registerGooseSession(
       sessionId,
       cwd: input.cwd ?? null,
       label: input.label ?? null,
+      // The upsert writes every column it is given, and this caller never knows
+      // the title, so re-registering would otherwise erase the name goose gave
+      // the session.
+      title: existing?.title ?? null,
       notify: true,
       backendKind: GOOSE_BACKEND_KIND,
       backendProtocolVersion: 1,

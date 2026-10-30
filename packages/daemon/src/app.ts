@@ -597,6 +597,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     const label = displayName({
       title: session?.title,
       label: session?.label,
+      boundTopicKey: session?.boundTopicKey,
       sessionId,
     });
 
@@ -737,7 +738,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     const notification = formatTelegramNotification({
       event,
       tag: opts.tagLookup?.get(sessionId) ?? null,
-      label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
+      label: displayName({ title: effectiveTitle, label: label || session.label, boundTopicKey: session.boundTopicKey, sessionId }),
       summary: message || summary || "Task completed",
       cwd: session.cwd,
       token,
@@ -783,7 +784,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // permanent. `policy` is the EFFECTIVE policy (post-TTL), so an expired quiet row reads
     // policy=all here and is explained by the `automated quiet expired` line above.
     // Placeholders are "-" so the fields are always present and greppable. (pigeon-2z5w)
-    console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${resolved.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, sessionId })}`);
+    console.log(`[stop] queued sessionId=${sessionId} event=${event} notificationId=${notificationId} origin=${resolved.origin ?? "-"} policy=${effectivePolicy ?? "-"} label=${displayName({ title: effectiveTitle, label: label || session.label, boundTopicKey: session.boundTopicKey, sessionId })}`);
     return Response.json({ ok: true, deliveryState: "queued", notificationId }, { status: 202 });
   }
 
@@ -2164,7 +2165,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (questions.length > 1) {
           // Multi-question: wizard mode — show step 1
           const notification = formatQuestionWizardStep({
-            label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
+            label: displayName({ title: effectiveTitle, label: label || session.label, boundTopicKey: session.boundTopicKey, sessionId }),
             questions,
             tag: opts.tagLookup?.get(sessionId) ?? null,
             currentStep: 0,
@@ -2185,7 +2186,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         } else {
           // Single-question: existing behavior
           const notification = formatQuestionNotification({
-            label: displayName({ title: effectiveTitle, label: label || session.label, sessionId }),
+            label: displayName({ title: effectiveTitle, label: label || session.label, boundTopicKey: session.boundTopicKey, sessionId }),
             questions,
             tag: opts.tagLookup?.get(sessionId) ?? null,
             cwd: session.cwd,

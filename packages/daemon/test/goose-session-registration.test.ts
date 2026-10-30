@@ -245,3 +245,35 @@ describe("registerGooseSession", () => {
     expect(storage.sessions.getByBackendSessionId("20260920_1")?.sessionId).toBe("gse_fixed");
   });
 });
+
+describe("registerGooseSession title", () => {
+  let storage: StorageDb | null = null;
+  afterEach(() => {
+    if (storage) { storage.db.close(); storage = null; }
+  });
+
+  /**
+   * The upsert takes every column from its input, and this function never knows
+   * the title, so without this a re-registration (honk re-attaching, a restart)
+   * erased the name goose gave the session.
+   */
+  it("keeps the title when the same goose session registers again", () => {
+    storage = openStorageDb(":memory:");
+    registerGooseSession(
+      storage.sessions,
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://a/acp" },
+      1_000,
+      () => "gse_fixed",
+    );
+    storage.sessions.setTitle("gse_fixed", "Fix flaky login test", 1_500);
+
+    registerGooseSession(
+      storage.sessions,
+      { machineId: null, backendSessionId: "20260920_1", endpoint: "ws://b/acp" },
+      2_000,
+      () => "gse_ignored",
+    );
+
+    expect(storage.sessions.get("gse_fixed")?.title).toBe("Fix flaky login test");
+  });
+});
