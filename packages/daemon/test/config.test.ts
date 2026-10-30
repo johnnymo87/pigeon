@@ -176,3 +176,35 @@ describe("ocTagsBin", () => {
     expect(loadConfig({ PIGEON_OC_TAGS_BIN: " /opt/oc-tags " }).ocTagsBin).toBe("/opt/oc-tags");
   });
 });
+
+describe("remoteLaunch config", () => {
+  it("defaults remoteLaunchFrom to empty and remoteLaunchSend to false", () => {
+    const config = loadConfig({});
+    expect(config.remoteLaunchFrom).toEqual([]);
+    expect(config.remoteLaunchSend).toBe(false);
+  });
+
+  it("parses remoteLaunchFrom excluding self", () => {
+    const config = loadConfig({
+      CCR_MACHINE_ID: "devbox",
+      PIGEON_REMOTE_LAUNCH_FROM: "cloudbox, devbox, macbook, cloudbox",
+    });
+    expect(config.remoteLaunchFrom).toEqual(["cloudbox", "macbook"]);
+  });
+
+  it("parses empty remoteLaunchFrom", () => {
+    const config = loadConfig({
+      CCR_MACHINE_ID: "devbox",
+      PIGEON_REMOTE_LAUNCH_FROM: "   ",
+    });
+    expect(config.remoteLaunchFrom).toEqual([]);
+  });
+
+  it("parses remoteLaunchSend when 1 (including trimmed), 0, or absent", () => {
+    expect(loadConfig({ PIGEON_REMOTE_LAUNCH_SEND: "1" }).remoteLaunchSend).toBe(true);
+    expect(loadConfig({ PIGEON_REMOTE_LAUNCH_SEND: " 1 " }).remoteLaunchSend).toBe(true);
+    expect(loadConfig({ PIGEON_REMOTE_LAUNCH_SEND: "0" }).remoteLaunchSend).toBe(false);
+    expect(loadConfig({ PIGEON_REMOTE_LAUNCH_SEND: "true" }).remoteLaunchSend).toBe(false);
+    expect(loadConfig({}).remoteLaunchSend).toBe(false);
+  });
+});

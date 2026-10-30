@@ -162,7 +162,14 @@ export class RelayClient {
  * turning sending off must not strand the ones already owed to this machine. It is inert until
  * this machine has relayed something.
  */
-export function relayPollHeader(acceptFrom: readonly string[], failures: boolean): string | null {
-  if (acceptFrom.length === 0 && !failures) return null;
-  return `accept=${acceptFrom.join(",")}${failures ? "; failures=1" : ""}`;
+export function relayPollHeader(
+  acceptFrom: readonly string[],
+  failures: boolean,
+  launchFrom: readonly string[] = [],
+): string | null {
+  if (acceptFrom.length === 0 && !failures && launchFrom.length === 0) return null;
+  const parts: string[] = [`accept=${acceptFrom.join(",")}`];
+  if (launchFrom.length > 0) parts.push(`launch=${launchFrom.join(",")}`);
+  if (failures) parts.push("failures=1");
+  return parts.join("; ");
 }

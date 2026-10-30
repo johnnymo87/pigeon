@@ -101,7 +101,9 @@ export class OpencodeClient {
     url: string,
     init: RequestInit,
     consume: (res: Response) => T | Promise<T>,
+    timeoutMs?: number,
   ): Promise<T> {
+    const effectiveTimeoutMs = timeoutMs ?? this.requestTimeoutMs;
     const buildHeaders = (): Record<string, string> => {
       const authHeader = resolveServeAuthHeader();
       const authObj: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
@@ -121,8 +123,8 @@ export class OpencodeClient {
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
-        reject(new RequestTimeoutError(this.requestTimeoutMs, url));
-      }, this.requestTimeoutMs);
+        reject(new RequestTimeoutError(effectiveTimeoutMs, url));
+      }, effectiveTimeoutMs);
     });
     // The loser of every race below is left rejecting into the void; without a
     // handler that is an unhandled rejection (fatal under Node's default).
@@ -151,7 +153,7 @@ export class OpencodeClient {
         return await Promise.race([p, deadline]);
       } catch (err) {
         if (controller.signal.aborted && !(err instanceof RequestTimeoutError)) {
-          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          const timeout = new RequestTimeoutError(effectiveTimeoutMs, url);
           // A body-phase abort arrives AFTER the final status was observed, so
           // this is normally a no-op; it matters only when the body read is what
           // aborts before any status exists. Without the guard one hung-body
@@ -173,7 +175,7 @@ export class OpencodeClient {
         });
       } catch (err) {
         if (controller.signal.aborted) {
-          const timeout = new RequestTimeoutError(this.requestTimeoutMs, url);
+          const timeout = new RequestTimeoutError(effectiveTimeoutMs, url);
           observeOnce({ error: timeout });
           throw timeout;
         }
@@ -230,19 +232,20 @@ export class OpencodeClient {
     }
   }
 
-  async healthCheck(): Promise<boolean> {
+  async healthCheck(opts?: { timeoutMs?: number }): Promise<boolean> {
     try {
       return await this.request(
         `${this.baseUrl}/global/health`,
         { method: "GET" },
         (response) => response.ok,
+        opts?.timeoutMs,
       );
     } catch {
       return false;
     }
   }
 
-  async createSession(directory: string): Promise<{ id: string }> {
+  async createSession(directory: string, opts?: { timeoutMs?: number }): Promise<{ id: string }> {
     return this.request(
       `${this.baseUrl}/session`,
       {
@@ -255,6 +258,7 @@ export class OpencodeClient {
         }
         return (await response.json()) as { id: string };
       },
+      opts?.timeoutMs,
     );
   }
 
@@ -324,7 +328,12 @@ export class OpencodeClient {
     );
   }
 
-  async sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void> {
+  async sendPrompt(
+    sessionId: string,
+    directory: string,
+    prompt: string,
+    opts?: { timeoutMs?: number },
+  ): Promise<void> {
     this.injectedPrompts?.record(sessionId, hashPrompt(prompt));
     return this.request(
       `${this.baseUrl}/session/${sessionId}/prompt_async`,
@@ -345,6 +354,7 @@ export class OpencodeClient {
           );
         }
       },
+      opts?.timeoutMs,
     );
   }
 

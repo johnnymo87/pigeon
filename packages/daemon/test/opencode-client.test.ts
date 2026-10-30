@@ -1150,6 +1150,55 @@ describe("OpencodeClient", () => {
     });
   });
 
+  describe("per-call timeoutMs", () => {
+    it("createSession with timeoutMs: 50 against a never-answering fetch rejects with RequestTimeoutError mentioning 50ms", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(() => new Promise(() => {}));
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const pending = client.createSession("/test/dir", { timeoutMs: 50 }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(50);
+      const err = (await pending) as Error;
+
+      expect(err.name).toBe("RequestTimeoutError");
+      expect(err.message).toMatch(/timed out after 50ms/);
+    });
+
+    it("healthCheck honours timeoutMs", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(() => new Promise(() => {}));
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const pending = client.healthCheck({ timeoutMs: 50 });
+      await vi.advanceTimersByTimeAsync(50);
+      const result = await pending;
+
+      expect(result).toBe(false);
+    });
+
+    it("sendPrompt honours timeoutMs", async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(() => new Promise(() => {}));
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const pending = client.sendPrompt("sess-1", "/test/dir", "hi", { timeoutMs: 50 }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(50);
+      const err = (await pending) as Error;
+
+      expect(err.name).toBe("RequestTimeoutError");
+      expect(err.message).toMatch(/timed out after 50ms/);
+    });
+  });
+
   describe("guard: prompt_async call site restriction", () => {
     it("has no prompt_async call sites outside opencode-client", () => {
       const srcDir = resolve(__dirname, "../src");
