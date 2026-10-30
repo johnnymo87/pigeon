@@ -267,6 +267,75 @@ journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '1 hour ago' \
 - **A send retries for ~6 minutes, then reports NOT received.** The owner was `offline` (or the worker unreachable) for every attempt; the attempt budget is 10. A scheduled row retries every 30s until its `expires_at`. Once the worker has answered 202 there are no sender retries: if the owner then goes away, the worker holds the item up to 24h and the sender hears `never_collected` or `unconfirmed` from the hourly expiry, up to ~25h later.
 - **The sender heard nothing, but the receiver logged `received`.** The receiver's local delivery is stuck in a watchdog non-terminal state (blocked behind a turn, silent in flight). Relayed senders are verified at handoff, so nothing reports this (spec §7). Inspect the row on the receiver like any local row.
 
+## Remote Launch Operations
+
+Remote launch (`pigeon-k0qn.17`) operates across worker D1 and three local SQLite tables in the daemon database (`remote_launch_outbound`, `remote_launch_inbound`, `remote_launch_results_seen`).
+
+### Inspecting Worker D1 State
+
+To inspect remote launches in D1 (from `packages/worker`):
+
+```bash
+# Recent launches and their statuses
+npx wrangler d1 execute ccr-d1 --remote --command \
+  "SELECT from_machine, launch_id, item_kind, to_machine, status, session_id, reason, datetime(created_at/1000,'unixepoch') AS created \
+   FROM remote_launch ORDER BY created_at DESC LIMIT 20;"
+
+# Check which machines are currently accepting remote launches
+npx wrangler d1 execute ccr-d1 --remote --command \
+  "SELECT machine_id, accept_csv, datetime(updated_at/1000,'unixepoch') AS updated \
+   FROM machine_launch_accept;"
+```
+
+### Inspecting Local Daemon Tables
+
+The three tables live in the daemon's SQLite database (`~/projects/pigeon/packages/daemon/data/pigeon-daemon.db`):
+
+```bash
+# 1. Outbound launches (on requester machine A)
+npx --yes -p sqlite -- sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+  "SELECT launch_id, to_machine, state, resolved_outcome, refusal_code, attempts, \
+          datetime(created_at/1000,'unixepoch') AS created, \
+          datetime(deadline_at/1000,'unixepoch') AS deadline \
+   FROM remote_launch_outbound ORDER BY created_at DESC LIMIT 10;"
+
+# 2. Result dedup log (on requester machine A)
+npx --yes -p sqlite -- sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+  "SELECT result_id, launch_id, datetime(received_at/1000,'unixepoch') AS received \
+   FROM remote_launch_results_seen ORDER BY received_at DESC LIMIT 10;"
+
+# 3. Inbound launches (on target machine B)
+npx --yes -p sqlite -- sqlite3 -readonly ~/projects/pigeon/packages/daemon/data/pigeon-daemon.db \
+  "SELECT from_machine, launch_id, state, session_id, outcome, reason, ack_done, ack_attempts, \
+          datetime(received_at/1000,'unixepoch') AS received \
+   FROM remote_launch_inbound ORDER BY received_at DESC LIMIT 10;"
+```
+
+### Reading `[remote-launch]` Logs
+
+Tail daemon logs on Linux (devbox/cloudbox):
+
+```bash
+journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '30 minutes ago' \
+  | grep '\[remote-launch\]'
+```
+
+Key log lines and their meaning:
+
+| Log line | Meaning |
+|---|---|
+| `[remote-launch] launch_from=<list> launch_send=<on|off>` | Boot banner indicating configured remote launch accept list and send capability. |
+| `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: <list>` | Receiver warning: `remoteLaunchFrom` is set, but receiving is disabled because one or more prerequisites (`opencodeClient`, `telegramBotToken`, `telegramChatId`, `remoteLaunchClient`) are missing. Daemon advertises empty `launch=` in poll header. |
+| `[remote-launch] remoteLaunchSend is enabled but worker credentials are missing...` | Sender warning: `PIGEON_REMOTE_LAUNCH_SEND=1` is set, but daemon lacks worker credentials. |
+| `[remote-launch] from_machine not accepted` | Receiver refused launch: sending machine is not listed in `PIGEON_REMOTE_LAUNCH_FROM` or equals self. |
+| `[remote-launch] relaySendEnabled is false, refusing no_return_path` | Receiver refused launch: B's `PIGEON_SWARM_RELAY_SEND` is not `1`, so the launched session would have no return path to report back to A. |
+| `[remote-launch] opencodeClient not provided, refusing serve_unavailable` | Receiver refused launch: opencode serve client is not initialized on B. |
+| `[remote-launch] directory is not absolute or not a directory` / `resolved directory contains character above U+00FF` | Receiver refused launch: directory does not exist (`no_such_directory`) or contains non-Latin1 characters (`invalid_directory`). |
+| `[remote-launch] existing inbound row found, re-acking per state` | Re-handout of an already processed launch (e.g. after a lost ack): B re-acks its current state without launching a second session. |
+| `[remote-launch] ack item failed wire validation, marking done` | Wire safety: an ack item violated regex constraints, marked done locally to prevent blocking the ack queue. |
+| `[remote-launch] failed to ack launch_result item` | Requester failed to ack a result item to the worker; worker will re-hand out on next poll. |
+| `[remote-launch] error processing send retry in tick` / `error processing deadline in tick` | Requester background loop encountered an error retrying a pending launch or enforcing the 15m+180s deadline. |
+
 ## Force-Failing A Stuck Retry Loop
 
 If a target is unreachable and you want to stop the arbiter from retrying (e.g. test detritus targeting `ses_throwaway_smoke`):

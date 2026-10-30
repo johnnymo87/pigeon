@@ -121,6 +121,43 @@ for p in 4096 4097 4098 4099; do
 done
 ```
 
+## Remote Upgrade (via `swarm_launch`)
+
+When upgrading pigeon across machines, an agent on machine A can start a fresh session on machine B using the `swarm_launch` tool to perform the pull, install, and service restarts without human intervention.
+
+### Example: Remote Upgrade Call
+
+Invoke the `swarm_launch` tool with the target machine, project directory, and an upgrade prompt:
+
+```ts
+swarm_launch({
+  machine: "devbox",
+  directory: "~/projects/pigeon",
+  prompt: `Perform a pigeon deploy on this machine:
+1. Run git pull:
+   cd ~/projects/pigeon && git pull
+2. Run npm install as a SEPARATE bash tool call (do not chain with git pull):
+   cd ~/projects/pigeon && npm install
+3. Restart the daemon:
+   sudo systemctl restart pigeon-daemon.service
+4. Verify daemon health:
+   curl -s http://127.0.0.1:4731/health
+5. Report the result back to the requesting session using swarm_send. Note that any plugin changes cannot be verified by this session itself (it is running on the pre-restart plugin).
+6. As the VERY LAST step, schedule the serve-pool restart from a delayed job:
+   systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 systemctl --user restart opencode-serve-pool.target
+   (Do NOT restart the pool directly in this session — restarting the pool immediately kills this session mid-turn before it can report!)`
+})
+```
+
+### Critical Rules for Remote Upgrades
+
+1. **The pool-restart trap:** The launched session runs inside B's `opencode-serve` pool. Calling the host's serve-pool restart command directly (`systemctl --user restart opencode-serve-pool.target` on devbox, or `sudo systemctl restart opencode-serve-pool.target` on cloudbox) terminates all pool instances immediately, killing the launched session mid-turn. The serve-pool restart must be:
+   - Scheduled as the **last step** using a delayed transient unit: `systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 <restart-command>`.
+   - Executed **after** the session has sent its status report via `swarm_send`.
+2. **Plugin verification limitation:** A plugin change takes effect only after the serve pool restarts. Because the launched session runs inside the pre-restart serve pool, it cannot verify plugin changes itself; its report must note this limitation.
+3. **Split git pull and npm install:** `git pull` and `npm install` must run in separate tool calls (see "Why split?" in Step 1 above).
+4. **Mac rebuilds:** If a deploy requires rebuilding Nix service definitions on macOS (`darwin-rebuild switch`), it requires `sudo` password entry and cannot be run by an unattended agent; Jonathan must perform it.
+
 ## Nix Service Changes
 
 If service definitions changed (not just application code), rebuild instead of restarting:

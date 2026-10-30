@@ -37,6 +37,13 @@ It also gives us durable delivery, retry with backoff, replay via inbox, and an 
 | `packages/daemon/src/swarm/relay-notice.ts` | `formatRelayFailureNotice()` / `formatRelayRefusalReason()` — sender-facing text rendered from a reason code only |
 | `packages/daemon/src/swarm/relay-fail-sender.ts` | `RelayFailSender` — reports late failures of relayed-in rows to the worker's `/swarm/relay/fail` (5s loop, backoff) |
 | `packages/daemon/src/storage/relay-inbound-repo.ts` | `swarm_relay_inbound` — "this `msg_id` arrived by relay" (hop rule, late-failure diversion, envelope `from_machine`) |
+| `packages/daemon/src/storage/remote-launch-repo.ts` | `initRemoteLaunchSchema`, `RemoteLaunchRepository` — typed accessors for `remote_launch_inbound`, `remote_launch_outbound`, `remote_launch_results_seen` |
+| `packages/daemon/src/worker/remote-launch-client.ts` | `RemoteLaunchClient` — `POST /launch/relay` and `POST /launch/relay/ack` to the worker |
+| `packages/daemon/src/swarm/remote-launch-receiver.ts` | `processLaunchItems`, `retryLaunchAcks` — executes remote launches on B, acks outcome |
+| `packages/daemon/src/swarm/remote-launch-requester.ts` | `RemoteLaunchRequester` — handles `POST /swarm/launch`, retries, deadlines, formats results |
+| `packages/daemon/src/swarm/remote-launch-poll.ts` | `handleLaunchItems` — dispatches `launch_result` and `launch` poll items |
+| `packages/opencode-plugin/src/swarm-launch-tool.ts` | `swarm_launch` tool — launches a fresh session on another machine |
+| `packages/worker/src/remote-launch.ts` | Worker side: `remote_launch` / `machine_launch_accept` tables, `/launch/relay` and `/ack` routes, poll hand-out, expiry |
 | `packages/worker/src/relay.ts` | Worker side: `swarm_relay` / `machine_relay_accept` tables, relay/ack/fail routes, poll hand-out, hourly expiry. **Source of truth for the wire shapes** |
 | `packages/worker/src/remote-sessions.ts` | `GET /sessions/remote` for `swarm_list remote: true` |
 | `packages/opencode-plugin/src/swarm-list-tool.ts` | `swarm_list`, including `remote: true` (daemon `GET /swarm/remote-sessions`) |
@@ -174,6 +181,26 @@ Request body (JSON):
 - Exactly one of `at` or `after` is required (`at` requires full RFC3339 timestamp with UTC offset or 'Z').
 - Refused for pull sessions: returns HTTP 409 `{ "error": "scheduled messages cannot be banked for a pull session" }` if `to` is an opted-in pull session. A pull session has no delivery clock to honour `deliver_at`, and moving scheduling onto the recipient was rejected.
 - Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_...", "deliver_at": ... }`.
+
+### `POST /swarm/launch`
+
+Request body (JSON):
+
+```json
+{
+  "launch_id": "rl_...",
+  "from": "ses_...",
+  "machine": "devbox",
+  "directory": "~/projects/pigeon",
+  "prompt": "run the upgrade",
+  "tag": "launch-tag"
+}
+```
+
+- Handled by `RemoteLaunchRequester` (daemon A). Gated on `PIGEON_REMOTE_LAUNCH_SEND=1` (returns 403 `launch_send_disabled` if unset; 503 `no_worker` if worker client is not configured).
+- `launch_id`, `from`, `machine`, `directory`, `prompt` are required. `tag` is optional (inherits from requester's session tag via `oc-tags which <from>` if omitted).
+- Validates parameters, inserts an outbound record into SQLite `remote_launch_outbound` with state `sending` before calling the worker, and relays to worker `POST /launch/relay`.
+- Response: HTTP 202 `{ "launch_id": "rl_...", "status": "accepted", "to_machine": "..." }` or `{ "launch_id": "rl_...", "status": "pending" }` (if worker returned a transient error or timed out). Known refusals return the worker's status and error code inline.
 
 ### `GET /swarm/inbox?session=<id>[&since=<msg_id>]`
 
@@ -337,6 +364,77 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 - An ambiguous relay can mislead. Suppose the worker stored a relay whose 202 was lost, every retry then hits a transient error, and the receiver never answers. The attempt budget then reports "NOT received, safe to resend" while the worker still holds the message.
 - Goose sessions are neither remote targets nor relaying senders (`pigeon-k0qn.13`). Channels are not relayed.
 
+## Remote Launch (pigeon-k0qn.17)
+
+Remote launch allows an agent session on machine A to start a fresh headless opencode session on machine B with an initial prompt via the `swarm_launch` tool (`{machine, directory, prompt, tag?}`). It copies the cross-machine relay's trust and wire model (per-machine keys, D1 queue, poll hand-out, receipts) instead of using the Telegram `commands` queue.
+
+### Storage Schema
+
+**Worker (Cloudflare D1):**
+
+- `remote_launch`: PK `(from_machine, launch_id)`. Tracks launch lifecycle and result delivery.
+  - Columns: `from_machine`, `launch_id`, `item_kind` (`'launch'` or `'result'`), `to_machine`, `from_session`, `body_json`, `body_sha256`, `status` (`'queued'`, `'leased'`, `'launched'`, `'refused'`, `'expired'`), `session_id`, `reason`, `lease_count`, `created_at`, `leased_at`, `expires_at`, `settled_at`.
+- `machine_launch_accept`: PK `machine_id`. Tracks which machines each target accepts launches from.
+  - Columns: `machine_id`, `accept_csv`, `updated_at`.
+
+**Daemon (Local SQLite):**
+
+- `remote_launch_inbound` (Receiver / B side): PK `(from_machine, launch_id)`.
+  - Columns: `from_machine`, `launch_id`, `from_session`, `state` (`'received'`, `'created'`, `'settled'`), `session_id`, `outcome` (`'launched'`, `'refused'`, `'unconfirmed'`), `reason`, `ack_done`, `ack_attempts`, `next_ack_at`, `received_at`, `updated_at`.
+- `remote_launch_outbound` (Requester / A side): PK `launch_id`.
+  - Columns: `launch_id`, `from_session`, `to_machine`, `directory`, `request_json`, `state` (`'sending'`, `'accepted'`, `'refused'`, `'resolved'`, `'deadline'`), `resolved_outcome` (`'launched'`, `'refused'`, `'unconfirmed'`), `refusal_code`, `refusal_status`, `refusal_detail`, `attempts`, `next_attempt_at`, `created_at`, `request_expires_at`, `deadline_at`, `settled_at`.
+- `remote_launch_results_seen` (Requester / A side): PK `result_id`.
+  - Columns: `result_id`, `launch_id`, `received_at`. Used to dedup incoming result poll items by result row id so duplicate deliveries do not duplicate swarm messages.
+
+### Routes
+
+- **Daemon A (`POST /swarm/launch`):** Authenticated with daemon token. Handled by `RemoteLaunchRequester`. Validates body, records `sending` in `remote_launch_outbound`, and POSTs to worker `/launch/relay`.
+- **Worker (`POST /launch/relay`):** Requires machine principal key (`requireMachinePrincipal`). Performs validation, duplicate check, sender check, target retired check, accept check, online check, return path check, queue cap, and rate limit. Writes to `remote_launch`.
+- **Worker (`POST /launch/relay/ack`):** Called by machine B to ack a launch outcome. Requires machine key matching `to_machine`. Settle status: `launched` -> status `launched`, `session_id`; `refused` -> status `refused`, `reason`; `unconfirmed` -> status `expired`, reason `unconfirmed`. Mints result row `r:<launch_id>` (or `r:<launch_id>:<outcome>` on corrections) addressed to `from_machine`.
+- **Worker (`POST /launch/relay/ack` kind='result'):** Called by machine A to ack delivery of a `launch_result` item (`outcome='delivered'`).
+
+### Poll Header Token
+
+The daemon includes launch acceptance in `X-Pigeon-Swarm-Relay`:
+
+```
+X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
+```
+
+- Advertised only if B is **launch-capable** (`config.remoteLaunchFrom.length > 0`, `opencodeClient` available, bot token and chat ID present, and worker credentials configured).
+- If `remoteLaunchFrom` is set but B lacks any capability, the daemon logs a warning naming what is missing and advertises an empty `launch=` token.
+- Hand-out: worker checks target's live poll header and hands out at most 1 launch item per poll in `body.launches`. Result items (`item: "launch_result"`) are handed out to the requester under `failures=1` (up to 20 per poll).
+
+### Lifecycle and State Transitions
+
+1. **Request:** Agent calls `swarm_launch` tool in opencode. Tool resolves root session id, mints `launch_id = rl_<base36 now>_<8 hex>`, and POSTs to daemon A's `POST /swarm/launch`.
+2. **Outbound Record & Worker Relay:** Daemon A validates the request, resolves the requester's oc-tags tag if not provided, inserts `remote_launch_outbound` with state `sending` and `request_expires_at = now + 15m`, `deadline_at = request_expires_at + 180s`. It then POSTs to worker `/launch/relay`.
+   - On 202 `accepted` -> marks state `accepted`.
+   - On transient failure -> marks `next_attempt_at = now + 5s`, returns 202 `pending`. Background `tick()` retries with backoff up to `request_expires_at`.
+   - On known refusal -> marks `refused`, returns worker's error inline.
+3. **Queueing in Worker:** Worker stores in D1 `remote_launch` (`status='queued'`).
+4. **Poll Hand-out to Target B:** Worker hands out launch to B in `launches` array. Leased for 60s (up to 3 leases).
+5. **Receiver Execution on B (`remote-launch-receiver.ts`):**
+   - Refusal checks: validate shape, check against B's `launchFrom` list, verify B's `relaySendEnabled` is true (`no_return_path` if false), check `opencodeClient` (`serve_unavailable` if missing), verify `expires_at > now`.
+   - Dedup: if `(from_machine, launch_id)` already exists in `remote_launch_inbound`, re-acks per existing state without re-running launch.
+   - Insert `remote_launch_inbound` with state `received`.
+   - Resolve directory via `resolveHome(expandShorthand(dir))`; checks character code points ≤ 0xff (refuses `invalid_directory` if violated) and filesystem existence (refuses `no_such_directory` if missing or not a directory).
+   - Framed prompt: `[Remote launch requested by <from> on <fromMachine>; report back with swarm_send to <from>.]\n\n<prompt>`.
+   - `startSession` executes with step budgets: health 5s, create 15s, prompt 20s. Hooks `onCreated` -> updates inbound row state to `created(sessionId)`.
+   - Settle inbound row state to `settled` with outcome (`launched`, `refused`, or `unconfirmed`).
+   - Acks outcome to worker `POST /launch/relay/ack` (sent one item per HTTP call).
+   - Side effects (run detached in background): `autoAttach`, Telegram info alert (`🚀 Remote launch from ...`), and `applyTag` if tag present.
+6. **Result Row Minting on Worker:** On B's ack, worker marks launch row settled and inserts a result row `r:<launch_id>` with status `queued`, addressed to `from_machine`. If an `unconfirmed` launch is later acked as `launched`, a corrective result row `r:<launch_id>:launched` is minted.
+7. **Result Delivery to Requester A:** Worker hands out `launch_result` on A's poll (under `failures=1`).
+   - Requester checks `from_machine === self`, matches against `remote_launch_outbound`, and records `result_id` in `remote_launch_results_seen`.
+   - **Never-downgrade rule:** If outbound is already `resolved` to `launched` or `refused`, an incoming `unconfirmed` item is dropped. Duplicate `unconfirmed` without session ID is also dropped if already `unconfirmed`.
+   - Formats payload using `formatLaunchResult` and inserts local swarm message (`fromSession='pigeon'`, `kind='launch.result'`) to `from_session`.
+   - Updates outbound record to `resolved`.
+   - Acks `delivered` to worker.
+8. **Deadlines & Expiry:**
+   - Worker expiry runs from the requester's poll (and hourly cron backstop). At 15 min TTL: queued launch -> `expired`/`never_collected`; leased launch -> `unconfirmed`.
+   - Local deadline on A: if `deadline_at` (15m + 180s) arrives while outbound is `sending` or `accepted`, A mints a local `unconfirmed` (no session id) `launch.result` swarm message and marks state `deadline`. A late result can still upgrade this.
+
 Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BACKOFF_SCHEDULE[min(N, 4)]` — i.e. attempt ≥5 stays at 60s. Total wall time before `failed`: ~6.5min (2+5+15+6×60s between the 10 attempts). Outage-class failures (`TargetUnavailableError`, transport) on a row with `expires_at` are instead retried every 30s, uncounted, until expiry.
 
 **The race-fix property**: at most one `prompt_async` to the same target at any time. Proven both by integration test (`test/swarm-routes.integration.test.ts` — fires 4 concurrent POSTs and asserts no overlap via timestamps) and by live smoke (10 concurrent → arbiter events strictly 500ms apart, see `2026-04-21-swarm-ipc-plan.md` Task 12 results).
@@ -495,13 +593,18 @@ if (swarmArbiter) {
 
 The arbiter is opt-in: a daemon configured without `opencodeUrl` (e.g. a worker-only deployment) skips arbiter startup entirely. The routes (`POST /swarm/send`, `GET /swarm/inbox`) still work — messages will accumulate in `state='queued'` until an arbiter eventually drains them.
 
-## OpenCode Plugin Tool
+## OpenCode Plugin Tools
 
-The plugin registers `swarm.read` as an opencode tool that calls `GET /swarm/inbox` on behalf of the calling session. See `opencode-plugin-architecture` for the tool registration mechanism. The pure helper (`swarmRead()`) and the factory (`createSwarmReadTool(daemonBaseUrl)`) live in `packages/opencode-plugin/src/swarm-tool.ts`.
+The plugin registers tools on behalf of sessions:
+- `swarm_read`: calls `GET /swarm/inbox` to read received swarm messages (`packages/opencode-plugin/src/swarm-tool.ts`).
+- `swarm_send`: POSTs to `/swarm/send` with the calling session as `from` (`packages/opencode-plugin/src/`).
+- `swarm_launch`: starts a fresh session on another machine via daemon `/swarm/launch` (`packages/opencode-plugin/src/swarm-launch-tool.ts`). Resolves the calling root session id as `from`, mints a stable `launch_id`, handles transient retries, and surfaces `pending` or `accepted`.
+- `swarm_list`: lists local and remote sessions (`packages/opencode-plugin/src/swarm-list-tool.ts`).
+- `swarm_schedule` / `swarm_scheduled`: schedules future self-wakes and manages pending wakes (`packages/opencode-plugin/src/swarm-schedule-tool.ts`).
 
 ## Senders
 
-Agents send with the plugin's `swarm_send` tool (`packages/opencode-plugin/src/`), which POSTs to `/swarm/send` with the calling session as `from`. The `pigeon-send` / `opencode-send` CLIs no longer exist (removed in workstation `91d1a91`). User-facing guidance is the workstation `assets/opencode/skills/swarm-messaging/` skill.
+Agents send with the plugin's `swarm_send` and `swarm_launch` tools. The old `pigeon-send` / `opencode-send` CLIs no longer exist (removed in workstation `91d1a91`). User-facing guidance is the workstation `assets/opencode/skills/swarm-messaging/` skill.
 
 ## Verify
 
