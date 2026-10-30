@@ -190,7 +190,7 @@ export default {
     }
     try {
       const launch = await runLaunchExpiry(env.DB);
-      if (launch.expired > 0) console.log("[remote-launch] expiry", launch);
+      if (launch.expired > 0 || launch.pruned > 0) console.log("[remote-launch] expiry", launch);
     } catch (err) {
       console.error("Launch expiry failed:", err);
     }

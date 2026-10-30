@@ -465,7 +465,7 @@ export async function runLaunchExpiry(
     if (!opts.machine) {
       const pruneRes = await db
         .prepare(
-          "DELETE FROM remote_launch WHERE status NOT IN ('queued', 'leased') AND created_at < ?",
+          "DELETE FROM remote_launch WHERE status IN ('launched', 'refused', 'expired', 'delivered') AND created_at < ?",
         )
         .bind(now - LAUNCH_RETENTION_MS)
         .run();
