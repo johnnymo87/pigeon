@@ -387,6 +387,8 @@ export function createSwarmLaunchTool(
   return tool({
     description:
       "Start a FRESH session on another machine via the pigeon daemon. " +
+      "Off unless this machine's daemon has PIGEON_REMOTE_LAUNCH_SEND=1 (errors with launch_send_disabled); " +
+      "target must list this machine in PIGEON_REMOTE_LAUNCH_FROM. " +
       "Call ONCE per launch; the result arrives as a launch.result swarm message. " +
       "'pending' means do not call again; a pool restart on that machine kills " +
       "the launched session (see the cross-device-deployment skill).",

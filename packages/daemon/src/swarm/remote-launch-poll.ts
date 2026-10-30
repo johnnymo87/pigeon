@@ -18,11 +18,59 @@ import {
   type LaunchReceiverDeps,
 } from "./remote-launch-receiver";
 
+export interface LaunchWorkLock {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+}
+
+export function createLaunchWorkLock(): LaunchWorkLock {
+  let tail: Promise<unknown> = Promise.resolve();
+  return {
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      const prev = tail;
+      let resolveTail: () => void;
+      tail = new Promise<void>((r) => {
+        resolveTail = r;
+      });
+      try {
+        await prev;
+      } catch {
+        // Continue queue even if previous task rejected
+      }
+      try {
+        return await fn();
+      } finally {
+        resolveTail!();
+      }
+    },
+  };
+}
+
+const defaultLock = createLaunchWorkLock();
+
 export interface HandleLaunchItemsDeps {
   requester?: RemoteLaunchRequester;
   client: Pick<RemoteLaunchClient, "ack">;
   receiverDeps: LaunchReceiverDeps;
+  lock?: LaunchWorkLock;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
+}
+
+export interface RunAckRetriesDeps {
+  receiverDeps: LaunchReceiverDeps;
+  lock?: LaunchWorkLock;
+  log?: (msg: string, fields?: Record<string, unknown>) => void;
+}
+
+export async function runAckRetries(deps: RunAckRetriesDeps): Promise<void> {
+  const log = deps.log ?? ((msg, fields) => console.log(`[remote-launch] ${msg}`, fields ?? ""));
+  const lock = deps.lock ?? defaultLock;
+  await lock.run(async () => {
+    try {
+      await retryLaunchAcks(deps.receiverDeps);
+    } catch (err) {
+      log("failed to retry launch acks", { err: String(err) });
+    }
+  });
 }
 
 export async function handleLaunchItems(
@@ -62,19 +110,21 @@ export async function handleLaunchItems(
     }
   }
 
-  // 2. Process launch items (receiver side)
-  if (launchItems.length > 0) {
-    try {
-      await processLaunchItems(deps.receiverDeps, launchItems);
-    } catch (err) {
-      log("failed to process launch items", { err: String(err) });
+  // 2. Process launch items (receiver side) & 3. Retry pending launch acks
+  const lock = deps.lock ?? defaultLock;
+  await lock.run(async () => {
+    if (launchItems.length > 0) {
+      try {
+        await processLaunchItems(deps.receiverDeps, launchItems);
+      } catch (err) {
+        log("failed to process launch items", { err: String(err) });
+      }
     }
-  }
 
-  // 3. Retry pending launch acks
-  try {
-    await retryLaunchAcks(deps.receiverDeps);
-  } catch (err) {
-    log("failed to retry launch acks", { err: String(err) });
-  }
+    try {
+      await retryLaunchAcks(deps.receiverDeps);
+    } catch (err) {
+      log("failed to retry launch acks", { err: String(err) });
+    }
+  });
 }

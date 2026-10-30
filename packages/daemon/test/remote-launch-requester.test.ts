@@ -510,6 +510,120 @@ describe("RemoteLaunchRequester", () => {
       );
     });
 
+    describe("pre-dedup refusal codes on tick resend", () => {
+      const preDedupCodes = [
+        { code: "unauthorized", status: 401 },
+        { code: "machine_mismatch", status: 400 },
+        { code: "worker_too_old", status: 404 },
+        { code: "launch_unavailable", status: 503 },
+      ];
+
+      for (const { code, status } of preDedupCodes) {
+        it(`treats ${code} in tick as transient: no refused message, row stays sending with backoff`, async () => {
+          client.request = vi.fn().mockResolvedValueOnce({
+            kind: "transient",
+            detail: "timeout",
+          });
+
+          const requester = makeRequester();
+          await requester.handleRequest({
+            launch_id: `lnch_${code}`,
+            from: "ses_sender123",
+            machine: "devbox",
+            directory: "/home/dev/pigeon",
+            prompt: "echo hi",
+          });
+
+          // Row is in state 'sending' with attempts = 1
+          const initialRow = storage.remoteLaunch.outbound.get(`lnch_${code}`);
+          expect(initialRow?.state).toBe("sending");
+          expect(initialRow?.attempts).toBe(1);
+
+          now += 6000;
+          client.request = vi.fn().mockResolvedValueOnce({
+            kind: "refused",
+            code,
+            detail: `${code} occurred`,
+            status,
+          });
+
+          await requester.tick();
+
+          const row = storage.remoteLaunch.outbound.get(`lnch_${code}`);
+          expect(row?.state).toBe("sending");
+          expect(row?.resolvedOutcome).toBeNull();
+          expect(row?.attempts).toBe(2);
+          expect(row?.nextAttemptAt).toBe(now + 10_000); // 5000 * 2^1 = 10000
+
+          // No refused launch.result message was inserted
+          const messages = getSwarmMessages();
+          expect(messages).toHaveLength(0);
+        });
+      }
+
+      it("normal refusal (not_accepted) in tick still marks refused and inserts launch.result", async () => {
+        client.request = vi.fn().mockResolvedValueOnce({
+          kind: "transient",
+          detail: "timeout",
+        });
+
+        const requester = makeRequester();
+        await requester.handleRequest({
+          launch_id: "lnch_not_accepted",
+          from: "ses_sender123",
+          machine: "devbox",
+          directory: "/home/dev/pigeon",
+          prompt: "echo hi",
+        });
+
+        now += 6000;
+        client.request = vi.fn().mockResolvedValueOnce({
+          kind: "refused",
+          code: "not_accepted",
+          detail: "devbox does not accept launches from cloudbox",
+          status: 403,
+        });
+
+        await requester.tick();
+
+        const row = storage.remoteLaunch.outbound.get("lnch_not_accepted");
+        expect(row?.state).toBe("refused");
+        expect(row?.resolvedOutcome).toBe("refused");
+
+        const messages = getSwarmMessages();
+        expect(messages).toHaveLength(1);
+        expect(messages[0]!.kind).toBe("launch.result");
+        expect(messages[0]!.payload).toContain(
+          "REMOTE LAUNCH REFUSED: launch lnch_not_accepted did NOT start on devbox (not_accepted).",
+        );
+      });
+
+      it("handleRequest first attempt with pre-dedup refusal code still marks refused immediately", async () => {
+        client.request = vi.fn().mockResolvedValueOnce({
+          kind: "refused",
+          code: "unauthorized",
+          detail: "bad token",
+          status: 401,
+        });
+
+        const requester = makeRequester();
+        const res = await requester.handleRequest({
+          launch_id: "lnch_unauth_initial",
+          from: "ses_sender123",
+          machine: "devbox",
+          directory: "/home/dev/pigeon",
+          prompt: "echo hi",
+        });
+
+        expect(res.status).toBe(401);
+        expect(res.body).toEqual({ error: "unauthorized", detail: "bad token" });
+
+        const row = storage.remoteLaunch.outbound.get("lnch_unauth_initial");
+        expect(row?.state).toBe("refused");
+        expect(row?.resolvedOutcome).toBe("refused");
+      });
+    });
+
     it("deadline inserts unconfirmed once", async () => {
       const requester = makeRequester();
       await requester.handleRequest({

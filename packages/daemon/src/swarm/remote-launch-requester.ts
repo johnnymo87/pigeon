@@ -25,6 +25,19 @@ export const REASON_RE = /^[a-z0-9_]{1,64}$/;
 export const LAUNCH_MAX_DIRECTORY = 512;
 export const LAUNCH_MAX_PROMPT = 16_000;
 
+/**
+ * Worker refusal codes emitted before the duplicate check that may be false
+ * if an earlier attempt landed (e.g. key rotation -> 401, worker rollback -> 404,
+ * missing table -> launch_unavailable, machine_mismatch).
+ * In tick(), when resending, these codes are treated as transient.
+ */
+export const PRE_DEDUP_REFUSAL_CODES = new Set([
+  "unauthorized",
+  "machine_mismatch",
+  "worker_too_old",
+  "launch_unavailable",
+]);
+
 export interface LaunchResultAck {
   kind: "result";
   from_machine: string;
@@ -333,7 +346,7 @@ export class RemoteLaunchRequester {
 
           if (res.kind === "accepted") {
             this.storage.remoteLaunch.outbound.markAccepted(row.launchId);
-          } else if (res.kind === "refused") {
+          } else if (res.kind === "refused" && !PRE_DEDUP_REFUSAL_CODES.has(res.code)) {
             const nowRefused = this.nowFn();
             this.storage.db.transaction(() => {
               const marked = this.storage.remoteLaunch.outbound.markRefused(

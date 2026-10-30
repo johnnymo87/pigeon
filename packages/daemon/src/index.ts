@@ -10,7 +10,11 @@ import { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import {
   type LaunchReceiverDeps,
 } from "./swarm/remote-launch-receiver";
-import { handleLaunchItems } from "./swarm/remote-launch-poll";
+import {
+  handleLaunchItems,
+  runAckRetries,
+  createLaunchWorkLock,
+} from "./swarm/remote-launch-poll";
 import {
   TelegramNotificationService,
   generateToken,
@@ -543,6 +547,8 @@ const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
     }
   : undefined;
 
+const launchWorkLock = launchReceiverDeps ? createLaunchWorkLock() : undefined;
+
 const poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
@@ -594,6 +600,7 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
                     requester: remoteLaunchRequester,
                     client: remoteLaunchClient,
                     receiverDeps: launchReceiverDeps,
+                    lock: launchWorkLock,
                     log: (msg, fields) => console.log(`[remote-launch] ${msg}`, fields ?? ""),
                   },
                   items,
@@ -947,6 +954,14 @@ relayFailSender?.start(5_000);
 let remoteLaunchRequesterTimer: NodeJS.Timeout | undefined;
 if (remoteLaunchRequester) {
   remoteLaunchRequesterTimer = setInterval(() => void remoteLaunchRequester.tick(), 5_000);
+}
+
+let remoteLaunchAckRetryTimer: NodeJS.Timeout | undefined;
+if (launchReceiverDeps) {
+  remoteLaunchAckRetryTimer = setInterval(
+    () => void runAckRetries({ receiverDeps: launchReceiverDeps, lock: launchWorkLock }),
+    5_000,
+  );
 }
 
 if (swarmArbiter) {
@@ -1337,6 +1352,10 @@ async function shutdown(signal: string): Promise<void> {
   if (remoteLaunchRequesterTimer) {
     clearInterval(remoteLaunchRequesterTimer);
     remoteLaunchRequesterTimer = undefined;
+  }
+  if (remoteLaunchAckRetryTimer) {
+    clearInterval(remoteLaunchAckRetryTimer);
+    remoteLaunchAckRetryTimer = undefined;
   }
   relayFailSender?.stop();
 

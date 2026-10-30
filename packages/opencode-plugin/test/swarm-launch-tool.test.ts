@@ -471,6 +471,9 @@ describe("createSwarmLaunchTool", () => {
     )
 
     expect(toolDef.description).toContain("FRESH session on another machine")
+    expect(toolDef.description).toContain("PIGEON_REMOTE_LAUNCH_SEND=1")
+    expect(toolDef.description).toContain("launch_send_disabled")
+    expect(toolDef.description).toContain("PIGEON_REMOTE_LAUNCH_FROM")
     expect(toolDef.description).toContain("ONCE per launch")
     expect(toolDef.description).toContain("launch.result")
     expect(toolDef.description).toContain("pending")
