@@ -8526,6 +8526,12 @@ describe("topics module and topicName", () => {
         expect(isPlaceholderTitle("Fix New session - 2026-08-11T10:11:16.127Z parsing")).toBe(false);
       });
 
+      it("isPlaceholderTitle matches goose's default title exactly", () => {
+        expect(isPlaceholderTitle("New Chat")).toBe(true);
+        expect(isPlaceholderTitle(" New Chat ")).toBe(true);
+        expect(isPlaceholderTitle("New Chat button styling")).toBe(false);
+      });
+
       it("a placeholder title never reaches the topic name; the topic is marked provisional", async () => {
         const sessionId = "ses_prov_create";
         const tg = fakeTg({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 900 } }) });

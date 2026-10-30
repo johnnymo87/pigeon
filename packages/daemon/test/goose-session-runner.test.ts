@@ -2864,6 +2864,21 @@ describe("GooseSessionRunner session title", () => {
     expect(stops[0]!.title).toBe("Fix flaky login test");
   });
 
+  /**
+   * goose names the session in parallel with the reply, so on a short turn the
+   * name can land after the turn's /stop. Persisting it on arrival keeps it
+   * from living only in this runner's memory until a /stop that may never come.
+   */
+  it("persists the title the moment goose announces it", () => {
+    const titles: Array<[string, string]> = [];
+    const { runner } = makeRunner({ setTitle: (id: string, t: string) => titles.push([id, t]) });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "New Chat" });
+
+    expect(titles).toEqual([["20260918_1", "Fix flaky login test"]]);
+  });
+
   it("sends no title when goose has not named the session", async () => {
     const { runner, client, stops } = makeRunner();
     await runner.deliver("c1", "hello");

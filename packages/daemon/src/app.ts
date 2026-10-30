@@ -261,8 +261,11 @@ export function parseSwarmSendBody(
  * matching and behaviour reverts to what it was, never worse. The worker matches the same shape
  * independently (`isPlaceholderTitle` in topics.ts) because daemons are deployed per-machine and
  * one lagging daemon must not be able to mint placeholder-named topics.
+ *
+ * goose's equivalent is the literal `New Chat` (acp/server/new_session.rs), which `honk telegram`
+ * forwards as a title before goose has named the session.
  */
-const PLACEHOLDER_TITLE_PATTERN = /^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?$/;
+const PLACEHOLDER_TITLE_PATTERN = /^(?:New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?|New Chat)$/;
 
 function parseTitle(val: unknown): string | undefined {
   if (typeof val !== "string") return undefined;

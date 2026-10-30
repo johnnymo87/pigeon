@@ -162,6 +162,8 @@ export interface GooseSessionRunnerOptions {
   postStop: (body: Record<string, unknown>) => Promise<void>;
   /** Keeps the reaper off a session whose only activity is goose-side. */
   touch: (sessionId: string) => void;
+  /** Persists the session's title as soon as goose announces it. */
+  setTitle?: (sessionId: string, title: string) => void;
   /** Persisted in-flight turns store for crash recovery (honk-znj.10). */
   inflight?: GooseInflightStore;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
@@ -1340,7 +1342,17 @@ export class GooseSessionRunner {
   onUpdate(update: Record<string, unknown>): void {
     if (update.sessionUpdate === "session_info_update") {
       const title = gooseSessionTitle(update.title);
-      if (title !== undefined) this.title = title;
+      if (title !== undefined && title !== this.title) {
+        this.title = title;
+        try {
+          this.opts.setTitle?.(this.sessionId, title);
+        } catch (err) {
+          this.log("goose runner: setTitle failed", {
+            sessionId: this.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
 
     const turn = this.turn;
