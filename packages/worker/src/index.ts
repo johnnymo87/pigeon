@@ -8,6 +8,7 @@ import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
+import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
@@ -52,6 +53,14 @@ export default {
         }
         if (path === "/swarm/relay/fail" && method === "POST") {
           return handleRelayFail(db, env, request);
+        }
+
+        // Remote launch (pigeon-k0qn.17). Machine credentials only.
+        if (path === "/launch/relay" && method === "POST") {
+          return handleLaunchRelay(db, env, request);
+        }
+        if (path === "/launch/relay/ack" && method === "POST") {
+          return handleLaunchRelayAck(db, env, request);
         }
 
         // Sessions
@@ -178,6 +187,12 @@ export default {
       if (relay.expired > 0) console.log("[relay] expiry", relay);
     } catch (err) {
       console.error("Relay expiry failed:", err);
+    }
+    try {
+      const launch = await runLaunchExpiry(env.DB);
+      if (launch.expired > 0 || launch.pruned > 0) console.log("[remote-launch] expiry", launch);
+    } catch (err) {
+      console.error("Launch expiry failed:", err);
     }
     try {
       await sweepStaleSessions(env.DB);

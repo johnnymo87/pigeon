@@ -130,9 +130,10 @@ beforeEach(async () => {
 describe("parseRelayHeader", () => {
   it("parses accept and failures, drops malformed machine ids, and treats absence as null", () => {
     expect(parseRelayHeader(null)).toBeNull();
-    expect(parseRelayHeader("accept=b,a, a ,BAD!; failures=1")).toEqual({ accept: ["a", "b"], failures: true });
-    expect(parseRelayHeader("failures=1")).toEqual({ accept: [], failures: true });
-    expect(parseRelayHeader("")).toEqual({ accept: [], failures: false });
+    expect(parseRelayHeader("accept=b,a, a ,BAD!; failures=1")).toEqual({ accept: ["a", "b"], launch: [], failures: true });
+    expect(parseRelayHeader("failures=1")).toEqual({ accept: [], launch: [], failures: true });
+    expect(parseRelayHeader("")).toEqual({ accept: [], launch: [], failures: false });
+    expect(parseRelayHeader("accept=a; launch=c,b,BAD!; failures=1")).toEqual({ accept: ["a"], launch: ["b", "c"], failures: true });
   });
 });
 
