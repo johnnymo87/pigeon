@@ -325,7 +325,7 @@ Key log lines and their meaning:
 | Log line | Meaning |
 |---|---|
 | `[remote-launch] launch_from=<list> launch_send=<on|off>` | Boot banner indicating configured remote launch accept list and send capability. |
-| `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: <list>` | Receiver warning: `remoteLaunchFrom` is set, but receiving is disabled because one or more prerequisites (`opencodeClient`, `telegramBotToken`, `telegramChatId`, `remoteLaunchClient`) are missing. Daemon advertises empty `launch=` in poll header. |
+| `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: <list>` | Receiver warning: `remoteLaunchFrom` is set, but receiving is disabled because one or more prerequisites (`opencodeClient`, `telegramBotToken`, `telegramChatId`, `remoteLaunchClient`) are missing. The daemon leaves `launch=` out of its poll header. |
 | `[remote-launch] remoteLaunchSend is enabled but worker credentials are missing...` | Sender warning: `PIGEON_REMOTE_LAUNCH_SEND=1` is set, but daemon lacks worker credentials. |
 | `[remote-launch] from_machine not accepted` | Receiver refused launch: sending machine is not listed in `PIGEON_REMOTE_LAUNCH_FROM` or equals self. |
 | `[remote-launch] relaySendEnabled is false, refusing no_return_path` | Receiver refused launch: B's `PIGEON_SWARM_RELAY_SEND` is not `1`, so the launched session would have no return path to report back to A. |
@@ -333,7 +333,7 @@ Key log lines and their meaning:
 | `[remote-launch] directory is not absolute or not a directory` / `resolved directory contains character above U+00FF` | Receiver refused launch: directory does not exist (`no_such_directory`) or contains non-Latin1 characters (`invalid_directory`). |
 | `[remote-launch] existing inbound row found, re-acking per state` | Re-handout of an already processed launch (e.g. after a lost ack): B re-acks its current state without launching a second session. |
 | `[remote-launch] ack item failed wire validation, marking done` | Wire safety: an ack item violated regex constraints, marked done locally to prevent blocking the ack queue. |
-| `[remote-launch] failed to ack launch_result item` | Requester failed to ack a result item to the worker; worker will re-hand out on next poll. |
+| `[remote-launch] ack answered <status>` / `[remote-launch] ack failed: <error>` | An ack (launch on B, result on A) did not land. B retries launch acks from `remote_launch_inbound` every 5s with backoff; a result ack is not stored, the worker re-hands the result out and `remote_launch_results_seen` dedups it. |
 | `[remote-launch] error processing send retry in tick` / `error processing deadline in tick` | Requester background loop encountered an error retrying a pending launch or enforcing the 15m+180s deadline. |
 
 ## Force-Failing A Stuck Retry Loop

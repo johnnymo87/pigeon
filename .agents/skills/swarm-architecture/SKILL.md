@@ -402,7 +402,7 @@ X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
 ```
 
 - Advertised only if B is **launch-capable** (`config.remoteLaunchFrom.length > 0`, `opencodeClient` available, bot token and chat ID present, and worker credentials configured).
-- If `remoteLaunchFrom` is set but B lacks any capability, the daemon logs a warning naming what is missing and advertises an empty `launch=` token.
+- If `remoteLaunchFrom` is set but B lacks any capability, the daemon logs a warning naming what is missing and leaves the `launch=` token out of its poll header, so it is handed no launches (results for its own requests still arrive on `failures=1`).
 - Hand-out: worker checks target's live poll header and hands out at most 1 launch item per poll in `body.launches`. Result items (`item: "launch_result"`) are handed out to the requester under `failures=1` (up to 20 per poll).
 
 ### Lifecycle and State Transitions

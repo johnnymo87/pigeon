@@ -144,20 +144,31 @@ swarm_launch({
 4. curl -s http://127.0.0.1:4731/health must show ok:true.
 5. swarm_send me: the new HEAD sha, the health output, and anything that failed. If the
    plugin changed, say that it is NOT verified yet: you are running on the old plugin.
-6. Only if the plugin changed, and only AFTER step 5, schedule the serve-pool restart
-   from a delayed job (restarting the pool directly kills you mid-turn):
-   export XDG_RUNTIME_DIR=/run/user/$(id -u)
-   systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect --setenv=PATH="$PATH" systemctl --user restart opencode-serve-pool.target
-   Then stop. Do not try to verify the restart.`
+6. Do NOT restart the serve pool unless I asked for it in this prompt.`
 })
+```
+
+Before ending your own turn on A, schedule a wake (`swarm_schedule`, about 20 minutes) that
+checks B shows `available` in `swarm_list remote: true` and that its report arrived. A daemon
+that fails to come back up cannot send that report, and takes B's Telegram and relay down with
+it, so silence is the failure signal and nothing else will raise it.
+
+If the plugin changed and Jonathan wants it live before the nightly reset, the prompt's last
+step (after the report) can be a delayed pool restart:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect \
+  --setenv=PATH="$PATH" systemctl --user restart opencode-serve-pool.target
 ```
 
 ### Rules
 
 1. **The pool-restart trap.** The launched session lives on B's serve pool. Restarting the pool
-   (step 3 of the per-machine deploy) kills it, and any other session there, mid-turn. So the
-   restart is optional (needed only for a plugin change, as above), comes last, after the
-   report, and runs from a delayed transient unit rather than inline. `XDG_RUNTIME_DIR` and
+   (step 3 of the per-machine deploy) kills it mid-turn, and also every other session there,
+   including a human's. So the restart is not a default step: it needs a plugin change and an
+   explicit ask, comes last, after the report, and runs from a delayed transient unit rather
+   than inline. `XDG_RUNTIME_DIR` and
    `PATH` are passed because opencode bash calls lack the first and transient units get a
    minimal second (see the user-level "Backgrounding Long-Running Processes" notes).
 2. **A plugin change cannot be verified by the session that deployed it.** It is running on the
