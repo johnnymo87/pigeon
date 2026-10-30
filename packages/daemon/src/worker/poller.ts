@@ -405,6 +405,11 @@ export interface PollerCallbacks {
    * A throw is logged and does not cost the command.
    */
   onRelayItems?: (items: unknown[]) => Promise<void>;
+  /**
+   * Remote launch items from a poll response (pigeon-k0qn.17), awaited after `onRelayItems`
+   * and before command dispatch. A throw is logged and does not cost the command.
+   */
+  onLaunchItems?: (items: unknown[]) => Promise<void>;
 }
 
 export interface PollerDeps {
@@ -482,12 +487,19 @@ export class Poller {
     }
     this.polling = true;
     try {
-      const { msg, swarm } = await this.pollNext();
+      const { msg, swarm, launches } = await this.pollNext();
       if (swarm.length > 0 && this.callbacks.onRelayItems) {
         try {
           await this.callbacks.onRelayItems(swarm);
         } catch (err) {
           console.warn("[poller] relay items failed:", err instanceof Error ? err.message : String(err));
+        }
+      }
+      if (launches.length > 0 && this.callbacks.onLaunchItems) {
+        try {
+          await this.callbacks.onLaunchItems(launches);
+        } catch (err) {
+          console.warn("[poller] launch items failed:", err instanceof Error ? err.message : String(err));
         }
       }
       if (msg === null) {
@@ -507,10 +519,11 @@ export class Poller {
   }
 
   /**
-   * One poll: the next command (null for none) and any relay items. A relay-aware worker
-   * answers a poll with relay items but no command as 200 `{swarm: [...]}` with no `commandId`.
+   * One poll: the next command (null for none), any relay items, and any remote launch items.
+   * A relay-aware worker answers a poll with relay or launch items but no command as 200
+   * `{swarm?, launches?}` with no `commandId`.
    */
-  async pollNext(): Promise<{ msg: WorkerMessage | null; swarm: unknown[] }> {
+  async pollNext(): Promise<{ msg: WorkerMessage | null; swarm: unknown[]; launches: unknown[] }> {
     const url = `${this.config.workerUrl}/machines/${encodeURIComponent(this.config.machineId)}/next`;
     const response = await this.fetchFn(url, {
       headers: {
@@ -538,7 +551,7 @@ export class Poller {
     }
 
     if (response.status === 204) {
-      return { msg: null, swarm: [] };
+      return { msg: null, swarm: [], launches: [] };
     }
 
     if (!response.ok) {
@@ -547,9 +560,10 @@ export class Poller {
 
     const body = (await response.json()) as Record<string, unknown>;
     const swarm = Array.isArray(body.swarm) ? (body.swarm as unknown[]) : [];
-    if (typeof body.commandId !== "string") return { msg: null, swarm };
-    const { swarm: _swarm, ...command } = body;
-    return { msg: command as unknown as WorkerMessage, swarm };
+    const launches = Array.isArray(body.launches) ? (body.launches as unknown[]) : [];
+    if (typeof body.commandId !== "string") return { msg: null, swarm, launches };
+    const { swarm: _swarm, launches: _launches, ...command } = body;
+    return { msg: command as unknown as WorkerMessage, swarm, launches };
   }
 
   /**

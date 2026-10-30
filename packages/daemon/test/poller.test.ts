@@ -1603,6 +1603,164 @@ describe("Poller dispatch — tag commands", () => {
   });
 });
 
+describe("Poller remote launch items (pigeon-k0qn.17)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("pollNext() returns launches array and strips it from msg", async () => {
+    const rawLaunch = { item: "launch", launch_id: "ln-1", from: "ses_1", directory: "/tmp", prompt: "hi" };
+    const command = makeExecuteMsg();
+    const fetchFn = vi.fn().mockResolvedValue(
+      json200({
+        ...command,
+        swarm: [{ item: "message", msg_id: "m-1" }],
+        launches: [rawLaunch],
+      }),
+    ) as unknown as typeof fetch;
+
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+    const { msg, swarm, launches } = await poller.pollNext();
+
+    expect(launches).toEqual([rawLaunch]);
+    expect(swarm).toHaveLength(1);
+    expect(msg).toEqual(command);
+    expect((msg as Record<string, unknown> | null)?.launches).toBeUndefined();
+    expect((msg as Record<string, unknown> | null)?.swarm).toBeUndefined();
+  });
+
+  it("pollNext() returns empty launches on 204 or when body has no launches", async () => {
+    const fetch204 = vi.fn().mockResolvedValue(noContent()) as unknown as typeof fetch;
+    const poller204 = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetch204 });
+    const res204 = await poller204.pollNext();
+    expect(res204.launches).toEqual([]);
+
+    const fetchNoLaunches = vi.fn().mockResolvedValue(json200({ ...makeExecuteMsg() })) as unknown as typeof fetch;
+    const pollerNoLaunches = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchNoLaunches });
+    const resNoLaunches = await pollerNoLaunches.pollNext();
+    expect(resNoLaunches.launches).toEqual([]);
+  });
+
+  it("pollNext() returns launches when body has no commandId", async () => {
+    const rawLaunch = { item: "launch_result", result_id: "r-1", launch_id: "ln-1" };
+    const fetchFn = vi.fn().mockResolvedValue(
+      json200({
+        launches: [rawLaunch],
+      }),
+    ) as unknown as typeof fetch;
+
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
+    const { msg, swarm, launches } = await poller.pollNext();
+
+    expect(msg).toBeNull();
+    expect(swarm).toEqual([]);
+    expect(launches).toEqual([rawLaunch]);
+  });
+
+  it("calls callbacks in order: onRelayItems -> onLaunchItems -> command dispatch", async () => {
+    const callOrder: string[] = [];
+    const rawRelay = { item: "message", msg_id: "m-1" };
+    const rawLaunch = { item: "launch", launch_id: "ln-1" };
+    const msg = makeExecuteMsg();
+
+    const onRelayItems = vi.fn(async () => {
+      callOrder.push("relay");
+    });
+    const onLaunchItems = vi.fn(async () => {
+      callOrder.push("launch");
+    });
+    const onCommand = vi.fn(async () => {
+      callOrder.push("command");
+    });
+
+    const callbacks = makeCallbacks({
+      onRelayItems,
+      onLaunchItems,
+      onCommand,
+    });
+
+    const fetchFn = makeFetch([
+      () =>
+        json200({
+          ...msg,
+          swarm: [rawRelay],
+          launches: [rawLaunch],
+        }),
+      () => ackOk(),
+    ]);
+
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onRelayItems).toHaveBeenCalledWith([rawRelay]);
+    expect(onLaunchItems).toHaveBeenCalledWith([rawLaunch]);
+    expect(onCommand).toHaveBeenCalledWith(msg);
+    expect(callOrder).toEqual(["relay", "launch", "command"]);
+    poller.stop();
+  });
+
+  it("a throwing onLaunchItems does not cost the command (dispatched and acked)", async () => {
+    const rawLaunch = { item: "launch", launch_id: "ln-1" };
+    const msg = makeExecuteMsg();
+    const acked: string[] = [];
+
+    const onLaunchItems = vi.fn().mockRejectedValue(new Error("launch processing exploded"));
+    const onCommand = vi.fn().mockResolvedValue(undefined);
+
+    const callbacks = makeCallbacks({
+      onLaunchItems,
+      onCommand,
+    });
+
+    const fetchFn = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/next")) {
+        return Promise.resolve(
+          json200({
+            ...msg,
+            launches: [rawLaunch],
+          }),
+        );
+      }
+      if (String(url).includes("/ack")) {
+        acked.push(String(url));
+        return Promise.resolve(ackOk());
+      }
+      return Promise.resolve(noContent());
+    });
+
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn: fetchFn as unknown as typeof fetch });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onLaunchItems).toHaveBeenCalledWith([rawLaunch]);
+    expect(onCommand).toHaveBeenCalledWith(msg);
+    expect(acked.some((u) => u.includes("cmd-1"))).toBe(true);
+    poller.stop();
+  });
+
+  it("does not call onLaunchItems when launches is empty", async () => {
+    const onLaunchItems = vi.fn().mockResolvedValue(undefined);
+    const callbacks = makeCallbacks({ onLaunchItems });
+
+    const fetchFn = makeFetch([
+      () => json200({ ...makeExecuteMsg() }),
+      () => ackOk(),
+    ]);
+
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onLaunchItems).not.toHaveBeenCalled();
+    poller.stop();
+  });
+});
+
 describe("Poller.lookupSessionOwner() (pigeon-k0qn.2)", () => {
   const mk = (res: Response) => {
     const fetchFn = vi.fn().mockResolvedValue(res);

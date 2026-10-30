@@ -3,8 +3,15 @@ import { createApp } from "./app";
 import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
 import { RelayClient, relayPollHeader } from "./worker/relay-client";
+import { RemoteLaunchClient } from "./worker/remote-launch-client";
 import { processRelayItems } from "./swarm/relay-receiver";
 import { RelayFailSender } from "./swarm/relay-fail-sender";
+import { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
+import {
+  processLaunchItems,
+  retryLaunchAcks,
+  type LaunchReceiverDeps,
+} from "./swarm/remote-launch-receiver";
 import {
   TelegramNotificationService,
   generateToken,
@@ -38,7 +45,7 @@ import {
   ingestTagTopCommand,
 } from "./worker/tag-ingest";
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
-import { SessionTagResolver } from "./tag-resolver";
+import { SessionTagResolver, parseWhichLine } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
@@ -468,6 +475,75 @@ if (config.swarmRelayAcceptFrom.length > 0 || config.swarmRelaySend) {
   );
 }
 
+// Remote launch client (pigeon-k0qn.17).
+const remoteLaunchClient = config.workerUrl && config.workerApiKey
+  ? new RemoteLaunchClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
+  : undefined;
+
+const launchCapable = Boolean(
+  config.remoteLaunchFrom.length > 0 &&
+  opencodeClient &&
+  config.telegramBotToken &&
+  config.telegramChatId &&
+  remoteLaunchClient,
+);
+
+if (config.remoteLaunchFrom.length > 0 || config.remoteLaunchSend) {
+  console.log(
+    `[remote-launch] launch_from=${config.remoteLaunchFrom.join(",") || "(none)"} launch_send=${config.remoteLaunchSend ? "on" : "off"}`,
+  );
+}
+if (config.remoteLaunchFrom.length > 0 && !launchCapable) {
+  const missing: string[] = [];
+  if (!opencodeClient) missing.push("opencodeClient");
+  if (!config.telegramBotToken) missing.push("telegramBotToken");
+  if (!config.telegramChatId) missing.push("telegramChatId");
+  if (!remoteLaunchClient) missing.push("remoteLaunchClient");
+  console.warn(
+    `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: ${missing.join(", ")}`,
+  );
+}
+if (config.remoteLaunchSend && !remoteLaunchClient) {
+  console.warn(
+    "[remote-launch] remoteLaunchSend is enabled but worker credentials are missing; remote launch will not be available",
+  );
+}
+
+const remoteLaunchRequester = remoteLaunchClient
+  ? new RemoteLaunchRequester({
+      storage,
+      client: remoteLaunchClient,
+      sendEnabled: config.remoteLaunchSend,
+      selfMachineId: config.machineId ?? "",
+      resolveRequesterTag: async (sessionId: string) => {
+        const runner = resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS);
+        if (!runner) return null;
+        try {
+          const res = await runner(["which", sessionId]);
+          if (!res || res.code !== 0) return null;
+          const which = parseWhichLine(String(res.stdout ?? ""));
+          return which?.kind === "session" ? which.tag : null;
+        } catch {
+          return null;
+        }
+      },
+    })
+  : undefined;
+
+const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
+  ? {
+      storage,
+      selfMachineId: config.machineId ?? "",
+      launchFrom: launchCapable ? config.remoteLaunchFrom : [],
+      relaySendEnabled: config.swarmRelaySend,
+      ...(opencodeClient ? { opencodeClient } : {}),
+      resolveOwnerClient: clientForSession,
+      ack: (items) => remoteLaunchClient.ack(items),
+      runOcTags: () => resolveRunOcTags(),
+      onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
+    }
+  : undefined;
+
 const poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
@@ -490,7 +566,11 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           opencode: Boolean(opencodeClient),
           goose: canLaunchGoose,
         }),
-        relayHeader: relayPollHeader(config.swarmRelayAcceptFrom, true),
+        relayHeader: relayPollHeader(
+          config.swarmRelayAcceptFrom,
+          true,
+          launchCapable ? config.remoteLaunchFrom : [],
+        ),
       },
       {
         // Relay items: inserted and acked before this poll's command is dispatched.
@@ -506,6 +586,37 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
           );
           await relayClient?.ack(acks);
         },
+        // Remote launch items: process results and launch items, then retry launch acks.
+        ...(remoteLaunchClient && launchReceiverDeps
+          ? {
+              onLaunchItems: async (items: unknown[]) => {
+                const launchItems: unknown[] = [];
+                const resultItems: unknown[] = [];
+                for (const item of items) {
+                  if (typeof item === "object" && item !== null) {
+                    const kind = (item as { item?: unknown }).item;
+                    if (kind === "launch_result") {
+                      resultItems.push(item);
+                    } else if (kind === "launch") {
+                      launchItems.push(item);
+                    }
+                  }
+                }
+
+                if (remoteLaunchRequester && resultItems.length > 0) {
+                  const acks = remoteLaunchRequester.processResults(resultItems);
+                  for (const ack of acks) {
+                    await remoteLaunchClient.ack([ack]);
+                  }
+                }
+
+                if (launchItems.length > 0) {
+                  await processLaunchItems(launchReceiverDeps, launchItems);
+                }
+                await retryLaunchAcks(launchReceiverDeps);
+              },
+            }
+          : {}),
         // Any inbound action on a session means the user is looking at it, so the
         // unread badge clears. This is the single boundary every Telegram-originated
         // command crosses -- a typed reply and a question-card callback both arrive
@@ -849,6 +960,11 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
 const relayFailSender = relayClient ? new RelayFailSender(storage, relayClient) : undefined;
 relayFailSender?.start(5_000);
 
+let remoteLaunchRequesterTimer: NodeJS.Timeout | undefined;
+if (remoteLaunchRequester) {
+  remoteLaunchRequesterTimer = setInterval(() => void remoteLaunchRequester.tick(), 5_000);
+}
+
 if (swarmArbiter) {
   swarmArbiter.start(500);
   console.log("[pigeon-daemon] swarm arbiter started (interval=500ms)");
@@ -908,6 +1024,15 @@ setInterval(() => {
   // Kept while its message row lives, though: the hop rule and the /fail diversion read it.
   const relayInboundCleaned = storage.relayInbound.pruneOlderThan(now - 8 * 24 * 60 * 60 * 1000);
   if (relayInboundCleaned > 0) console.log(`[relay] pruned ${relayInboundCleaned} inbound records`);
+
+  const remoteLaunchCleaned = storage.remoteLaunch.pruneOlderThan(now - 8 * 24 * 60 * 60 * 1000);
+  const totalRemoteLaunchCleaned =
+    remoteLaunchCleaned.inbound + remoteLaunchCleaned.outbound + remoteLaunchCleaned.resultsSeen;
+  if (totalRemoteLaunchCleaned > 0) {
+    console.log(
+      `[remote-launch] pruned ${totalRemoteLaunchCleaned} records (inbound=${remoteLaunchCleaned.inbound}, outbound=${remoteLaunchCleaned.outbound}, resultsSeen=${remoteLaunchCleaned.resultsSeen})`,
+    );
+  }
 
   // Unlike the swarm cleanup above, which spares 'queued' rows, every ledger row is
   // prunable: a row exists only because delivery already succeeded, so there is no
@@ -1144,6 +1269,7 @@ const app = createApp(storage, {
   // swarm_list remote discovery (pigeon-k0qn.9). Absent without a worker: 503 no_worker.
   listRemoteSessions: poller ? (limit, signal) => poller.listRemoteSessions(limit, signal) : undefined,
   swarmRelaySend: config.swarmRelaySend,
+  remoteLaunch: remoteLaunchRequester,
   // Registers whatever `notify` says: the worker row is the session's ownership claim for
   // cross-machine relays (pigeon-k0qn.5), not only its notification route.
   onSessionStart: async (sessionId, _notify, label) => {
@@ -1223,6 +1349,12 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[pigeon-daemon] ${signal} received, draining swarm arbiter...`);
+
+  if (remoteLaunchRequesterTimer) {
+    clearInterval(remoteLaunchRequesterTimer);
+    remoteLaunchRequesterTimer = undefined;
+  }
+  relayFailSender?.stop();
 
   if (swarmArbiter) {
     try {
