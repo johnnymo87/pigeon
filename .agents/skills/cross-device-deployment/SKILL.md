@@ -31,12 +31,21 @@ daemon. One command does all of it, on every host:
 <project-path>/pigeon/scripts/deploy-daemon.sh             # pull, install, check, restart, poll /health
 ```
 
+**First rollout of the script:** a production checkout older than the commit that added it has no
+`scripts/deploy-daemon.sh` yet. Run it from any up-to-date worktree instead (it finds the
+production checkout from the service, not from its own location), or `git pull --ff-only` the
+checkout once by hand first.
+
 It reads the running service definition (launchd plist on macOS, the systemd unit and its
 `ExecStart` wrapper on Linux) to find the node binary the daemon execs and the checkout it runs,
 so it works from a worktree and from a non-interactive shell with no `npm` on PATH. It refuses —
 and never stashes, resets or cleans — when the checkout is not on `main`, has tracked edits, or
-has commits on no remote. After `npm install` it loads `better-sqlite3` under the service's node
-and **does not restart** if that fails, so the running daemon stays up. Override with
+has commits on no remote. After `npm install` it checks that `tsx` is present and `better-sqlite3`
+loads under the service's node (running `npm rebuild better-sqlite3` once if not: `npm install`
+leaves a wrong-ABI binary in place) and **does not restart** if that still fails. That does not
+make a failure harmless: the checkout is already pulled, and the next restart of the daemon,
+including the unattended nightly one on devbox/cloudbox, runs it. The script says so on exit; fix
+`node_modules` and re-run rather than leaving it. Override with
 `PIGEON_DAEMON_NODE_DIR` / `PIGEON_DAEMON_REPO` only if resolution fails on an unusual host.
 
 ### Why the node matters
@@ -146,9 +155,9 @@ curl -s http://127.0.0.1:4096/global/health   # opencode-serve (ONE pool instanc
 Both should return JSON with `"ok":true` / `"healthy":true`. `/health` is anonymous by design.
 
 Any **other** daemon route needs `Authorization: Bearer <token>` only where the host sets
-`PIGEON_DAEMON_AUTH_TOKEN` (cloudbox, from `/run/secrets/pigeon_daemon_auth_token`). Daemon auth is
-off where it is unset (macbook today: the plist has no such variable), and the header is then
-omitted, not sent empty. Check before copying a curl from another host:
+`PIGEON_DAEMON_AUTH_TOKEN` (devbox and cloudbox, from `/run/secrets/pigeon_daemon_auth_token`).
+Daemon auth is off where it is unset (macbook today: the plist has no such variable), and the
+header is then omitted, not sent empty. Check before copying a curl from another host:
 `plutil -p ~/Library/LaunchAgents/org.nix-community.home.pigeon-daemon.plist | grep AUTH_TOKEN` /
 `grep AUTH_TOKEN "$(systemctl show pigeon-daemon.service -p ExecStart --value | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"`
 (no output: off). On NixOS it is exported by the start wrapper, so `systemctl show -p Environment`

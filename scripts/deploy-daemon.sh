@@ -80,7 +80,7 @@ if [ -n "${PIGEON_DAEMON_NODE_DIR:-}" ]; then
   NODE_DIR="$PIGEON_DAEMON_NODE_DIR"
 else
   node_bin="$(printf '%s\n' "$launcher" | grep -oE "/[^ \"']*/bin/node([ \"']|$)" \
-    | head -1 | sed -E "s/[ \"']$//")"
+    | head -1 | sed -E "s/[ \"']$//" || true)"
   [ -n "$node_bin" ] || die "cannot find the node binary in the service's launcher (set PIGEON_DAEMON_NODE_DIR)"
   NODE_DIR="$(dirname "$node_bin")"
 fi
@@ -90,7 +90,7 @@ fi
 if [ -n "${PIGEON_DAEMON_REPO:-}" ]; then
   REPO="$PIGEON_DAEMON_REPO"
 else
-  tsx="$(printf '%s\n' "$launcher" | grep -oE "/[^ \"']*/node_modules/tsx/" | head -1)"
+  tsx="$(printf '%s\n' "$launcher" | grep -oE "/[^ \"']*/node_modules/tsx/" | head -1 || true)"
   [ -n "$tsx" ] || die "cannot find the repo (node_modules/tsx) in the service's launcher (set PIGEON_DAEMON_REPO)"
   REPO="${tsx%/node_modules/tsx/}"
 fi
@@ -103,10 +103,16 @@ say "node:     $NODE_DIR/node ($("$NODE_DIR/node" -v), ABI $("$NODE_DIR/node" -p
 # Runs node/npm exactly as the service would see them. PATH is prefixed, not
 # just the binary named, because better-sqlite3's install scripts call `node`.
 with_node() { PATH="$NODE_DIR:$PATH" "$@"; }
-sqlite_check() {
+# What the service needs from node_modules: tsx (a devDependency it execs) and
+# a better-sqlite3 binary built for ITS node's ABI.
+runtime_check() {
+  [ -f "$REPO/node_modules/tsx/dist/cli.mjs" ] || return 1
   (cd "$REPO/packages/daemon" && with_node node -e \
-    'new (require("better-sqlite3"))(":memory:").close()')
+    'new (require("better-sqlite3"))(":memory:").close()') 2>/dev/null
 }
+# npm install does not re-run install scripts for an unchanged package, so a
+# binary built earlier for the wrong ABI survives it; only a rebuild fixes that.
+REBUILD_HINT="(cd $REPO && PATH=$NODE_DIR:\$PATH npm rebuild better-sqlite3)"
 
 # --- 3. Preflight (read-only) -------------------------------------------------
 g() { git -C "$REPO" "$@"; }
@@ -121,15 +127,16 @@ if [ "$DRY_RUN" = 1 ]; then
   ahead="$(g rev-list --count '@{u}..HEAD')"
   behind="$(g rev-list --count 'HEAD..@{u}')"
   say "HEAD:     $(g rev-parse --short HEAD) (vs last-fetched upstream: ahead $ahead, behind $behind; not fetched)"
-  if sqlite_check 2>/dev/null; then
-    say "better-sqlite3 currently loads under the service's node"
+  if runtime_check; then
+    say "node_modules currently fits the service's node (tsx present, better-sqlite3 loads)"
   else
-    say "WARNING: better-sqlite3 does NOT load under the service's node right now"
+    say "WARNING: node_modules does NOT fit the service's node right now; the next restart"
+    say "  (devbox/cloudbox restart it nightly) would fail. Fix: $REBUILD_HINT"
   fi
   say "dry run; would run:"
   say "  git -C $REPO pull --ff-only"
   say "  (cd $REPO && PATH=$NODE_DIR:\$PATH npm install --no-audit --no-fund)"
-  say "  better-sqlite3 load check under $NODE_DIR/node"
+  say "  tsx + better-sqlite3 check under $NODE_DIR/node (npm rebuild better-sqlite3 once if it fails)"
   say "  ${restart_cmd[*]}"
   say "  poll $HEALTH_URL"
   exit 0
@@ -145,14 +152,33 @@ g pull --ff-only --quiet
 after="$(g rev-parse --short HEAD)"
 say "pulled:   $before -> $after"
 
+# From here the checkout is ahead of the running daemon. Any failure leaves it
+# that way, and the next restart -- including the unattended nightly one on
+# devbox/cloudbox -- runs whatever is on disk. Say so instead of "unaffected".
+restarted=0
+# shellcheck disable=SC2329  # invoked via trap
+on_exit() {
+  rc=$?
+  if [ "$rc" != 0 ] && [ "$restarted" = 0 ]; then
+    echo "deploy-daemon: FAILED before restart. The checkout is at $after but the daemon still runs $before." >&2
+    echo "deploy-daemon: The NEXT restart (nightly on devbox/cloudbox) runs $after as installed now." >&2
+    echo "deploy-daemon: Fix node_modules ($REBUILD_HINT) and re-run; do NOT reset/stash/clean the checkout." >&2
+  fi
+}
+trap on_exit EXIT
+
 (cd "$REPO" && with_node npm install --no-audit --no-fund)
 
-# Gate the restart on the native module loading under the service's node. The
-# running daemon already has its copy loaded, so failing here leaves it up.
-sqlite_check || die "better-sqlite3 does not load under $NODE_DIR/node after install; NOT restarting (the running daemon is unaffected)"
+# Gate the restart on node_modules fitting the service's node.
+if ! runtime_check; then
+  say "node_modules does not fit $NODE_DIR/node; rebuilding better-sqlite3 once"
+  (cd "$REPO" && with_node npm rebuild better-sqlite3)
+  runtime_check || die "tsx missing or better-sqlite3 does not load under $NODE_DIR/node; NOT restarting"
+fi
 
 # --- 5. Restart and verify ----------------------------------------------------
 say "restarting: ${restart_cmd[*]}"
+restarted=1
 "${restart_cmd[@]}"
 
 for _ in $(seq 1 30); do
