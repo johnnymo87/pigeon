@@ -8,10 +8,9 @@ import { processRelayItems } from "./swarm/relay-receiver";
 import { RelayFailSender } from "./swarm/relay-fail-sender";
 import { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import {
-  processLaunchItems,
-  retryLaunchAcks,
   type LaunchReceiverDeps,
 } from "./swarm/remote-launch-receiver";
+import { handleLaunchItems } from "./swarm/remote-launch-poll";
 import {
   TelegramNotificationService,
   generateToken,
@@ -590,30 +589,15 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
         ...(remoteLaunchClient && launchReceiverDeps
           ? {
               onLaunchItems: async (items: unknown[]) => {
-                const launchItems: unknown[] = [];
-                const resultItems: unknown[] = [];
-                for (const item of items) {
-                  if (typeof item === "object" && item !== null) {
-                    const kind = (item as { item?: unknown }).item;
-                    if (kind === "launch_result") {
-                      resultItems.push(item);
-                    } else if (kind === "launch") {
-                      launchItems.push(item);
-                    }
-                  }
-                }
-
-                if (remoteLaunchRequester && resultItems.length > 0) {
-                  const acks = remoteLaunchRequester.processResults(resultItems);
-                  for (const ack of acks) {
-                    await remoteLaunchClient.ack([ack]);
-                  }
-                }
-
-                if (launchItems.length > 0) {
-                  await processLaunchItems(launchReceiverDeps, launchItems);
-                }
-                await retryLaunchAcks(launchReceiverDeps);
+                await handleLaunchItems(
+                  {
+                    requester: remoteLaunchRequester,
+                    client: remoteLaunchClient,
+                    receiverDeps: launchReceiverDeps,
+                    log: (msg, fields) => console.log(`[remote-launch] ${msg}`, fields ?? ""),
+                  },
+                  items,
+                );
               },
             }
           : {}),

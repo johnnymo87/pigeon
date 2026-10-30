@@ -34,6 +34,7 @@ export interface SwarmLaunchRequestOptions {
   fetchFn?: typeof fetch
   sleepFn?: (ms: number) => Promise<void>
   makeLaunchId?: () => string
+  timeoutMs?: number
 }
 
 export interface SwarmLaunchResult {
@@ -94,7 +95,12 @@ export async function resolveRootSession(
         data?: { parentID?: string }
       } | null
       const parentId = data?.parentID ?? data?.data?.parentID
-      if (!parentId || typeof parentId !== "string" || seen.has(parentId)) {
+      if (
+        !parentId ||
+        typeof parentId !== "string" ||
+        !parentId.startsWith("ses_") ||
+        seen.has(parentId)
+      ) {
         return currentId
       }
       seen.add(parentId)
@@ -112,6 +118,30 @@ export async function resolveRootSession(
  */
 const KNOWN_429_REFUSALS = new Set(["queue_full", "rate_limited"])
 const KNOWN_503_REFUSALS = new Set(["target_offline", "launch_unavailable", "no_worker"])
+
+function isConnectionRefused(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false
+  const directCode = (err as { code?: unknown }).code
+  if (directCode === "ECONNREFUSED") return true
+
+  const cause = (err as { cause?: unknown }).cause
+  if (cause && typeof cause === "object") {
+    const causeCode = (cause as { code?: unknown }).code
+    if (causeCode === "ECONNREFUSED") return true
+    const innerCause = (cause as { cause?: unknown }).cause
+    if (innerCause && typeof innerCause === "object") {
+      const innerCode = (innerCause as { code?: unknown }).code
+      if (innerCode === "ECONNREFUSED") return true
+    }
+    const causeMsg = (cause as { message?: unknown }).message
+    if (typeof causeMsg === "string" && causeMsg.includes("ECONNREFUSED")) return true
+  }
+
+  const msg = err instanceof Error ? err.message : String(err)
+  if (msg.includes("ECONNREFUSED")) return true
+
+  return false
+}
 
 function formatErrorMessage(code: string | undefined, detail: string | undefined, fallback: string): string {
   if (code && detail) return `${code}: ${detail}`
@@ -131,6 +161,7 @@ export async function swarmLaunch(
   const sleepFn = opts.sleepFn ?? defaultSleep
   const makeLaunchId = opts.makeLaunchId ?? defaultMakeLaunchId
   const url = new URL("/swarm/launch", opts.daemonBaseUrl)
+  const timeoutMs = opts.timeoutMs ?? 30_000
 
   const launchId = makeLaunchId()
 
@@ -153,7 +184,8 @@ export async function swarmLaunch(
   const bodyJson = JSON.stringify(body)
 
   let authRetried = false
-  let sawDaemon5xx = false
+  let sawAmbiguousFailure = false
+  let lastError: Error | undefined
 
   const pendingMessage = (id: string) =>
     `Launch ${id} is pending (the worker did not answer). The result arrives as a launch.result swarm message. Do NOT call swarm_launch again for this.`
@@ -161,26 +193,37 @@ export async function swarmLaunch(
   for (let attempt = 1; attempt <= SWARM_LAUNCH_MAX_ATTEMPTS; attempt++) {
     const isLast = attempt === SWARM_LAUNCH_MAX_ATTEMPTS
 
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+
     let res: Response
     try {
       res = await fetchFn(url.toString(), {
         method: "POST",
         headers,
         body: bodyJson,
+        signal: controller.signal,
       })
-    } catch {
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err))
+      if (!isConnectionRefused(err)) {
+        sawAmbiguousFailure = true
+      }
       if (isLast) {
-        if (sawDaemon5xx) {
+        if (sawAmbiguousFailure) {
           return {
             launch_id: launchId,
             status: "pending",
             message: pendingMessage(launchId),
           }
         }
-        throw new Error("swarm_launch failed: daemon unreachable")
+        const detail = lastError ? ` (${lastError.message})` : ""
+        throw new Error(`swarm_launch failed: daemon unreachable${detail}`)
       }
       await sleepFn(backoffMs(attempt))
       continue
+    } finally {
+      clearTimeout(timer)
     }
 
     if (res.ok) {
@@ -217,11 +260,14 @@ export async function swarmLaunch(
       } else {
         delete headers["Authorization"]
       }
+      const reauthController = new AbortController()
+      const reauthTimer = setTimeout(() => reauthController.abort(), timeoutMs)
       try {
         res = await fetchFn(url.toString(), {
           method: "POST",
           headers,
           body: bodyJson,
+          signal: reauthController.signal,
         })
         if (res.ok) {
           const data = (await res.json().catch(() => ({}))) as {
@@ -245,20 +291,27 @@ export async function swarmLaunch(
           }
         }
         text = await res.text().catch(() => "")
-      } catch {
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err))
+        if (!isConnectionRefused(err)) {
+          sawAmbiguousFailure = true
+        }
         authRetried = false
         if (isLast) {
-          if (sawDaemon5xx) {
+          if (sawAmbiguousFailure) {
             return {
               launch_id: launchId,
               status: "pending",
               message: pendingMessage(launchId),
             }
           }
-          throw new Error("swarm_launch failed: daemon unreachable")
+          const detail = lastError ? ` (${lastError.message})` : ""
+          throw new Error(`swarm_launch failed: daemon unreachable${detail}`)
         }
         await sleepFn(backoffMs(attempt))
         continue
+      } finally {
+        clearTimeout(reauthTimer)
       }
     }
 
@@ -300,11 +353,11 @@ export async function swarmLaunch(
 
     // Transient errors:
     if (res.status >= 500) {
-      sawDaemon5xx = true
+      sawAmbiguousFailure = true
     }
 
     if (isLast) {
-      if (sawDaemon5xx) {
+      if (sawAmbiguousFailure) {
         return {
           launch_id: launchId,
           status: "pending",
@@ -318,7 +371,8 @@ export async function swarmLaunch(
   }
 
   // Unreachable
-  throw new Error("swarm_launch failed: daemon unreachable")
+  const detail = lastError ? ` (${lastError.message})` : ""
+  throw new Error(`swarm_launch failed: daemon unreachable${detail}`)
 }
 
 /**

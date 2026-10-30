@@ -16,11 +16,8 @@ import { Poller } from "../src/worker/poller";
 import { relayPollHeader } from "../src/worker/relay-client";
 import { RemoteLaunchClient } from "../src/worker/remote-launch-client";
 import { RemoteLaunchRequester } from "../src/swarm/remote-launch-requester";
-import {
-  processLaunchItems,
-  retryLaunchAcks,
-  type LaunchReceiverDeps,
-} from "../src/swarm/remote-launch-receiver";
+import { type LaunchReceiverDeps } from "../src/swarm/remote-launch-receiver";
+import { handleLaunchItems } from "../src/swarm/remote-launch-poll";
 import type { OpencodeClient } from "../src/opencode-client";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -199,6 +196,19 @@ async function world(): Promise<World> {
     log: quiet,
   };
 
+  const receiverDepsA: LaunchReceiverDeps = {
+    storage: devbox,
+    selfMachineId: "devbox",
+    launchFrom: [],
+    relaySendEnabled: true,
+    opencodeClient: fakeOpencodeClient,
+    ack: async (items) => devLaunchClient.ack(items),
+    statDirectory: (dir: string) => dir !== "/nonexistent",
+    spawn: () => ({ unref: () => {} } as any),
+    nowFn: () => currentNow,
+    log: quiet,
+  };
+
   const devPoller = new Poller(
     {
       workerUrl: "https://worker",
@@ -208,18 +218,15 @@ async function world(): Promise<World> {
     },
     {
       onLaunchItems: async (items: unknown[]) => {
-        const resultItems: unknown[] = [];
-        for (const item of items) {
-          if (typeof item === "object" && item !== null && (item as any).item === "launch_result") {
-            resultItems.push(item);
-          }
-        }
-        if (resultItems.length > 0) {
-          const acks = requesterA.processResults(resultItems);
-          for (const ack of acks) {
-            await devLaunchClient.ack([ack]);
-          }
-        }
+        await handleLaunchItems(
+          {
+            requester: requesterA,
+            client: devLaunchClient,
+            receiverDeps: receiverDepsA,
+            log: quiet,
+          },
+          items,
+        );
       },
     } as never,
     { fetchFn },
@@ -234,16 +241,14 @@ async function world(): Promise<World> {
     },
     {
       onLaunchItems: async (items: unknown[]) => {
-        const launchItems: unknown[] = [];
-        for (const item of items) {
-          if (typeof item === "object" && item !== null && (item as any).item === "launch") {
-            launchItems.push(item);
-          }
-        }
-        if (launchItems.length > 0) {
-          await processLaunchItems(receiverDepsB, launchItems);
-        }
-        await retryLaunchAcks(receiverDepsB);
+        await handleLaunchItems(
+          {
+            client: cloudLaunchClient,
+            receiverDeps: receiverDepsB,
+            log: quiet,
+          },
+          items,
+        );
       },
     } as never,
     { fetchFn },

@@ -108,6 +108,16 @@ describe("resolveRootSession", () => {
     expect(root).toBe("ses_parent")
   })
 
+  test("only climbs to a parentID that starts with ses_, stops if parentID lacks ses_ prefix", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse(200, { id: "ses_child", parentID: "non_ses_parent" }),
+    ) as unknown as typeof fetch
+
+    const root = await resolveRootSession("ses_child", "http://127.0.0.1:4096", fetchFn)
+    expect(root).toBe("ses_child")
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
   test("stops and returns furthest resolved session if hop fails (e.g. 404 or network error)", async () => {
     const fetchFn = vi.fn()
       .mockResolvedValueOnce(jsonResponse(200, { id: "ses_c", parentID: "ses_b" }))
@@ -340,15 +350,80 @@ describe("swarmLaunch", () => {
     expect(res.status).toBe("accepted")
   })
 
-  test("retries exhausted on network failures without seeing 5xx throws daemon unreachable", async () => {
+  test("retries exhausted on network failures without seeing 5xx throws daemon unreachable with error detail", async () => {
+    const err = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:4731"), { code: "ECONNREFUSED" })
     const { fetchFn, seen } = capturingFetch(() => {
-      throw new Error("ECONNREFUSED")
+      throw err
     })
 
     await expect(swarmLaunch({ ...baseOpts, fetchFn }, baseArgs)).rejects.toThrow(
-      "swarm_launch failed: daemon unreachable",
+      "swarm_launch failed: daemon unreachable (connect ECONNREFUSED 127.0.0.1:4731)",
     )
     expect(seen).toHaveLength(6)
+  })
+
+  test("one ECONNRESET then refusals -> pending", async () => {
+    let call = 0
+    const resetErr = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+    const refusedErr = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:4731"), { code: "ECONNREFUSED" })
+    const { fetchFn, seen } = capturingFetch(() => {
+      call++
+      if (call === 1) throw resetErr
+      throw refusedErr
+    })
+
+    const res = await swarmLaunch(
+      { ...baseOpts, fetchFn, makeLaunchId: () => "rl_reset" },
+      baseArgs,
+    )
+
+    expect(seen).toHaveLength(6)
+    expect(res.status).toBe("pending")
+    expect(res.message).toBe(
+      "Launch rl_reset is pending (the worker did not answer). The result arrives as a launch.result swarm message. Do NOT call swarm_launch again for this.",
+    )
+  })
+
+  test("one timeout then refusals -> pending", async () => {
+    let call = 0
+    const timeoutErr = Object.assign(new Error("The operation was aborted due to timeout"), { name: "AbortError" })
+    const refusedErr = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:4731"), { code: "ECONNREFUSED" })
+    const { fetchFn, seen } = capturingFetch(() => {
+      call++
+      if (call === 1) throw timeoutErr
+      throw refusedErr
+    })
+
+    const res = await swarmLaunch(
+      { ...baseOpts, fetchFn, makeLaunchId: () => "rl_timeout" },
+      baseArgs,
+    )
+
+    expect(seen).toHaveLength(6)
+    expect(res.status).toBe("pending")
+    expect(res.message).toBe(
+      "Launch rl_timeout is pending (the worker did not answer). The result arrives as a launch.result swarm message. Do NOT call swarm_launch again for this.",
+    )
+  })
+
+  test("passes signal with timeout to fetch, aborting if timeout passes", async () => {
+    const fetchFn = vi.fn().mockImplementation((url, init) => {
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }))
+        })
+      })
+    }) as unknown as typeof fetch
+
+    const res = await swarmLaunch(
+      { ...baseOpts, fetchFn, timeoutMs: 10, makeLaunchId: () => "rl_abort" },
+      baseArgs,
+    )
+
+    expect(res.status).toBe("pending")
+    expect(res.message).toBe(
+      "Launch rl_abort is pending (the worker did not answer). The result arrives as a launch.result swarm message. Do NOT call swarm_launch again for this.",
+    )
   })
 
   test("retries exhausted on 500 returns pending message", async () => {
