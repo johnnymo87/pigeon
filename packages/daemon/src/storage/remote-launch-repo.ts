@@ -47,6 +47,7 @@ export function initRemoteLaunchSchema(db: BetterSqlite3.Database): void {
 
 export type InboundState = "received" | "created" | "settled";
 export type OutboundState = "sending" | "accepted" | "refused" | "resolved" | "deadline";
+export type LaunchOutcome = "launched" | "refused" | "unconfirmed";
 
 export interface RemoteLaunchInboundRecord {
   fromMachine: string;
@@ -54,7 +55,7 @@ export interface RemoteLaunchInboundRecord {
   fromSession: string;
   state: InboundState;
   sessionId: string | null;
-  outcome: string | null;
+  outcome: LaunchOutcome | null;
   reason: string | null;
   ackDone: boolean;
   ackAttempts: number;
@@ -70,7 +71,7 @@ export interface RemoteLaunchOutboundRecord {
   directory: string;
   requestJson: string;
   state: OutboundState;
-  resolvedOutcome: "launched" | "refused" | "unconfirmed" | null;
+  resolvedOutcome: LaunchOutcome | null;
   refusalCode: string | null;
   refusalStatus: number | null;
   refusalDetail: string | null;
@@ -97,7 +98,7 @@ function asInboundRecord(r: Row): RemoteLaunchInboundRecord {
     fromSession: String(r.from_session),
     state: r.state as InboundState,
     sessionId: (r.session_id as string | null) ?? null,
-    outcome: (r.outcome as string | null) ?? null,
+    outcome: (r.outcome as LaunchOutcome | null) ?? null,
     reason: (r.reason as string | null) ?? null,
     ackDone: Number(r.ack_done) === 1,
     ackAttempts: Number(r.ack_attempts ?? 0),
@@ -115,7 +116,7 @@ function asOutboundRecord(r: Row): RemoteLaunchOutboundRecord {
     directory: String(r.directory),
     requestJson: String(r.request_json),
     state: r.state as OutboundState,
-    resolvedOutcome: (r.resolved_outcome as RemoteLaunchOutboundRecord["resolvedOutcome"]) ?? null,
+    resolvedOutcome: (r.resolved_outcome as LaunchOutcome | null) ?? null,
     refusalCode: (r.refusal_code as string | null) ?? null,
     refusalStatus: (r.refusal_status as number | null) ?? null,
     refusalDetail: (r.refusal_detail as string | null) ?? null,
@@ -174,7 +175,7 @@ export class RemoteLaunchInboundRepo {
   settle(
     fromMachine: string,
     launchId: string,
-    outcome: string,
+    outcome: LaunchOutcome,
     sessionId: string | null,
     reason: string | null,
     now: number,
@@ -194,7 +195,7 @@ export class RemoteLaunchInboundRepo {
       .prepare(
         `UPDATE remote_launch_inbound
          SET ack_done = 1, updated_at = ?
-         WHERE from_machine = ? AND launch_id = ?`,
+         WHERE from_machine = ? AND launch_id = ? AND ack_done = 0`,
       )
       .run(now, fromMachine, launchId);
     return result.changes > 0;
@@ -205,7 +206,7 @@ export class RemoteLaunchInboundRepo {
       .prepare(
         `UPDATE remote_launch_inbound
          SET ack_attempts = ack_attempts + 1, next_ack_at = ?, updated_at = ?
-         WHERE from_machine = ? AND launch_id = ?`,
+         WHERE from_machine = ? AND launch_id = ? AND ack_done = 0`,
       )
       .run(nextAt, now, fromMachine, launchId);
     return result.changes > 0;
@@ -277,7 +278,7 @@ export class RemoteLaunchOutboundRepo {
       .prepare(
         `UPDATE remote_launch_outbound
          SET state = 'accepted', next_attempt_at = NULL
-         WHERE launch_id = ?`,
+         WHERE launch_id = ? AND state = 'sending'`,
       )
       .run(launchId);
     return result.changes > 0;
@@ -295,7 +296,7 @@ export class RemoteLaunchOutboundRepo {
         `UPDATE remote_launch_outbound
          SET state = 'refused', resolved_outcome = 'refused',
              refusal_code = ?, refusal_status = ?, refusal_detail = ?, settled_at = ?
-         WHERE launch_id = ?`,
+         WHERE launch_id = ? AND state = 'sending'`,
       )
       .run(code, status, detail, now, launchId);
     return result.changes > 0;
@@ -306,7 +307,7 @@ export class RemoteLaunchOutboundRepo {
       .prepare(
         `UPDATE remote_launch_outbound
          SET attempts = attempts + 1, next_attempt_at = ?
-         WHERE launch_id = ?`,
+         WHERE launch_id = ? AND state = 'sending'`,
       )
       .run(nextAt, launchId);
     return result.changes > 0;
@@ -314,16 +315,17 @@ export class RemoteLaunchOutboundRepo {
 
   markResolved(
     launchId: string,
-    outcome: "launched" | "refused" | "unconfirmed",
+    outcome: LaunchOutcome,
     now: number,
   ): boolean {
     const result = this.db
       .prepare(
         `UPDATE remote_launch_outbound
          SET state = 'resolved', resolved_outcome = ?, settled_at = ?
-         WHERE launch_id = ?`,
+         WHERE launch_id = ?
+           AND NOT (? = 'unconfirmed' AND resolved_outcome IN ('launched', 'refused'))`,
       )
-      .run(outcome, now, launchId);
+      .run(outcome, now, launchId, outcome);
     return result.changes > 0;
   }
 
@@ -332,7 +334,7 @@ export class RemoteLaunchOutboundRepo {
       .prepare(
         `UPDATE remote_launch_outbound
          SET state = 'deadline', resolved_outcome = 'unconfirmed', settled_at = ?
-         WHERE launch_id = ?`,
+         WHERE launch_id = ? AND state IN ('sending', 'accepted')`,
       )
       .run(now, launchId);
     return result.changes > 0;
@@ -406,10 +408,6 @@ export class RemoteLaunchRepository {
     this.inbound = new RemoteLaunchInboundRepo(db);
     this.outbound = new RemoteLaunchOutboundRepo(db);
     this.resultsSeen = new RemoteLaunchResultsSeenRepo(db);
-  }
-
-  get results_seen(): RemoteLaunchResultsSeenRepo {
-    return this.resultsSeen;
   }
 
   pruneOlderThan(cutoff: number): { inbound: number; outbound: number; resultsSeen: number } {

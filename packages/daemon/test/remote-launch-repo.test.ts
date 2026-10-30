@@ -142,7 +142,7 @@ describe("RemoteLaunchRepository", () => {
       expect(repo.settle("devbox", "l_ok", "launched", "ses_target", null, 2_300)).toBe(false);
     });
 
-    it("markAckDone and markAckRetry update ack status", () => {
+    it("markAckDone and markAckRetry update ack status and enforce ack_done=0", () => {
       const s = newDb();
       const repo = s.remoteLaunch.inbound;
 
@@ -152,24 +152,29 @@ describe("RemoteLaunchRepository", () => {
       );
       repo.settle("devbox", "l1", "launched", "ses_target", null, 1_100);
 
-      // Retry
+      // Retry when ack_done = 0 succeeds
       expect(repo.markAckRetry("devbox", "l1", 5_000, 1_200)).toBe(true);
       let record = repo.get("devbox", "l1");
       expect(record?.ackAttempts).toBe(1);
       expect(record?.nextAckAt).toBe(5_000);
       expect(record?.updatedAt).toBe(1_200);
 
-      // Second retry
-      repo.markAckRetry("devbox", "l1", 10_000, 5_500);
+      // Second retry succeeds
+      expect(repo.markAckRetry("devbox", "l1", 10_000, 5_500)).toBe(true);
       record = repo.get("devbox", "l1");
       expect(record?.ackAttempts).toBe(2);
       expect(record?.nextAckAt).toBe(10_000);
 
-      // Mark done
+      // Mark done succeeds when ack_done = 0
       expect(repo.markAckDone("devbox", "l1", 10_500)).toBe(true);
       record = repo.get("devbox", "l1");
       expect(record?.ackDone).toBe(true);
       expect(record?.updatedAt).toBe(10_500);
+
+      // Further markAckDone or markAckRetry calls return false once ack_done = 1
+      expect(repo.markAckDone("devbox", "l1", 11_000)).toBe(false);
+      expect(repo.markAckRetry("devbox", "l1", 15_000, 11_000)).toBe(false);
+      expect(repo.get("devbox", "l1")?.ackAttempts).toBe(2);
     });
 
     it("listAcksDue returns settled rows with ack_done=0 and next_ack_at <= now", () => {
@@ -273,7 +278,7 @@ describe("RemoteLaunchRepository", () => {
       expect(repo.get("l1")?.fromSession).toBe("ses_caller");
     });
 
-    it("markAccepted sets state='accepted' and clears next_attempt_at", () => {
+    it("markAccepted only succeeds from state='sending'", () => {
       const s = newDb();
       const repo = s.remoteLaunch.outbound;
 
@@ -287,13 +292,21 @@ describe("RemoteLaunchRepository", () => {
       });
       repo.markRetry("l1", 2_000);
 
+      // markAccepted succeeds from state='sending'
       expect(repo.markAccepted("l1")).toBe(true);
       const record = repo.get("l1");
       expect(record?.state).toBe("accepted");
       expect(record?.nextAttemptAt).toBeNull();
+
+      // markAccepted returns false if state is already 'accepted'
+      expect(repo.markAccepted("l1")).toBe(false);
+
+      // markAccepted returns false if state is 'resolved'
+      repo.markResolved("l1", "launched", 3_000);
+      expect(repo.markAccepted("l1")).toBe(false);
     });
 
-    it("markRefused sets state='refused', resolved_outcome='refused', refusal details, and settled_at", () => {
+    it("markRefused only succeeds from state='sending'", () => {
       const s = newDb();
       const repo = s.remoteLaunch.outbound;
 
@@ -306,6 +319,7 @@ describe("RemoteLaunchRepository", () => {
         createdAt: 1_000,
       });
 
+      // markRefused succeeds from state='sending'
       expect(repo.markRefused("l1", "target_offline", 503, "cloudbox is not polling", 2_500)).toBe(true);
       const record = repo.get("l1");
       expect(record?.state).toBe("refused");
@@ -314,9 +328,25 @@ describe("RemoteLaunchRepository", () => {
       expect(record?.refusalStatus).toBe(503);
       expect(record?.refusalDetail).toBe("cloudbox is not polling");
       expect(record?.settledAt).toBe(2_500);
+
+      // markRefused returns false if state is already 'refused'
+      expect(repo.markRefused("l1", "target_offline", 503, "retry refusal", 3_000)).toBe(false);
+
+      // Cannot refuse a resolved or accepted row
+      repo.insert({
+        launchId: "l2",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markAccepted("l2");
+      expect(repo.markRefused("l2", "queue_full", 429, "full", 2_000)).toBe(false);
+      expect(repo.get("l2")?.state).toBe("accepted");
     });
 
-    it("markRetry increments attempts and sets next_attempt_at (state stays sending)", () => {
+    it("markRetry only succeeds from state='sending'", () => {
       const s = newDb();
       const repo = s.remoteLaunch.outbound;
 
@@ -339,12 +369,19 @@ describe("RemoteLaunchRepository", () => {
       record = repo.get("l1");
       expect(record?.attempts).toBe(2);
       expect(record?.nextAttemptAt).toBe(12_000);
+
+      // Once accepted or settled, markRetry returns false
+      repo.markAccepted("l1");
+      expect(repo.markRetry("l1", 18_000)).toBe(false);
+      expect(repo.get("l1")?.state).toBe("accepted");
+      expect(repo.get("l1")?.attempts).toBe(2);
     });
 
-    it("markResolved sets state='resolved', resolved_outcome, and settled_at", () => {
+    it("markDeadline only succeeds from state IN ('sending', 'accepted')", () => {
       const s = newDb();
       const repo = s.remoteLaunch.outbound;
 
+      // 1. From 'sending'
       repo.insert({
         launchId: "l1",
         fromSession: "ses_c",
@@ -353,32 +390,116 @@ describe("RemoteLaunchRepository", () => {
         requestJson: "{}",
         createdAt: 1_000,
       });
-
-      expect(repo.markResolved("l1", "launched", 3_000)).toBe(true);
-      const record = repo.get("l1");
-      expect(record?.state).toBe("resolved");
-      expect(record?.resolvedOutcome).toBe("launched");
-      expect(record?.settledAt).toBe(3_000);
-    });
-
-    it("markDeadline sets state='deadline', resolved_outcome='unconfirmed', and settled_at", () => {
-      const s = newDb();
-      const repo = s.remoteLaunch.outbound;
-
-      repo.insert({
-        launchId: "l1",
-        fromSession: "ses_c",
-        toMachine: "cloudbox",
-        directory: "dir",
-        requestJson: "{}",
-        createdAt: 1_000,
-      });
-
       expect(repo.markDeadline("l1", 50_000)).toBe(true);
-      const record = repo.get("l1");
+      let record = repo.get("l1");
       expect(record?.state).toBe("deadline");
       expect(record?.resolvedOutcome).toBe("unconfirmed");
       expect(record?.settledAt).toBe(50_000);
+
+      // Repeat deadline returns false
+      expect(repo.markDeadline("l1", 60_000)).toBe(false);
+
+      // 2. From 'accepted'
+      repo.insert({
+        launchId: "l2",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markAccepted("l2");
+      expect(repo.markDeadline("l2", 50_000)).toBe(true);
+      expect(repo.get("l2")?.state).toBe("deadline");
+
+      // 3. Negative guard: deadline after resolved returns false and leaves row resolved
+      repo.insert({
+        launchId: "l3",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markResolved("l3", "launched", 2_000);
+      expect(repo.markDeadline("l3", 50_000)).toBe(false);
+      record = repo.get("l3");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("launched");
+
+      // 4. Negative guard: deadline after refused returns false and leaves row refused
+      repo.insert({
+        launchId: "l4",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markRefused("l4", "invalid", 400, "bad", 2_000);
+      expect(repo.markDeadline("l4", 50_000)).toBe(false);
+      record = repo.get("l4");
+      expect(record?.state).toBe("refused");
+      expect(record?.resolvedOutcome).toBe("refused");
+    });
+
+    it("markResolved sets state='resolved' and never downgrades terminal outcomes", () => {
+      const s = newDb();
+      const repo = s.remoteLaunch.outbound;
+
+      // Settle from sending
+      repo.insert({
+        launchId: "l1",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      expect(repo.markResolved("l1", "launched", 3_000)).toBe(true);
+      let record = repo.get("l1");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("launched");
+      expect(record?.settledAt).toBe(3_000);
+
+      // Upgrades from deadline (unconfirmed) to launched / refused succeed
+      repo.insert({
+        launchId: "l2",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markDeadline("l2", 50_000);
+      expect(repo.get("l2")?.resolvedOutcome).toBe("unconfirmed");
+
+      expect(repo.markResolved("l2", "launched", 55_000)).toBe(true);
+      record = repo.get("l2");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("launched");
+      expect(record?.settledAt).toBe(55_000);
+
+      // NEVER DOWNGRADE: if outcome is already 'launched', incoming 'unconfirmed' is rejected
+      expect(repo.markResolved("l2", "unconfirmed", 60_000)).toBe(false);
+      record = repo.get("l2");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("launched");
+
+      // NEVER DOWNGRADE: if outcome is already 'refused', incoming 'unconfirmed' is rejected
+      repo.insert({
+        launchId: "l3",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markResolved("l3", "refused", 2_000);
+      expect(repo.markResolved("l3", "unconfirmed", 3_000)).toBe(false);
+      record = repo.get("l3");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("refused");
     });
 
     it("listSendDue returns sending rows where next_attempt_at <= now and request_expires_at > now", () => {
@@ -495,9 +616,6 @@ describe("RemoteLaunchRepository", () => {
         launchId: "l1",
         receivedAt: 1_000,
       });
-
-      // results_seen snake_case alias
-      expect(s.remoteLaunch.results_seen).toBe(s.remoteLaunch.resultsSeen);
     });
 
     it("pruneOlderThan deletes results seen with received_at < cutoff", () => {

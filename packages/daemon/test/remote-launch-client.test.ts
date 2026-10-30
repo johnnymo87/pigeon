@@ -89,6 +89,7 @@ describe("RemoteLaunchClient", () => {
       [429, "queue_full", "10 launches already wait for target"],
       [429, "rate_limited", "caller has created 30 launches in the last hour"],
       [503, "launch_unavailable", "launch table missing"],
+      [403, "machine_mismatch", "caller devbox does not match from_machine cloudbox"],
     ])("classifies %i with error %s as refused", async (status, code, detail) => {
       const fetchFn = vi.fn(async () =>
         new Response(JSON.stringify({ error: code, detail }), { status }),

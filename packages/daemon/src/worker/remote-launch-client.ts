@@ -20,6 +20,7 @@ export const KNOWN_REFUSED_CODES = new Set([
   "queue_full",
   "rate_limited",
   "launch_unavailable",
+  "machine_mismatch",
 ]);
 
 export interface RemoteLaunchRequestBody {
@@ -78,15 +79,21 @@ export class RemoteLaunchClient {
   }
 
   private async post(path: string, body: unknown): Promise<Response> {
-    return this.fetchFn(`${this.config.workerUrl}${path}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      return await this.fetchFn(`${this.config.workerUrl}${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** `POST /launch/relay`. Never throws. */
