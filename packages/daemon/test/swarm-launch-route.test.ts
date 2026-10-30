@@ -43,6 +43,74 @@ describe("POST /swarm/launch route", () => {
     expect(await res.json()).toEqual({ error: "no_worker" });
   });
 
+  describe("browser requests are refused (CSRF against a daemon without auth)", () => {
+    const valid = {
+      launch_id: "lnch_csrf",
+      from: "ses_sender123",
+      machine: "devbox",
+      directory: "/home/dev/pigeon",
+      prompt: "hello",
+    };
+    const accepted = () =>
+      ({
+        handleRequest: vi.fn().mockResolvedValue({
+          status: 202,
+          body: { launch_id: "lnch_csrf", status: "accepted", to_machine: "devbox" },
+        }),
+      }) as unknown as RemoteLaunchRequester;
+
+    it("refuses any request carrying an Origin header", async () => {
+      const requester = accepted();
+      const app = createApp(storage!, { remoteLaunch: requester });
+      const res = await postLaunch(app, valid, { Origin: "https://evil.example" });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({
+        error: "browser_request_refused",
+        detail: "requests carrying an Origin header are refused",
+      });
+      expect(requester.handleRequest).not.toHaveBeenCalled();
+    });
+
+    it("refuses a body that is not declared application/json (text/plain skips CORS preflight)", async () => {
+      const requester = accepted();
+      const app = createApp(storage!, { remoteLaunch: requester });
+      const res = await postLaunch(app, valid, { "Content-Type": "text/plain;charset=UTF-8" });
+      expect(res.status).toBe(415);
+      expect(await res.json()).toEqual({
+        error: "invalid",
+        detail: "Content-Type must be application/json",
+      });
+      expect(requester.handleRequest).not.toHaveBeenCalled();
+    });
+
+    it("refuses a body with no Content-Type", async () => {
+      const requester = accepted();
+      const app = createApp(storage!, { remoteLaunch: requester });
+      const res = await app(
+        new Request("http://localhost/swarm/launch", {
+          method: "POST",
+          body: new Blob([JSON.stringify(valid)]),
+        }),
+      );
+      expect(res.status).toBe(415);
+      expect(requester.handleRequest).not.toHaveBeenCalled();
+    });
+
+    it("accepts application/json with parameters", async () => {
+      const requester = accepted();
+      const app = createApp(storage!, { remoteLaunch: requester });
+      const res = await postLaunch(app, valid, { "Content-Type": "Application/JSON; charset=utf-8" });
+      expect(res.status).toBe(202);
+      expect(requester.handleRequest).toHaveBeenCalledWith(valid);
+    });
+
+    it("refuses browser requests even before the no_worker check", async () => {
+      const app = createApp(storage!, {});
+      const res = await postLaunch(app, valid, { Origin: "null" });
+      expect(res.status).toBe(403);
+    });
+  });
+
   it("returns 400 invalid when JSON body is malformed", async () => {
     const fakeRequester = {
       handleRequest: vi.fn(),

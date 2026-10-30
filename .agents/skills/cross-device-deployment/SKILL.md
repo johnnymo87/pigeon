@@ -175,7 +175,7 @@ done
 
 ## Remote Upgrade (via `swarm_launch`)
 
-Where remote launch is enabled (it is off by default; see "Remote launch" in `AGENTS.md`), an
+Where remote launch is enabled (off by default, on between cloudbox, devbox and macbook since `pigeon-k0qn.18`; see "Remote launch" in `AGENTS.md`), an
 agent on machine A can deploy pigeon on machine B by starting a fresh session there with
 `swarm_launch`. That session does the per-machine steps above and reports back. The worker
 deploy is still done once, from anywhere, as above.
