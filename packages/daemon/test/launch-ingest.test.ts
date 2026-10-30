@@ -276,6 +276,26 @@ describe("ingestLaunchCommand", () => {
         "Launch on devbox may or may not have started: request timed out after 30000ms: http://localhost:4096/session",
       );
     });
+
+    it("does not throw when sendTelegramReply fails for unconfirmed without id", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const input = makeInput({
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(30000, "http://localhost:4096/session")),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+        sendTelegramReply: vi.fn().mockRejectedValue(new Error("telegram network error")),
+      });
+
+      await expect(ingestLaunchCommand(input)).resolves.not.toThrow();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[launch-ingest] unconfirmed reply failed:"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
+    });
   });
 
   describe("post-start failure resilience", () => {
@@ -922,6 +942,28 @@ describe("startSession", () => {
     expect(fakeClient.createSession).not.toHaveBeenCalled();
   });
 
+  it("returns refused serve_unavailable when healthCheck rejects", async () => {
+    const fakeClient = {
+      healthCheck: vi.fn().mockRejectedValue(new Error("network failure")),
+      createSession: vi.fn(),
+      sendPrompt: vi.fn(),
+      deleteSession: vi.fn(),
+    } as unknown as OpencodeClient;
+
+    const outcome = await startSession({
+      directory: "/home/user/project",
+      prompt: "hello",
+      opencodeClient: fakeClient,
+    });
+
+    expect(outcome).toEqual({
+      outcome: "refused",
+      reason: "serve_unavailable",
+      detail: "network failure",
+    });
+    expect(fakeClient.createSession).not.toHaveBeenCalled();
+  });
+
   describe("createSession classification", () => {
     it("RequestTimeoutError -> unconfirmed with null id", async () => {
       const fakeClient = {
@@ -1318,6 +1360,39 @@ describe("startSession", () => {
         reason: "prompt_rejected",
         detail: "rejected on owner",
       });
+    });
+
+    it("falls back to opencodeClient and logs warning when resolveOwnerClient throws", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const createClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-fallback" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const resolveOwnerClient = vi.fn().mockImplementation(() => {
+        throw new Error("routing table corrupted");
+      });
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: createClient,
+        resolveOwnerClient,
+      });
+
+      expect(resolveOwnerClient).toHaveBeenCalledWith("sess-fallback");
+      expect(createClient.sendPrompt).toHaveBeenCalledWith("sess-fallback", "/home/user/project", "hello");
+      expect(outcome).toEqual({
+        outcome: "launched",
+        sessionId: "sess-fallback",
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[launch-ingest] resolveOwnerClient threw for session sess-fallback"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
     });
   });
 

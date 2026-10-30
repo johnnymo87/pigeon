@@ -289,7 +289,14 @@ export async function startSession(input: LaunchStartInput): Promise<LaunchStart
     }
   }
 
-  const owner = input.resolveOwnerClient?.(session.id) ?? input.opencodeClient;
+  let owner = input.opencodeClient;
+  if (input.resolveOwnerClient) {
+    try {
+      owner = input.resolveOwnerClient(session.id) ?? input.opencodeClient;
+    } catch (err) {
+      console.warn(`[launch-ingest] resolveOwnerClient threw for session ${session.id}, falling back to opencodeClient:`, err);
+    }
+  }
   try {
     if (input.budgets) {
       await owner.sendPrompt(session.id, input.directory, input.prompt, { timeoutMs: input.budgets.promptMs });
@@ -397,7 +404,11 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
   }
 
   if (outcome.outcome === "unconfirmed" && outcome.sessionId === null) {
-    await sendTelegramReply(chatId, `Launch${machineLabel} may or may not have started: ${outcome.detail}`);
+    try {
+      await sendTelegramReply(chatId, `Launch${machineLabel} may or may not have started: ${outcome.detail}`);
+    } catch (err) {
+      console.warn(`[launch-ingest] unconfirmed reply failed:`, err);
+    }
     return;
   }
 
