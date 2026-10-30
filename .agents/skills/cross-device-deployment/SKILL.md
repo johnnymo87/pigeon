@@ -23,34 +23,68 @@ npm run --workspace @pigeon/worker deploy
 
 ## Per-Machine Daemon Deploy
 
-On each machine, pull latest code and restart the daemon.
-
-### 1. Pull and Install
-
-Run these as **two separate bash calls**, not one compound command:
+On each machine, pull latest code, install with **the daemon's own node**, and restart the
+daemon. One command does all of it, on every host:
 
 ```bash
-cd <project-path>/pigeon && git pull
+<project-path>/pigeon/scripts/deploy-daemon.sh --dry-run   # resolve + preflight, changes nothing
+<project-path>/pigeon/scripts/deploy-daemon.sh             # pull, install, check, restart, poll /health
+```
+
+It reads the running service definition (launchd plist on macOS, the systemd unit and its
+`ExecStart` wrapper on Linux) to find the node binary the daemon execs and the checkout it runs,
+so it works from a worktree and from a non-interactive shell with no `npm` on PATH. It refuses —
+and never stashes, resets or cleans — when the checkout is not on `main`, has tracked edits, or
+has commits on no remote. After `npm install` it loads `better-sqlite3` under the service's node
+and **does not restart** if that fails, so the running daemon stays up. Override with
+`PIGEON_DAEMON_NODE_DIR` / `PIGEON_DAEMON_REPO` only if resolution fails on an unusual host.
+
+### Why the node matters
+
+`packages/daemon` depends on `better-sqlite3`, a **native** module. `npm install` builds or
+fetches its binary for whichever `node` is first on PATH (its install scripts call `node`, so
+naming the `npm` binary alone is not enough). If that is a different Node major than the one the
+service runs, the daemon dies at the next restart with a `NODE_MODULE_VERSION` mismatch and takes
+the host's Telegram and swarm relay with it. Every host's service runs a pinned nix node:
+
+| Machine | Daemon's node comes from |
+|---------|--------------------------|
+| devbox / cloudbox | `pkgs.nodejs` in `systemd.services.pigeon-daemon` (`hosts/<host>/configuration.nix` in workstation): the `exec …/bin/node` line of the `pigeon-daemon-start` wrapper, also first on the unit's `PATH` |
+| macbook | `pkgs.nodejs` in `users/dev/home.darwin.nix`: the `exec …/bin/node` in the plist's `ProgramArguments`, also first in its `EnvironmentVariables.PATH` |
+
+The `npm` an interactive or opencode shell finds (devenv, home-manager, nothing at all) is not
+guaranteed to be that node. On macOS an opencode bash call has **no `npm` at all** (direnv/devenv
+is not loaded), so a bare `npm install` fails with `npm: command not found`, which is the benign
+form of the same bug.
+
+### Manual fallback
+
+If the script cannot run, do the same by hand: find the daemon's node, then put its directory
+first on PATH for the install.
+
+```bash
+# macOS
+plutil -extract ProgramArguments.2 raw -o - ~/Library/LaunchAgents/org.nix-community.home.pigeon-daemon.plist | grep -o '/nix/store/[^ ]*/bin/node'
+# devbox/cloudbox (system unit; chromebook: systemctl --user)
+grep -o '/nix/store/[^ ]*/bin/node' "$(systemctl show pigeon-daemon.service -p ExecStart --value | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
 ```
 
 ```bash
-cd <project-path>/pigeon && npm install
+cd <project-path>/pigeon && git pull --ff-only
+cd <project-path>/pigeon && PATH=<node-dir>:$PATH <node-dir>/npm install
 ```
 
-> **Why split?** On cloudbox, a bash command containing a bare `git` token is exempted from
-> the per-command systemd scope and runs inside the `opencode serve` cgroup
-> (`MemoryMax=14G`, `OOMPolicy=stop`, shared with peer sessions). `npm install` peaks around
-> 1.9 GiB; chaining it after `git pull` charges that to the serve, where an OOM stops the
-> serve, kills the plugin, and silently ends Telegram notifications for every session on
-> that port. See the Quickstart section of `AGENTS.md` (`pigeon-8bif`).
+Then restart (below) and verify (see Verify).
 
-### 2. Restart Daemon
+### Restart commands
+
+The script runs these; they are listed for the manual path.
 
 | Machine | Command |
 |---------|---------|
 | **devbox** | `sudo systemctl restart pigeon-daemon.service` |
 | **cloudbox** | `sudo systemctl restart pigeon-daemon.service` |
-| **macbook** | `launchctl stop org.nix-community.home.pigeon-daemon && launchctl start org.nix-community.home.pigeon-daemon` |
+| **macbook** | `launchctl kickstart -k gui/$(id -u)/org.nix-community.home.pigeon-daemon` |
 | **chromebook** | `systemctl --user restart pigeon-daemon.service` |
 
 > **Daemon before serve, always.** The plugin (in the serve process) and the daemon share the
@@ -66,7 +100,7 @@ cd <project-path>/pigeon && npm install
 > daemon that mints its own, and it revokes the flag. No pool restart is required after a
 > rollback, but a restart is still the fastest way to a known state.
 
-### 3. Restart opencode-serve (only when you actually need it — see below)
+### Restart opencode-serve (only when you actually need it — see below)
 
 > **⚠️ `opencode-serve.service` no longer exists on devbox or cloudbox.** Both now run a
 > **pool** of instances (`opencode-serve@4096..4099.service`) governed by
@@ -102,14 +136,23 @@ If any command fails because a name doesn't match, discover the real one with
 `systemctl list-units '*opencode*'` / `systemctl --user list-units '*opencode*'` (Linux) or
 `launchctl list | grep opencode` (macOS) before improvising.
 
-### 4. Verify
+### Verify
 
 ```bash
 curl -s http://127.0.0.1:4731/health          # pigeon-daemon
 curl -s http://127.0.0.1:4096/global/health   # opencode-serve (ONE pool instance only)
 ```
 
-Both should return JSON with `"ok":true` / `"healthy":true`.
+Both should return JSON with `"ok":true` / `"healthy":true`. `/health` is anonymous by design.
+
+Any **other** daemon route needs `Authorization: Bearer <token>` only where the host sets
+`PIGEON_DAEMON_AUTH_TOKEN` (cloudbox, from `/run/secrets/pigeon_daemon_auth_token`). Daemon auth is
+off where it is unset (macbook today: the plist has no such variable), and the header is then
+omitted, not sent empty. Check before copying a curl from another host:
+`plutil -p ~/Library/LaunchAgents/org.nix-community.home.pigeon-daemon.plist | grep AUTH_TOKEN` /
+`grep AUTH_TOKEN "$(systemctl show pigeon-daemon.service -p ExecStart --value | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"`
+(no output: off). On NixOS it is exported by the start wrapper, so `systemctl show -p Environment`
+does not show it.
 
 On the pool hosts (devbox, cloudbox) the `:4096` curl proves only that **one of four** instances
 is up. Check them all — a single wedged instance silently degrades a quarter of sessions:
@@ -130,21 +173,20 @@ deploy is still done once, from anywhere, as above.
 
 ### Example
 
-The prompt below is for **devbox**. For another host, substitute that host's commands from the
-tables above (cloudbox's pool target is a *system* unit and takes `sudo`).
+The prompt below is for **devbox**. For another host, change the machine and the project path
+(`~/Code/pigeon` on macbook); the script finds the service itself.
 
 ```ts
 swarm_launch({
   machine: "devbox",
   directory: "~/projects/pigeon",
   prompt: `Deploy pigeon main on this machine, then report to me with swarm_send.
-1. In one bash call: cd ~/projects/pigeon && git pull --ff-only
-2. In a SEPARATE bash call: cd ~/projects/pigeon && npm install
-3. sudo systemctl restart pigeon-daemon.service
-4. curl -s http://127.0.0.1:4731/health must show ok:true.
-5. swarm_send me: the new HEAD sha, the health output, and anything that failed. If the
+1. ~/projects/pigeon/scripts/deploy-daemon.sh --dry-run, then without --dry-run. It pulls,
+   installs with the daemon's own node, restarts, and polls /health. If it refuses, do NOT
+   stash, reset or clean anything: report its message.
+2. swarm_send me: the new HEAD sha, the health output, and anything that failed. If the
    plugin changed, say that it is NOT verified yet: you are running on the old plugin.
-6. Do NOT restart the serve pool unless I asked for it in this prompt.`
+3. Do NOT restart the serve pool unless I asked for it in this prompt.`
 })
 ```
 
@@ -165,7 +207,7 @@ systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect
 ### Rules
 
 1. **The pool-restart trap.** The launched session lives on B's serve pool. Restarting the pool
-   (step 3 of the per-machine deploy) kills it mid-turn, and also every other session there,
+   ("Restart opencode-serve" above) kills it mid-turn, and also every other session there,
    including a human's. So the restart is not a default step: it needs a plugin change and an
    explicit ask, comes last, after the report, and runs from a delayed transient unit rather
    than inline. `XDG_RUNTIME_DIR` and
@@ -174,7 +216,8 @@ systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect
 2. **A plugin change cannot be verified by the session that deployed it.** It is running on the
    old plugin and is killed by the restart that loads the new one. Verify from A afterwards,
    for example with a second short `swarm_launch` that reports its own behaviour.
-3. **`git pull` and `npm install` stay separate calls**, for the reason in step 1 above.
+3. **Never a bare `npm install`.** Use the script, or the manual fallback with the daemon's node
+   first on PATH, for the reason in "Why the node matters" above.
 4. **macOS service changes still need Jonathan.** `darwin-rebuild switch` needs a sudo
    password, which an unattended session cannot supply. A code-only macbook deploy (pull,
    install, `launchctl` restart) works remotely.
