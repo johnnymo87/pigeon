@@ -25,8 +25,8 @@ the existing `/launch` code (`daemon/src/worker/launch-ingest.ts`), refactored i
 
 **Commands:** from the worktree root `/home/dev/projects/pigeon/.worktrees/k0qn17-remote-launch`:
 `npm run test --workspace @pigeon/worker`, `npm run test --workspace @pigeon/daemon`,
-`npm run test --workspace @pigeon/opencode-plugin` (check the plugin's package name in its
-package.json), `npm run typecheck`. Run a single file with
+`npm run test --workspace @pigeon/opencode-plugin` (tests in `packages/opencode-plugin/test/`),
+`npm run typecheck`. Run a single file with
 `npx vitest run test/<file> ` inside the package directory. Commit messages start `[NO-JIRA]`. Run
 `git commit` bare (never set an identity).
 
@@ -560,8 +560,7 @@ Commit `[NO-JIRA] Daemon: wire remote launch into the poller and the app`.
 ### Task 9: plugin tool + end-to-end
 
 **Files:** create `opencode-plugin/src/swarm-launch-tool.ts`, register in `opencode-plugin/src/index.ts`
-next to `swarm_send`; test `opencode-plugin/test/swarm-launch-tool.test.ts` (match the plugin's test
-location — check where `swarm-send-tool` tests live). Create `daemon/test/swarm-launch-e2e.test.ts`.
+next to `swarm_send`; test `opencode-plugin/test/swarm-launch-tool.test.ts`. Create `daemon/test/swarm-launch-e2e.test.ts`.
 
 Tool `swarm_launch` (`SWARM_LAUNCH_TOOL_NAME`), args `{machine, directory, prompt, tag?}`, description
 must say: starts a FRESH session on another machine; call ONCE per launch; the result arrives as a
