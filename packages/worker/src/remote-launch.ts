@@ -22,7 +22,7 @@ import {
   sha256Hex,
   MACHINE_ID_PATTERN,
 } from "./credentials";
-import { SENDER_ID, isMissingTable, relayReachability } from "./relay";
+import { SENDER_ID, isMissingTable, relayReachability, readJson, parseRelayHeader } from "./relay";
 import { isValidTag } from "./tag-command";
 
 export const LAUNCH_TTL_MS = 15 * 60_000;
@@ -40,6 +40,8 @@ export const LAUNCH_MAX_DIRECTORY = 512;
 export const LAUNCH_ONLINE_MS = 60_000;
 
 const LAUNCH_ID_PATTERN = /^[^:\s]{1,128}$/;
+const REASON = /^[a-z0-9_]{1,64}$/;
+const RESULT_ID_PATTERN = /^r:[^:\s]{1,128}(:[a-z0-9_]{1,64})?$/;
 
 export interface LaunchRequest {
   launch_id: string;
@@ -82,17 +84,6 @@ async function tolerant(fn: () => Promise<Response>): Promise<Response> {
   } catch (err) {
     if (isMissingTable(err)) return unavailable();
     throw err;
-  }
-}
-
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
-  try {
-    const body = (await request.json()) as unknown;
-    return body && typeof body === "object" && !Array.isArray(body)
-      ? (body as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
   }
 }
 
@@ -331,5 +322,489 @@ export async function handleLaunchRelay(
       { accepted: true, launch_id: req.launch_id, to_machine: req.machine },
       { status: 202 },
     );
+  });
+}
+
+export type LaunchHandOut =
+  | {
+      item: "launch";
+      from_machine: string;
+      launch_id: string;
+      from: string;
+      directory: string;
+      prompt: string;
+      tag: string | null;
+      expires_at: number;
+    }
+  | {
+      item: "launch_result";
+      from_machine: string;
+      result_id: string;
+      launch_id: string;
+      machine: string;
+      outcome: "launched" | "refused" | "unconfirmed";
+      session_id: string | null;
+      reason: string | null;
+    };
+
+/** Task 3 implements expiry; this stub satisfies Task 2's call site. */
+export async function runLaunchExpiry(
+  _db: D1Database,
+  _now: number = Date.now(),
+  _opts: { machine?: string; limit?: number } = {},
+): Promise<{ expired: number; pruned: number }> {
+  return { expired: 0, pruned: 0 };
+}
+
+/**
+ * Leases at most LAUNCH_HANDOUT_LIMIT launch items and (if failures=1) up to
+ * LAUNCH_RESULT_HANDOUT_LIMIT result items for the polling machine.
+ * Never throws.
+ */
+export async function handOutLaunchItems(
+  db: D1Database,
+  machineId: string,
+  headerValue: string | null,
+  now: number = Date.now(),
+): Promise<LaunchHandOut[]> {
+  const header = parseRelayHeader(headerValue);
+  try {
+    if (header === null) {
+      await db
+        .prepare("UPDATE machine_launch_accept SET accept_csv = '', updated_at = ? WHERE machine_id = ? AND accept_csv <> ''")
+        .bind(now, machineId)
+        .run();
+      return [];
+    }
+    const csv = header.launch.join(",");
+    await db
+      .prepare(
+        `INSERT INTO machine_launch_accept (machine_id, accept_csv, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT (machine_id) DO UPDATE SET accept_csv = excluded.accept_csv, updated_at = excluded.updated_at
+         WHERE machine_launch_accept.accept_csv IS NOT excluded.accept_csv`,
+      )
+      .bind(machineId, csv, now)
+      .run();
+
+    await runLaunchExpiry(db, now, { machine: machineId, limit: 20 });
+
+    const launchItems: LaunchHandOut[] = [];
+    if (header.launch.length > 0) {
+      const placeholders = header.launch.map(() => "?").join(",");
+      const { results: launchRows } = await db
+        .prepare(
+          `UPDATE remote_launch SET status = 'leased', leased_at = ?, lease_count = lease_count + 1
+           WHERE rowid IN (
+             SELECT rowid FROM remote_launch
+             WHERE to_machine = ?
+               AND item_kind = 'launch'
+               AND from_machine IN (${placeholders})
+               AND (status = 'queued' OR (status = 'leased' AND leased_at < ?))
+               AND lease_count < ?
+               AND expires_at - ? >= ?
+             ORDER BY created_at ASC
+             LIMIT ?
+           )
+           AND (status = 'queued' OR (status = 'leased' AND leased_at < ?))
+           RETURNING from_machine, launch_id, item_kind, body_json, created_at, expires_at`,
+        )
+        .bind(
+          now,
+          machineId,
+          ...header.launch,
+          now - LAUNCH_LEASE_MS,
+          LAUNCH_MAX_LEASES,
+          now,
+          LAUNCH_LEASE_MS,
+          LAUNCH_HANDOUT_LIMIT,
+          now - LAUNCH_LEASE_MS,
+        )
+        .all<{ from_machine: string; launch_id: string; item_kind: string; body_json: string; created_at: number; expires_at: number }>();
+
+      const sortedLaunches = [...launchRows].sort((a, b) => a.created_at - b.created_at || a.launch_id.localeCompare(b.launch_id));
+      for (const r of sortedLaunches) {
+        const body = JSON.parse(r.body_json) as {
+          from: string;
+          directory: string;
+          prompt: string;
+          tag: string | null;
+        };
+        launchItems.push({
+          item: "launch",
+          from_machine: r.from_machine,
+          launch_id: r.launch_id,
+          from: body.from,
+          directory: body.directory,
+          prompt: body.prompt,
+          tag: body.tag ?? null,
+          expires_at: r.expires_at,
+        });
+      }
+    }
+
+    const resultItems: LaunchHandOut[] = [];
+    if (header.failures) {
+      const { results: resultRows } = await db
+        .prepare(
+          `UPDATE remote_launch SET status = 'leased', leased_at = ?, lease_count = lease_count + 1
+           WHERE rowid IN (
+             SELECT rowid FROM remote_launch
+             WHERE to_machine = ?
+               AND item_kind = 'result'
+               AND (status = 'queued' OR (status = 'leased' AND leased_at < ?))
+               AND lease_count < ?
+               AND expires_at > ?
+             ORDER BY created_at ASC
+             LIMIT ?
+           )
+           AND (status = 'queued' OR (status = 'leased' AND leased_at < ?))
+           RETURNING from_machine, launch_id, item_kind, body_json, created_at, expires_at`,
+        )
+        .bind(
+          now,
+          machineId,
+          now - LAUNCH_LEASE_MS,
+          LAUNCH_RESULT_MAX_LEASES,
+          now,
+          LAUNCH_RESULT_HANDOUT_LIMIT,
+          now - LAUNCH_LEASE_MS,
+        )
+        .all<{ from_machine: string; launch_id: string; item_kind: string; body_json: string; created_at: number; expires_at: number }>();
+
+      const sortedResults = [...resultRows].sort((a, b) => a.created_at - b.created_at || a.launch_id.localeCompare(b.launch_id));
+      for (const r of sortedResults) {
+        const body = JSON.parse(r.body_json) as {
+          launch_id: string;
+          machine: string;
+          outcome: "launched" | "refused" | "unconfirmed";
+          session_id: string | null;
+          reason: string | null;
+        };
+        resultItems.push({
+          item: "launch_result",
+          from_machine: r.from_machine,
+          result_id: r.launch_id,
+          launch_id: body.launch_id,
+          machine: body.machine,
+          outcome: body.outcome,
+          session_id: body.session_id ?? null,
+          reason: body.reason ?? null,
+        });
+      }
+    }
+
+    return [...launchItems, ...resultItems];
+  } catch (err) {
+    if (!isMissingTable(err)) {
+      console.error("[remote-launch] hand-out failed; poll continues without launch items", { machineId, error: String(err) });
+    }
+    return [];
+  }
+}
+
+function resultInsert(
+  db: D1Database,
+  row: RemoteLaunchRow,
+  outcome: "launched" | "refused" | "unconfirmed",
+  sessionId: string | null,
+  reason: string | null,
+  key: string,
+  now: number,
+  guardStatuses: string[],
+): D1PreparedStatement {
+  const body = {
+    launch_id: row.launch_id,
+    machine: row.to_machine,
+    outcome,
+    session_id: sessionId,
+    reason,
+  };
+  const placeholders = guardStatuses.map(() => "?").join(",");
+  return db
+    .prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session,
+                                  body_json, body_sha256, status, lease_count, created_at, expires_at)
+       SELECT ?, ?, 'result', ?, ?, ?, '', 'queued', 0, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM remote_launch
+         WHERE from_machine = ? AND launch_id = ? AND item_kind = 'launch'
+           AND status IN (${placeholders})
+       )
+       ON CONFLICT (from_machine, launch_id) DO NOTHING`,
+    )
+    .bind(
+      row.from_machine,
+      key,
+      row.from_machine,
+      row.from_session,
+      JSON.stringify(body),
+      now,
+      now + LAUNCH_RESULT_TTL_MS,
+      row.from_machine,
+      row.launch_id,
+      ...guardStatuses,
+    );
+}
+
+export type LaunchAckItem =
+  | {
+      kind: "launch";
+      from_machine: string;
+      launch_id: string;
+      outcome: "launched" | "refused" | "unconfirmed";
+      session_id?: string;
+      reason?: string;
+    }
+  | {
+      kind: "result";
+      from_machine: string;
+      result_id: string;
+      outcome: "delivered" | "refused";
+      reason?: string;
+    };
+
+/**
+ * `POST /launch/relay/ack`: machine key only.
+ * Settle launch or result rows.
+ */
+export async function handleLaunchRelayAck(
+  db: D1Database,
+  env: Env,
+  request: Request,
+  now: number = Date.now(),
+): Promise<Response> {
+  const principal = await requireMachinePrincipal(request, env);
+  if (principal instanceof Response) return principal;
+
+  const raw = await readJson(request);
+  const items = raw?.items;
+  if (!Array.isArray(items) || items.length === 0) return bad("items must be a non-empty array");
+  if (items.length > 100) return bad("at most 100 items per ack");
+
+  const parsed: LaunchAckItem[] = [];
+  for (const it of items as unknown[]) {
+    const o = it as Record<string, unknown> | null;
+    if (!o || typeof o !== "object") return bad("each item must be an object");
+    if (typeof o.from_machine !== "string" || !MACHINE_ID_PATTERN.test(o.from_machine)) {
+      return bad("from_machine is invalid");
+    }
+    if (o.kind === "launch") {
+      if (typeof o.launch_id !== "string" || !LAUNCH_ID_PATTERN.test(o.launch_id)) {
+        return bad("launch_id is invalid");
+      }
+      if (o.outcome !== "launched" && o.outcome !== "refused" && o.outcome !== "unconfirmed") {
+        return bad("outcome must be launched, refused, or unconfirmed");
+      }
+      if (o.outcome === "launched") {
+        if (typeof o.session_id !== "string" || !SENDER_ID.test(o.session_id)) {
+          return bad("launched requires a valid ses_ session_id");
+        }
+      } else if (o.outcome === "unconfirmed") {
+        if (
+          o.session_id !== undefined &&
+          o.session_id !== null &&
+          (typeof o.session_id !== "string" || !SENDER_ID.test(o.session_id))
+        ) {
+          return bad("session_id must be a valid ses_ session id if present");
+        }
+      } else if (o.outcome === "refused") {
+        if (typeof o.reason !== "string" || !REASON.test(o.reason)) {
+          return bad("a refusal needs a reason code ([a-z0-9_]{1,64})");
+        }
+      }
+      parsed.push({
+        kind: "launch",
+        from_machine: o.from_machine,
+        launch_id: o.launch_id,
+        outcome: o.outcome,
+        session_id: o.session_id as string | undefined,
+        reason: o.reason as string | undefined,
+      });
+    } else if (o.kind === "result") {
+      if (typeof o.result_id !== "string" || !RESULT_ID_PATTERN.test(o.result_id)) {
+        return bad("result_id is invalid");
+      }
+      if (o.outcome !== "delivered" && o.outcome !== "refused") {
+        return bad("outcome must be delivered or refused");
+      }
+      if (
+        o.reason !== undefined &&
+        o.reason !== null &&
+        (typeof o.reason !== "string" || !REASON.test(o.reason))
+      ) {
+        return bad("reason must be a code ([a-z0-9_]{1,64})");
+      }
+      parsed.push({
+        kind: "result",
+        from_machine: o.from_machine,
+        result_id: o.result_id,
+        outcome: o.outcome,
+        reason: o.reason as string | undefined,
+      });
+    } else {
+      return bad("kind must be launch or result");
+    }
+  }
+
+  return tolerant(async () => {
+    type AckResult =
+      | { kind: "launch"; from_machine: string; launch_id: string; result: "ok" | "not_found" | "not_yours" }
+      | { kind: "result"; from_machine: string; result_id: string; result: "ok" | "not_found" | "not_yours" };
+    const results: AckResult[] = [];
+
+    for (const it of parsed) {
+      if (it.kind === "result") {
+        const row = await getLaunchRow(db, it.from_machine, it.result_id);
+        if (!row || row.item_kind !== "result") {
+          results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_found" });
+          continue;
+        }
+        if (row.to_machine !== principal.machineId) {
+          results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "not_yours" });
+          continue;
+        }
+
+        await db
+          .prepare(
+            `UPDATE remote_launch SET status = ?, reason = ?, settled_at = ?
+             WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
+          )
+          .bind(it.outcome, it.reason ?? null, now, row.from_machine, row.launch_id, principal.machineId)
+          .run();
+
+        if (it.outcome === "refused") {
+          console.error("[remote-launch] result item refused by its receiver; dropped", {
+            fromMachine: row.from_machine,
+            resultId: row.launch_id,
+            reason: it.reason,
+          });
+        }
+        results.push({ kind: "result", from_machine: it.from_machine, result_id: it.result_id, result: "ok" });
+      } else {
+        // it.kind === "launch"
+        const row = await getLaunchRow(db, it.from_machine, it.launch_id);
+        if (!row || row.item_kind !== "launch") {
+          results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_found" });
+          continue;
+        }
+        if (row.to_machine !== principal.machineId) {
+          results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "not_yours" });
+          continue;
+        }
+
+        if (row.status === "queued" || row.status === "leased") {
+          let settleStatus: string;
+          let sessionId: string | null = null;
+          let reason: string | null = null;
+          if (it.outcome === "launched") {
+            settleStatus = "launched";
+            sessionId = it.session_id!;
+          } else if (it.outcome === "refused") {
+            settleStatus = "refused";
+            reason = it.reason!;
+          } else {
+            settleStatus = "expired";
+            reason = "unconfirmed";
+            sessionId = it.session_id ?? null;
+          }
+
+          const insertStmt = resultInsert(
+            db,
+            row,
+            it.outcome,
+            it.session_id ?? null,
+            it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
+            `r:${row.launch_id}`,
+            now,
+            ["queued", "leased"],
+          );
+          const settleStmt = db
+            .prepare(
+              `UPDATE remote_launch SET status = ?, session_id = ?, reason = ?, settled_at = ?
+               WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status IN ('queued','leased')`,
+            )
+            .bind(settleStatus, sessionId, reason, now, row.from_machine, row.launch_id, principal.machineId);
+
+          await db.batch([insertStmt, settleStmt]);
+        } else if (row.status === "expired") {
+          // CORRECTION
+          const isAllowed =
+            it.outcome === "launched" ||
+            it.outcome === "refused" ||
+            (it.outcome === "unconfirmed" && Boolean(it.session_id) && row.session_id === null);
+
+          if (isAllowed) {
+            let updateRes: D1Response;
+            if (it.outcome === "launched") {
+              updateRes = await db
+                .prepare(
+                  `UPDATE remote_launch SET status = 'launched', session_id = ?, reason = NULL, settled_at = ?
+                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
+                )
+                .bind(it.session_id!, now, row.from_machine, row.launch_id, principal.machineId)
+                .run();
+            } else if (it.outcome === "refused") {
+              updateRes = await db
+                .prepare(
+                  `UPDATE remote_launch SET status = 'refused', session_id = NULL, reason = ?, settled_at = ?
+                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired'`,
+                )
+                .bind(it.reason!, now, row.from_machine, row.launch_id, principal.machineId)
+                .run();
+            } else {
+              // unconfirmed with session_id while row.session_id IS NULL
+              updateRes = await db
+                .prepare(
+                  `UPDATE remote_launch SET session_id = ?, settled_at = ?
+                   WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired' AND session_id IS NULL`,
+                )
+                .bind(it.session_id!, now, row.from_machine, row.launch_id, principal.machineId)
+                .run();
+            }
+
+            if (updateRes.meta.changes > 0) {
+              const existingResult = await getLaunchRow(db, row.from_machine, `r:${row.launch_id}`);
+              const newBody = JSON.stringify({
+                launch_id: row.launch_id,
+                machine: row.to_machine,
+                outcome: it.outcome,
+                session_id: it.session_id ?? null,
+                reason: it.reason ?? (it.outcome === "unconfirmed" ? "unconfirmed" : null),
+              });
+
+              if (existingResult && existingResult.status === "queued") {
+                await db
+                  .prepare("UPDATE remote_launch SET body_json = ? WHERE from_machine = ? AND launch_id = ? AND status = 'queued'")
+                  .bind(newBody, row.from_machine, `r:${row.launch_id}`)
+                  .run();
+              } else {
+                await db
+                  .prepare(
+                    `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session,
+                                                body_json, body_sha256, status, lease_count, created_at, expires_at)
+                     VALUES (?, ?, 'result', ?, ?, ?, '', 'queued', 0, ?, ?)
+                     ON CONFLICT (from_machine, launch_id) DO NOTHING`,
+                  )
+                  .bind(
+                    row.from_machine,
+                    `r:${row.launch_id}:${it.outcome}`,
+                    row.from_machine,
+                    row.from_session,
+                    newBody,
+                    now,
+                    now + LAUNCH_RESULT_TTL_MS,
+                  )
+                  .run();
+              }
+            }
+          }
+        }
+        // status launched/refused -> no-op (never reverse)
+
+        results.push({ kind: "launch", from_machine: it.from_machine, launch_id: it.launch_id, result: "ok" });
+      }
+    }
+
+    return Response.json({ ok: true, results });
   });
 }

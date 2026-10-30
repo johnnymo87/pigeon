@@ -3,6 +3,7 @@ import { authenticate, checkActsAs } from "./credentials";
 import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
 import { createTelegramClient } from "./telegram";
 import { handOutRelayItems, SWARM_RELAY_HEADER, type HandOutItem } from "./relay";
+import { handOutLaunchItems, type LaunchHandOut } from "./remote-launch";
 import { topicsEnabled } from "./topics";
 
 /**
@@ -98,8 +99,9 @@ function parseMetadata(metadataJson: string | null | undefined): Record<string, 
  * Updates machine last_poll_at for online detection.
  *
  * With a machine credential and `X-Pigeon-Swarm-Relay`, also hands out cross-machine relay
- * items as `swarm: [...]` on whichever response the command step returns; a 204 then becomes
- * `200 {swarm}` (pigeon-k0qn.5, relay.ts). A daemon that never sends the header never sees it.
+ * items as `swarm: [...]` and remote launch items as `launches: [...]` on whichever response
+ * the command step returns; a 204 then becomes `200 {swarm?, launches?}` (pigeon-k0qn.5, relay.ts;
+ * pigeon-k0qn.17, remote-launch.ts). A daemon that never sends the header never sees them.
  */
 export async function handlePollNext(
   db: D1Database,
@@ -119,30 +121,41 @@ export async function handlePollNext(
 
   await touchMachine(db, machineId);
 
-  // Relay items (pigeon-k0qn.5) are claimed once, before the command loop, and attached to
-  // whichever response it returns. Machine credentials only: the shared key can never collect
-  // relays. handOutRelayItems never throws.
+  // Relay items (pigeon-k0qn.5) and remote launch items (pigeon-k0qn.17) are claimed once,
+  // before the command loop, and attached to whichever response it returns. Machine
+  // credentials only: the shared key can never collect relays or launches. Neither hand-out
+  // throws.
+  const relayHeader = request.headers.get(SWARM_RELAY_HEADER);
   const swarm: HandOutItem[] =
     principal.kind === "machine"
-      ? await handOutRelayItems(db, machineId, request.headers.get(SWARM_RELAY_HEADER))
+      ? await handOutRelayItems(db, machineId, relayHeader)
       : [];
-  if (swarm.length === 0) return nextCommand(db, env, request, machineId);
+  const launches: LaunchHandOut[] =
+    principal.kind === "machine"
+      ? await handOutLaunchItems(db, machineId, relayHeader)
+      : [];
+  if (swarm.length === 0 && launches.length === 0) return nextCommand(db, env, request, machineId);
 
   let response: Response;
   try {
     response = await nextCommand(db, env, request, machineId);
   } catch (err) {
     // The command stays leased and is retried after its lease, exactly as with the 500 this
-    // would otherwise be; the relay items must not ride that 500 into a 60s re-lease.
-    console.error("[poll] command step failed; returning relay items only", {
+    // would otherwise be; the relay and launch items must not ride that 500 into a 60s re-lease.
+    console.error("[poll] command step failed; returning relay and launch items only", {
       machineId,
       error: err instanceof Error ? err.message : String(err),
     });
     response = new Response(null, { status: 204 });
   }
-  if (response.status === 204) return Response.json({ swarm });
+
+  const extra: Record<string, unknown> = {};
+  if (swarm.length > 0) extra.swarm = swarm;
+  if (launches.length > 0) extra.launches = launches;
+
+  if (response.status === 204) return Response.json(extra);
   const body = (await response.json()) as Record<string, unknown>;
-  return Response.json({ ...body, swarm }, { status: response.status });
+  return Response.json({ ...body, ...extra }, { status: response.status });
 }
 
 /** The command half of the poll: today's behaviour, unchanged. */

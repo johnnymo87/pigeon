@@ -120,7 +120,7 @@ async function tolerant(fn: () => Promise<Response>): Promise<Response> {
   }
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+export async function readJson(request: Request): Promise<Record<string, unknown> | null> {
   try {
     const body = (await request.json()) as unknown;
     return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
@@ -476,10 +476,11 @@ export async function handleRelayFail(db: D1Database, env: Env, request: Request
   });
 }
 
-/** Parsed `X-Pigeon-Swarm-Relay: accept=a,b; failures=1`. Null when the header is absent. */
-export function parseRelayHeader(value: string | null): { accept: string[]; failures: boolean } | null {
+/** Parsed `X-Pigeon-Swarm-Relay: accept=a,b; launch=c,d; failures=1`. Null when the header is absent. */
+export function parseRelayHeader(value: string | null): { accept: string[]; launch: string[]; failures: boolean } | null {
   if (value === null) return null;
   let accept: string[] = [];
+  let launch: string[] = [];
   let failures = false;
   for (const part of value.split(";")) {
     const [k, v = ""] = part.split("=", 2).map((s) => s.trim());
@@ -488,11 +489,20 @@ export function parseRelayHeader(value: string | null): { accept: string[]; fail
         .split(",")
         .map((s) => s.trim())
         .filter((s) => MACHINE_ID_PATTERN.test(s));
+    } else if (k === "launch") {
+      launch = v
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => MACHINE_ID_PATTERN.test(s));
     } else if (k === "failures") {
       failures = v === "1";
     }
   }
-  return { accept: [...new Set(accept)].sort().slice(0, RELAY_MAX_ACCEPT), failures };
+  return {
+    accept: [...new Set(accept)].sort().slice(0, RELAY_MAX_ACCEPT),
+    launch: [...new Set(launch)].sort().slice(0, RELAY_MAX_ACCEPT),
+    failures,
+  };
 }
 
 /** One item in the `swarm` array of a poll response. */

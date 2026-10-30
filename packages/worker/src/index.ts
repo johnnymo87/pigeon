@@ -8,7 +8,7 @@ import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
-import { handleLaunchRelay } from "./remote-launch";
+import { handleLaunchRelay, handleLaunchRelayAck } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
@@ -58,6 +58,9 @@ export default {
         // Remote launch (pigeon-k0qn.17). Machine credentials only.
         if (path === "/launch/relay" && method === "POST") {
           return handleLaunchRelay(db, env, request);
+        }
+        if (path === "/launch/relay/ack" && method === "POST") {
+          return handleLaunchRelayAck(db, env, request);
         }
 
         // Sessions
