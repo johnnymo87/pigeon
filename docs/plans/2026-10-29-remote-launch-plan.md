@@ -383,6 +383,7 @@ CREATE TABLE IF NOT EXISTS remote_launch_outbound (      -- A side
   from_session TEXT NOT NULL, to_machine TEXT NOT NULL, directory TEXT NOT NULL,
   request_json TEXT NOT NULL,
   state TEXT NOT NULL,                  -- sending | accepted | refused | resolved | deadline
+  resolved_outcome TEXT,                -- launched | refused | unconfirmed: last outcome told to the agent
   refusal_code TEXT, refusal_status INTEGER, refusal_detail TEXT,
   attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER,
   created_at INTEGER NOT NULL, request_expires_at INTEGER NOT NULL, deadline_at INTEGER NOT NULL,
@@ -405,8 +406,10 @@ launchId, now)` returning false on repeat. `request_expires_at = created + 15 mi
 `RemoteLaunchClient` (copy `RelayClient`'s `post` with a 10 s timeout, never throws):
 - `request(body)` → `{kind:"accepted", toMachine, duplicate}` | `{kind:"refused", code, detail, status}`
   | `{kind:"transient", detail}`. **Refused = any worker answer with a known code** (design §9.6):
-  `invalid, launch_id_conflict, sender_not_yours, same_machine, receiver_not_retired, not_accepted,
-  target_offline, no_return_path, queue_full, rate_limited, launch_unavailable`. 404 with no code →
+  `invalid, launch_id_conflict, expired, sender_not_yours, same_machine, receiver_not_retired,
+  not_accepted, target_offline, no_return_path, queue_full, rate_limited, launch_unavailable`.
+  The request body always carries `expires_at = outbound.request_expires_at` (PR 1 review: the
+  worker anchors the launch's life to the requester's deadline, so A's `deadline_at` stays valid). 404 with no code →
   `refused` code `worker_too_old`. Unknown code, 5xx, network → transient.
 - `ack(items)` → boolean.
 
@@ -448,10 +451,15 @@ Per `item:"launch"` (in order; each refusal is recorded `settled` so a re-handou
 5. `!relaySendEnabled` → refused `no_return_path`.
 6. no `opencodeClient` → refused `serve_unavailable`.
 7. `insertReceived`. Directory: `resolveHome(expandShorthand(dir))`; not absolute or not a directory →
-   settle refused `no_such_directory`.
+   settle refused `no_such_directory`; contains a character above U+00FF → refused
+   `invalid_directory` (it becomes the `x-opencode-directory` header, and `fetch` throws on such a
+   value before sending, which would otherwise read as an ambiguous transport error).
 8. `startSession({directory, prompt: framed, budgets: {5000,15000,20000}, onCreated: markCreated})`.
    Framed prompt = `[Remote launch requested by ${from} on ${fromMachine}; report back with swarm_send to ${from}.]\n\n${prompt}`.
-9. `settle(...)`, then `ack([...])` → `markAckDone` or `markAckRetry(now + backoff)`.
+9. `settle(...)`, then `ack([...])` → `markAckDone` or `markAckRetry(now + backoff)`. **Acks go one
+   item per request** (the worker 400s a whole batch for one bad item, and a poisoned batch retried
+   from the table would block every later ack), and every item is checked against the wire regexes
+   before sending; an item that fails them is logged and marked done (it can never succeed).
 10. **After the ack, not awaited by the tick** (`void (async () => {...})()` with its own catch):
     for launched/unconfirmed-with-id: `autoAttach`, `applyTag(item.tag)` if a tag is present, and
     `storage.alerts.enqueue({source:"remote-launch", refMsgId:`rl:${fromMachine}:${launchId}`,
@@ -506,7 +514,11 @@ export class RemoteLaunchRequester {
   against `^[a-z0-9_]{1,64}$` (invalid → `unrecognised`). Insert the local message via
   `bankOrInsertSwarmMessage` (`fromSession:"pigeon"`, `toSession: outbound.from_session`,
   `kind:"launch.result"`, `priority:"normal"`, `replyTo:null`, payload from
-  `formatLaunchResult(...)`), `markResolved` unless state is already resolved, ack `delivered`.
+  `formatLaunchResult(...)`), `markResolved(outcome)` (sets `resolved_outcome`), ack `delivered`.
+  **Never downgrade** (PR 1 review): if `resolved_outcome` is `launched` or `refused` and the incoming
+  outcome is `unconfirmed`, ack `delivered` and insert no message (a correction can overtake the
+  original after a lost poll response). The deadline's local `unconfirmed` sets
+  `resolved_outcome = 'unconfirmed'`, so a later real result is still delivered.
   Self machine id comes from deps (add `selfMachineId`).
 - `formatLaunchResult({launchId, machine, directory, outcome, sessionId, reason})` (texts are a
   contract; tests pin them):
