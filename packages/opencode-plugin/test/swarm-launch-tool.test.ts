@@ -481,7 +481,7 @@ describe("createSwarmLaunchTool", () => {
     expect(toolDef.description).toContain("cross-device-deployment")
 
     const args = toolDef.args as Record<string, { description?: string }>
-    expect(args.directory.description).toContain("absolute path or ~/... or a bare project name expanded to ~/projects/<name>")
+    expect(args.directory.description).toContain("~/projects/<name> on Linux, ~/Code/<name> on macOS")
   })
 
   test("execute resolves root session and launches", async () => {

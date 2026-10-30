@@ -928,6 +928,27 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       }
 
       if (request.method === "POST" && url.pathname === "/swarm/launch") {
+        // Refuse browser requests before anything else (pigeon-k0qn.18). A daemon
+        // without a token (the Mac today) is otherwise open to any web page in the
+        // local browser: a no-cors POST with a text/plain JSON body needs no CORS
+        // preflight, and this route starts an agent with a shell on another
+        // machine. Browsers always send Origin on a cross-origin POST, and no
+        // legitimate caller (the plugin, curl) does. Requiring application/json
+        // makes any browser request that omits Origin a preflighted one, which
+        // this daemon never answers.
+        if (request.headers.get("origin") !== null) {
+          return Response.json(
+            { error: "browser_request_refused", detail: "requests carrying an Origin header are refused" },
+            { status: 403 },
+          );
+        }
+        const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+        if (contentType !== "application/json") {
+          return Response.json(
+            { error: "invalid", detail: "Content-Type must be application/json" },
+            { status: 415 },
+          );
+        }
         if (!opts.remoteLaunch) {
           return Response.json({ error: "no_worker" }, { status: 503 });
         }

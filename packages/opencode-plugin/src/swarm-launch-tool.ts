@@ -399,7 +399,7 @@ export function createSwarmLaunchTool(
       directory: tool.schema
         .string()
         .describe(
-          "Working directory for the new session: absolute path or ~/... or a bare project name expanded to ~/projects/<name> on the target machine.",
+          "Working directory for the new session on the target machine: absolute path, ~/..., or a bare project name expanded to that machine's project root (~/projects/<name> on Linux, ~/Code/<name> on macOS).",
         ),
       prompt: tool.schema
         .string()
