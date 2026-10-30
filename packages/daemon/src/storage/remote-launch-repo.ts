@@ -323,7 +323,7 @@ export class RemoteLaunchOutboundRepo {
         `UPDATE remote_launch_outbound
          SET state = 'resolved', resolved_outcome = ?, settled_at = ?
          WHERE launch_id = ?
-           AND NOT (? = 'unconfirmed' AND resolved_outcome IN ('launched', 'refused'))`,
+           AND NOT (? = 'unconfirmed' AND COALESCE(resolved_outcome, '') IN ('launched', 'refused'))`,
       )
       .run(outcome, now, launchId, outcome);
     return result.changes > 0;

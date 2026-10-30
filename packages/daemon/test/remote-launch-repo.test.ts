@@ -502,6 +502,28 @@ describe("RemoteLaunchRepository", () => {
       expect(record?.resolvedOutcome).toBe("refused");
     });
 
+    it("markResolved records a first 'unconfirmed' result on a row with no outcome yet", () => {
+      const s = newDb();
+      const repo = s.remoteLaunch.outbound;
+      repo.insert({
+        launchId: "l4",
+        fromSession: "ses_c",
+        toMachine: "cloudbox",
+        directory: "dir",
+        requestJson: "{}",
+        createdAt: 1_000,
+      });
+      repo.markAccepted("l4");
+      // resolved_outcome IS NULL here: a NULL-unsafe predicate would skip the update.
+      expect(repo.markResolved("l4", "unconfirmed", 2_000)).toBe(true);
+      const record = repo.get("l4");
+      expect(record?.state).toBe("resolved");
+      expect(record?.resolvedOutcome).toBe("unconfirmed");
+      // and a later correction still upgrades it
+      expect(repo.markResolved("l4", "launched", 3_000)).toBe(true);
+      expect(repo.get("l4")?.resolvedOutcome).toBe("launched");
+    });
+
     it("listSendDue returns sending rows where next_attempt_at <= now and request_expires_at > now", () => {
       const s = newDb();
       const repo = s.remoteLaunch.outbound;
