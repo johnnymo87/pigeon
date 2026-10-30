@@ -27,6 +27,7 @@ import { PullInboxRepository } from "./pull-inbox-repo";
 import { initGooseInflightSchema } from "./goose-inflight-schema";
 import { GooseInflightRepository } from "./goose-inflight-repo";
 import { initRelayInboundSchema, RelayInboundRepository } from "./relay-inbound-repo";
+import { initRemoteLaunchSchema, RemoteLaunchRepository } from "./remote-launch-repo";
 
 export interface StorageDb {
   db: BetterSqlite3.Database;
@@ -48,6 +49,8 @@ export interface StorageDb {
   gooseInflight: GooseInflightRepository;
   /** Messages that arrived by cross-machine relay (pigeon-k0qn.6). See relay-inbound-repo.ts. */
   relayInbound: RelayInboundRepository;
+  /** Remote launch inbound, outbound, and results-seen storage (pigeon-k0qn.17). */
+  remoteLaunch: RemoteLaunchRepository;
   serves: ServeInstanceRepo;
   assignments: SessionAssignmentRepo;
   leases: SessionLeaseRepo;
@@ -71,6 +74,7 @@ export function openStorageDb(path: string): StorageDb {
   initPullInboxSchema(db);
   initGooseInflightSchema(db);
   initRelayInboundSchema(db);
+  initRemoteLaunchSchema(db);
   initAlertSchema(db);
   initRouteSchema(db);
   // Deliberately a SEPARATE schema call: this table must stay out of ROUTING_DDL,
@@ -93,6 +97,7 @@ export function openStorageDb(path: string): StorageDb {
     pullInbox: new PullInboxRepository(db),
     gooseInflight: new GooseInflightRepository(db),
     relayInbound: new RelayInboundRepository(db),
+    remoteLaunch: new RemoteLaunchRepository(db),
     serves: new ServeInstanceRepo(db),
     assignments: new SessionAssignmentRepo(db),
     leases: new SessionLeaseRepo(db),

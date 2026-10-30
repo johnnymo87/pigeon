@@ -45,6 +45,13 @@ export interface DaemonConfig {
   /** Relay swarm messages for sessions on other machines (pigeon-k0qn.7, `PIGEON_SWARM_RELAY_SEND=1`). */
   swarmRelaySend: boolean;
   /**
+   * Machines whose remote launch requests this daemon accepts (pigeon-k0qn.17,
+   * `PIGEON_REMOTE_LAUNCH_FROM`, comma separated). Empty, the default: accept none.
+   */
+  remoteLaunchFrom: string[];
+  /** Relay remote launch requests to other machines (pigeon-k0qn.17, `PIGEON_REMOTE_LAUNCH_SEND=1`). */
+  remoteLaunchSend: boolean;
+  /**
    * The goose `serve` ACP endpoint, e.g. `ws://127.0.0.1:3400/acp`. Absent means
    * goose is not configured on this machine, which makes goose sessions
    * correctly unroutable rather than half-routable.
@@ -153,5 +160,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
     swarmRelayAcceptFrom: parseMachineList(env.PIGEON_SWARM_RELAY_ACCEPT_FROM, env.CCR_MACHINE_ID?.trim()),
     swarmRelaySend: env.PIGEON_SWARM_RELAY_SEND?.trim() === "1",
+    remoteLaunchFrom: parseMachineList(env.PIGEON_REMOTE_LAUNCH_FROM, env.CCR_MACHINE_ID?.trim()),
+    remoteLaunchSend: env.PIGEON_REMOTE_LAUNCH_SEND?.trim() === "1",
   };
 }

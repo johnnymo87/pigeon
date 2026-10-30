@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { ingestLaunchCommand, type LaunchCommandInput } from "../src/worker/launch-ingest";
-import type { OpencodeClient } from "../src/opencode-client";
+import {
+  ingestLaunchCommand,
+  startSession,
+  autoAttach,
+  applyTag,
+  type LaunchCommandInput,
+  type LaunchStartInput,
+  type LaunchStartOutcome,
+} from "../src/worker/launch-ingest";
+import { OpencodeHttpError, type OpencodeClient } from "../src/opencode-client";
+import { RequestTimeoutError, TransportError } from "../src/routing/serve-outcome";
 
 function makeInput(overrides: Partial<LaunchCommandInput> = {}): LaunchCommandInput {
   const opencodeClient: OpencodeClient = {
@@ -211,7 +220,7 @@ describe("ingestLaunchCommand", () => {
   });
 
   describe("prompt sending fails", () => {
-    it("sends 'Failed to launch' Telegram reply when sendPrompt throws", async () => {
+    it("reports session started with unconfirmed prompt warning instead of 'Failed to launch'", async () => {
       const input = makeInput({
         opencodeClient: {
           healthCheck: vi.fn().mockResolvedValue(true),
@@ -222,10 +231,91 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
+      const [chatId, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+      expect(chatId).toBe("42");
+      expect(text).toContain("Session started:");
+      expect(text).toContain("sess-xyz");
+      expect(text).toContain("⚠️ Its prompt may not have arrived: sendPrompt failed: 500 Internal Server Error");
+      expect(text).toContain("The pigeon plugin will notify you when the session stops or has questions.");
+      expect(text).not.toContain("Failed to launch session");
+    });
+  });
+
+  describe("unconfirmed outcomes", () => {
+    it("reports 'Launch may or may not have started' when createSession times out without id", async () => {
+      const input = makeInput({
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(30000, "http://localhost:4096/session")),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+      });
+
+      await ingestLaunchCommand(input);
+
       expect(input.sendTelegramReply).toHaveBeenCalledWith(
         "42",
-        expect.stringContaining("Failed to launch session"),
+        "Launch may or may not have started: request timed out after 30000ms: http://localhost:4096/session",
       );
+    });
+
+    it("reports machine label when createSession times out without id", async () => {
+      const input = makeInput({
+        machineId: "devbox",
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(30000, "http://localhost:4096/session")),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+        "42",
+        "Launch on devbox may or may not have started: request timed out after 30000ms: http://localhost:4096/session",
+      );
+    });
+
+    it("does not throw when sendTelegramReply fails for unconfirmed without id", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const input = makeInput({
+        opencodeClient: {
+          healthCheck: vi.fn().mockResolvedValue(true),
+          createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(30000, "http://localhost:4096/session")),
+          sendPrompt: vi.fn(),
+        } as unknown as OpencodeClient,
+        sendTelegramReply: vi.fn().mockRejectedValue(new Error("telegram network error")),
+      });
+
+      await expect(ingestLaunchCommand(input)).resolves.not.toThrow();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[launch-ingest] unconfirmed reply failed:"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe("post-start failure resilience", () => {
+    it("still sends 'Session started' when tag step throws after launch", async () => {
+      const runOcTags = vi.fn().mockRejectedValue(new Error("tags.db is locked"));
+      const input = makeInput({
+        tag: "my-tag",
+        runOcTags,
+      });
+
+      await ingestLaunchCommand(input);
+
+      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+        "42",
+        expect.stringContaining("Session started"),
+        expect.anything(),
+      );
+      const text = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0]![1];
+      expect(text).not.toContain("Failed to launch session");
+      expect(text).toContain("sess-123");
     });
   });
 
@@ -393,13 +483,14 @@ describe("ingestLaunchCommand", () => {
       }
     });
 
-    it("does not spawn auto-attach when sendPrompt throws", async () => {
+    it("does not spawn auto-attach when sendPrompt is refused", async () => {
       const spawn = vi.fn();
       const input = makeInput({
         opencodeClient: {
           healthCheck: vi.fn().mockResolvedValue(true),
           createSession: vi.fn().mockResolvedValue({ id: "sess-fail" }),
-          sendPrompt: vi.fn().mockRejectedValue(new Error("send failed")),
+          sendPrompt: vi.fn().mockRejectedValue(new OpencodeHttpError(400, "Bad Request", "send failed")),
+          deleteSession: vi.fn().mockResolvedValue(undefined),
         } as unknown as import("../src/opencode-client").OpencodeClient,
         spawn,
       });
@@ -817,5 +908,542 @@ describe("ingestLaunchCommand", () => {
       expect(onTagged).not.toHaveBeenCalled();
       expect(lastReply(input)).toContain(`Tag not applied: sqlite3.OperationalError: database is locked (inheriting from ${PARENT})`);
     });
+  });
+});
+
+describe("startSession", () => {
+  function makeTransportError(code?: string, msg = "fetch failed"): TransportError {
+    const cause = new Error(msg);
+    if (code) {
+      (cause as unknown as { cause: { code: string } }).cause = { code };
+    }
+    return new TransportError(cause);
+  }
+
+  it("returns refused serve_unavailable when healthCheck returns false", async () => {
+    const fakeClient = {
+      healthCheck: vi.fn().mockResolvedValue(false),
+      createSession: vi.fn(),
+      sendPrompt: vi.fn(),
+      deleteSession: vi.fn(),
+    } as unknown as OpencodeClient;
+
+    const outcome = await startSession({
+      directory: "/home/user/project",
+      prompt: "hello",
+      opencodeClient: fakeClient,
+    });
+
+    expect(outcome).toEqual({
+      outcome: "refused",
+      reason: "serve_unavailable",
+      detail: "opencode serve is not running",
+    });
+    expect(fakeClient.createSession).not.toHaveBeenCalled();
+  });
+
+  it("returns refused serve_unavailable when healthCheck rejects", async () => {
+    const fakeClient = {
+      healthCheck: vi.fn().mockRejectedValue(new Error("network failure")),
+      createSession: vi.fn(),
+      sendPrompt: vi.fn(),
+      deleteSession: vi.fn(),
+    } as unknown as OpencodeClient;
+
+    const outcome = await startSession({
+      directory: "/home/user/project",
+      prompt: "hello",
+      opencodeClient: fakeClient,
+    });
+
+    expect(outcome).toEqual({
+      outcome: "refused",
+      reason: "serve_unavailable",
+      detail: "network failure",
+    });
+    expect(fakeClient.createSession).not.toHaveBeenCalled();
+  });
+
+  describe("createSession classification", () => {
+    it("RequestTimeoutError -> unconfirmed with null id", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(15000, "http://serve/session")),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: null,
+        detail: "request timed out after 15000ms: http://serve/session",
+      });
+      expect(fakeClient.sendPrompt).not.toHaveBeenCalled();
+    });
+
+    it("TransportError with ECONNREFUSED -> refused serve_unreachable", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockRejectedValue(makeTransportError("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:4096")),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "serve_unreachable",
+        detail: "Transport error: connect ECONNREFUSED 127.0.0.1:4096",
+      });
+      expect(fakeClient.sendPrompt).not.toHaveBeenCalled();
+    });
+
+    it("TransportError with other code (e.g. ECONNRESET) -> unconfirmed with null id", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockRejectedValue(makeTransportError("ECONNRESET", "socket hang up")),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: null,
+        detail: "Transport error: socket hang up",
+      });
+      expect(fakeClient.sendPrompt).not.toHaveBeenCalled();
+    });
+
+    it("any other error (e.g. HTTP non-ok or bad body) -> refused create_failed", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockRejectedValue(new Error("createSession failed: 500 Internal Server Error")),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "create_failed",
+        detail: "createSession failed: 500 Internal Server Error",
+      });
+      expect(fakeClient.sendPrompt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sendPrompt classification", () => {
+    it("ok -> launched", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "launched",
+        sessionId: "sess-1",
+      });
+      expect(fakeClient.deleteSession).not.toHaveBeenCalled();
+    });
+
+    it("OpencodeHttpError with 4xx status -> refused prompt_rejected and deleteSession called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(new OpencodeHttpError(400, "Bad Request", "prompt rejected: prompt too large")),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "prompt_rejected",
+        detail: "prompt rejected: prompt too large",
+      });
+      expect(fakeClient.deleteSession).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("TransportError with ECONNREFUSED -> refused prompt_unreachable and deleteSession called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(makeTransportError("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:4096")),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "prompt_unreachable",
+        detail: "Transport error: connect ECONNREFUSED 127.0.0.1:4096",
+      });
+      expect(fakeClient.deleteSession).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("swallows errors from deleteSession when sendPrompt was refused", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(new OpencodeHttpError(404, "Not Found", "session not found")),
+        deleteSession: vi.fn().mockRejectedValue(new Error("deleteSession failed: 500")),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "prompt_rejected",
+        detail: "session not found",
+      });
+      expect(fakeClient.deleteSession).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("RequestTimeoutError -> unconfirmed with id and deleteSession not called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(new RequestTimeoutError(20000, "http://serve/prompt")),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: "sess-1",
+        detail: "request timed out after 20000ms: http://serve/prompt",
+      });
+      expect(fakeClient.deleteSession).not.toHaveBeenCalled();
+    });
+
+    it("OpencodeHttpError with 5xx status -> unconfirmed with id and deleteSession not called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(new OpencodeHttpError(502, "Bad Gateway", "serve crashed")),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: "sess-1",
+        detail: "serve crashed",
+      });
+      expect(fakeClient.deleteSession).not.toHaveBeenCalled();
+    });
+
+    it("TransportError with other code (e.g. ECONNRESET) -> unconfirmed with id and deleteSession not called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(makeTransportError("ECONNRESET", "socket hang up")),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: "sess-1",
+        detail: "Transport error: socket hang up",
+      });
+      expect(fakeClient.deleteSession).not.toHaveBeenCalled();
+    });
+
+    it("generic Error -> unconfirmed with id and deleteSession not called", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-1" }),
+        sendPrompt: vi.fn().mockRejectedValue(new Error("unexpected error")),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome).toEqual({
+        outcome: "unconfirmed",
+        sessionId: "sess-1",
+        detail: "unexpected error",
+      });
+      expect(fakeClient.deleteSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("onCreated hook", () => {
+    it("calls onCreated with sessionId right after createSession and before sendPrompt", async () => {
+      const callOrder: string[] = [];
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockImplementation(async () => {
+          callOrder.push("createSession");
+          return { id: "sess-hook" };
+        }),
+        sendPrompt: vi.fn().mockImplementation(async () => {
+          callOrder.push("sendPrompt");
+        }),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const onCreated = vi.fn().mockImplementation((id: string) => {
+        callOrder.push(`onCreated:${id}`);
+      });
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+        onCreated,
+      });
+
+      expect(outcome).toEqual({ outcome: "launched", sessionId: "sess-hook" });
+      expect(callOrder).toEqual(["createSession", "onCreated:sess-hook", "sendPrompt"]);
+      expect(onCreated).toHaveBeenCalledWith("sess-hook");
+    });
+
+    it("onCreated throwing does not change the outcome", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-hook-err" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const onCreated = vi.fn().mockImplementation(() => {
+        throw new Error("hook exploded");
+      });
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+        onCreated,
+      });
+
+      expect(outcome).toEqual({ outcome: "launched", sessionId: "sess-hook-err" });
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe("budgets option", () => {
+    it("passes budgets to healthCheck, createSession, and sendPrompt", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-budgets" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+        budgets: { healthMs: 5000, createMs: 15000, promptMs: 20000 },
+      });
+
+      expect(fakeClient.healthCheck).toHaveBeenCalledWith({ timeoutMs: 5000 });
+      expect(fakeClient.createSession).toHaveBeenCalledWith("/home/user/project", { timeoutMs: 15000 });
+      expect(fakeClient.sendPrompt).toHaveBeenCalledWith("sess-budgets", "/home/user/project", "hello", { timeoutMs: 20000 });
+    });
+
+    it("calls client methods without timeout options when budgets is not provided", async () => {
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-nobudgets" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(fakeClient.healthCheck).toHaveBeenCalledWith();
+      expect(fakeClient.createSession).toHaveBeenCalledWith("/home/user/project");
+      expect(fakeClient.sendPrompt).toHaveBeenCalledWith("sess-nobudgets", "/home/user/project", "hello");
+    });
+  });
+
+  describe("resolveOwnerClient", () => {
+    it("sends prompt and deletes on owner client when provided", async () => {
+      const createClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-owner" }),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const ownerClient = {
+        sendPrompt: vi.fn().mockRejectedValue(new OpencodeHttpError(400, "Bad Request", "rejected on owner")),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OpencodeClient;
+
+      const resolveOwnerClient = vi.fn().mockReturnValue(ownerClient);
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: createClient,
+        resolveOwnerClient,
+      });
+
+      expect(resolveOwnerClient).toHaveBeenCalledWith("sess-owner");
+      expect(ownerClient.sendPrompt).toHaveBeenCalledWith("sess-owner", "/home/user/project", "hello");
+      expect(ownerClient.deleteSession).toHaveBeenCalledWith("sess-owner");
+      expect(outcome).toEqual({
+        outcome: "refused",
+        reason: "prompt_rejected",
+        detail: "rejected on owner",
+      });
+    });
+
+    it("falls back to opencodeClient and logs warning when resolveOwnerClient throws", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const createClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockResolvedValue({ id: "sess-fallback" }),
+        sendPrompt: vi.fn().mockResolvedValue(undefined),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const resolveOwnerClient = vi.fn().mockImplementation(() => {
+        throw new Error("routing table corrupted");
+      });
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: createClient,
+        resolveOwnerClient,
+      });
+
+      expect(resolveOwnerClient).toHaveBeenCalledWith("sess-fallback");
+      expect(createClient.sendPrompt).toHaveBeenCalledWith("sess-fallback", "/home/user/project", "hello");
+      expect(outcome).toEqual({
+        outcome: "launched",
+        sessionId: "sess-fallback",
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[launch-ingest] resolveOwnerClient threw for session sess-fallback"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe("detail truncation", () => {
+    it("truncates error messages longer than 300 characters", async () => {
+      const longMessage = "E".repeat(500);
+      const fakeClient = {
+        healthCheck: vi.fn().mockResolvedValue(true),
+        createSession: vi.fn().mockRejectedValue(new Error(longMessage)),
+        sendPrompt: vi.fn(),
+        deleteSession: vi.fn(),
+      } as unknown as OpencodeClient;
+
+      const outcome = await startSession({
+        directory: "/home/user/project",
+        prompt: "hello",
+        opencodeClient: fakeClient,
+      });
+
+      expect(outcome.outcome).toBe("refused");
+      if (outcome.outcome === "refused") {
+        expect(outcome.detail.length).toBe(300);
+        expect(outcome.detail.endsWith("…")).toBe(true);
+      }
+    });
+  });
+});
+
+describe("autoAttach export", () => {
+  it("exports autoAttach and spawns oc-auto-attach with sessionId", () => {
+    const unref = vi.fn();
+    const spawnFn = vi.fn(() => ({
+      unref,
+      on: vi.fn(),
+    } as unknown as ReturnType<typeof import("child_process").spawn>));
+
+    autoAttach("sess-auto", spawnFn);
+
+    expect(spawnFn).toHaveBeenCalledWith(
+      expect.stringContaining("oc-auto-attach"),
+      ["sess-auto"],
+      expect.objectContaining({ detached: true }),
+    );
+  });
+});
+
+describe("applyTag export", () => {
+  it("exports applyTag and tags a session", async () => {
+    const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "tagged fbm\n", stderr: "" });
+    const line = await applyTag("fbm", "sess-1", runOcTags, "");
+    expect(line).toBe("tagged fbm");
+    expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-1"]);
   });
 });

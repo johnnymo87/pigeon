@@ -121,6 +121,64 @@ for p in 4096 4097 4098 4099; do
 done
 ```
 
+## Remote Upgrade (via `swarm_launch`)
+
+Where remote launch is enabled (it is off by default; see "Remote launch" in `AGENTS.md`), an
+agent on machine A can deploy pigeon on machine B by starting a fresh session there with
+`swarm_launch`. That session does the per-machine steps above and reports back. The worker
+deploy is still done once, from anywhere, as above.
+
+### Example
+
+The prompt below is for **devbox**. For another host, substitute that host's commands from the
+tables above (cloudbox's pool target is a *system* unit and takes `sudo`).
+
+```ts
+swarm_launch({
+  machine: "devbox",
+  directory: "~/projects/pigeon",
+  prompt: `Deploy pigeon main on this machine, then report to me with swarm_send.
+1. In one bash call: cd ~/projects/pigeon && git pull --ff-only
+2. In a SEPARATE bash call: cd ~/projects/pigeon && npm install
+3. sudo systemctl restart pigeon-daemon.service
+4. curl -s http://127.0.0.1:4731/health must show ok:true.
+5. swarm_send me: the new HEAD sha, the health output, and anything that failed. If the
+   plugin changed, say that it is NOT verified yet: you are running on the old plugin.
+6. Do NOT restart the serve pool unless I asked for it in this prompt.`
+})
+```
+
+Before ending your own turn on A, schedule a wake (`swarm_schedule`, about 20 minutes) that
+checks B shows `available` in `swarm_list remote: true` and that its report arrived. A daemon
+that fails to come back up cannot send that report, and takes B's Telegram and relay down with
+it, so silence is the failure signal and nothing else will raise it.
+
+If the plugin changed and Jonathan wants it live before the nightly reset, the prompt's last
+step (after the report) can be a delayed pool restart:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect \
+  --setenv=PATH="$PATH" systemctl --user restart opencode-serve-pool.target
+```
+
+### Rules
+
+1. **The pool-restart trap.** The launched session lives on B's serve pool. Restarting the pool
+   (step 3 of the per-machine deploy) kills it mid-turn, and also every other session there,
+   including a human's. So the restart is not a default step: it needs a plugin change and an
+   explicit ask, comes last, after the report, and runs from a delayed transient unit rather
+   than inline. `XDG_RUNTIME_DIR` and
+   `PATH` are passed because opencode bash calls lack the first and transient units get a
+   minimal second (see the user-level "Backgrounding Long-Running Processes" notes).
+2. **A plugin change cannot be verified by the session that deployed it.** It is running on the
+   old plugin and is killed by the restart that loads the new one. Verify from A afterwards,
+   for example with a second short `swarm_launch` that reports its own behaviour.
+3. **`git pull` and `npm install` stay separate calls**, for the reason in step 1 above.
+4. **macOS service changes still need Jonathan.** `darwin-rebuild switch` needs a sudo
+   password, which an unattended session cannot supply. A code-only macbook deploy (pull,
+   install, `launchctl` restart) works remotely.
+
 ## Nix Service Changes
 
 If service definitions changed (not just application code), rebuild instead of restarting:

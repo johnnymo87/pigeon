@@ -110,7 +110,7 @@ export interface OutcomeObservation {
  * whose port is closed would never be evicted from the routing pool. A test
  * pins the wrapped shape; do not delete it.
  */
-function transportCode(error: unknown): string | undefined {
+export function transportCode(error: unknown): string | undefined {
   const unwrapped = error instanceof TransportError ? error.cause : error;
   if (typeof unwrapped !== "object" || unwrapped === null) {
     return undefined;

@@ -1,6 +1,6 @@
 # Remote launch — design
 
-Status: approved for build 2026-10-29 (adversarial reviewer buy-in after two rounds; fixes folded in, the second round's in §9). Bead `pigeon-k0qn.17`, epic `pigeon-k0qn`.
+Status: built (PR 1 = #198 (merged), PR 2 = #199). Approved for build 2026-10-29 (adversarial reviewer buy-in after two rounds; fixes folded in, the second round's in §9). Bead `pigeon-k0qn.17`, epic `pigeon-k0qn`.
 
 ## Problem
 

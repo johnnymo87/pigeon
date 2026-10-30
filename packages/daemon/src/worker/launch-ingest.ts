@@ -1,7 +1,8 @@
 import os from "os";
 import { openSync } from "fs";
 import { spawn as nodeSpawn, type ChildProcess } from "child_process";
-import type { OpencodeClient } from "../opencode-client";
+import { OpencodeHttpError, type OpencodeClient } from "../opencode-client";
+import { RequestTimeoutError, TransportError, transportCode } from "../routing/serve-outcome";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
 import { isValidSessionId, isValidTag, truncate } from "./tag-ingest";
@@ -120,7 +121,7 @@ function lastLine(...candidates: Array<string | undefined>): string {
  * they like) or through drift between the two validator copies, where refusing
  * would reject a tag the worker had just accepted.
  */
-async function applyTag(
+export async function applyTag(
   tag: string,
   sessionId: string,
   runOcTags: OcTagsRunner | null | undefined,
@@ -222,104 +223,233 @@ async function inheritTag(
   }
 }
 
+export type LaunchStartOutcome =
+  | { outcome: "launched"; sessionId: string }
+  | { outcome: "refused"; reason: string; detail: string }          // nothing is running
+  | { outcome: "unconfirmed"; sessionId: string | null; detail: string };
+
+export interface LaunchStartInput {
+  directory: string;              // already resolved, absolute
+  prompt: string;
+  opencodeClient: OpencodeClient;
+  resolveOwnerClient?: (sessionId: string) => OpencodeClient | undefined;
+  budgets?: { healthMs: number; createMs: number; promptMs: number };  // remote launches pass 5000/15000/20000
+  onCreated?: (sessionId: string) => void;   // called synchronously right after createSession returns, before sendPrompt
+}
+
+function formatDetail(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return truncate(message, 300);
+}
+
+export async function startSession(input: LaunchStartInput): Promise<LaunchStartOutcome> {
+  try {
+    const healthy = input.budgets
+      ? await input.opencodeClient.healthCheck({ timeoutMs: input.budgets.healthMs })
+      : await input.opencodeClient.healthCheck();
+    if (!healthy) {
+      return {
+        outcome: "refused",
+        reason: "serve_unavailable",
+        detail: "opencode serve is not running",
+      };
+    }
+  } catch (err) {
+    return {
+      outcome: "refused",
+      reason: "serve_unavailable",
+      detail: formatDetail(err),
+    };
+  }
+
+  let session: { id: string };
+  try {
+    session = input.budgets
+      ? await input.opencodeClient.createSession(input.directory, { timeoutMs: input.budgets.createMs })
+      : await input.opencodeClient.createSession(input.directory);
+  } catch (err) {
+    const detail = formatDetail(err);
+    if (err instanceof RequestTimeoutError) {
+      return { outcome: "unconfirmed", sessionId: null, detail };
+    }
+    if (err instanceof TransportError && transportCode(err) === "ECONNREFUSED") {
+      return { outcome: "refused", reason: "serve_unreachable", detail };
+    }
+    if (err instanceof TransportError) {
+      return { outcome: "unconfirmed", sessionId: null, detail };
+    }
+    return { outcome: "refused", reason: "create_failed", detail };
+  }
+
+  if (input.onCreated) {
+    try {
+      input.onCreated(session.id);
+    } catch (err) {
+      console.warn(`[launch-ingest] onCreated threw for session ${session.id}:`, err);
+    }
+  }
+
+  let owner = input.opencodeClient;
+  if (input.resolveOwnerClient) {
+    try {
+      owner = input.resolveOwnerClient(session.id) ?? input.opencodeClient;
+    } catch (err) {
+      console.warn(`[launch-ingest] resolveOwnerClient threw for session ${session.id}, falling back to opencodeClient:`, err);
+    }
+  }
+  try {
+    if (input.budgets) {
+      await owner.sendPrompt(session.id, input.directory, input.prompt, { timeoutMs: input.budgets.promptMs });
+    } else {
+      await owner.sendPrompt(session.id, input.directory, input.prompt);
+    }
+    console.log(`[launch-ingest] session started sessionId=${session.id} directory=${input.directory}`);
+    return { outcome: "launched", sessionId: session.id };
+  } catch (err) {
+    const detail = formatDetail(err);
+    if (err instanceof OpencodeHttpError && err.status >= 400 && err.status < 500) {
+      try {
+        await owner.deleteSession(session.id);
+      } catch {
+        // best-effort deleteSession (swallow errors)
+      }
+      return { outcome: "refused", reason: "prompt_rejected", detail };
+    }
+    if (err instanceof TransportError && transportCode(err) === "ECONNREFUSED") {
+      try {
+        await owner.deleteSession(session.id);
+      } catch {
+        // best-effort deleteSession (swallow errors)
+      }
+      return { outcome: "refused", reason: "prompt_unreachable", detail };
+    }
+    // RequestTimeoutError, 5xx OpencodeHttpError, other TransportError, or any other error
+    return { outcome: "unconfirmed", sessionId: session.id, detail };
+  }
+}
+
+export function autoAttach(
+  sessionId: string,
+  spawn?: LaunchCommandInput["spawn"],
+): void {
+  // Auto-attach: best-effort, fire-and-forget. If oc-auto-attach is not
+  // installed (e.g. cloudbox), node spawn emits ENOENT asynchronously
+  // on the child's 'error' event — we MUST listen for it or node crashes.
+  // The synchronous try/catch handles rare cases like invalid arguments
+  // that throw immediately.
+  //
+  // OC_AUTO_ATTACH_BIN env var lets systemd-managed deployments pin an
+  // absolute path to the binary. Required on hosts (e.g. cloudbox) where
+  // the daemon's PATH is a locked-down nix-store list that does NOT
+  // include ~/.nix-profile/bin — without it, spawn would silently ENOENT
+  // and the auto-attach to nvim+tmux for telegram /launch would never run.
+  //
+  // We route the child's stdout AND stderr to /tmp/oc-auto-attach.log
+  // (the same log file the home.base.nix shell wrapper uses). Without
+  // this, daemon-spawned launches would discard the script's logs and
+  // any internal failure (e.g. a missing tool in the script's PATH
+  // under `set -o pipefail`) would be completely invisible. We hit
+  // exactly that on cloudbox: oc-auto-attach silently failed for a
+  // /launch into a project without an existing tmux window because
+  // `awk` was missing from the script's hard-coded PATH.
+  //
+  // openSync failure (e.g. /tmp not writable) is swallowed — we'd
+  // rather lose logs than crash the launcher.
+  try {
+    const spawnFn = spawn ?? nodeSpawn;
+    const bin = process.env.OC_AUTO_ATTACH_BIN ?? "oc-auto-attach";
+    let logFd: number | "ignore" = "ignore";
+    try {
+      logFd = openSync(AUTO_ATTACH_LOG_PATH, "a");
+    } catch (logErr: unknown) {
+      console.warn(`[launch-ingest] could not open ${AUTO_ATTACH_LOG_PATH}:`, logErr);
+    }
+    const child = spawnFn(bin, [sessionId], {
+      stdio: ["ignore", logFd, logFd],
+      detached: true,
+    });
+    child.on?.("error", (err: NodeJS.ErrnoException) => {
+      if (err.code !== "ENOENT") {
+        console.warn(`[launch-ingest] auto-attach spawn failed (async):`, err);
+      }
+    });
+    child.unref?.();
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      console.warn(`[launch-ingest] auto-attach spawn failed (sync):`, err);
+    }
+  }
+}
+
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
   const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const directory = resolveHome(expandShorthand(input.directory));
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
-  const healthy = await opencodeClient.healthCheck();
-  if (!healthy) {
-    await sendTelegramReply(chatId, `opencode serve is not running${machineLabel}.`);
+  const outcome = await startSession({
+    directory,
+    prompt,
+    opencodeClient,
+    resolveOwnerClient: input.resolveOwnerClient,
+  });
+
+  if (outcome.outcome === "refused") {
+    if (outcome.reason === "serve_unavailable") {
+      await sendTelegramReply(chatId, `opencode serve is not running${machineLabel}.`);
+      return;
+    }
+    await sendTelegramReply(chatId, `Failed to launch session${machineLabel}: ${outcome.detail}`);
     return;
   }
 
-  try {
-    const session = await opencodeClient.createSession(directory);
-    // Route the prompt to the serve that owns the session (HRW placement);
-    // fall back to the create serve when routing is unavailable.
-    const owner = input.resolveOwnerClient?.(session.id) ?? opencodeClient;
-    await owner.sendPrompt(session.id, directory, prompt);
-    console.log(`[launch-ingest] session started sessionId=${session.id} directory=${directory}`);
-
-    // Auto-attach: best-effort, fire-and-forget. If oc-auto-attach is not
-    // installed (e.g. cloudbox), node spawn emits ENOENT asynchronously
-    // on the child's 'error' event — we MUST listen for it or node crashes.
-    // The synchronous try/catch handles rare cases like invalid arguments
-    // that throw immediately.
-    //
-    // OC_AUTO_ATTACH_BIN env var lets systemd-managed deployments pin an
-    // absolute path to the binary. Required on hosts (e.g. cloudbox) where
-    // the daemon's PATH is a locked-down nix-store list that does NOT
-    // include ~/.nix-profile/bin — without it, spawn would silently ENOENT
-    // and the auto-attach to nvim+tmux for telegram /launch would never run.
-    //
-    // We route the child's stdout AND stderr to /tmp/oc-auto-attach.log
-    // (the same log file the home.base.nix shell wrapper uses). Without
-    // this, daemon-spawned launches would discard the script's logs and
-    // any internal failure (e.g. a missing tool in the script's PATH
-    // under `set -o pipefail`) would be completely invisible. We hit
-    // exactly that on cloudbox: oc-auto-attach silently failed for a
-    // /launch into a project without an existing tmux window because
-    // `awk` was missing from the script's hard-coded PATH.
-    //
-    // openSync failure (e.g. /tmp not writable) is swallowed — we'd
-    // rather lose logs than crash the launcher.
+  if (outcome.outcome === "unconfirmed" && outcome.sessionId === null) {
     try {
-      const spawnFn = input.spawn ?? nodeSpawn;
-      const bin = process.env.OC_AUTO_ATTACH_BIN ?? "oc-auto-attach";
-      let logFd: number | "ignore" = "ignore";
-      try {
-        logFd = openSync(AUTO_ATTACH_LOG_PATH, "a");
-      } catch (logErr: unknown) {
-        console.warn(`[launch-ingest] could not open ${AUTO_ATTACH_LOG_PATH}:`, logErr);
-      }
-      const child = spawnFn(bin, [session.id], {
-        stdio: ["ignore", logFd, logFd],
-        detached: true,
-      });
-      child.on?.("error", (err: NodeJS.ErrnoException) => {
-        if (err.code !== "ENOENT") {
-          console.warn(`[launch-ingest] auto-attach spawn failed (async):`, err);
-        }
-      });
-      child.unref?.();
-    } catch (err: unknown) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        console.warn(`[launch-ingest] auto-attach spawn failed (sync):`, err);
-      }
+      await sendTelegramReply(chatId, `Launch${machineLabel} may or may not have started: ${outcome.detail}`);
+    } catch (err) {
+      console.warn(`[launch-ingest] unconfirmed reply failed:`, err);
     }
+    return;
+  }
 
-    // Tagging happens LAST, after the session exists and the prompt is away.
-    // That costs nothing, because oc-tags attribution is retroactive: report/top
-    // join costs against tags.db at read time (aggregate() takes the tag maps as
-    // arguments and session_tag.created_at is written but never read), so a tag
-    // written a second late still covers every dollar this session ever spends.
-    // There is no race to win by tagging earlier, only a launch to risk.
-    //
-    // An explicit --tag wins outright: the inheritance lookup is not even run.
-    const tagLine = input.tag === undefined
-      ? await inheritTag(input, session.id, machineLabel)
-      : await applyTag(input.tag, session.id, input.runOcTags, machineLabel, input.onTagged);
+  const sessionId = outcome.sessionId!;
+
+  try {
+    autoAttach(sessionId, input.spawn);
+  } catch (err) {
+    console.warn(`[launch-ingest] autoAttach failed session=${sessionId}:`, err);
+  }
+
+  let tagLine: string | null = null;
+  try {
+    tagLine = input.tag === undefined
+      ? await inheritTag(input, sessionId, machineLabel)
+      : await applyTag(input.tag, sessionId, input.runOcTags, machineLabel, input.onTagged);
     if (tagLine) {
       const what = input.tag === undefined ? `inherit=${input.inheritFromSessionId}` : `tag=${input.tag}`;
-      console.log(`[launch-ingest] tag commandId=${input.commandId} session=${session.id} ${what}: ${tagLine}`);
+      console.log(`[launch-ingest] tag commandId=${commandId} session=${sessionId} ${what}: ${tagLine}`);
     }
+  } catch (err) {
+    console.warn(`[launch-ingest] tag step failed session=${sessionId}:`, err);
+  }
 
+  try {
     const builder = new TgMessageBuilder()
       .append(`Session started${machineLabel}:\n🆔 `)
-      .appendCode(session.id)
+      .appendCode(sessionId)
       .append("\n📂 ")
       .appendCode(directory);
     if (tagLine) {
       builder.append(`\n🏷 ${tagLine}`);
     }
+    if (outcome.outcome === "unconfirmed") {
+      builder.append(`\n⚠️ Its prompt may not have arrived: ${outcome.detail}`);
+    }
     const msg = builder
       .append("\n\nThe pigeon plugin will notify you when the session stops or has questions.")
       .build();
     await sendTelegramReply(chatId, msg.text, msg.entities);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await sendTelegramReply(chatId, `Failed to launch session${machineLabel}: ${message}`);
+  } catch (err) {
+    console.warn(`[launch-ingest] confirmation reply failed session=${sessionId}:`, err);
   }
 }

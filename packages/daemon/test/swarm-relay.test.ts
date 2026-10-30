@@ -522,8 +522,13 @@ describe("relay wire client and poller", () => {
 
   it("builds the poll header", async () => {
     expect(relayPollHeader([], false)).toBeNull();
+    expect(relayPollHeader([], false, [])).toBeNull();
     expect(relayPollHeader([], true)).toBe("accept=; failures=1");
     expect(relayPollHeader(["devbox", "macbook"], true)).toBe("accept=devbox,macbook; failures=1");
+    // Remote launch additions
+    expect(relayPollHeader(["devbox"], false)).toBe("accept=devbox");
+    expect(relayPollHeader(["devbox"], true, ["cloudbox"])).toBe("accept=devbox; launch=cloudbox; failures=1");
+    expect(relayPollHeader([], false, ["cloudbox"])).toBe("accept=; launch=cloudbox");
   });
 
   it("sends the header, hands relay items over before dispatching the command, and treats 200 without commandId as no command", async () => {
