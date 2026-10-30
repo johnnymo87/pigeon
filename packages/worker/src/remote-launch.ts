@@ -605,7 +605,7 @@ function correctionBatch(
     // unconfirmed with sessionId
     stmt1 = db
       .prepare(
-        `UPDATE remote_launch SET session_id = ?, settled_at = ?
+        `UPDATE remote_launch SET session_id = ?, reason = 'unconfirmed', settled_at = ?
          WHERE from_machine = ? AND launch_id = ? AND to_machine = ? AND status = 'expired' AND session_id IS NULL`,
       )
       .bind(sessionId!, now, row.from_machine, row.launch_id, principalMachineId);

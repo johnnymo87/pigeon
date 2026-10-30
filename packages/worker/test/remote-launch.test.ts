@@ -847,6 +847,118 @@ describe("POST /launch/relay/ack", () => {
     expect(body2.launches[0].outcome).toBe("launched");
   });
 
+  it("correction for row expired with never_collected: B acks unconfirmed with session_id -> row becomes expired/unconfirmed with that session_id and result carrying id is minted", async () => {
+    // 1. Queued result row case (updated in place)
+    await launch(KEY_A, { launch_id: "launch_rl_expire_01" });
+    const now = Date.now();
+    await env.DB.prepare(
+      "UPDATE remote_launch SET status = 'expired', reason = 'never_collected', settled_at = ? WHERE from_machine = ? AND launch_id = ?",
+    )
+      .bind(now, A, "launch_rl_expire_01")
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:launch_rl_expire_01', 'result', ?, ?, ?, '', 'queued', 0, ?, ?)`,
+    )
+      .bind(
+        A,
+        A,
+        SENDER,
+        JSON.stringify({
+          launch_id: "launch_rl_expire_01",
+          machine: B,
+          outcome: "refused",
+          session_id: null,
+          reason: "never_collected",
+        }),
+        now,
+        now + 86400000,
+      )
+      .run();
+
+    const ackRes1 = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_expire_01",
+        outcome: "unconfirmed",
+        session_id: "ses_rlUnconfirmed01",
+      },
+    ]);
+    expect(ackRes1.status).toBe(200);
+
+    const lRow1 = await row(A, "launch_rl_expire_01");
+    expect(lRow1!.status).toBe("expired");
+    expect(lRow1!.reason).toBe("unconfirmed");
+    expect(lRow1!.session_id).toBe("ses_rlUnconfirmed01");
+
+    const rRow1 = await row(A, "r:launch_rl_expire_01");
+    expect(rRow1!.status).toBe("queued");
+    const rBody1 = JSON.parse(String(rRow1!.body_json));
+    expect(rBody1).toMatchObject({
+      launch_id: "launch_rl_expire_01",
+      machine: B,
+      outcome: "unconfirmed",
+      session_id: "ses_rlUnconfirmed01",
+      reason: "unconfirmed",
+    });
+
+    // 2. Already-leased/collected result row case (r:<id>:unconfirmed minted)
+    await launch(KEY_A, { launch_id: "launch_rl_expire_02" });
+    await env.DB.prepare(
+      "UPDATE remote_launch SET status = 'expired', reason = 'never_collected', settled_at = ? WHERE from_machine = ? AND launch_id = ?",
+    )
+      .bind(now, A, "launch_rl_expire_02")
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO remote_launch (from_machine, launch_id, item_kind, to_machine, from_session, body_json, body_sha256, status, lease_count, created_at, expires_at)
+       VALUES (?, 'r:launch_rl_expire_02', 'result', ?, ?, ?, '', 'leased', 1, ?, ?)`,
+    )
+      .bind(
+        A,
+        A,
+        SENDER,
+        JSON.stringify({
+          launch_id: "launch_rl_expire_02",
+          machine: B,
+          outcome: "refused",
+          session_id: null,
+          reason: "never_collected",
+        }),
+        now,
+        now + 86400000,
+      )
+      .run();
+
+    const ackRes2 = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_expire_02",
+        outcome: "unconfirmed",
+        session_id: "ses_rlUnconfirmed02",
+      },
+    ]);
+    expect(ackRes2.status).toBe(200);
+
+    const lRow2 = await row(A, "launch_rl_expire_02");
+    expect(lRow2!.status).toBe("expired");
+    expect(lRow2!.reason).toBe("unconfirmed");
+    expect(lRow2!.session_id).toBe("ses_rlUnconfirmed02");
+
+    const rRow2 = await row(A, "r:launch_rl_expire_02:unconfirmed");
+    expect(rRow2).not.toBeNull();
+    expect(rRow2!.status).toBe("queued");
+    const rBody2 = JSON.parse(String(rRow2!.body_json));
+    expect(rBody2).toMatchObject({
+      launch_id: "launch_rl_expire_02",
+      machine: B,
+      outcome: "unconfirmed",
+      session_id: "ses_rlUnconfirmed02",
+      reason: "unconfirmed",
+    });
+  });
+
   it("ack refused on a launched row -> ok, row unchanged, no new result row", async () => {
     await launch(KEY_A);
     await poll(KEY_B, B, `launch=${A}`);
