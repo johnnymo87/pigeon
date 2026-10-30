@@ -17,7 +17,7 @@ Use this file as the quickstart and table of contents for agent-facing docs.
 - OpenCode serve health (local): `curl http://127.0.0.1:4096/global/health`
 - Swarm route exists (local): `curl -s -X POST -H 'content-type: application/json' -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" http://127.0.0.1:4731/swarm/send -d '{}'` → expect `{"error":"from is required"}` (NOT 404)
 - Deploy worker: `npm run --workspace @pigeon/worker deploy`
-- Deploy daemon/plugin: `git pull`, then **separately** `npm install`, then restart service per machine (see [cross-device-deployment](.agents/skills/cross-device-deployment/SKILL.md)). Two bash calls, not one — see below.
+- Deploy daemon/plugin: `scripts/deploy-daemon.sh` on each machine (pull, `npm install` under the daemon's own node, restart, poll `/health`; `--dry-run` first). Never a bare `npm install` for a deploy: `better-sqlite3` is native and must match the service's node. See [cross-device-deployment](.agents/skills/cross-device-deployment/SKILL.md).
 
 ### Heavy commands and your serve's memory cgroup
 
