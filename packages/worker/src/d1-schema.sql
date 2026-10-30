@@ -159,3 +159,35 @@ CREATE TABLE IF NOT EXISTS machine_relay_accept (
   accept_csv  TEXT NOT NULL,
   updated_at  INTEGER NOT NULL
 );
+
+-- Remote launch (pigeon-k0qn.17, docs/plans/2026-10-29-remote-launch-design.md).
+-- item_kind 'launch': A asks B to start a session. item_kind 'result': the receipt for A,
+-- keyed r:<launch_id> (or r:<launch_id>:<outcome> for a correction, design §9.1).
+CREATE TABLE IF NOT EXISTS remote_launch (
+  from_machine  TEXT NOT NULL,
+  launch_id     TEXT NOT NULL,
+  item_kind     TEXT NOT NULL,              -- 'launch' | 'result'
+  to_machine    TEXT NOT NULL,
+  from_session  TEXT NOT NULL,
+  body_json     TEXT NOT NULL,
+  body_sha256   TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'queued', -- queued|leased|launched|refused|expired (results: queued|leased|delivered|refused|expired)
+  session_id    TEXT,
+  reason        TEXT,
+  lease_count   INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  leased_at     INTEGER,
+  expires_at    INTEGER NOT NULL,
+  settled_at    INTEGER,
+  PRIMARY KEY (from_machine, launch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_launch_handout ON remote_launch(to_machine, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_remote_launch_expiry ON remote_launch(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_remote_launch_from ON remote_launch(from_machine, item_kind, created_at);
+
+-- Which machines a machine runs launches for, from the poll header's launch= token.
+CREATE TABLE IF NOT EXISTS machine_launch_accept (
+  machine_id  TEXT PRIMARY KEY,
+  accept_csv  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);

@@ -8,6 +8,7 @@ import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
+import { handleLaunchRelay } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
@@ -52,6 +53,11 @@ export default {
         }
         if (path === "/swarm/relay/fail" && method === "POST") {
           return handleRelayFail(db, env, request);
+        }
+
+        // Remote launch (pigeon-k0qn.17). Machine credentials only.
+        if (path === "/launch/relay" && method === "POST") {
+          return handleLaunchRelay(db, env, request);
         }
 
         // Sessions
