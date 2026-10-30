@@ -85,6 +85,33 @@ describe("remote-launch-receiver", () => {
       expect(record?.reason).toBeNull();
       expect(record?.ackDone).toBe(true);
     });
+
+    it("resamples now after startSession returns for settle and backoff", async () => {
+      ackMock.mockResolvedValueOnce(false); // ack fails so next_ack_at is set
+      (client.createSession as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        now += 15_000; // time advances 15s during startSession
+        return { id: "ses_remote12345" };
+      });
+
+      const deps = makeDeps();
+      const item = {
+        item: "launch",
+        from_machine: "devbox",
+        launch_id: "lnch_advance_clock",
+        from: "ses_sender12345",
+        directory: "/home/dev/projects/pigeon",
+        prompt: "echo hello",
+        tag: null,
+        expires_at: now + 60_000,
+      };
+
+      await processLaunchItems(deps, [item]);
+
+      const record = storage.remoteLaunch.inbound.get("devbox", "lnch_advance_clock");
+      expect(record?.state).toBe("settled");
+      expect(record?.nextAckAt).toBe(now + 5000);
+      expect(record?.updatedAt).toBe(now);
+    });
   });
 
   describe("step 1: missing or invalid from_machine or launch_id", () => {
@@ -261,6 +288,27 @@ describe("remote-launch-receiver", () => {
         { kind: "launch", from_machine: "devbox", launch_id: "l1", outcome: "refused", reason: "not_accepted" },
       ]);
       const record = storage.remoteLaunch.inbound.get("devbox", "l1");
+      expect(record?.reason).toBe("not_accepted");
+    });
+
+    it("refuses not_accepted even when item is expired if from_machine is not in launchFrom", async () => {
+      const deps = makeDeps({ launchFrom: ["devbox"] });
+      const item = {
+        item: "launch",
+        from_machine: "untrusted_machine",
+        launch_id: "l_expired_untrusted",
+        from: "ses_valid12345",
+        directory: "/a",
+        prompt: "p",
+        expires_at: now - 1000,
+      };
+
+      await processLaunchItems(deps, [item]);
+
+      expect(ackMock).toHaveBeenCalledWith([
+        { kind: "launch", from_machine: "untrusted_machine", launch_id: "l_expired_untrusted", outcome: "refused", reason: "not_accepted" },
+      ]);
+      const record = storage.remoteLaunch.inbound.get("untrusted_machine", "l_expired_untrusted");
       expect(record?.reason).toBe("not_accepted");
     });
 
@@ -520,6 +568,98 @@ describe("remote-launch-receiver", () => {
         },
       ]);
     });
+
+    it("settles created row as unconfirmed so a failed ack allows retryLaunchAcks to retry it", async () => {
+      storage.remoteLaunch.inbound.insertReceived(
+        { fromMachine: "devbox", launchId: "lnch_crash_created", fromSession: "ses_sender12345" },
+        now,
+      );
+      storage.remoteLaunch.inbound.markCreated("devbox", "lnch_crash_created", "ses_partial123", now);
+
+      ackMock.mockResolvedValueOnce(false); // First ack fails
+
+      const deps = makeDeps();
+      const item = {
+        item: "launch",
+        from_machine: "devbox",
+        launch_id: "lnch_crash_created",
+        from: "ses_sender12345",
+        directory: "/home/dev/projects/pigeon",
+        prompt: "echo hello",
+        tag: null,
+        expires_at: now + 60_000,
+      };
+
+      await processLaunchItems(deps, [item]);
+
+      const record = storage.remoteLaunch.inbound.get("devbox", "lnch_crash_created");
+      expect(record?.state).toBe("settled");
+      expect(record?.outcome).toBe("unconfirmed");
+      expect(record?.sessionId).toBe("ses_partial123");
+      expect(record?.ackDone).toBe(false);
+
+      // Advance time to nextAckAt and test retryLaunchAcks
+      now += 5000;
+      ackMock.mockResolvedValueOnce(true);
+      await retryLaunchAcks(deps);
+
+      expect(ackMock).toHaveBeenLastCalledWith([
+        {
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_crash_created",
+          outcome: "unconfirmed",
+          session_id: "ses_partial123",
+        },
+      ]);
+      const updated = storage.remoteLaunch.inbound.get("devbox", "lnch_crash_created");
+      expect(updated?.ackDone).toBe(true);
+    });
+
+    it("settles received row as unconfirmed so a failed ack allows retryLaunchAcks to retry it", async () => {
+      storage.remoteLaunch.inbound.insertReceived(
+        { fromMachine: "devbox", launchId: "lnch_crash_received", fromSession: "ses_sender12345" },
+        now,
+      );
+
+      ackMock.mockResolvedValueOnce(false); // First ack fails
+
+      const deps = makeDeps();
+      const item = {
+        item: "launch",
+        from_machine: "devbox",
+        launch_id: "lnch_crash_received",
+        from: "ses_sender12345",
+        directory: "/home/dev/projects/pigeon",
+        prompt: "echo hello",
+        tag: null,
+        expires_at: now + 60_000,
+      };
+
+      await processLaunchItems(deps, [item]);
+
+      const record = storage.remoteLaunch.inbound.get("devbox", "lnch_crash_received");
+      expect(record?.state).toBe("settled");
+      expect(record?.outcome).toBe("unconfirmed");
+      expect(record?.sessionId).toBeNull();
+      expect(record?.ackDone).toBe(false);
+
+      // Advance time to nextAckAt and test retryLaunchAcks
+      now += 5000;
+      ackMock.mockResolvedValueOnce(true);
+      await retryLaunchAcks(deps);
+
+      expect(ackMock).toHaveBeenLastCalledWith([
+        {
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_crash_received",
+          outcome: "unconfirmed",
+        },
+      ]);
+      const updated = storage.remoteLaunch.inbound.get("devbox", "lnch_crash_received");
+      expect(updated?.ackDone).toBe(true);
+    });
   });
 
   describe("prompt timeout outcome", () => {
@@ -628,6 +768,55 @@ describe("remote-launch-receiver", () => {
       expect(ackMock).not.toHaveBeenCalled();
       const updated = storage.remoteLaunch.inbound.get("devbox", "lnch_badack");
       expect(updated?.ackDone).toBe(true);
+    });
+
+    it("stops retryLaunchAcks loop at first failed send, but skips invalid items without stopping", async () => {
+      // Row 1: invalid item in DB (reason has uppercase/space), marked done without calling ack, counts as success
+      storage.remoteLaunch.inbound.insertReceived(
+        { fromMachine: "devbox", launchId: "lnch_r1", fromSession: "ses_sender12345" },
+        now,
+      );
+      storage.remoteLaunch.inbound.settle("devbox", "lnch_r1", "refused", null, "INVALID REASON", now);
+
+      // Row 2: valid row, but ack will return false
+      storage.remoteLaunch.inbound.insertReceived(
+        { fromMachine: "devbox", launchId: "lnch_r2", fromSession: "ses_sender12345" },
+        now,
+      );
+      storage.remoteLaunch.inbound.settle("devbox", "lnch_r2", "launched", "ses_r2_12345", null, now);
+
+      // Row 3: valid row, should NOT be attempted because Row 2 failed
+      storage.remoteLaunch.inbound.insertReceived(
+        { fromMachine: "devbox", launchId: "lnch_r3", fromSession: "ses_sender12345" },
+        now,
+      );
+      storage.remoteLaunch.inbound.settle("devbox", "lnch_r3", "launched", "ses_r3_12345", null, now);
+
+      ackMock.mockResolvedValueOnce(false); // Row 2's ack fails
+
+      const deps = makeDeps();
+      await retryLaunchAcks(deps);
+
+      // ackMock should only have been called ONCE (for Row 2, not Row 3)
+      expect(ackMock).toHaveBeenCalledTimes(1);
+      expect(ackMock).toHaveBeenCalledWith([
+        {
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_r2",
+          outcome: "launched",
+          session_id: "ses_r2_12345",
+        },
+      ]);
+
+      // Row 1 should be marked done
+      expect(storage.remoteLaunch.inbound.get("devbox", "lnch_r1")?.ackDone).toBe(true);
+      // Row 2 should be marked retry (not done)
+      expect(storage.remoteLaunch.inbound.get("devbox", "lnch_r2")?.ackDone).toBe(false);
+      expect(storage.remoteLaunch.inbound.get("devbox", "lnch_r2")?.ackAttempts).toBe(1);
+      // Row 3 should not have been attempted yet (ack_attempts = 0)
+      expect(storage.remoteLaunch.inbound.get("devbox", "lnch_r3")?.ackDone).toBe(false);
+      expect(storage.remoteLaunch.inbound.get("devbox", "lnch_r3")?.ackAttempts).toBe(0);
     });
 
     it("never throws if storage or ack throws", async () => {

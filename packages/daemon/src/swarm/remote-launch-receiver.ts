@@ -95,12 +95,12 @@ async function sendAck(
   deps: LaunchReceiverDeps,
   item: LaunchAckItem,
   now: number,
-): Promise<void> {
+): Promise<boolean> {
   const log = deps.log ?? ((msg, fields) => console.log(`[remote-launch] ${msg}`, fields ?? ""));
   if (!isValidLaunchAckItem(item)) {
     log("ack item failed wire validation, marking done", { item });
     deps.storage.remoteLaunch.inbound.markAckDone(item.from_machine, item.launch_id, now);
-    return;
+    return true;
   }
 
   let ok = false;
@@ -112,11 +112,13 @@ async function sendAck(
 
   if (ok) {
     deps.storage.remoteLaunch.inbound.markAckDone(item.from_machine, item.launch_id, now);
+    return true;
   } else {
     const row = deps.storage.remoteLaunch.inbound.get(item.from_machine, item.launch_id);
     const attempts = row?.ackAttempts ?? 0;
     const backoff = Math.min(300_000, 5_000 * Math.pow(2, attempts));
     deps.storage.remoteLaunch.inbound.markAckRetry(item.from_machine, item.launch_id, now + backoff, now);
+    return false;
   }
 }
 
@@ -250,6 +252,14 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
         ...(existing.reason ? { reason: existing.reason } : {}),
       };
     } else if (existing.state === "created") {
+      deps.storage.remoteLaunch.inbound.settle(
+        fromMachine,
+        launchId,
+        "unconfirmed",
+        existing.sessionId,
+        null,
+        now,
+      );
       ackItem = {
         kind: "launch",
         from_machine: fromMachine,
@@ -259,6 +269,14 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
       };
     } else {
       // state === "received"
+      deps.storage.remoteLaunch.inbound.settle(
+        fromMachine,
+        launchId,
+        "unconfirmed",
+        null,
+        null,
+        now,
+      );
       ackItem = {
         kind: "launch",
         from_machine: fromMachine,
@@ -267,13 +285,6 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
       };
     }
     await sendAck(deps, ackItem, now);
-    return;
-  }
-
-  // Additionally: if expires_at <= now -> refuse expired
-  if ((it.expires_at as number) <= now) {
-    log("launch item already expired", { fromMachine, launchId, expires_at: it.expires_at, now });
-    await recordRefusalAndAck(deps, fromMachine, launchId, fromSession, "expired", now);
     return;
   }
 
@@ -295,6 +306,13 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
   if (!deps.opencodeClient) {
     log("opencodeClient not provided, refusing serve_unavailable", { fromMachine, launchId });
     await recordRefusalAndAck(deps, fromMachine, launchId, fromSession, "serve_unavailable", now);
+    return;
+  }
+
+  // Order review fix: expires_at <= now checked AFTER step 6 so non-allowlisted machines get not_accepted
+  if ((it.expires_at as number) <= now) {
+    log("launch item already expired", { fromMachine, launchId, expires_at: it.expires_at, now });
+    await recordRefusalAndAck(deps, fromMachine, launchId, fromSession, "expired", now);
     return;
   }
 
@@ -365,9 +383,12 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
     },
   });
 
+  // Re-sample clock after startSession returns (review fix 1)
+  const postStartNow = (deps.nowFn ?? Date.now)();
+
   // 9. settle and ack
   if (outcome.outcome === "launched") {
-    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "launched", outcome.sessionId, null, now);
+    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "launched", outcome.sessionId, null, postStartNow);
     await sendAck(
       deps,
       {
@@ -377,11 +398,11 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
         outcome: "launched",
         session_id: outcome.sessionId,
       },
-      now,
+      postStartNow,
     );
     runStep10(deps, fromMachine, launchId, from, outcome.sessionId, resolvedDir, prompt, tag, false);
   } else if (outcome.outcome === "refused") {
-    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "refused", null, outcome.reason, now);
+    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "refused", null, outcome.reason, postStartNow);
     await sendAck(
       deps,
       {
@@ -391,11 +412,11 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
         outcome: "refused",
         reason: outcome.reason,
       },
-      now,
+      postStartNow,
     );
   } else {
     // outcome.outcome === "unconfirmed"
-    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "unconfirmed", outcome.sessionId, null, now);
+    deps.storage.remoteLaunch.inbound.settle(fromMachine, launchId, "unconfirmed", outcome.sessionId, null, postStartNow);
     await sendAck(
       deps,
       {
@@ -405,7 +426,7 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
         outcome: "unconfirmed",
         ...(outcome.sessionId ? { session_id: outcome.sessionId } : {}),
       },
-      now,
+      postStartNow,
     );
     if (outcome.sessionId) {
       runStep10(deps, fromMachine, launchId, from, outcome.sessionId, resolvedDir, prompt, tag, true);
@@ -445,9 +466,13 @@ export async function retryLaunchAcks(deps: LaunchReceiverDeps): Promise<void> {
           ...(row.sessionId ? { session_id: row.sessionId } : {}),
           ...(row.reason ? { reason: row.reason } : {}),
         };
-        await sendAck(deps, ackItem, now);
+        const ok = await sendAck(deps, ackItem, now);
+        if (!ok) {
+          break;
+        }
       } catch (err) {
         deps.log?.("retryLaunchAcks failed for row", { row, err: String(err) });
+        break;
       }
     }
   } catch (err) {
