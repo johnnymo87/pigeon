@@ -14,6 +14,7 @@ import { TokenTracker, ProviderCache, type MessageTokenInfo } from "./token-trac
 import { SessionManager, normalizeTitle } from "./session-state"
 import { createSwarmReadTool, SWARM_READ_TOOL_NAME } from "./swarm-tool"
 import { createSwarmSendTool, SWARM_SEND_TOOL_NAME } from "./swarm-send-tool"
+import { createSwarmLaunchTool, SWARM_LAUNCH_TOOL_NAME } from "./swarm-launch-tool"
 import { createSwarmListTool, SWARM_LIST_TOOL_NAME } from "./swarm-list-tool"
 import { createSwarmScheduleTool, SWARM_SCHEDULE_TOOL_NAME } from "./swarm-schedule-tool"
 import { createSwarmScheduledTool, SWARM_SCHEDULED_TOOL_NAME } from "./swarm-scheduled-tool"
@@ -445,6 +446,7 @@ const plugin: Plugin = async (ctx) => {
         // See SWARM_READ_TOOL_NAME comment in swarm-tool.ts for history.
         [SWARM_READ_TOOL_NAME]: createSwarmReadTool(daemonUrl),
         [SWARM_SEND_TOOL_NAME]: createSwarmSendTool(daemonUrl),
+        [SWARM_LAUNCH_TOOL_NAME]: createSwarmLaunchTool(daemonUrl, String(ctx.serverUrl), internalFetch),
         [SWARM_LIST_TOOL_NAME]: createSwarmListTool(String(ctx.serverUrl), internalFetch, { daemonBaseUrl: daemonUrl }),
         [SWARM_SCHEDULE_TOOL_NAME]: createSwarmScheduleTool(daemonUrl),
         [SWARM_SCHEDULED_TOOL_NAME]: createSwarmScheduledTool(daemonUrl),

@@ -1759,6 +1759,38 @@ describe("Poller remote launch items (pigeon-k0qn.17)", () => {
     expect(onLaunchItems).not.toHaveBeenCalled();
     poller.stop();
   });
+
+  it("calls onLaunchItems on a tick where pollNext returns no command but has launches", async () => {
+    const rawLaunch = {
+      item: "launch",
+      from_machine: "devbox",
+      launch_id: "rl_001",
+      from: "ses_sender",
+      directory: "/home/dev/projects/pigeon",
+      prompt: "test",
+      tag: null,
+      expires_at: Date.now() + 60_000,
+    };
+    const onLaunchItems = vi.fn().mockResolvedValue(undefined);
+    const onCommand = vi.fn().mockResolvedValue(undefined);
+    const callbacks = makeCallbacks({ onLaunchItems, onCommand });
+
+    const fetchFn = makeFetch([
+      () =>
+        new Response(JSON.stringify({ launches: [rawLaunch] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    ]);
+
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onLaunchItems).toHaveBeenCalledWith([rawLaunch]);
+    expect(onCommand).not.toHaveBeenCalled();
+    poller.stop();
+  });
 });
 
 describe("Poller.lookupSessionOwner() (pigeon-k0qn.2)", () => {
