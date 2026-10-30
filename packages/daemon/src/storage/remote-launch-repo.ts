@@ -248,6 +248,7 @@ export class RemoteLaunchOutboundRepo {
     directory: string;
     requestJson: string;
     createdAt: number;
+    nextAttemptAt?: number | null;
   }): boolean {
     const requestExpiresAt = input.createdAt + REMOTE_LAUNCH_REQUEST_TTL_MS;
     const deadlineAt = requestExpiresAt + REMOTE_LAUNCH_DEADLINE_GRACE_MS;
@@ -255,9 +256,9 @@ export class RemoteLaunchOutboundRepo {
       .prepare(
         `INSERT INTO remote_launch_outbound (
            launch_id, from_session, to_machine, directory, request_json,
-           state, attempts, created_at, request_expires_at, deadline_at
+           state, attempts, created_at, request_expires_at, deadline_at, next_attempt_at
          )
-         VALUES (?, ?, ?, ?, ?, 'sending', 0, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, 'sending', 0, ?, ?, ?, ?)
          ON CONFLICT (launch_id) DO NOTHING`,
       )
       .run(
@@ -269,6 +270,7 @@ export class RemoteLaunchOutboundRepo {
         input.createdAt,
         requestExpiresAt,
         deadlineAt,
+        input.nextAttemptAt ?? null,
       );
     return result.changes > 0;
   }

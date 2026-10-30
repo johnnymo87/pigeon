@@ -43,6 +43,23 @@ describe("POST /swarm/launch route", () => {
     expect(await res.json()).toEqual({ error: "no_worker" });
   });
 
+  it("returns 400 invalid when JSON body is malformed", async () => {
+    const fakeRequester = {
+      handleRequest: vi.fn(),
+    } as unknown as RemoteLaunchRequester;
+
+    const app = createApp(storage!, { remoteLaunch: fakeRequester });
+    const res = await postLaunch(app, "not valid json {", {
+      "Content-Type": "application/json",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: "invalid",
+      detail: "invalid JSON body",
+    });
+    expect(fakeRequester.handleRequest).not.toHaveBeenCalled();
+  });
+
   it("requires auth when authToken is configured", async () => {
     const fakeRequester = {
       handleRequest: vi.fn().mockResolvedValue({

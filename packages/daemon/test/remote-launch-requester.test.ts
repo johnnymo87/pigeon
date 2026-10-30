@@ -543,6 +543,43 @@ describe("RemoteLaunchRequester", () => {
       await requester.tick();
       expect(getSwarmMessages()).toHaveLength(1);
     });
+
+    it("tick run while request is pending does not call request a second time", async () => {
+      let resolveRequest: (val: any) => void;
+      client.request = vi.fn().mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRequest = resolve;
+          }),
+      );
+
+      const requester = makeRequester();
+      const requestPromise = requester.handleRequest({
+        launch_id: "lnch_race",
+        from: "ses_sender123",
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "echo hi",
+      });
+
+      // The outbound row now exists
+      expect(storage.remoteLaunch.outbound.get("lnch_race")?.state).toBe("sending");
+
+      // Tick runs while request is still pending
+      await requester.tick();
+
+      // client.request was only called once (by handleRequest), NOT a second time by tick
+      expect(client.request).toHaveBeenCalledTimes(1);
+
+      // Now complete the pending request
+      resolveRequest!({
+        kind: "accepted",
+        toMachine: "devbox",
+        duplicate: false,
+      });
+      await requestPromise;
+      expect(storage.remoteLaunch.outbound.get("lnch_race")?.state).toBe("accepted");
+    });
   });
 
   describe("processResults", () => {
@@ -801,6 +838,210 @@ describe("RemoteLaunchRequester", () => {
       expect(messages).toHaveLength(1);
       expect(messages[0]!.payload).toBe(
         "REMOTE LAUNCH REFUSED: launch lnch_sanitize did NOT start on devbox (unrecognised). Safe to retry.",
+      );
+    });
+
+    it("rolls back seen-record and emits no ack if transaction throws, enabling redelivery", () => {
+      const requester = makeRequester();
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_tx_fail",
+        fromSession: "ses_sender123",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      const item = {
+        item: "launch_result",
+        from_machine: selfMachineId,
+        result_id: "r:lnch_tx_fail",
+        launch_id: "lnch_tx_fail",
+        machine: "devbox",
+        outcome: "launched",
+        session_id: "ses_started_ok",
+        reason: null,
+      };
+
+      // Mock markResolved to throw
+      const markResolvedSpy = vi
+        .spyOn(storage.remoteLaunch.outbound, "markResolved")
+        .mockImplementationOnce(() => {
+          throw new Error("simulated database failure");
+        });
+
+      const acks = requester.processResults([item]);
+      // Emits NO ack for this item
+      expect(acks).toHaveLength(0);
+      // Seen record was rolled back!
+      expect(storage.remoteLaunch.resultsSeen.get("r:lnch_tx_fail")).toBeNull();
+
+      // On next redelivery without error:
+      markResolvedSpy.mockRestore();
+      const retryAcks = requester.processResults([item]);
+      expect(retryAcks).toEqual([
+        {
+          kind: "result",
+          from_machine: selfMachineId,
+          result_id: "r:lnch_tx_fail",
+          outcome: "delivered",
+        },
+      ]);
+      expect(storage.remoteLaunch.resultsSeen.get("r:lnch_tx_fail")).not.toBeNull();
+      expect(getSwarmMessages()).toHaveLength(1);
+    });
+
+    it("earlier items' acks are preserved if a subsequent item throws", () => {
+      const requester = makeRequester();
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_item1",
+        fromSession: "ses_sender123",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_item2",
+        fromSession: "ses_sender123",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      const item1 = {
+        item: "launch_result",
+        from_machine: selfMachineId,
+        result_id: "r:lnch_item1",
+        launch_id: "lnch_item1",
+        machine: "devbox",
+        outcome: "launched",
+        session_id: "ses_started_1",
+        reason: null,
+      };
+      const item2 = {
+        item: "launch_result",
+        from_machine: selfMachineId,
+        result_id: "r:lnch_item2",
+        launch_id: "lnch_item2",
+        machine: "devbox",
+        outcome: "launched",
+        session_id: "ses_started_2",
+        reason: null,
+      };
+
+      // Mock markResolved to throw only for item2
+      const origMarkResolved = storage.remoteLaunch.outbound.markResolved.bind(storage.remoteLaunch.outbound);
+      vi.spyOn(storage.remoteLaunch.outbound, "markResolved").mockImplementation((id, outcome, t) => {
+        if (id === "lnch_item2") throw new Error("crash on item 2");
+        return origMarkResolved(id, outcome, t);
+      });
+
+      const acks = requester.processResults([item1, item2]);
+      // Item 1 acked, item 2 not acked
+      expect(acks).toHaveLength(1);
+      expect(acks[0]!.result_id).toBe("r:lnch_item1");
+      expect(acks[0]!.outcome).toBe("delivered");
+    });
+
+    it("duplicate unconfirmed without session id carries no new info when already unconfirmed (records seen, ack delivered, no message)", () => {
+      const requester = makeRequester();
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_unconf_dup",
+        fromSession: "ses_sender123",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      // Initially marked deadline (resolvedOutcome = 'unconfirmed', 1 message inserted)
+      storage.remoteLaunch.outbound.markDeadline("lnch_unconf_dup", now);
+      // Insert deadline message manually to simulate tick's message
+      storage.swarm.insert(
+        {
+          msgId: "m_deadline",
+          fromSession: "pigeon",
+          toSession: "ses_sender123",
+          channel: null,
+          kind: "launch.result",
+          priority: "normal",
+          replyTo: null,
+          payload: "deadline payload",
+        },
+        now,
+      );
+      expect(getSwarmMessages()).toHaveLength(1);
+
+      // Now incoming unconfirmed without session id
+      const acks = requester.processResults([
+        {
+          item: "launch_result",
+          from_machine: selfMachineId,
+          result_id: "r:lnch_unconf_dup:1",
+          launch_id: "lnch_unconf_dup",
+          machine: "devbox",
+          outcome: "unconfirmed",
+          session_id: null,
+          reason: null,
+        },
+      ]);
+
+      expect(acks).toEqual([
+        {
+          kind: "result",
+          from_machine: selfMachineId,
+          result_id: "r:lnch_unconf_dup:1",
+          outcome: "delivered",
+        },
+      ]);
+      // Seen record recorded
+      expect(storage.remoteLaunch.resultsSeen.get("r:lnch_unconf_dup:1")).not.toBeNull();
+      // NO new message inserted!
+      expect(getSwarmMessages()).toHaveLength(1);
+    });
+
+    it("incoming unconfirmed WITH session id is delivered even when already unconfirmed", () => {
+      const requester = makeRequester();
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_unconf_with_id",
+        fromSession: "ses_sender123",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      // Initially resolved_outcome is unconfirmed (e.g. from deadline)
+      storage.remoteLaunch.outbound.markDeadline("lnch_unconf_with_id", now);
+      expect(getSwarmMessages()).toHaveLength(0);
+
+      // Incoming unconfirmed WITH session id
+      const acks = requester.processResults([
+        {
+          item: "launch_result",
+          from_machine: selfMachineId,
+          result_id: "r:lnch_unconf_with_id:late",
+          launch_id: "lnch_unconf_with_id",
+          machine: "devbox",
+          outcome: "unconfirmed",
+          session_id: "ses_recovered999",
+          reason: null,
+        },
+      ]);
+
+      expect(acks).toEqual([
+        {
+          kind: "result",
+          from_machine: selfMachineId,
+          result_id: "r:lnch_unconf_with_id:late",
+          outcome: "delivered",
+        },
+      ]);
+      expect(getSwarmMessages()).toHaveLength(1);
+      expect(getSwarmMessages()[0]!.payload).toContain(
+        "REMOTE LAUNCH UNCONFIRMED: launch lnch_unconf_with_id created session ses_recovered999 on devbox",
       );
     });
   });

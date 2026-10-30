@@ -223,6 +223,7 @@ export class RemoteLaunchRequester {
       directory,
       requestJson,
       createdAt: now,
+      nextAttemptAt: now + 15_000,
     });
 
     if (!inserted) {
@@ -425,102 +426,111 @@ export class RemoteLaunchRequester {
     if (!Array.isArray(items)) return acks;
 
     for (const raw of items) {
-      if (typeof raw !== "object" || raw === null) continue;
-      const item = raw as Record<string, unknown>;
-      if (item.item !== "launch_result") continue;
+      try {
+        if (typeof raw !== "object" || raw === null) continue;
+        const item = raw as Record<string, unknown>;
+        if (item.item !== "launch_result") continue;
 
-      const resultId = typeof item.result_id === "string" ? item.result_id : null;
-      const fromMachine = typeof item.from_machine === "string" ? item.from_machine : null;
+        const resultId = typeof item.result_id === "string" ? item.result_id : null;
+        const fromMachine = typeof item.from_machine === "string" ? item.from_machine : null;
 
-      if (!resultId || !fromMachine) {
-        this.log("skipping launch_result with missing/invalid result_id or from_machine", { item });
-        continue;
-      }
+        if (!resultId || !fromMachine) {
+          this.log("skipping launch_result with missing/invalid result_id or from_machine", { item });
+          continue;
+        }
 
-      const launchId = typeof item.launch_id === "string" ? item.launch_id : "";
-      const machine = typeof item.machine === "string" ? item.machine : "";
-      const outbound = launchId ? this.storage.remoteLaunch.outbound.get(launchId) : null;
+        const launchId = typeof item.launch_id === "string" ? item.launch_id : "";
+        const machine = typeof item.machine === "string" ? item.machine : "";
+        const outbound = launchId ? this.storage.remoteLaunch.outbound.get(launchId) : null;
 
-      if (fromMachine !== this.selfMachineId || !outbound || outbound.toMachine !== machine) {
-        acks.push({
-          kind: "result",
-          from_machine: fromMachine,
-          result_id: resultId,
-          outcome: "refused",
-          reason: "no_matching_launch",
-        });
-        continue;
-      }
+        if (fromMachine !== this.selfMachineId || !outbound || outbound.toMachine !== machine) {
+          acks.push({
+            kind: "result",
+            from_machine: fromMachine,
+            result_id: resultId,
+            outcome: "refused",
+            reason: "no_matching_launch",
+          });
+          continue;
+        }
 
-      const now = this.nowFn();
-      const recorded = this.storage.remoteLaunch.resultsSeen.record(resultId, launchId, now);
-      if (!recorded) {
+        const outcome = item.outcome;
+        if (outcome !== "launched" && outcome !== "refused" && outcome !== "unconfirmed") {
+          this.log("launch_result has unknown outcome", { resultId, outcome });
+          acks.push({
+            kind: "result",
+            from_machine: fromMachine,
+            result_id: resultId,
+            outcome: "refused",
+            reason: "unrecognised",
+          });
+          continue;
+        }
+
+        let sessionId: string | null = null;
+        if (typeof item.session_id === "string" && SESSION_ID_RE.test(item.session_id)) {
+          sessionId = item.session_id;
+        }
+
+        let reason: string | null = null;
+        if (typeof item.reason === "string") {
+          reason = REASON_RE.test(item.reason) ? item.reason : "unrecognised";
+        }
+
+        const now = this.nowFn();
+
+        this.storage.db.transaction(() => {
+          const recorded = this.storage.remoteLaunch.resultsSeen.record(resultId, launchId, now);
+          if (!recorded) {
+            // Already recorded in a committed transaction
+            return;
+          }
+
+          const currentOutbound = this.storage.remoteLaunch.outbound.get(launchId);
+          // Duplicate unconfirmed: an incoming unconfirmed result with NO session id
+          // when the row's resolved_outcome is already 'unconfirmed' carries no new info ->
+          // record seen, ack delivered, no message.
+          if (outcome === "unconfirmed" && !sessionId && currentOutbound?.resolvedOutcome === "unconfirmed") {
+            return;
+          }
+
+          const marked = this.storage.remoteLaunch.outbound.markResolved(launchId, outcome, now);
+          if (marked) {
+            const payload = formatLaunchResult({
+              launchId,
+              machine: outbound.toMachine,
+              directory: outbound.directory,
+              outcome,
+              sessionId,
+              reason,
+            });
+            bankOrInsertSwarmMessage(
+              this.storage,
+              {
+                msgId: makeMsgId(),
+                fromSession: "pigeon",
+                toSession: outbound.fromSession,
+                channel: null,
+                kind: "launch.result",
+                priority: "normal",
+                replyTo: null,
+                payload,
+              },
+              now,
+            );
+          }
+        })();
+
+        // Ack 'delivered' only after the transaction commits
         acks.push({
           kind: "result",
           from_machine: fromMachine,
           result_id: resultId,
           outcome: "delivered",
         });
-        continue;
+      } catch (err) {
+        this.log("error processing launch_result item", { error: String(err), item: raw });
       }
-
-      const outcome = item.outcome;
-      if (outcome !== "launched" && outcome !== "refused" && outcome !== "unconfirmed") {
-        this.log("launch_result has unknown outcome", { resultId, outcome });
-        acks.push({
-          kind: "result",
-          from_machine: fromMachine,
-          result_id: resultId,
-          outcome: "refused",
-          reason: "unrecognised",
-        });
-        continue;
-      }
-
-      let sessionId: string | null = null;
-      if (typeof item.session_id === "string" && SESSION_ID_RE.test(item.session_id)) {
-        sessionId = item.session_id;
-      }
-
-      let reason: string | null = null;
-      if (typeof item.reason === "string") {
-        reason = REASON_RE.test(item.reason) ? item.reason : "unrecognised";
-      }
-
-      this.storage.db.transaction(() => {
-        const marked = this.storage.remoteLaunch.outbound.markResolved(launchId, outcome, now);
-        if (marked) {
-          const payload = formatLaunchResult({
-            launchId,
-            machine: outbound.toMachine,
-            directory: outbound.directory,
-            outcome,
-            sessionId,
-            reason,
-          });
-          bankOrInsertSwarmMessage(
-            this.storage,
-            {
-              msgId: makeMsgId(),
-              fromSession: "pigeon",
-              toSession: outbound.fromSession,
-              channel: null,
-              kind: "launch.result",
-              priority: "normal",
-              replyTo: null,
-              payload,
-            },
-            now,
-          );
-        }
-      })();
-
-      acks.push({
-        kind: "result",
-        from_machine: fromMachine,
-        result_id: resultId,
-        outcome: "delivered",
-      });
     }
 
     return acks;

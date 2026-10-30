@@ -931,7 +931,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         if (!opts.remoteLaunch) {
           return Response.json({ error: "no_worker" }, { status: 503 });
         }
-        const body = await readJsonBody(request);
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ error: "invalid", detail: "invalid JSON body" }, { status: 400 });
+        }
         const result = await opts.remoteLaunch.handleRequest(body);
         return Response.json(result.body, { status: result.status });
       }
