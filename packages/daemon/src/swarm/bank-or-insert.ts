@@ -68,7 +68,12 @@ export function bankOrInsertSwarmMessage(
     };
   }
 
-  if (targetSession && targetSession.backendKind === GOOSE_BACKEND_KIND && !targetSession.pullSources.includes("swarm")) {
+  if (
+    targetSession &&
+    targetSession.backendKind === GOOSE_BACKEND_KIND &&
+    !targetSession.backendEndpoint &&
+    !targetSession.pullSources.includes("swarm")
+  ) {
     return {
       status: "refused",
       reason: "no_mailbox",
@@ -79,7 +84,7 @@ export function bankOrInsertSwarmMessage(
 
   const wouldBank = Boolean(
     targetSession &&
-      (isPullBackend(targetSession) || targetSession.backendKind === GOOSE_BACKEND_KIND) &&
+      (isPullBackend(targetSession) || (targetSession.backendKind === GOOSE_BACKEND_KIND && !targetSession.backendEndpoint)) &&
       targetSession.pullSources.includes("swarm"),
   );
 

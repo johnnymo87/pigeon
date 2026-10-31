@@ -301,4 +301,34 @@ describe("state guards added before the second writer exists", () => {
     expect(f.row("msg_raced")?.state).toBe("handed_off");
     expect(f.senderInbox()).toBe("");
   });
+
+  it("skips goose targets in unverified handed-off loop and raises no alerts or transcript reads", async () => {
+    const f = makeFixture();
+    f.storage.sessions.upsert({
+      sessionId: "gse_coord_wd",
+      backendKind: "goose-acp",
+      notify: true,
+    });
+
+    f.insertHandedOff({
+      msgId: "msg_goose_wd",
+      toSession: "gse_coord_wd",
+      handedOffAt: 1_000,
+      family: "receipt",
+    });
+
+    // Advance beyond grace period
+    f.setNow(1_000 + GRACE + 10_000);
+
+    const counts = await f.watchdog.processOnce();
+
+    expect(counts.skipped).toBe(1);
+    expect(f.resolveClients).not.toHaveBeenCalled();
+    expect(f.sendPlainAlert).not.toHaveBeenCalled();
+    expect(f.storage.alerts.countDrainable(2_000_000)).toBe(0);
+    expect(f.senderInbox()).toBe("");
+
+    // Message row remains handed_off, not marked failed
+    expect(f.row("msg_goose_wd")?.state).toBe("handed_off");
+  });
 });

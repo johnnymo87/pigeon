@@ -2887,4 +2887,151 @@ describe("GooseSessionRunner session title", () => {
 
     expect(stops[0]!).not.toHaveProperty("title");
   });
+
+  describe("swarm origin delivery", () => {
+    it("never steers into a live turn: goes straight to enqueue", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.setRunId("20260918_1", "run_1");
+      client.ownership = "own";
+
+      // Start turn 1
+      await runner.deliver("c1", "turn 1 prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Deliver swarm message while turn 1 is in flight
+      const outcome = await runner.deliver("swarm:msg_1", "swarm task prompt", { origin: "swarm" });
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("queued");
+
+      // Verify no steer was attempted
+      expect(client.steers).toHaveLength(0);
+
+      // Verify NO "Queued" Telegram notice was posted
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("does not post a Queued notice on enqueue even without explicit origin if commandId starts with swarm:", async () => {
+      const { runner, client, stops } = makeRunner();
+      await runner.deliver("c1", "turn 1");
+
+      const outcome = await runner.deliver("swarm:msg_2", "swarm task prompt");
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("queued");
+      expect(client.steers).toHaveLength(0);
+
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("does not post a Queued notice on honk-busy requeue for swarm origin", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+
+      await runner.deliver("swarm:msg_busy", "prompt that hits busy");
+      expect(client.liveTurns).toBe(1);
+
+      // Honkd rejects with busy
+      client.finishBusy("run_live");
+      await runner.settled();
+
+      // Verified: no Queued notice posted
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("infers swarm origin from commandId prefix after restart recovery", async () => {
+      const { runner, client, stops, inflight } = makeRunner();
+      client.isHonk = true;
+
+      // Simulate recovery from goose_inflight_turns
+      runner.enqueueRecovered({
+        commandId: "swarm:msg_recovered",
+        sessionId: "20260918_1",
+        backendSessionId: "20260918_1",
+        isHonk: true,
+        promptText: "recovered swarm prompt",
+        recoveryAttempts: 0,
+        createdAt: 1000,
+        updatedAt: 1000,
+        lastAliveAt: 1000,
+        cleanSuspend: false,
+        state: "queued",
+      });
+
+      // Let drain run and prompt client
+      await runner.maybeDrain();
+      expect(client.prompts).toContain("recovered swarm prompt");
+
+      // Honkd rejects with busy
+      client.finishBusy("run_live_2");
+      await runner.settled();
+
+      // Queued notice must NOT be posted because swarm origin was inferred
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("uses swarm-appropriate wording for error Stop messages instead of telling human to send it again", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false; // bare goose
+      client.steerOutcome = { kind: "failed" };
+
+      await runner.deliver("swarm:msg_lost_1", "lost prompt");
+      client.finishBusy("run_busy_bare");
+      await runner.settled();
+
+      const errorStops = stops.filter((s) => s.event === "Error");
+      expect(errorStops).toHaveLength(1);
+      expect(errorStops[0]!.message).toContain(
+        "a swarm message to this coordinator was not delivered (msg msg_lost_1); the sender was not told",
+      );
+      expect(errorStops[0]!.message).not.toContain("please send it again");
+    });
+
+    it("preserves telegram-origin behaviour unchanged (steers, posts Queued notice, human wording)", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.setRunId("20260918_1", "run_tg");
+      client.ownership = "own";
+
+      await runner.deliver("tg_1", "turn 1 prompt");
+
+      // Telegram origin steer
+      client.steerOutcome = { kind: "steered", messageId: "steer_msg_1" };
+      const outcome = await runner.deliver("tg_2", "steer prompt", { origin: "telegram" });
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("steered");
+      expect(client.steers).toHaveLength(1);
+
+      // Inflight queued notice for telegram
+      const { runner: runner2, client: client2, stops: stops2 } = makeRunner();
+      client2.isHonk = true;
+      await runner2.deliver("tg_busy", "prompt");
+      client2.finishBusy("run_live");
+      await runner2.settled();
+
+      const queuedStops = stops2.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(1);
+      expect(queuedStops[0]!.message).toContain("goose is busy with a turn");
+    });
+
+    it("dropQueuedItems returns queued items and cleans up inflight rows", async () => {
+      const { runner, client, inflight } = makeRunner();
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("swarm:msg_q1", "q1");
+      await runner.deliver("swarm:msg_q2", "q2");
+      expect(inflight.get("swarm:msg_q1")?.state).toBe("queued");
+      expect(inflight.get("swarm:msg_q2")?.state).toBe("queued");
+
+      const dropped = runner.dropQueuedItems();
+      expect(dropped).toHaveLength(2);
+      expect(dropped[0]!.commandId).toBe("swarm:msg_q1");
+      expect(dropped[1]!.commandId).toBe("swarm:msg_q2");
+      expect(inflight.get("swarm:msg_q1")).toBeUndefined();
+      expect(inflight.get("swarm:msg_q2")).toBeUndefined();
+    });
+  });
 });

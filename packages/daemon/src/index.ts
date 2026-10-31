@@ -52,6 +52,7 @@ import { SessionTagResolver, parseWhichLine } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
+import { dropGooseRunnerWithSwarmNotify } from "./goose/runner-rotation.js";
 import { GooseAcpClient, ownRunPolicy } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
@@ -931,7 +932,7 @@ const notifier: StopNotifier | undefined = telegramNotifier;
 // Requires opencode-client or ingress router.
 const directoryForSession = makeDirectoryResolver({ ingressRouter, fallbackBaseUrl: config.opencodeUrl });
 
-const swarmArbiter = (config.opencodeUrl || ingressRouter)
+const swarmArbiter = (config.opencodeUrl || ingressRouter || gooseRunners)
   ? new SwarmArbiter({
       storage,
       clientForSession,
@@ -942,6 +943,19 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter)
       ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
       selfMachineId: config.machineId,
       relay: config.swarmRelaySend && relayClient ? (body) => relayClient.relay(body) : undefined,
+      gooseDeliver: gooseRunners
+        ? async (sessionId, commandId, text) => {
+            const row = storage.sessions.get(sessionId);
+            if (!row) {
+              throw new Error(`no session row for ${sessionId}`);
+            }
+            const runner = gooseRunners.get(row);
+            const outcome = await runner.deliver(commandId, text, { origin: "swarm" });
+            if (!outcome.ok) {
+              throw new Error(outcome.error ?? "goose delivery refused");
+            }
+          }
+        : undefined,
       log: (msg, fields) =>
         console.log(`[swarm-arbiter] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
@@ -1068,7 +1082,7 @@ if (poller) {
       // A reaped goose session's runner still holds a websocket. Dropping the
       // row without the runner leaks the socket and leaves any turn reporting
       // into a session that no longer exists.
-      gooseRunners?.drop(sessionId);
+      dropGooseRunnerWithSwarmNotify(storage, gooseRunners, sessionId);
       return poller.unregisterSession(sessionId);
     },
     registerSession: (sessionId, label, signal) => poller.registerSession(sessionId, label, signal),
@@ -1284,7 +1298,7 @@ const app = createApp(storage, {
     // A goose session's runner holds a websocket; dropping the row without
     // dropping the runner would leak the socket and leave a turn reporting into
     // a session that no longer exists.
-    gooseRunners?.drop(sessionId);
+    dropGooseRunnerWithSwarmNotify(storage, gooseRunners, sessionId);
     if (poller) {
       // Interactive close: this fires on an explicit session delete (`/kill`, plugin session
       // teardown), where a human is watching, so the forum topic closes now rather than waiting

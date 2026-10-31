@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { bankOrInsertSwarmMessage } from "../src/swarm/bank-or-insert";
 
 describe("bankOrInsertSwarmMessage", () => {
@@ -326,5 +327,136 @@ describe("bankOrInsertSwarmMessage", () => {
     }, 1_000);
     expect(bigResult.status).toBe("inserted");
     expect(s.swarm.getByMsgId("msg_big_oc")).not.toBeNull();
+  });
+
+  it("inserts into swarm_messages when goose target has a backendEndpoint (push target)", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_push",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://127.0.0.1:4280/acp",
+      notify: true,
+    });
+    // pullSources does NOT need "swarm"
+    s.sessions.setPullSources("gse_push", ["telegram-reply"]);
+
+    const result = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_goose_push",
+      fromSession: "ses_peer",
+      toSession: "gse_push",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello push coordinator",
+    }, 1_000);
+
+    expect(result).toEqual({
+      status: "inserted",
+      msgId: "msg_goose_push",
+      inserted: true,
+    });
+    expect(s.swarm.getByMsgId("msg_goose_push")).not.toBeNull();
+    expect(s.pullInbox.pendingCount("gse_push", 2_000)).toBe(0);
+  });
+
+  it("inserts scheduled messages and large payloads for goose target with backendEndpoint", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_push",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://127.0.0.1:4280/acp",
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_push", ["telegram-reply", "swarm"]);
+
+    const schedResult = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_goose_sched",
+      fromSession: "ses_peer",
+      toSession: "gse_push",
+      channel: null,
+      kind: "wake",
+      priority: "normal",
+      replyTo: null,
+      payload: "wake up coordinator",
+      deliverAt: 10_000,
+    }, 1_000);
+    expect(schedResult.status).toBe("inserted");
+    expect(s.swarm.getByMsgId("msg_goose_sched")).not.toBeNull();
+
+    const bigPayload = "x".repeat(5000);
+    const bigResult = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_goose_big",
+      fromSession: "ses_peer",
+      toSession: "gse_push",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: bigPayload,
+    }, 1_000);
+    expect(bigResult.status).toBe("inserted");
+    expect(s.swarm.getByMsgId("msg_goose_big")).not.toBeNull();
+  });
+
+  it("banks when goose target has NO backendEndpoint and has opted into swarm", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_pull_only",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_pull_only", ["telegram-reply", "swarm"]);
+
+    const result = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_pull_goose",
+      fromSession: "ses_peer",
+      toSession: "gse_pull_only",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello pull goose",
+    }, 1_000);
+
+    expect(result).toEqual({
+      status: "banked",
+      msgId: "msg_pull_goose",
+      fresh: true,
+    });
+    expect(s.pullInbox.claim("gse_pull_only", 2_000)).toHaveLength(1);
+    expect(s.swarm.getByMsgId("msg_pull_goose")).toBeNull();
+  });
+
+  it("refuses with no_mailbox when goose target has NO backendEndpoint and has NOT opted into swarm", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_no_mb",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_no_mb", ["telegram-reply"]);
+
+    const result = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_no_mb",
+      fromSession: "ses_peer",
+      toSession: "gse_no_mb",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello without mailbox",
+    }, 1_000);
+
+    expect(result).toEqual({
+      status: "refused",
+      reason: "no_mailbox",
+      statusCode: 409,
+      error: "goose session gse_no_mb has no swarm mailbox",
+    });
+    expect(s.pullInbox.pendingCount("gse_no_mb", 2_000)).toBe(0);
+    expect(s.swarm.getByMsgId("msg_no_mb")).toBeNull();
   });
 });
