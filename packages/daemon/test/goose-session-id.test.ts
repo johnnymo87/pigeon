@@ -102,16 +102,8 @@ describe("goose registration mints the derived id", () => {
     })).json()) as Record<string, string>;
     const gse = first.session_id!;
 
-    storage!.pullInbox.bank(
-      {
-        msgId: "msg_hello",
-        sessionId: gse,
-        source: "swarm",
-        payload: "hello",
-        senderId: "ses_sender",
-      },
-      1_000,
-    );
+    const send = await post(app, "/swarm/send", { from: "ses_sender", to: gse, payload: "hello" });
+    expect(send.status).toBe(202);
 
     // Reaped, or killed.
     storage!.sessions.delete(gse);

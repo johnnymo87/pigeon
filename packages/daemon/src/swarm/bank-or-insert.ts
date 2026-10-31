@@ -68,10 +68,17 @@ export function bankOrInsertSwarmMessage(
     };
   }
 
+  const isGoosePush = Boolean(
+    targetSession &&
+      targetSession.backendKind === GOOSE_BACKEND_KIND &&
+      targetSession.backendEndpoint &&
+      targetSession.notify,
+  );
+
   if (
     targetSession &&
     targetSession.backendKind === GOOSE_BACKEND_KIND &&
-    !targetSession.backendEndpoint &&
+    !isGoosePush &&
     !targetSession.pullSources.includes("swarm")
   ) {
     return {
@@ -84,7 +91,7 @@ export function bankOrInsertSwarmMessage(
 
   const wouldBank = Boolean(
     targetSession &&
-      (isPullBackend(targetSession) || (targetSession.backendKind === GOOSE_BACKEND_KIND && !targetSession.backendEndpoint)) &&
+      (isPullBackend(targetSession) || (targetSession.backendKind === GOOSE_BACKEND_KIND && !isGoosePush)) &&
       targetSession.pullSources.includes("swarm"),
   );
 

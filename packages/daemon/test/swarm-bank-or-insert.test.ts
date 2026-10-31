@@ -459,4 +459,65 @@ describe("bankOrInsertSwarmMessage", () => {
     expect(s.pullInbox.pendingCount("gse_no_mb", 2_000)).toBe(0);
     expect(s.swarm.getByMsgId("msg_no_mb")).toBeNull();
   });
+
+  it("banks when goose target has backendEndpoint but notify=false and has opted into swarm", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_mb_only",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://127.0.0.1:4280/acp",
+      notify: false,
+    });
+    s.sessions.setPullSources("gse_mb_only", ["telegram-reply", "swarm"]);
+
+    const result = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_mb_only",
+      fromSession: "ses_peer",
+      toSession: "gse_mb_only",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello mailbox only goose",
+    }, 1_000);
+
+    expect(result).toEqual({
+      status: "banked",
+      msgId: "msg_mb_only",
+      fresh: true,
+    });
+    expect(s.pullInbox.claim("gse_mb_only", 2_000)).toHaveLength(1);
+    expect(s.swarm.getByMsgId("msg_mb_only")).toBeNull();
+  });
+
+  it("refuses with no_mailbox when goose target has backendEndpoint but notify=false and has NOT opted into swarm", () => {
+    const s = newStorage();
+    s.sessions.upsert({
+      sessionId: "gse_mb_no_optin",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://127.0.0.1:4280/acp",
+      notify: false,
+    });
+    s.sessions.setPullSources("gse_mb_no_optin", ["telegram-reply"]);
+
+    const result = bankOrInsertSwarmMessage(s, {
+      msgId: "msg_mb_no_optin",
+      fromSession: "ses_peer",
+      toSession: "gse_mb_no_optin",
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello without swarm optin",
+    }, 1_000);
+
+    expect(result).toEqual({
+      status: "refused",
+      reason: "no_mailbox",
+      statusCode: 409,
+      error: "goose session gse_mb_no_optin has no swarm mailbox",
+    });
+    expect(s.pullInbox.pendingCount("gse_mb_no_optin", 2_000)).toBe(0);
+    expect(s.swarm.getByMsgId("msg_mb_no_optin")).toBeNull();
+  });
 });

@@ -302,13 +302,9 @@ describe("state guards added before the second writer exists", () => {
     expect(f.senderInbox()).toBe("");
   });
 
-  it("skips goose targets in unverified handed-off loop and raises no alerts or transcript reads", async () => {
+  it("skips receipt-family rows when isReceiptPending is true and raises no alerts", async () => {
     const f = makeFixture();
-    f.storage.sessions.upsert({
-      sessionId: "gse_coord_wd",
-      backendKind: "goose-acp",
-      notify: true,
-    });
+    f.isReceiptPending.mockImplementation((msgId) => msgId === "msg_goose_wd");
 
     f.insertHandedOff({
       msgId: "msg_goose_wd",
@@ -330,5 +326,27 @@ describe("state guards added before the second writer exists", () => {
 
     // Message row remains handed_off, not marked failed
     expect(f.row("msg_goose_wd")?.state).toBe("handed_off");
+  });
+
+  it("fails receipt-family row with sender notification when isReceiptPending is false after grace period", async () => {
+    const f = makeFixture();
+    f.isReceiptPending.mockReturnValue(false);
+
+    f.insertHandedOff({
+      msgId: "msg_goose_lost",
+      fromSession: "ses_sender",
+      toSession: "gse_coord_wd",
+      handedOffAt: 1_000,
+      family: "receipt",
+    });
+
+    // Advance beyond grace period
+    f.setNow(1_000 + GRACE + 10_000);
+
+    const counts = await f.watchdog.processOnce();
+
+    expect(counts.terminal).toBe(1);
+    expect(f.row("msg_goose_lost")?.state).toBe("failed");
+    expect(f.senderInbox()).toContain("no turn-end receipt");
   });
 });

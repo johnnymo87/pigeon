@@ -113,6 +113,7 @@ class FakeClient {
   connectCalls = 0;
   closed = false;
   isHonk = false;
+  supportsResumeOnly = true;
   /** Resolvers for in-flight prompts, keyed by the text that started them. */
   private turns: Array<{ text: string; resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
   prompts: string[] = [];
@@ -250,10 +251,15 @@ function makeRunner(over: Record<string, unknown> = {}) {
   const stops: Array<Record<string, unknown>> = [];
   const touches: string[] = [];
   const inflight = (over.inflight as FakeInflightStore | undefined) ?? new FakeInflightStore();
+  const settledSwarm: Array<{ msgId: string; outcome: unknown }> = [];
+  const onSwarmSettled =
+    (over.onSwarmSettled as any) ??
+    ((msgId: string, outcome: unknown) => settledSwarm.push({ msgId, outcome }));
   const runner = new GooseSessionRunner({
     session: session(),
     client: client as never,
     inflight,
+    onSwarmSettled,
     postStop: async (body) => {
       stops.push(body);
     },
@@ -261,7 +267,7 @@ function makeRunner(over: Record<string, unknown> = {}) {
     log: () => {},
     ...over,
   });
-  return { runner, client, stops, touches, inflight };
+  return { runner, client, stops, touches, inflight, settledSwarm };
 }
 
 describe("GooseSessionRunner turn lifecycle", () => {
@@ -2940,13 +2946,14 @@ describe("GooseSessionRunner session title", () => {
       expect(queuedStops).toHaveLength(0);
     });
 
-    it("infers swarm origin from commandId prefix after restart recovery", async () => {
-      const { runner, client, stops, inflight } = makeRunner();
+    it("infers swarm origin on resume() after recovery, asserts swarm wording on recovered-busy, and notifies sender", async () => {
+      const { runner, client, stops, settledSwarm } = makeRunner();
       client.isHonk = true;
+      client.supportsResumeOnly = true;
 
-      // Simulate recovery from goose_inflight_turns
-      runner.enqueueRecovered({
-        commandId: "swarm:msg_recovered",
+      // Resume a turn recovered from goose_inflight_turns with a swarm: commandId
+      const resumed = runner.resume({
+        commandId: "swarm:msg_rec_busy_1",
         sessionId: "20260918_1",
         backendSessionId: "20260918_1",
         isHonk: true,
@@ -2956,20 +2963,59 @@ describe("GooseSessionRunner session title", () => {
         updatedAt: 1000,
         lastAliveAt: 1000,
         cleanSuspend: false,
-        state: "queued",
+        state: "sent",
       });
+      expect(resumed).toBe(true);
 
-      // Let drain run and prompt client
-      await runner.maybeDrain();
-      expect(client.prompts).toContain("recovered swarm prompt");
+      await new Promise((r) => setTimeout(r, 10));
 
-      // Honkd rejects with busy
-      client.finishBusy("run_live_2");
+      // Honkd rejects recovery prompt with busy
+      client.finishBusy("run_live_recovered");
       await runner.settled();
 
-      // Queued notice must NOT be posted because swarm origin was inferred
-      const queuedStops = stops.filter((s) => s.event === "Queued");
-      expect(queuedStops).toHaveLength(0);
+      // Check Stop notification
+      const errorStops = stops.filter((s) => s.event === "Error");
+      expect(errorStops).toHaveLength(1);
+      expect(errorStops[0]!.message).toContain(
+        "a swarm message to this coordinator was not delivered (msg msg_rec_busy_1); goose was busy and nothing was resent",
+      );
+      expect(errorStops[0]!.message).not.toContain("send it again");
+
+      // Check onSwarmSettled notified failure
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_rec_busy_1");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "failed" }),
+      );
+    });
+
+    it("settles swarm message as delivered when turn finishes normally", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      await runner.deliver("swarm:msg_normal", "normal task");
+      expect(client.liveTurns).toBe(1);
+
+      client.finishTurn("end_turn");
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_normal");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+    });
+
+    it("settles swarm message as failed when busy prompt cannot steer", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      client.isHonk = false; // bare goose
+      client.steerOutcome = { kind: "failed" };
+
+      await runner.deliver("swarm:msg_busy_fail", "lost prompt");
+      client.finishBusy("run_busy_bare");
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_busy_fail");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "failed" }),
+      );
     });
 
     it("uses swarm-appropriate wording for error Stop messages instead of telling human to send it again", async () => {

@@ -3,7 +3,6 @@ import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
 import { notifySenderOfFailure } from "./notify-sender";
-import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { resolveVerifyFamily, type VerifyFamily } from "./verify-family";
 import {
   isWakeKind,
@@ -851,16 +850,6 @@ export class DeliveryWatchdog {
     for (const row of rows) {
       const target = row.toSession;
       if (!target) continue;
-
-      if (target.startsWith("gse_") || this.storage.sessions.get(target)?.backendKind === GOOSE_BACKEND_KIND) {
-        counts.skipped++;
-        this.log("skipped", {
-          msgId: row.msgId,
-          sessionId: target,
-          reason: "goose-target",
-        });
-        continue;
-      }
 
       const family = resolveVerifyFamily(row.verifyFamily);
       // `relayed` rows are verified at handoff, so one here is a bug: refuse it like an unknown

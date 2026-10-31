@@ -1,5 +1,7 @@
 import type { SessionRecord } from "../storage/types.js";
+import type { StorageDb } from "../storage/database.js";
 import type { GooseRunnerRegistry, GooseSessionRunner } from "./session-runner.js";
+import { dropGooseRunnerWithSwarmNotify } from "./runner-rotation.js";
 
 export interface GooseKillDeps {
   storage: {
@@ -10,6 +12,8 @@ export interface GooseKillDeps {
     assignments: {
       delete(id: string): void;
     };
+    swarm?: StorageDb["swarm"];
+    db?: StorageDb["db"];
   };
   gooseRunners?: GooseRunnerRegistry;
   poller?: {
@@ -107,7 +111,7 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
   const isHonk = runner?.isHonk;
   const isHonkKnown = runner?.isHonkKnown;
 
-  deps.gooseRunners?.drop(sessionId);
+  dropGooseRunnerWithSwarmNotify(deps.storage, deps.gooseRunners, sessionId);
   deps.storage.sessions.delete(sessionId);
   deps.storage.assignments.delete(sessionId);
   if (deps.poller) {

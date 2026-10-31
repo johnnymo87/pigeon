@@ -224,6 +224,76 @@ describe("goose runner rotation and session deletion cleanup", () => {
     expect(failureRows[0]!.reply_to).toBe("msg_sw_1");
   });
 
+  it("does not notify sender when markFailed returns false (e.g. already verified or already failed)", () => {
+    const s = newStorage();
+    const now = 1_000_000;
+
+    s.sessions.upsert({
+      sessionId: "gse_already_done",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://127.0.0.1:4280/acp",
+      notify: true,
+    });
+
+    s.swarm.insert(
+      {
+        msgId: "msg_already_ver",
+        fromSession: "ses_worker_ver",
+        toSession: "gse_already_done",
+        channel: null,
+        kind: "task.assign",
+        priority: "normal",
+        replyTo: null,
+        payload: "already verified payload",
+      },
+      now,
+    );
+    s.swarm.markHandedOff("msg_already_ver", now);
+    // Mark verified: markFailed will return false!
+    s.swarm.markVerified("msg_already_ver", now + 100);
+
+    const sessionRec = s.sessions.get("gse_already_done")!;
+    const registry = new GooseRunnerRegistry({
+      createRunner: () => {
+        const runner = new GooseSessionRunner({
+          session: sessionRec,
+          client: {
+            prompt: async () => ({ kind: "receipt" }),
+            steer: async () => ({ kind: "steered" }),
+            close: () => {},
+            isClosed: () => false,
+          } as never,
+          inflight: s.gooseInflight,
+          postStop: async () => {},
+          touch: () => {},
+        });
+        runner.enqueueRecovered({
+          commandId: "swarm:msg_already_ver",
+          sessionId: "gse_already_done",
+          backendSessionId: "20261031_done",
+          isHonk: true,
+          promptText: "already verified payload",
+          recoveryAttempts: 0,
+          createdAt: now,
+          updatedAt: now,
+          lastAliveAt: now,
+          cleanSuspend: false,
+          state: "queued",
+        });
+        return runner;
+      },
+    });
+
+    registry.get(sessionRec);
+    dropGooseRunnerWithSwarmNotify(s, registry, "gse_already_done", now + 1000);
+
+    // No delivery.failed message should be sent to ses_worker_ver
+    const failureRows = s.db
+      .prepare("SELECT * FROM swarm_messages WHERE to_session = 'ses_worker_ver' AND kind = 'delivery.failed'")
+      .all();
+    expect(failureRows).toHaveLength(0);
+  });
+
   it("does not throw when gooseRunners is undefined or session has no runner", () => {
     const s = newStorage();
     expect(() => dropGooseRunnerWithSwarmNotify(s, undefined, "gse_none")).not.toThrow();

@@ -622,7 +622,7 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     expect(touched.lastSeen).toBe(5_000);
   });
 
-  it("swarm send into a notify: false goose row writes no w: outbox row", async () => {
+  it("bank into a notify: false goose row writes no w: outbox row", async () => {
     const { app, storage: s } = newApp(1_000);
     const mailboxRes = await (await app(
       new Request("http://localhost/goose/swarm-mailbox", {
@@ -649,7 +649,7 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     );
     expect(sendRes.status).toBe(202);
     const body = (await sendRes.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
-    expect(body.accepted).toBe(true);
+    expect(body.banked).toBe(true);
 
     // No w:<msg_id> in outbox
     expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).toBeNull();
@@ -716,9 +716,6 @@ describe("Task A4: goose-acp may drain its mailbox", () => {
         }),
       }),
     )).json()) as { session_id: string };
-
-    // Clear endpoint so this session operates as a banked pull target
-    s.sessions.upsert({ sessionId: mailboxRes.session_id, backendKind: GOOSE_BACKEND_KIND, backendEndpoint: null, notify: false });
 
     // Bank a swarm message into this goose mailbox
     const sendRes = await app(

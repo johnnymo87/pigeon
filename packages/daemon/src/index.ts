@@ -53,6 +53,7 @@ import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
 import { dropGooseRunnerWithSwarmNotify } from "./goose/runner-rotation.js";
+import { settleSwarmMessage } from "./swarm/swarm-settle.js";
 import { GooseAcpClient, ownRunPolicy } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
@@ -239,6 +240,7 @@ const gooseRunners = config.gooseAcpUrl
         new GooseSessionRunner({
           session,
           inflight: storage.gooseInflight,
+          onSwarmSettled: (msgId, outcome) => settleSwarmMessage(storage, msgId, outcome),
           client: new GooseAcpClient({
             url: session.backendEndpoint ?? config.gooseAcpUrl!,
             transportFactory: webSocketTransport(session.backendAuthToken ?? config.gooseAcpToken),
@@ -887,6 +889,7 @@ if (gooseRunners) {
   void recoverGooseTurns({
     storage,
     gooseRunners,
+    onSwarmSettled: (msgId, outcome) => settleSwarmMessage(storage, msgId, outcome),
   }).catch((err) => {
     console.error("[pigeon-daemon] recoverGooseTurns failed:", err);
   });
@@ -1240,6 +1243,7 @@ const deliveryWatchdog = (config.opencodeUrl || ingressRouter)
       resolveClients: watchdogResolveClients,
       directoryForSession,
       notifier,
+      isReceiptPending: (msgId: string) => Boolean(storage.gooseInflight.get("swarm:" + msgId)),
       intervalMs: config.watchdogIntervalMs,
       verifyAfterMs: config.verifyAfterMs,
       stuckAlertMs: config.stuckAlertMs,
