@@ -85,7 +85,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "not_delivered",
               reason: "queued message older than 24h was never sent",
             });
           }
@@ -117,7 +117,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "not_delivered",
               reason: "session missing or no longer goose backend",
             });
           }
@@ -135,6 +135,9 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), { kind: "delivered" });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -167,7 +170,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "turn was in flight more than 24h ago; not resumed",
             });
           }
@@ -184,7 +187,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "session missing or no longer goose backend",
             });
           }
@@ -204,6 +207,9 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), { kind: "delivered" });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -221,7 +227,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             });
             if (commandId.startsWith("swarm:")) {
               opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-                kind: "failed",
+                kind: "unconfirmed",
                 reason: "recovery attempts exceeded; giving up to prevent crash loop",
               });
             }
@@ -252,7 +258,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "bare goose turn cancelled by restart",
             });
           }
@@ -280,7 +286,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
           });
           if (commandId.startsWith("swarm:")) {
             opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "pigeon was down too long (>6h) to safely collect the reply from honkd",
             });
           }

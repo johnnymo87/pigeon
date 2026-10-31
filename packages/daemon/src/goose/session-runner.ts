@@ -266,7 +266,7 @@ const BUSY_NOT_DELIVERED_TEXT =
 function busyNotDeliveredText(commandId: string, origin?: GooseTurnOrigin): string {
   if (resolveTurnOrigin(commandId, origin) === "swarm") {
     const msgId = commandId.startsWith("swarm:") ? commandId.slice(6) : commandId;
-    return `a swarm message to this coordinator was not delivered (msg ${msgId}); the sender was not told`;
+    return `a swarm message to this coordinator was not delivered (msg ${msgId}); the sender was told it was not received`;
   }
   return BUSY_NOT_DELIVERED_TEXT;
 }
@@ -425,8 +425,9 @@ export class GooseSessionRunner {
       if (item.commandId.startsWith("swarm:")) {
         const msgId = item.commandId.slice(6);
         this.opts.onSwarmSettled?.(msgId, {
-          kind: "failed",
+          kind: "not_delivered",
           reason: "the coordinator session was retired before it read the message; resend to its successor",
+          customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${this.sessionId} was NOT received. Reason: the coordinator session was retired before it read the message; resend to its successor.`,
         });
       }
     }
@@ -540,8 +541,8 @@ export class GooseSessionRunner {
     return this.turn ? { commandId: this.turn.commandId } : undefined;
   }
 
-  private settleSwarmTurn(turn: Turn, outcome: SwarmSettleOutcome): void {
-    if (turn.swarmSettled) return;
+  private settleSwarmTurn(turn: Turn, outcome: SwarmSettleOutcome, allowLateDelivered = false): void {
+    if (turn.swarmSettled && !allowLateDelivered) return;
     if (!turn.commandId.startsWith("swarm:")) return;
     turn.swarmSettled = true;
     const msgId = turn.commandId.slice(6);
@@ -649,7 +650,7 @@ export class GooseSessionRunner {
               error_kind: "goose-turn-recovery-unsupported",
             });
             this.settleSwarmTurn(turn, {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "pigeon restarted while goose was working on this; recovery unsupported",
             });
             this.retire(turn);
@@ -1170,7 +1171,7 @@ export class GooseSessionRunner {
               error_kind: "goose-turn-recovery-unsupported",
             });
             this.settleSwarmTurn(turn, {
-              kind: "failed",
+              kind: "unconfirmed",
               reason: "pigeon restarted while goose was working on this; recovery unsupported",
             });
             this.retire(turn);
@@ -1291,12 +1292,12 @@ export class GooseSessionRunner {
           event: "Error",
           error_kind: "honk-unknown-request",
         });
-        this.settleSwarmTurn(turn, {
-          kind: "failed",
-          reason: "honkd has no record of this turn; message not delivered",
-        });
-        this.retire(turn);
-      } catch (reportErr) {
+            this.settleSwarmTurn(turn, {
+              kind: "unconfirmed",
+              reason: "pigeon restarted while goose was working on this; recovery unsupported",
+            });
+            this.retire(turn);
+          } catch (reportErr) {
         this.log("goose runner: could not report unknown-request notice", {
           sessionId: this.sessionId,
           commandId: turn.commandId,
@@ -1327,7 +1328,7 @@ export class GooseSessionRunner {
             error_kind: "goose-busy-recovered",
           });
           this.settleSwarmTurn(turn, {
-            kind: "failed",
+            kind: "unconfirmed",
             reason: "goose was busy during recovery; message not delivered",
           });
           this.retire(turn);
@@ -1354,12 +1355,17 @@ export class GooseSessionRunner {
         );
         return;
       }
-      if (this.isHonk) {
-        this.log("honkd rejected the prompt as busy; queueing turn instead of steering", {
-          sessionId: this.sessionId,
-          runId,
-          commandId: turn.commandId,
-        });
+      if (this.isHonk || turn.origin === "swarm") {
+        this.log(
+          this.isHonk
+            ? "honkd rejected the prompt as busy; queueing turn instead of steering"
+            : "goose rejected swarm prompt as busy; queueing turn instead of steering",
+          {
+            sessionId: this.sessionId,
+            runId,
+            commandId: turn.commandId,
+          },
+        );
         try {
           this.opts.inflight?.markQueued(turn.commandId, Date.now());
         } catch (err) {
@@ -1643,7 +1649,7 @@ export class GooseSessionRunner {
         event: "Error",
         error_kind: "goose-turn-stalled",
       });
-      this.settleSwarmTurn(turn, { kind: "failed", reason: `turn stalled: ${reason}` });
+      this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: `turn stalled: ${reason}` });
       this.retire(turn);
     } catch (reportErr) {
       this.log("goose runner: could not report a stalled turn", {
@@ -1678,7 +1684,7 @@ export class GooseSessionRunner {
         sessionId: this.sessionId,
         commandId: turn.commandId,
       });
-      this.settleSwarmTurn(turn, { kind: "failed", reason: "turn cancelled" });
+      this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: "turn cancelled" });
       this.retire(turn);
       this.scheduleDrain();
       return;
@@ -1696,7 +1702,7 @@ export class GooseSessionRunner {
           commandId: turn.commandId,
           error: err instanceof Error ? err.message : String(err),
         });
-        this.settleSwarmTurn(turn, { kind: "failed", reason: "abandoned turn failed" });
+        this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: "abandoned turn failed" });
         this.retire(turn);
         return;
       }
@@ -1786,6 +1792,22 @@ export class GooseSessionRunner {
         }
       }
 
+      if (err !== undefined) {
+        if (
+          err instanceof Error &&
+          err.message.includes("a swarm message to this coordinator was not delivered")
+        ) {
+          this.settleSwarmTurn(turn, { kind: "not_delivered", reason: err.message });
+        } else {
+          this.settleSwarmTurn(turn, {
+            kind: "unconfirmed",
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } else {
+        this.settleSwarmTurn(turn, { kind: "delivered" }, true);
+      }
+
       await this.postStop({
         session_id: this.sessionId,
         // The `/stop` route requires this exact prefix and a restricted charset;
@@ -1804,12 +1826,6 @@ export class GooseSessionRunner {
             }
           : {}),
       });
-      if (failed) {
-        const reason = err instanceof Error ? err.message : String(err ?? `goose stopped: ${stopReason}`);
-        this.settleSwarmTurn(turn, { kind: "failed", reason });
-      } else {
-        this.settleSwarmTurn(turn, { kind: "delivered" });
-      }
       this.retire(turn);
     } catch (reportErr) {
       // Losing the report is bad; taking the process down with it is worse.
