@@ -3064,7 +3064,7 @@ describe("GooseSessionRunner session title", () => {
       );
     });
 
-    it("settles swarm message as not_delivered when resent turn hits busy", async () => {
+    it("settles swarm message as unconfirmed when resent turn hits busy", async () => {
       const { runner, client, settledSwarm, stops } = makeRunner();
       client.isHonk = true;
 
@@ -3080,14 +3080,15 @@ describe("GooseSessionRunner session title", () => {
       expect(settledSwarm).toHaveLength(1);
       expect(settledSwarm[0]!.msgId).toBe("msg_busy_fail");
       expect(settledSwarm[0]!.outcome).toEqual(
-        expect.objectContaining({ kind: "not_delivered" }),
+        expect.objectContaining({ kind: "unconfirmed" }),
       );
 
       const errorStops = stops.filter((s) => s.event === "Error");
       expect(errorStops).toHaveLength(1);
       expect(errorStops[0]!.message).toContain(
-        "a swarm message to this coordinator was not delivered (msg msg_busy_fail); the sender was told it was not received",
+        "a swarm message to this coordinator was not confirmed (msg msg_busy_fail); honkd rejected the resend as busy",
       );
+      expect(errorStops[0]!.message).not.toContain("the sender was told it was not received");
     });
 
     it("settles unconfirmed with UNCONFIRMED wording and Do NOT resend advice", () => {
