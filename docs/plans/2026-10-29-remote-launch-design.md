@@ -23,7 +23,7 @@ This design adds a second, agent-facing entry to the same launch code.
 - **No per-launch approval.** Jonathan, 2026-10-29: approval guard rails are not necessary. The
   gate is configuration: a machine runs remote launches only from machines it lists.
 - **Fresh sessions only.** Never prompt an existing session to do the job.
-- **The Mac's `darwin-rebuild` needs sudo** and a launched agent cannot do it. Accepted; out of scope.
+- **The Mac's `darwin-switch` needs sudo** and a launched agent cannot do it. Accepted; out of scope.
 
 ## Shape
 

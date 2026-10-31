@@ -143,7 +143,15 @@ export async function swarmListRemote(opts: SwarmListRemoteOptions): Promise<Rem
   return (await res.json()) as RemoteSessionsListing
 }
 
-function explainRelay(status: string, machine: string, self: string): string {
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+
+function explainRelay(
+  status: string,
+  machine: string,
+  self: string,
+  lastPollAt: number | null,
+  now: number,
+): string {
   switch (status) {
     case "available":
       return "available"
@@ -151,8 +159,16 @@ function explainRelay(status: string, machine: string, self: string): string {
       return `not_accepted (${machine} does not accept relays from ${self})`
     case "not_retired":
       return `not_retired (${machine} still accepts the shared worker key, so it cannot receive relays)`
-    case "offline":
-      return `offline (${machine} is not polling the worker; asleep or down)`
+    case "offline": {
+      if (lastPollAt == null || !Number.isFinite(lastPollAt)) {
+        return `offline (${machine} is not polling the worker; asleep or down)`
+      }
+      const ageMs = now - lastPollAt
+      if (ageMs <= SEVEN_DAYS_MS) {
+        return `offline (${machine} last polled ${relativeAge(lastPollAt, now)} ago; a message sent now is held up to 24h and delivered if it wakes in time)`
+      }
+      return `offline (${machine} has not polled for ${relativeAge(lastPollAt, now)}; sends are refused)`
+    }
     case "unknown":
       return "unknown (the worker's relay schema is not applied)"
     default:
@@ -183,11 +199,11 @@ export function formatRemoteSessions(listing: RemoteSessionsListing, now: number
   }
   out.push(
     "",
-    `Relay from ${self} (what swarm_send to each machine would get now; "available" means the ` +
-      "worker will queue it, and the receiving session may still refuse it):",
+    `Relay from ${self} (what swarm_send to each machine would get now; "available" and "offline" ` +
+      "(within 7 days) are queued by the worker, and the receiving session may still refuse it):",
   )
   for (const m of listing.machines) {
-    out.push(`  ${m.machine_id}: ${explainRelay(m.relay, m.machine_id, self)}`)
+    out.push(`  ${m.machine_id}: ${explainRelay(m.relay, m.machine_id, self, m.last_poll_at, now)}`)
   }
   if (!listing.relay_send) {
     out.push(

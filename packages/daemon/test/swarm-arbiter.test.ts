@@ -1706,4 +1706,92 @@ describe("SwarmArbiter", () => {
     });
   });
 
+  describe("relayed message hold annotation (held_ms)", () => {
+    it("renders held_ms when inbound relayedAt is 2h old (exceeds 60s)", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+      storage.relayInbound.record(
+        { msgId: "m_relayed_2h", fromMachine: "devbox", fromSession: "ses_remote", toSession: "ses_local", fromLabel: null, relayedAt: now - 7_200_000 },
+        now - 1000,
+      );
+      storage.swarm.insert(
+        {
+          msgId: "m_relayed_2h",
+          fromSession: "ses_remote",
+          toSession: "ses_local",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "hello",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+      await arbiter.processOnce();
+      const calls = fixture.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).toContain('from_machine="devbox" held_ms="7200000"');
+    });
+
+    it("omits held_ms when inbound relayedAt is 30s old (does not exceed 60s)", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+      storage.relayInbound.record(
+        { msgId: "m_relayed_30s", fromMachine: "devbox", fromSession: "ses_remote", toSession: "ses_local", fromLabel: null, relayedAt: now - 30_000 },
+        now - 1000,
+      );
+      storage.swarm.insert(
+        {
+          msgId: "m_relayed_30s",
+          fromSession: "ses_remote",
+          toSession: "ses_local",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "hello",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+      await arbiter.processOnce();
+      const calls = fixture.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).toContain('from_machine="devbox"');
+      expect(calls[0]!.prompt).not.toContain("held_ms");
+    });
+
+    it("omits held_ms for a local row with no inbound record", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+      storage.swarm.insert(
+        {
+          msgId: "m_local",
+          fromSession: "ses_sender",
+          toSession: "ses_local",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "hello",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+      await arbiter.processOnce();
+      const calls = fixture.calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).not.toContain("held_ms");
+    });
+  });
 });

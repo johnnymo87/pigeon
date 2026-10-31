@@ -287,7 +287,7 @@ On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, 
 | `404 unknown_session` | permanent. An id shaped like a truncation gets the incomplete-id notice instead |
 | `409 same_machine`, `403 sender_not_yours`, `400 invalid` | permanent, plus a loud `[swarm-arbiter] relay refused (<code>)` line: two of our own views disagree |
 | `403 receiver_not_retired`, `403 not_accepted`, `409 msg_id_conflict`, `410 expired` | permanent |
-| `503 target_offline`, `429 queue_full`, `503 relay_unavailable`, other 5xx, transport, `401` | `TargetUnavailableError`: the normal retry and attempt budget apply |
+| `503 target_offline` (owner silent > 7 days), `429 queue_full`, `503 relay_unavailable`, other 5xx, transport, `401` | `TargetUnavailableError`: the normal retry and attempt budget apply |
 
 Permanent answers become a `RelayRefusedError` and a `delivery.failed` worded by `formatRelayRefusalReason`. A wake or scheduled row also raises a `wake-permanent` alert. A cancel that lands during the POST loses: the row is stamped relayed from `cancelled`.
 
@@ -298,7 +298,7 @@ Permanent answers become a `RelayRefusedError` and a `delivery.failed` worded by
 ### Worker
 
 - `swarm_relay`: primary key `(from_machine, msg_id)`, so two machines' reused caller-supplied ids cannot swallow each other. A same-key retry with the same `payload_sha256` (over `from`, `to`, `kind`, `reply_to`, `payload`) answers `202 duplicate`; a different hash answers `409 msg_id_conflict`.
-- `/swarm/relay` checks, in order: validate (`400 invalid`; includes a 64 KiB UTF-8 payload cap, which the sender is told as "will fail the same way" though a shorter payload would go); `expires_at` already past (`410 expired`); duplicate or conflict; `sender_not_yours`; owner (`unknown_session`); `same_machine`; `receiver_not_retired`; accept set (`not_accepted`), then the owner's last poll within 60s (`target_offline`); 50 queued for that machine (`queue_full`).
+- `/swarm/relay` checks, in order: validate (`400 invalid`; includes a 64 KiB UTF-8 payload cap, which the sender is told as "will fail the same way" though a shorter payload would go); `expires_at` already past (`410 expired`); duplicate or conflict; `sender_not_yours`; owner (`unknown_session`); `same_machine`; `receiver_not_retired`; accept set (`not_accepted`), then the owner's last poll within 7 days (`RELAY_GONE_MS`; older is `target_offline`, while a poll older than 60s but within 7 days is a sleeping machine and is held like an online one, `pigeon-k0qn.22`); 50 queued for that machine (`queue_full`).
 - Expiry: the worker's deadline is the sender's `expires_at` capped at 24h, or 24h when null. An expired item becomes a failure item: `never_collected` if still queued, `unconfirmed` if leased. Leases last 60s, at most 5 leases per item; an item never acked within them expires as `unconfirmed`. Settled rows are deleted 7 days after creation.
 - Failure items (`msg_id` `f:<original>`) go to the original `from_machine` recorded on the row, never re-resolved through D1. They live 24h and are never answered: one that expires or is refused is logged and dropped.
 
@@ -346,7 +346,7 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 ### Discovery (`swarm_list remote: true`)
 
 - **Worker `GET /sessions/remote?limit=`**, machine credential only. "Other machines" means other than the caller's principal. It lists rows with a `ses_` id, `updated_at` within 7 days, and a machine id that passes validation, newest first. `limit` defaults to 100, capped at 500. Labels are untrusted text: control characters are replaced, the label is cut to 120 code points, and the plugin JSON-quotes it.
-- **Per machine,** `relay` is what `/swarm/relay` would answer for this caller now: `not_retired`, `not_accepted`, `offline`, or `available`. A missing `machine_relay_accept` table gives `unknown`. Both routes share `relayReachability`, so the two cannot drift.
+- **Per machine,** `relay` is what `/swarm/relay` would answer for this caller now: `not_retired`, `not_accepted`, `offline`, or `available`. A missing `machine_relay_accept` table gives `unknown`. Both routes share `relayReachability`, but `/swarm/relay` reads its `offline` as "hold" unless the machine has been silent over 7 days, so for a send `offline` means held. Remote launch's return-path check reads the same answer literally.
 - **Daemon `GET /swarm/remote-sessions`** proxies the worker route (5s) and adds `relay_send`, this machine's own flag. Its errors: `503 no_worker`, `502 worker_error`, `502 worker_unreachable`.
 - **The plugin** renders a `SEEN` column. `updated_at` is bumped by the daily re-registration, so it means "still held", not "recently active".
 
@@ -357,7 +357,7 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 - Latency is one poll interval (≤5s) plus round trips, and up to 60s after a receiver crash. Ordering across machines is best-effort.
 - `reply_to` is carried verbatim, but each side's `swarm_read` shows only its own half of a thread.
 - A session idle for more than 7 days is unregistered from D1, so relays to it fail with `unknown_session` while local sends still work. Another machine's credential can then claim it.
-- A sleeping Mac answers `target_offline`. Ordinary sends fail when their attempts run out; scheduled sends retry until they expire.
+- A sleeping (or down) machine's messages are held up to 24h and delivered when it polls again (`pigeon-k0qn.22`); the receiver's envelope carries `held_ms`. Past 24h the sender gets `never_collected`. A machine silent over 7 days refuses with `target_offline`. Remote launches never hold.
 - Fixed pull-lane ids stay with the first machine that registered them. A second machine gets `409 owned_by_other_machine`.
 - A relayed-in row stuck in one of the watchdog's non-terminal states reports nothing to its sender: blocked behind a turn, silent in flight, no healthy serve, or a 404 with no second opinion. The sender's row was already verified at handoff.
 - A failure more than 7 days after the relay is not reported, because the worker has forgotten the row.

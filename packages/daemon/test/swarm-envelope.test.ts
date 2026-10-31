@@ -220,4 +220,36 @@ describe("renderEnvelope", () => {
       expect(out).toContain('ref="test&quot;ref&amp;&lt;bad&gt;"');
     });
   });
+
+  describe("held_ms (relayed hold)", () => {
+    it("renders held_ms right after from_machine when present and finite", () => {
+      const fields: EnvelopeFields = {
+        ...FIELDS,
+        fromMachine: "devbox",
+        heldMs: 7200000,
+      };
+      const out = renderEnvelope(fields, "hello");
+      expect(out).toContain('from_machine="devbox" held_ms="7200000"');
+    });
+
+    it("floors held_ms and handles large values without exponent/decimal", () => {
+      const fields: EnvelopeFields = {
+        ...FIELDS,
+        fromMachine: "devbox",
+        heldMs: 86400000.85,
+      };
+      const out = renderEnvelope(fields, "hello");
+      const val = out.match(/held_ms="([^"]+)"/)?.[1];
+      expect(val).toBe("86400000");
+      expect(val).not.toContain(".");
+      expect(val).not.toContain("e");
+    });
+
+    it("omits held_ms when null, undefined, or NaN", () => {
+      expect(renderEnvelope({ ...FIELDS, fromMachine: "devbox", heldMs: null }, "hi")).not.toContain("held_ms");
+      expect(renderEnvelope({ ...FIELDS, fromMachine: "devbox", heldMs: undefined }, "hi")).not.toContain("held_ms");
+      expect(renderEnvelope({ ...FIELDS, fromMachine: "devbox", heldMs: Number.NaN }, "hi")).not.toContain("held_ms");
+      expect(renderEnvelope({ ...FIELDS, fromMachine: "devbox", heldMs: Number.POSITIVE_INFINITY }, "hi")).not.toContain("held_ms");
+    });
+  });
 });

@@ -292,6 +292,15 @@ describe("POST /launch/relay", () => {
     expect(await res.json()).toMatchObject({ error: "target_offline" });
   });
 
+  it("B last polled 10 minutes ago -> 503 target_offline (remote launch does not hold for sleeping machines)", async () => {
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(Date.now() - 600_000, B)
+      .run();
+    const res = await launch(KEY_A);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "target_offline" });
+  });
+
   it("return path missing (B accepts launches from A, but A's relay accept lacks B) -> 409 no_return_path; with A polled as accept=rl-b; failures=1 -> 202", async () => {
     // Clear A's relay accept of B by polling with accept=rl-c
     expect((await poll(KEY_A, A, `accept=${C}; failures=1`)).status).toBe(204);

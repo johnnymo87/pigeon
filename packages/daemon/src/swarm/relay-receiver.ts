@@ -199,8 +199,9 @@ function receiveMessage(
     // 6. Insert. The inbound record goes first, in the same transaction, so the Telegram notice
     //    and any immediate failure already see it; a refusal rolls both back.
     const fromLabel = typeof it.from_label === "string" ? it.from_label.slice(0, 200) : null;
+    const relayedAt = typeof it.relayed_at === "number" && Number.isFinite(it.relayed_at) ? it.relayed_at : null;
     storage.db.transaction(() => {
-      storage.relayInbound.record({ msgId, fromMachine, fromSession: f.from, toSession: to, fromLabel }, now);
+      storage.relayInbound.record({ msgId, fromMachine, fromSession: f.from, toSession: to, fromLabel, relayedAt }, now);
       const result = bankOrInsertSwarmMessage(
         storage,
         {
