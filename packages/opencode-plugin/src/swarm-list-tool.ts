@@ -165,7 +165,7 @@ function explainRelay(
       }
       const ageMs = now - lastPollAt
       if (ageMs <= SEVEN_DAYS_MS) {
-        return `offline (${machine} last polled ${relativeAge(lastPollAt, now)}; a message sent now is held up to 24h and delivered if it wakes in time)`
+        return `offline (${machine} last polled ${relativeAge(lastPollAt, now)} ago; a message sent now is held up to 24h and delivered if it wakes in time)`
       }
       return `offline (${machine} has not polled for ${relativeAge(lastPollAt, now)}; sends are refused)`
     }

@@ -252,7 +252,7 @@ describe("formatRemoteSessions", () => {
     expect(out).toMatch(/c: offline \(c is not polling the worker; asleep or down\)/)
     expect(out).toMatch(/d: unknown/)
     expect(out).toMatch(
-      /e: offline \(e last polled 1h; a message sent now is held up to 24h and delivered if it wakes in time\)/,
+      /e: offline \(e last polled 1h ago; a message sent now is held up to 24h and delivered if it wakes in time\)/,
     )
     expect(out).toMatch(/f: offline \(f has not polled for 8d; sends are refused\)/)
   })

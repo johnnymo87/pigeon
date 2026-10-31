@@ -48,7 +48,7 @@ export function formatRelayFailureNotice(msgId: string, target: string, machine:
     const targetMachine = /^[A-Za-z0-9_-]{1,64}$/.test(machine) ? machine : "the receiving machine";
     return (
       `DELIVERY FAILED: your swarm message ${msgId} to ${target}${where} was NOT received. ` +
-      `Reason: the worker held it for ${targetMachine} and the machine never collected it (asleep, down, or gone) (${safeCode}). ` +
+      `Reason: the worker held it for ${targetMachine} and the machine never collected it (${safeCode}); it was asleep, down, or gone. ` +
       `Nothing was written to the target; check \`swarm_list remote: true\` and resend only if it is still relevant.`
     );
   }

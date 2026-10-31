@@ -485,7 +485,7 @@ describe("failure items: receipts for relays this machine sent (pigeon-k0qn.7)",
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ to_session: SENDER, reply_to: "m1" });
     expect(notices[0]!.payload).toBe(formatRelayFailureNotice("m1", TARGET, "cloudbox", "never_collected"));
-    expect(notices[0]!.payload).toContain("the worker held it for cloudbox and the machine never collected it (asleep, down, or gone)");
+    expect(notices[0]!.payload).toContain("the worker held it for cloudbox and the machine never collected it (never_collected); it was asleep, down, or gone.");
     expect(notices[0]!.payload).toContain("Nothing was written to the target; check `swarm_list remote: true` and resend only if it is still relevant.");
     expect(notices[0]!.payload).not.toContain("safe to resend");
   });
