@@ -116,7 +116,7 @@ except to say launches still refuse an offline target.
 
 ## Deployment and rollback
 
-The worker deploy alone switches the hold on; no schema change. The wording ships with the next
+The worker deploy alone switches the hold on; no D1 schema change. The daemon adds one nullable column (`swarm_relay_inbound.relayed_at`, additive `ALTER`) for `held_ms`, and its new receipt wording only reaches senders whose daemon is updated, so daemons should follow the worker promptly. The wording ships with the next
 daemon/plugin deploy and is cosmetic. Rollback: redeploy the previous worker; items already queued
 for a sleeping machine stay queued and are delivered or expire as normal.
 

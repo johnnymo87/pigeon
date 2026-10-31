@@ -227,8 +227,9 @@ systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect
    for example with a second short `swarm_launch` that reports its own behaviour.
 3. **Never a bare `npm install`.** Use the script, or the manual fallback with the daemon's node
    first on PATH, for the reason in "Why the node matters" above.
-4. **macOS service changes still need Jonathan.** `darwin-switch` needs a sudo
-   password, which an unattended session cannot supply. A code-only macbook deploy (pull,
+4. **macOS system changes still need Jonathan.** `darwin-switch` needs a sudo
+   password, which an unattended session cannot supply. `pigeon-daemon` is a home-manager
+   launchd agent, so a change to its environment needs only `home-switch`, which needs no root. A code-only macbook deploy (pull,
    install, `launchctl` restart) works remotely.
 
 ## Nix Service Changes
