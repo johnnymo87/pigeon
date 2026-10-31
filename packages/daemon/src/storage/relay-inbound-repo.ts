@@ -26,6 +26,7 @@ export function initRelayInboundSchema(db: BetterSqlite3.Database): void {
       to_session TEXT NOT NULL,
       from_label TEXT,
       received_at INTEGER NOT NULL,
+      relayed_at INTEGER,
       fail_reason TEXT,
       fail_attempts INTEGER NOT NULL DEFAULT 0,
       fail_next_at INTEGER,
@@ -34,6 +35,12 @@ export function initRelayInboundSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_relay_inbound_fail
       ON swarm_relay_inbound(fail_done_at, fail_next_at);
   `);
+
+  try {
+    db.exec("ALTER TABLE swarm_relay_inbound ADD COLUMN relayed_at INTEGER");
+  } catch {
+    // Column already exists.
+  }
 }
 
 export interface RelayInboundRecord {
@@ -43,6 +50,7 @@ export interface RelayInboundRecord {
   toSession: string;
   fromLabel: string | null;
   receivedAt: number;
+  relayedAt: number | null;
   failReason: string | null;
   failAttempts: number;
   failNextAt: number | null;
@@ -59,6 +67,7 @@ function asRecord(r: Row): RelayInboundRecord {
     toSession: String(r.to_session),
     fromLabel: (r.from_label as string | null) ?? null,
     receivedAt: Number(r.received_at),
+    relayedAt: r.relayed_at != null ? Number(r.relayed_at) : null,
     failReason: (r.fail_reason as string | null) ?? null,
     failAttempts: Number(r.fail_attempts ?? 0),
     failNextAt: (r.fail_next_at as number | null) ?? null,
@@ -70,16 +79,23 @@ export class RelayInboundRepository {
   constructor(private readonly db: BetterSqlite3.Database) {}
 
   record(
-    input: { msgId: string; fromMachine: string; fromSession: string; toSession: string; fromLabel: string | null },
+    input: {
+      msgId: string;
+      fromMachine: string;
+      fromSession: string;
+      toSession: string;
+      fromLabel: string | null;
+      relayedAt?: number | null;
+    },
     now: number,
   ): boolean {
     const result = this.db
       .prepare(
-        `INSERT INTO swarm_relay_inbound (msg_id, from_machine, from_session, to_session, from_label, received_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO swarm_relay_inbound (msg_id, from_machine, from_session, to_session, from_label, received_at, relayed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(msg_id) DO NOTHING`,
       )
-      .run(input.msgId, input.fromMachine, input.fromSession, input.toSession, input.fromLabel, now);
+      .run(input.msgId, input.fromMachine, input.fromSession, input.toSession, input.fromLabel, now, input.relayedAt ?? null);
     return result.changes > 0;
   }
 

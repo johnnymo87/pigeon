@@ -14,7 +14,6 @@ const REASON_CODE = /^[a-z0-9_]{1,64}$/;
 
 /** Codes after which nothing reached the target and a resend is the right move. */
 const RESENDABLE: Record<string, string> = {
-  never_collected: "the receiving machine never collected it from the worker",
   not_delivered_on_receiver: "the receiving machine accepted it but could not deliver it to the session",
 };
 
@@ -45,6 +44,14 @@ export function isReasonCode(value: unknown): value is string {
 export function formatRelayFailureNotice(msgId: string, target: string, machine: string, code: string): string {
   const where = /^[A-Za-z0-9_-]{1,64}$/.test(machine) ? ` on ${machine}` : "";
   const safeCode = isReasonCode(code) ? code : "unrecognised";
+  if (safeCode === "never_collected") {
+    const targetMachine = /^[A-Za-z0-9_-]{1,64}$/.test(machine) ? machine : "the receiving machine";
+    return (
+      `DELIVERY FAILED: your swarm message ${msgId} to ${target}${where} was NOT received. ` +
+      `Reason: the worker held it for ${targetMachine} and the machine never collected it (asleep, down, or gone) (${safeCode}). ` +
+      `Nothing was written to the target; check \`swarm_list remote: true\` and resend only if it is still relevant.`
+    );
+  }
   if (RESENDABLE[safeCode]) {
     return (
       `DELIVERY FAILED: your swarm message ${msgId} to ${target}${where} was NOT received. ` +

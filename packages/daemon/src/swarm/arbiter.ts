@@ -587,6 +587,7 @@ export class SwarmArbiter {
         if (!directory) {
           throw new TargetUnavailableError(`target ${target} not resolvable: directory lookup returned empty`);
         }
+        const inbound = this.inboundFor(next);
         const prompt = renderEnvelope(
           {
             v: "1",
@@ -603,7 +604,11 @@ export class SwarmArbiter {
                 ? Math.max(0, now - next.deliverAt)
                 : null,
             ref: next.ref,
-            fromMachine: this.inboundFor(next)?.fromMachine ?? null,
+            fromMachine: inbound?.fromMachine ?? null,
+            heldMs:
+              inbound?.relayedAt != null && now - inbound.relayedAt > 60_000
+                ? now - inbound.relayedAt
+                : null,
           },
           next.payload,
         );

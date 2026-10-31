@@ -80,6 +80,44 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     expect(s.relayInbound.get("msg_relayed_1")).toMatchObject({ fromMachine: "devbox", fromLabel: "pigeon work" });
   });
 
+  it("stores relayed_at on the inbound record when present and finite, null otherwise", async () => {
+    const s = db();
+    await receive(s, [message({ msg_id: "m_relayed_at", relayed_at: NOW - 50_000 })]);
+    expect(s.relayInbound.get("m_relayed_at")?.relayedAt).toBe(NOW - 50_000);
+
+    await receive(s, [message({ msg_id: "m_no_relayed_at" })]);
+    expect(s.relayInbound.get("m_no_relayed_at")?.relayedAt).toBeNull();
+
+    await receive(s, [message({ msg_id: "m_nan_relayed_at", relayed_at: "not-a-number" })]);
+    expect(s.relayInbound.get("m_nan_relayed_at")?.relayedAt).toBeNull();
+  });
+
+  it("migrates existing swarm_relay_inbound table without relayed_at idempotently", async () => {
+    const betterSqlite = (await import("better-sqlite3")).default;
+    const rawDb = betterSqlite(":memory:");
+    rawDb.exec(`
+      CREATE TABLE swarm_relay_inbound (
+        msg_id TEXT PRIMARY KEY,
+        from_machine TEXT NOT NULL,
+        from_session TEXT NOT NULL,
+        to_session TEXT NOT NULL,
+        from_label TEXT,
+        received_at INTEGER NOT NULL,
+        fail_reason TEXT,
+        fail_attempts INTEGER NOT NULL DEFAULT 0,
+        fail_next_at INTEGER,
+        fail_done_at INTEGER
+      );
+    `);
+    const { initRelayInboundSchema, RelayInboundRepository } = await import("../src/storage/relay-inbound-repo");
+    initRelayInboundSchema(rawDb);
+    initRelayInboundSchema(rawDb);
+    const repo = new RelayInboundRepository(rawDb);
+    repo.record({ msgId: "m_migrated", fromMachine: "devbox", fromSession: "ses_a", toSession: "ses_b", fromLabel: null, relayedAt: 12345 }, 1000);
+    expect(repo.get("m_migrated")?.relayedAt).toBe(12345);
+    rawDb.close();
+  });
+
   it("keeps a null expires_at null, ignoring relay_expires_at (the arbiter's retry policy keys on it)", async () => {
     const s = db();
     (await receive(s, [message()]));
@@ -447,7 +485,16 @@ describe("failure items: receipts for relays this machine sent (pigeon-k0qn.7)",
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ to_session: SENDER, reply_to: "m1" });
     expect(notices[0]!.payload).toBe(formatRelayFailureNotice("m1", TARGET, "cloudbox", "never_collected"));
-    expect(notices[0]!.payload).toContain("safe to resend");
+    expect(notices[0]!.payload).toContain("the worker held it for cloudbox and the machine never collected it (asleep, down, or gone)");
+    expect(notices[0]!.payload).toContain("Nothing was written to the target; check `swarm_list remote: true` and resend only if it is still relevant.");
+    expect(notices[0]!.payload).not.toContain("safe to resend");
+  });
+
+  it("not_delivered_on_receiver keeps safe to resend wording", async () => {
+    const a = await relayedOut();
+    await receiveAsDevbox(a.s, [failure({ msg_id: "f:m1", reason: "not_delivered_on_receiver" })]);
+    const notices = pigeonNotices(a.s);
+    expect(notices[0]!.payload).toContain("Nothing was written to the target, so it is safe to resend.");
   });
 
   it.each([

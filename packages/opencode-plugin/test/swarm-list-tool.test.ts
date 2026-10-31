@@ -231,23 +231,36 @@ describe("formatRemoteSessions", () => {
     expect(out).not.toMatch(/more sessions/)
   })
 
-  test("explains each non-available relay status", () => {
+  test("explains each non-available relay status and offline hold window", () => {
+    const now = 1_000_000_000
     const out = formatRemoteSessions(
       {
         ...REMOTE,
         machines: [
-          { machine_id: "a", relay: "not_accepted", last_poll_at: 1 },
-          { machine_id: "b", relay: "not_retired", last_poll_at: 1 },
+          { machine_id: "a", relay: "not_accepted", last_poll_at: now - 1000 },
+          { machine_id: "b", relay: "not_retired", last_poll_at: now - 1000 },
           { machine_id: "c", relay: "offline", last_poll_at: null },
           { machine_id: "d", relay: "unknown", last_poll_at: null },
+          { machine_id: "e", relay: "offline", last_poll_at: now - 3600_000 }, // 1h ago
+          { machine_id: "f", relay: "offline", last_poll_at: now - 8 * 86400_000 }, // 8d ago
         ],
       },
-      10_000,
+      now,
     )
     expect(out).toMatch(/a: not_accepted .*does not accept relays from cloudbox/)
     expect(out).toMatch(/b: not_retired .*shared worker key/)
-    expect(out).toMatch(/c: offline .*not polling/)
+    expect(out).toMatch(/c: offline \(c is not polling the worker; asleep or down\)/)
     expect(out).toMatch(/d: unknown/)
+    expect(out).toMatch(
+      /e: offline \(e last polled 1h; a message sent now is held up to 24h and delivered if it wakes in time\)/,
+    )
+    expect(out).toMatch(/f: offline \(f has not polled for 8d; sends are refused\)/)
+  })
+
+  test("header explains that available and offline within 7 days are queued by worker", () => {
+    const out = formatRemoteSessions(REMOTE, 10_000)
+    expect(out).toContain('"available" and "offline" (within 7 days) are queued by the worker')
+    expect(out).not.toContain('"available" means the worker will queue it')
   })
 
   test("warns when this machine does not relay, and when the list was truncated", () => {
