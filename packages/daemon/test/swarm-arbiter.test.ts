@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { SwarmArbiter } from "../src/swarm/arbiter";
 import { PermanentDeliveryError } from "../src/swarm/envelope";
 import { TransportError } from "../src/opencode-client";
@@ -20,6 +21,7 @@ function makeFixture(opts?: {
   clientForSession?: (sessionId: string) => any;
   directoryForSession?: (sessionId: string) => Promise<string | undefined>;
   directoryMissing?: (dir: string) => boolean;
+  gooseDeliver?: (sessionId: string, commandId: string, text: string) => Promise<void>;
 }) {
   const storage: StorageDb = openStorageDb(":memory:");
   const calls: DeliveryCall[] = [];
@@ -77,6 +79,7 @@ function makeFixture(opts?: {
     directoryForSession: (sessionId: string) => dirFn(sessionId),
     directoryMissing: (dir: string) => dirMissingFn(dir),
     nowFn: () => now,
+    gooseDeliver: opts?.gooseDeliver,
     log: () => {},
   });
 
@@ -1792,6 +1795,239 @@ describe("SwarmArbiter", () => {
       const calls = fixture.calls;
       expect(calls).toHaveLength(1);
       expect(calls[0]!.prompt).not.toContain("held_ms");
+    });
+  });
+
+  describe("goose delivery branch", () => {
+    it("delivers to goose session via gooseDeliver and marks handed off", async () => {
+      const gooseCalls: Array<{ sessionId: string; commandId: string; text: string }> = [];
+      const gooseDeliver = vi.fn(async (sessionId: string, commandId: string, text: string) => {
+        gooseCalls.push({ sessionId, commandId, text });
+      });
+
+      fixture = makeFixture({ gooseDeliver });
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+
+      storage.sessions.upsert({
+        sessionId: "gse_coord_1",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:4280/acp",
+        notify: true,
+      });
+
+      storage.swarm.insert(
+        {
+          msgId: "m_goose_1",
+          fromSession: "ses_sender",
+          toSession: "gse_coord_1",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "coordinator task",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+
+      await arbiter.processOnce();
+
+      expect(gooseDeliver).toHaveBeenCalledTimes(1);
+      expect(gooseCalls).toHaveLength(1);
+      expect(gooseCalls[0]!.sessionId).toBe("gse_coord_1");
+      expect(gooseCalls[0]!.commandId).toBe("swarm:m_goose_1");
+      expect(gooseCalls[0]!.text).toContain("<swarm_message");
+      expect(gooseCalls[0]!.text).toContain('msg_id="m_goose_1"');
+      expect(gooseCalls[0]!.text).toContain("coordinator task");
+
+      // Marked handed off
+      const row = storage.swarm.getByMsgId("m_goose_1");
+      expect(row?.state).toBe("handed_off");
+      expect(row?.handedOffAt).toBe(now);
+
+      // Opencode client was not called
+      expect(fixture.calls).toHaveLength(0);
+    });
+
+    it("renders envelope contents identically to opencode", async () => {
+      let deliveredPrompt = "";
+      const gooseDeliver = vi.fn(async (_sessionId: string, _commandId: string, text: string) => {
+        deliveredPrompt = text;
+      });
+
+      fixture = makeFixture({ gooseDeliver });
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+
+      storage.sessions.upsert({
+        sessionId: "gse_coord_env",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:4280/acp",
+        notify: true,
+      });
+
+      storage.swarm.insert(
+        {
+          msgId: "m_env_test",
+          fromSession: "ses_sender_1",
+          toSession: "gse_coord_env",
+          channel: null,
+          kind: "task.assign",
+          priority: "urgent",
+          replyTo: "m_prev",
+          ref: "bd:pigeon-123",
+          payload: "critical assignment",
+          deliverAt: 9_999_000,
+          expiresAt: 10_100_000,
+        },
+        now,
+      );
+
+      await arbiter.processOnce();
+
+      expect(deliveredPrompt).toContain('<swarm_message v="1"');
+      expect(deliveredPrompt).toContain('kind="task.assign"');
+      expect(deliveredPrompt).toContain('from="ses_sender_1"');
+      expect(deliveredPrompt).toContain('to="gse_coord_env"');
+      expect(deliveredPrompt).toContain('msg_id="m_env_test"');
+      expect(deliveredPrompt).toContain('reply_to="m_prev"');
+      expect(deliveredPrompt).toContain('priority="urgent"');
+      expect(deliveredPrompt).toContain('ref="bd:pigeon-123"');
+      expect(deliveredPrompt).toContain('delivered_late_ms="1000"');
+      expect(deliveredPrompt).toContain("critical assignment");
+      expect(deliveredPrompt).toContain("</swarm_message>");
+    });
+
+    it("retries when gooseDeliver throws an error", async () => {
+      const gooseDeliver = vi.fn(async () => {
+        throw new Error("honkd connection refused");
+      });
+
+      fixture = makeFixture({ gooseDeliver });
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+
+      storage.sessions.upsert({
+        sessionId: "gse_coord_err",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:4280/acp",
+        notify: true,
+      });
+
+      storage.swarm.insert(
+        {
+          msgId: "m_err_test",
+          fromSession: "ses_sender",
+          toSession: "gse_coord_err",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+
+      await arbiter.processOnce();
+
+      const row = storage.swarm.getByMsgId("m_err_test");
+      expect(row?.state).toBe("queued");
+      expect(row?.attempts).toBe(1);
+      expect(row?.nextRetryAt).toBeGreaterThan(now);
+    });
+
+    it("fails with TargetUnavailable and retries when gooseDeliver is not configured", async () => {
+      // makeFixture without gooseDeliver
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+
+      storage.sessions.upsert({
+        sessionId: "gse_no_deliver",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:4280/acp",
+        notify: true,
+      });
+
+      storage.swarm.insert(
+        {
+          msgId: "m_no_deliver",
+          fromSession: "ses_sender",
+          toSession: "gse_no_deliver",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+
+      await arbiter.processOnce();
+
+      const row = storage.swarm.getByMsgId("m_no_deliver");
+      expect(row?.state).toBe("queued");
+      expect(row?.attempts).toBe(1);
+      expect(row?.nextRetryAt).toBeGreaterThan(now);
+    });
+
+    it("skips directory lookup and directory preflight for goose targets", async () => {
+      const directoryForSession = vi.fn(async () => {
+        throw new Error("directory lookup must not be called for goose");
+      });
+      const directoryMissing = vi.fn(() => {
+        throw new Error("directory missing preflight must not be called for goose");
+      });
+      const gooseDeliver = vi.fn(async () => {});
+
+      fixture = makeFixture({
+        directoryForSession,
+        directoryMissing,
+        gooseDeliver,
+      });
+      const { storage, arbiter } = fixture;
+      const now = 10_000_000;
+      fixture.setNow(now);
+
+      storage.sessions.upsert({
+        sessionId: "gse_no_dir",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendEndpoint: "ws://127.0.0.1:4280/acp",
+        notify: true,
+      });
+
+      storage.swarm.insert(
+        {
+          msgId: "m_no_dir",
+          fromSession: "ses_sender",
+          toSession: "gse_no_dir",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "payload",
+          deliverAt: null,
+          expiresAt: null,
+        },
+        now,
+      );
+
+      await arbiter.processOnce();
+
+      expect(gooseDeliver).toHaveBeenCalledTimes(1);
+      expect(directoryForSession).not.toHaveBeenCalled();
+      expect(directoryMissing).not.toHaveBeenCalled();
+      expect(storage.swarm.getByMsgId("m_no_dir")?.state).toBe("handed_off");
     });
   });
 });

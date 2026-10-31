@@ -3,6 +3,13 @@ import type { StorageDb } from "../storage/database.js";
 import { GooseRunnerRegistry, GooseSessionRunner, gooseShutdownNotice, sanitiseIdPart } from "./session-runner.js";
 import type { GooseInflightRecord } from "../storage/goose-inflight-repo.js";
 import type { SessionRecord } from "../storage/types.js";
+import type { SwarmSettleCallback } from "../swarm/swarm-settle.js";
+import {
+  msgIdFromCommandId,
+  queuedStaleNotice,
+  recoveryExhaustedNotice,
+  recoveryCutoffNotice,
+} from "./turn-notices.js";
 
 export const DEFAULT_MAX_DOWNTIME_MS = 6 * 60 * 60 * 1000; // 6 hours (R1)
 export const DEFAULT_STALE_CUTOFF_MS = 24 * 60 * 60 * 1000; // 24 hours (R9)
@@ -11,6 +18,7 @@ export const DEFAULT_MAX_RECOVERY_ATTEMPTS = 3; // Poison guard
 export interface RecoverGooseTurnsOptions {
   storage: StorageDb;
   gooseRunners: GooseRunnerRegistry;
+  onSwarmSettled?: SwarmSettleCallback;
   now?: number;
   maxDowntimeMs?: number;
   staleCutoffMs?: number;
@@ -75,13 +83,21 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             sessionId,
             createdAt: row.createdAt,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "not_delivered",
+              reason: "queued message older than 24h was never sent",
+            });
+          }
           if (session) {
             void sendPostStop(
               {
                 session_id: sessionId,
                 notification_id: normalNotifId,
-                message:
-                  "pigeon queued this message more than 24h ago and never sent it; nothing was sent",
+                message: queuedStaleNotice(
+                  commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                  msgIdFromCommandId(commandId),
+                ),
                 event: "Error",
                 error_kind: "goose-queued-stale",
               },
@@ -99,6 +115,12 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "not_delivered",
+              reason: "session missing or no longer goose backend",
+            });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -113,6 +135,9 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), { kind: "delivered" });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -143,6 +168,12 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             sessionId,
             createdAt: row.createdAt,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "unconfirmed",
+              reason: "turn was in flight more than 24h ago; not resumed",
+            });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -154,6 +185,12 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "unconfirmed",
+              reason: "session missing or no longer goose backend",
+            });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -170,6 +207,9 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), { kind: "delivered" });
+          }
           opts.storage.gooseInflight.delete(commandId);
           opts.storage.inbox.markDone(commandId);
           continue;
@@ -185,12 +225,20 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
               sessionId,
               attempts,
             });
+            if (commandId.startsWith("swarm:")) {
+              opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+                kind: "unconfirmed",
+                reason: "recovery attempts exceeded; giving up to prevent crash loop",
+              });
+            }
             void sendPostStop(
               {
                 session_id: sessionId,
                 notification_id: normalNotifId,
-                message:
-                  "pigeon failed repeatedly while processing this turn; giving up to prevent crash loop. Check the session before resending.",
+                message: recoveryExhaustedNotice(
+                  commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                  msgIdFromCommandId(commandId),
+                ),
                 event: "Error",
                 error_kind: "goose-recovery-exhausted",
               },
@@ -208,6 +256,12 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             commandId,
             sessionId,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "unconfirmed",
+              reason: "bare goose turn cancelled by restart",
+            });
+          }
           void sendPostStop(
             {
               session_id: sessionId,
@@ -230,12 +284,20 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
             sessionId,
             lastAliveAt: row.lastAliveAt,
           });
+          if (commandId.startsWith("swarm:")) {
+            opts.onSwarmSettled?.(msgIdFromCommandId(commandId), {
+              kind: "unconfirmed",
+              reason: "pigeon was down too long (>6h) to safely collect the reply from honkd",
+            });
+          }
           void sendPostStop(
             {
               session_id: sessionId,
               notification_id: normalNotifId,
-              message:
-                "pigeon was down too long (>6h) to safely collect the reply from honkd; nothing was resent. Check the session before asking again.",
+              message: recoveryCutoffNotice(
+                commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                msgIdFromCommandId(commandId),
+              ),
               event: "Error",
               error_kind: "goose-recovery-cutoff",
             },

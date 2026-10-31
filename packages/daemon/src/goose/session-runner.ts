@@ -64,6 +64,14 @@ import {
   parseGooseUsage,
   type GooseUsage,
 } from "./usage-footer.js";
+import type { SwarmSettleCallback, SwarmSettleOutcome } from "../swarm/swarm-settle.js";
+import {
+  msgIdFromCommandId,
+  recoveredBusyNotice,
+  recoveryUnsupportedNotice,
+  resumeAdviceNotice,
+  honkResumeAdviceNotice,
+} from "./turn-notices.js";
 
 export { DEFAULT_MAX_TRANSCRIPT_BYTES, TRUNCATION_NOTICE };
 
@@ -166,6 +174,8 @@ export interface GooseSessionRunnerOptions {
   setTitle?: (sessionId: string, title: string) => void;
   /** Persisted in-flight turns store for crash recovery (honk-znj.10). */
   inflight?: GooseInflightStore;
+  /** Callback fired exactly once when a swarm: turn settles (delivered or failed). */
+  onSwarmSettled?: SwarmSettleCallback;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
   /** Transcript buffer cap. A runaway turn must not be able to exhaust memory. */
   maxTranscriptBytes?: number;
@@ -223,12 +233,22 @@ interface Turn {
   fromQueue?: boolean;
   permissionNoticePosted?: boolean;
   usage?: GooseUsage;
+  origin?: GooseTurnOrigin;
+  swarmSettled?: boolean;
 }
 
-interface QueuedItem {
+export type GooseTurnOrigin = "telegram" | "swarm";
+
+export function resolveTurnOrigin(commandId: string, origin?: GooseTurnOrigin): GooseTurnOrigin {
+  if (origin) return origin;
+  return commandId.startsWith("swarm:") ? "swarm" : "telegram";
+}
+
+export interface QueuedItem {
   commandId: string;
   text: string;
   queuedNoticeSent?: boolean;
+  origin?: GooseTurnOrigin;
 }
 
 const TOUCH_ALIVE_INTERVAL_MS = 60_000; // ~1/min throttled touchAlive (R1)
@@ -242,6 +262,14 @@ const MAX_UNCONSUMED_STEER_IDS = 100;
 const BUSY_NOT_DELIVERED_TEXT =
   "goose was already running a turn and pigeon could not add this message to it. "
   + "It was NOT delivered -- please send it again once the current turn finishes.";
+
+function busyNotDeliveredText(commandId: string, origin?: GooseTurnOrigin): string {
+  if (resolveTurnOrigin(commandId, origin) === "swarm") {
+    const msgId = commandId.startsWith("swarm:") ? commandId.slice(6) : commandId;
+    return `a swarm message to this coordinator was not delivered (msg ${msgId}); the sender was told it was not received`;
+  }
+  return BUSY_NOT_DELIVERED_TEXT;
+}
 
 const DEFAULT_HONK_RECONNECT_BUDGET_MS = 120_000;
 const DEFAULT_HONK_RECOVERY_BUDGET_MS = 10 * 60 * 1000; // 10 minutes
@@ -380,7 +408,11 @@ export class GooseSessionRunner {
   }
 
   dropQueued(): number {
-    const count = this.queue.length;
+    return this.dropQueuedItems().length;
+  }
+
+  dropQueuedItems(): QueuedItem[] {
+    const items = [...this.queue];
     for (const item of this.queue) {
       try {
         this.opts.inflight?.delete(item.commandId);
@@ -390,10 +422,22 @@ export class GooseSessionRunner {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+      if (item.commandId.startsWith("swarm:")) {
+        const msgId = item.commandId.slice(6);
+        this.opts.onSwarmSettled?.(msgId, {
+          kind: "not_delivered",
+          reason: "the coordinator session was retired before it read the message; resend to its successor",
+          customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${this.sessionId} was NOT received. Reason: the coordinator session was retired before it read the message; resend to its successor.`,
+        });
+      }
     }
     this.queue = [];
     this.clearDrainFallbackTimer();
-    return count;
+    return items;
+  }
+
+  queuedItems(): QueuedItem[] {
+    return [...this.queue];
   }
 
   holdDrain(): void {
@@ -410,6 +454,7 @@ export class GooseSessionRunner {
       commandId: row.commandId,
       text: row.promptText,
       queuedNoticeSent: true,
+      origin: resolveTurnOrigin(row.commandId),
     });
     this.scheduleDrain();
     this.armDrainFallbackTimer();
@@ -496,6 +541,14 @@ export class GooseSessionRunner {
     return this.turn ? { commandId: this.turn.commandId } : undefined;
   }
 
+  private settleSwarmTurn(turn: Turn, outcome: SwarmSettleOutcome, allowLateDelivered = false): void {
+    if (turn.swarmSettled && !allowLateDelivered) return;
+    if (!turn.commandId.startsWith("swarm:")) return;
+    turn.swarmSettled = true;
+    const msgId = turn.commandId.slice(6);
+    this.opts.onSwarmSettled?.(msgId, outcome);
+  }
+
   retire(turn: { commandId: string }): void {
     try {
       this.opts.inflight?.delete(turn.commandId);
@@ -541,6 +594,7 @@ export class GooseSessionRunner {
       resent: true,
       recovered: true,
       usage: undefined,
+      origin: resolveTurnOrigin(row.commandId),
     };
     this.turn = turn;
     this.pruneSentSteers();
@@ -584,12 +638,18 @@ export class GooseSessionRunner {
             supportsResumeOnly: this.opts.client.supportsResumeOnly,
           });
           if (this.turn === turn) this.clearTurn();
+          this.settleSwarmTurn(turn, {
+            kind: "unconfirmed",
+            reason: "pigeon restarted while goose was working on this; recovery unsupported",
+          });
           try {
             await this.postStop({
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
-              message:
-                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              message: recoveryUnsupportedNotice(
+                turn.origin ?? "telegram",
+                msgIdFromCommandId(row.commandId),
+              ),
               event: "Error",
               error_kind: "goose-turn-recovery-unsupported",
             });
@@ -709,7 +769,12 @@ export class GooseSessionRunner {
    * ok: false only for permanent refusals (e.g. steer-timeout)
    * throw only before anything was saved or sent
    */
-  async deliver(commandId: string, text: string): Promise<DeliverOutcome> {
+  async deliver(
+    commandId: string,
+    text: string,
+    opts?: { origin?: GooseTurnOrigin },
+  ): Promise<DeliverOutcome> {
+    const origin = resolveTurnOrigin(commandId, opts?.origin);
     this.clearIdleSocketTimer();
 
     // 3a. Redelivery of the command that started the turn we are already running.
@@ -723,14 +788,18 @@ export class GooseSessionRunner {
     }
 
     // 3c. this.turn set (our turn in flight):
+    // For origin "swarm": NEVER steer into a live turn: in the "our turn in flight" branch go straight to enqueue.
     // if client ownership is "own" AND a run id is known AND not a recovered turn -> steer as today
     // Otherwise (pending, unknown, foreign, or no run id yet -- this REPLACES the "no-run-id-yet" refusal
     // and also covers recovered turns) -> enqueue.
     if (this.turn) {
+      if (origin === "swarm") {
+        return this.enqueue(commandId, text, undefined, origin);
+      }
       const isOwn = !this.turn.recovered && this.ownsActiveRun();
       const runId = this.runId();
       if (!isOwn || !runId) {
-        return this.enqueue(commandId, text);
+        return this.enqueue(commandId, text, undefined, origin);
       }
 
       await this.ensureConnected();
@@ -769,6 +838,7 @@ export class GooseSessionRunner {
               commandId,
               text,
               "your message reached goose too late for the turn it was added to; queued",
+              origin,
             );
           }
           this.pruneSentSteers();
@@ -783,24 +853,30 @@ export class GooseSessionRunner {
       });
       this.clearTurn();
       if (this.queue.length > 0) {
-        return this.enqueue(commandId, text);
+        return this.enqueue(commandId, text, undefined, origin);
       }
     }
 
     // 3d. no turn of ours but queue non-empty -> enqueue (order).
     if (this.queue.length > 0) {
-      return this.enqueue(commandId, text);
+      return this.enqueue(commandId, text, undefined, origin);
     }
 
     // 3e. otherwise ensureConnected + startTurn as today.
     await this.ensureConnected();
     if (this.turn || this.queue.length > 0) {
-      return this.enqueue(commandId, text);
+      return this.enqueue(commandId, text, undefined, origin);
     }
-    return this.startTurn(commandId, text);
+    return this.startTurn(commandId, text, { origin });
   }
 
-  private async enqueue(commandId: string, text: string, customMessage?: string): Promise<DeliverOutcome> {
+  private async enqueue(
+    commandId: string,
+    text: string,
+    customMessage?: string,
+    origin?: GooseTurnOrigin,
+  ): Promise<DeliverOutcome> {
+    const resolvedOrigin = resolveTurnOrigin(commandId, origin);
     if (this.opts.inflight) {
       this.opts.inflight.insert({
         commandId,
@@ -812,22 +888,24 @@ export class GooseSessionRunner {
       });
     }
 
-    this.queue.push({ commandId, text, queuedNoticeSent: true });
+    this.queue.push({ commandId, text, queuedNoticeSent: true, origin: resolvedOrigin });
 
-    const message = customMessage ?? QUEUED_NOTICE_MESSAGE;
-    try {
-      await this.postStop({
-        session_id: this.sessionId,
-        notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}:queued`,
-        message,
-        event: "Queued",
-      });
-    } catch (err) {
-      this.log("goose runner: could not post queued notice", {
-        sessionId: this.sessionId,
-        commandId,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    if (resolvedOrigin !== "swarm") {
+      const message = customMessage ?? QUEUED_NOTICE_MESSAGE;
+      try {
+        await this.postStop({
+          session_id: this.sessionId,
+          notification_id: `s:${this.sessionId}:${sanitiseIdPart(commandId)}:queued`,
+          message,
+          event: "Queued",
+        });
+      } catch (err) {
+        this.log("goose runner: could not post queued notice", {
+          sessionId: this.sessionId,
+          commandId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     this.scheduleDrain();
@@ -888,7 +966,7 @@ export class GooseSessionRunner {
       this.queue.shift();
 
       try {
-        this.startTurn(item.commandId, item.text, { fromQueue: true });
+        this.startTurn(item.commandId, item.text, { fromQueue: true, origin: item.origin });
       } catch (err) {
         this.queue.unshift(item);
         this.log("goose runner: startTurn failed during drain", {
@@ -946,7 +1024,11 @@ export class GooseSessionRunner {
    * promise, so by the time this function returns the command HAS been sent.
    * That is what makes "throw means nothing was sent" true for callers.
    */
-  private startTurn(commandId: string, text: string, options?: { fromQueue?: boolean }): DeliverOutcome {
+  private startTurn(
+    commandId: string,
+    text: string,
+    options?: { fromQueue?: boolean; origin?: GooseTurnOrigin },
+  ): DeliverOutcome {
     this.pruneSentSteers();
     this.clearIdleSocketTimer();
     this.clearDrainFallbackTimer();
@@ -979,6 +1061,7 @@ export class GooseSessionRunner {
       queuedNoticeSent: options?.fromQueue ?? false,
       fromQueue: options?.fromQueue ?? false,
       usage: undefined,
+      origin: resolveTurnOrigin(commandId, options?.origin),
     };
     this.turn = turn;
     this.opts.touch(this.sessionId);
@@ -1076,12 +1159,18 @@ export class GooseSessionRunner {
         });
         if (turn.recovered) {
           if (this.turn === turn) this.clearTurn();
+          this.settleSwarmTurn(turn, {
+            kind: "unconfirmed",
+            reason: "pigeon restarted while goose was working on this; recovery unsupported",
+          });
           try {
             await this.postStop({
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
-              message:
-                "pigeon restarted while goose was working on this; can't safely collect the reply, nothing was resent — check the session / ask again",
+              message: recoveryUnsupportedNotice(
+                turn.origin ?? "telegram",
+                msgIdFromCommandId(turn.commandId),
+              ),
               event: "Error",
               error_kind: "goose-turn-recovery-unsupported",
             });
@@ -1195,6 +1284,10 @@ export class GooseSessionRunner {
         commandId: turn.commandId,
       });
       if (this.turn === turn) this.clearTurn();
+      this.settleSwarmTurn(turn, {
+        kind: "not_delivered",
+        reason: "honkd has no record of this turn (it may never have arrived, or honkd lost it); nothing was resent",
+      });
       try {
         await this.postStop({
           session_id: this.sessionId,
@@ -1223,11 +1316,18 @@ export class GooseSessionRunner {
           runId,
         });
         if (this.turn === turn) this.clearTurn();
+        this.settleSwarmTurn(turn, {
+          kind: "unconfirmed",
+          reason: "goose was busy during recovery; message not delivered",
+        });
         try {
           await this.postStop({
             session_id: this.sessionId,
             notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
-            message: "your message was not delivered (goose was busy); nothing was resent — send it again.",
+            message: recoveredBusyNotice(
+              turn.origin ?? "telegram",
+              msgIdFromCommandId(turn.commandId),
+            ),
             event: "Error",
             error_kind: "goose-busy-recovered",
           });
@@ -1248,19 +1348,32 @@ export class GooseSessionRunner {
           sessionId: this.sessionId,
           runId,
         });
+        this.settleSwarmTurn(turn, {
+          kind: "unconfirmed",
+          reason: "honkd rejected the resend as busy; turn may still be running",
+        });
+        const msg =
+          turn.origin === "swarm"
+            ? `a swarm message to this coordinator was not confirmed (msg ${msgIdFromCommandId(turn.commandId)}); honkd rejected the resend as busy`
+            : BUSY_NOT_DELIVERED_TEXT;
         await this.finishTurn(
           turn,
           undefined,
-          new Error(BUSY_NOT_DELIVERED_TEXT),
+          new Error(msg),
         );
         return;
       }
-      if (this.isHonk) {
-        this.log("honkd rejected the prompt as busy; queueing turn instead of steering", {
-          sessionId: this.sessionId,
-          runId,
-          commandId: turn.commandId,
-        });
+      if (this.isHonk || turn.origin === "swarm") {
+        this.log(
+          this.isHonk
+            ? "honkd rejected the prompt as busy; queueing turn instead of steering"
+            : "goose rejected swarm prompt as busy; queueing turn instead of steering",
+          {
+            sessionId: this.sessionId,
+            runId,
+            commandId: turn.commandId,
+          },
+        );
         try {
           this.opts.inflight?.markQueued(turn.commandId, Date.now());
         } catch (err) {
@@ -1274,10 +1387,10 @@ export class GooseSessionRunner {
           this.clearTurn();
         }
         const alreadyNoticeSent = turn.queuedNoticeSent ?? false;
-        this.queue.unshift({ commandId: turn.commandId, text, queuedNoticeSent: true });
+        this.queue.unshift({ commandId: turn.commandId, text, queuedNoticeSent: true, origin: turn.origin });
         this.armDrainFallbackTimer();
 
-        if (!alreadyNoticeSent) {
+        if (!alreadyNoticeSent && turn.origin !== "swarm") {
           try {
             await this.postStop({
               session_id: this.sessionId,
@@ -1331,7 +1444,7 @@ export class GooseSessionRunner {
       await this.finishTurn(
         turn,
         undefined,
-        new Error(BUSY_NOT_DELIVERED_TEXT),
+        new Error(busyNotDeliveredText(turn.commandId, turn.origin)),
       );
       return;
     }
@@ -1530,10 +1643,11 @@ export class GooseSessionRunner {
 
     try {
       const partial = turn.text.join("");
-      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdvice(turn.resent)}`;
+      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdviceNotice(turn.origin ?? "telegram", msgIdFromCommandId(turn.commandId), turn.resent)}`;
       const bareDetail =
         "goose cancels a turn once it sees its connection close, so do not wait for this one: "
-        + `no result is coming here. ${resumeAdvice(turn.resent)}`;
+        + `no result is coming here. ${resumeAdviceNotice(turn.origin ?? "telegram", msgIdFromCommandId(turn.commandId), turn.resent)}`;
+      this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: `turn stalled: ${reason}` });
       await this.postStop({
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:stalled`,
@@ -1578,6 +1692,7 @@ export class GooseSessionRunner {
         sessionId: this.sessionId,
         commandId: turn.commandId,
       });
+      this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: "turn cancelled" });
       this.retire(turn);
       this.scheduleDrain();
       return;
@@ -1595,6 +1710,7 @@ export class GooseSessionRunner {
           commandId: turn.commandId,
           error: err instanceof Error ? err.message : String(err),
         });
+        this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: "abandoned turn failed" });
         this.retire(turn);
         return;
       }
@@ -1652,7 +1768,11 @@ export class GooseSessionRunner {
         // Said in the human's terms rather than as the raw error, because the
         // one thing they need to know -- that they should NOT wait for this
         // turn -- is otherwise buried after a close code and a run id.
-        const advice = resumeAdvice(turn.resent);
+        const advice = resumeAdviceNotice(
+          turn.origin ?? "telegram",
+          msgIdFromCommandId(turn.commandId),
+          turn.resent,
+        );
         const detail =
           "The connection to goose dropped mid-turn, and goose cancels a turn when its connection "
           + `closes, so this turn was cancelled and will not finish. ${advice}`
@@ -1678,6 +1798,22 @@ export class GooseSessionRunner {
         if (footer) {
           message += `\n\n${footer}`;
         }
+      }
+
+      if (err !== undefined) {
+        if (
+          err instanceof Error &&
+          err.message.includes("a swarm message to this coordinator was not delivered")
+        ) {
+          this.settleSwarmTurn(turn, { kind: "not_delivered", reason: err.message });
+        } else {
+          this.settleSwarmTurn(turn, {
+            kind: "unconfirmed",
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } else {
+        this.settleSwarmTurn(turn, { kind: "delivered" }, true);
       }
 
       await this.postStop({
@@ -1905,6 +2041,7 @@ export function sanitiseIdPart(s: string): string {
 
 export interface GooseRunnerRegistryOptions {
   createRunner: (session: SessionRecord) => GooseSessionRunner;
+  onSwarmSettled?: SwarmSettleCallback;
   inbox?: { markDone: (commandId: string) => void };
   inflight?: GooseInflightStore;
 }

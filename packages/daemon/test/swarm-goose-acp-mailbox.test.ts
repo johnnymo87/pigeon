@@ -23,7 +23,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     };
   }
 
-  it("POST /swarm/send to an opted-in goose-acp gse_ returns 202 banked: true and stores in pull_inbox", async () => {
+  it("POST /swarm/send to a goose-acp gse_ with endpoint pushes into swarm_messages", async () => {
     const { app, storage: s } = newApp();
     registerGooseSession(
       s.sessions,
@@ -50,30 +50,70 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     expect(res.status).toBe(202);
     const body = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
     expect(body.accepted).toBe(true);
+    expect(body.banked).toBeUndefined();
+    expect(body.msg_id).toMatch(/^msg_/);
+
+    // Inserted into swarm_messages for the arbiter to deliver
+    const swarmRow = s.swarm.getByMsgId(body.msg_id);
+    expect(swarmRow).not.toBeNull();
+    expect(swarmRow!.toSession).toBe("gse_target");
+    expect(swarmRow!.payload).toBe("hello goose");
+
+    // Nothing in pull_inbox
+    expect(s.pullInbox.claim("gse_target", 2_000)).toHaveLength(0);
+  });
+
+  it("POST /swarm/send to an opted-in goose-acp gse_ without endpoint returns 202 banked: true and stores in pull_inbox", async () => {
+    const { app, storage: s } = newApp();
+    s.sessions.upsert({
+      sessionId: "gse_pull_target",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_pull_target", ["telegram-reply", "swarm"]);
+
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: "gse_pull_target",
+          kind: "chat",
+          priority: "normal",
+          payload: "hello pull goose",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
+    expect(body.accepted).toBe(true);
     expect(body.banked).toBe(true);
     expect(body.msg_id).toMatch(/^msg_/);
 
     // Row in pull_inbox with source: "swarm"
-    const claimed = s.pullInbox.claim("gse_target", 2_000);
+    const claimed = s.pullInbox.claim("gse_pull_target", 2_000);
     expect(claimed).toHaveLength(1);
     expect(claimed[0]!.msgId).toBe(body.msg_id);
     expect(claimed[0]!.source).toBe("swarm");
     expect(claimed[0]!.senderId).toBe("ses_sender");
-    expect(claimed[0]!.payload).toBe("hello goose");
+    expect(claimed[0]!.payload).toBe("hello pull goose");
 
     // Nothing in swarm_messages
     expect(s.swarm.getByMsgId(body.msg_id)).toBeNull();
   });
 
-  it("POST /swarm/send to a goose-acp gse_ not opted in returns 409 naming session and 'no swarm mailbox', storing nothing", async () => {
+  it("POST /swarm/send to a goose-acp gse_ not opted in and without endpoint returns 409 'no swarm mailbox', storing nothing", async () => {
     const { app, storage: s } = newApp();
-    registerGooseSession(
-      s.sessions,
-      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
-      1_000,
-      () => "gse_no_optin",
-    );
-    // pullSources defaults to ["telegram-reply"], "swarm" not present
+    s.sessions.upsert({
+      sessionId: "gse_no_optin",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_no_optin", ["telegram-reply"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -98,6 +138,36 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     expect(s.pullInbox.pendingCount("gse_no_optin", 2_000)).toBe(0);
     const countSwarm = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages").get() as { n: number };
     expect(countSwarm.n).toBe(0);
+  });
+
+  it("POST /swarm/send to a goose-acp gse_ with endpoint succeeds even if not opted into pull swarm", async () => {
+    const { app, storage: s } = newApp();
+    registerGooseSession(
+      s.sessions,
+      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
+      1_000,
+      () => "gse_endpoint_no_pull_optin",
+    );
+    s.sessions.setPullSources("gse_endpoint_no_pull_optin", ["telegram-reply"]);
+
+    const res = await app(
+      new Request("http://localhost/swarm/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: "gse_endpoint_no_pull_optin",
+          kind: "chat",
+          priority: "normal",
+          payload: "hello push without pull optin",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string };
+    expect(body.accepted).toBe(true);
+    expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
   });
 
   it("POST /swarm/send to a gse_ with no row returns 409 'no goose session … on this machine', storing nothing", async () => {
@@ -127,15 +197,15 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     expect(countSwarm.n).toBe(0);
   });
 
-  it("POST /swarm/schedule to an opted-in gse_ returns 409 scheduled", async () => {
+  it("POST /swarm/schedule to an opted-in gse_ without endpoint returns 409 scheduled", async () => {
     const { app, storage: s } = newApp();
-    registerGooseSession(
-      s.sessions,
-      { machineId: null, backendSessionId: "20261020_1", endpoint: "ws://127.0.0.1:4080/acp" },
-      1_000,
-      () => "gse_sched",
-    );
-    s.sessions.setPullSources("gse_sched", ["telegram-reply", "swarm"]);
+    s.sessions.upsert({
+      sessionId: "gse_sched_pull",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
+    s.sessions.setPullSources("gse_sched_pull", ["telegram-reply", "swarm"]);
 
     const res = await app(
       new Request("http://localhost/swarm/schedule", {
@@ -143,7 +213,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           from: "ses_sender",
-          to: "gse_sched",
+          to: "gse_sched_pull",
           after: "1h",
           payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.",
         }),
@@ -153,6 +223,34 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/scheduled messages cannot be banked/);
+  });
+
+  it("POST /swarm/schedule to a gse_ with endpoint inserts into swarm_messages", async () => {
+    const { app, storage: s } = newApp();
+    registerGooseSession(
+      s.sessions,
+      { machineId: null, backendSessionId: "20261020_sched", endpoint: "ws://127.0.0.1:4080/acp" },
+      1_000,
+      () => "gse_sched_push",
+    );
+
+    const res = await app(
+      new Request("http://localhost/swarm/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "ses_sender",
+          to: "gse_sched_push",
+          after: "1h",
+          payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.",
+        }),
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { accepted: boolean; msg_id: string };
+    expect(body.accepted).toBe(true);
+    expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
   });
 
   it("rejects `to` matching neither ses_ nor gse_ with 400 naming both prefixes", async () => {
@@ -725,14 +823,14 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
     };
   }
 
-  it("a failure for a message from an opted-in gse_ sender banks delivery.failed into its mailbox", async () => {
+  it("a failure for a message from an opted-in gse_ sender without endpoint banks delivery.failed into its mailbox", async () => {
     const { storage: s } = newApp(1_000);
-    registerGooseSession(
-      s.sessions,
-      { machineId: null, backendSessionId: "20261020_sender", endpoint: "ws://127.0.0.1:4080/acp" },
-      1_000,
-      () => "gse_sender",
-    );
+    s.sessions.upsert({
+      sessionId: "gse_sender",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
     s.sessions.setPullSources("gse_sender", ["telegram-reply", "swarm"]);
 
     notifySenderOfFailure(
@@ -762,14 +860,43 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
     expect(countSwarm.n).toBe(0);
   });
 
-  it("a failure for a message from a non-opted-in gse_ sender is refused and logged, nothing inserted", async () => {
+  it("a failure for a message from a gse_ sender with endpoint inserts delivery.failed into swarm_messages", async () => {
     const { storage: s } = newApp(1_000);
     registerGooseSession(
       s.sessions,
-      { machineId: null, backendSessionId: "20261020_sender2", endpoint: "ws://127.0.0.1:4080/acp" },
+      { machineId: null, backendSessionId: "20261020_sender_push", endpoint: "ws://127.0.0.1:4080/acp" },
       1_000,
-      () => "gse_sender_no_optin",
+      () => "gse_sender_push",
     );
+
+    notifySenderOfFailure(
+      s,
+      {
+        msgId: "msg_orig_push_fail",
+        fromSession: "gse_sender_push",
+        toSession: "ses_unreachable",
+        channel: null,
+        kind: "chat",
+        handedOffAt: null,
+      },
+      "expired",
+      2_000,
+    );
+
+    // Inserted into swarm_messages for push delivery
+    const countSwarm = s.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages").get() as { n: number };
+    expect(countSwarm.n).toBe(1);
+    expect(s.pullInbox.pendingCount("gse_sender_push", 3_000)).toBe(0);
+  });
+
+  it("a failure for a message from a non-opted-in gse_ sender without endpoint is refused and logged, nothing inserted", async () => {
+    const { storage: s } = newApp(1_000);
+    s.sessions.upsert({
+      sessionId: "gse_sender_no_optin",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: null,
+      notify: true,
+    });
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 

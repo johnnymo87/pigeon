@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { openStorageDb } from "../src/storage/database.js";
+import { settleSwarmMessage } from "../src/swarm/swarm-settle.js";
 import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
 import { DisconnectedDuringTurn, GooseProtocolError } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
@@ -113,6 +115,7 @@ class FakeClient {
   connectCalls = 0;
   closed = false;
   isHonk = false;
+  supportsResumeOnly = true;
   /** Resolvers for in-flight prompts, keyed by the text that started them. */
   private turns: Array<{ text: string; resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
   prompts: string[] = [];
@@ -250,10 +253,15 @@ function makeRunner(over: Record<string, unknown> = {}) {
   const stops: Array<Record<string, unknown>> = [];
   const touches: string[] = [];
   const inflight = (over.inflight as FakeInflightStore | undefined) ?? new FakeInflightStore();
+  const settledSwarm: Array<{ msgId: string; outcome: unknown }> = [];
+  const onSwarmSettled =
+    (over.onSwarmSettled as any) ??
+    ((msgId: string, outcome: unknown) => settledSwarm.push({ msgId, outcome }));
   const runner = new GooseSessionRunner({
     session: session(),
     client: client as never,
     inflight,
+    onSwarmSettled,
     postStop: async (body) => {
       stops.push(body);
     },
@@ -261,7 +269,7 @@ function makeRunner(over: Record<string, unknown> = {}) {
     log: () => {},
     ...over,
   });
-  return { runner, client, stops, touches, inflight };
+  return { runner, client, stops, touches, inflight, settledSwarm };
 }
 
 describe("GooseSessionRunner turn lifecycle", () => {
@@ -2886,5 +2894,313 @@ describe("GooseSessionRunner session title", () => {
     await runner.settled();
 
     expect(stops[0]!).not.toHaveProperty("title");
+  });
+
+  describe("swarm origin delivery", () => {
+    it("never steers into a live turn: goes straight to enqueue", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.setRunId("20260918_1", "run_1");
+      client.ownership = "own";
+
+      // Start turn 1
+      await runner.deliver("c1", "turn 1 prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Deliver swarm message while turn 1 is in flight
+      const outcome = await runner.deliver("swarm:msg_1", "swarm task prompt", { origin: "swarm" });
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("queued");
+
+      // Verify no steer was attempted
+      expect(client.steers).toHaveLength(0);
+
+      // Verify NO "Queued" Telegram notice was posted
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("does not post a Queued notice on enqueue even without explicit origin if commandId starts with swarm:", async () => {
+      const { runner, client, stops } = makeRunner();
+      await runner.deliver("c1", "turn 1");
+
+      const outcome = await runner.deliver("swarm:msg_2", "swarm task prompt");
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("queued");
+      expect(client.steers).toHaveLength(0);
+
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("does not post a Queued notice on honk-busy requeue for swarm origin", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = true;
+
+      await runner.deliver("swarm:msg_busy", "prompt that hits busy");
+      expect(client.liveTurns).toBe(1);
+
+      // Honkd rejects with busy
+      client.finishBusy("run_live");
+      await runner.settled();
+
+      // Verified: no Queued notice posted
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("infers swarm origin on resume() after recovery, asserts swarm wording on recovered-busy, and notifies sender", async () => {
+      const { runner, client, stops, settledSwarm } = makeRunner();
+      client.isHonk = true;
+      client.supportsResumeOnly = true;
+
+      // Resume a turn recovered from goose_inflight_turns with a swarm: commandId
+      const resumed = runner.resume({
+        commandId: "swarm:msg_rec_busy_1",
+        sessionId: "20260918_1",
+        backendSessionId: "20260918_1",
+        isHonk: true,
+        promptText: "recovered swarm prompt",
+        recoveryAttempts: 0,
+        createdAt: 1000,
+        updatedAt: 1000,
+        lastAliveAt: 1000,
+        cleanSuspend: false,
+        state: "sent",
+      });
+      expect(resumed).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Honkd rejects recovery prompt with busy
+      client.finishBusy("run_live_recovered");
+      await runner.settled();
+
+      // Check Stop notification
+      const errorStops = stops.filter((s) => s.event === "Error");
+      expect(errorStops).toHaveLength(1);
+      expect(errorStops[0]!.message).toContain(
+        "a swarm message to this coordinator was not delivered (msg msg_rec_busy_1); goose was busy and nothing was resent",
+      );
+      expect(errorStops[0]!.message).not.toContain("send it again");
+
+      // Check onSwarmSettled notified unconfirmed failure
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_rec_busy_1");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "unconfirmed" }),
+      );
+    });
+
+    it("settles swarm message as delivered when turn finishes normally (end_turn)", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      await runner.deliver("swarm:msg_normal", "normal task");
+      expect(client.liveTurns).toBe(1);
+
+      client.finishTurn("end_turn");
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_normal");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+    });
+
+    it("settles swarm message as delivered on cancelled or max_turns receipts", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      await runner.deliver("swarm:msg_cancelled_rec", "cancelled receipt task");
+      client.finishTurn("cancelled");
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_cancelled_rec");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+
+      const { runner: runner2, client: client2, settledSwarm: settledSwarm2 } = makeRunner();
+      await runner2.deliver("swarm:msg_max_turns", "max turns task");
+      client2.finishTurn("max_turns");
+      await runner2.settled();
+
+      expect(settledSwarm2).toHaveLength(1);
+      expect(settledSwarm2[0]!.msgId).toBe("msg_max_turns");
+      expect(settledSwarm2[0]!.outcome).toEqual({ kind: "delivered" });
+    });
+
+    it("requeues instead of steering when bare goose rejects swarm prompt as busy", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false; // bare goose
+
+      await runner.deliver("swarm:msg_bare_busy", "bare prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Bare goose returns busy
+      client.finishBusy("run_live_bare");
+      await runner.settled();
+
+      // Does NOT steer
+      expect(client.steers).toHaveLength(0);
+
+      // Requeued into queue
+      expect(runner.queuedItems()).toHaveLength(1);
+      expect(runner.queuedItems()[0]!.commandId).toBe("swarm:msg_bare_busy");
+
+      // No Queued notice posted
+      const queuedStops = stops.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(0);
+    });
+
+    it("settles swarm message as unconfirmed on disconnect after send", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      client.isHonk = false; // bare goose disconnects without honk resend
+
+      await runner.deliver("swarm:msg_disc_1", "disconnect task");
+      expect(client.liveTurns).toBe(1);
+
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_disc", 1006));
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_disc_1");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "unconfirmed" }),
+      );
+    });
+
+    it("settles swarm message as unconfirmed when resent turn hits busy", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = true;
+
+      await runner.deliver("swarm:msg_busy_fail", "prompt");
+      // First disconnect triggers honk reconnect and resend
+      client.failTurn(new DisconnectedDuringTurn("20260918_1", "run_1", 1006));
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Resend prompt arrives, finish with busy
+      client.finishBusy("run_busy_again");
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_busy_fail");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "unconfirmed" }),
+      );
+
+      const errorStops = stops.filter((s) => s.event === "Error");
+      expect(errorStops).toHaveLength(1);
+      expect(errorStops[0]!.message).toContain(
+        "a swarm message to this coordinator was not confirmed (msg msg_busy_fail); honkd rejected the resend as busy",
+      );
+      expect(errorStops[0]!.message).not.toContain("the sender was told it was not received");
+    });
+
+    it("settles unconfirmed with UNCONFIRMED wording and Do NOT resend advice", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_unconf",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "unconfirmed task",
+      }, now);
+      storage.swarm.markHandedOff("msg_unconf", now);
+
+      settleSwarmMessage(storage, "msg_unconf", { kind: "unconfirmed", reason: "connection dropped" });
+
+      const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
+      expect(notice?.payload).toContain("DELIVERY UNCONFIRMED");
+      expect(notice?.payload).toContain("Do NOT resend it");
+    });
+
+    it("settles not_delivered with NOT received wording and safe to resend advice", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_not_del",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "not delivered task",
+      }, now);
+      storage.swarm.markHandedOff("msg_not_del", now);
+
+      settleSwarmMessage(storage, "msg_not_del", {
+        kind: "not_delivered",
+        reason: "queued message dropped before turn started",
+      });
+
+      const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
+      expect(notice?.payload).toContain("DELIVERY FAILED");
+      expect(notice?.payload).toContain("was never delivered and was NOT received");
+      expect(notice?.payload).toContain("safe to resend");
+    });
+
+    it("settles late receipt on abandoned turn as delivered", async () => {
+      const { runner, client, settledSwarm } = makeRunner();
+      await runner.deliver("swarm:msg_late_rec", "task");
+      expect(client.liveTurns).toBe(1);
+
+      // Abandon turn
+      await (runner as any).abandonTurn((runner as any).turn, "testing late receipt");
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.outcome).toEqual(expect.objectContaining({ kind: "unconfirmed" }));
+
+      // Late receipt arrives
+      client.finishTurn("end_turn", { text: "late answer" });
+      await runner.settled();
+
+      // Second settle call attempted with delivered
+      expect(settledSwarm).toHaveLength(2);
+      expect(settledSwarm[1]!.outcome).toEqual({ kind: "delivered" });
+    });
+
+    it("preserves telegram-origin behaviour unchanged (steers, posts Queued notice, human wording)", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.setRunId("20260918_1", "run_tg");
+      client.ownership = "own";
+
+      await runner.deliver("tg_1", "turn 1 prompt");
+
+      // Telegram origin steer
+      client.steerOutcome = { kind: "steered", messageId: "steer_msg_1" };
+      const outcome = await runner.deliver("tg_2", "steer prompt", { origin: "telegram" });
+      expect(outcome.ok).toBe(true);
+      expect(outcome.meta?.mode).toBe("steered");
+      expect(client.steers).toHaveLength(1);
+
+      // Inflight queued notice for telegram
+      const { runner: runner2, client: client2, stops: stops2 } = makeRunner();
+      client2.isHonk = true;
+      await runner2.deliver("tg_busy", "prompt");
+      client2.finishBusy("run_live");
+      await runner2.settled();
+
+      const queuedStops = stops2.filter((s) => s.event === "Queued");
+      expect(queuedStops).toHaveLength(1);
+      expect(queuedStops[0]!.message).toContain("goose is busy with a turn");
+    });
+
+    it("dropQueuedItems returns queued items and cleans up inflight rows", async () => {
+      const { runner, client, inflight } = makeRunner();
+      await runner.deliver("c0", "turn 0");
+      client.runStateValue = "running";
+      client.ownership = "foreign";
+
+      await runner.deliver("swarm:msg_q1", "q1");
+      await runner.deliver("swarm:msg_q2", "q2");
+      expect(inflight.get("swarm:msg_q1")?.state).toBe("queued");
+      expect(inflight.get("swarm:msg_q2")?.state).toBe("queued");
+
+      const dropped = runner.dropQueuedItems();
+      expect(dropped).toHaveLength(2);
+      expect(dropped[0]!.commandId).toBe("swarm:msg_q1");
+      expect(dropped[1]!.commandId).toBe("swarm:msg_q2");
+      expect(inflight.get("swarm:msg_q1")).toBeUndefined();
+      expect(inflight.get("swarm:msg_q2")).toBeUndefined();
+    });
   });
 });

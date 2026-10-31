@@ -15,6 +15,8 @@ export interface ArbiterClient {
   sendPrompt(sessionId: string, directory: string, prompt: string): Promise<void>;
 }
 import { renderEnvelope, PermanentDeliveryError } from "./envelope";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
+import type { VerifyFamily } from "./verify-family";
 import { isOpencodeRoutable } from "../routing/opencode-routable";
 import type { Locality } from "../routing/locality";
 import { directoryMissing } from "./directory-check";
@@ -204,6 +206,10 @@ export interface ArbiterOptions {
    * is POSTed to the worker instead of failed. Absent: Phase 1 behaviour.
    */
   relay?: (body: RelayMessageBody) => Promise<RelaySendAnswer>;
+  /**
+   * Goose session delivery. Injected narrow capability (send prompt only, no abort).
+   */
+  gooseDeliver?: (sessionId: string, commandId: string, text: string) => Promise<void>;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -237,6 +243,7 @@ export class SwarmArbiter {
     | undefined;
   private readonly selfMachineId: string | undefined;
   private readonly relay: ((body: RelayMessageBody) => Promise<RelaySendAnswer>) | undefined;
+  private readonly gooseDeliver: ((sessionId: string, commandId: string, text: string) => Promise<void>) | undefined;
   private readonly nowFn: () => number;
   private readonly log: (
     msg: string,
@@ -265,6 +272,7 @@ export class SwarmArbiter {
     this.ownerOf = opts.ownerOf;
     this.selfMachineId = opts.selfMachineId;
     this.relay = opts.relay;
+    this.gooseDeliver = opts.gooseDeliver;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
       opts.log ?? ((m, f) => console.log(`[swarm-arbiter] ${m}`, f ?? ""));
@@ -504,6 +512,51 @@ export class SwarmArbiter {
     throw new RelayRefusedError(formatRelayRefusalReason(target, answer.code, answer.detail), answer.code);
   }
 
+  private renderPrompt(record: SwarmMessageRecord, now: number): string {
+    const inbound = this.inboundFor(record);
+    return renderEnvelope(
+      {
+        v: "1",
+        kind: record.kind,
+        from: record.fromSession,
+        to: record.toSession,
+        channel: record.channel,
+        msgId: record.msgId,
+        replyTo: record.replyTo,
+        priority: record.priority,
+        scheduledFor: record.deliverAt,
+        deliveredLateMs:
+          record.deliverAt !== null
+            ? Math.max(0, now - record.deliverAt)
+            : null,
+        ref: record.ref,
+        fromMachine: inbound?.fromMachine ?? null,
+        heldMs:
+          inbound?.relayedAt != null && now - inbound.relayedAt > 60_000
+            ? now - inbound.relayedAt
+            : null,
+      },
+      record.payload,
+    );
+  }
+
+  private recordHandedOff(msgId: string, target: string, family?: VerifyFamily): void {
+    const handedOff = this.storage.swarm.markHandedOff(msgId, this.nowFn(), family);
+    if (!handedOff) {
+      const current = this.storage.swarm.getByMsgId(msgId);
+      this.log("delivered mid-flight race (cancel lost to delivery)", {
+        msgId,
+        target,
+        currentState: current?.state,
+      });
+      if (current?.state === "cancelled") {
+        this.storage.swarm.markHandedOffAfterCancel(msgId, this.nowFn(), family);
+      }
+    } else {
+      this.log("delivered", { msgId, target });
+    }
+  }
+
   private async drainTargetInner(target: string): Promise<void> {
     while (true) {
       // Shutting down: leave the remaining backlog `queued` for the next
@@ -571,12 +624,32 @@ export class SwarmArbiter {
           }
         }
 
+        const targetRow = this.storage.sessions.get(target);
+        if (targetRow?.backendKind === GOOSE_BACKEND_KIND) {
+          const prompt = this.renderPrompt(next, now);
+          if (!this.gooseDeliver) {
+            throw new TargetUnavailableError(
+              `target ${target} not routable: goose delivery not configured on this daemon`,
+            );
+          }
+          try {
+            await this.gooseDeliver(target, `swarm:${next.msgId}`, prompt);
+          } catch (err) {
+            if (err instanceof TargetUnavailableError) throw err;
+            throw new TargetUnavailableError(
+              `goose delivery failed for target ${target}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          this.recordHandedOff(next.msgId, target, "receipt");
+          continue;
+        }
+
         const client = this.clientForSession(target);
         if (!client) {
           // clientForSession also refuses sessions the opencode pool must not
           // own (goose, or a registration with no backend). Naming those as a
           // serve outage would send the sender hunting for one.
-          const row = this.storage.sessions.get(target);
+          const row = targetRow;
           throw new TargetUnavailableError(
             row && !isOpencodeRoutable(row)
               ? `target ${target} not routable: it has no opencode backend (backend_kind=${row.backendKind ?? "none"})`
@@ -587,31 +660,7 @@ export class SwarmArbiter {
         if (!directory) {
           throw new TargetUnavailableError(`target ${target} not resolvable: directory lookup returned empty`);
         }
-        const inbound = this.inboundFor(next);
-        const prompt = renderEnvelope(
-          {
-            v: "1",
-            kind: next.kind,
-            from: next.fromSession,
-            to: next.toSession,
-            channel: next.channel,
-            msgId: next.msgId,
-            replyTo: next.replyTo,
-            priority: next.priority,
-            scheduledFor: next.deliverAt,
-            deliveredLateMs:
-              next.deliverAt !== null
-                ? Math.max(0, now - next.deliverAt)
-                : null,
-            ref: next.ref,
-            fromMachine: inbound?.fromMachine ?? null,
-            heldMs:
-              inbound?.relayedAt != null && now - inbound.relayedAt > 60_000
-                ? now - inbound.relayedAt
-                : null,
-          },
-          next.payload,
-        );
+        const prompt = this.renderPrompt(next, now);
 
         // WORKING-DIRECTORY PREFLIGHT (pigeon-0ay7).
         //
@@ -690,20 +739,7 @@ export class SwarmArbiter {
         }
 
         await client.sendPrompt(target, directory, prompt);
-        const handedOff = this.storage.swarm.markHandedOff(next.msgId, this.nowFn());
-        if (!handedOff) {
-          const current = this.storage.swarm.getByMsgId(next.msgId);
-          this.log("delivered mid-flight race (cancel lost to delivery)", {
-            msgId: next.msgId,
-            target,
-            currentState: current?.state,
-          });
-          if (current?.state === "cancelled") {
-            this.storage.swarm.markHandedOffAfterCancel(next.msgId, this.nowFn());
-          }
-        } else {
-          this.log("delivered", { msgId: next.msgId, target });
-        }
+        this.recordHandedOff(next.msgId, target);
       } catch (err) {
         // Permanent errors can never succeed on retry (e.g. the payload
         // contains the literal close tag). Fail fast instead of burning

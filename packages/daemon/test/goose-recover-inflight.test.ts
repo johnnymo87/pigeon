@@ -930,5 +930,143 @@ describe("recoverGooseTurns (Commit 2)", () => {
       expect(client.prompts[2]).toBe("poller prompt");
       expect(runner.activeTurn?.commandId).toBe("cmd_poller");
     });
+
+    it("settles swarm message as failed when session is missing or not goose (Check 2)", async () => {
+      const s = newStorage();
+      createSession(s, "ses_missing_swarm", { backendKind: "opencode-plugin-direct" });
+      const settled: Array<{ msgId: string; outcome: unknown }> = [];
+      const client = new FakeClient();
+
+      s.gooseInflight.insert({
+        commandId: "swarm:msg_missing_sess",
+        sessionId: "ses_missing_swarm",
+        backendSessionId: "20261012_ghost",
+        isHonk: true,
+        promptText: "ghost prompt",
+        state: "sent",
+      });
+
+      const registry = new GooseRunnerRegistry({
+        createRunner: () => new GooseSessionRunner({
+          session: { sessionId: "gse_ghost", backendKind: GOOSE_BACKEND_KIND } as SessionRecord,
+          client: client as never,
+          postStop: async () => {},
+          touch: () => {},
+        }),
+      });
+
+      await recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        onSwarmSettled: (msgId, outcome) => settled.push({ msgId, outcome }),
+      });
+
+      expect(settled).toHaveLength(1);
+      expect(settled[0]!.msgId).toBe("msg_missing_sess");
+      expect(settled[0]!.outcome).toEqual(expect.objectContaining({ kind: "unconfirmed" }));
+    });
+
+    it("settles swarm message as not_delivered and uses swarm wording on 24h stale queued check", async () => {
+      const s = newStorage();
+      const settled: Array<{ msgId: string; outcome: unknown }> = [];
+      const stops: Array<Record<string, unknown>> = [];
+      const client = new FakeClient();
+
+      s.sessions.upsert({
+        sessionId: "gse_stale_sess",
+        backendKind: GOOSE_BACKEND_KIND,
+        notify: true,
+      });
+
+      const now = 2_000_000_000;
+      s.gooseInflight.insert({
+        commandId: "swarm:msg_stale_q",
+        sessionId: "gse_stale_sess",
+        backendSessionId: "20261012_stale",
+        isHonk: true,
+        promptText: "stale prompt",
+        createdAt: now - 30 * 60 * 60 * 1000, // 30h old
+        state: "queued",
+      });
+
+      const registry = new GooseRunnerRegistry({
+        createRunner: () => new GooseSessionRunner({
+          session: s.sessions.get("gse_stale_sess")!,
+          client: client as never,
+          postStop: async () => {},
+          touch: () => {},
+        }),
+      });
+
+      await recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now,
+        onSwarmSettled: (msgId, outcome) => settled.push({ msgId, outcome }),
+        postStop: async (body) => { stops.push(body); },
+      });
+
+      expect(settled).toHaveLength(1);
+      expect(settled[0]!.msgId).toBe("msg_stale_q");
+      expect(settled[0]!.outcome).toEqual(expect.objectContaining({ kind: "not_delivered" }));
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.message).toContain("pigeon queued a swarm message (msg msg_stale_q) more than 24h ago");
+      expect(stops[0]!.message).not.toContain("this message");
+    });
+
+    it("settles swarm message as delivered when notification is already in outbox (Check 3)", async () => {
+      const s = newStorage();
+      const settled: Array<{ msgId: string; outcome: unknown }> = [];
+      const client = new FakeClient();
+
+      s.sessions.upsert({
+        sessionId: "gse_outbox_sess",
+        backendKind: GOOSE_BACKEND_KIND,
+        notify: true,
+      });
+
+      const now = 2_000_000_000;
+      s.gooseInflight.insert({
+        commandId: "swarm:msg_outbox_test",
+        sessionId: "gse_outbox_sess",
+        backendSessionId: "20261012_outbox",
+        isHonk: true,
+        promptText: "outbox prompt",
+        createdAt: now,
+        state: "sent",
+      });
+
+      // Pre-seed outbox row with s:sessionId:sanitisedCmd
+      s.outbox.upsert({
+        notificationId: `s:gse_outbox_sess:swarm-msg_outbox_test`,
+        sessionId: "gse_outbox_sess",
+        requestId: "req_test",
+        kind: "stop",
+        payload: JSON.stringify({ message: "done" }),
+        token: "tok_test",
+      });
+
+      const registry = new GooseRunnerRegistry({
+        createRunner: () => new GooseSessionRunner({
+          session: s.sessions.get("gse_outbox_sess")!,
+          client: client as never,
+          postStop: async () => {},
+          touch: () => {},
+        }),
+      });
+
+      await recoverGooseTurns({
+        storage: s,
+        gooseRunners: registry,
+        now,
+        onSwarmSettled: (msgId, outcome) => settled.push({ msgId, outcome }),
+      });
+
+      expect(settled).toHaveLength(1);
+      expect(settled[0]!.msgId).toBe("msg_outbox_test");
+      expect(settled[0]!.outcome).toEqual({ kind: "delivered" });
+      expect(s.gooseInflight.get("swarm:msg_outbox_test")).toBeUndefined();
+    });
   });
 });
