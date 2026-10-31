@@ -227,7 +227,7 @@ systemd-run --user --unit="pigeon-pool-restart-$RANDOM" --on-active=60 --collect
    for example with a second short `swarm_launch` that reports its own behaviour.
 3. **Never a bare `npm install`.** Use the script, or the manual fallback with the daemon's node
    first on PATH, for the reason in "Why the node matters" above.
-4. **macOS service changes still need Jonathan.** `darwin-rebuild switch` needs a sudo
+4. **macOS service changes still need Jonathan.** `darwin-switch` needs a sudo
    password, which an unattended session cannot supply. A code-only macbook deploy (pull,
    install, `launchctl` restart) works remotely.
 
@@ -239,7 +239,7 @@ If service definitions changed (not just application code), rebuild instead of r
 |---------|---------|
 | **devbox** | `sudo nixos-rebuild switch --flake .#devbox` |
 | **cloudbox** | `sudo nixos-rebuild switch --flake .#cloudbox` |
-| **macbook** | `darwin-rebuild switch --flake .#Y0FMQX93RR-2` |
+| **macbook** | `home-switch` (user agents, including `pigeon-daemon`), then `darwin-switch` (system; needs sudo). Both are workstation helpers; `darwin-rebuild` is no longer run directly |
 | **chromebook** | `home-manager switch --flake .#livia` |
 
 Service definitions live in `~/projects/workstation`.

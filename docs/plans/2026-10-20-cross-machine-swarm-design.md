@@ -533,7 +533,9 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
     because a session idle that long rarely receives relays. Every cross-machine takeover is
     logged by the worker.
 - A sleeping Mac answers `target_offline`: ordinary sends fail when their attempts run out,
-  scheduled sends retry until they expire.
+  scheduled sends retry until they expire. *Superseded by `pigeon-k0qn.22`
+  (`2026-10-30-relay-hold-design.md`): the worker now holds messages for a machine silent up to
+  7 days, for up to 24h.*
 - Fixed pull-lane ids (`ses_lane_maven_renovate`, `ses_stallwatch_*`) stay with the machine that
   registered them first. A second machine gets `409 owned_by_other_machine` (and its daemon raises
   an alert) until the first unregisters or its row has been idle 7 days.
