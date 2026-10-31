@@ -9,6 +9,7 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import worker from "../src/index";
 import { clearCredentialCache, sha256Hex } from "../src/credentials";
 import {
+  RELAY_GONE_MS,
   RELAY_HANDOUT_LIMIT,
   RELAY_LEASE_MS,
   RELAY_MAX_LEASES,
@@ -16,6 +17,7 @@ import {
   RELAY_QUEUE_CAP,
   RELAY_RETENTION_MS,
   SWARM_RELAY_HEADER,
+  handleRelay,
   parseRelayHeader,
   runRelayExpiry,
 } from "../src/relay";
@@ -92,6 +94,15 @@ function relayBody(over: Record<string, unknown> = {}): Record<string, unknown> 
 
 const relay = (key: string, over: Record<string, unknown> = {}, envOverride?: Partial<Env>) =>
   call("/swarm/relay", key, { method: "POST", body: relayBody(over), envOverride });
+
+const relayAt = (key: string, now: number, over: Record<string, unknown> = {}, envOverride?: Partial<Env>) => {
+  const request = new Request("https://worker/swarm/relay", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(relayBody(over)),
+  });
+  return handleRelay(env.DB, { ...env, ...RETIRED, ...(envOverride ?? {}) } as Env, request, now);
+};
 
 async function row(fromMachine: string, msgId: string) {
   return env.DB.prepare("SELECT * FROM swarm_relay WHERE from_machine = ? AND msg_id = ?")
@@ -244,13 +255,103 @@ describe("POST /swarm/relay", () => {
     expect(await res.json()).toMatchObject({ error: "not_accepted" });
   });
 
-  it("answers 503 target_offline when the owner has not polled within the online window", async () => {
+  it("holds messages for a sleeping machine: target last polled 10 min ago -> 202 and a queued row", async () => {
     await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
-      .bind(Date.now() - 61_000, B)
+      .bind(Date.now() - 600_000, B)
       .run();
     const res = await relay(KEY_A);
-    expect(res.status).toBe(503);
-    expect(await res.json()).toMatchObject({ error: "target_offline" });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ accepted: true, to_machine: B });
+    const r = await row(A, "msg_rly_0001");
+    expect(r).toMatchObject({ status: "queued", to_machine: B });
+  });
+
+  it("refuses with 503 target_offline only past RELAY_GONE_MS (7 days), and names how long", async () => {
+    const now = 1_800_000_000_000;
+    // Exactly at the boundary: accepted
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(now - RELAY_GONE_MS, B)
+      .run();
+    const resBoundary = await relayAt(KEY_A, now, { msg_id: "msg_boundary" });
+    expect(resBoundary.status).toBe(202);
+
+    // 1 ms past boundary: refused 503 target_offline, detail says 7 days
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(now - (RELAY_GONE_MS + 1), B)
+      .run();
+    const resPast = await relayAt(KEY_A, now, { msg_id: "msg_past" });
+    expect(resPast.status).toBe(503);
+    expect(await resPast.json()).toEqual({
+      error: "target_offline",
+      detail: `${B} has not polled for 7 days`,
+    });
+
+    // 9 days silent: detail says 9 days
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(now - 9 * 24 * 60 * 60 * 1000, B)
+      .run();
+    const res9d = await relayAt(KEY_A, now, { msg_id: "msg_9d" });
+    expect(res9d.status).toBe(503);
+    expect(await res9d.json()).toEqual({
+      error: "target_offline",
+      detail: `${B} has not polled for 9 days`,
+    });
+
+    // No machines row (lastPollAt is null): detail says is not polling
+    await env.DB.prepare("DELETE FROM machines WHERE machine_id = ?")
+      .bind(B)
+      .run();
+    const resNull = await relayAt(KEY_A, now, { msg_id: "msg_null" });
+    expect(resNull.status).toBe(503);
+    expect(await resNull.json()).toEqual({
+      error: "target_offline",
+      detail: `${B} is not polling`,
+    });
+  });
+
+  it("checks check order: machine silent > 7 days still gets not_retired or not_accepted first", async () => {
+    const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(eightDaysAgo, B)
+      .run();
+
+    // 1. Not retired check comes first
+    const resNotRetired = await relay(KEY_A, { msg_id: "msg_order_1" }, { SHARED_KEY_REFUSED_MACHINES: `${A}` });
+    expect(resNotRetired.status).toBe(403);
+    expect(await resNotRetired.json()).toMatchObject({ error: "receiver_not_retired" });
+
+    // 2. Not accepted check comes before target_offline
+    // B accepts only C, not A
+    await env.DB.prepare("UPDATE machine_relay_accept SET accept_csv = ? WHERE machine_id = ?")
+      .bind(C, B)
+      .run();
+    const resNotAccepted = await relay(KEY_A, { msg_id: "msg_order_2" });
+    expect(resNotAccepted.status).toBe(403);
+    expect(await resNotAccepted.json()).toMatchObject({ error: "not_accepted" });
+  });
+
+  it("queue_full applies to a sleeping target", async () => {
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(Date.now() - 600_000, B)
+      .run();
+    for (let i = 0; i < RELAY_QUEUE_CAP; i++) {
+      expect((await relay(KEY_A, { msg_id: `msg_sleep_cap_${i}` })).status).toBe(202);
+    }
+    const resOver = await relay(KEY_A, { msg_id: "msg_sleep_cap_over" });
+    expect(resOver.status).toBe(429);
+    expect(await resOver.json()).toMatchObject({ error: "queue_full" });
+  });
+
+  it("GET /sessions/remote still reports offline for a sleeping machine", async () => {
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(Date.now() - 600_000, B)
+      .run();
+    const res = await call("/sessions/remote", KEY_A);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { machines: Array<{ machine_id: string; relay: string }> };
+    const mB = body.machines.find((m) => m.machine_id === B);
+    expect(mB).toBeDefined();
+    expect(mB!.relay).toBe("offline");
   });
 
   it("answers 429 once the owner has the cap of messages waiting", async () => {
@@ -312,9 +413,35 @@ describe("hand-out on GET /machines/:id/next", () => {
         deliver_at: 123,
         ref: "bd:x",
         from_label: "sender label",
+        relayed_at: expect.any(Number),
       }),
     ]);
     expect(await row(A, "msg_rly_0001")).toMatchObject({ status: "leased", lease_count: 1 });
+  });
+
+  it("an item accepted while the target was offline is handed out on its next poll carrying relayed_at", async () => {
+    await env.DB.prepare("UPDATE machines SET last_poll_at = ? WHERE machine_id = ?")
+      .bind(Date.now() - 600_000, B)
+      .run();
+    const resRelay = await relay(KEY_A, { msg_id: "msg_held_01" });
+    expect(resRelay.status).toBe(202);
+
+    const r = await row(A, "msg_held_01");
+    expect(r).not.toBeNull();
+    const acceptTime = Number(r!.created_at);
+
+    // Target wakes up and polls
+    const resPoll = await poll(KEY_B, B, `accept=${A}`);
+    expect(resPoll.status).toBe(200);
+    const body = (await resPoll.json()) as Record<string, unknown>;
+    expect(body.swarm).toEqual([
+      expect.objectContaining({
+        item: "message",
+        from_machine: A,
+        msg_id: "msg_held_01",
+        relayed_at: acceptTime,
+      }),
+    ]);
   });
 
   it("attaches swarm to a command response without changing the command", async () => {

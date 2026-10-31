@@ -25,6 +25,11 @@ export const SWARM_RELAY_HEADER = "X-Pigeon-Swarm-Relay";
 export const RELAY_LEASE_MS = 60_000;
 /** An owner whose last poll is older than this is offline (503, retried by the sender). */
 export const RELAY_ONLINE_MS = 60_000;
+/**
+ * A machine silent this long is treated as decommissioned or renamed (its accept row
+ * and sessions survive until the 14-day sweep), not asleep.
+ */
+export const RELAY_GONE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Message items queued or leased for one machine before the relay answers 429. */
 export const RELAY_QUEUE_CAP = 50;
 /** Items per poll response. */
@@ -198,10 +203,10 @@ export type RelayReachability = "available" | "not_retired" | "not_accepted" | "
 
 /**
  * Whether `toMachine` would take a relay from `fromMachine` right now, short of the queue cap.
- * The one implementation of these checks, in their load-bearing order: `POST /swarm/relay`
- * answers from it, and `GET /sessions/remote` (pigeon-k0qn.9) reports it, so discovery cannot
- * drift from what a send would be told. Throws "no such table" when the relay schema is missing;
- * each caller decides what that means.
+ * The descriptive answer used by `GET /sessions/remote` and remote launch's return-path check;
+ * `handleRelay` reads `offline` as "hold" unless silent > `RELAY_GONE_MS`, so `offline` in
+ * discovery means "held". Throws "no such table" when the relay schema is missing; each caller
+ * decides what that means.
  */
 export async function relayReachability(
   db: D1Database,
@@ -295,7 +300,17 @@ export async function handleRelay(db: D1Database, env: Env, request: Request, no
       );
     }
     if (reach.relay === "offline") {
-      return Response.json({ error: "target_offline", detail: `${toMachine} is not polling` }, { status: 503 });
+      if (reach.lastPollAt === null) {
+        return Response.json({ error: "target_offline", detail: `${toMachine} is not polling` }, { status: 503 });
+      }
+      const silentMs = now - reach.lastPollAt;
+      if (silentMs > RELAY_GONE_MS) {
+        const days = Math.floor(silentMs / (24 * 60 * 60 * 1000));
+        return Response.json(
+          { error: "target_offline", detail: `${toMachine} has not polled for ${days} days` },
+          { status: 503 },
+        );
+      }
     }
     const queued = await db
       .prepare(
@@ -507,7 +522,7 @@ export function parseRelayHeader(value: string | null): { accept: string[]; laun
 
 /** One item in the `swarm` array of a poll response. */
 export type HandOutItem =
-  | ({ item: "message"; from_machine: string } & StoredMessage)
+  | ({ item: "message"; from_machine: string; relayed_at: number } & StoredMessage)
   | ({ item: "failure"; from_machine: string; msg_id: string } & FailureBody);
 
 /**
@@ -576,7 +591,7 @@ export async function handOutRelayItems(
         const body = JSON.parse(r.body_json) as StoredMessage | FailureBody;
         return r.item_kind === "failure"
           ? ({ item: "failure", from_machine: r.from_machine, msg_id: r.msg_id, ...(body as FailureBody) } as HandOutItem)
-          : ({ item: "message", from_machine: r.from_machine, ...(body as StoredMessage) } as HandOutItem);
+          : ({ item: "message", from_machine: r.from_machine, relayed_at: r.created_at, ...(body as StoredMessage) } as HandOutItem);
       });
   } catch (err) {
     if (!isMissingTable(err)) {
