@@ -591,7 +591,7 @@ export async function handOutRelayItems(
         const body = JSON.parse(r.body_json) as StoredMessage | FailureBody;
         return r.item_kind === "failure"
           ? ({ item: "failure", from_machine: r.from_machine, msg_id: r.msg_id, ...(body as FailureBody) } as HandOutItem)
-          : ({ item: "message", from_machine: r.from_machine, relayed_at: r.created_at, ...(body as StoredMessage) } as HandOutItem);
+          : ({ item: "message", from_machine: r.from_machine, ...(body as StoredMessage), relayed_at: r.created_at } as HandOutItem);
       });
   } catch (err) {
     if (!isMissingTable(err)) {

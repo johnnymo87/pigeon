@@ -160,7 +160,7 @@ function explainRelay(
     case "not_retired":
       return `not_retired (${machine} still accepts the shared worker key, so it cannot receive relays)`
     case "offline": {
-      if (lastPollAt === null) {
+      if (lastPollAt == null || !Number.isFinite(lastPollAt)) {
         return `offline (${machine} is not polling the worker; asleep or down)`
       }
       const ageMs = now - lastPollAt
