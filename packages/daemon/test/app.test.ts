@@ -231,6 +231,23 @@ describe("createApp", () => {
     expect(storage?.sessions.get("ses_placeholder_2")?.title).toBe("Real title");
   });
 
+  it("treats goose's placeholder title as absent", async () => {
+    const app = newApp();
+    const res = await app(new Request("http://localhost/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "ses_goose_placeholder",
+        notify: true,
+        cwd: "/home/dev/projects/pigeon",
+        label: "pigeon",
+        title: " New Chat ",
+      }),
+    }));
+    expect(res.status).toBe(200);
+    expect(storage?.sessions.get("ses_goose_placeholder")?.title ?? null).toBeNull();
+  });
+
   it("a title that merely mentions a placeholder-like string is kept (pigeon-353p)", async () => {
     const app = newApp();
     const res = await app(new Request("http://localhost/session-start", {

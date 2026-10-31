@@ -2803,3 +2803,88 @@ describe("GooseSessionRunner liveness probing", () => {
   });
 });
 
+
+/**
+ * goose names a session itself (session_naming.rs) and announces it with a
+ * `session_info_update` carrying `title`. That frame is the only way the name
+ * reaches pigeon, and `/stop`'s `title` is how pigeon stores it and upgrades the
+ * topic from its directory name -- the same route opencode titles take.
+ */
+describe("GooseSessionRunner session title", () => {
+  it("attaches the title goose announced to the turn's /stop", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!.title).toBe("Fix flaky login test");
+  });
+
+  it("remembers a title announced while no turn is running", async () => {
+    const { runner, client, stops } = makeRunner();
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    await runner.deliver("c1", "hello");
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!.title).toBe("Fix flaky login test");
+  });
+
+  it("keeps the latest title when goose renames the session", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Login test" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!.title).toBe("Fix flaky login test");
+  });
+
+  it("never reports goose's placeholder name, because topic names are write-once", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "New Chat" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "   " });
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!).not.toHaveProperty("title");
+  });
+
+  it("ignores session_info_update frames that carry only the run id", async () => {
+    const { runner, client, stops } = makeRunner();
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    await runner.deliver("c1", "hello");
+    runner.onUpdate({ sessionUpdate: "session_info_update", _meta: { goose: { activeRunId: null } } });
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!.title).toBe("Fix flaky login test");
+  });
+
+  /**
+   * goose names the session in parallel with the reply, so on a short turn the
+   * name can land after the turn's /stop. Persisting it on arrival keeps it
+   * from living only in this runner's memory until a /stop that may never come.
+   */
+  it("persists the title the moment goose announces it", () => {
+    const titles: Array<[string, string]> = [];
+    const { runner } = makeRunner({ setTitle: (id: string, t: string) => titles.push([id, t]) });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "Fix flaky login test" });
+    runner.onUpdate({ sessionUpdate: "session_info_update", title: "New Chat" });
+
+    expect(titles).toEqual([["20260918_1", "Fix flaky login test"]]);
+  });
+
+  it("sends no title when goose has not named the session", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    client.finishTurn("end_turn");
+    await runner.settled();
+
+    expect(stops[0]!).not.toHaveProperty("title");
+  });
+});

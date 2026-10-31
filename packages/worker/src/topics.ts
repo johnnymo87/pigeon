@@ -31,7 +31,8 @@ export interface TopicRow {
  * keep minting placeholder-named topics indefinitely. Fail-open by construction — if opencode
  * changes the format this stops matching and we are back to today's behaviour, never worse.
  */
-const PLACEHOLDER_TITLE_RE = /^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?$/;
+// goose's equivalent placeholder is the literal `New Chat` (acp/server/new_session.rs).
+const PLACEHOLDER_TITLE_RE = /^(?:New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?|New Chat)$/;
 
 export function isPlaceholderTitle(title: string | null | undefined): boolean {
   if (typeof title !== "string") return false;

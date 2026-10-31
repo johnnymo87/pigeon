@@ -297,6 +297,7 @@ const gooseRunners = config.gooseAcpUrl
             }
           },
           touch: (sessionId) => storage.sessions.touch(sessionId, Date.now()),
+          setTitle: (sessionId, title) => storage.sessions.setTitle(sessionId, title, Date.now()),
           log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
         }),
     })

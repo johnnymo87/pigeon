@@ -474,7 +474,7 @@ export class SwarmArbiter {
       expires_at: row.expiresAt,
       ref: row.ref,
       from_label: sender
-        ? displayName({ title: sender.title, label: sender.label, sessionId: row.fromSession })
+        ? displayName({ title: sender.title, label: sender.label, boundTopicKey: sender.boundTopicKey, sessionId: row.fromSession })
         : null,
     });
     if (answer.kind === "accepted") {

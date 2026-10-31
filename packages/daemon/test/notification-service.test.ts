@@ -34,6 +34,18 @@ describe("displayName", () => {
   it("handles session ids shorter than 8 characters", () => {
     expect(displayName({ title: null, label: null, sessionId: "ses_123" })).toBe("ses_123");
   });
+  it("prefers the label of a session bound to a named topic", () => {
+    expect(displayName({
+      title: "stallwatch-honk-1792619184012",
+      label: "📋 honk",
+      boundTopicKey: "honk",
+      sessionId: "gse_7f5885b4",
+    })).toBe("📋 honk");
+  });
+  it("falls back to the title of a bound session that has no label", () => {
+    expect(displayName({ title: "Fix auth", label: " ", boundTopicKey: "honk", sessionId: "gse_7f5885b4" }))
+      .toBe("Fix auth");
+  });
 });
 
 describe("formatTelegramNotification", () => {
