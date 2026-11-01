@@ -5,6 +5,7 @@ import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
+import { hasButtons, resolveMentionKeyboard } from "./mention-links";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -450,14 +451,34 @@ export async function handleSendNotification(
 
     const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
 
+    // Buttons to the topics of sessions the text mentions (pigeon-ylx3), unless the caller sent
+    // a keyboard of its own (a question's answer buttons). Decoration: if Telegram rejects the
+    // keyboard with a 400 (nothing was posted), the message is resent once without it and the
+    // rest of this handler carries on as if it had never been added.
+    let linkMarkup = hasButtons(replyMarkup)
+      ? undefined
+      : await resolveMentionKeyboard(db, text, sessionId);
+    const sendText = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+      const result = await tg.sendMessage({
+        chatId,
+        messageThreadId: threadId,
+        text,
+        entities: entities as unknown[] | undefined,
+        replyMarkup: linkMarkup ?? replyMarkup,
+      });
+      if (linkMarkup && !result.ok && result.kind === "error" && result.errorCode === 400) {
+        console.warn("[worker] mention link buttons rejected, resending without them", {
+          sessionId,
+          details: getTelegramErrorDetails(result),
+        });
+        linkMarkup = undefined;
+        return sendText(threadId);
+      }
+      return result;
+    };
+
     // Call Telegram API
-    let telegramResult = await tg.sendMessage({
-      chatId,
-      messageThreadId,
-      text,
-      entities: entities as unknown[] | undefined,
-      replyMarkup,
-    });
+    let telegramResult = await sendText(messageThreadId);
 
     // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band in Telegram)
     if (
@@ -541,13 +562,7 @@ export async function handleSendNotification(
         retryTopicRes.created === true;
 
       // Retry sendMessage exactly once
-      telegramResult = await tg.sendMessage({
-        chatId,
-        messageThreadId,
-        text,
-        entities: entities as unknown[] | undefined,
-        replyMarkup,
-      });
+      telegramResult = await sendText(messageThreadId);
     }
 
     // PERMANENT topic failure -> fall back to General.
@@ -574,13 +589,7 @@ export async function handleSendNotification(
       });
       relocationReason = "send_failed";
       messageThreadId = undefined;
-      telegramResult = await tg.sendMessage({
-        chatId,
-        messageThreadId,
-        text,
-        entities: entities as unknown[] | undefined,
-        replyMarkup,
-      });
+      telegramResult = await sendText(messageThreadId);
     }
 
     // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
