@@ -94,7 +94,7 @@ describe("goose registration mints the derived id", () => {
   });
 
   /** The bug itself: delete the row, register again, and the address and the mail come back. */
-  it("a deleted goose row re-registers under the same id and its banked mail drains again", async () => {
+  it("a deleted goose row re-registers under the same id: pushed mail keeps that address, and old banked mail drains again", async () => {
     const app = newApp("cloudbox");
     const first = (await (await post(app, "/goose/swarm-mailbox", {
       session_id: "20261028_1",
@@ -102,8 +102,15 @@ describe("goose registration mints the derived id", () => {
     })).json()) as Record<string, string>;
     const gse = first.session_id!;
 
+    // Pushed (the row has an endpoint): queued for the arbiter, addressed to gse.
     const send = await post(app, "/swarm/send", { from: "ses_sender", to: gse, payload: "hello" });
     expect(send.status).toBe(202);
+    const { msg_id: pushedId } = (await send.json()) as { msg_id: string };
+    // Mail banked before push existed must still drain after re-registration.
+    storage!.pullInbox.bank(
+      { msgId: "msg_old_banked", sessionId: gse, source: "swarm", payload: "hello", senderId: "ses_sender", kind: "chat", replyTo: null },
+      1_000,
+    );
 
     // Reaped, or killed.
     storage!.sessions.delete(gse);
@@ -116,6 +123,7 @@ describe("goose registration mints the derived id", () => {
     expect(again.session_id).toBe(gse);
     expect(again.created).toBe(true);
 
+    expect(storage!.swarm.getByMsgId(pushedId)?.toSession).toBe(gse);
     const claimed = storage!.pullInbox.claim(gse, 2_000);
     expect(claimed.map((r) => r.payload)).toEqual(["hello"]);
   });

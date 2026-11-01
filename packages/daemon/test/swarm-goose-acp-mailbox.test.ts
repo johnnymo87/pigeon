@@ -622,7 +622,7 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     expect(touched.lastSeen).toBe(5_000);
   });
 
-  it("bank into a notify: false goose row writes no w: outbox row", async () => {
+  it("a message to a notify: false goose row is pushed and writes no w: outbox row", async () => {
     const { app, storage: s } = newApp(1_000);
     const mailboxRes = await (await app(
       new Request("http://localhost/goose/swarm-mailbox", {
@@ -649,7 +649,8 @@ describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
     );
     expect(sendRes.status).toBe(202);
     const body = (await sendRes.json()) as { accepted: boolean; msg_id: string; banked?: boolean };
-    expect(body.banked).toBe(true);
+    expect(body.banked).toBeUndefined();
+    expect(s.swarm.getByMsgId(body.msg_id)?.toSession).toBe(mailboxRes.session_id);
 
     // No w:<msg_id> in outbox
     expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).toBeNull();
@@ -717,22 +718,21 @@ describe("Task A4: goose-acp may drain its mailbox", () => {
       }),
     )).json()) as { session_id: string };
 
-    // Bank a swarm message into this goose mailbox
-    const sendRes = await app(
-      new Request("http://localhost/swarm/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          from: "ses_sender",
-          to: mailboxRes.session_id,
-          kind: "chat",
-          payload: "task for goose",
-        }),
-      }),
+    // Swarm mail to a goose session with an endpoint is now pushed, so seed the
+    // mailbox directly: drain/ack must still serve rows banked before that change.
+    const sendBody = { msg_id: "msg_drain_seed" };
+    s.pullInbox.bank(
+      {
+        msgId: sendBody.msg_id,
+        sessionId: mailboxRes.session_id,
+        source: "swarm",
+        payload: "task for goose",
+        senderId: "ses_sender",
+        kind: "chat",
+        replyTo: null,
+      },
+      1_000,
     );
-    expect(sendRes.status).toBe(202);
-    const sendBody = (await sendRes.json()) as { msg_id: string; banked?: boolean };
-    expect(sendBody.banked).toBe(true);
 
     // Drain the mailbox via POST /pull/drain
     const drainRes = await app(

@@ -6,7 +6,7 @@ export function msgIdFromCommandId(commandId: string): string {
 
 export function recoveredBusyNotice(origin: GooseTurnOrigin, msgId: string): string {
   if (origin === "swarm") {
-    return `a swarm message to this coordinator was not delivered (msg ${msgId}); goose was busy and nothing was resent.`;
+    return `a swarm message to this goose session was not delivered (msg ${msgId}); goose was busy and nothing was resent.`;
   }
   return "your message was not delivered (goose was busy); nothing was resent — send it again.";
 }

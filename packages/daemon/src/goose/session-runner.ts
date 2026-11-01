@@ -266,7 +266,7 @@ const BUSY_NOT_DELIVERED_TEXT =
 function busyNotDeliveredText(commandId: string, origin?: GooseTurnOrigin): string {
   if (resolveTurnOrigin(commandId, origin) === "swarm") {
     const msgId = commandId.startsWith("swarm:") ? commandId.slice(6) : commandId;
-    return `a swarm message to this coordinator was not delivered (msg ${msgId}); the sender was told it was not received`;
+    return `a swarm message to this goose session was not delivered (msg ${msgId}); the sender was told it was not received`;
   }
   return BUSY_NOT_DELIVERED_TEXT;
 }
@@ -426,8 +426,8 @@ export class GooseSessionRunner {
         const msgId = item.commandId.slice(6);
         this.opts.onSwarmSettled?.(msgId, {
           kind: "not_delivered",
-          reason: "the coordinator session was retired before it read the message; resend to its successor",
-          customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${this.sessionId} was NOT received. Reason: the coordinator session was retired before it read the message; resend to its successor.`,
+          reason: "the goose session was retired before it read the message (if it was a coordinator, resend to its successor)",
+          customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${this.sessionId} was NOT received. Reason: the goose session was retired before it read the message (if it was a coordinator, resend to its successor).`,
         });
       }
     }
@@ -1354,7 +1354,7 @@ export class GooseSessionRunner {
         });
         const msg =
           turn.origin === "swarm"
-            ? `a swarm message to this coordinator was not confirmed (msg ${msgIdFromCommandId(turn.commandId)}); honkd rejected the resend as busy`
+            ? `a swarm message to this goose session was not confirmed (msg ${msgIdFromCommandId(turn.commandId)}); honkd rejected the resend as busy`
             : BUSY_NOT_DELIVERED_TEXT;
         await this.finishTurn(
           turn,
@@ -1803,7 +1803,7 @@ export class GooseSessionRunner {
       if (err !== undefined) {
         if (
           err instanceof Error &&
-          err.message.includes("a swarm message to this coordinator was not delivered")
+          err.message.includes("a swarm message to this goose session was not delivered")
         ) {
           this.settleSwarmTurn(turn, { kind: "not_delivered", reason: err.message });
         } else {
