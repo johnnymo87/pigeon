@@ -2979,7 +2979,7 @@ describe("GooseSessionRunner session title", () => {
       const errorStops = stops.filter((s) => s.event === "Error");
       expect(errorStops).toHaveLength(1);
       expect(errorStops[0]!.message).toContain(
-        "a swarm message to this coordinator was not delivered (msg msg_rec_busy_1); goose was busy and nothing was resent",
+        "a swarm message to this goose session was not delivered (msg msg_rec_busy_1); goose was busy and nothing was resent",
       );
       expect(errorStops[0]!.message).not.toContain("send it again");
 
@@ -3086,7 +3086,7 @@ describe("GooseSessionRunner session title", () => {
       const errorStops = stops.filter((s) => s.event === "Error");
       expect(errorStops).toHaveLength(1);
       expect(errorStops[0]!.message).toContain(
-        "a swarm message to this coordinator was not confirmed (msg msg_busy_fail); honkd rejected the resend as busy",
+        "a swarm message to this goose session was not confirmed (msg msg_busy_fail); honkd rejected the resend as busy",
       );
       expect(errorStops[0]!.message).not.toContain("the sender was told it was not received");
     });

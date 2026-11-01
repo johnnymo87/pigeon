@@ -9,7 +9,7 @@ export type SwarmSettleOutcome =
 export type SwarmSettleCallback = (msgId: string, outcome: SwarmSettleOutcome) => void;
 
 /**
- * Settles a swarm message pushed to a goose coordinator.
+ * Settles a swarm message pushed to a goose session.
  *
  * Exactly one outcome per message:
  * - delivered: marks the swarm row verified (refuses already-failed rows) so cleanupOlderThan can reap it.

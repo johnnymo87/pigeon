@@ -94,7 +94,7 @@ describe("goose registration mints the derived id", () => {
   });
 
   /** The bug itself: delete the row, register again, and the address and the mail come back. */
-  it("a deleted goose row re-registers under the same id, so mail addressed to it still lands", async () => {
+  it("a deleted goose row re-registers under the same id: pushed mail keeps that address, and old banked mail drains again", async () => {
     const app = newApp("cloudbox");
     const first = (await (await post(app, "/goose/swarm-mailbox", {
       session_id: "20261028_1",

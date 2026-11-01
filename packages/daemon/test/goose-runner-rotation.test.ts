@@ -116,7 +116,7 @@ describe("goose runner rotation and session deletion cleanup", () => {
     expect(failureRows).toHaveLength(1);
     expect(failureRows[0]!.reply_to).toBe("msg_queued_1");
     expect(failureRows[0]!.payload).toContain(
-      "the coordinator session was retired before it read the message; resend to its successor",
+      "the goose session was retired before it read the message (if it was a coordinator, resend to its successor)",
     );
   });
 

@@ -28,8 +28,8 @@ export function dropGooseRunnerWithSwarmNotify(
             msgId,
             {
               kind: "not_delivered",
-              reason: "the coordinator session was retired before it read the message; resend to its successor",
-              customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${sessionId} was NOT received. Reason: the coordinator session was retired before it read the message; resend to its successor.`,
+              reason: "the goose session was retired before it read the message (if it was a coordinator, resend to its successor)",
+              customPayload: `DELIVERY FAILED: your swarm message ${msgId} to ${sessionId} was NOT received. Reason: the goose session was retired before it read the message (if it was a coordinator, resend to its successor).`,
             },
             now,
           );
