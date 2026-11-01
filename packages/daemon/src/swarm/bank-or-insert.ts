@@ -68,11 +68,14 @@ export function bankOrInsertSwarmMessage(
     };
   }
 
+  // Any goose session pigeon can reach is pushed, like an opencode session: the
+  // coordinators (notify on) and honk chat sessions known only from a swarm-tool
+  // call (notify off, so their turns are not mirrored to Telegram). Only a goose
+  // row with no endpoint falls back to the pull mailbox.
   const isGoosePush = Boolean(
     targetSession &&
       targetSession.backendKind === GOOSE_BACKEND_KIND &&
-      targetSession.backendEndpoint &&
-      targetSession.notify,
+      targetSession.backendEndpoint,
   );
 
   if (
