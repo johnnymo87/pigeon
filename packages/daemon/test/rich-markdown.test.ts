@@ -23,6 +23,15 @@ describe("hasPipeTable", () => {
     expect(hasPipeTable("x\n\na | b\n:-- | --:\n1 | 2")).toBe(true);
   });
 
+  it("detects a one-column table, which needs both outer pipes", () => {
+    expect(hasPipeTable("| a |\n|---|\n| 1 |")).toBe(true);
+    expect(hasPipeTable("a |\n---\n1")).toBe(false);
+  });
+
+  it("requires the header to have as many cells as the delimiter row", () => {
+    expect(hasPipeTable("a | b\n|---|\nc")).toBe(false);
+  });
+
   it("ignores a lone pipe line", () => {
     expect(hasPipeTable("run `a | b` then\nsomething else")).toBe(false);
   });
@@ -60,7 +69,8 @@ describe("sanitizeBodyMarkdown", () => {
   });
 
   it("escapes < so generics are not read as HTML", () => {
-    expect(sanitizeBodyMarkdown("returns Promise<void>")).toBe("returns Promise\\<void>");
+    // Probed against Telegram: "\\<void>" renders "\\" and DROPS "<void>"; "&lt;" renders "<".
+    expect(sanitizeBodyMarkdown("returns Promise<void>")).toBe("returns Promise&lt;void>");
   });
 
   it("escapes == (marked text) and || (spoiler) in prose", () => {
@@ -137,8 +147,23 @@ describe("sanitizeBodyMarkdown", () => {
     expect(sanitizeBodyMarkdown("Summary\n---\nmore")).toBe("Summary\n\n---\n\nmore");
   });
 
-  it("escapes & so entities stay literal, as plain text showed them", () => {
-    expect(sanitizeBodyMarkdown("a &amp; b &rarr; c")).toBe("a \\&amp; b \\&rarr; c");
+  it("encodes & so entities stay literal, as plain text showed them", () => {
+    // Probed against Telegram: "\\&" keeps its backslash; "&amp;" renders "&".
+    expect(sanitizeBodyMarkdown("a &amp; b &rarr; c &#60; d & e")).toBe("a &amp;amp; b &amp;rarr; c &amp;#60; d & e");
+  });
+
+  it("leaves a lone & alone, so query strings in links keep working", () => {
+    expect(sanitizeBodyMarkdown("see https://x/?a=1&b=2 and [q](https://x/?a=1&b=2), R&D")).toBe(
+      "see https://x/?a=1&b=2 and [q](https://x/?a=1&b=2), R&D",
+    );
+  });
+
+  it("does not let an agent's own backslash swallow < or &", () => {
+    expect(sanitizeBodyMarkdown("a \\<b> \\&lt;")).toBe("a \\&lt;b> \\&amp;lt;");
+  });
+
+  it("encodes < and & inside table cells too", () => {
+    expect(sanitizeBodyMarkdown("| a |\n|---|\n| Promise<T> &amp; x |")).toBe("| a |\n|---|\n| Promise&lt;T> &amp;amp; x |");
   });
 
   it("escapes inline images so Telegram does not fetch them as media", () => {
@@ -148,8 +173,8 @@ describe("sanitizeBodyMarkdown", () => {
 
 describe("tgMessageToMarkdown", () => {
   it("escapes markdown-significant characters in plain text", () => {
-    expect(tgMessageToMarkdown(plain("✅ fix_the *thing* [x] $5 a|b <c>"))).toBe(
-      "✅ fix\\_the \\*thing\\* \\[x\\] \\$5 a\\|b \\<c\\>",
+    expect(tgMessageToMarkdown(plain("✅ fix_the *thing* [x] $5 a|b <c> R&D"))).toBe(
+      "✅ fix\\_the \\*thing\\* \\[x\\] \\$5 a\\|b &lt;c\\> R&D",
     );
   });
 
