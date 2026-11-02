@@ -23,6 +23,13 @@ interface SendNotificationBody {
   rich?: { markdown?: unknown };
 }
 
+/**
+ * Suffix on `messages.notification_id` for a notification sent as one rich message. Safe
+ * because nothing looks a stop row up by its exact id: only questions are edited
+ * (`/notifications/edit`) or parsed (`q:` ids), and questions are never sent rich.
+ */
+const RICH_ID_SUFFIX = "#rich";
+
 /** Telegram's limit on a rich message's text, in characters (code points). */
 export const RICH_MAX_CHARS = 32768;
 
@@ -363,16 +370,25 @@ export async function handleSendNotification(
 
     // Idempotency: if notificationId was provided and we already sent this notification,
     // return the existing message data without calling Telegram again.
+    //
+    // A rich send is recorded under `<id>#rich` (pigeon-p909), so a retry of a request whose
+    // response was lost can say it was rich, and the daemon then skips the remaining plain
+    // chunks instead of posting them under a message that already shows everything.
     if (notificationId) {
       const existing = await withD1(
         "send.idempotencyLookup",
         db
-          .prepare("SELECT * FROM messages WHERE notification_id = ?")
-          .bind(notificationId)
+          .prepare("SELECT * FROM messages WHERE notification_id IN (?, ?)")
+          .bind(notificationId, `${notificationId}${RICH_ID_SUFFIX}`)
           .first<MessageRow>(),
       );
       if (existing) {
-        return json({ ok: true, messageId: existing.message_id, deduplicated: true });
+        return json({
+          ok: true,
+          messageId: existing.message_id,
+          deduplicated: true,
+          ...(existing.notification_id === `${notificationId}${RICH_ID_SUFFIX}` ? { rich: "sent" } : {}),
+        });
       }
     }
 
@@ -546,6 +562,16 @@ export async function handleSendNotification(
         if (!isRichRejection(result)) {
           lastSendWasRich = true;
           return result;
+        }
+        if (richLinkMarkup) {
+          // The mention buttons may be what Telegram refused (sendPlain makes the same retry).
+          // Try rich once more without them before blaming the markdown.
+          console.warn("[worker] mention link buttons rejected on a rich message, resending without them", {
+            sessionId,
+            details: getTelegramErrorDetails(result),
+          });
+          richLinkMarkup = undefined;
+          return sendText(threadId);
         }
         // Nothing was posted (a 4xx). Fall back once, and loudly: a rich rejection means the
         // daemon produced markdown Telegram would not take, which is a bug to go and look at.
@@ -728,7 +754,14 @@ export async function handleSendNotification(
         .prepare(
           "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(String(chatId), messageId, sessionId, token, notificationId, Date.now())
+        .bind(
+          String(chatId),
+          messageId,
+          sessionId,
+          token,
+          notificationId && lastSendWasRich ? `${notificationId}${RICH_ID_SUFFIX}` : notificationId,
+          Date.now(),
+        )
         .run(),
     );
 

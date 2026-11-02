@@ -96,7 +96,7 @@ describe("POST /notifications/send with rich", () => {
     expect(rich[0].message_thread_id).toBeUndefined();
 
     const row = await env.DB.prepare("SELECT session_id, notification_id FROM messages WHERE message_id = 701").first<any>();
-    expect(row).toEqual({ session_id: SENDER, notification_id: "s:rich:1" });
+    expect(row).toEqual({ session_id: SENDER, notification_id: "s:rich:1#rich" });
   });
 
   it("falls back to the plain text once on a 400, and says so", async () => {
@@ -178,11 +178,48 @@ describe("POST /notifications/send with rich", () => {
     )
       .bind(MENTIONED)
       .run();
-    const rich = capture("sendRichMessage", [badRequest]);
+    // Rejected with the buttons, then without them: the markdown itself is the problem.
+    const rich = capture("sendRichMessage", [badRequest, badRequest]);
     const plain = capture("sendMessage", [ok(707)]);
     await send({ rich: { markdown: `${TABLE}\n\nsee ses_e71285de` } });
     expect(rich[0].reply_markup?.inline_keyboard?.[0]?.[0]?.text).toBe("Worker A");
+    expect(rich[1].reply_markup).toBeUndefined();
     expect(plain[0].reply_markup).toBeUndefined();
+  });
+
+  it("retries rich without the link buttons when the rich send with them is rejected", async () => {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
+       VALUES (?, 'm1', '-1001234567890', 77, 'Worker A', 'open', 1, 1)`,
+    )
+      .bind(MENTIONED)
+      .run();
+    const rich = capture("sendRichMessage", [
+      { status: 400, body: { ok: false, error_code: 400, description: "Bad Request: BUTTON_URL_INVALID" } },
+      ok(711),
+    ]);
+    const res = await send({ rich: { markdown: `${TABLE}\n\nsee ses_e71285de` } });
+    expect(await res.json()).toMatchObject({ rich: "sent", messageId: 711 });
+    expect(rich).toHaveLength(2);
+    expect(rich[0].reply_markup).toBeDefined();
+    expect(rich[1].reply_markup).toBeUndefined();
+  });
+
+  it("answers a retry of a delivered rich send with rich: sent, so the daemon skips the other chunks", async () => {
+    capture("sendRichMessage", [ok(712)]);
+    await send({ notificationId: "s:rich:dedup#c0" });
+    const retry = await send({ notificationId: "s:rich:dedup#c0" });
+    expect(await retry.json()).toMatchObject({ ok: true, messageId: 712, deduplicated: true, rich: "sent" });
+  });
+
+  it("answers a retry of a plain fallback as deduplicated without rich: sent", async () => {
+    capture("sendRichMessage", [badRequest]);
+    capture("sendMessage", [ok(713)]);
+    await send({ notificationId: "s:rich:fb#c0" });
+    const retry = await send({ notificationId: "s:rich:fb#c0" });
+    const json = (await retry.json()) as any;
+    expect(json).toMatchObject({ deduplicated: true, messageId: 713 });
+    expect(json.rich).not.toBe("sent");
   });
 
   describe("in a forum topic", () => {

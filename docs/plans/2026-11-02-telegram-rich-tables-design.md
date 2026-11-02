@@ -72,9 +72,11 @@ New module `rich-markdown.ts`:
 
 - `hasPipeTable(body)`: a header line containing `|` immediately followed by a delimiter row
   (`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$`, Hermes's regex), outside fenced code.
-- `sanitizeBodyMarkdown(body)`: outside fenced code blocks and inline code spans, escape the
-  Telegram extensions GFM does not have: `$` → `\$`, `<` → `\<`, `==` → `\=\=`, and `||` →
-  `\|\|` on non-table lines. Then convert lone `\n` to hard breaks (`"  \n"`) outside fenced
+- `sanitizeBodyMarkdown(body)`: outside fenced code blocks (including fences under list items
+  and in quotes) and inline code spans, escape the Telegram extensions GFM does not have and
+  the constructs that would change meaning: `$`, `<`, `&` (entities stay literal), `![`
+  (media blocks Telegram would fetch), `==`, and `||` on non-table lines. A `---` line next to
+  prose gets blank lines so it is a rule, not a setext heading. Then convert lone `\n` to hard breaks (`"  \n"`) outside fenced
   code and table blocks, because plain text preserved every newline and markdown collapses
   soft breaks.
 - `tgMessageToMarkdown(msg)`: the entity converter above. Returns null on overlapping
@@ -117,11 +119,15 @@ behaviour. An old daemon never sends `rich`.
 
 ### Known limits
 
-- **Ambiguous retry of a multi-chunk rich send.** If Telegram accepted the rich message but
-  the worker's response was lost, the retry hits the worker's idempotency check, which
-  answers `deduplicated` without saying whether the row was rich. The daemon then sends
-  chunks 1..N-1, duplicating the tail. Duplicate over loss, matching the outbox's existing
-  bias. Single-chunk notifications (the common case) are unaffected.
+- **Lost responses.** A rich send is recorded in D1 as `<notificationId>#rich`; the
+  idempotency check looks up both ids and answers a retry with `rich: "sent"`, so a lost
+  response does not make the daemon post the remaining chunks too. (Safe: nothing looks a stop
+  row up by its exact id; only question ids are edited or parsed.)
+- **Persistent upstream failure.** A Telegram 5xx is not a rejection, so the outbox retries
+  rich. After two such failures the outbox removes `rich` from the stored payload and the
+  entry goes plain, so a parser bug on Telegram's side cannot cost the notification.
+- **Link keyboard.** A 4xx on a rich send that carried mention buttons is retried rich without
+  them first, as `sendPlain` already does, before it counts as a markdown rejection.
 - **Escape rendering is unverified until first deploy.** GFM honours backslash escapes and
   Telegram says it is GFM-compatible, but no probe was possible from this host (no bot
   token). Post-deploy check: one stop containing a table, `$5 and $10`, `a == b`,
