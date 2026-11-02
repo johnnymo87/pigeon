@@ -79,6 +79,7 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 - **Question notifications (single)**: formatted with the question text + inline keyboard buttons. Each option becomes a button with `callback_data: "cmd:TOKEN:q0"`, `"cmd:TOKEN:q1"`, etc.
 - **Question notifications (multi/wizard)**: when multiple questions exist, rendered one at a time in a single Telegram message. Buttons use versioned callback data (`cmd:TOKEN:v{version}:q{index}`). As the user answers each step, the message is edited in-place via `POST /notifications/edit` to show the next question. On completion, the message is edited to "All answers submitted".
 - **Message splitting**: when a notification body exceeds Telegram's 4096-character limit, `splitTelegramMessage()` splits it into multiple messages at natural boundaries (paragraph, line, sentence). Reply markup is attached only to the last chunk.
+- **Rich tables**: a stop whose body has a GFM pipe table also gets `rich: {markdown}` (`buildRichMarkdown`, `rich-markdown.ts`) in its outbox payload. The outbox sends it on chunk 0; on the worker's `rich: "sent"` the remaining chunks are skipped, otherwise they go out as before (pigeon-p909, see AGENTS.md "Tables render natively").
 
 Both notification types display a session ID on its own line for easy copy-paste in Telegram.
 
