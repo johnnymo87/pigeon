@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   GooseAcpClient,
+  GooseProtocolError,
   ALLOWED_ACP_METHODS,
   DEFAULT_SESSION_EXTENSIONS,
   DEFAULT_SERVE_FLOOR,
@@ -1460,6 +1461,7 @@ describe("GooseAcpClient", () => {
         "session/prompt",
         "_goose/unstable/session/steer",
         "session/cancel",
+        "_goose/unstable/session/rename",
       ]);
     });
 
@@ -1530,6 +1532,47 @@ describe("GooseAcpClient", () => {
       expect((client as any).pending.size).toBe(0);
       client.cancel("sess-1");
       expect((client as any).pending.size).toBe(0);
+    });
+
+    it("sends _goose/unstable/session/rename request with sessionId and title", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_goose/unstable/session/rename") {
+          p.reply(msg.id, {});
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      await client.renameSession("sess-1", "New Title");
+
+      const renameMsg = peer.lastOf("_goose/unstable/session/rename");
+      expect(renameMsg).toBeDefined();
+      expect(renameMsg).toMatchObject({
+        jsonrpc: "2.0",
+        method: "_goose/unstable/session/rename",
+        params: { sessionId: "sess-1", title: "New Title" },
+      });
+      expect(renameMsg).toHaveProperty("id");
+    });
+
+    it("renameSession throws GooseProtocolError on JSON-RPC error", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_goose/unstable/session/rename") {
+          p.replyError(msg.id, -32000, "session not found", "detail");
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      await expect(client.renameSession("sess-1", "New Title")).rejects.toThrow(GooseProtocolError);
     });
   });
 

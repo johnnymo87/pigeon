@@ -959,6 +959,37 @@ export class Poller {
     return { unbound: body.unbound };
   }
 
+  /**
+   * Rename a session's forum topic via the worker (`POST /topics/rename`).
+   * Deliberately NOT recorded in the worker-health monitor (same as lookupTopics).
+   */
+  async renameTopic(
+    params: { sessionId: string; title: string; dir: string },
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    const response = await this.fetchFn(`${this.config.workerUrl}/topics/rename`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(params),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) {
+      let errDetail = "";
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        if (typeof body?.error === "string") errDetail = body.error;
+      } catch {
+        // ignore JSON parse failure
+      }
+      if (!errDetail) errDetail = response.statusText || String(response.status);
+      throw new Error(`topics/rename returned ${response.status}: ${errDetail}`);
+    }
+    return (await response.json()) as Record<string, unknown>;
+  }
+
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {

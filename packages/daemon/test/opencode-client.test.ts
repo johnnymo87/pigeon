@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { OpencodeClient } from "../src/opencode-client";
+import { OpencodeClient, OpencodeHttpError } from "../src/opencode-client";
 import { invalidateServeAuthHeader } from "../src/serve-auth";
 import { openStorageDb } from "../src/storage/database";
 import { hashPrompt } from "../src/hash-prompt";
@@ -214,6 +214,44 @@ describe("OpencodeClient", () => {
 
       expect(recordedAtCallTime).toBe(true);
       expect(db.injectedPrompts.has("sess-abc", hashPrompt("Hello, world!"))).toBe(true);
+    });
+  });
+
+  describe("setSessionTitle", () => {
+    it("sends PATCH to /session/:id with directory header and title body", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await client.setSessionTitle("sess-abc", "/home/user/project", "New Session Title");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc",
+        expect.objectContaining({
+          method: "PATCH",
+          headers: expect.objectContaining({
+            "x-opencode-directory": "/home/user/project",
+            "Content-Type": "application/json",
+          }),
+          body: JSON.stringify({ title: "New Session Title" }),
+        }),
+      );
+    });
+
+    it("throws OpencodeHttpError when response is non-OK", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 500, statusText: "Internal Server Error" }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      await expect(client.setSessionTitle("sess-abc", "/home/user/project", "New Title")).rejects.toThrow(
+        OpencodeHttpError,
+      );
     });
   });
 

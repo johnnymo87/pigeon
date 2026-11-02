@@ -1288,6 +1288,23 @@ const app = createApp(storage, {
   listRemoteSessions: poller ? (limit, signal) => poller.listRemoteSessions(limit, signal) : undefined,
   swarmRelaySend: config.swarmRelaySend,
   remoteLaunch: remoteLaunchRequester,
+  sessionRename: {
+    renameGoose: gooseRunners
+      ? (session, title) => gooseRunners.get(session).rename(title)
+      : undefined,
+    renameOpencode: async (session, title) => {
+      const client = clientForSession(session.sessionId);
+      if (!client) {
+        throw new Error(`no opencode client for session ${session.sessionId}`);
+      }
+      const dir = await directoryForSession(session.sessionId);
+      if (!dir) {
+        throw new Error(`no directory for session ${session.sessionId}`);
+      }
+      await client.setSessionTitle(session.sessionId, dir, title);
+    },
+    renameTopic: poller ? (params, signal) => poller.renameTopic(params, signal) : undefined,
+  },
   // Registers whatever `notify` says: the worker row is the session's ownership claim for
   // cross-machine relays (pigeon-k0qn.5), not only its notification route.
   onSessionStart: async (sessionId, _notify, label) => {

@@ -1039,6 +1039,17 @@ export class GooseAcpClient {
     this.notify("session/cancel", { sessionId });
   }
 
+  async renameSession(sessionId: string, title: string): Promise<void> {
+    const res = await this.call(
+      "_goose/unstable/session/rename",
+      { sessionId, title },
+      { sessionId, isTurn: false },
+    );
+    if (res.error) {
+      throw new GooseProtocolError(res.error.code, res.error.message, res.error.data);
+    }
+  }
+
   private ensureTransport(method: string): AcpTransport {
     const transport = this.transport;
     if (!transport) throw new Error("goose acp client is not connected");
@@ -1448,6 +1459,9 @@ export function refuse(options: PermissionParams["options"]): string | undefined
  * Human decision (2026-10-12): Added `session/cancel` to ALLOWED_ACP_METHODS.
  * It cancels a turn and executes nothing. /kill on a goose session sends
  * `session/cancel` against both honkd and bare goose, then closes the socket.
+ *
+ * Human decision (2026-11-02, Jonathan): rename goose/honk sessions when a
+ * coordinator reassigns a worker. Renames only; executes nothing.
  */
 export const ALLOWED_ACP_METHODS = [
   "initialize",
@@ -1455,4 +1469,5 @@ export const ALLOWED_ACP_METHODS = [
   "session/prompt",
   "_goose/unstable/session/steer",
   "session/cancel",
+  "_goose/unstable/session/rename",
 ] as const;

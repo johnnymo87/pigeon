@@ -145,6 +145,8 @@ class FakeClient {
 
   cancel(sessionId: string): void {}
 
+  async renameSession(_sessionId: string, _title: string): Promise<void> {}
+
   async ping(): Promise<void> {
     if (this.pingReject) throw new Error("ping timeout");
   }

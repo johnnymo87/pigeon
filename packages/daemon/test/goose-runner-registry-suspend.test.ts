@@ -143,6 +143,8 @@ class FakeClient {
 
   cancel(sessionId: string): void {}
 
+  async renameSession(): Promise<void> {}
+
   async ping(): Promise<void> {}
 
   close(): void {
