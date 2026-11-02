@@ -90,6 +90,7 @@ export async function handleSessionRename(
     const timeoutMs = deps.topicTimeoutMs ?? 10_000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
     try {
       const workerResult = await deps.renameTopic(
         { sessionId, title, dir: session.cwd ?? "" },

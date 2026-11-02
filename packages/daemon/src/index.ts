@@ -1297,7 +1297,7 @@ const app = createApp(storage, {
       if (!client) {
         throw new Error(`no opencode client for session ${session.sessionId}`);
       }
-      const dir = await directoryForSession(session.sessionId);
+      const dir = (await directoryForSession(session.sessionId)) ?? session.cwd ?? undefined;
       if (!dir) {
         throw new Error(`no directory for session ${session.sessionId}`);
       }

@@ -125,6 +125,12 @@ describe("POST /topics/rename", () => {
     expect(emptyDirRes.status).not.toBe(400);
   });
 
+  it("rejects a whitespace-only title, which would strip the topic down to its directory", async () => {
+    await seedSession("s-ws", "mach-1");
+    const res = await callRename({ sessionId: "s-ws", title: "   ", dir: "~/project" });
+    expect(res.status).toBe(400);
+  });
+
   it("rejects placeholder titles with 400", async () => {
     await seedSession("s-ph", "mach-1");
 

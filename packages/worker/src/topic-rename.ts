@@ -69,7 +69,7 @@ export async function handleTopicRename(
     typeof sessionId !== "string" ||
     sessionId.length === 0 ||
     typeof title !== "string" ||
-    title.length === 0 ||
+    title.trim().length === 0 ||
     typeof dir !== "string"
   ) {
     return Response.json(
