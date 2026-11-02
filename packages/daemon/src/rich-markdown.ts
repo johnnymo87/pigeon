@@ -1,0 +1,295 @@
+/**
+ * Markdown for Telegram's `sendRichMessage` (Bot API 10.1), used for stop notifications whose
+ * body contains a GFM pipe table (pigeon-p909). Design:
+ * docs/plans/2026-11-02-telegram-rich-tables-design.md.
+ *
+ * Why only tables trigger it: plain `sendMessage` shows a table as a wall of `|`, and nothing
+ * else agents write is unreadable that way. Turning markdown on for every message would change
+ * how every answer reads, and Telegram's dialect is GFM PLUS extensions that make ordinary
+ * prose fragile (`$5 and $10` is inline math, `a || b` a spoiler, `Promise<void>` an
+ * unsupported HTML tag and therefore a parse error). So rich is the exception, and
+ * `sanitizeBodyMarkdown` defangs exactly those extensions.
+ *
+ * Everything here is pure, and every "this cannot be sent rich" answer is `null`, which the
+ * caller treats as "send plain, as before".
+ */
+import type { TgMessage } from "./telegram-message";
+
+/** Telegram's documented limits for a rich message. */
+export const RICH_MAX_CHARS = 32768;
+export const RICH_MAX_BLOCKS = 500;
+export const RICH_MAX_COLUMNS = 20;
+
+/** A GFM table delimiter row (Hermes's regex): `|---|:-:|`, `--- | ---`, ... */
+const DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/;
+const FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})/;
+
+interface LineInfo {
+  text: string;
+  /** Inside a fenced code block, including the fence lines themselves. */
+  fenced: boolean;
+  /** A fence open or close line. */
+  fenceLine: boolean;
+  /** Part of a pipe table (header, delimiter or data row). */
+  table: boolean;
+  /** Column count, on a table's delimiter row only. */
+  columns?: number;
+}
+
+/**
+ * Classifies each line as fenced code, table, or ordinary. A fence opens on 3+ backticks or
+ * tildes and closes on a line of only the same character, at least as long (CommonMark). An
+ * unclosed fence runs to the end of the text, as CommonMark renders it.
+ */
+function classifyLines(text: string): LineInfo[] {
+  const lines = text.split("\n").map<LineInfo>((t) => ({
+    text: t,
+    fenced: false,
+    fenceLine: false,
+    table: false,
+  }));
+
+  let fence: string | null = null;
+  for (const line of lines) {
+    if (fence !== null) {
+      line.fenced = true;
+      const close = line.text.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+      if (close && close[1]![0] === fence[0] && close[1]!.length >= fence.length) {
+        line.fenceLine = true;
+        fence = null;
+      }
+      continue;
+    }
+    const open = line.text.match(FENCE_OPEN);
+    if (open) {
+      line.fenced = true;
+      line.fenceLine = true;
+      fence = open[1]!;
+    }
+  }
+
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const head = lines[i]!;
+    const delim = lines[i + 1]!;
+    if (head.fenced || delim.fenced || head.table) continue;
+    if (!head.text.includes("|") || !DELIMITER_ROW.test(delim.text)) continue;
+    head.table = true;
+    delim.table = true;
+    delim.columns = countColumns(delim.text);
+    let j = i + 2;
+    while (j < lines.length) {
+      const row = lines[j]!;
+      if (row.fenced || row.text.trim() === "" || !row.text.includes("|")) break;
+      row.table = true;
+      j++;
+    }
+    i = j - 1;
+  }
+
+  return lines;
+}
+
+function countColumns(delimiterRow: string): number {
+  let t = delimiterRow.trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  return t.split("|").length;
+}
+
+/** True when the text contains a GFM pipe table outside fenced code. */
+export function hasPipeTable(text: string): boolean {
+  return classifyLines(text).some((l) => l.table);
+}
+
+/** Column count of the widest table outside fenced code; 0 when there is none. */
+export function maxTableColumns(text: string): number {
+  return classifyLines(text).reduce((max, l) => Math.max(max, l.columns ?? 0), 0);
+}
+
+const ASCII_PUNCT = /[!-/:-@[-`{-~]/;
+
+/**
+ * Escapes Telegram's non-GFM extensions in one line of prose, outside inline code spans:
+ * `$` (math), `<` (HTML), `==` (marked) and, off table rows, `||` (spoiler). A table row keeps
+ * `||` because there it is an empty cell. An existing backslash escape is copied as is.
+ */
+function escapeInline(line: string, inTable: boolean): string {
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i]!;
+    if (ch === "\\" && i + 1 < line.length && ASCII_PUNCT.test(line[i + 1]!)) {
+      out += line.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (ch === "`") {
+      let run = 1;
+      while (line[i + run] === "`") run++;
+      const close = findBacktickRun(line, i + run, run);
+      if (close === -1) {
+        out += line.slice(i, i + run);
+        i += run;
+      } else {
+        out += line.slice(i, close + run);
+        i = close + run;
+      }
+      continue;
+    }
+    if (ch === "$" || ch === "<") {
+      out += "\\" + ch;
+    } else if (ch === "=" && (line[i + 1] === "=" || line[i - 1] === "=")) {
+      out += "\\=";
+    } else if (!inTable && ch === "|" && (line[i + 1] === "|" || line[i - 1] === "|")) {
+      out += "\\|";
+    } else {
+      out += ch;
+    }
+    i++;
+  }
+  return out;
+}
+
+/** Index of the next backtick run of exactly `len` at or after `from`, or -1. */
+function findBacktickRun(line: string, from: number, len: number): number {
+  let i = from;
+  while (i < line.length) {
+    if (line[i] !== "`") {
+      i++;
+      continue;
+    }
+    let run = 1;
+    while (line[i + run] === "`") run++;
+    if (run === len) return i;
+    i += run;
+  }
+  return -1;
+}
+
+/**
+ * Prepares an agent's text for rich markdown:
+ *
+ * - escapes the Telegram extensions (see `escapeInline`) outside fenced and inline code;
+ * - turns a lone newline into a hard break (`"  \n"`), because plain text showed every
+ *   newline and markdown would otherwise fold consecutive lines into one paragraph. Not
+ *   inside fences or tables, and not next to a fence line;
+ * - puts a blank line before and after every table, so a table directly under a line of
+ *   prose is not read as part of that paragraph, and a line directly under a table is not
+ *   read as one more row.
+ */
+export function sanitizeBodyMarkdown(text: string): string {
+  const lines = classifyLines(text);
+  let out = "";
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    out += line.fenced ? line.text : escapeInline(line.text, line.table);
+    const next = lines[i + 1];
+    if (!next) break;
+    const blank = line.text.trim() === "";
+    const nextBlank = next.text.trim() === "";
+    if (!blank && !nextBlank && line.table !== next.table && !line.fenced && !next.fenced) {
+      out += "\n\n";
+    } else if (
+      !blank &&
+      !nextBlank &&
+      !line.table &&
+      !next.table &&
+      !line.fenced &&
+      !next.fenced
+    ) {
+      out += "  \n";
+    } else {
+      out += "\n";
+    }
+  }
+  return out;
+}
+
+/** Characters escaped in pigeon's own (non-agent) text: header, footer. */
+const MD_SPECIAL = /[\\`*_[\]<>|$=~#]/g;
+
+function escapePlain(s: string): string {
+  return s.replace(MD_SPECIAL, (c) => "\\" + c).replace(/\n/g, "  \n");
+}
+
+function codeSpan(content: string): string {
+  const longest = Math.max(0, ...(content.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = content.startsWith("`") || content.endsWith("`") ? " " : "";
+  return `${fence}${pad}${content}${pad}${fence}`;
+}
+
+function codeBlock(content: string): string {
+  const longest = Math.max(2, ...(content.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(longest + 1);
+  return `${fence}\n${content}\n${fence}`;
+}
+
+/**
+ * Converts one of pigeon's entity-built messages (header, footer) to rich markdown. Plain
+ * segments are escaped; entities become their markdown form. Returns null on overlapping
+ * entities, which pigeon never builds, so the caller falls back to plain.
+ */
+export function tgMessageToMarkdown(msg: TgMessage): string | null {
+  const entities = [...msg.entities].sort((a, b) => a.offset - b.offset);
+  let out = "";
+  let pos = 0;
+  for (const e of entities) {
+    if (e.offset < pos) return null;
+    out += escapePlain(msg.text.slice(pos, e.offset));
+    const content = msg.text.slice(e.offset, e.offset + e.length);
+    switch (e.type) {
+      case "code":
+        out += codeSpan(content);
+        break;
+      case "pre":
+        out += codeBlock(content);
+        break;
+      case "bold":
+        out += `**${escapePlain(content)}**`;
+        break;
+      case "italic":
+        out += `_${escapePlain(content)}_`;
+        break;
+    }
+    pos = e.offset + e.length;
+  }
+  out += escapePlain(msg.text.slice(pos));
+  return out;
+}
+
+/** Upper bound on Telegram's block count: every non-blank line outside fences, plus fences. */
+function estimateBlocks(markdown: string): number {
+  let blocks = 0;
+  for (const line of classifyLines(markdown)) {
+    if (line.fenceLine) blocks++;
+    else if (!line.fenced && line.text.trim() !== "") blocks++;
+  }
+  return blocks;
+}
+
+/**
+ * The rich markdown for a notification, or null when it should go plain: no table in the
+ * body, a header/footer that cannot be converted, or any of Telegram's limits exceeded.
+ * Layout matches the plain chunk: header, body, footer separated by blank lines, empty
+ * parts skipped.
+ */
+export function buildRichMarkdown(
+  header: TgMessage,
+  body: TgMessage,
+  footer: TgMessage,
+): string | null {
+  if (!hasPipeTable(body.text)) return null;
+  if (maxTableColumns(body.text) > RICH_MAX_COLUMNS) return null;
+
+  const head = tgMessageToMarkdown(header);
+  const foot = tgMessageToMarkdown(footer);
+  if (head === null || foot === null) return null;
+
+  const parts = [head, sanitizeBodyMarkdown(body.text), foot].filter((p) => p.length > 0);
+  const markdown = parts.join("\n\n");
+
+  if ([...markdown].length > RICH_MAX_CHARS) return null;
+  if (estimateBlocks(markdown) > RICH_MAX_BLOCKS) return null;
+  return markdown;
+}
