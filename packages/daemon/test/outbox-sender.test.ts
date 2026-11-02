@@ -913,6 +913,99 @@ describe("OutboxSender.processOnce()", () => {
   });
 });
 
+describe("OutboxSender rich messages (pigeon-p909)", () => {
+  let storage: StorageDb;
+  const RICH = { markdown: "| a | b |\n|---|---|\n| 1 | 2 |" };
+
+  beforeEach(() => {
+    storage = openStorageDb(":memory:");
+  });
+
+  afterEach(() => {
+    storage.db.close();
+  });
+
+  function seed(messages: Array<{ text: string }>, rich: unknown = RICH): void {
+    storage.outbox.upsert({
+      notificationId: "stop-1",
+      sessionId: "sess-1",
+      requestId: "req-1",
+      kind: "stop",
+      payload: JSON.stringify({ messages, replyMarkup: { inline_keyboard: [] }, notificationId: "stop-1", rich }),
+      token: "tok",
+    }, 1_000);
+  }
+
+  function senderWith(sendFn: SendNotificationFn, log?: (m: string, f?: Record<string, unknown>) => void) {
+    return new OutboxSender({ storage, sendNotification: sendFn, chatId: "chat-123", nowFn: () => 5_000, log });
+  }
+
+  const success = (body: unknown) => ({ ok: true, kind: "success", status: 200, body });
+
+  it("puts rich on the first chunk and stops after a rich send, even with more chunks", async () => {
+    seed([{ text: "part 1" }, { text: "part 2" }, { text: "part 3" }]);
+    const sendFn = vi.fn().mockResolvedValue(success({ ok: true, messageId: 1, rich: "sent" }));
+    await senderWith(sendFn as unknown as SendNotificationFn).processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    const input = sendFn.mock.calls[0]![0] as SendNotificationInput;
+    expect(input.rich).toEqual(RICH);
+    expect(input.text).toBe("part 1");
+    expect(input.notificationId).toBe("stop-1#c0");
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
+  });
+
+  it("uses the bare id for a single-chunk rich send", async () => {
+    seed([{ text: "only" }]);
+    const sendFn = vi.fn().mockResolvedValue(success({ ok: true, messageId: 1, rich: "sent" }));
+    await senderWith(sendFn as unknown as SendNotificationFn).processOnce();
+    expect((sendFn.mock.calls[0]![0] as SendNotificationInput).notificationId).toBe("stop-1");
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
+  });
+
+  it("continues with the remaining plain chunks after a fallback, and logs it", async () => {
+    seed([{ text: "part 1" }, { text: "part 2" }]);
+    const sendFn = vi
+      .fn()
+      .mockResolvedValueOnce(success({ ok: true, messageId: 1, rich: "fallback", richError: { error_code: 400 } }))
+      .mockResolvedValueOnce(success({ ok: true, messageId: 2 }));
+    const log = vi.fn();
+    await senderWith(sendFn as unknown as SendNotificationFn, log).processOnce();
+
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    const second = sendFn.mock.calls[1]![0] as SendNotificationInput;
+    expect(second.text).toBe("part 2");
+    expect(second.rich).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(
+      "outbox rich send fell back to plain",
+      expect.objectContaining({ notificationId: "stop-1", richError: { error_code: 400 } }),
+    );
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
+  });
+
+  it("treats a success without a rich field (worker predates rich) as plain", async () => {
+    seed([{ text: "part 1" }, { text: "part 2" }]);
+    const sendFn = vi.fn().mockResolvedValue({ ok: true });
+    await senderWith(sendFn as unknown as SendNotificationFn).processOnce();
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    expect((sendFn.mock.calls[1]![0] as SendNotificationInput).rich).toBeUndefined();
+  });
+
+  it("ignores a malformed rich field", async () => {
+    seed([{ text: "only" }], { markdown: 42 });
+    const sendFn = vi.fn().mockResolvedValue({ ok: true });
+    await senderWith(sendFn as unknown as SendNotificationFn).processOnce();
+    expect((sendFn.mock.calls[0]![0] as SendNotificationInput).rich).toBeUndefined();
+  });
+
+  it("sends no rich field for an entry without one", async () => {
+    seed([{ text: "only" }], null);
+    const sendFn = vi.fn().mockResolvedValue({ ok: true });
+    await senderWith(sendFn as unknown as SendNotificationFn).processOnce();
+    expect(sendFn.mock.calls[0]![0]).not.toHaveProperty("rich");
+  });
+});
+
 describe("chunkNotificationId unit tests", () => {
   it("returns undefined when notificationId is undefined", () => {
     expect(chunkNotificationId(undefined, 0, false)).toBeUndefined();

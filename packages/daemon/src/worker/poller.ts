@@ -22,6 +22,12 @@ export interface SendNotificationInput {
   dir?: string;
   threaded?: boolean;
   onTopicUnavailable?: "retry" | "general";
+  /**
+   * Ask the worker to send the WHOLE notification as one Telegram rich message (pigeon-p909).
+   * `text`/`entities` are still this chunk's plain rendering: the worker falls back to them on
+   * a rich rejection, and a worker that predates rich ignores this field and sends them.
+   */
+  rich?: { markdown: string };
 }
 
 export type WorkerResultSuccess<T = unknown> = {
@@ -956,7 +962,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable } = input;
+    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -976,6 +982,7 @@ export class Poller {
           ...(dir ? { dir } : {}),
           ...(threaded !== undefined ? { threaded } : {}),
           ...(onTopicUnavailable !== undefined ? { onTopicUnavailable } : {}),
+          ...(rich ? { rich } : {}),
         }),
       }),
     );

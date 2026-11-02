@@ -258,6 +258,25 @@ export function commitDelivery(
   })();
 }
 
+/**
+ * What the worker did with a `rich` request (pigeon-p909): `"sent"` (one rich message carries
+ * the whole notification), `"fallback"` (the worker sent this chunk plain), or undefined. A
+ * success with no `rich` field comes from a worker that predates rich, which sent the chunk
+ * plain; so does a `deduplicated` answer, which cannot say what the earlier send was. Both are
+ * treated as plain, so the remaining chunks still go out: a possible duplicate, never a loss.
+ */
+function richOutcomeOf(result: unknown): "sent" | "fallback" | undefined {
+  const body = (result as { body?: unknown }).body;
+  if (!body || typeof body !== "object") return undefined;
+  const rich = (body as { rich?: unknown }).rich;
+  return rich === "sent" || rich === "fallback" ? rich : undefined;
+}
+
+function richErrorOf(result: unknown): unknown {
+  const body = (result as { body?: unknown }).body;
+  return body && typeof body === "object" ? (body as { richError?: unknown }).richError : undefined;
+}
+
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
@@ -539,6 +558,7 @@ export class OutboxSender {
         let title: string | undefined;
         let dir: string | undefined;
         let threaded: boolean | undefined;
+        let rich: { markdown: string } | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
             messages?: Array<{ text: string; entities?: unknown[] }>;
@@ -548,6 +568,7 @@ export class OutboxSender {
             title?: string;
             dir?: string;
             threaded?: boolean;
+            rich?: { markdown?: unknown };
           };
           messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
@@ -555,6 +576,10 @@ export class OutboxSender {
           title = parsed.title;
           dir = parsed.dir;
           threaded = parsed.threaded;
+          rich =
+            typeof parsed.rich?.markdown === "string" && parsed.rich.markdown.length > 0
+              ? { markdown: parsed.rich.markdown }
+              : undefined;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           this.markTerminal(entry, now, "payload_parse_failed", errMsg);
@@ -629,6 +654,7 @@ export class OutboxSender {
         try {
           let allOk = true;
           let sentUnderGeneral = false;
+          let sentChunks = 0;
           for (let i = 0; i < messages.length; i++) {
             const isLast = i === messages.length - 1;
             const msg = messages[i]!;
@@ -657,6 +683,10 @@ export class OutboxSender {
               dir,
               threaded,
               onTopicUnavailable,
+              // Rich rides on chunk 0 only (pigeon-p909): if the worker sends it rich, that one
+              // message is the whole notification; otherwise chunk 0 went out plain and the
+              // loop carries on exactly as it always has.
+              ...(i === 0 && rich ? { rich } : {}),
             });
 
             if (onTopicUnavailable === "general") {
@@ -904,10 +934,25 @@ export class OutboxSender {
               });
               break;
             }
+
+            sentChunks++;
+            if (i === 0 && rich) {
+              const richOutcome = richOutcomeOf(result);
+              if (richOutcome === "sent") break;
+              if (richOutcome === "fallback") {
+                // The worker already warned with Telegram's error; this is the daemon-side half,
+                // so the fallback is visible in the daemon journal too.
+                this.log("outbox rich send fell back to plain", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  richError: richErrorOf(result),
+                });
+              }
+            }
           }
 
           if (allOk) {
-            commitDelivery(this.storage, entry, now, messages.length, this.log);
+            commitDelivery(this.storage, entry, now, sentChunks, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
             this.entriesSentUnderGeneral.delete(entry.notificationId);
             if (!sentUnderGeneral) {
