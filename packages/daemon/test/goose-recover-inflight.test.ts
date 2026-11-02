@@ -47,6 +47,7 @@ class FakeClient {
   }
 
   cancel(): void {}
+  async renameSession(): Promise<void> {}
   async ping(): Promise<void> {}
   close(): void {
     this.closed = true;

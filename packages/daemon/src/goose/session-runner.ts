@@ -145,6 +145,7 @@ export interface RunnerClient {
   runOwnership?(sessionId: string): RunOwnership;
   runState?(sessionId: string): RunState;
   cancel(sessionId: string): void;
+  renameSession(sessionId: string, title: string): Promise<void>;
   close(): void;
 }
 
@@ -2009,6 +2010,26 @@ export class GooseSessionRunner {
     }
 
     return "no-connection";
+  }
+
+  async rename(title: string): Promise<void> {
+    try {
+      await withDeadline(this.ensureConnected(), NON_TURN_TIMEOUT_MS, "connect");
+      await withDeadline(
+        this.opts.client.renameSession(this.backendSessionId, title),
+        NON_TURN_TIMEOUT_MS,
+        "session/rename",
+      );
+      // Cached title is attached to every /stop; update ONLY on success so a
+      // failed rename leaves the previous title intact.
+      this.title = title;
+    } finally {
+      // A rename on an idle session opens a socket no turn will close, and an
+      // attached viewer keeps honkd holding the session in memory.
+      if (!this.turn && this.connected && !this.opts.client.isClosed()) {
+        this.armIdleSocketTimer();
+      }
+    }
   }
 
   ownsActiveRun(): boolean {

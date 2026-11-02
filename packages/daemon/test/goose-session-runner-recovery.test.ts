@@ -158,6 +158,8 @@ class FakeRecoveryClient {
     this.cancelCalls.push(sessionId);
   }
 
+  async renameSession(): Promise<void> {}
+
   async ping(): Promise<void> {}
 
   close(): void {

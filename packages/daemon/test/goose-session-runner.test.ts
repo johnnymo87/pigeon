@@ -189,6 +189,12 @@ class FakeClient {
     this.cancelCalls.push(sessionId);
     if (this.cancelImpl) this.cancelImpl(sessionId);
   }
+  renameCalls: Array<{ sessionId: string; title: string }> = [];
+  renameSessionImpl: ((sessionId: string, title: string) => Promise<void>) | undefined;
+  async renameSession(sessionId: string, title: string): Promise<void> {
+    this.renameCalls.push({ sessionId, title });
+    if (this.renameSessionImpl) await this.renameSessionImpl(sessionId, title);
+  }
   /** Answers by default; tests set pingImpl to model a dead socket. */
   pingImpl: (() => Promise<void>) | undefined;
   pings = 0;
@@ -3201,6 +3207,83 @@ describe("GooseSessionRunner session title", () => {
       expect(dropped[1]!.commandId).toBe("swarm:msg_q2");
       expect(inflight.get("swarm:msg_q1")).toBeUndefined();
       expect(inflight.get("swarm:msg_q2")).toBeUndefined();
+    });
+  });
+
+  describe("GooseSessionRunner.rename", () => {
+    it("ensures connected and calls client.renameSession with backendSessionId and title", async () => {
+      const { runner, client } = makeRunner();
+      expect(client.connected).toBe(false);
+
+      await runner.rename("New work");
+
+      expect(client.connected).toBe(true);
+      expect(client.renameCalls).toEqual([{ sessionId: "20260918_1", title: "New work" }]);
+    });
+
+    it("acceptance: after runner.rename('New work'), the next turn's /stop body carries title 'New work'", async () => {
+      const { runner, client, stops } = makeRunner();
+      await runner.rename("New work");
+
+      await runner.deliver("c1", "hello");
+      client.finishTurn("end_turn", { text: "all done" });
+      await runner.settled();
+
+      expect(stops.length).toBeGreaterThan(0);
+      const stop = stops[stops.length - 1];
+      expect(stop?.title).toBe("New work");
+    });
+
+    it("acceptance: a failed rename leaves the previous title", async () => {
+      const { runner, client, stops } = makeRunner();
+      // Establish an initial title via onUpdate or a successful rename
+      runner.onUpdate({ sessionUpdate: "session_info_update", title: "Previous title" });
+
+      client.renameSessionImpl = async () => {
+        throw new Error("rename refused");
+      };
+
+      await expect(runner.rename("Failed title")).rejects.toThrow("rename refused");
+
+      await runner.deliver("c1", "hello");
+      client.finishTurn("end_turn", { text: "all done" });
+      await runner.settled();
+
+      expect(stops.length).toBeGreaterThan(0);
+      const stop = stops[stops.length - 1];
+      expect(stop?.title).toBe("Previous title");
+    });
+
+    it("works when a turn is already in flight without touching the queue", async () => {
+      const { runner, client, stops } = makeRunner();
+      await runner.deliver("c1", "first turn prompt");
+
+      // While turn is live, rename succeeds
+      await runner.rename("In-flight rename");
+      expect(client.renameCalls).toEqual([{ sessionId: "20260918_1", title: "In-flight rename" }]);
+
+      client.finishTurn("end_turn", { text: "finished turn" });
+      await runner.settled();
+
+      expect(stops.length).toBeGreaterThan(0);
+      const stop = stops[stops.length - 1];
+      expect(stop?.title).toBe("In-flight rename");
+    });
+
+    it("closes a socket opened only for the rename once it has been idle, so it does not pin a honkd session", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
+
+        await runner.rename("New work");
+        expect(client.closed).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(client.closed).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

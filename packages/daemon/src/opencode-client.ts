@@ -358,6 +358,35 @@ export class OpencodeClient {
     );
   }
 
+  async setSessionTitle(
+    sessionId: string,
+    directory: string,
+    title: string,
+    opts?: { timeoutMs?: number },
+  ): Promise<void> {
+    return this.request(
+      `${this.baseUrl}/session/${sessionId}`,
+      {
+        method: "PATCH",
+        headers: {
+          "x-opencode-directory": directory,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ title }),
+      },
+      (response) => {
+        if (!response.ok) {
+          throw new OpencodeHttpError(
+            response.status,
+            response.statusText,
+            `setSessionTitle failed: ${response.status} ${response.statusText}`,
+          );
+        }
+      },
+      opts?.timeoutMs,
+    );
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     return this.request(
       `${this.baseUrl}/session/${sessionId}`,

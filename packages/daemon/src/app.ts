@@ -22,7 +22,8 @@ import { payloadHasCloseTag } from "./swarm/envelope";
 import { parseScheduleTime } from "./swarm/schedule-time";
 import type { Priority } from "./storage/swarm-repo";
 import { makeMsgId } from "./ids";
-import { clampPreservingSurrogates, excerptOf } from "./text";
+import { clampPreservingSurrogates, excerptOf, parseTitle, MAX_TITLE_LENGTH } from "./text";
+export { parseTitle };
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
@@ -34,6 +35,7 @@ import { buildRichMarkdown } from "./rich-markdown";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
+import { handleSessionRename, type SessionRenameDeps } from "./session-rename.js";
 
 const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
 const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
@@ -121,13 +123,6 @@ function maybeNumber(value: unknown): number | undefined {
   }
   return undefined;
 }
-
-/**
- * Maximum session title length (200 characters).
- * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
- * and to accommodate Phase 2 forum topic names (capped at 128 chars).
- */
-const MAX_TITLE_LENGTH = 200;
 
 export interface SwarmSendFields {
   from: string;
@@ -251,33 +246,6 @@ export function parseSwarmSendBody(
   };
 }
 
-/**
- * opencode names a brand-new session `New session - <ISO timestamp>` and only replaces it once
- * its summarizer produces a real title, seconds later. That placeholder is not a title: baking it
- * into a Telegram forum topic name is permanent, because topic names are write-once (pigeon-353p).
- *
- * Treated as ABSENT rather than rewritten, so every existing consumer keeps its own fallback —
- * `displayName` drops through to the session label, and the worker names the topic after the
- * directory alone and marks it upgradable. Fail-open: if opencode changes the format this stops
- * matching and behaviour reverts to what it was, never worse. The worker matches the same shape
- * independently (`isPlaceholderTitle` in topics.ts) because daemons are deployed per-machine and
- * one lagging daemon must not be able to mint placeholder-named topics.
- *
- * goose's equivalent is the literal `New Chat` (acp/server/new_session.rs), which `honk telegram`
- * forwards as a title before goose has named the session.
- */
-const PLACEHOLDER_TITLE_PATTERN = /^(?:New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?|New Chat)$/;
-
-function parseTitle(val: unknown): string | undefined {
-  if (typeof val !== "string") return undefined;
-  const trimmed = val.trim();
-  if (trimmed === "") return undefined;
-  if (PLACEHOLDER_TITLE_PATTERN.test(trimmed)) return undefined;
-  // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that Telegram
-  // cannot encode, silently killing every notification for the session. See text.ts.
-  return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);
-}
-
 const MAX_NOTIFICATION_ID_LENGTH = 128;
 const NOTIFICATION_ID_CHARSET = /^[A-Za-z0-9_:.-]+$/;
 
@@ -383,6 +351,10 @@ interface AppOptions {
    * the route then answers 503 `no_worker`.
    */
   remoteLaunch?: RemoteLaunchRequester;
+  /**
+   * Session rename options for `POST /sessions/:id/rename`.
+   */
+  sessionRename?: Omit<SessionRenameDeps, "storage"> & { storage?: StorageDb };
 }
 
 /** Bound on the worker call behind `GET /swarm/remote-sessions`. An agent is waiting on it. */
@@ -2370,6 +2342,40 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // removed is still meaningful and must be recorded.
         storage.sessionEvents.advanceRead(sessionId, lastEventId, nowFn());
         return Response.json({ ok: true });
+      }
+
+      if (
+        request.method === "POST"
+        && url.pathname.startsWith("/sessions/")
+        && url.pathname.endsWith("/rename")
+      ) {
+        let sessionId: string;
+        try {
+          sessionId = decodeURIComponent(
+            url.pathname.slice("/sessions/".length, -"/rename".length),
+          );
+        } catch {
+          // decodeURIComponent throws URIError on a malformed escape (/sessions/%zz/rename),
+          // which the outer handler would report as a 500. Same reasoning as the JSON guard
+          // below: a client's bad input is not a daemon fault.
+          return Response.json({ error: "invalid session id encoding" }, { status: 400 });
+        }
+        if (!sessionId) {
+          return Response.json({ error: "session id is required" }, { status: 400 });
+        }
+
+        let body: Record<string, unknown>;
+        try {
+          body = await readJsonBody(request);
+        } catch {
+          return Response.json({ error: "invalid JSON body" }, { status: 400 });
+        }
+
+        return await handleSessionRename(
+          { storage, ...options.sessionRename },
+          sessionId,
+          body,
+        );
       }
 
       if (url.pathname.startsWith("/sessions/")) {

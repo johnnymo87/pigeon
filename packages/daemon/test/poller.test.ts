@@ -1449,6 +1449,61 @@ describe("Poller.unbindNamedTopic()", () => {
   });
 });
 
+describe("Poller.renameTopic()", () => {
+  it("POSTs sessionId, title, and dir to /topics/rename and returns the parsed 200 body", async () => {
+    const responseBody = { renamed: true, name: "New Title · ~/repo" };
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(responseBody), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    const signal = new AbortController().signal;
+
+    const result = await poller.renameTopic(
+      { sessionId: "ses_1", title: "New Title", dir: "~/repo" },
+      signal,
+    );
+
+    expect(result).toEqual(responseBody);
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8787/topics/rename");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual({
+      sessionId: "ses_1",
+      title: "New Title",
+      dir: "~/repo",
+    });
+    expect(init.signal).toBe(signal);
+  });
+
+  it("throws Error('topics/rename returned <status>: <error>') on non-200 with error body", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "unknown_session" }), { status: 404 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+
+    await expect(
+      poller.renameTopic({ sessionId: "ses_1", title: "New Title", dir: "~/repo" }),
+    ).rejects.toMatchObject({
+      message: "topics/rename returned 404: unknown_session",
+      status: 404,
+      workerError: "unknown_session",
+    });
+  });
+
+  it("throws Error('topics/rename returned <status>: <error>') on non-200 without json error", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response("Bad Gateway", { status: 502, statusText: "Bad Gateway" }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+
+    await expect(
+      poller.renameTopic({ sessionId: "ses_1", title: "New Title", dir: "~/repo" }),
+    ).rejects.toThrow("topics/rename returned 502: Bad Gateway");
+  });
+});
+
 describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
   function capture() {
     const bodies: unknown[] = [];

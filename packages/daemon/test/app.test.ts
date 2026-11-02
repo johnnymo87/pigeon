@@ -3041,3 +3041,75 @@ describe("POST /sessions/{id}/read", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("POST /sessions/{id}/rename", () => {
+  let storage: StorageDb | null = null;
+
+  afterEach(() => {
+    if (storage) {
+      storage.db.close();
+      storage = null;
+    }
+  });
+
+  function newApp(sessionRenameOpts: any = {}) {
+    storage = openStorageDb(":memory:");
+    return createApp(storage, {
+      nowFn: () => 1_000,
+      sessionRename: sessionRenameOpts,
+    });
+  }
+
+  async function post(app: ReturnType<typeof createApp>, path: string, body: unknown) {
+    return app(
+      new Request(`http://localhost${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: typeof body === "string" ? body : JSON.stringify(body),
+      }),
+    );
+  }
+
+  it("rejects a malformed percent-escape with 400", async () => {
+    const app = newApp();
+    const res = await post(app, "/sessions/%zz/rename", { title: "New Title" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "invalid session id encoding" });
+  });
+
+  it("rejects malformed JSON with 400", async () => {
+    const app = newApp();
+    const res = await post(app, "/sessions/sess-1/rename", "{bad json");
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "invalid JSON body" });
+  });
+
+  it("dispatches to handleSessionRename and returns 200 on success", async () => {
+    const renameGoose = vi.fn().mockResolvedValue(undefined);
+    const renameTopic = vi.fn().mockResolvedValue({ renamed: true, name: "New Title · ~/work" });
+    const app = newApp({ renameGoose, renameTopic });
+
+    storage!.sessions.upsert({
+      sessionId: "s_goose",
+      backendKind: "goose-acp",
+      cwd: "/home/dev/work",
+      notify: true,
+    });
+
+    const res = await post(app, "/sessions/s_goose/rename", { title: "New Title" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      title: "New Title",
+      backend: "renamed",
+      stored: true,
+      topic: {
+        status: "renamed",
+        renamed: true,
+        name: "New Title · ~/work",
+      },
+    });
+
+    expect(storage!.sessions.get("s_goose")?.title).toBe("New Title");
+  });
+});

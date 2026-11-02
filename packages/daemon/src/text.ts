@@ -54,3 +54,22 @@ export function excerptOf(text: string | null | undefined): string | null {
   // caller's text came through JSON.parse and a \udXXX escape decodes to one.
   return clampPreservingSurrogates(trimmed, EXCERPT_MAX_CHARS).toWellFormed();
 }
+
+/**
+ * Maximum session title length (200 characters).
+ * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
+ * and to accommodate Phase 2 forum topic names (capped at 128 chars).
+ */
+export const MAX_TITLE_LENGTH = 200;
+
+export const PLACEHOLDER_TITLE_PATTERN = /^(?:New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z?|New Chat)$/;
+
+export function parseTitle(val: unknown): string | undefined {
+  if (typeof val !== "string") return undefined;
+  const trimmed = val.trim();
+  if (trimmed === "") return undefined;
+  if (PLACEHOLDER_TITLE_PATTERN.test(trimmed)) return undefined;
+  // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that Telegram
+  // cannot encode, silently killing every notification for the session.
+  return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);
+}
