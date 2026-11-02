@@ -81,10 +81,8 @@ export async function handleSessionRename(
     return Response.json({ error: "unsupported_backend" }, { status: 409 });
   }
 
-  // Persist new title in daemon storage
   deps.storage.sessions.setTitle(sessionId, title);
 
-  // Topic rename (best effort / optional)
   let topic: Record<string, unknown>;
   if (!deps.renameTopic) {
     topic = { status: "skipped", reason: "no_worker" };

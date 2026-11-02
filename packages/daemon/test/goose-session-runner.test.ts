@@ -3269,5 +3269,21 @@ describe("GooseSessionRunner session title", () => {
       const stop = stops[stops.length - 1];
       expect(stop?.title).toBe("In-flight rename");
     });
+
+    it("closes a socket opened only for the rename once it has been idle, so it does not pin a honkd session", async () => {
+      vi.useFakeTimers();
+      try {
+        const { runner, client } = makeRunner({ idleSocketTimeoutMs: 60_000 });
+        client.isHonk = true;
+
+        await runner.rename("New work");
+        expect(client.closed).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(client.closed).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });
