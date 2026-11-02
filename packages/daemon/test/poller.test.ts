@@ -1485,7 +1485,11 @@ describe("Poller.renameTopic()", () => {
 
     await expect(
       poller.renameTopic({ sessionId: "ses_1", title: "New Title", dir: "~/repo" }),
-    ).rejects.toThrow("topics/rename returned 404: unknown_session");
+    ).rejects.toMatchObject({
+      message: "topics/rename returned 404: unknown_session",
+      status: 404,
+      workerError: "unknown_session",
+    });
   });
 
   it("throws Error('topics/rename returned <status>: <error>') on non-200 without json error", async () => {

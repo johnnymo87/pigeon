@@ -4,6 +4,7 @@ import { handleSessionRename, type SessionRenameDeps } from "../src/session-rena
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind.js";
 import { OPENCODE_BACKEND_KIND } from "../src/routing/opencode-routable.js";
 import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull.js";
+import { TopicRenameError } from "../src/worker/poller.js";
 
 describe("handleSessionRename", () => {
   let storage: StorageDb;
@@ -233,6 +234,25 @@ describe("handleSessionRename", () => {
 
     // DB title was updated because step 1 & 2 succeeded
     expect(storage.sessions.get("s_goose")?.title).toBe("New Title");
+  });
+
+  it("passes the worker's status and error code through so a caller can tell retryable from terminal", async () => {
+    storage.sessions.upsert({ sessionId: "s_goose", backendKind: GOOSE_BACKEND_KIND, notify: true });
+    const deps: SessionRenameDeps = {
+      storage,
+      renameGoose: vi.fn().mockResolvedValue(undefined),
+      renameTopic: vi.fn().mockRejectedValue(new TopicRenameError(409, "bound_session")),
+    };
+
+    const res = await handleSessionRename(deps, "s_goose", { title: "New Title" });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      step: "topic",
+      worker_status: 409,
+      worker_error: "bound_session",
+    });
   });
 
   it("marks topic status as 'unchanged' when worker returns renamed: false", async () => {

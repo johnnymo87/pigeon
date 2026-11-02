@@ -296,6 +296,34 @@ describe("POST /topics/rename", () => {
     expect(session?.label).toBe("Old Session Label");
   });
 
+  it.each([
+    ["a titled topic", "Old work · ~/projects/pigeon", 0],
+    ["a provisional, directory-only topic", "~/projects/pigeon", 1],
+  ])("keeps the current directory suffix of %s when the caller sends no dir", async (_kind, oldName, provisional) => {
+    const sessionId = `ses_keep_dir_${provisional}`;
+    await seedSession(sessionId, MACHINE_A);
+    await seedTopic({ sessionId, chatId: "-1001234567890", threadId: 884500 + provisional, name: oldName, provisional });
+
+    let captured: any;
+    fetchMock
+      .get("https://api.telegram.org")
+      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
+      .reply((opts: any) => {
+        captured = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
+        return {
+          statusCode: 200,
+          data: JSON.stringify({ ok: true, result: true }),
+          responseOptions: { headers: { "Content-Type": "application/json" } },
+        };
+      });
+
+    const res = await callRename({ sessionId, title: "New work", dir: "" });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ renamed: true, name: "New work · ~/projects/pigeon" });
+    expect(captured.name).toBe("New work · ~/projects/pigeon");
+  });
+
   it("treats TOPIC_NOT_MODIFIED as success, updating D1 and returning 200", async () => {
     const sessionId = "ses_topic_not_modified";
     const chatId = "-1001234567890";

@@ -43,6 +43,19 @@ export async function editTopicName(
   return { ok: true };
 }
 
+/**
+ * The ` · ~/dir` part of a topic's current name, so a caller that knows no directory does not
+ * strip it: the worker stores no per-session directory, only the name it rendered. A provisional
+ * name IS the directory. A clamped name (ending in "…") may have lost its suffix, so it yields none.
+ */
+function currentDirSuffix(topic: TopicRow): string {
+  const name = topic.name ?? "";
+  if (topic.name_provisional === 1) return name === "session" ? "" : name;
+  if (name.endsWith("…")) return "";
+  const i = name.lastIndexOf(" · ");
+  return i >= 0 ? name.slice(i + " · ".length) : "";
+}
+
 export async function handleTopicRename(
   db: D1Database,
   env: Env,
@@ -131,7 +144,7 @@ export async function handleTopicRename(
       return Response.json({ renamed: false, reason: "no_topic" });
     }
 
-    const name = topicName(dir, title);
+    const name = topicName(dir || currentDirSuffix(topic), title);
     const editRes = await editTopicName(db, env, topic, name);
     if (!editRes.ok) {
       return Response.json({ error: "telegram_failed", detail: editRes.error }, { status: 502 });

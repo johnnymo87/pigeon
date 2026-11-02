@@ -450,6 +450,21 @@ export type WorkerIdentity =
   | { kind: "unsupported" }
   | { kind: "unknown"; error: string };
 
+/**
+ * A non-2xx from the worker's `POST /topics/rename`. Keeps the status and the worker's error
+ * code apart so a caller can tell a retryable failure (503 storage, 502 Telegram) from a
+ * terminal one (403 machine_mismatch, 404 unknown_session, 409 bound_session).
+ */
+export class TopicRenameError extends Error {
+  constructor(
+    readonly status: number,
+    readonly workerError: string,
+  ) {
+    super(`topics/rename returned ${status}: ${workerError}`);
+    this.name = "TopicRenameError";
+  }
+}
+
 export class Poller {
   private readonly fetchFn: typeof fetch;
   private readonly healthMonitor: WorkerHealthObserver | undefined;
@@ -985,7 +1000,7 @@ export class Poller {
         // ignore JSON parse failure
       }
       if (!errDetail) errDetail = response.statusText || String(response.status);
-      throw new Error(`topics/rename returned ${response.status}: ${errDetail}`);
+      throw new TopicRenameError(response.status, errDetail);
     }
     return (await response.json()) as Record<string, unknown>;
   }

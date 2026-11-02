@@ -4,6 +4,7 @@ import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { isOpencodeRoutable } from "./routing/opencode-routable.js";
 import { isPullBackend } from "./adapters/goose-pull.js";
 import { parseTitle } from "./text.js";
+import { TopicRenameError } from "./worker/poller.js";
 
 export interface SessionRenameDeps {
   storage: StorageDb;
@@ -16,6 +17,24 @@ export interface SessionRenameDeps {
   topicTimeoutMs?: number;
 }
 
+/**
+ * `POST /sessions/:id/rename {title}`: backend, then the daemon's stored title, then the topic.
+ *
+ * Status codes, for callers deciding whether to retry:
+ * - 400 bad title; 409 bound_session / pull_session / unsupported_backend: terminal.
+ * - 404: the daemon has no row. Long-idle rows are reaped after SESSION_TTL_MS and come back on
+ *   the session's next activity, so a caller about to message the session may retry after it.
+ * - 503: this daemon has no goose or opencode backend configured. Terminal.
+ * - 502 step "backend": nothing was changed; safe to retry.
+ * - 502 step "topic": backend and stored title are renamed; `worker_status`/`worker_error`
+ *   carry the worker's answer when it gave one (5xx retryable, 4xx terminal). Retrying the whole
+ *   route is safe: every step is idempotent.
+ *
+ * Accepted residual: a rename that lands while a young session's FIRST turns are running can be
+ * overwritten by the backend's own auto-namer (goose `maybe_update_name`, opencode `ensureTitle`
+ * read the title at turn start). Renaming before sending the prompt, as `./sw message --title`
+ * does, avoids it.
+ */
 export async function handleSessionRename(
   deps: SessionRenameDeps,
   sessionId: string,
@@ -108,6 +127,9 @@ export async function handleSessionRename(
           backend: "renamed",
           stored: true,
           error: err instanceof Error ? err.message : String(err),
+          ...(err instanceof TopicRenameError
+            ? { worker_status: err.status, worker_error: err.workerError }
+            : {}),
         },
         { status: 502 },
       );
