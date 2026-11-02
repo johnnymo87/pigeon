@@ -88,6 +88,8 @@ function classifyLines(text: string): LineInfo[] {
     const delim = lines[i + 1]!;
     if (head.fenced || delim.fenced || head.table) continue;
     if (!head.text.includes("|") || !DELIMITER_ROW.test(delim.text)) continue;
+    // GFM: the header must have as many cells as the delimiter row, or it is not a table.
+    if (countColumns(head.text) !== countColumns(delim.text)) continue;
     head.table = true;
     delim.table = true;
     delim.columns = countColumns(delim.text);
@@ -131,6 +133,7 @@ const ASCII_PUNCT = /[!-/:-@[-`{-~]/;
  * (`\$ \= \| \! \* \_ \> \# \~ \\ \[ \] \``) was probed and works. Not applied inside code,
  * where entities are not decoded.
  */
+const ENTITY_SHAPED = /^&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#[xX][0-9a-fA-F]+);/;
 const ENTITY_ENCODED = new Map([
   ["<", "&lt;"],
   ["&", "&amp;"],
@@ -164,8 +167,12 @@ function escapeInline(line: string, inTable: boolean): string {
       }
       continue;
     }
-    if (ENTITY_ENCODED.has(ch)) {
-      out += ENTITY_ENCODED.get(ch);
+    if (ch === "<") {
+      out += "&lt;";
+    } else if (ch === "&" && ENTITY_SHAPED.test(line.slice(i))) {
+      // Only an `&` that would be decoded: a lone `&` (R&D, `?a=1&b=2` in a URL) already
+      // renders as itself, and encoding it would break query strings in links.
+      out += "&amp;";
     } else if (ch === "$") {
       out += "\\$";
     } else if (ch === "!" && line[i + 1] === "[") {
@@ -247,7 +254,9 @@ const MD_SPECIAL = /[\\`*_[\]<>|$=~#&!]/g;
 
 function escapePlain(s: string): string {
   return s
-    .replace(MD_SPECIAL, (c) => ENTITY_ENCODED.get(c) ?? "\\" + c)
+    .replace(MD_SPECIAL, (c, i: number) =>
+      c === "&" ? (ENTITY_SHAPED.test(s.slice(i)) ? "&amp;" : "&") : (ENTITY_ENCODED.get(c) ?? "\\" + c),
+    )
     .replace(/\n/g, "  \n");
 }
 
