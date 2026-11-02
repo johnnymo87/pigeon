@@ -1,6 +1,7 @@
 import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { maybeAnswerInNamedTopic, getBoundSessionByThread } from "./named-topics";
-import { getBySession, getByThread, rename as renameTopic, topicName, topicsEnabled } from "./topics";
+import { getBySession, getByThread, topicName, topicsEnabled } from "./topics";
+import { editTopicName } from "./topic-rename";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
@@ -1152,21 +1153,9 @@ export async function handleTelegramWebhook(
       if (topicsEnabled(env)) {
         const topic = await getBySession(db, resolved.sessionId);
         if (topic && topic.message_thread_id !== null) {
-          const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-          const editRes = await tg.editForumTopic({
-            chatId: topic.chat_id,
-            messageThreadId: topic.message_thread_id,
-            name: formattedName,
-          });
+          const editRes = await editTopicName(db, env, topic, formattedName);
 
-          // TOPIC_NOT_MODIFIED means Telegram's name already equals the requested one, so the
-          // rename is effectively done — treat it as success and fall through to the D1 writes.
-          // This matches the reopen path (topic-manager.ts:77) and matters for two reasons:
-          // repeating /rename with the same title must not report a failure, and because the
-          // Telegram edit deliberately precedes the D1 writes, a crash in between leaves D1
-          // stale — re-issuing the command is the repair, and it only converges if this is
-          // not treated as an error.
-          if (!editRes.ok && editRes.kind !== "topic_not_modified") {
+          if (!editRes.ok) {
             await sendTelegramMessage(
               env,
               renameChatId,
@@ -1178,7 +1167,6 @@ export async function handleTelegramWebhook(
             return OK();
           }
 
-          await renameTopic(db, { sessionId: resolved.sessionId, name: formattedName });
           await db
             .prepare("UPDATE sessions SET label = ?, updated_at = ? WHERE session_id = ?")
             .bind(formattedName, now, resolved.sessionId)

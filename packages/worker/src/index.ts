@@ -6,6 +6,7 @@ import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
+import { handleTopicRename } from "./topic-rename";
 import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
 import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
@@ -88,9 +89,12 @@ export default {
           return handleSessionOwner(db, env, request, sessionId);
         }
 
-        // Topics (read-only)
+        // Topics
         if (path === "/topics/lookup" && method === "POST") {
           return handleTopicLookup(db, env, request);
+        }
+        if (path === "/topics/rename" && method === "POST") {
+          return handleTopicRename(db, env, request);
         }
         if (path === "/topics/named" && method === "POST") {
           return handleNamedTopic(db, env, request);
