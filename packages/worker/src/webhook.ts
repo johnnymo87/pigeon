@@ -217,6 +217,8 @@ export interface TelegramMessage {
     from?: { id: number; is_bot?: boolean; username?: string };
     text?: string;
     caption?: string;
+    /** Set instead of `text` when the replied-to message is a rich message (pigeon-p909). */
+    rich_message?: unknown;
   };
   quote?: { text?: string; is_manual?: boolean };
   // Service messages. Telegram emits these into a chat as bot-visible updates with
@@ -847,6 +849,54 @@ async function resolveReplySession(
 /**
  * Handle an incoming Telegram webhook request.
  */
+/** Plain text of a `RichText` value: a string, an array of RichText, or an object with `text`. */
+function richInlineText(node: unknown): string {
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(richInlineText).join("");
+  if (node && typeof node === "object" && "text" in node) {
+    return richInlineText((node as { text: unknown }).text);
+  }
+  return "";
+}
+
+function richBlockText(block: unknown): string {
+  if (!block || typeof block !== "object") return "";
+  const b = block as { cells?: unknown; items?: unknown; blocks?: unknown; summary?: unknown; text?: unknown };
+  if (Array.isArray(b.cells)) {
+    return b.cells
+      .map((row) =>
+        Array.isArray(row)
+          ? row.map((cell) => richInlineText((cell as { text?: unknown } | null)?.text)).join(" | ")
+          : "",
+      )
+      .filter((line) => line.length > 0)
+      .join("\n");
+  }
+  if (Array.isArray(b.items)) return richBlocksText(b.items);
+  const parts: string[] = [];
+  if (b.summary !== undefined) parts.push(richInlineText(b.summary));
+  if (b.text !== undefined) parts.push(richInlineText(b.text));
+  if (Array.isArray(b.blocks)) parts.push(richBlocksText(b.blocks));
+  return parts.filter((p) => p.length > 0).join("\n");
+}
+
+function richBlocksText(blocks: unknown[]): string {
+  return blocks.map(richBlockText).filter((t) => t.length > 0).join("\n");
+}
+
+/**
+ * Plain text of a Telegram `RichMessage` (pigeon-p909). A rich message has `rich_message` and no
+ * `text`, so a swipe-reply to one would otherwise carry no `inReplyTo` context. Paragraphs,
+ * headings, list items and quotes become lines; table rows become `a | b` lines. Defensive by
+ * construction: the shape is Telegram's, so anything unrecognised contributes nothing rather
+ * than throwing inside the webhook.
+ */
+export function richMessagePlainText(richMessage: unknown): string {
+  if (!richMessage || typeof richMessage !== "object") return "";
+  const blocks = (richMessage as { blocks?: unknown }).blocks;
+  return Array.isArray(blocks) ? richBlocksText(blocks) : "";
+}
+
 /** Longest replied-to bot text forwarded as context. */
 export const IN_REPLY_TO_MAX_CHARS = 500;
 
@@ -879,7 +929,7 @@ export function buildExecuteMetadata(
     && botName
     && replied.from.username?.toLowerCase() === botName
   ) {
-    const text = (replied.text ?? replied.caption ?? "").trim();
+    const text = (replied.text ?? replied.caption ?? richMessagePlainText(replied.rich_message)).trim();
     if (text) meta.inReplyTo = text.slice(0, IN_REPLY_TO_MAX_CHARS);
     const q = (message.quote?.text ?? "").trim();
     if (q) meta.inReplyToQuote = q.slice(0, IN_REPLY_TO_MAX_CHARS);
