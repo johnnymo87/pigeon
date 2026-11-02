@@ -118,6 +118,32 @@ describe("sanitizeBodyMarkdown", () => {
   it("treats an unclosed fence as running to the end", () => {
     expect(sanitizeBodyMarkdown("```\n$a\nb")).toBe("```\n$a\nb");
   });
+
+  it("does not read line-start inline code (```x```) as a fence", () => {
+    expect(sanitizeBodyMarkdown("```npm test``` passes\n$5")).toBe("```npm test``` passes  \n\\$5");
+  });
+
+  it("recognises fences indented under list items", () => {
+    const md = "1. step\n\n    ```\n    a $b <c>\n    ```";
+    expect(sanitizeBodyMarkdown(md)).toBe(md);
+  });
+
+  it("recognises fences inside blockquotes", () => {
+    const md = "> ```\n> a $b\n> ```";
+    expect(sanitizeBodyMarkdown(md)).toBe(md);
+  });
+
+  it("keeps a --- separator under prose from turning the prose into a heading", () => {
+    expect(sanitizeBodyMarkdown("Summary\n---\nmore")).toBe("Summary\n\n---\n\nmore");
+  });
+
+  it("escapes & so entities stay literal, as plain text showed them", () => {
+    expect(sanitizeBodyMarkdown("a &amp; b &rarr; c")).toBe("a \\&amp; b \\&rarr; c");
+  });
+
+  it("escapes inline images so Telegram does not fetch them as media", () => {
+    expect(sanitizeBodyMarkdown("badge ![ci](https://x/y.svg) ok")).toBe("badge \\![ci](https://x/y.svg) ok");
+  });
 });
 
 describe("tgMessageToMarkdown", () => {
@@ -211,6 +237,11 @@ describe("buildRichMarkdown", () => {
   it("returns null when the estimated block count exceeds the limit", () => {
     const rows = Array.from({ length: RICH_MAX_BLOCKS }, (_, i) => `| ${i} | x |`).join("\n");
     expect(buildRichMarkdown(header, plain(TABLE + "\n" + rows), footer)).toBeNull();
+  });
+
+  it("counts a list item as two blocks (item plus paragraph)", () => {
+    const items = Array.from({ length: RICH_MAX_BLOCKS / 2 }, (_, i) => `- item ${i}`).join("\n");
+    expect(buildRichMarkdown(plain(""), plain(TABLE + "\n\n" + items), plain(""))).toBeNull();
   });
 
   it("returns null when the markdown exceeds the character limit", () => {

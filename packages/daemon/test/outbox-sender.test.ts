@@ -998,6 +998,52 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
     expect((sendFn.mock.calls[0]![0] as SendNotificationInput).rich).toBeUndefined();
   });
 
+  it("drops rich after a second failed rich attempt, so a persistent Telegram 5xx cannot cost the notification", async () => {
+    seed([{ text: "only" }]);
+    const telegram5xx = {
+      ok: false,
+      kind: "http_error",
+      status: 502,
+      body: { error: "Telegram API error", details: { ok: false, error_code: 500 } },
+    };
+    let now = 5_000;
+    const sendFn = vi.fn().mockResolvedValue(telegram5xx);
+    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, chatId: "chat-123", nowFn: () => now });
+
+    await sender.processOnce();
+    // First failure: a glitch is worth one more rich try.
+    expect(JSON.parse(storage.outbox.getByNotificationId("stop-1")!.payload).rich).toEqual(RICH);
+
+    now += 10 * 60_000;
+    await sender.processOnce();
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(storage.outbox.getByNotificationId("stop-1")!.payload)).not.toHaveProperty("rich");
+
+    now += 10 * 60_000;
+    sendFn.mockResolvedValue({ ok: true });
+    await sender.processOnce();
+    expect(sendFn.mock.calls[2]![0]).not.toHaveProperty("rich");
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
+  });
+
+  it("keeps rich through a topic hold or a transport failure", async () => {
+    seed([{ text: "only" }]);
+    let now = 5_000;
+    const sendFn = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, kind: "transport_error", error: "ECONNREFUSED" })
+      .mockResolvedValueOnce({ ok: false, kind: "transport_error", error: "ECONNREFUSED" })
+      .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 502, body: { error: "topic_unavailable", reason: "poll_exhausted" } })
+      .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 502, body: { error: "topic_unavailable", reason: "poll_exhausted" } });
+    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, chatId: "chat-123", nowFn: () => now });
+    for (let i = 0; i < 4; i++) {
+      await sender.processOnce();
+      now += 10 * 60_000;
+    }
+    expect(sendFn).toHaveBeenCalledTimes(4);
+    expect(JSON.parse(storage.outbox.getByNotificationId("stop-1")!.payload).rich).toEqual(RICH);
+  });
+
   it("sends no rich field for an entry without one", async () => {
     seed([{ text: "only" }], null);
     const sendFn = vi.fn().mockResolvedValue({ ok: true });

@@ -22,7 +22,18 @@ export const RICH_MAX_COLUMNS = 20;
 
 /** A GFM table delimiter row (Hermes's regex): `|---|:-:|`, `--- | ---`, ... */
 const DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/;
-const FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})/;
+/**
+ * A fence opener, after any indentation and blockquote markers: fences under list items are
+ * indented, fences in quotes carry `>`. A backtick fence's info string cannot contain a
+ * backtick (CommonMark), so ```` ```npm test``` ```` at the start of a line is inline code,
+ * not a fence that would swallow the rest of the message.
+ */
+const FENCE_OPEN = /^(?:[ \t]*>)*[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
+const FENCE_CLOSE = /^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})\s*$/;
+/** A thematic break made of dashes: under a line of prose it would make that line a heading. */
+const DASH_RULE = /^\s{0,3}-{3,}\s*$/;
+/** A list item marker, which Telegram counts as two blocks (the item and its paragraph). */
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
 
 interface LineInfo {
   text: string;
@@ -53,7 +64,7 @@ function classifyLines(text: string): LineInfo[] {
   for (const line of lines) {
     if (fence !== null) {
       line.fenced = true;
-      const close = line.text.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+      const close = line.text.match(FENCE_CLOSE);
       if (close && close[1]![0] === fence[0] && close[1]!.length >= fence.length) {
         line.fenceLine = true;
         fence = null;
@@ -64,7 +75,7 @@ function classifyLines(text: string): LineInfo[] {
     if (open) {
       line.fenced = true;
       line.fenceLine = true;
-      fence = open[1]!;
+      fence = (open[1] ?? open[2])!;
     }
   }
 
@@ -136,8 +147,12 @@ function escapeInline(line: string, inTable: boolean): string {
       }
       continue;
     }
-    if (ch === "$" || ch === "<") {
+    if (ch === "$" || ch === "<" || ch === "&") {
+      // `&` too: plain text showed `&amp;` literally, and only a few named entities parse.
       out += "\\" + ch;
+    } else if (ch === "!" && line[i + 1] === "[") {
+      // `![alt](url)` is a media block that Telegram fetches, and inline it is a parse error.
+      out += "\\!";
     } else if (ch === "=" && (line[i + 1] === "=" || line[i - 1] === "=")) {
       out += "\\=";
     } else if (!inTable && ch === "|" && (line[i + 1] === "|" || line[i - 1] === "|")) {
@@ -187,7 +202,11 @@ export function sanitizeBodyMarkdown(text: string): string {
     if (!next) break;
     const blank = line.text.trim() === "";
     const nextBlank = next.text.trim() === "";
-    if (!blank && !nextBlank && line.table !== next.table && !line.fenced && !next.fenced) {
+    const plainPair = !blank && !nextBlank && !line.fenced && !next.fenced;
+    if (
+      plainPair &&
+      (line.table !== next.table || DASH_RULE.test(next.text) || DASH_RULE.test(line.text))
+    ) {
       out += "\n\n";
     } else if (
       !blank &&
@@ -258,12 +277,16 @@ export function tgMessageToMarkdown(msg: TgMessage): string | null {
   return out;
 }
 
-/** Upper bound on Telegram's block count: every non-blank line outside fences, plus fences. */
+/**
+ * Estimate of Telegram's block count, which includes nested blocks: every non-blank line
+ * outside fences, list items twice (item plus paragraph), plus fences. An undercount costs
+ * one rejected call and a plain fallback, not a lost message.
+ */
 function estimateBlocks(markdown: string): number {
   let blocks = 0;
   for (const line of classifyLines(markdown)) {
     if (line.fenceLine) blocks++;
-    else if (!line.fenced && line.text.trim() !== "") blocks++;
+    else if (!line.fenced && line.text.trim() !== "") blocks += LIST_ITEM.test(line.text) ? 2 : 1;
   }
   return blocks;
 }
