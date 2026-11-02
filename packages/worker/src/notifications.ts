@@ -19,6 +19,35 @@ interface SendNotificationBody {
   dir?: string;
   threaded?: boolean;
   onTopicUnavailable?: "retry" | "general";
+  /** Send the whole notification as one Telegram rich message; `text` is the fallback (pigeon-p909). */
+  rich?: { markdown?: unknown };
+}
+
+/**
+ * Suffix on `messages.notification_id` for a notification sent as one rich message. Safe
+ * because nothing looks a stop row up by its exact id: only questions are edited
+ * (`/notifications/edit`) or parsed (`q:` ids), and questions are never sent rich.
+ */
+const RICH_ID_SUFFIX = "#rich";
+
+/** Telegram's limit on a rich message's text, in characters (code points). */
+export const RICH_MAX_CHARS = 32768;
+
+/**
+ * Did Telegram refuse the rich message itself, such that the plain text may still go through?
+ * Any 4xx except a rate limit (its own kind) and "thread not found" (a topic problem, which the
+ * caller's topic recovery handles whichever mode it is in). A 5xx or an unparseable body says
+ * nothing about the markdown, so it is NOT a rejection: it surfaces as a 502 and the outbox
+ * retries the rich send.
+ */
+function isRichRejection(result: TgResult<unknown>): boolean {
+  return (
+    !result.ok &&
+    result.kind === "error" &&
+    typeof result.errorCode === "number" &&
+    result.errorCode >= 400 &&
+    result.errorCode < 500
+  );
 }
 
 interface SessionRow {
@@ -341,16 +370,25 @@ export async function handleSendNotification(
 
     // Idempotency: if notificationId was provided and we already sent this notification,
     // return the existing message data without calling Telegram again.
+    //
+    // A rich send is recorded under `<id>#rich` (pigeon-p909), so a retry of a request whose
+    // response was lost can say it was rich, and the daemon then skips the remaining plain
+    // chunks instead of posting them under a message that already shows everything.
     if (notificationId) {
       const existing = await withD1(
         "send.idempotencyLookup",
         db
-          .prepare("SELECT * FROM messages WHERE notification_id = ?")
-          .bind(notificationId)
+          .prepare("SELECT * FROM messages WHERE notification_id IN (?, ?)")
+          .bind(notificationId, `${notificationId}${RICH_ID_SUFFIX}`)
           .first<MessageRow>(),
       );
       if (existing) {
-        return json({ ok: true, messageId: existing.message_id, deduplicated: true });
+        return json({
+          ok: true,
+          messageId: existing.message_id,
+          deduplicated: true,
+          ...(existing.notification_id === `${notificationId}${RICH_ID_SUFFIX}` ? { rich: "sent" } : {}),
+        });
       }
     }
 
@@ -451,14 +489,43 @@ export async function handleSendNotification(
 
     const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
 
+    // Rich message (pigeon-p909): the daemon offers the whole notification as Telegram rich
+    // markdown when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is
+    // tried first and, once Telegram rejects it, latched off for the rest of this request, so
+    // the topic recovery and relocation below re-send plain. `rich` in the response tells the
+    // daemon whether one rich message carried the whole notification ("sent") or chunk 0 went
+    // out plain ("fallback"), in which case it sends the remaining chunks.
+    const richMarkdown =
+      typeof body.rich?.markdown === "string" && body.rich.markdown.length > 0
+        ? body.rich.markdown
+        : undefined;
+    let richEnabled = richMarkdown !== undefined && env.TELEGRAM_RICH_MESSAGES !== "off";
+    if (richEnabled && [...richMarkdown!].length > RICH_MAX_CHARS) {
+      // The daemon checks this too; a skewed or buggy daemon must not cost a round trip.
+      console.warn("[worker] rich markdown over Telegram's limit, sending plain", {
+        sessionId,
+        notificationId,
+        chars: [...richMarkdown!].length,
+      });
+      richEnabled = false;
+    }
+    let lastSendWasRich = false;
+    let richError: unknown;
+
     // Buttons to the topics of sessions the text mentions (pigeon-ylx3), unless the caller sent
     // a keyboard of its own (a question's answer buttons). Decoration: if Telegram rejects the
     // keyboard with a 400 (nothing was posted), the message is resent once without it and the
-    // rest of this handler carries on as if it had never been added.
-    let linkMarkup = hasButtons(replyMarkup)
-      ? undefined
-      : await resolveMentionKeyboard(db, text, sessionId);
-    const sendText = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+    // rest of this handler carries on as if it had never been added. Resolved lazily, and
+    // separately for the rich markdown (the whole notification) and the plain text (chunk 0),
+    // so each mode links exactly the sessions it shows.
+    const callerHasButtons = hasButtons(replyMarkup);
+    let linkMarkup: unknown;
+    let linkMarkupResolved = false;
+    const sendPlain = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+      if (!linkMarkupResolved) {
+        linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId);
+        linkMarkupResolved = true;
+      }
       const result = await tg.sendMessage({
         chatId,
         messageThreadId: threadId,
@@ -472,9 +539,53 @@ export async function handleSendNotification(
           details: getTelegramErrorDetails(result),
         });
         linkMarkup = undefined;
-        return sendText(threadId);
+        return sendPlain(threadId);
       }
       return result;
+    };
+    let richLinkMarkup: unknown;
+    let richLinkMarkupResolved = false;
+    const sendText = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+      if (richEnabled) {
+        if (!richLinkMarkupResolved) {
+          richLinkMarkup = callerHasButtons
+            ? undefined
+            : await resolveMentionKeyboard(db, richMarkdown!, sessionId);
+          richLinkMarkupResolved = true;
+        }
+        const result = await tg.sendRichMessage({
+          chatId,
+          messageThreadId: threadId,
+          markdown: richMarkdown!,
+          replyMarkup: richLinkMarkup ?? replyMarkup,
+        });
+        if (!isRichRejection(result)) {
+          lastSendWasRich = true;
+          return result;
+        }
+        if (richLinkMarkup) {
+          // The mention buttons may be what Telegram refused (sendPlain makes the same retry).
+          // Try rich once more without them before blaming the markdown.
+          console.warn("[worker] mention link buttons rejected on a rich message, resending without them", {
+            sessionId,
+            details: getTelegramErrorDetails(result),
+          });
+          richLinkMarkup = undefined;
+          return sendText(threadId);
+        }
+        // Nothing was posted (a 4xx). Fall back once, and loudly: a rich rejection means the
+        // daemon produced markdown Telegram would not take, which is a bug to go and look at.
+        richEnabled = false;
+        richError = getTelegramErrorDetails(result);
+        console.warn("[worker] rich message rejected, sending plain", {
+          sessionId,
+          notificationId,
+          messageThreadId: threadId,
+          details: richError,
+        });
+      }
+      lastSendWasRich = false;
+      return sendPlain(threadId);
     };
 
     // Call Telegram API
@@ -643,7 +754,14 @@ export async function handleSendNotification(
         .prepare(
           "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(String(chatId), messageId, sessionId, token, notificationId, Date.now())
+        .bind(
+          String(chatId),
+          messageId,
+          sessionId,
+          token,
+          notificationId && lastSendWasRich ? `${notificationId}${RICH_ID_SUFFIX}` : notificationId,
+          Date.now(),
+        )
         .run(),
     );
 
@@ -722,7 +840,17 @@ export async function handleSendNotification(
       }
     }
 
-    return json({ ok: true, messageId, token });
+    return json({
+      ok: true,
+      messageId,
+      token,
+      ...(richMarkdown !== undefined
+        ? {
+            rich: lastSendWasRich ? "sent" : "fallback",
+            ...(richError !== undefined ? { richError } : {}),
+          }
+        : {}),
+    });
   } catch (err) {
     if (err instanceof StorageError) {
       console.error("[worker] storage error", { op: err.op, error: err.message });

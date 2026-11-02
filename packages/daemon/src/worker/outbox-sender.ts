@@ -258,9 +258,49 @@ export function commitDelivery(
   })();
 }
 
+/** Upstream failures of a rich send after which the entry is sent plain (pigeon-p909). */
+export const RICH_FAILURES_BEFORE_PLAIN = 2;
+
+/**
+ * The worker's answer when Telegram itself failed the send (`502 {error: "Telegram API
+ * error"}`), as opposed to a topic hold, a rate limit or the worker being unreachable, none
+ * of which say anything about the rich message.
+ */
+function isTelegramSendFailure(result: unknown): boolean {
+  const r = result as { kind?: unknown; status?: unknown; body?: unknown };
+  return (
+    r.kind === "http_error" &&
+    r.status === 502 &&
+    !!r.body &&
+    typeof r.body === "object" &&
+    (r.body as { error?: unknown }).error === "Telegram API error"
+  );
+}
+
+/**
+ * What the worker did with a `rich` request (pigeon-p909): `"sent"` (one rich message carries
+ * the whole notification), `"fallback"` (the worker sent this chunk plain), or undefined. A
+ * success with no `rich` field comes from a worker that predates rich, which sent the chunk
+ * plain; so does a `deduplicated` answer, which cannot say what the earlier send was. Both are
+ * treated as plain, so the remaining chunks still go out: a possible duplicate, never a loss.
+ */
+function richOutcomeOf(result: unknown): "sent" | "fallback" | undefined {
+  const body = (result as { body?: unknown }).body;
+  if (!body || typeof body !== "object") return undefined;
+  const rich = (body as { rich?: unknown }).rich;
+  return rich === "sent" || rich === "fallback" ? rich : undefined;
+}
+
+function richErrorOf(result: unknown): unknown {
+  const body = (result as { body?: unknown }).body;
+  return body && typeof body === "object" ? (body as { richError?: unknown }).richError : undefined;
+}
+
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
+  /** Telegram send failures of an entry's rich attempt, by notificationId (pigeon-p909). */
+  private readonly richFailures = new Map<string, number>();
   private readonly registerSession: RegisterSessionFn | undefined;
   private readonly unregisterSession: UnregisterSessionFn | undefined;
   private readonly gateSwarmOnLocalSession: boolean;
@@ -357,6 +397,25 @@ export class OutboxSender {
   }
 
   /** Mark an outbox entry failed terminally, clean up, and log uniform outbox terminal drop. */
+  /** Removes `rich` from a stored payload so every later attempt sends plain (pigeon-p909). */
+  private dropRich(entry: { notificationId: string; sessionId: string; payload: string }, now: number, result: unknown): void {
+    try {
+      const parsed = JSON.parse(entry.payload) as Record<string, unknown>;
+      delete parsed.rich;
+      this.storage.outbox.updatePayload(entry.notificationId, JSON.stringify(parsed), now);
+      this.log("outbox rich send keeps failing, sending plain from now on", {
+        notificationId: entry.notificationId,
+        sessionId: entry.sessionId,
+        body: (result as { body?: unknown }).body,
+      });
+    } catch (err) {
+      this.log("outbox rich drop payload update failed", {
+        notificationId: entry.notificationId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private markTerminal(
     entry: OutboxRecord,
     now: number,
@@ -367,6 +426,7 @@ export class OutboxSender {
     this.storage.outbox.markFailed(entry.notificationId, now, reason, lastError);
     this.reregisteredEntries.delete(entry.notificationId);
     this.entriesSentUnderGeneral.delete(entry.notificationId);
+    this.richFailures.delete(entry.notificationId);
     const hold = this.getTopicHold(entry.sessionId, now);
     if (hold && hold.holderId === entry.notificationId) {
       this.topicHolds.delete(entry.sessionId);
@@ -539,6 +599,7 @@ export class OutboxSender {
         let title: string | undefined;
         let dir: string | undefined;
         let threaded: boolean | undefined;
+        let rich: { markdown: string } | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
             messages?: Array<{ text: string; entities?: unknown[] }>;
@@ -548,6 +609,7 @@ export class OutboxSender {
             title?: string;
             dir?: string;
             threaded?: boolean;
+            rich?: { markdown?: unknown };
           };
           messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
@@ -555,6 +617,10 @@ export class OutboxSender {
           title = parsed.title;
           dir = parsed.dir;
           threaded = parsed.threaded;
+          rich =
+            typeof parsed.rich?.markdown === "string" && parsed.rich.markdown.length > 0
+              ? { markdown: parsed.rich.markdown }
+              : undefined;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           this.markTerminal(entry, now, "payload_parse_failed", errMsg);
@@ -629,6 +695,7 @@ export class OutboxSender {
         try {
           let allOk = true;
           let sentUnderGeneral = false;
+          let sentChunks = 0;
           for (let i = 0; i < messages.length; i++) {
             const isLast = i === messages.length - 1;
             const msg = messages[i]!;
@@ -657,6 +724,10 @@ export class OutboxSender {
               dir,
               threaded,
               onTopicUnavailable,
+              // Rich rides on chunk 0 only (pigeon-p909): if the worker sends it rich, that one
+              // message is the whole notification; otherwise chunk 0 went out plain and the
+              // loop carries on exactly as it always has.
+              ...(i === 0 && rich ? { rich } : {}),
             });
 
             if (onTopicUnavailable === "general") {
@@ -700,6 +771,21 @@ export class OutboxSender {
                   reason,
                   heldForMs,
                 });
+              }
+
+              if (i === 0 && rich && isTelegramSendFailure(result)) {
+                // A rich send that keeps failing upstream (a Telegram 5xx or an unparseable
+                // answer, which the worker deliberately does NOT treat as a rejection) would
+                // otherwise retry rich until the entry expires and the answer is lost: a 5xx
+                // counts no attempt, so only the 24h age cap ends it. One retry covers a
+                // glitch; after that the entry goes plain (pigeon-p909). Counted in memory, so
+                // a restart grants one more rich try, which is harmless.
+                const failures = (this.richFailures.get(entry.notificationId) ?? 0) + 1;
+                this.richFailures.set(entry.notificationId, failures);
+                if (failures >= RICH_FAILURES_BEFORE_PLAIN) {
+                  this.dropRich(entry, now, result);
+                  this.richFailures.delete(entry.notificationId);
+                }
               }
 
               const localSession = this.storage.sessions.get(entry.sessionId);
@@ -904,12 +990,28 @@ export class OutboxSender {
               });
               break;
             }
+
+            sentChunks++;
+            if (i === 0 && rich) {
+              const richOutcome = richOutcomeOf(result);
+              if (richOutcome === "sent") break;
+              if (richOutcome === "fallback") {
+                // The worker already warned with Telegram's error; this is the daemon-side half,
+                // so the fallback is visible in the daemon journal too.
+                this.log("outbox rich send fell back to plain", {
+                  notificationId: entry.notificationId,
+                  sessionId: entry.sessionId,
+                  richError: richErrorOf(result),
+                });
+              }
+            }
           }
 
           if (allOk) {
-            commitDelivery(this.storage, entry, now, messages.length, this.log);
+            commitDelivery(this.storage, entry, now, sentChunks, this.log);
             this.reregisteredEntries.delete(entry.notificationId);
             this.entriesSentUnderGeneral.delete(entry.notificationId);
+            this.richFailures.delete(entry.notificationId);
             if (!sentUnderGeneral) {
               this.topicHolds.delete(entry.sessionId);
             }

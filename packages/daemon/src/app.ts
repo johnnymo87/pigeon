@@ -30,6 +30,7 @@ import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
 import type { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
+import { buildRichMarkdown } from "./rich-markdown";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
@@ -750,6 +751,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     });
 
     const chunks = splitTelegramMessage(notification.header, notification.body, notification.footer);
+    // A body with a pipe table also gets the whole notification as Telegram rich markdown
+    // (pigeon-p909). The plain chunks stay: they are the worker's fallback, and what a worker
+    // that predates rich sends. Stop notifications carry no buttons, so the single rich
+    // message loses nothing the last plain chunk would have carried.
+    const richMarkdown = buildRichMarkdown(notification.header, notification.body, notification.footer);
     const notificationPayload = {
       messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
       replyMarkup: notification.replyMarkup,
@@ -757,6 +763,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       title: effectiveTitle ?? undefined,
       dir: session.cwd ?? undefined,
       threaded: true,
+      ...(richMarkdown !== null ? { rich: { markdown: richMarkdown } } : {}),
     };
 
     const afterNotificationId = stopOpts?.afterNotificationId ?? null;

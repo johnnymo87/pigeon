@@ -48,7 +48,7 @@ import {
   MACHINE_ICON_COLORS,
   DEFAULT_ICON_COLOR,
 } from "../src/topics";
-import { buildExecuteMetadata, IN_REPLY_TO_MAX_CHARS } from "../src/webhook";
+import { buildExecuteMetadata, IN_REPLY_TO_MAX_CHARS, richMessagePlainText } from "../src/webhook";
 import { resolveTopic, RESERVATION_TTL_MS } from "../src/topic-manager";
 import {
   runTopicReaper,
@@ -14705,5 +14705,54 @@ describe("buildExecuteMetadata", () => {
       )!,
     );
     expect(m.inReplyToQuote).toHaveLength(IN_REPLY_TO_MAX_CHARS);
+  });
+
+  it("reads the replied-to text out of a rich message, which has no text field (pigeon-p909)", () => {
+    const bot = { id: 9, is_bot: true, username: "the_bot" };
+    const rich_message = {
+      blocks: [
+        { type: "paragraph", text: ["✅ ", { type: "bold", text: "done" }] },
+        {
+          type: "table",
+          cells: [
+            [{ text: "a", is_header: true }, { text: "b", is_header: true }],
+            [{ text: "1" }, { text: { type: "code", text: "2" } }],
+          ],
+        },
+      ],
+    };
+    const m = JSON.parse(
+      buildExecuteMetadata({ ...base, reply_to_message: { message_id: 2, from: bot, rich_message } }, undefined, env)!,
+    );
+    expect(m.inReplyTo).toBe("✅ done\na | b\n1 | 2");
+  });
+});
+
+describe("richMessagePlainText", () => {
+  it("flattens headings, lists, quotes, details and pre blocks", () => {
+    expect(
+      richMessagePlainText({
+        blocks: [
+          { type: "heading", size: 2, text: "Title" },
+          {
+            type: "list",
+            items: [
+              { label: "•", blocks: [{ type: "paragraph", text: "one" }] },
+              { label: "•", blocks: [{ type: "paragraph", text: ["two ", { type: "italic", text: "x" }] }] },
+            ],
+          },
+          { type: "blockquote", blocks: [{ type: "paragraph", text: "quoted" }] },
+          { type: "details", summary: "More", blocks: [{ type: "paragraph", text: "hidden" }] },
+          { type: "pre", text: "code()" },
+          { type: "divider" },
+        ],
+      }),
+    ).toBe("Title\none\ntwo x\nquoted\nMore\nhidden\ncode()");
+  });
+
+  it("returns an empty string for anything it does not recognise", () => {
+    expect(richMessagePlainText(undefined)).toBe("");
+    expect(richMessagePlainText({ blocks: "nope" })).toBe("");
+    expect(richMessagePlainText({ blocks: [null, 5, { type: "map" }] })).toBe("");
   });
 });
