@@ -20,8 +20,12 @@ export const RICH_MAX_CHARS = 32768;
 export const RICH_MAX_BLOCKS = 500;
 export const RICH_MAX_COLUMNS = 20;
 
-/** A GFM table delimiter row (Hermes's regex): `|---|:-:|`, `--- | ---`, ... */
-const DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/;
+/**
+ * A GFM table delimiter row: `|---|:-:|`, `--- | ---` (Hermes's regex), or a one-column `|---|`,
+ * which needs both outer pipes so a plain `---` rule is never read as one.
+ */
+const DELIMITER_ROW =
+  /^\s*(?:\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?|\|\s*:?-+:?\s*\|)\s*$/;
 /**
  * A fence opener, after any indentation and blockquote markers: fences under list items are
  * indented, fences in quotes carry `>`. A backtick fence's info string cannot contain a
@@ -120,6 +124,19 @@ export function maxTableColumns(text: string): number {
 const ASCII_PUNCT = /[!-/:-@[-`{-~]/;
 
 /**
+ * Characters Telegram's rich markdown does NOT take a backslash escape for, so they are
+ * written as entities. Probed against the live API on 2026-11-02: `Promise\<void>` rendered as
+ * `Promise\` with `<void>` silently dropped (read as an unsupported HTML tag), and `\&` kept
+ * its backslash. `&lt;` and `&amp;` render as `<` and `&`. Every other escape used here
+ * (`\$ \= \| \! \* \_ \> \# \~ \\ \[ \] \``) was probed and works. Not applied inside code,
+ * where entities are not decoded.
+ */
+const ENTITY_ENCODED = new Map([
+  ["<", "&lt;"],
+  ["&", "&amp;"],
+]);
+
+/**
  * Escapes Telegram's non-GFM extensions in one line of prose, outside inline code spans:
  * `$` (math), `<` (HTML), `==` (marked) and, off table rows, `||` (spoiler). A table row keeps
  * `||` because there it is an empty cell. An existing backslash escape is copied as is.
@@ -129,7 +146,7 @@ function escapeInline(line: string, inTable: boolean): string {
   let i = 0;
   while (i < line.length) {
     const ch = line[i]!;
-    if (ch === "\\" && i + 1 < line.length && ASCII_PUNCT.test(line[i + 1]!)) {
+    if (ch === "\\" && i + 1 < line.length && ASCII_PUNCT.test(line[i + 1]!) && !ENTITY_ENCODED.has(line[i + 1]!)) {
       out += line.slice(i, i + 2);
       i += 2;
       continue;
@@ -147,9 +164,10 @@ function escapeInline(line: string, inTable: boolean): string {
       }
       continue;
     }
-    if (ch === "$" || ch === "<" || ch === "&") {
-      // `&` too: plain text showed `&amp;` literally, and only a few named entities parse.
-      out += "\\" + ch;
+    if (ENTITY_ENCODED.has(ch)) {
+      out += ENTITY_ENCODED.get(ch);
+    } else if (ch === "$") {
+      out += "\\$";
     } else if (ch === "!" && line[i + 1] === "[") {
       // `![alt](url)` is a media block that Telegram fetches, and inline it is a parse error.
       out += "\\!";
@@ -225,10 +243,12 @@ export function sanitizeBodyMarkdown(text: string): string {
 }
 
 /** Characters escaped in pigeon's own (non-agent) text: header, footer. */
-const MD_SPECIAL = /[\\`*_[\]<>|$=~#]/g;
+const MD_SPECIAL = /[\\`*_[\]<>|$=~#&!]/g;
 
 function escapePlain(s: string): string {
-  return s.replace(MD_SPECIAL, (c) => "\\" + c).replace(/\n/g, "  \n");
+  return s
+    .replace(MD_SPECIAL, (c) => ENTITY_ENCODED.get(c) ?? "\\" + c)
+    .replace(/\n/g, "  \n");
 }
 
 function codeSpan(content: string): string {
