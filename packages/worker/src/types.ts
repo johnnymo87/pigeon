@@ -13,6 +13,8 @@ declare global {
     ALLOWED_USER_IDS?: string;
     TELEGRAM_TOPICS_ENABLED?: string;
     TELEGRAM_BOT_USERNAME?: string;
+    /** "off" disables Telegram rich messages worker-wide; anything else leaves them on (pigeon-p909). */
+    TELEGRAM_RICH_MESSAGES?: string;
     MEDIA: R2Bucket;
   }
 }

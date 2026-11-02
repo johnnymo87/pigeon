@@ -13,6 +13,14 @@ export interface SendMessageOptions {
   messageThreadId?: number;
 }
 
+export interface SendRichMessageOptions {
+  chatId: string | number;
+  /** GFM plus Telegram's extensions; see https://core.telegram.org/bots/api/rich-messages.md */
+  markdown: string;
+  replyMarkup?: unknown;
+  messageThreadId?: number;
+}
+
 export interface EditMessageTextOptions {
   chatId: string | number;
   messageId: number;
@@ -313,6 +321,35 @@ export async function sendMessage(
   });
 }
 
+/**
+ * Sends one rich message (Bot API 10.1, `sendRichMessage`) from markdown (pigeon-p909).
+ *
+ * Same shape as `sendMessage` on purpose, so the caller's topic recovery and relocation can
+ * run unchanged whichever of the two it is using. `reply_markup` accepts an inline keyboard,
+ * and the result is an ordinary `Message`, whose `message_id` routes replies like any other.
+ */
+export async function sendRichMessage(
+  botToken: string,
+  options: SendRichMessageOptions,
+): Promise<TgResult<{ message_id: number }>> {
+  const payload: Record<string, unknown> = {
+    chat_id: options.chatId,
+    rich_message: { markdown: options.markdown },
+  };
+  if (options.replyMarkup) {
+    payload.reply_markup = options.replyMarkup;
+  }
+  if (options.messageThreadId !== undefined) {
+    payload.message_thread_id = options.messageThreadId;
+  }
+
+  return callTelegram<{ message_id: number }>(botToken, "sendRichMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function editMessageText(
   botToken: string,
   options: EditMessageTextOptions,
@@ -516,6 +553,7 @@ export async function unpinAllForumTopicMessages(
 export function createTelegramClient(botToken: string) {
   return {
     sendMessage: (options: SendMessageOptions) => sendMessage(botToken, options),
+    sendRichMessage: (options: SendRichMessageOptions) => sendRichMessage(botToken, options),
     editMessageText: (options: EditMessageTextOptions) => editMessageText(botToken, options),
     sendPhoto: (options: SendPhotoOptions) => sendPhoto(botToken, options),
     sendDocument: (options: SendDocumentOptions) => sendDocument(botToken, options),
