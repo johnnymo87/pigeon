@@ -1,9 +1,10 @@
 /**
  * Markdown for Telegram's `sendRichMessage` (Bot API 10.1), used for stop notifications whose
- * body contains a GFM pipe table (pigeon-p909). Design:
- * docs/plans/2026-11-02-telegram-rich-tables-design.md.
+ * body contains a GFM pipe table (pigeon-p909), and for every goose turn (pigeon-6mkr). Design:
+ * docs/plans/2026-11-02-telegram-rich-tables-design.md and
+ * docs/plans/2026-11-03-goose-rich-markdown-design.md.
  *
- * Why only tables trigger it: plain `sendMessage` shows a table as a wall of `|`, and nothing
+ * Why only tables trigger it for opencode (whose plugin strips markdown anyway): plain `sendMessage` shows a table as a wall of `|`, and nothing
  * else agents write is unreadable that way. Turning markdown on for every message would change
  * how every answer reads, and Telegram's dialect is GFM PLUS extensions that make ordinary
  * prose fragile (`$5 and $10` is inline math, `a || b` a spoiler, `Promise<void>` an
@@ -36,6 +37,11 @@ const FENCE_OPEN = /^(?:[ \t]*>)*[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
 const FENCE_CLOSE = /^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})\s*$/;
 /** A thematic break made of dashes: under a line of prose it would make that line a heading. */
 const DASH_RULE = /^\s{0,3}-{3,}\s*$/;
+/**
+ * An ATX heading (CommonMark: up to three spaces, one to six `#`, then a space or the end).
+ * `#5387` is not one.
+ */
+const ATX_HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
 /** A list item marker, which Telegram counts as two blocks (the item and its paragraph). */
 const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
 
@@ -215,7 +221,9 @@ function findBacktickRun(line: string, from: number, len: number): number {
  *   inside fences or tables, and not next to a fence line;
  * - puts a blank line before and after every table, so a table directly under a line of
  *   prose is not read as part of that paragraph, and a line directly under a table is not
- *   read as one more row.
+ *   read as one more row;
+ * - puts a blank line before a heading under a non-blank line. Probed: Telegram folds
+ *   `- done\n# Heading` into the list item (pigeon-6mkr).
  */
 export function sanitizeBodyMarkdown(text: string): string {
   const lines = classifyLines(text);
@@ -230,7 +238,10 @@ export function sanitizeBodyMarkdown(text: string): string {
     const plainPair = !blank && !nextBlank && !line.fenced && !next.fenced;
     if (
       plainPair &&
-      (line.table !== next.table || DASH_RULE.test(next.text) || DASH_RULE.test(line.text))
+      (line.table !== next.table ||
+        DASH_RULE.test(next.text) ||
+        DASH_RULE.test(line.text) ||
+        (!next.table && ATX_HEADING.test(next.text)))
     ) {
       out += "\n\n";
     } else if (
@@ -320,18 +331,27 @@ function estimateBlocks(markdown: string): number {
   return blocks;
 }
 
+export interface BuildRichOptions {
+  /**
+   * Only offer rich when the body has a pipe table (the default, pigeon-p909). False for
+   * goose turns, whose markdown is rendered whatever it contains (pigeon-6mkr).
+   */
+  requireTable?: boolean;
+}
+
 /**
  * The rich markdown for a notification, or null when it should go plain: no table in the
- * body, a header/footer that cannot be converted, or any of Telegram's limits exceeded.
- * Layout matches the plain chunk: header, body, footer separated by blank lines, empty
- * parts skipped.
+ * body (unless `requireTable` is false), a header/footer that cannot be converted, or any of
+ * Telegram's limits exceeded. Layout matches the plain chunk: header, body, footer separated
+ * by blank lines, empty parts skipped.
  */
 export function buildRichMarkdown(
   header: TgMessage,
   body: TgMessage,
   footer: TgMessage,
+  options: BuildRichOptions = {},
 ): string | null {
-  if (!hasPipeTable(body.text)) return null;
+  if ((options.requireTable ?? true) && !hasPipeTable(body.text)) return null;
   if (maxTableColumns(body.text) > RICH_MAX_COLUMNS) return null;
 
   const head = tgMessageToMarkdown(header);

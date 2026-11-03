@@ -64,6 +64,18 @@ describe("maxTableColumns", () => {
 });
 
 describe("sanitizeBodyMarkdown", () => {
+  it("puts a blank line before a heading under a non-blank line", () => {
+    // Probed: Telegram folds "- done\n# Heading" into the list item.
+    expect(sanitizeBodyMarkdown("- done\n# Heading\ntext")).toBe("- done\n\n# Heading  \ntext");
+    expect(sanitizeBodyMarkdown("para\n### Sub")).toBe("para\n\n### Sub");
+  });
+
+  it("leaves heading-like lines that are not headings alone", () => {
+    expect(sanitizeBodyMarkdown("see\n#5387 merged")).toBe("see  \n#5387 merged");
+    expect(sanitizeBodyMarkdown("a\n\n# H")).toBe("a\n\n# H");
+    expect(sanitizeBodyMarkdown("```\nx\n# not a heading\n```")).toBe("```\nx\n# not a heading\n```");
+  });
+
   it("escapes dollar signs so amounts are not read as math", () => {
     expect(sanitizeBodyMarkdown("costs $5 and $10")).toBe("costs \\$5 and \\$10");
   });
@@ -235,6 +247,20 @@ describe("buildRichMarkdown", () => {
 
   it("returns null when the body has no table", () => {
     expect(buildRichMarkdown(header, plain("just **prose**"), footer)).toBeNull();
+  });
+
+  it("accepts a body without a table when a table is not required", () => {
+    expect(buildRichMarkdown(header, plain("just **prose** at $5"), footer, { requireTable: false })).toBe(
+      "✅ my\\_session\n\njust **prose** at \\$5\n\n🆔 `ses_1`",
+    );
+  });
+
+  it("still applies the limits when a table is not required", () => {
+    const big = "x".repeat(RICH_MAX_CHARS + 1);
+    expect(buildRichMarkdown(header, plain(big), footer, { requireTable: false })).toBeNull();
+    const n = RICH_MAX_COLUMNS + 1;
+    const wide = `|${" h |".repeat(n)}\n|${"---|".repeat(n)}\n|${" 1 |".repeat(n)}`;
+    expect(buildRichMarkdown(header, plain(wide), footer, { requireTable: false })).toBeNull();
   });
 
   it("joins header, sanitized body and footer with blank lines", () => {

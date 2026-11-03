@@ -44,6 +44,11 @@ describe("POST /stop rich payload", () => {
     expect(messages[0]!.text).toContain("| tag | $ |");
   });
 
+  it("adds no rich field for an opencode session even when the message has other markdown", async () => {
+    const payload = await stopPayload("Done, **all** good\n- one\n- two");
+    expect(payload).not.toHaveProperty("rich");
+  });
+
   it("adds no rich field when the message has no table", async () => {
     const payload = await stopPayload("Done, **all** good");
     expect(payload).not.toHaveProperty("rich");
