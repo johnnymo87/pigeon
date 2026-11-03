@@ -205,6 +205,24 @@ describe("POST /goose/turn-event", () => {
     expect(count).toBe(1);
   });
 
+  it("turn.ended -> payload offers the turn as rich markdown even without a table (pigeon-6mkr)", async () => {
+    const app = newApp();
+    const gseId = await registerGoose(app, "goose-sess-1");
+    const res = await postTurnEvent(app, {
+      v: 1,
+      type: "turn.ended",
+      session_id: "goose-sess-1",
+      upstream_id: "hk-rich",
+      stop_reason: "end_turn",
+      final_text: "**1. Done.** It will:\n- build it\n- cost $5",
+    });
+    expect(res.status).toBe(202);
+    const payload = JSON.parse(storage!.outbox.getByNotificationId(`s:${gseId}:h-hk-rich`)!.payload);
+    expect(payload.rich.markdown).toContain("**1. Done.** It will:  \n- build it  \n- cost \\$5");
+    // The plain chunks are still built for the fallback.
+    expect(payload.messages[0].text).toContain("**1. Done.** It will:");
+  });
+
   it("turn.ended with usage -> stop outbox payload message ends with usage footer", async () => {
     const app = newApp();
     const gseId = await registerGoose(app, "goose-sess-1");

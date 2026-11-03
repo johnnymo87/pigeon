@@ -727,7 +727,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // (pigeon-p909). The plain chunks stay: they are the worker's fallback, and what a worker
     // that predates rich sends. Stop notifications carry no buttons, so the single rich
     // message loses nothing the last plain chunk would have carried.
-    const richMarkdown = buildRichMarkdown(notification.header, notification.body, notification.footer);
+    // A goose turn is offered rich whatever it contains (pigeon-6mkr): goose agents write
+    // markdown and nothing strips it, unlike opencode's plugin. All goose stops (hook turns,
+    // runner turns, runner notices) come through here on a goose-acp session.
+    const richMarkdown = buildRichMarkdown(notification.header, notification.body, notification.footer, {
+      requireTable: session.backendKind !== GOOSE_BACKEND_KIND,
+    });
     const notificationPayload = {
       messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
       replyMarkup: notification.replyMarkup,

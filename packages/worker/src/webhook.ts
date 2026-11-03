@@ -873,12 +873,22 @@ function richBlockText(block: unknown): string {
       .filter((line) => line.length > 0)
       .join("\n");
   }
-  if (Array.isArray(b.items)) return richBlocksText(b.items);
+  if (Array.isArray(b.items)) return b.items.map(richListItemText).filter((t) => t.length > 0).join("\n");
   const parts: string[] = [];
   if (b.summary !== undefined) parts.push(richInlineText(b.summary));
   if (b.text !== undefined) parts.push(richInlineText(b.text));
   if (Array.isArray(b.blocks)) parts.push(richBlocksText(b.blocks));
   return parts.filter((p) => p.length > 0).join("\n");
+}
+
+/**
+ * A list item with its label (`1.`, `•`), so a swipe-reply like "go with 2" keeps the numbers
+ * it refers to (pigeon-6mkr). The label goes on the item's first line only.
+ */
+function richListItemText(item: unknown): string {
+  const text = richBlockText(item);
+  const label = (item as { label?: unknown } | null)?.label;
+  return typeof label === "string" && label.length > 0 && text.length > 0 ? `${label} ${text}` : text;
 }
 
 function richBlocksText(blocks: unknown[]): string {
@@ -889,7 +899,7 @@ function richBlocksText(blocks: unknown[]): string {
  * Plain text of a Telegram `RichMessage` (pigeon-p909). A rich message has `rich_message` and no
  * `text`, so a swipe-reply to one would otherwise carry no `inReplyTo` context. Paragraphs,
  * headings, list items and quotes become lines; table rows become `a | b` lines. Defensive by
- * construction: the shape is Telegram's, so anything unrecognised contributes nothing rather
+ * construction (list items keep their `1.`/`•` labels): the shape is Telegram's, so anything unrecognised contributes nothing rather
  * than throwing inside the webhook.
  */
 export function richMessagePlainText(richMessage: unknown): string {
