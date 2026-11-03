@@ -14747,7 +14747,30 @@ describe("richMessagePlainText", () => {
           { type: "divider" },
         ],
       }),
-    ).toBe("Title\none\ntwo x\nquoted\nMore\nhidden\ncode()");
+    ).toBe("Title\n• one\n• two x\nquoted\nMore\nhidden\ncode()");
+  });
+
+  it("keeps list numbers, so a reply like 'go with 2' still has its context (pigeon-6mkr)", () => {
+    expect(
+      richMessagePlainText({
+        blocks: [
+          {
+            type: "list",
+            items: [
+              {
+                label: "1.",
+                blocks: [
+                  { type: "paragraph", text: "Gather" },
+                  { type: "list", items: [{ label: "•", blocks: [{ type: "paragraph", text: "tickets" }] }] },
+                ],
+              },
+              { label: "2.", blocks: [{ type: "paragraph", text: "Re-review" }] },
+              { blocks: [{ type: "paragraph", text: "no label" }] },
+            ],
+          },
+        ],
+      }),
+    ).toBe("1. Gather\n• tickets\n2. Re-review\nno label");
   });
 
   it("returns an empty string for anything it does not recognise", () => {

@@ -70,6 +70,15 @@ describe("sanitizeBodyMarkdown", () => {
     expect(sanitizeBodyMarkdown("para\n### Sub")).toBe("para\n\n### Sub");
   });
 
+  it("ends a quote before an unquoted line, so the reply is not drawn inside the quote", () => {
+    // Probed: "> a  \nb" is one blockquote paragraph (lazy continuation).
+    expect(sanitizeBodyMarkdown("> You said: ship it\nI'll ship it now.")).toBe(
+      "> You said: ship it\n\nI'll ship it now.",
+    );
+    expect(sanitizeBodyMarkdown("> one\n> two\nafter")).toBe("> one  \n> two\n\nafter");
+    expect(sanitizeBodyMarkdown("- item\n  > q\n  more")).toBe("- item  \n  > q\n\n  more");
+  });
+
   it("leaves heading-like lines that are not headings alone", () => {
     expect(sanitizeBodyMarkdown("see\n#5387 merged")).toBe("see  \n#5387 merged");
     expect(sanitizeBodyMarkdown("a\n\n# H")).toBe("a\n\n# H");
