@@ -191,13 +191,16 @@ id is known only through this daemon's `sessions.backend_session_id` (NULL on a 
 whose pigeon id *is* goose's id), so every tag call maps a goose row there first
 (`daemon/src/tag-key.ts`): `/launch --backend goose [--tag]`, inheritance from a goose
 context session, `/tag` typed in a goose topic, and the footer's `which`. A `gse_` id with no
-local goose row is refused with a reason, never passed through. Every call passes `--`
-before its positional arguments.
+local goose row is refused with a reason, never passed through. `/tag <id> <tag>` also takes
+`gse_…` and `goose:<native>` targets, since the backlog view lists goose rows in the latter
+form. Every call passes `--` before its positional arguments.
 
 **A stall-watch coordinator passes on its program, not its own tag.** A coordinator is tagged
 `stall-watcher-runs`, which says nothing about the work. When a `/launch` (either backend)
 inherits from a session whose `bound_topic_key` is `stallwatch:<tag>`, typically by
 swipe-replying to a coordinator's notification, the new session gets `<tag>`. No `which` is run.
+As a backstop, a `which` answer of `stall-watcher-runs` (a coordinator row that has lost its
+binding) is never inherited either.
 
 ### Telegram Forum Topics
 

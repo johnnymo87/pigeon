@@ -57,9 +57,13 @@ export function isValidTag(tag: string): boolean {
 // Matches the shape pigeon uses elsewhere (daemon app.ts); opencode ids may
 // carry "-" and "_". A leading "ses_" means this can never look like a flag.
 const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]+$/;
+// A goose session, as pigeon names it (gse_<uuid>) or as session-tags does
+// (goose:<native id>, which is what the backlog view lists). The daemon maps a
+// gse_ id to goose:<native>; goose:gse_ is refused there and here.
+const GOOSE_ID_RE = /^(?:gse_[A-Za-z0-9_-]+|goose:(?!gse_)[A-Za-z0-9][A-Za-z0-9_.-]*)$/;
 
 export function looksLikeSessionId(token: string): boolean {
-  return typeof token === "string" && SESSION_ID_RE.test(token);
+  return typeof token === "string" && (SESSION_ID_RE.test(token) || GOOSE_ID_RE.test(token));
 }
 
 /**
@@ -94,7 +98,8 @@ export function parseTagArgs(rest: string | undefined): TagCommand {
 
   if (tokens.length === 1) {
     const tag = tokens[0]!;
-    // A lone session id is a half-typed command, not a tag named "ses_...".
+    // A lone session id is a half-typed command, not a tag named "ses_..." (or
+    // "goose:...", which is how the backlog view lists goose sessions).
     if (looksLikeSessionId(tag) || !isValidTag(tag)) {
       return { kind: "usage" };
     }

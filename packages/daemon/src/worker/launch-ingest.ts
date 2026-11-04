@@ -17,6 +17,9 @@ import type { LaunchMessage } from "./poller";
  */
 export const INHERIT_WHICH_TIMEOUT_MS = 3_000;
 
+/** stall-watch's tag for its own coordinator sessions. Never inherited. */
+const COORDINATOR_OWN_TAG = "stall-watcher-runs";
+
 /** Path of the log file shared with the home.base.nix shell wrapper. */
 const AUTO_ATTACH_LOG_PATH = "/tmp/oc-auto-attach.log";
 
@@ -240,6 +243,13 @@ async function inheritTag(
     }
     if (which.kind !== "session") {
       return `No tag inherited: ${parent} has no session tag`;
+    }
+    // Backstop for the coordinator rule above, which sees only a CURRENT
+    // binding: a coordinator row that lost it (rotated, delete failed) or never
+    // had one still carries stall-watch's own tag, which says nothing about
+    // the work and must never be copied onto a worker.
+    if (which.tag === COORDINATOR_OWN_TAG) {
+      return `Tag not inherited: ${parent} is a stall-watch coordinator with no program binding; pass --tag`;
     }
 
     // Tags live on ROOT sessions; when the context session is a subagent the

@@ -874,6 +874,21 @@ describe("ingestLaunchCommand", () => {
         expect(lastReply(input)).toContain("(program of coordinator gse_ctx-1)");
       });
 
+      it("never copies stall-watcher-runs, even from a coordinator row that lost its binding", async () => {
+        const runOcTags = setRunner();
+        const input = makeInput({
+          inheritFromSessionId: "gse_ctx-1",
+          sessions: store(goose()),
+          runOcTagsWhich: whichOut(`stall-watcher-runs\tmanual\tgoose:20261104_7\tsession\n`),
+          runOcTags,
+        });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(lastReply(input)).toContain("Tag not inherited: gse_ctx-1 is a stall-watch coordinator with no program binding");
+      });
+
       it("reports an unusable coordinator program rather than falling back to the coordinator's tag", async () => {
         const runOcTagsWhich = vi.fn();
         const runOcTags = setRunner();

@@ -45,6 +45,23 @@ describe("parseTagArgs", () => {
     expect(parsed.kind).toBe("usage");
   });
 
+  // The backlog view lists goose rows as `/tag goose:<native>` (session-tags
+  // keys goose spend that way), so those ids must work as targets, and a lone
+  // one must not tag the context session with the string "goose:...".
+  it("accepts a goose:<native> or gse_ target", () => {
+    expect(parseTagArgs("goose:20261031_1 billing")).toEqual({ kind: "set", targetSessionId: "goose:20261031_1", tag: "billing" });
+    expect(parseTagArgs("gse_ab12-cd34 billing")).toEqual({ kind: "set", targetSessionId: "gse_ab12-cd34", tag: "billing" });
+  });
+
+  it("rejects a lone goose or gse_ id rather than tagging the context session with it", () => {
+    expect(parseTagArgs("goose:20261031_1").kind).toBe("usage");
+    expect(parseTagArgs("gse_ab12-cd34").kind).toBe("usage");
+  });
+
+  it("does not treat goose:gse_ as a target (session-tags refuses it)", () => {
+    expect(parseTagArgs("goose:gse_ab12 billing").kind).toBe("usage");
+  });
+
   it("rejects an auto: tag, which oc-tags reserves for its directory fallback", () => {
     expect(parseTagArgs("auto:mono").kind).toBe("usage");
     expect(parseTagArgs("ses_f966a4af3ffeIXwkQcs07oAfBL auto:mono").kind).toBe("usage");

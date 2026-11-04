@@ -49,6 +49,16 @@ describe("tagKeyFor", () => {
     expect(tagKeyFor("gse_aaaa-bbbb", lookup(goose({ backendSessionId: "-x" }))).ok).toBe(false);
   });
 
+  it("passes a well-formed goose:<native> key through (the /tag backlog lists them)", () => {
+    expect(tagKeyFor("goose:20261031_1", lookup())).toEqual({ ok: true, key: "goose:20261031_1" });
+  });
+
+  it("refuses goose:gse_ and a goose: key that could be read oddly", () => {
+    expect(tagKeyFor("goose:gse_abc", lookup()).ok).toBe(false);
+    expect(tagKeyFor("goose:", lookup()).ok).toBe(false);
+    expect(tagKeyFor("goose:-x", lookup()).ok).toBe(false);
+  });
+
   it("works with no session store for an opencode id", () => {
     expect(tagKeyFor("ses_abc", undefined)).toEqual({ ok: true, key: "ses_abc" });
   });

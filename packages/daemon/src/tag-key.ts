@@ -55,6 +55,13 @@ export function tagKeyFor(sessionId: string, sessions: TagKeySessionLookup | und
     return { ok: true, key: `goose:${native}` };
   }
   if (OPENCODE_ID_RE.test(sessionId)) return { ok: true, key: sessionId };
+  // Already a session-tags key (the /tag backlog view lists goose rows this way).
+  if (sessionId.startsWith("goose:")) {
+    const native = sessionId.slice("goose:".length);
+    return !native.startsWith("gse_") && NATIVE_GOOSE_ID_RE.test(native)
+      ? { ok: true, key: sessionId }
+      : { ok: false, reason: `invalid goose session key ${sessionId.slice(0, 64)}` };
+  }
   if (sessionId.startsWith("gse_")) {
     return { ok: false, reason: `${sessionId} is not a goose session on this machine` };
   }

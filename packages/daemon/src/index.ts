@@ -547,7 +547,7 @@ const remoteLaunchRequester = remoteLaunchClient
         const runner = resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS);
         if (!runner) return null;
         try {
-          const res = await runner(["which", sessionId]);
+          const res = await runner(["which", "--", sessionId]);
           if (!res || res.code !== 0) return null;
           const which = parseWhichLine(String(res.stdout ?? ""));
           return which?.kind === "session" ? which.tag : null;

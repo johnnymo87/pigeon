@@ -2974,7 +2974,7 @@ describe("/launch command", () => {
       const row = await launchRow(machineId);
       expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
       expect(sent).toHaveLength(1);
-      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one`);
+      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one (a coordinator's program)`);
     });
 
     it("treats the topic's ForumTopicCreated service reply as topic context, not a swipe-reply", async () => {
