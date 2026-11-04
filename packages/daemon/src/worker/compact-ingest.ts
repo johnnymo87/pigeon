@@ -6,7 +6,7 @@ export interface CompactCommandInput {
   sessionId: string;
   chatId: string;
   machineId?: string;
-  opencodeClient: Pick<OpencodeClient, "getSessionMessages" | "summarize">;
+  opencodeClient: Pick<OpencodeClient, "getSessionMessagesPage" | "summarize">;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
 }
 
@@ -19,20 +19,49 @@ interface SessionMessage {
   parts: unknown[];
 }
 
+type UserWithModel = SessionMessage & {
+  info: { role: "user"; model: { providerID: string; modelID: string } };
+};
+
+/** Pages read back for the last user message before giving up (pigeon-hfsj). */
+const COMPACT_PAGE_LIMIT = 20;
+const COMPACT_MAX_PAGES = 5;
+
+/**
+ * The newest user message that names a model, read newest page first. The
+ * whole transcript of a large session is seconds of serve work and hundreds of
+ * MB (pigeon-hfsj); the answer is almost always in the first page.
+ */
+async function findLastUserWithModel(
+  client: Pick<OpencodeClient, "getSessionMessagesPage">,
+  sessionId: string,
+): Promise<UserWithModel | undefined> {
+  let before: string | undefined;
+  for (let page = 0; page < COMPACT_MAX_PAGES; page++) {
+    const res = await client.getSessionMessagesPage(sessionId, {
+      limit: COMPACT_PAGE_LIMIT,
+      ...(before !== undefined ? { before } : {}),
+    });
+    const found = [...(res.messages as SessionMessage[])]
+      .reverse()
+      .find(
+        (m): m is UserWithModel =>
+          m?.info?.role === "user" && !!m.info.model?.providerID && !!m.info.model?.modelID,
+      );
+    if (found) return found;
+    if (!res.nextCursor) return undefined;
+    before = res.nextCursor;
+  }
+  return undefined;
+}
+
 export async function ingestCompactCommand(input: CompactCommandInput): Promise<void> {
   const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   try {
-    const messages = (await opencodeClient.getSessionMessages(sessionId)) as SessionMessage[];
-
-    // Find the last user message to extract the current model
-    const lastUserMessage = [...messages]
-      .reverse()
-      .find(
-        (m): m is SessionMessage & { info: { role: "user"; model: { providerID: string; modelID: string } } } =>
-          m.info.role === "user" && !!m.info.model?.providerID && !!m.info.model?.modelID,
-      );
+    // The last user message carries the session's current model.
+    const lastUserMessage = await findLastUserWithModel(opencodeClient, sessionId);
 
     if (!lastUserMessage) {
       const msg = new TgMessageBuilder()

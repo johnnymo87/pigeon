@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import type { StopNotifier, AlertSeverity } from "../notification-service";
-import { notifySenderOfFailure } from "./notify-sender";
+import { notifySenderOfFailure, type DeliveryEvidence } from "./notify-sender";
 import { resolveVerifyFamily, type VerifyFamily } from "./verify-family";
 import {
   isWakeKind,
@@ -18,7 +18,16 @@ export { isWakeKind, isSuppressedFromRecovery };
 
 /** The subset of OpencodeClient the watchdog needs. */
 export interface WatchdogClient {
-  getSessionMessages(sessionId: string): Promise<unknown[]>;
+  /**
+   * One page of the transcript, newest first by page (each page chronological).
+   * The watchdog has NO unbounded read on purpose (pigeon-hfsj): it used to
+   * fetch a session's whole history every cycle, which for a 6.8k-message
+   * session was ~300 MB and ~16 s of serve work every minute, for 23 days.
+   */
+  getSessionMessagesPage(
+    sessionId: string,
+    opts: { limit: number; before?: string },
+  ): Promise<{ messages: unknown[]; nextCursor: string | null }>;
   /**
    * DELIBERATELY RETAINED THOUGH THE WATCHDOG NEVER CALLS IT (pigeon-0gxy).
    *
@@ -103,6 +112,37 @@ export const DEFAULT_DIRECTORY_TIMEOUT_MS = 5_000;
 /** See `DeliveryWatchdogOptions.stallAlertMs`. */
 export const DEFAULT_STALL_ALERT_MS = 10 * 60_000;
 
+/**
+ * How long after handoff the watchdog keeps watching a row it cannot resolve
+ * (pigeon-hfsj). Past it the row goes terminal with an honest "unconfirmed"
+ * rather than being re-examined forever.
+ *
+ * Without it several branches never end: a scheduled wake whose anchor is
+ * missing (redelivery is suppressed), a silent in-flight turn, and a turn
+ * queued behind a blocking one (pigeon-0gxy forbids preempting it). The row
+ * that caused pigeon-hfsj sat in the first for 23 days. Stopping watching does
+ * not preempt anything: it injects nothing and aborts nothing.
+ *
+ * Measured from `handed_off_at`, never from `expires_at`, which is a DELIVERY
+ * deadline (deliver_at + 6 h by default): a wake handed off near it would get
+ * a minute of watching. 24 h outlives every legitimate turn, because the
+ * nightly serve restart ends any turn older than that.
+ */
+export const DEFAULT_MAX_WATCH_MS = 24 * 60 * 60_000;
+
+/**
+ * Transcript window (pigeon-hfsj). The watchdog reads newest-first pages until
+ * every row of the session is settled (see `rowSettled`), or gives up after
+ * MAX_PAGES. Almost every check settles on the first page.
+ */
+export const DEFAULT_TRANSCRIPT_PAGE_LIMIT = 50;
+export const DEFAULT_TRANSCRIPT_MAX_PAGES = 20;
+/**
+ * Slack below a row's earliest possible write time before "anchor absent" is
+ * believed. Covers clock skew between daemon and serve stamps.
+ */
+export const TRANSCRIPT_WINDOW_MARGIN_MS = 10 * 60_000;
+
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
 
@@ -136,6 +176,12 @@ export interface DeliveryWatchdogOptions {
   stallAlertMs?: number;
   /** See {@link DEFAULT_RECEIPT_GRACE_MS}. */
   receiptGraceMs?: number;
+  /** See {@link DEFAULT_MAX_WATCH_MS}. Must exceed stuckAlertMs and stuckAbortSilenceMs. */
+  maxWatchMs?: number;
+  /** See {@link DEFAULT_TRANSCRIPT_PAGE_LIMIT}. */
+  transcriptPageLimit?: number;
+  /** See {@link DEFAULT_TRANSCRIPT_MAX_PAGES}. */
+  transcriptMaxPages?: number;
   /**
    * Whether a receipt for this message is still legitimately outstanding —
    * i.e. THIS process is holding the call that would produce it.
@@ -158,6 +204,12 @@ export interface CycleSummary {
   alerted: number;
   terminal: number;
   skipped: number;
+  /**
+   * Transcript pages and messages read this cycle. Logged so the cost of a
+   * cycle is visible: pigeon-hfsj's 300 MB-a-minute read appeared in no log.
+   */
+  transcriptPages: number;
+  transcriptMessages: number;
   /** True when this call coalesced into an already-running cycle and did no work. */
   coalesced: boolean;
   /** Set when the cycle threw and was caught at the top level; counts above
@@ -173,6 +225,8 @@ function emptySummary(coalesced = false): CycleSummary {
     alerted: 0,
     terminal: 0,
     skipped: 0,
+    transcriptPages: 0,
+    transcriptMessages: 0,
     coalesced,
   };
 }
@@ -366,21 +420,28 @@ function findSilentInFlight(
 }
 
 /**
- * The in-flight assistant turn that started before our anchor and is still
- * running — i.e. the turn blocking our prompt from ever being read.
+ * The turn blocking our prompt from being read: the NEWEST assistant message
+ * created before our anchor, if it is still in flight.
+ *
+ * Only the newest one can block. opencode runs one loop per session, so an
+ * in-flight message older than a completed one is an orphan (a serve killed
+ * mid-step never writes its `completed`), not a running turn. This used to
+ * return the newest in-flight message across ALL pre-anchor history, so one
+ * such orphan made a row wait behind it forever, and finding it needed the
+ * whole transcript. The windowed read (pigeon-hfsj) guarantees this message is
+ * in the window, so the answer no longer depends on how far back we read.
  */
 function findBlockingInFlight(
   messages: ParsedMessage[],
   anchor: number,
 ): ParsedMessage | null {
-  let blocking: ParsedMessage | null = null;
+  let newest: ParsedMessage | null = null;
   for (const m of messages) {
     if (m.role !== "assistant") continue;
-    if (m.completed !== null) continue;
     if (m.created >= anchor) continue;
-    if (blocking === null || m.created > blocking.created) blocking = m;
+    if (newest === null || m.created > newest.created) newest = m;
   }
-  return blocking;
+  return newest !== null && newest.completed === null ? newest : null;
 }
 
 function partTimestamps(part: unknown): number[] {
@@ -424,15 +485,37 @@ function lastActivityOf(msg: ParsedMessage): number {
 interface FetchOk {
   ok: true;
   messages: ParsedMessage[];
+  pages: number;
+  read: number;
 }
 interface FetchErr {
   ok: false;
   status: number | null;
   error: Error;
+  pages: number;
+  read: number;
 }
-type FetchResult = FetchOk | FetchErr;
+/**
+ * The window could not be completed: a later page failed, or the page cap was
+ * reached before every row settled. NOT an error about the session (a later
+ * page's 404 must never reach the confirmed-gone terminal), and not evidence
+ * either: an anchor missing from a truncated window may simply be older.
+ */
+interface FetchIncomplete {
+  ok: "incomplete";
+  why: string;
+  pages: number;
+  read: number;
+}
+type FetchResult = FetchOk | FetchErr | FetchIncomplete;
 
-/** OpencodeClient throws `getSessionMessages failed (<status>): <body>` on
+interface TranscriptWindow {
+  pageLimit: number;
+  maxPages: number;
+  marginMs: number;
+}
+
+/** OpencodeClient.getSessionMessagesPage throws `getSessionMessages failed (<status>): <body>` on
  *  any non-2xx response — pull the status back out of that message. */
 function extractStatus(err: unknown): number | null {
   if (err instanceof Error) {
@@ -442,23 +525,86 @@ function extractStatus(err: unknown): number | null {
   return null;
 }
 
+/**
+ * Is the window deep enough to judge this row exactly as the full transcript
+ * would?
+ *
+ * - Anchor found: every message after it is in the window (pages are read
+ *   newest first), which is all verification and silent-in-flight look at. The
+ *   blocking-turn check also needs the newest assistant message BEFORE the
+ *   anchor, so settle once one is in the window.
+ * - Anchor not found: absence is believed only once the window reaches back
+ *   past the earliest moment the envelope could have been written, minus a
+ *   margin. That is `deliverAt` (scheduled) or `createdAt`, NOT `handedOffAt`:
+ *   handoff is stamped after the SUCCESSFUL prompt_async, and an earlier
+ *   attempt that timed out may already have written the envelope minutes
+ *   before. Keying on handoff would call that copy absent and requeue a
+ *   duplicate.
+ */
+function rowSettled(
+  messages: ParsedMessage[],
+  row: SwarmMessageRecord,
+  marginMs: number,
+): boolean {
+  const anchor = findAnchor(messages, row.msgId);
+  if (anchor !== null) {
+    return messages.some((m) => m.role === "assistant" && m.created < anchor);
+  }
+  const oldest = messages[0];
+  if (!oldest) return false;
+  const earliestWrite = row.deliverAt ?? row.createdAt;
+  return oldest.created < earliestWrite - marginMs;
+}
+
+/**
+ * Read as much of the transcript as these rows need, newest page first
+ * (pigeon-hfsj). Returns the window in chronological order.
+ *
+ * "Exhausted" (no cursor) means there is nothing older: this opencode reads
+ * limit+1 rows, so a last page of exactly `limit` messages carries no cursor
+ * (measured). A server that ignores `limit` returns everything with no cursor,
+ * which is also exhausted, just expensive.
+ */
 async function fetchTranscript(
   client: WatchdogClient,
   sessionId: string,
+  rows: SwarmMessageRecord[],
+  window: TranscriptWindow,
 ): Promise<FetchResult> {
-  try {
-    const raw = await client.getSessionMessages(sessionId);
-    const messages = (Array.isArray(raw) ? raw : [])
-      .map(parseMessage)
-      .filter((m): m is ParsedMessage => m !== null);
-    return { ok: true, messages };
-  } catch (err) {
-    return {
-      ok: false,
-      status: extractStatus(err),
-      error: err instanceof Error ? err : new Error(String(err)),
-    };
+  const pages: ParsedMessage[][] = [];
+  let read = 0;
+  let before: string | undefined;
+  for (let page = 1; page <= window.maxPages; page++) {
+    let res: { messages: unknown[]; nextCursor: string | null };
+    try {
+      res = await client.getSessionMessagesPage(sessionId, {
+        limit: window.pageLimit,
+        ...(before !== undefined ? { before } : {}),
+      });
+    } catch (err) {
+      if (page === 1) {
+        return {
+          ok: false,
+          status: extractStatus(err),
+          error: err instanceof Error ? err : new Error(String(err)),
+          pages: 0,
+          read,
+        };
+      }
+      return { ok: "incomplete", why: "later-page-failed", pages: page - 1, read };
+    }
+    const raw = Array.isArray(res.messages) ? res.messages : [];
+    read += raw.length;
+    pages.unshift(
+      raw.map(parseMessage).filter((m): m is ParsedMessage => m !== null),
+    );
+    const messages = pages.flat();
+    if (!res.nextCursor || rows.every((r) => rowSettled(messages, r, window.marginMs))) {
+      return { ok: true, messages, pages: page, read };
+    }
+    before = res.nextCursor;
   }
+  return { ok: "incomplete", why: "page-cap", pages: window.maxPages, read };
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +627,8 @@ export class DeliveryWatchdog {
   private readonly maxNudges: number;
   private readonly overdueAlertMs: number;
   private readonly receiptGraceMs: number;
+  private readonly maxWatchMs: number;
+  private readonly transcriptWindow: TranscriptWindow;
   private readonly isReceiptPending: (msgId: string) => boolean;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
@@ -542,6 +690,23 @@ export class DeliveryWatchdog {
     this.maxNudges = opts.maxNudges ?? DEFAULT_MAX_NUDGES;
     this.overdueAlertMs = opts.overdueAlertMs ?? DEFAULT_OVERDUE_ALERT_MS;
     this.receiptGraceMs = opts.receiptGraceMs ?? DEFAULT_RECEIPT_GRACE_MS;
+    this.maxWatchMs = opts.maxWatchMs ?? DEFAULT_MAX_WATCH_MS;
+    // The horizon must outlast both advisories, or a row could be retired
+    // before a human was ever told it was stuck.
+    if (
+      this.maxWatchMs <= this.stuckAlertMs ||
+      this.maxWatchMs <= this.stuckAbortSilenceMs
+    ) {
+      throw new Error(
+        `delivery watchdog: maxWatchMs (${this.maxWatchMs}) must exceed ` +
+          `stuckAlertMs (${this.stuckAlertMs}) and stuckAbortSilenceMs (${this.stuckAbortSilenceMs})`,
+      );
+    }
+    this.transcriptWindow = {
+      pageLimit: opts.transcriptPageLimit ?? DEFAULT_TRANSCRIPT_PAGE_LIMIT,
+      maxPages: opts.transcriptMaxPages ?? DEFAULT_TRANSCRIPT_MAX_PAGES,
+      marginMs: TRANSCRIPT_WINDOW_MARGIN_MS,
+    };
     this.isReceiptPending = opts.isReceiptPending ?? (() => false);
     this.directoryTimeoutMs =
       opts.directoryTimeoutMs ?? DEFAULT_DIRECTORY_TIMEOUT_MS;
@@ -637,8 +802,9 @@ export class DeliveryWatchdog {
     // THE WORDING DOES NOT PICK A CAUSE, because this trigger cannot separate
     // the two. Exceeding the threshold proves only that the cycle has run that
     // long. A hung await produces it — but so does a legitimate backlog: the
-    // cycle makes up to two bounded 30s transcript fetches per eligible session,
-    // so ~10 sessions on unresponsive serves reach 10 minutes honestly. Naming
+    // cycle makes up to two bounded transcript reads per eligible session, each
+    // up to DEFAULT_TRANSCRIPT_MAX_PAGES pages of 30s requests, so a handful of
+    // sessions on unresponsive serves reach 10 minutes honestly. Naming
     // "hung" and demanding a restart would be a decisive instruction derived
     // from evidence that does not support it, and during a multi-serve outage it
     // would repeat every cycle. The follow-up alert below is what disambiguates.
@@ -1029,6 +1195,10 @@ export class DeliveryWatchdog {
 
     if (!readClient) {
       for (const row of rows) {
+        if (this.pastHorizon(row, now)) {
+          await this.retireUnwatched(row, sessionId, now, counts, "unobserved", "no healthy serve to read its transcript");
+          continue;
+        }
         counts.skipped++;
         this.log("skipped", {
           msgId: row.msgId,
@@ -1053,25 +1223,27 @@ export class DeliveryWatchdog {
       return;
     }
 
-    const initial = await fetchTranscript(readClient, sessionId);
+    const initial = await this.readWindow(readClient, sessionId, rows, counts);
     let messages: ParsedMessage[];
+
+    if (initial.ok === "incomplete") {
+      await this.skipOrRetire(rows, sessionId, now, counts, `window-incomplete:${initial.why}`);
+      return;
+    }
 
     if (!initial.ok) {
       if (initial.status === 404) {
         const alt = clients.all.find((c) => c !== readClient);
         if (!alt) {
-          for (const row of rows) {
-            counts.skipped++;
-            this.log("skipped", {
-              msgId: row.msgId,
-              sessionId,
-              reason: "404-no-second-opinion-client",
-            });
-          }
+          await this.skipOrRetire(rows, sessionId, now, counts, "404-no-second-opinion-client");
           return;
         }
 
-        const second = await fetchTranscript(alt, sessionId);
+        const second = await this.readWindow(alt, sessionId, rows, counts);
+        if (second.ok === "incomplete") {
+          await this.skipOrRetire(rows, sessionId, now, counts, `window-incomplete:${second.why}`);
+          return;
+        }
         if (second.ok) {
           // Contradicted — the "gone" serve was wrong. Proceed with the
           // second opinion's transcript, and adopt `alt` as the read client
@@ -1134,26 +1306,12 @@ export class DeliveryWatchdog {
         } else {
           // Second opinion errored too (network/5xx) — can't confirm or
           // deny. Skip this cycle, no counter bumps.
-          for (const row of rows) {
-            counts.skipped++;
-            this.log("skipped", {
-              msgId: row.msgId,
-              sessionId,
-              reason: "404-second-opinion-errored",
-            });
-          }
+          await this.skipOrRetire(rows, sessionId, now, counts, "404-second-opinion-errored");
           return;
         }
       } else {
         // 5xx/network error — skip this cycle entirely, no counter bumps.
-        for (const row of rows) {
-          counts.skipped++;
-          this.log("skipped", {
-            msgId: row.msgId,
-            sessionId,
-            reason: "fetch-error",
-          });
-        }
+        await this.skipOrRetire(rows, sessionId, now, counts, "fetch-error");
         return;
       }
     } else {
@@ -1174,6 +1332,129 @@ export class DeliveryWatchdog {
       );
       if (used) interventionUsed = true;
     }
+  }
+
+  private async readWindow(
+    client: WatchdogClient,
+    sessionId: string,
+    rows: SwarmMessageRecord[],
+    counts: CycleSummary,
+  ): Promise<FetchResult> {
+    const result = await fetchTranscript(client, sessionId, rows, this.transcriptWindow);
+    counts.transcriptPages += result.pages;
+    counts.transcriptMessages += result.read;
+    if (result.ok === "incomplete") {
+      this.log("transcript window incomplete", {
+        sessionId,
+        why: result.why,
+        pages: result.pages,
+        messages: result.read,
+      });
+    }
+    return result;
+  }
+
+  private pastHorizon(row: SwarmMessageRecord, now: number): boolean {
+    return row.handedOffAt !== null && now - row.handedOffAt > this.maxWatchMs;
+  }
+
+  /**
+   * Every branch that could not read a usable transcript this cycle. A row
+   * inside the horizon is skipped as before (retried next cycle, no state
+   * change); a row past it is retired with `unobserved` evidence, because
+   * otherwise a session the watchdog can never read (no serve, persistent
+   * 5xx, a window that never completes) keeps its rows forever.
+   */
+  private async skipOrRetire(
+    rows: SwarmMessageRecord[],
+    sessionId: string,
+    now: number,
+    counts: CycleSummary,
+    reason: string,
+  ): Promise<void> {
+    for (const row of rows) {
+      if (this.pastHorizon(row, now)) {
+        await this.retireUnwatched(row, sessionId, now, counts, "unobserved", `transcript unreadable: ${reason}`);
+        continue;
+      }
+      counts.skipped++;
+      this.log("skipped", { msgId: row.msgId, sessionId, reason });
+    }
+  }
+
+  /**
+   * The terminal for a row past {@link DEFAULT_MAX_WATCH_MS} (pigeon-hfsj).
+   *
+   * It says "unconfirmed", never "failed to deliver": the watchdog is giving up
+   * WATCHING, which is the only thing it knows. Evidence is what was observed:
+   * `present` when the anchor is in a complete window, `absent` when a
+   * complete window lacks it, `unobserved` when no window could be read.
+   *
+   * It injects and aborts nothing, so it is not limited by (and does not use)
+   * the per-session intervention budget. A wake or scheduled row has nobody
+   * watching in-band, so its payload goes to a human in a DURABLE alert keyed
+   * on the bare msg_id (the terminal slot; see suppressWakeRecovery for the
+   * namespacing that keeps advisories out of it). A nudge row is internal
+   * plumbing: marked failed and logged, nothing else.
+   */
+  private async retireUnwatched(
+    row: SwarmMessageRecord,
+    sessionId: string,
+    now: number,
+    counts: CycleSummary,
+    evidence: DeliveryEvidence,
+    observation: string,
+  ): Promise<void> {
+    const age = now - (row.handedOffAt ?? now);
+    const seen =
+      evidence === "present"
+        ? "its envelope IS in the transcript"
+        : evidence === "absent"
+          ? "its envelope is NOT in the transcript"
+          : "its transcript could not be read";
+    const reason =
+      `no turn was confirmed to have read it within ${humanDuration(this.maxWatchMs)} ` +
+      `of handoff, so the delivery watchdog stopped watching it; ${seen} (${observation})`;
+    const isNudge = row.kind === NUDGE_KIND;
+    const suppressed = isSuppressedFromRecovery(row);
+
+    let marked = false;
+    this.storage.db.transaction(() => {
+      if (!this.storage.swarm.markFailed(row.msgId, now)) return;
+      marked = true;
+      if (isNudge) return;
+      if (suppressed) {
+        this.storage.alerts.enqueue({
+          source: "wake-watch-expired",
+          refMsgId: row.msgId,
+          text: formatWakePayloadAlert(
+            row,
+            `${reason} (handed off ${humanDuration(age)} ago; observed ${new Date(now).toISOString()})`,
+            "delivery watchdog: wake unconfirmed, no longer watched",
+          ),
+          severity: "error",
+          now,
+        });
+      }
+      if (row.fromSession !== row.toSession) {
+        notifySenderOfFailure(this.storage, row, reason, now, evidence);
+      }
+    })();
+
+    if (!marked) {
+      counts.skipped++;
+      this.log("skipped", { msgId: row.msgId, sessionId, reason: "retire-row-no-longer-handed-off" });
+      return;
+    }
+    if (!isNudge && !suppressed) {
+      await this.alert(
+        "warning",
+        `delivery watchdog: msg ${row.msgId} to ${sessionId} — ${reason}`,
+      );
+    }
+    counts.terminal++;
+    this.pruneDedupe(row.msgId);
+    this.log("terminal", { msgId: row.msgId, sessionId, reason: "watch-horizon", evidence, ageMs: age });
   }
 
   /** Shared skip block for every "we already used this cycle's one
@@ -1282,6 +1563,31 @@ export class DeliveryWatchdog {
     interventionAlreadyUsed: boolean,
   ): Promise<boolean> {
     const anchor = findAnchor(messages, row.msgId);
+
+    // Past the horizon: verification still wins (a late turn that read it is a
+    // success), otherwise stop watching. Before every other branch, because each
+    // of them can repeat forever (pigeon-hfsj).
+    if (this.pastHorizon(row, now)) {
+      if (anchor !== null) {
+        const late = findVerificationEvidence(messages, anchor);
+        if (late) {
+          this.storage.swarm.markVerified(row.msgId, now);
+          this.pruneDedupe(row.msgId);
+          counts.verified++;
+          this.log("verified", { msgId: row.msgId, sessionId, reason: late });
+          return false;
+        }
+      }
+      await this.retireUnwatched(
+        row,
+        sessionId,
+        now,
+        counts,
+        anchor !== null ? "present" : "absent",
+        anchor !== null ? "no turn after it confirmed reading it" : "it never appeared",
+      );
+      return false;
+    }
 
     if (anchor === null) {
       // The 2xx lied (or the write was lost) — our prompt never made it

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { pagesFrom } from "./transcript-pages";
 import { ingestCompactCommand, type CompactCommandInput } from "../src/worker/compact-ingest";
 
 describe("ingestCompactCommand", () => {
@@ -8,7 +9,7 @@ describe("ingestCompactCommand", () => {
       sessionId: "sess-xyz",
       chatId: "99999",
       opencodeClient: {
-        getSessionMessages: vi.fn().mockResolvedValue([]),
+        getSessionMessagesPage: vi.fn(pagesFrom(async () => [])),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
       sendTelegramReply: vi.fn().mockResolvedValue(undefined),
@@ -22,14 +23,14 @@ describe("ingestCompactCommand", () => {
     ];
     const input = makeInput({
       opencodeClient: {
-        getSessionMessages: vi.fn().mockResolvedValue(messages),
+        getSessionMessagesPage: vi.fn(pagesFrom(async () => messages)),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
     });
 
     await ingestCompactCommand(input);
 
-    expect(input.opencodeClient.getSessionMessages).toHaveBeenCalledWith("sess-xyz");
+    expect(input.opencodeClient.getSessionMessagesPage).toHaveBeenCalledWith("sess-xyz", { limit: 20 });
     expect(input.opencodeClient.summarize).toHaveBeenCalledWith(
       "sess-xyz",
       "anthropic",
@@ -45,7 +46,7 @@ describe("ingestCompactCommand", () => {
     ];
     const input = makeInput({
       opencodeClient: {
-        getSessionMessages: vi.fn().mockResolvedValue(messages),
+        getSessionMessagesPage: vi.fn(pagesFrom(async () => messages)),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
     });
@@ -65,7 +66,7 @@ describe("ingestCompactCommand", () => {
     ];
     const input = makeInput({
       opencodeClient: {
-        getSessionMessages: vi.fn().mockResolvedValue(messages),
+        getSessionMessagesPage: vi.fn(pagesFrom(async () => messages)),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
     });
@@ -91,7 +92,7 @@ describe("ingestCompactCommand", () => {
     ];
     const input = makeInput({
       opencodeClient: {
-        getSessionMessages: vi.fn().mockResolvedValue(messages),
+        getSessionMessagesPage: vi.fn(pagesFrom(async () => messages)),
         summarize: vi.fn().mockRejectedValue(new Error("summarize server error")),
       },
     });
@@ -108,7 +109,7 @@ describe("ingestCompactCommand", () => {
     const input = makeInput({
       machineId: "devbox",
       opencodeClient: {
-        getSessionMessages: vi.fn().mockRejectedValue(new Error("connection failed")),
+        getSessionMessagesPage: vi.fn().mockRejectedValue(new Error("connection failed")),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
     });
@@ -119,5 +120,25 @@ describe("ingestCompactCommand", () => {
       "99999",
       expect.stringContaining("devbox"),
     );
+  });
+});
+
+describe("ingestCompactCommand paging (pigeon-hfsj)", () => {
+  it("pages back past assistant-only pages to find the model, without reading everything", async () => {
+    const messages: unknown[] = [
+      { info: { role: "user", model: { providerID: "p", modelID: "m" } }, parts: [] },
+      ...Array.from({ length: 45 }, () => ({ info: { role: "assistant" }, parts: [] })),
+    ];
+    const page = vi.fn(pagesFrom(async () => messages));
+    const summarize = vi.fn().mockResolvedValue(undefined);
+    await ingestCompactCommand({
+      commandId: "c",
+      sessionId: "s",
+      chatId: "1",
+      opencodeClient: { getSessionMessagesPage: page, summarize },
+      sendTelegramReply: vi.fn(),
+    });
+    expect(page).toHaveBeenCalledTimes(3);
+    expect(summarize).toHaveBeenCalledWith("s", "p", "m");
   });
 });

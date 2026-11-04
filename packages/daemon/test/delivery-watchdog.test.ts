@@ -9,6 +9,7 @@ import {
   type WatchdogClient,
 } from "../src/swarm/delivery-watchdog";
 import { NUDGE_KIND } from "../src/swarm/delivery-policy";
+import { pagesFrom } from "./transcript-pages";
 
 // ---------------------------------------------------------------------------
 // Transcript builders — mirror opencode's GET /session/:id/message shape.
@@ -70,12 +71,21 @@ function alertRows(storage: any) {
 // Fixture
 // ---------------------------------------------------------------------------
 
+/**
+ * `getSessionMessages` is the whole transcript the test sets up; the watchdog
+ * reads it through `getSessionMessagesPage`, paged the way opencode pages it
+ * (pigeon-hfsj). Transcripts here are far under a page, so most tests see one
+ * page, exactly as before.
+ */
 function makeClient(): WatchdogClient & {
   getSessionMessages: ReturnType<typeof vi.fn>;
+  getSessionMessagesPage: ReturnType<typeof vi.fn>;
   abortSession: ReturnType<typeof vi.fn>;
 } {
+  const getSessionMessages = vi.fn(async (_sessionId: string) => [] as unknown[]);
   return {
-    getSessionMessages: vi.fn(async () => [] as unknown[]),
+    getSessionMessages,
+    getSessionMessagesPage: vi.fn(pagesFrom((id) => getSessionMessages(id))),
     abortSession: vi.fn(async () => {}),
   };
 }
@@ -2076,8 +2086,9 @@ describe("DeliveryWatchdog", () => {
       const row = alertRows(storage)[0]!;
       storage.alerts.markSent(String(row.id), f.now + 1_000);
 
-      // The hourly sweep, a day later: past the 1h sent-retention.
-      const later = f.now + 24 * 60 * 60 * 1000;
+      // The hourly sweep, two hours later: past the 1h sent-retention, and
+      // inside the 24h watch horizon (past it the row is retired instead).
+      const later = f.now + 2 * 60 * 60 * 1000;
       storage.alerts.cleanupOlderThan(later - 60 * 60 * 1000, later - 7 * 24 * 60 * 60 * 1000);
 
       const restarted = new DeliveryWatchdog({
@@ -3809,6 +3820,303 @@ describe("DeliveryWatchdog", () => {
       expect(row.state).toBe("handed_off");
       expect(row.verifiedAt).toBeNull();
       expect(row.requeueCount).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // pigeon-hfsj: bounded transcript window and the watch horizon
+  // -------------------------------------------------------------------------
+  describe("pigeon-hfsj: bounded transcript window", () => {
+    const HOUR = 60 * 60_000;
+
+    /** n filler turns (user then completed assistant) ending before `until`. */
+    function filler(n: number, until: number): unknown[] {
+      const out: unknown[] = [];
+      for (let i = n; i > 0; i--) {
+        const t = until - i * 10_000;
+        out.push(userMessage(t, "filler"));
+        out.push(assistantMessage({ created: t + 1, completed: t + 2 }));
+      }
+      return out;
+    }
+
+    function setup(transcript: unknown[], row: { msgId: string; handedOffAt: number; createdAt?: number }) {
+      const f = makeFixture();
+      fixture = f;
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue(transcript);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.storage.swarm.insert(
+        {
+          msgId: row.msgId,
+          fromSession: "ses_a",
+          toSession: "ses_b",
+          channel: null,
+          kind: "chat",
+          priority: "normal",
+          replyTo: null,
+          payload: "p",
+        },
+        row.createdAt ?? row.handedOffAt,
+      );
+      f.storage.swarm.markHandedOff(row.msgId, row.handedOffAt);
+      return { ...f, client };
+    }
+
+    it("never reads the whole transcript: a verified row in a 2,000-message session costs one page", async () => {
+      const base = 100 * HOUR;
+      const f = setup(
+        [
+          ...filler(1000, base),
+          userMessage(base + 10, `<swarm_message v="1" msg_id="m_big">`),
+          assistantMessage({ created: base + 20, completed: base + 30 }),
+        ],
+        { msgId: "m_big", handedOffAt: base },
+      );
+      f.setNow(base + 400_000);
+
+      const summary = await f.watchdog.processOnce();
+
+      expect(f.storage.swarm.getByMsgId("m_big")!.verifiedAt).toBe(base + 400_000);
+      expect(f.client.getSessionMessagesPage).toHaveBeenCalledTimes(1);
+      expect(f.client.getSessionMessagesPage.mock.calls[0]![1]).toEqual({ limit: 50 });
+      expect(summary.transcriptPages).toBe(1);
+      expect(summary.transcriptMessages).toBe(50);
+    });
+
+    it("pages back until a missing anchor is believable, then requeues (absence is evidence only in a deep enough window)", async () => {
+      const base = 100 * HOUR;
+      // Envelope absent; 300 turns (600 msgs, 10 s apart) end at base, so the
+      // window must reach 10 min (120 msgs) before createdAt to believe it.
+      const f = setup(filler(300, base), {
+        msgId: "m_absent",
+        handedOffAt: base,
+        createdAt: base,
+      });
+      f.setNow(base + 400_000);
+
+      const summary = await f.watchdog.processOnce();
+
+      // Settled once the oldest message read is < createdAt - 10 min, not before.
+      expect(summary.transcriptPages).toBe(3);
+      expect(f.storage.swarm.getByMsgId("m_absent")!.state).toBe("queued");
+      expect(summary.requeued).toBe(1);
+    });
+
+    it("a window cut off by the page cap is NOT evidence of absence: skip, change nothing", async () => {
+      const base = 100 * HOUR;
+      const f = makeFixture();
+      fixture = f;
+      const client = makeClient();
+      client.getSessionMessages.mockResolvedValue(filler(2000, base + 24 * HOUR));
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({ msgId: "m_cap", fromSession: "ses_a", toSession: "ses_b", handedOffAt: base });
+      f.setNow(base + 400_000);
+
+      const summary = await f.watchdog.processOnce();
+
+      expect(client.getSessionMessagesPage).toHaveBeenCalledTimes(20);
+      const row = f.storage.swarm.getByMsgId("m_cap")!;
+      expect(row.state).toBe("handed_off");
+      expect(row.requeueCount).toBe(0);
+      expect(summary.skipped).toBe(1);
+    });
+
+    it("a later page failing (even with 404) is incomplete, never the confirmed-gone terminal", async () => {
+      const base = 100 * HOUR;
+      const f = makeFixture();
+      fixture = f;
+      const all = filler(200, base + 24 * HOUR);
+      const client = makeClient();
+      client.getSessionMessagesPage.mockImplementation(async (_id: string, opts: { limit: number; before?: string }) => {
+        if (opts.before !== undefined) throw new Error("getSessionMessages failed (404): gone");
+        return { messages: all.slice(-opts.limit), nextCursor: "x" };
+      });
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({ msgId: "m_p2", fromSession: "ses_a", toSession: "ses_b", handedOffAt: base });
+      f.setNow(base + 400_000);
+
+      await f.watchdog.processOnce();
+
+      expect(f.storage.swarm.getByMsgId("m_p2")!.state).toBe("handed_off");
+      expect(f.storage.db.prepare("SELECT count(*) n FROM swarm_messages WHERE kind='delivery.failed'").get()).toEqual({ n: 0 });
+    });
+
+    it("an anchored row reads back to the newest assistant turn before the anchor, so a blocking turn is still seen", async () => {
+      const base = 100 * HOUR;
+      // A long-running turn started before our prompt, then 80 user messages
+      // queued after it (2 pages of 50), then our envelope.
+      const queued: unknown[] = [];
+      for (let i = 0; i < 80; i++) queued.push(userMessage(base - 80_000 + i * 1000, "queued"));
+      const f = setup(
+        [
+          ...filler(30, base - 200_000),
+          assistantMessage({ created: base - 100_000, completed: null, parts: [toolPart(base - 99_000)] }),
+          ...queued,
+          userMessage(base, `<swarm_message v="1" msg_id="m_blocked">`),
+        ],
+        { msgId: "m_blocked", handedOffAt: base },
+      );
+      f.setNow(base + 400_000);
+
+      const summary = await f.watchdog.processOnce();
+
+      expect(summary.transcriptPages).toBe(2);
+      const row = f.storage.swarm.getByMsgId("m_blocked")!;
+      // Waiting behind the turn: not nudged, not requeued.
+      expect(row.nudgeCount).toBe(0);
+      expect(summary.nudged).toBe(0);
+      expect(f.client.abortSession).not.toHaveBeenCalled();
+    });
+
+    it("an in-flight orphan OLDER than a completed turn no longer blocks forever: the row is nudged", async () => {
+      const base = 100 * HOUR;
+      const f = setup(
+        [
+          assistantMessage({ created: base - 50_000, completed: null }), // orphan from a killed serve
+          assistantMessage({ created: base - 10_000, completed: base - 5_000 }),
+          userMessage(base, `<swarm_message v="1" msg_id="m_orphan">`),
+        ],
+        { msgId: "m_orphan", handedOffAt: base },
+      );
+      f.setNow(base + 400_000);
+
+      const summary = await f.watchdog.processOnce();
+
+      expect(summary.nudged).toBe(1);
+    });
+  });
+
+  describe("pigeon-hfsj: watch horizon", () => {
+    const HOUR = 60 * 60_000;
+    const base = 1000 * HOUR;
+    const now = base + 25 * HOUR;
+
+    function horizonFixture(transcript: unknown[] | Error, row: { kind?: string; deliverAt?: number | null; from?: string }) {
+      const f = makeFixture();
+      fixture = f;
+      f.setNow(now);
+      const client = makeClient();
+      if (transcript instanceof Error) client.getSessionMessages.mockRejectedValue(transcript);
+      else client.getSessionMessages.mockResolvedValue(transcript);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({
+        msgId: "m_h",
+        fromSession: row.from ?? "ses_a",
+        toSession: "ses_b",
+        handedOffAt: base,
+        kind: row.kind,
+        deliverAt: row.deliverAt,
+        payload: "HORIZON_PAYLOAD",
+      });
+      return { ...f, client };
+    }
+
+    function notices(storage: StorageDb) {
+      return storage.db
+        .prepare("SELECT payload FROM swarm_messages WHERE kind = 'delivery.failed'")
+        .all() as Array<{ payload: string }>;
+    }
+
+    it("the pigeon-hfsj row: a scheduled self-wake whose anchor never appeared is retired once, with its payload alerted durably", async () => {
+      const f = horizonFixture([userMessage(base - 20 * 60_000, "unrelated")], {
+        kind: "chat",
+        deliverAt: base - 60_000,
+        from: "ses_b",
+      });
+
+      const s1 = await f.watchdog.processOnce();
+
+      expect(s1.terminal).toBe(1);
+      expect(f.storage.swarm.getByMsgId("m_h")!.state).toBe("failed");
+      const alerts = alertRows(f.storage).filter((a) => a.source === "wake-watch-expired");
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.ref_msg_id).toBe("m_h");
+      expect(String(alerts[0]!.text)).toContain("HORIZON_PAYLOAD");
+      expect(notices(f.storage)).toHaveLength(0); // self-wake: no sender to notify
+
+      // Gone from the watch set: the next cycle reads nothing.
+      f.client.getSessionMessagesPage.mockClear();
+      f.setNow(now + 60_000);
+      await f.watchdog.processOnce();
+      expect(f.client.getSessionMessagesPage).not.toHaveBeenCalled();
+    });
+
+    it("a row still waiting behind a blocking turn after 24 h is retired as UNCONFIRMED (present), without aborting the turn", async () => {
+      const f = horizonFixture(
+        [
+          assistantMessage({ created: base - 1000, completed: null, parts: [toolPart(base - 900)] }),
+          userMessage(base, `<swarm_message v="1" msg_id="m_h">`),
+        ],
+        {},
+      );
+
+      const s = await f.watchdog.processOnce();
+
+      expect(s.terminal).toBe(1);
+      expect(f.storage.swarm.getByMsgId("m_h")!.state).toBe("failed");
+      expect(f.client.abortSession).not.toHaveBeenCalled();
+      const [n] = notices(f.storage);
+      expect(n!.payload).toContain("DELIVERY UNCONFIRMED");
+      expect(n!.payload).toContain("stopped watching");
+      expect(f.sendPlainAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it("verification still wins past the horizon", async () => {
+      const f = horizonFixture(
+        [
+          userMessage(base, `<swarm_message v="1" msg_id="m_h">`),
+          assistantMessage({ created: base + 10, completed: base + 20 }),
+        ],
+        {},
+      );
+
+      const s = await f.watchdog.processOnce();
+
+      expect(s.verified).toBe(1);
+      expect(f.storage.swarm.getByMsgId("m_h")!.state).toBe("handed_off");
+      expect(f.storage.swarm.getByMsgId("m_h")!.verifiedAt).toBe(now);
+    });
+
+    it("a transcript that can never be read (persistent 5xx) retires with 'unobserved' evidence", async () => {
+      const f = horizonFixture(new Error("getSessionMessages failed (500): boom"), {});
+
+      const s = await f.watchdog.processOnce();
+
+      expect(s.terminal).toBe(1);
+      expect(f.storage.swarm.getByMsgId("m_h")!.state).toBe("failed");
+      expect(notices(f.storage)).toHaveLength(1);
+    });
+
+    it("an anchor missing from a complete window past the horizon tells the sender it was NOT received", async () => {
+      const f = horizonFixture([userMessage(base - 20 * 60_000, "unrelated")], {});
+
+      await f.watchdog.processOnce();
+
+      expect(notices(f.storage)[0]!.payload).toContain("NOT received");
+    });
+
+    it("rows inside the horizon are untouched by it", async () => {
+      const f = horizonFixture(new Error("getSessionMessages failed (500): boom"), {});
+      f.setNow(base + 23 * HOUR);
+
+      const s = await f.watchdog.processOnce();
+
+      expect(s.terminal).toBe(0);
+      expect(f.storage.swarm.getByMsgId("m_h")!.state).toBe("handed_off");
+    });
+
+    it("refuses a horizon that does not outlast the advisories", () => {
+      const storage = openStorageDb(":memory:");
+      expect(
+        () =>
+          new DeliveryWatchdog({
+            storage,
+            resolveClients: () => ({ preferred: undefined, all: [] }),
+            maxWatchMs: 60_000,
+          }),
+      ).toThrow(/maxWatchMs/);
+      storage.db.close();
     });
   });
 });

@@ -317,40 +317,45 @@ describe("OpencodeClient", () => {
     });
   });
 
-  describe("getSessionMessages", () => {
-    it("calls GET /session/:id/message and returns parsed JSON array", async () => {
-      const messages = [
-        { role: "user", content: "hello" },
-        { role: "assistant", content: "hi there" },
-      ];
-      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(messages), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }));
-
-      const client = new OpencodeClient({
+  // pigeon-hfsj: the bounded read the watchdog pages with.
+  describe("getSessionMessagesPage", () => {
+    const client = () =>
+      new OpencodeClient({
         baseUrl: "http://localhost:4320",
         fetchFn: fetchMock as unknown as typeof fetch,
       });
 
-      const result = await client.getSessionMessages("sess-abc");
+    it("sends limit (and before, encoded) and returns the page plus X-Next-Cursor", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify([{ a: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "X-Next-Cursor": "eyJ+/=" },
+      }));
 
-      expect(result).toEqual(messages);
+      const result = await client().getSessionMessagesPage("sess-abc", { limit: 50, before: "c+/=" });
+
+      expect(result).toEqual({ messages: [{ a: 1 }], nextCursor: "eyJ+/=" });
       expect(fetchMock).toHaveBeenCalledWith(
-        "http://localhost:4320/session/sess-abc/message",
+        "http://localhost:4320/session/sess-abc/message?limit=50&before=c%2B%2F%3D",
         expect.objectContaining({ method: "GET" }),
       );
     });
 
-    it("throws on non-ok response", async () => {
+    it("returns nextCursor null on the oldest page, and omits before on the first", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("[]", { status: 200 }));
+
+      const result = await client().getSessionMessagesPage("sess-abc", { limit: 50 });
+
+      expect(result).toEqual({ messages: [], nextCursor: null });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://localhost:4320/session/sess-abc/message?limit=50",
+        expect.anything(),
+      );
+    });
+
+    it("keeps getSessionMessages' error text, which callers parse for the status", async () => {
       fetchMock.mockResolvedValueOnce(new Response("session not found", { status: 404 }));
 
-      const client = new OpencodeClient({
-        baseUrl: "http://localhost:4320",
-        fetchFn: fetchMock as unknown as typeof fetch,
-      });
-
-      await expect(client.getSessionMessages("sess-abc")).rejects.toThrow(
+      await expect(client().getSessionMessagesPage("sess-abc", { limit: 50 })).rejects.toThrow(
         "getSessionMessages failed (404): session not found",
       );
     });
@@ -371,6 +376,7 @@ describe("OpencodeClient", () => {
         ok: status >= 200 && status < 300,
         status,
         statusText: "OK",
+        headers: new Headers(),
         json: () => new Promise<never>(() => {}),
         text: () => new Promise<never>(() => {}),
       }) as unknown as Response;
@@ -385,7 +391,7 @@ describe("OpencodeClient", () => {
         requestTimeoutMs: 30_000,
       });
 
-      const pending = client.getSessionMessages("sess-abc");
+      const pending = client.getSessionMessagesPage("sess-abc", { limit: 50 });
       const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
       await vi.advanceTimersByTimeAsync(30_000);
       await assertion;
@@ -403,7 +409,7 @@ describe("OpencodeClient", () => {
         requestTimeoutMs: 30_000,
       });
 
-      const pending = client.getSessionMessages("sess-abc");
+      const pending = client.getSessionMessagesPage("sess-abc", { limit: 50 });
       const assertion = expect(pending).rejects.toThrow(/timed out after 30000ms/);
       await vi.advanceTimersByTimeAsync(30_000);
       await assertion;
@@ -424,7 +430,7 @@ describe("OpencodeClient", () => {
         requestTimeoutMs: 30_000,
       });
 
-      const pending = client.getSessionMessages("sess-abc").catch((e: unknown) => e);
+      const pending = client.getSessionMessagesPage("sess-abc", { limit: 50 }).catch((e: unknown) => e);
       await vi.advanceTimersByTimeAsync(30_000);
       const err = (await pending) as Error;
 
@@ -445,7 +451,7 @@ describe("OpencodeClient", () => {
         requestTimeoutMs: 30_000,
       });
 
-      await expect(client.getSessionMessages("sess-abc")).rejects.toThrow(
+      await expect(client.getSessionMessagesPage("sess-abc", { limit: 50 })).rejects.toThrow(
         "getSessionMessages failed (404): gone",
       );
     });
