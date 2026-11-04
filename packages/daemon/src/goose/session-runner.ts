@@ -1529,7 +1529,9 @@ export class GooseSessionRunner {
       (messageId !== undefined && turn.lastTextMessageId !== undefined
         ? messageId !== turn.lastTextMessageId
         : turn.toolSinceText === true);
-    const piece = newStep ? stepSeparator(turn.text[turn.text.length - 1]!) + text : text;
+    // goose often streams "\n" as a chunk of its own, so look at the tail of
+    // the last two pieces, not one.
+    const piece = newStep ? stepSeparator(turn.text.slice(-2).join("").slice(-2)) + text : text;
     turn.text.push(piece);
     turn.bytes += piece.length;
     turn.lastTextMessageId = messageId;

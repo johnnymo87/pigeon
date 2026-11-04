@@ -357,6 +357,17 @@ describe("GooseSessionRunner turn lifecycle", () => {
     expect(stops[0]!.message).toBe("first\n\nsecond still second");
   });
 
+  it("counts a newline streamed as its own chunk toward the blank line", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate(chunk("foo\n", "m1"));
+    runner.onUpdate(chunk("\n", "m1"));
+    runner.onUpdate(chunk("bar", "m2"));
+    client.finishTurn("end_turn");
+    await runner.settled();
+    expect(stops[0]!.message).toBe("foo\n\nbar");
+  });
+
   it("touches the session on delivery so the reaper does not collect it", async () => {
     // Every writer of last_seen today is opencode-plugin-driven. A goose session
     // nobody touches is reaped and its Telegram topic unregistered while the
