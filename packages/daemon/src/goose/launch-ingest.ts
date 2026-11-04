@@ -1,5 +1,6 @@
 import { TgMessageBuilder, type TgEntity } from "../telegram-message.js";
-import { expandShorthand, resolveHome } from "../worker/launch-ingest.js";
+import { expandShorthand, resolveHome, tagLaunchedSession } from "../worker/launch-ingest.js";
+import type { OcTagsRunner } from "../worker/oc-tags.js";
 import { registerGooseSession, type GooseSessionStore } from "./register-session.js";
 import { classifyReachability, type Reachability } from "./preflight.js";
 import type { SessionRecord } from "../storage/types.js";
@@ -78,6 +79,27 @@ export interface GooseLaunchInput {
   now?: () => number;
   /** Bound on the two mint calls. See the file header. */
   mintTimeoutMs?: number;
+  /**
+   * `/launch --backend goose --tag <tag>`. Applied as `set -- <tag>
+   * goose:<native id>`: session-tags keys goose sessions by goose's own id,
+   * never by pigeon's gse_ id (which it refuses).
+   */
+  tag?: string;
+  /**
+   * The /launch's context session (its topic or a swipe-reply), set by the
+   * worker when there is no `--tag`. Resolved through `sessions` exactly as on
+   * the opencode path, including the coordinator-program rule.
+   */
+  inheritFromSessionId?: string;
+  /** null (or absent) means oc-tags is not installed on this machine. */
+  runOcTags?: OcTagsRunner | null;
+  /** The inheritance `which`, on a short budget. Absent: falls back to runOcTags. */
+  runOcTagsWhich?: OcTagsRunner | null;
+  /**
+   * Called with the PIGEON id once a tag is written, so the footer's cached
+   * tag (keyed by pigeon id) is refetched. A throw is swallowed.
+   */
+  onTagged?: (sessionId: string) => void;
   /** Injected for tests. */
   reachability?: typeof classifyReachability;
   mintPigeonId?: () => string;
@@ -216,6 +238,32 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
     failure = `starting its first turn failed: ${err instanceof Error ? err.message : String(err)}`;
   }
 
+  // Tag once the session is registered, whether or not its first prompt went
+  // through: the session exists and will be revived, and its spend belongs to
+  // the work it was launched for either way. After the prompt, like the
+  // opencode path, so bookkeeping never delays the turn; session-tags joins
+  // costs at read time, so a tag written a second late still covers every
+  // dollar. Never throws (see tagLaunchedSession).
+  let tagLine: string | null = null;
+  if (sessionId !== undefined && (input.tag !== undefined || input.inheritFromSessionId !== undefined)) {
+    const pigeonId = sessionId;
+    tagLine = await tagLaunchedSession(
+      {
+        commandId: input.commandId,
+        ...(input.tag !== undefined ? { tag: input.tag } : {}),
+        ...(input.inheritFromSessionId !== undefined ? { inheritFromSessionId: input.inheritFromSessionId } : {}),
+        sessions: input.sessions,
+        runOcTags: input.runOcTags ?? null,
+        ...(input.runOcTagsWhich !== undefined ? { runOcTagsWhich: input.runOcTagsWhich } : {}),
+        onTagged: () => input.onTagged?.(pigeonId),
+      },
+      // registerGooseSession stored this as backend_session_id; it is goose's
+      // own id and the key goose spend is ledgered under.
+      `goose:${backendSessionId}`,
+      machineLabel,
+    );
+  }
+
   // Sending is OUTSIDE the try on purpose. Inside, a send that threw would be
   // caught and relabelled as a launch failure -- reporting the wrong cause for
   // a session that had actually started fine. `sendTelegramReply` is documented
@@ -226,11 +274,12 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
       // human must be able to reach it rather than be told the launch "failed"
       // and leave it orphaned.
       const idPart = sessionId ? ` (session ${sessionId}, goose id ${backendSessionId})` : ` (goose id ${backendSessionId})`;
-      await sendTelegramReply(chatId, `The goose session was created${machineLabel}${idPart}, but ${failure}`);
+      const tagPart = tagLine ? `\n\u{1F3F7} ${tagLine}` : "";
+      await sendTelegramReply(chatId, `The goose session was created${machineLabel}${idPart}, but ${failure}${tagPart}`);
       return;
     }
 
-    const msg = new TgMessageBuilder()
+    const builder = new TgMessageBuilder()
       .append(`goose session started${machineLabel}:\n\u{1F194} `)
       .appendCode(sessionId!)
       .append("\n\u{1F4C2} ")
@@ -238,7 +287,9 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
       // goose's own name for it, which is what `goose session list` shows --
       // pigeon's id means nothing outside pigeon.
       .append("\n\u{1FABF} goose id ")
-      .appendCode(backendSessionId)
+      .appendCode(backendSessionId);
+    if (tagLine) builder.append(`\n\u{1F3F7} ${tagLine}`);
+    const msg = builder
       // Deliberately NOT the opencode path's "the pigeon plugin will notify
       // you": goose has no plugin, which is the whole reason this path exists.
       // The runner reports the turn instead.

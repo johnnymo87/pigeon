@@ -56,6 +56,33 @@ describe("resolveOcTagsBin", () => {
     ).toBe("/run/current-system/sw/bin/oc-tags");
   });
 
+  it("prefers session-tags (the new name) over oc-tags in the same place", () => {
+    expect(
+      resolveOcTagsBin({
+        env: { PATH: "/usr/bin", HOME: "/home/dev" },
+        isExecutable: executableSet(["/usr/bin/oc-tags", "/usr/bin/session-tags"]),
+      }),
+    ).toBe("/usr/bin/session-tags");
+  });
+
+  it("prefers session-tags anywhere over oc-tags anywhere", () => {
+    expect(
+      resolveOcTagsBin({
+        env: { PATH: "/usr/bin:/bin", HOME: "/home/dev" },
+        isExecutable: executableSet(["/usr/bin/oc-tags", "/home/dev/.nix-profile/bin/session-tags"]),
+      }),
+    ).toBe("/home/dev/.nix-profile/bin/session-tags");
+  });
+
+  it("falls back to oc-tags where session-tags is not installed", () => {
+    expect(
+      resolveOcTagsBin({
+        env: { PATH: "/usr/bin", HOME: "/home/dev" },
+        isExecutable: executableSet(["/home/dev/.nix-profile/bin/oc-tags"]),
+      }),
+    ).toBe("/home/dev/.nix-profile/bin/oc-tags");
+  });
+
   it("returns null when oc-tags is installed nowhere", () => {
     expect(
       resolveOcTagsBin({

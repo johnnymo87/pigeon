@@ -5,8 +5,9 @@ import { OpencodeHttpError, type OpencodeClient } from "../opencode-client";
 import { RequestTimeoutError, TransportError, transportCode } from "../routing/serve-outcome";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
-import { isValidSessionId, isValidTag, truncate } from "./tag-ingest";
+import { isValidTag, truncate } from "./tag-ingest";
 import { parseWhichLine } from "../tag-resolver";
+import { coordinatorProgramOf, lookupSession, tagKeyFor, type TagKeySessionLookup } from "../tag-key";
 import type { LaunchMessage } from "./poller";
 
 /**
@@ -66,9 +67,14 @@ export interface LaunchCommandInput {
    * swipe-reply to its notification), set by the worker only when no `--tag`
    * was given and that session is on this machine. If oc-tags says its tag is
    * an explicit SESSION tag, the new session gets a copy. A dir-rule or
-   * `auto:` tag is never inherited. Absent from an old worker.
+   * `auto:` tag is never inherited. A stall-watch coordinator (bound to
+   * `stallwatch:<tag>`) passes on its program `<tag>` instead of its own tag.
+   * May be a goose `gse_…` id, looked up through `sessions`. Absent from an
+   * old worker.
    */
   inheritFromSessionId?: string;
+  /** This daemon's session rows. Without it a gse_ or coordinator context cannot be resolved. */
+  sessions?: TagKeySessionLookup;
   /** null (or absent) means oc-tags is not installed on this machine. */
   runOcTags?: OcTagsRunner | null;
   /**
@@ -138,10 +144,11 @@ export async function applyTag(
   }
 
   try {
-    // argv, never a command string, and `set <tag> <session-id>` — tag FIRST.
+    // argv, never a command string, and `set -- <tag> <session-id>` — tag FIRST.
     // Reversed, oc-tags tags a session literally named after the tag and reports
-    // success.
-    const result = await runOcTags(["set", tag, sessionId]);
+    // success. `--` ends option parsing, so neither value can be read as a flag
+    // even if a validator upstream ever lets a leading `-` through.
+    const result = await runOcTags(["set", "--", tag, sessionId]);
     if (result.code !== 0) {
       return `Tag not applied: ${lastLine(result.stderr, result.stdout) || `oc-tags exited ${result.code}`}`;
     }
@@ -173,16 +180,39 @@ export async function applyTag(
  * every outcome that is not an inheritance says why.
  */
 async function inheritTag(
-  input: LaunchCommandInput,
-  sessionId: string,
+  input: LaunchTagInput,
+  sessionKey: string,
   machineLabel: string,
 ): Promise<string | null> {
   const parent = input.inheritFromSessionId;
   try {
     if (parent === undefined) return null;
-    if (!isValidSessionId(parent)) {
+    if (typeof parent !== "string") {
       return `Tag not inherited: invalid session id ${truncate(String(parent), 64)}`;
     }
+
+    // A stall-watch coordinator's own tag is `stall-watcher-runs`, which would
+    // file the new session's spend under stall-watch itself. A /launch in a
+    // coordinator's context is work for its PROGRAM, so that is what it gets.
+    const row = lookupSession(parent, input.sessions);
+    const coordinator = coordinatorProgramOf(row);
+    if (coordinator) {
+      if ("invalid" in coordinator) {
+        return `Tag not inherited: coordinator ${parent} has an unusable program tag ${truncate(coordinator.invalid, 64) || "(empty)"}`;
+      }
+      const line = await applyTag(coordinator.program, sessionKey, input.runOcTags, machineLabel, input.onTagged);
+      return line.startsWith("Tag not applied")
+        ? `${line} (inheriting the program of coordinator ${parent})`
+        : `${line} (program of coordinator ${parent})`;
+    }
+
+    // An opencode parent is asked about by its own id; a goose one by
+    // goose:<native>, since session-tags knows nothing of pigeon's gse_ ids.
+    const key = tagKeyFor(parent, input.sessions);
+    if (!key.ok) {
+      return `Tag not inherited: ${key.reason}`;
+    }
+    const parentKey = key.key;
     const runWhich = input.runOcTagsWhich !== undefined ? input.runOcTagsWhich : input.runOcTags;
     if (!runWhich) {
       return `Tag not inherited: oc-tags is not installed${machineLabel}.`;
@@ -190,7 +220,7 @@ async function inheritTag(
 
     let result;
     try {
-      result = await runWhich(["which", parent]);
+      result = await runWhich(["which", "--", parentKey]);
     } catch (err) {
       return `Tag not inherited from ${parent}: ${describeOcTagsFailure(err, INHERIT_WHICH_TIMEOUT_MS)}`;
     }
@@ -213,15 +243,58 @@ async function inheritTag(
     }
 
     // Tags live on ROOT sessions; when the context session is a subagent the
-    // tag actually came from its root, so name that.
-    const source = which.rootSessionId && which.rootSessionId !== parent ? which.rootSessionId : parent;
-    const line = await applyTag(which.tag, sessionId, input.runOcTags, machineLabel, input.onTagged);
+    // tag actually came from its root, so name that. Compared with the key, not
+    // the pigeon id: for a goose parent `which` echoes goose:<native>.
+    const source = which.rootSessionId && which.rootSessionId !== parentKey ? which.rootSessionId : parent;
+    const line = await applyTag(which.tag, sessionKey, input.runOcTags, machineLabel, input.onTagged);
     return line.startsWith("Tag not applied")
       ? `${line} (inheriting from ${source})`
       : `${line} (inherited from ${source})`;
   } catch (err) {
-    console.warn(`[launch-ingest] tag inheritance failed session=${sessionId} parent=${String(parent)}:`, err);
+    console.warn(`[launch-ingest] tag inheritance failed session=${sessionKey} parent=${String(parent)}:`, err);
     return `Tag not inherited: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/** What both launch paths (opencode and goose) need to tag the new session. */
+export interface LaunchTagInput {
+  commandId: string;
+  tag?: string;
+  inheritFromSessionId?: string;
+  /** This daemon's session rows: maps a gse_ context session to goose:<native>, and spots coordinators. */
+  sessions?: TagKeySessionLookup;
+  runOcTags?: OcTagsRunner | null;
+  runOcTagsWhich?: OcTagsRunner | null;
+  /** Called with the session-tags key once a tag is written. A throw is swallowed. */
+  onTagged?: (sessionKey: string) => void;
+}
+
+/**
+ * Tags a freshly launched session: an explicit `--tag` wins, otherwise the
+ * context session's tag is inherited. Returns the line for the confirmation, or
+ * null when there was nothing to do. NEVER throws: a throw skips the poller
+ * ack, and a redelivered launch is a duplicate session.
+ *
+ * `sessionKey` is the session-tags key of the NEW session (`ses_…`, or
+ * `goose:<native>`), never a pigeon `gse_…` id.
+ */
+export async function tagLaunchedSession(
+  input: LaunchTagInput,
+  sessionKey: string,
+  machineLabel: string,
+): Promise<string | null> {
+  try {
+    const tagLine = input.tag === undefined
+      ? await inheritTag(input, sessionKey, machineLabel)
+      : await applyTag(input.tag, sessionKey, input.runOcTags, machineLabel, input.onTagged);
+    if (tagLine) {
+      const what = input.tag === undefined ? `inherit=${input.inheritFromSessionId}` : `tag=${input.tag}`;
+      console.log(`[launch-ingest] tag commandId=${input.commandId} session=${sessionKey} ${what}: ${tagLine}`);
+    }
+    return tagLine;
+  } catch (err) {
+    console.warn(`[launch-ingest] tag step failed session=${sessionKey}:`, err);
+    return null;
   }
 }
 
@@ -539,18 +612,8 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     console.warn(`[launch-ingest] autoAttach failed session=${sessionId}:`, err);
   }
 
-  let tagLine: string | null = null;
-  try {
-    tagLine = input.tag === undefined
-      ? await inheritTag(input, sessionId, machineLabel)
-      : await applyTag(input.tag, sessionId, input.runOcTags, machineLabel, input.onTagged);
-    if (tagLine) {
-      const what = input.tag === undefined ? `inherit=${input.inheritFromSessionId}` : `tag=${input.tag}`;
-      console.log(`[launch-ingest] tag commandId=${commandId} session=${sessionId} ${what}: ${tagLine}`);
-    }
-  } catch (err) {
-    console.warn(`[launch-ingest] tag step failed session=${sessionId}:`, err);
-  }
+  // An opencode session's session-tags key is its own id.
+  const tagLine = await tagLaunchedSession(input, sessionId, machineLabel);
 
   try {
     const builder = new TgMessageBuilder()

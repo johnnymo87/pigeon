@@ -40,7 +40,39 @@ describe("SessionTagResolver", () => {
     const calls: string[][] = [];
     const resolver = new SessionTagResolver({ runner: makeRunner([ok("x\tmanual\tses_a\n")], calls) });
     await resolver.refresh("ses_a");
-    expect(calls).toEqual([["which", "ses_a"]]);
+    expect(calls).toEqual([["which", "--", "ses_a"]]);
+  });
+
+  it("asks about the session-tags key keyFor gives, and caches under the pigeon id", async () => {
+    const calls: string[][] = [];
+    const resolver = new SessionTagResolver({
+      runner: makeRunner([ok("mono-ci\tmanual\tgoose:20261104_1\tsession\n")], calls),
+      keyFor: (id) => (id === "gse_x" ? "goose:20261104_1" : id),
+    });
+    await resolver.refresh("gse_x");
+    expect(calls).toEqual([["which", "--", "goose:20261104_1"]]);
+    expect(resolver.get("gse_x")).toBe("mono-ci");
+  });
+
+  it("caches a negative without spawning when keyFor has no key", async () => {
+    const calls: string[][] = [];
+    const resolver = new SessionTagResolver({ runner: makeRunner([ok("x\tmanual\tses_a\n")], calls), keyFor: () => null });
+    await resolver.refresh("gse_x");
+    expect(calls).toEqual([]);
+    expect(resolver.get("gse_x")).toBeNull();
+    await resolver.drain();
+    expect(calls).toEqual([]);
+  });
+
+  it("treats a throwing keyFor as no key, never as a rejection", async () => {
+    const calls: string[][] = [];
+    const resolver = new SessionTagResolver({
+      runner: makeRunner([ok("x\tmanual\tses_a\n")], calls),
+      keyFor: () => { throw new Error("db closed"); },
+      log: () => {},
+    });
+    await expect(resolver.refresh("gse_x")).resolves.toBeUndefined();
+    expect(calls).toEqual([]);
   });
 
   it("re-runs only after the TTL expires", async () => {

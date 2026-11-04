@@ -20,7 +20,13 @@ export interface OcTagsResult {
 
 export type OcTagsRunner = (args: string[]) => Promise<OcTagsResult>;
 
-const BIN_NAME = "oc-tags";
+/**
+ * Preferred first. The tool was renamed `session-tags` (it tags goose sessions
+ * too, workstation 555.29.6); `oc-tags` stays installed as a permanent alias,
+ * so it is the fallback for a machine that has not been switched yet. Same
+ * script, same DB, same output either way.
+ */
+const BIN_NAMES = ["session-tags", "oc-tags"] as const;
 
 /** 20s: `oc-tags top` scans opencode.db, which is large, but never for long. */
 const RUN_TIMEOUT_MS = 20_000;
@@ -43,7 +49,8 @@ export interface ResolveOcTagsBinOptions {
 }
 
 /**
- * Resolves the oc-tags binary, or null if it is not installed.
+ * Resolves the session-tags binary (or its `oc-tags` alias), or null if
+ * neither is installed.
  *
  * The daemon runs under systemd, whose PATH is minimal and typically contains
  * none of the profile directories a nix-installed oc-tags lives in. So a bare
@@ -65,24 +72,22 @@ export function resolveOcTagsBin(opts: ResolveOcTagsBinOptions = {}): string | n
     return isExecutable(configured) ? configured : null;
   }
 
-  for (const dir of (env.PATH ?? "").split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, BIN_NAME);
-    if (isExecutable(candidate)) {
-      return candidate;
-    }
-  }
-
   const home = env.HOME?.trim();
-  const fallbacks = [
-    ...(home ? [path.join(home, ".nix-profile/bin", BIN_NAME)] : []),
-    `/run/current-system/sw/bin/${BIN_NAME}`,
-    `/usr/local/bin/${BIN_NAME}`,
-    `/opt/homebrew/bin/${BIN_NAME}`,
+  const dirs = [
+    ...(env.PATH ?? "").split(path.delimiter).filter((d) => d !== ""),
+    ...(home ? [path.join(home, ".nix-profile/bin")] : []),
+    "/run/current-system/sw/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
   ];
-  for (const candidate of fallbacks) {
-    if (isExecutable(candidate)) {
-      return candidate;
+  // Name-major: a session-tags anywhere beats an oc-tags earlier on PATH, so
+  // which name runs does not depend on PATH order.
+  for (const name of BIN_NAMES) {
+    for (const dir of dirs) {
+      const candidate = path.join(dir, name);
+      if (isExecutable(candidate)) {
+        return candidate;
+      }
     }
   }
 

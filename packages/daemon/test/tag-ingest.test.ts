@@ -1,3 +1,4 @@
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, expect, it, vi } from "vitest";
 import {
   ingestTagListCommand,
@@ -232,7 +233,7 @@ describe("ingestTagSetCommand", () => {
     });
     await ingestTagSetCommand({ ...deps, targetSessionId: "ses_abcd1234", tag: "billing" });
 
-    expect(ocTagsArgs(deps)).toEqual(["set", "billing", "ses_abcd1234"]);
+    expect(ocTagsArgs(deps)).toEqual(["set", "--", "billing", "ses_abcd1234"]);
     expect(sentText(deps)).toContain("billing");
   });
 
@@ -242,6 +243,32 @@ describe("ingestTagSetCommand", () => {
 
     expect((deps.runOcTags as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     expect(sentText(deps)).toContain("Invalid tag");
+  });
+
+  describe("a goose session (/tag typed in its topic falls back to its gse_ id)", () => {
+    const sessions = {
+      get: (id: string) => id === "gse_goose-1"
+        ? { sessionId: id, backendKind: GOOSE_BACKEND_KIND, backendSessionId: "20261104_5", boundTopicKey: null }
+        : null,
+    };
+
+    it("tags goose:<native>, never the gse_ id session-tags refuses", async () => {
+      const deps = makeDeps({
+        runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged session 'goose:20261104_5' as 'billing'\n", stderr: "" }),
+      });
+      await ingestTagSetCommand({ ...deps, sessions, targetSessionId: "gse_goose-1", tag: "billing" });
+
+      expect(ocTagsArgs(deps)).toEqual(["set", "--", "billing", "goose:20261104_5"]);
+      expect(sentText(deps)).toContain("goose:20261104_5");
+    });
+
+    it("explains a gse_ id with no local goose row, without spawning anything", async () => {
+      const deps = makeDeps();
+      await ingestTagSetCommand({ ...deps, sessions, targetSessionId: "gse_other", tag: "billing" });
+
+      expect((deps.runOcTags as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect(sentText(deps)).toContain("gse_other is not a goose session on this machine");
+    });
   });
 
   it("refuses a bad session id without spawning anything", async () => {

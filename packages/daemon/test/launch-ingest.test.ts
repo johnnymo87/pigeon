@@ -10,6 +10,7 @@ import {
 } from "../src/worker/launch-ingest";
 import { OpencodeHttpError, type OpencodeClient } from "../src/opencode-client";
 import { RequestTimeoutError, TransportError } from "../src/routing/serve-outcome";
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 
 function makeInput(overrides: Partial<LaunchCommandInput> = {}): LaunchCommandInput {
   const opencodeClient: OpencodeClient = {
@@ -518,7 +519,7 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-123"]);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "fbm", "sess-123"]);
     });
 
     it("tags only after the session is created and the prompt is sent", async () => {
@@ -743,8 +744,8 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(runOcTagsWhich).toHaveBeenCalledWith(["which", PARENT]);
-      expect(runOcTags).toHaveBeenCalledWith(["set", "billing", "sess-123"]);
+      expect(runOcTagsWhich).toHaveBeenCalledWith(["which", "--", PARENT]);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "billing", "sess-123"]);
       expect(onTagged).toHaveBeenCalledWith("sess-123");
       const reply = lastReply(input);
       expect(reply).toContain("sess-123");
@@ -824,6 +825,69 @@ describe("ingestLaunchCommand", () => {
       }
     });
 
+    describe("goose and coordinator context sessions", () => {
+      const goose = (over: Record<string, unknown> = {}) => ({
+        sessionId: "gse_ctx-1",
+        backendKind: GOOSE_BACKEND_KIND,
+        backendSessionId: "20261104_7",
+        boundTopicKey: null,
+        ...over,
+      });
+      const store = (...rows: Array<ReturnType<typeof goose>>) => ({
+        get: (id: string) => rows.find((r) => r.sessionId === id) ?? null,
+      });
+
+      it("asks which about goose:<native> for a gse_ context session, never the pigeon id", async () => {
+        const runOcTagsWhich = whichOut(`billing\tmanual\tgoose:20261104_7\tsession\n`);
+        const runOcTags = setRunner();
+        const input = makeInput({ inheritFromSessionId: "gse_ctx-1", sessions: store(goose()), runOcTagsWhich, runOcTags });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTagsWhich).toHaveBeenCalledWith(["which", "--", "goose:20261104_7"]);
+        expect(runOcTags).toHaveBeenCalledWith(["set", "--", "billing", "sess-123"]);
+        expect(lastReply(input)).toContain("(inherited from gse_ctx-1)");
+      });
+
+      it("refuses a gse_ context session with no local row instead of asking session-tags about a pigeon id", async () => {
+        const runOcTagsWhich = vi.fn();
+        const input = makeInput({ inheritFromSessionId: "gse_gone", sessions: store(), runOcTagsWhich, runOcTags: setRunner() });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTagsWhich).not.toHaveBeenCalled();
+        expect(lastReply(input)).toContain("Tag not inherited: gse_gone is not a goose session on this machine");
+      });
+
+      it("inherits a coordinator's PROGRAM, never its own stall-watcher-runs tag", async () => {
+        const runOcTagsWhich = whichOut(`stall-watcher-runs\tmanual\tgoose:20261104_7\tsession\n`);
+        const runOcTags = setRunner();
+        const onTagged = vi.fn();
+        const coord = goose({ boundTopicKey: "stallwatch:mono-ci" });
+        const input = makeInput({ inheritFromSessionId: "gse_ctx-1", sessions: store(coord), runOcTagsWhich, runOcTags, onTagged });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTagsWhich).not.toHaveBeenCalled();
+        expect(runOcTags).toHaveBeenCalledWith(["set", "--", "mono-ci", "sess-123"]);
+        expect(onTagged).toHaveBeenCalledWith("sess-123");
+        expect(lastReply(input)).toContain("(program of coordinator gse_ctx-1)");
+      });
+
+      it("reports an unusable coordinator program rather than falling back to the coordinator's tag", async () => {
+        const runOcTagsWhich = vi.fn();
+        const runOcTags = setRunner();
+        const coord = goose({ boundTopicKey: "stallwatch:auto:x" });
+        const input = makeInput({ inheritFromSessionId: "gse_ctx-1", sessions: store(coord), runOcTagsWhich, runOcTags });
+
+        await ingestLaunchCommand(input);
+
+        expect(runOcTagsWhich).not.toHaveBeenCalled();
+        expect(runOcTags).not.toHaveBeenCalled();
+        expect(lastReply(input)).toContain("Tag not inherited: coordinator gse_ctx-1 has an unusable program tag");
+      });
+    });
+
     it("reports a which timeout without throwing, and applies no tag", async () => {
       // The runner REJECTS on timeout; a throw out of ingestLaunchCommand would
       // skip the ack and redeliver the launch as a duplicate session.
@@ -870,7 +934,7 @@ describe("ingestLaunchCommand", () => {
       await ingestLaunchCommand(input);
 
       expect(runOcTagsWhich).not.toHaveBeenCalled();
-      expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-123"]);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "fbm", "sess-123"]);
       expect(lastReply(input)).not.toContain("inherit");
     });
 
@@ -1444,7 +1508,7 @@ describe("applyTag export", () => {
     const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "tagged fbm\n", stderr: "" });
     const line = await applyTag("fbm", "sess-1", runOcTags, "");
     expect(line).toBe("tagged fbm");
-    expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-1"]);
+    expect(runOcTags).toHaveBeenCalledWith(["set", "--", "fbm", "sess-1"]);
   });
 });
 
