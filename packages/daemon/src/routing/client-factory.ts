@@ -1,5 +1,5 @@
 import { OpencodeClient } from "../opencode-client";
-import { type IngressRouter, NoHealthyServeError } from "./router";
+import { type IngressRouter, NoHealthyServeError, type PlaceOptions } from "./router";
 import type { OutcomeObservation } from "./serve-outcome";
 import type { InjectedPromptsRepository } from "../storage/injected-prompts-repo";
 
@@ -18,10 +18,10 @@ export class OpencodeClientFactory {
   ) {}
 
   /** The owning serve's client, or undefined if the session can't currently be routed (no healthy serve). */
-  forSession(sessionId: string): OpencodeClient | undefined {
+  forSession(sessionId: string, opts?: PlaceOptions): OpencodeClient | undefined {
     let apiBase: string;
     try {
-      apiBase = this.router.ensureRouted(sessionId, this.nowFn()).apiBase;
+      apiBase = this.router.ensureRouted(sessionId, this.nowFn(), opts).apiBase;
     } catch (err) {
       if (err instanceof NoHealthyServeError) return undefined;
       throw err;

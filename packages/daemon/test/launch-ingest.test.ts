@@ -1447,3 +1447,141 @@ describe("applyTag export", () => {
     expect(runOcTags).toHaveBeenCalledWith(["set", "fbm", "sess-1"]);
   });
 });
+
+describe("startSession create failover (createClients)", () => {
+  let n = 0;
+  function serve(create: () => Promise<{ id: string }>): OpencodeClient {
+    return {
+      endpoint: `http://127.0.0.1:${4096 + n++}`,
+      healthCheck: vi.fn().mockResolvedValue(true),
+      createSession: vi.fn(create),
+      sendPrompt: vi.fn().mockResolvedValue(undefined),
+      deleteSession: vi.fn(),
+    } as unknown as OpencodeClient;
+  }
+  const timeout = () => Promise.reject(new RequestTimeoutError(7500, "http://a/session"));
+  const ok = (id: string) => () => Promise.resolve({ id });
+
+  it("a create that times out on the first serve is retried on the second, and the prompt goes once to the owner", async () => {
+    const a = serve(timeout);
+    const b = serve(ok("ses_b"));
+    const owner = serve(ok("unused"));
+    const onCreated = vi.fn();
+    const resolveOwnerClient = vi.fn(() => owner);
+
+    const outcome = await startSession({
+      directory: "/d",
+      prompt: "p",
+      opencodeClient: a,
+      createClients: () => [a, b],
+      resolveOwnerClient,
+      budgets: { healthMs: 5000, createMs: 15000, promptMs: 20000 },
+      onCreated,
+    });
+
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_b" });
+    expect(onCreated).toHaveBeenCalledTimes(1);
+    expect(onCreated).toHaveBeenCalledWith("ses_b");
+    expect(owner.sendPrompt).toHaveBeenCalledTimes(1);
+    // The owner is placed OFF the serve the create just failed on.
+    expect(resolveOwnerClient).toHaveBeenCalledWith("ses_b", { avoidEndpoints: [a.endpoint] });
+    expect(a.sendPrompt).not.toHaveBeenCalled();
+    expect(b.sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("gives the first attempt the budget minus a 5s failover reserve, and the second what is left", async () => {
+    let now = 1_000_000;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const a = serve(() => { now += 15000; return timeout(); });
+    const b = serve(ok("ses_b"));
+    await startSession({
+      directory: "/d",
+      prompt: "p",
+      opencodeClient: a,
+      createClients: () => [a, b],
+      budgets: { healthMs: 5000, createMs: 20000, promptMs: 20000 },
+    });
+    const firstTimeout = (a.createSession as ReturnType<typeof vi.fn>).mock.calls[0]![1].timeoutMs;
+    const secondTimeout = (b.createSession as ReturnType<typeof vi.fn>).mock.calls[0]![1].timeoutMs;
+    spy.mockRestore();
+    expect(firstTimeout).toBe(15000);
+    expect(secondTimeout).toBe(5000);
+  });
+
+  it("skips the up-front health check with a pool, so a down serve-0 does not refuse the launch", async () => {
+    const a = serve(() => Promise.reject(new TransportError(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } }))));
+    (a.healthCheck as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+    const b = serve(ok("ses_b"));
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b] });
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_b" });
+    expect(a.healthCheck).not.toHaveBeenCalled();
+  });
+
+  it("tries at most two serves", async () => {
+    const a = serve(timeout);
+    const b = serve(timeout);
+    const c = serve(ok("ses_c"));
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b, c] });
+    expect(outcome.outcome).toBe("unconfirmed");
+    expect(c.createSession).not.toHaveBeenCalled();
+  });
+
+  it("all attempts failing: any ambiguous failure makes it unconfirmed with no id", async () => {
+    const refused = () => Promise.reject(new TransportError(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } })));
+    const a = serve(timeout);
+    const b = serve(refused);
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b] });
+    expect(outcome).toMatchObject({ outcome: "unconfirmed", sessionId: null });
+  });
+
+  it("all attempts refused: the last refusal stands", async () => {
+    const refused = () => Promise.reject(new TransportError(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } })));
+    const a = serve(() => Promise.reject(new Error("createSession failed: 500 Internal Server Error")));
+    const b = serve(refused);
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b] });
+    expect(outcome).toMatchObject({ outcome: "refused", reason: "serve_unreachable" });
+  });
+
+  it("one healthy pool serve that is not serve-0 is the one created on", async () => {
+    const legacy = serve(ok("ses_legacy"));
+    const other = serve(ok("ses_other"));
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: legacy, createClients: () => [other] });
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_other" });
+    expect(legacy.createSession).not.toHaveBeenCalled();
+  });
+
+  it("an empty healthy set keeps the single-serve path, with its health check", async () => {
+    const legacy = serve(ok("ses_legacy"));
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: legacy, createClients: () => [] });
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_legacy" });
+    expect(legacy.healthCheck).toHaveBeenCalled();
+  });
+
+  it("a first-attempt success places the owner with no avoid list", async () => {
+    const a = serve(ok("ses_a"));
+    const b = serve(ok("ses_b"));
+    const resolveOwnerClient = vi.fn(() => a);
+    await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b], resolveOwnerClient });
+    expect(resolveOwnerClient).toHaveBeenCalledWith("ses_a");
+    expect(b.createSession).not.toHaveBeenCalled();
+  });
+
+  it("a throwing createClients falls back to the single-serve path", async () => {
+    const legacy = serve(ok("ses_legacy"));
+    const outcome = await startSession({
+      directory: "/d",
+      prompt: "p",
+      opencodeClient: legacy,
+      createClients: () => { throw new Error("boom"); },
+    });
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_legacy" });
+  });
+
+  it("ingestLaunchCommand passes createClients through", async () => {
+    const a = serve(timeout);
+    const b = serve(ok("ses_b"));
+    const input = makeInput({ opencodeClient: a, createClients: () => [a, b] });
+    await ingestLaunchCommand(input);
+    expect(b.createSession).toHaveBeenCalledTimes(1);
+  });
+});

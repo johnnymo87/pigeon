@@ -64,6 +64,11 @@ export class OpencodeClient {
     this.injectedPrompts = options.injectedPrompts;
   }
 
+  /** The serve base URL this client talks to (no trailing slash). */
+  get endpoint(): string {
+    return this.baseUrl;
+  }
+
   /** Never let the observability tap perturb the request it is observing. */
   private observe(obs: OutcomeObservation): void {
     try {

@@ -59,7 +59,7 @@ describe("remote-launch-receiver", () => {
 
       await processLaunchItems(deps, [item]);
 
-      expect(client.createSession).toHaveBeenCalledWith("/home/dev/projects/pigeon", { timeoutMs: 15000 });
+      expect(client.createSession).toHaveBeenCalledWith("/home/dev/projects/pigeon", { timeoutMs: 20000 });
       expect(client.sendPrompt).toHaveBeenCalledWith(
         "ses_remote12345",
         "/home/dev/projects/pigeon",
