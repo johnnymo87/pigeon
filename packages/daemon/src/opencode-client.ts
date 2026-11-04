@@ -411,16 +411,41 @@ export class OpencodeClient {
     );
   }
 
-  async getSessionMessages(sessionId: string): Promise<unknown[]> {
+  /**
+   * One page of a session's transcript: the newest `limit` messages older than
+   * `before` (opencode's `X-Next-Cursor`), in chronological order.
+   *
+   * There is deliberately no unbounded transcript read on this client. The
+   * whole transcript of a large session is seconds of serve-side work and
+   * hundreds of MB; run on a schedule it put a serve into a restart storm
+   * (pigeon-hfsj). `nextCursor` is null when there is nothing older: this
+   * opencode reads limit+1 rows, so a final page of exactly `limit` messages
+   * carries no cursor.
+   *
+   * Errors read `getSessionMessages failed (<status>): <body>`, the text of the
+   * unbounded read this replaced, because callers parse the status out of it
+   * (the watchdog's 404 path).
+   */
+  async getSessionMessagesPage(
+    sessionId: string,
+    opts: { limit: number; before?: string },
+  ): Promise<{ messages: unknown[]; nextCursor: string | null }> {
+    const params = new URLSearchParams({ limit: String(opts.limit) });
+    if (opts.before) params.set("before", opts.before);
     return this.request(
-      `${this.baseUrl}/session/${sessionId}/message`,
+      `${this.baseUrl}/session/${sessionId}/message?${params.toString()}`,
       { method: "GET" },
       async (res) => {
         if (!res.ok) {
           const body = await res.text();
           throw new Error(`getSessionMessages failed (${res.status}): ${body}`);
         }
-        return (await res.json()) as unknown[];
+        const nextCursor = res.headers.get("X-Next-Cursor");
+        const messages = (await res.json()) as unknown;
+        return {
+          messages: Array.isArray(messages) ? messages : [],
+          nextCursor: nextCursor ? nextCursor : null,
+        };
       },
     );
   }

@@ -441,10 +441,49 @@ Backoff schedule (in `arbiter.ts`): `[1s, 2s, 5s, 15s, 60s]`. Attempt N uses `BA
 
 **Why a single in-flight per target is enough**: opencode serve's race occurs when two `prompt_async` calls land on the same session id from different `x-opencode-directory` headers. Since the daemon is the single writer and uses the registry to canonicalize the directory, all daemon-routed traffic always uses the same directory header. The race is gone for daemon-routed traffic. (Anything that calls `prompt_async` directly, bypassing the daemon, re-introduces the race.)
 
+## Watchdog Transcript Window and Watch Horizon (pigeon-hfsj)
+
+The watchdog never reads a whole transcript. It pages `GET /session/:id/message?limit=50`
+newest first (following `X-Next-Cursor` via `before=`) until every row of that session is
+**settled**, up to 20 pages. A row with its anchor found is settled once the newest assistant
+message *before* the anchor is in the window (that is the only pre-anchor message the
+blocking-turn check reads). A row without one is settled once the window reaches 10 minutes before
+the earliest moment its envelope could have been written (`deliver_at`, else `created_at`; never
+`handed_off_at`, which an earlier timed-out attempt can predate). A window that cannot be
+completed (page cap, a failing later page, or a cursor-less last page of exactly `limit`, which is
+what an opencode older than 1.2.20 answers on every page) leaves those rows unsettled: they are
+skipped without state change, because an anchor missing from a truncated window is not evidence,
+while the session's settled rows are judged normally. Two in-memory bounds keep steady-state cost
+near one page: a row the page cap could not settle is not read deep again for an hour
+(`DEEP_READ_BACKOFF_MS`), and once a complete window proves a row's anchor absent, later reads go
+back only to that window's newest message (`absentThrough`). A restart costs one deep read. `OpencodeClient` has no unbounded read at
+all, and every `cycle complete` log line carries `transcriptPages` / `transcriptMessages`.
+
+Why: a scheduled self-wake that never verified was re-examined every 60 s for 23 days, each time
+reading a 6.8k-message (~300 MB) transcript, ~16 s of serve work per minute that phase-locked
+with the serve canary and restarted that serve 42 times in a day; later, rows queued behind a
+27k-message session's open turn did the same. `?limit` is a real SQL bound on our opencode.
+
+**Watch horizon.** A row still unverified 24 h after `handed_off_at` (`DEFAULT_MAX_WATCH_MS`) is
+retired: `failed`, the sender told `DELIVERY UNCONFIRMED` (envelope present, or transcript
+unreadable) or `NOT received` (absent from a complete window), a wake/scheduled row's payload
+alerted durably (`wake-watch-expired`, ref = msg_id), a nudge row just marked failed. Verification
+still wins past the horizon. A row retired without any readable transcript (`unobserved`) gets
+a further hour (`UNOBSERVED_RETIRE_GRACE_MS`) so a brief outage at the horizon does not end it
+unlooked-at. Rows older than 24 h at first deploy retire on the first cycle, each with an alert
+and (cross-session) a sender notice: count them before deploying. This bounds the branches that otherwise never end (suppressed
+lost-wake, silent in flight, waiting behind a turn). It stops *watching*; it aborts and injects
+nothing, so it is consistent with the never-preempt policy below.
+
+**Blocking turn = the newest pre-anchor assistant message, if still in flight.** An in-flight
+message older than a completed one is an orphan (serve killed mid-step), so it no longer makes a
+row wait forever; that row is nudged.
+
 ## Turn-Preemption Policy (pigeon-0gxy)
 
 **Delivery never preempts a running turn.** If a message is queued behind the
-target's in-flight turn, the `DeliveryWatchdog` **waits indefinitely**. It
+target's in-flight turn, the `DeliveryWatchdog` **waits** (until the 24 h watch horizon above,
+when it stops watching without touching the turn). It
 raises a one-shot advisory alert once `stuckAlertMs` passes (labelling the
 blocker `ACTIVE` or `SILENT` per `STUCK_ABORT_SILENCE_MS`), and when the turn
 ends the row is picked up on a later cycle and **nudged** — never re-injected,

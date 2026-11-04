@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { pagesFrom } from "./transcript-pages";
 import {
   enqueueSwarmTelegramNotice,
   enqueueSwarmCancelNotice,
@@ -320,12 +321,12 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
       storage.db.prepare("UPDATE swarm_messages SET state = 'handed_off', handed_off_at = ? WHERE msg_id = ?").run(now - 30_000, "m_handed_off");
 
       const mockClient: WatchdogClient = {
-        getSessionMessages: async () => [
+        getSessionMessagesPage: pagesFrom(async () => [
           {
             info: { role: "user", time: { created: now - 30_000 } },
             parts: [{ type: "text", text: `<swarm_message v="1" msg_id="m_handed_off">test message</swarm_message>` }],
           },
-        ],
+        ]),
         abortSession: async () => {},
       };
 

@@ -24,7 +24,7 @@ function fakeClientFactory() {
   const forEndpoint = vi.fn((endpoint: string): WatchdogClient => {
     let c = clients.get(endpoint);
     if (!c) {
-      c = { getSessionMessages: vi.fn(), abortSession: vi.fn() };
+      c = { getSessionMessagesPage: vi.fn(), abortSession: vi.fn() };
       clients.set(endpoint, c);
     }
     return c;
@@ -112,7 +112,7 @@ describe("makeWatchdogResolveClients", () => {
   });
 
   it("routing not configured: falls back to the single plain client (both preferred and sole broadcast entry)", () => {
-    const singleClient: WatchdogClient = { getSessionMessages: vi.fn(), abortSession: vi.fn() };
+    const singleClient: WatchdogClient = { getSessionMessagesPage: vi.fn(), abortSession: vi.fn() };
     const serveRegistry = { listHealthy: vi.fn() };
     const routingMeta = { get: vi.fn() };
 
