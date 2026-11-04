@@ -126,7 +126,7 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM machine_launch_accept").run();
   await env.DB.prepare("DELETE FROM swarm_relay").run();
   await env.DB.prepare("DELETE FROM machine_relay_accept").run();
-  await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_rl%'").run();
+  await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_rl%' OR session_id LIKE 'gse_rl%'").run();
   await env.DB.prepare("DELETE FROM commands WHERE machine_id LIKE 'rl-%'").run();
   await env.DB.prepare("DELETE FROM machines WHERE machine_id LIKE 'rl-%'").run();
   await addKey(KEY_A, A);
@@ -179,10 +179,25 @@ describe("POST /launch/relay", () => {
   it("each validation failure -> 400", async () => {
     // bad launch_id with ':'
     expect((await launch(KEY_A, { launch_id: "launch:001" })).status).toBe(400);
-    // non-ses_ from
-    expect((await launch(KEY_A, { from: "gse_12345678" })).status).toBe(400);
-    expect((await launch(KEY_A, { from: "pigeon" })).status).toBe(400);
-    expect((await launch(KEY_A, { from: "not_a_session" })).status).toBe(400);
+    // non-ses_/non-gse_ from
+    const badPigeon = await launch(KEY_A, { from: "pigeon" });
+    expect(badPigeon.status).toBe(400);
+    expect(await badPigeon.json()).toMatchObject({
+      error: "invalid",
+      detail: "from must be a ses_ or gse_ session id",
+    });
+    const badXyz = await launch(KEY_A, { from: "xyz_12345678" });
+    expect(badXyz.status).toBe(400);
+    expect(await badXyz.json()).toMatchObject({
+      error: "invalid",
+      detail: "from must be a ses_ or gse_ session id",
+    });
+    const badNotSession = await launch(KEY_A, { from: "not_a_session" });
+    expect(badNotSession.status).toBe(400);
+    expect(await badNotSession.json()).toMatchObject({
+      error: "invalid",
+      detail: "from must be a ses_ or gse_ session id",
+    });
     // 513-char directory
     expect((await launch(KEY_A, { directory: "a".repeat(513) })).status).toBe(400);
     // directory with '\n'
@@ -241,6 +256,23 @@ describe("POST /launch/relay", () => {
     // Unregistered from passes
     const res2 = await launch(KEY_A, { from: "ses_rlUnregistered01", launch_id: "launch_unreg" });
     expect(res2.status).toBe(202);
+  });
+
+  it("a gse_ from is accepted: unregistered passes, registered to caller passes, registered to another machine -> 403 sender_not_yours", async () => {
+    // Unregistered gse_ from passes
+    const resUnregistered = await launch(KEY_A, { from: "gse_rlUnreg0001", launch_id: "launch_gse_unreg" });
+    expect(resUnregistered.status).toBe(202);
+
+    // gse_ registered to caller passes
+    await seedSession("gse_rlOnA0001", A);
+    const resRegistered = await launch(KEY_A, { from: "gse_rlOnA0001", launch_id: "launch_gse_reg" });
+    expect(resRegistered.status).toBe(202);
+
+    // gse_ registered to another machine C -> 403 sender_not_yours
+    await seedSession("gse_rlOnC0001", C);
+    const resOther = await launch(KEY_A, { from: "gse_rlOnC0001", launch_id: "launch_gse_other" });
+    expect(resOther.status).toBe(403);
+    expect(await resOther.json()).toMatchObject({ error: "sender_not_yours" });
   });
 
   it("valid non-null tag is accepted and stored in body_json", async () => {
@@ -813,6 +845,22 @@ describe("POST /launch/relay/ack", () => {
     ]);
     expect(ackNoSession.status).toBe(400);
 
+    // launched with gse_ session_id -> 400
+    const ackGseSession = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "launched",
+        session_id: "gse_rlLaunched01",
+      },
+    ]);
+    expect(ackGseSession.status).toBe(400);
+    expect(await ackGseSession.json()).toMatchObject({
+      error: "invalid",
+      detail: "launched requires a valid ses_ session_id",
+    });
+
     // refused without reason -> 400
     const ackNoReason = await ack(KEY_B, [
       {
@@ -884,6 +932,23 @@ describe("POST /launch/relay/ack", () => {
       },
     ]);
     expect(ackRefusedBadSession.status).toBe(400);
+
+    // kind launch: gse_ session_id on refused outcome -> 400
+    const ackRefusedGseSession = await ack(KEY_B, [
+      {
+        kind: "launch",
+        from_machine: A,
+        launch_id: "launch_rl_0001",
+        outcome: "refused",
+        reason: "valid_reason",
+        session_id: "gse_rlRefused01",
+      },
+    ]);
+    expect(ackRefusedGseSession.status).toBe(400);
+    expect(await ackRefusedGseSession.json()).toMatchObject({
+      error: "invalid",
+      detail: "session_id must be a valid ses_ session id if present",
+    });
 
     // kind launch: invalid session_id on unconfirmed outcome -> 400
     const ackUnconfirmedBadSession = await ack(KEY_B, [

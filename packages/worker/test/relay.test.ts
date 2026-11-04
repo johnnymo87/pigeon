@@ -126,7 +126,7 @@ beforeEach(async () => {
   clearCredentialCache();
   await env.DB.prepare("DELETE FROM swarm_relay").run();
   await env.DB.prepare("DELETE FROM machine_relay_accept").run();
-  await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_rly%'").run();
+  await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_rly%' OR session_id LIKE 'gse_rly%'").run();
   await env.DB.prepare("DELETE FROM commands WHERE machine_id LIKE 'rly-%'").run();
   await env.DB.prepare("DELETE FROM machines WHERE machine_id LIKE 'rly-%'").run();
   await addKey(KEY_A, A);
@@ -172,7 +172,7 @@ describe("POST /swarm/relay", () => {
   it.each([
     ["a msg_id with a colon", { msg_id: "f:x" }],
     ["from='pigeon'", { from: "pigeon" }],
-    ["a gse_ sender", { from: "gse_rlySenderOnA01" }],
+    ["an xyz_ sender", { from: "xyz_rlySenderOnA01" }],
     ["a target that is not a session id", { to: "foo" }],
     ["a bad priority", { priority: "high" }],
     ["a missing deliver_at", { deliver_at: undefined }],
@@ -183,6 +183,34 @@ describe("POST /swarm/relay", () => {
     for (const [k, v] of Object.entries(over)) if (v === undefined) delete body[k];
     const res = await call("/swarm/relay", KEY_A, { method: "POST", body });
     expect(res.status).toBe(400);
+  });
+
+  it("rejects invalid from senders with expected detail", async () => {
+    for (const badFrom of ["pigeon", "xyz_rlySenderOnA01", "not_a_session"]) {
+      const res = await relay(KEY_A, { from: badFrom });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({
+        error: "invalid",
+        detail: "from must be a ses_ or gse_ session id",
+      });
+    }
+  });
+
+  it("accepts a gse_ from: unregistered passes, registered to caller passes, registered to another machine -> 403 sender_not_yours", async () => {
+    // Unregistered gse_ sender passes
+    const resUnregistered = await relay(KEY_A, { msg_id: "msg_rly_gse_unreg", from: "gse_rlyUnregistered01" });
+    expect(resUnregistered.status).toBe(202);
+
+    // gse_ registered to caller passes
+    await seedSession("gse_rlySenderOnA01", A);
+    const resRegisteredCaller = await relay(KEY_A, { msg_id: "msg_rly_gse_reg", from: "gse_rlySenderOnA01" });
+    expect(resRegisteredCaller.status).toBe(202);
+
+    // gse_ registered to another machine -> 403 sender_not_yours
+    await seedSession("gse_rlySenderOnC01", C);
+    const resOtherMachine = await relay(KEY_A, { msg_id: "msg_rly_gse_other", from: "gse_rlySenderOnC01" });
+    expect(resOtherMachine.status).toBe(403);
+    expect(await resOtherMachine.json()).toMatchObject({ error: "sender_not_yours" });
   });
 
   it("answers 410 expired, not 400, for an expires_at that has passed", async () => {

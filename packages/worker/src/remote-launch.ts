@@ -22,7 +22,7 @@ import {
   sha256Hex,
   MACHINE_ID_PATTERN,
 } from "./credentials";
-import { SENDER_ID, isMissingTable, relayReachability, readJson, parseRelayHeader } from "./relay";
+import { SENDER_ID, RELAY_SENDER_ID, isMissingTable, relayReachability, readJson, parseRelayHeader } from "./relay";
 import { isValidTag } from "./tag-command";
 
 export const LAUNCH_TTL_MS = 15 * 60_000;
@@ -42,6 +42,7 @@ export const LAUNCH_ONLINE_MS = 60_000;
 const LAUNCH_ID_PATTERN = /^[^:\s]{1,128}$/;
 const REASON = /^[a-z0-9_]{1,64}$/;
 const RESULT_ID_PATTERN = /^r:[^:\s]{1,128}(:[a-z0-9_]{1,64})?$/;
+const REQUESTER_ID = RELAY_SENDER_ID;
 
 export interface LaunchRequest {
   launch_id: string;
@@ -93,8 +94,8 @@ export function validateLaunchBody(body: Record<string, unknown>): LaunchRequest
   if (typeof launch_id !== "string" || !LAUNCH_ID_PATTERN.test(launch_id)) {
     return bad("launch_id must be 1-128 characters with no ':' or whitespace");
   }
-  if (typeof from !== "string" || !SENDER_ID.test(from)) {
-    return bad("from must be a ses_ session id");
+  if (typeof from !== "string" || !REQUESTER_ID.test(from)) {
+    return bad("from must be a ses_ or gse_ session id");
   }
   if (typeof machine !== "string" || !MACHINE_ID_PATTERN.test(machine)) {
     return bad("machine must be a valid machine id");
