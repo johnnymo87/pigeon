@@ -30,6 +30,16 @@ export class LeaseContendedError extends Error {
 /** Structured logger, matching the shape used by the flap detector and outcome sensor. */
 export type RouterLogger = (msg: string, fields?: Record<string, unknown>) => void;
 
+/** Options for a NEW placement; ignored when the session already has a route. */
+export interface PlaceOptions {
+  /** Serve endpoints to keep this session off, when another healthy serve exists. */
+  avoidEndpoints?: string[];
+}
+
+function normalizeEndpoint(e: string): string {
+  return e.replace(/\/+$/, "");
+}
+
 export class IngressRouter {
   private sticky: StickyRouter<string, string>;
   private readonly log: RouterLogger;
@@ -316,6 +326,7 @@ export class IngressRouter {
     sessionId: string,
     now: number,
     directoryKey?: string | null,
+    opts?: PlaceOptions,
   ): RouteResult {
     const epoch = this.repos.meta.get().binaryEpoch;
     const healthy = this.repos.serves.listHealthy(
@@ -323,9 +334,20 @@ export class IngressRouter {
       this.opts.staleServeMs,
       epoch,
     );
-    const candidates = healthy.map((s) => s.serveId);
+    let candidates = healthy.map((s) => s.serveId);
     if (candidates.length === 0) {
       throw new NoHealthyServeError();
+    }
+    // A caller that just watched a serve fail (launch create failover) asks to
+    // keep the new session off it. Advisory: if it would empty the pool, the
+    // whole healthy set stays, because placing somewhere beats NoHealthyServe.
+    if (opts?.avoidEndpoints && opts.avoidEndpoints.length > 0) {
+      const avoid = new Set(opts.avoidEndpoints.map(normalizeEndpoint));
+      const kept = healthy.filter((s) => !avoid.has(normalizeEndpoint(s.endpoint))).map((s) => s.serveId);
+      if (kept.length > 0 && kept.length < candidates.length) {
+        this.log("placement avoiding serves the caller saw fail", { sessionId, avoided: opts.avoidEndpoints });
+        candidates = kept;
+      }
     }
 
     // Bounded-load skip. Load is LIVE LEASES, never `session_assignment` rows — see
@@ -544,8 +566,8 @@ export class IngressRouter {
    * read-only. Do not derive an "is this session active" signal from placement
    * recency; read `session_lease` instead. See `AssignmentRecord.lastPlacedAt`.
    */
-  ensureRouted(sessionId: string, now: number): RouteResult {
-    return this.resolveRoute(sessionId, now) ?? this.placeSession(sessionId, now);
+  ensureRouted(sessionId: string, now: number, opts?: PlaceOptions): RouteResult {
+    return this.resolveRoute(sessionId, now) ?? this.placeSession(sessionId, now, undefined, opts);
   }
 
   sweep(now: number): void {

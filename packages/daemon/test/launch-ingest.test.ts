@@ -1449,8 +1449,10 @@ describe("applyTag export", () => {
 });
 
 describe("startSession create failover (createClients)", () => {
+  let n = 0;
   function serve(create: () => Promise<{ id: string }>): OpencodeClient {
     return {
+      endpoint: `http://127.0.0.1:${4096 + n++}`,
       healthCheck: vi.fn().mockResolvedValue(true),
       createSession: vi.fn(create),
       sendPrompt: vi.fn().mockResolvedValue(undefined),
@@ -1465,13 +1467,14 @@ describe("startSession create failover (createClients)", () => {
     const b = serve(ok("ses_b"));
     const owner = serve(ok("unused"));
     const onCreated = vi.fn();
+    const resolveOwnerClient = vi.fn(() => owner);
 
     const outcome = await startSession({
       directory: "/d",
       prompt: "p",
       opencodeClient: a,
       createClients: () => [a, b],
-      resolveOwnerClient: () => owner,
+      resolveOwnerClient,
       budgets: { healthMs: 5000, createMs: 15000, promptMs: 20000 },
       onCreated,
     });
@@ -1480,28 +1483,29 @@ describe("startSession create failover (createClients)", () => {
     expect(onCreated).toHaveBeenCalledTimes(1);
     expect(onCreated).toHaveBeenCalledWith("ses_b");
     expect(owner.sendPrompt).toHaveBeenCalledTimes(1);
+    // The owner is placed OFF the serve the create just failed on.
+    expect(resolveOwnerClient).toHaveBeenCalledWith("ses_b", { avoidEndpoints: [a.endpoint] });
     expect(a.sendPrompt).not.toHaveBeenCalled();
     expect(b.sendPrompt).not.toHaveBeenCalled();
   });
 
-  it("splits the create budget between the attempts by elapsed time", async () => {
-    // The first attempt "takes" 7.5s of a 15s budget, so the second gets the rest.
+  it("gives the first attempt the budget minus a 5s failover reserve, and the second what is left", async () => {
     let now = 1_000_000;
     const spy = vi.spyOn(Date, "now").mockImplementation(() => now);
-    const a = serve(() => { now += 7500; return timeout(); });
+    const a = serve(() => { now += 15000; return timeout(); });
     const b = serve(ok("ses_b"));
     await startSession({
       directory: "/d",
       prompt: "p",
       opencodeClient: a,
       createClients: () => [a, b],
-      budgets: { healthMs: 5000, createMs: 15000, promptMs: 20000 },
+      budgets: { healthMs: 5000, createMs: 20000, promptMs: 20000 },
     });
     const firstTimeout = (a.createSession as ReturnType<typeof vi.fn>).mock.calls[0]![1].timeoutMs;
     const secondTimeout = (b.createSession as ReturnType<typeof vi.fn>).mock.calls[0]![1].timeoutMs;
     spy.mockRestore();
-    expect(firstTimeout).toBe(7500);
-    expect(secondTimeout).toBe(7500);
+    expect(firstTimeout).toBe(15000);
+    expect(secondTimeout).toBe(5000);
   });
 
   it("skips the up-front health check with a pool, so a down serve-0 does not refuse the launch", async () => {
@@ -1538,13 +1542,28 @@ describe("startSession create failover (createClients)", () => {
     expect(outcome).toMatchObject({ outcome: "refused", reason: "serve_unreachable" });
   });
 
-  it("fewer than two healthy serves keeps the single-serve path on opencodeClient", async () => {
+  it("one healthy pool serve that is not serve-0 is the one created on", async () => {
     const legacy = serve(ok("ses_legacy"));
     const other = serve(ok("ses_other"));
     const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: legacy, createClients: () => [other] });
+    expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_other" });
+    expect(legacy.createSession).not.toHaveBeenCalled();
+  });
+
+  it("an empty healthy set keeps the single-serve path, with its health check", async () => {
+    const legacy = serve(ok("ses_legacy"));
+    const outcome = await startSession({ directory: "/d", prompt: "p", opencodeClient: legacy, createClients: () => [] });
     expect(outcome).toEqual({ outcome: "launched", sessionId: "ses_legacy" });
     expect(legacy.healthCheck).toHaveBeenCalled();
-    expect(other.createSession).not.toHaveBeenCalled();
+  });
+
+  it("a first-attempt success places the owner with no avoid list", async () => {
+    const a = serve(ok("ses_a"));
+    const b = serve(ok("ses_b"));
+    const resolveOwnerClient = vi.fn(() => a);
+    await startSession({ directory: "/d", prompt: "p", opencodeClient: a, createClients: () => [a, b], resolveOwnerClient });
+    expect(resolveOwnerClient).toHaveBeenCalledWith("ses_a");
+    expect(b.createSession).not.toHaveBeenCalled();
   });
 
   it("a throwing createClients falls back to the single-serve path", async () => {

@@ -49,7 +49,7 @@ export interface LaunchCommandInput {
    * absent, or when it returns undefined (no healthy pool serve), the launch
    * degrades to sending on `opencodeClient` — the pre-pool single-serve behavior.
    */
-  resolveOwnerClient?: (sessionId: string) => OpencodeClient | undefined;
+  resolveOwnerClient?: (sessionId: string, opts?: { avoidEndpoints?: string[] }) => OpencodeClient | undefined;
   /** Healthy pool serves to create on, with failover. See LaunchStartInput.createClients. */
   createClients?: () => OpencodeClient[];
   /**
@@ -234,15 +234,21 @@ export interface LaunchStartInput {
   directory: string;              // already resolved, absolute
   prompt: string;
   opencodeClient: OpencodeClient;
-  resolveOwnerClient?: (sessionId: string) => OpencodeClient | undefined;
-  budgets?: { healthMs: number; createMs: number; promptMs: number };  // remote launches pass 5000/15000/20000
+  /**
+   * The owning serve's client for a session (HRW placement). `avoidEndpoints`
+   * names serves a create just failed on, so a NEW placement keeps the session
+   * off them while another healthy serve exists.
+   */
+  resolveOwnerClient?: (sessionId: string, opts?: { avoidEndpoints?: string[] }) => OpencodeClient | undefined;
+  budgets?: { healthMs: number; createMs: number; promptMs: number };  // remote launches pass 5000/20000/20000
   onCreated?: (sessionId: string) => void;   // called synchronously right after createSession returns, before sendPrompt
   /**
    * Clients for the pool's currently healthy serves, in the order to try
-   * `createSession` on. When it returns two or more, a create that times out,
-   * fails in transport or gets a non-OK answer is retried ONCE on the next
-   * serve, inside the same create budget. Absent, or fewer than two, means the
-   * single-serve path on `opencodeClient`, unchanged.
+   * `createSession` on. With one or more, the launch creates on them instead
+   * of `opencodeClient`, and a create that times out, fails in transport or
+   * gets a non-OK answer is retried ONCE on the next serve inside the same
+   * create budget. Absent, empty or throwing means the single-serve path on
+   * `opencodeClient`, with its up-front health check.
    *
    * Why (2026-11-03, devbox): serve-0 answered /global/health but hung every
    * session-DB route for 2.5h, and every launch timed out creating on it while
@@ -256,12 +262,19 @@ export interface LaunchStartInput {
 export const DEFAULT_CREATE_BUDGET_MS = 30_000;
 
 /**
- * At most this many serves are tried per launch. The create budget is split
- * between them, so more attempts would starve each of time a healthy create
- * might need (cold directory bootstrap), and the whole launch must finish
- * inside one 60s lease or the item is handed out again mid-launch.
+ * At most this many serves are tried per launch. More attempts would starve
+ * each of time, and the whole launch must finish inside one 60s lease or the
+ * item is handed out again mid-launch.
  */
 export const MAX_CREATE_ATTEMPTS = 2;
+
+/**
+ * Time held back from the first attempt for the failover attempt. The first
+ * serve gets everything else, so on an ordinary day (remote: 20s budget, first
+ * attempt 15s) a slow cold-directory create has exactly the time it had before
+ * failover existed; only a serve that blows through that falls over.
+ */
+export const FAILOVER_RESERVE_MS = 5_000;
 
 function formatDetail(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
@@ -285,16 +298,16 @@ function classifyCreateFailure(err: unknown): CreateFailure {
   return { outcome: "refused", reason: "create_failed", detail };
 }
 
-function resolveCreateClients(input: LaunchStartInput): OpencodeClient[] {
-  let clients: OpencodeClient[] = [];
-  if (input.createClients) {
-    try {
-      clients = input.createClients();
-    } catch (err) {
-      console.warn(`[launch-ingest] createClients threw, creating on opencodeClient:`, err);
-    }
+/** The pool candidates to create on, or null for the single-serve path. */
+function resolvePoolCandidates(input: LaunchStartInput): OpencodeClient[] | null {
+  if (!input.createClients) return null;
+  try {
+    const clients = input.createClients();
+    return clients.length > 0 ? clients.slice(0, MAX_CREATE_ATTEMPTS) : null;
+  } catch (err) {
+    console.warn(`[launch-ingest] createClients threw, creating on opencodeClient:`, err);
+    return null;
   }
-  return clients.length >= 2 ? clients.slice(0, MAX_CREATE_ATTEMPTS) : [input.opencodeClient];
 }
 
 /**
@@ -302,46 +315,40 @@ function resolveCreateClients(input: LaunchStartInput): OpencodeClient[] {
  *
  * Every failure fails over, including an ambiguous timeout. A timed-out create
  * may still complete on the first serve and leave an EMPTY, unprompted session
- * there. That orphan is harmless (it never runs a turn) and was already a known
- * outcome of a slow create; it is a far better trade than reporting the launch
- * as "may or may not have started" with no id, which is what a single attempt
- * gives. No prompt is ever sent twice: sendPrompt runs once, after one create
- * has succeeded.
+ * there. That orphan never runs a turn and was already a known outcome of a
+ * slow create; it is a far better trade than reporting the launch as "may or
+ * may not have started" with no id, which is what a single attempt gives. No
+ * prompt is ever sent twice: sendPrompt runs once, after one create succeeded.
  *
  * When every attempt fails, the result is the most cautious one seen: any
  * ambiguous failure makes it unconfirmed, otherwise the last refusal stands.
+ * `failedEndpoints` names the serves that failed before the winner, so the
+ * prompt's owner can be placed elsewhere.
  */
 async function createOnCandidates(
   input: LaunchStartInput,
   clients: OpencodeClient[],
-): Promise<{ session: { id: string } } | CreateFailure> {
-  if (clients.length === 1) {
-    try {
-      const session = input.budgets
-        ? await clients[0]!.createSession(input.directory, { timeoutMs: input.budgets.createMs })
-        : await clients[0]!.createSession(input.directory);
-      return { session };
-    } catch (err) {
-      return classifyCreateFailure(err);
-    }
-  }
-
+): Promise<{ session: { id: string }; failedEndpoints: string[] } | CreateFailure> {
   const totalMs = input.budgets?.createMs ?? DEFAULT_CREATE_BUDGET_MS;
   const startedAt = Date.now();
+  const failedEndpoints: string[] = [];
   let worst: CreateFailure | undefined;
   for (let i = 0; i < clients.length; i++) {
     const remaining = totalMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
-    const timeoutMs = Math.max(1, Math.floor(remaining / (clients.length - i)));
+    const reserve = (clients.length - 1 - i) * FAILOVER_RESERVE_MS;
+    const timeoutMs = Math.max(1, remaining - reserve > 0 ? remaining - reserve : Math.floor(remaining / (clients.length - i)));
+    const client = clients[i]!;
     try {
-      const session = await clients[i]!.createSession(input.directory, { timeoutMs });
+      const session = await client.createSession(input.directory, { timeoutMs });
       if (i > 0) {
-        console.warn(`[launch-ingest] createSession succeeded on failover serve attempt=${i + 1} session=${session.id}`);
+        console.warn(`[launch-ingest] createSession succeeded on failover attempt ${i + 1} session=${session.id} avoided=${failedEndpoints.join(",")}`);
       }
-      return { session };
+      return { session, failedEndpoints };
     } catch (err) {
       const failure = classifyCreateFailure(err);
-      console.warn(`[launch-ingest] createSession attempt ${i + 1}/${clients.length} failed (${failure.outcome}): ${failure.detail}`);
+      console.warn(`[launch-ingest] createSession attempt ${i + 1}/${clients.length} on ${client.endpoint ?? "?"} failed (${failure.outcome}): ${failure.detail}`);
+      if (client.endpoint) failedEndpoints.push(client.endpoint);
       if (!worst || failure.outcome === "unconfirmed") worst = failure;
       else if (worst.outcome === "refused") worst = failure;
     }
@@ -349,35 +356,45 @@ async function createOnCandidates(
   return worst ?? { outcome: "unconfirmed", sessionId: null, detail: "create budget exhausted" };
 }
 
-export async function startSession(input: LaunchStartInput): Promise<LaunchStartOutcome> {
-  const clients = resolveCreateClients(input);
-  // With a pool, the up-front /global/health on opencodeClient is skipped: it
-  // could only refuse a launch another healthy serve would take, and it passes
-  // on exactly the half-wedged serve the failover exists for. The pool's
-  // healthy set already stands in for it, and a dead serve fails the create
-  // fast (ECONNREFUSED) and fails over.
-  if (clients.length === 1) {
-    try {
-      const healthy = input.budgets
-        ? await input.opencodeClient.healthCheck({ timeoutMs: input.budgets.healthMs })
-        : await input.opencodeClient.healthCheck();
-      if (!healthy) {
-        return {
-          outcome: "refused",
-          reason: "serve_unavailable",
-          detail: "opencode serve is not running",
-        };
-      }
-    } catch (err) {
+async function createSingleServe(
+  input: LaunchStartInput,
+): Promise<{ session: { id: string }; failedEndpoints: string[] } | CreateFailure> {
+  try {
+    const healthy = input.budgets
+      ? await input.opencodeClient.healthCheck({ timeoutMs: input.budgets.healthMs })
+      : await input.opencodeClient.healthCheck();
+    if (!healthy) {
       return {
         outcome: "refused",
         reason: "serve_unavailable",
-        detail: formatDetail(err),
+        detail: "opencode serve is not running",
       };
     }
+  } catch (err) {
+    return {
+      outcome: "refused",
+      reason: "serve_unavailable",
+      detail: formatDetail(err),
+    };
   }
+  try {
+    const session = input.budgets
+      ? await input.opencodeClient.createSession(input.directory, { timeoutMs: input.budgets.createMs })
+      : await input.opencodeClient.createSession(input.directory);
+    return { session, failedEndpoints: [] };
+  } catch (err) {
+    return classifyCreateFailure(err);
+  }
+}
 
-  const created = await createOnCandidates(input, clients);
+export async function startSession(input: LaunchStartInput): Promise<LaunchStartOutcome> {
+  // With a pool, the up-front /global/health on opencodeClient is skipped: it
+  // could only refuse a launch another healthy serve would take, and it passes
+  // on exactly the half-wedged serve the failover exists for. The pool's
+  // healthy set (fresh heartbeats) stands in for it, and a dead serve fails the
+  // create fast (ECONNREFUSED) and fails over.
+  const pool = resolvePoolCandidates(input);
+  const created = pool ? await createOnCandidates(input, pool) : await createSingleServe(input);
   if ("outcome" in created) return created;
   const session = created.session;
 
@@ -392,7 +409,8 @@ export async function startSession(input: LaunchStartInput): Promise<LaunchStart
   let owner = input.opencodeClient;
   if (input.resolveOwnerClient) {
     try {
-      owner = input.resolveOwnerClient(session.id) ?? input.opencodeClient;
+      const placeOpts = created.failedEndpoints.length > 0 ? { avoidEndpoints: created.failedEndpoints } : undefined;
+      owner = (placeOpts ? input.resolveOwnerClient(session.id, placeOpts) : input.resolveOwnerClient(session.id)) ?? input.opencodeClient;
     } catch (err) {
       console.warn(`[launch-ingest] resolveOwnerClient threw for session ${session.id}, falling back to opencodeClient:`, err);
     }

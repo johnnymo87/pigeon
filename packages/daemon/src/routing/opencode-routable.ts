@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
+import type { PlaceOptions } from "./router";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import type { SessionRecord } from "../storage/types";
 
@@ -62,7 +63,7 @@ export function isOpencodeRoutable(session: RoutableEvidence | undefined): boole
 export interface ClientForSessionDeps {
   getSession(sessionId: string): SessionRecord | undefined;
   /** The pool-aware factory; absent when routing is unconfigured. */
-  clientFactory: { forSession(sessionId: string): OpencodeClient | undefined } | undefined;
+  clientFactory: { forSession(sessionId: string, opts?: PlaceOptions): OpencodeClient | undefined } | undefined;
   /** The single legacy client used when routing is unconfigured. */
   fallbackClient: OpencodeClient | undefined;
 }
@@ -81,9 +82,9 @@ export interface ClientForSessionDeps {
  */
 export function makeClientForSession(
   deps: ClientForSessionDeps,
-): (sessionId: string) => OpencodeClient | undefined {
-  return (sessionId) => {
+): (sessionId: string, opts?: PlaceOptions) => OpencodeClient | undefined {
+  return (sessionId, opts) => {
     if (!isOpencodeRoutable(deps.getSession(sessionId))) return undefined;
-    return deps.clientFactory ? deps.clientFactory.forSession(sessionId) : deps.fallbackClient;
+    return deps.clientFactory ? deps.clientFactory.forSession(sessionId, opts) : deps.fallbackClient;
   };
 }

@@ -44,7 +44,7 @@ export interface LaunchReceiverDeps {
   launchFrom: readonly string[];          // config.remoteLaunchFrom
   relaySendEnabled: boolean;              // config.swarmRelaySend (design §9.3)
   opencodeClient?: OpencodeClient;
-  resolveOwnerClient?: (id: string) => OpencodeClient | undefined;
+  resolveOwnerClient?: (id: string, opts?: { avoidEndpoints?: string[] }) => OpencodeClient | undefined;
   /** Healthy pool serves to create on, with failover (launch-ingest LaunchStartInput.createClients). */
   createClients?: () => OpencodeClient[];
   ack: (items: LaunchAckItem[]) => Promise<boolean>;
@@ -380,7 +380,7 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
     opencodeClient: deps.opencodeClient,
     resolveOwnerClient: deps.resolveOwnerClient,
     ...(deps.createClients ? { createClients: deps.createClients } : {}),
-    budgets: { healthMs: 5000, createMs: 15000, promptMs: 20000 },
+    budgets: { healthMs: 5000, createMs: 20000, promptMs: 20000 },
     onCreated: (sessionId: string) => {
       deps.storage.remoteLaunch.inbound.markCreated(fromMachine, launchId, sessionId, (deps.nowFn ?? Date.now)());
     },

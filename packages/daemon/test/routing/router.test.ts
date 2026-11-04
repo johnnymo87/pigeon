@@ -1756,3 +1756,38 @@ describe("IngressRouter.healthyEndpoints", () => {
     expect(s.assignments.get("anything")).toBeNull();
   });
 });
+
+describe("IngressRouter placement avoidEndpoints", () => {
+  function setup() {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000, staleServeMs: 2000, idleMigrateMs: 3000, dormantTtlMs: 10000, activeTurnCap: 10,
+    });
+    const now = 10_000;
+    const base = { binaryEpoch: 0, healthState: "healthy" as const, heartbeatAt: now, draining: false };
+    s.serves.upsert({ ...base, serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096" });
+    s.serves.upsert({ ...base, serveId: "serve-1", instanceUuid: "u1", endpoint: "http://127.0.0.1:4097" });
+    return { s, router, now };
+  }
+
+  it("keeps a new session off an avoided serve even when HRW prefers it", () => {
+    const { router, now } = setup();
+    const sid = sessionPreferring("serve-0", ["serve-0", "serve-1"]);
+    const r = router.ensureRouted(sid, now, { avoidEndpoints: ["http://127.0.0.1:4096/"] });
+    expect(r.serveId).toBe("serve-1");
+  });
+
+  it("ignores the avoid list when it would leave no serve", () => {
+    const { router, now } = setup();
+    const sid = sessionPreferring("serve-0", ["serve-0", "serve-1"]);
+    const r = router.ensureRouted(sid, now, { avoidEndpoints: ["http://127.0.0.1:4096", "http://127.0.0.1:4097"] });
+    expect(r.serveId).toBe("serve-0");
+  });
+
+  it("does not move a session that already has a route", () => {
+    const { router, now } = setup();
+    const sid = sessionPreferring("serve-0", ["serve-0", "serve-1"]);
+    expect(router.ensureRouted(sid, now).serveId).toBe("serve-0");
+    expect(router.ensureRouted(sid, now + 1, { avoidEndpoints: ["http://127.0.0.1:4096"] }).serveId).toBe("serve-0");
+  });
+});
