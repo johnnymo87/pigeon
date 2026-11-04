@@ -450,8 +450,13 @@ message *before* the anchor is in the window (that is the only pre-anchor messag
 blocking-turn check reads). A row without one is settled once the window reaches 10 minutes before
 the earliest moment its envelope could have been written (`deliver_at`, else `created_at`; never
 `handed_off_at`, which an earlier timed-out attempt can predate). A window that cannot be
-completed (page cap, a failing later page) is a `window-incomplete` skip that changes nothing: an
-anchor missing from a truncated window is not evidence. `OpencodeClient` has no unbounded read at
+completed (page cap, a failing later page, or a cursor-less last page of exactly `limit`, which is
+what an opencode older than 1.2.20 answers on every page) leaves those rows unsettled: they are
+skipped without state change, because an anchor missing from a truncated window is not evidence,
+while the session's settled rows are judged normally. Two in-memory bounds keep steady-state cost
+near one page: a row the page cap could not settle is not read deep again for an hour
+(`DEEP_READ_BACKOFF_MS`), and once a complete window proves a row's anchor absent, later reads go
+back only to that window's newest message (`absentThrough`). A restart costs one deep read. `OpencodeClient` has no unbounded read at
 all, and every `cycle complete` log line carries `transcriptPages` / `transcriptMessages`.
 
 Why: a scheduled self-wake that never verified was re-examined every 60 s for 23 days, each time
@@ -463,7 +468,10 @@ with the serve canary and restarted that serve 42 times in a day; later, rows qu
 retired: `failed`, the sender told `DELIVERY UNCONFIRMED` (envelope present, or transcript
 unreadable) or `NOT received` (absent from a complete window), a wake/scheduled row's payload
 alerted durably (`wake-watch-expired`, ref = msg_id), a nudge row just marked failed. Verification
-still wins past the horizon. This bounds the branches that otherwise never end (suppressed
+still wins past the horizon. A row retired without any readable transcript (`unobserved`) gets
+a further hour (`UNOBSERVED_RETIRE_GRACE_MS`) so a brief outage at the horizon does not end it
+unlooked-at. Rows older than 24 h at first deploy retire on the first cycle, each with an alert
+and (cross-session) a sender notice: count them before deploying. This bounds the branches that otherwise never end (suppressed
 lost-wake, silent in flight, waiting behind a turn). It stops *watching*; it aborts and injects
 nothing, so it is consistent with the never-preempt policy below.
 

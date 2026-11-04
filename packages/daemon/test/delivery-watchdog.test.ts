@@ -3987,6 +3987,103 @@ describe("DeliveryWatchdog", () => {
     });
   });
 
+  describe("pigeon-hfsj: review follow-ups", () => {
+    const HOUR = 60 * 60_000;
+
+    function turns(n: number, until: number): unknown[] {
+      const out: unknown[] = [];
+      for (let i = n; i > 0; i--) {
+        const t = until - i * 10_000;
+        out.push(userMessage(t, "filler"));
+        out.push(assistantMessage({ created: t + 1, completed: t + 2 }));
+      }
+      return out;
+    }
+
+    it("a row the page cap cannot settle neither holds back its sibling nor is re-read deep every cycle", async () => {
+      const base = 1000 * HOUR;
+      const f = makeFixture();
+      fixture = f;
+      const client = makeClient();
+      // 4,000 messages over ~5.5 h, then a fresh sibling's envelope and its answer.
+      client.getSessionMessages.mockResolvedValue([
+        ...turns(2000, base),
+        userMessage(base + 10, `<swarm_message v="1" msg_id="m_sib">`),
+        assistantMessage({ created: base + 20, completed: base + 30 }),
+      ]);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      // Old suppressed wake, anchor nowhere: needs history back to 6 h ago.
+      f.insertHandedOff({
+        msgId: "m_old", fromSession: "ses_b", toSession: "ses_b",
+        handedOffAt: base - 6 * HOUR, deliverAt: base - 6 * HOUR, kind: "chat",
+      });
+      f.insertHandedOff({ msgId: "m_sib", fromSession: "ses_a", toSession: "ses_b", handedOffAt: base });
+      f.setNow(base + 400_000);
+
+      const s1 = await f.watchdog.processOnce();
+      expect(s1.transcriptPages).toBe(20);
+      expect(f.storage.swarm.getByMsgId("m_sib")!.verifiedAt).toBe(base + 400_000);
+      expect(f.storage.swarm.getByMsgId("m_old")!.state).toBe("handed_off");
+
+      // Next cycle: the old row is backed off, so nothing is read for it.
+      f.setNow(base + 460_000);
+      const s2 = await f.watchdog.processOnce();
+      expect(s2.transcriptPages).toBe(0);
+      expect(s2.skipped).toBe(1);
+
+      // An hour later it gets one more deep read.
+      f.setNow(base + 400_000 + HOUR + 1);
+      expect((await f.watchdog.processOnce()).transcriptPages).toBe(20);
+    });
+
+    it("once absence is proven, later cycles read back only to where it was proven", async () => {
+      const base = 1000 * HOUR;
+      const f = makeFixture();
+      fixture = f;
+      const client = makeClient();
+      const history = turns(400, base); // 800 msgs, 10 s per turn, ending at base
+      client.getSessionMessages.mockResolvedValue(history);
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      // A suppressed wake written 20 min ago whose anchor never appeared.
+      f.insertHandedOff({
+        msgId: "m_w", fromSession: "ses_b", toSession: "ses_b",
+        handedOffAt: base - 20 * 60_000, deliverAt: base - 20 * 60_000, kind: "chat",
+      });
+      f.setNow(base + 60_000);
+
+      const s1 = await f.watchdog.processOnce();
+      expect(s1.transcriptPages).toBe(8); // back past base-30min: 181 turns = 362 msgs
+
+      // 30 new turns arrive; the next read only needs to reach base - 10 min.
+      client.getSessionMessages.mockResolvedValue([...history, ...turns(30, base + 400_000)]);
+      f.setNow(base + 120_000);
+      const s2 = await f.watchdog.processOnce();
+      expect(s2.transcriptPages).toBeLessThanOrEqual(4);
+      expect(f.storage.swarm.getByMsgId("m_w")!.state).toBe("handed_off");
+    });
+
+    it("a last page of exactly `limit` with no cursor (what a cursor-less opencode always answers) is not evidence of absence", async () => {
+      const base = 1000 * HOUR;
+      const f = makeFixture();
+      fixture = f;
+      const all = turns(500, base);
+      const client = makeClient();
+      client.getSessionMessagesPage.mockImplementation(async (_id: string, opts: { limit: number }) => ({
+        messages: all.slice(-opts.limit),
+        nextCursor: null,
+      }));
+      f.clientMap.set("ses_b", { preferred: client, all: [client] });
+      f.insertHandedOff({ msgId: "m_nc", fromSession: "ses_a", toSession: "ses_b", handedOffAt: base - 2 * HOUR });
+      f.setNow(base + 60_000);
+
+      const s = await f.watchdog.processOnce();
+
+      expect(s.requeued).toBe(0);
+      expect(s.skipped).toBe(1);
+      expect(f.storage.swarm.getByMsgId("m_nc")!.state).toBe("handed_off");
+    });
+  });
+
   describe("pigeon-hfsj: watch horizon", () => {
     const HOUR = 60 * 60_000;
     const base = 1000 * HOUR;
@@ -4078,9 +4175,12 @@ describe("DeliveryWatchdog", () => {
       expect(f.storage.swarm.getByMsgId("m_h")!.verifiedAt).toBe(now);
     });
 
-    it("a transcript that can never be read (persistent 5xx) retires with 'unobserved' evidence", async () => {
+    it("a transcript that can never be read (persistent 5xx) retires with 'unobserved' evidence, after a 1 h grace", async () => {
       const f = horizonFixture(new Error("getSessionMessages failed (500): boom"), {});
 
+      // 25 h: past the horizon but inside the unobserved grace, so it waits for a look.
+      expect((await f.watchdog.processOnce()).terminal).toBe(0);
+      f.setNow(base + 25 * HOUR + 60_000);
       const s = await f.watchdog.processOnce();
 
       expect(s.terminal).toBe(1);

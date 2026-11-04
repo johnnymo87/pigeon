@@ -142,3 +142,26 @@ describe("ingestCompactCommand paging (pigeon-hfsj)", () => {
     expect(summarize).toHaveBeenCalledWith("s", "p", "m");
   });
 });
+
+describe("ingestCompactCommand model fallback (pigeon-hfsj)", () => {
+  it("uses the newest assistant message's model when no user message is within the pages read", async () => {
+    const messages: unknown[] = [
+      { info: { role: "user", model: { providerID: "old", modelID: "old" } }, parts: [] },
+      ...Array.from({ length: 150 }, (_, i) => ({
+        info: { role: "assistant", providerID: "p", modelID: i === 149 ? "newest" : "m" },
+        parts: [],
+      })),
+    ];
+    const page = vi.fn(pagesFrom(async () => messages));
+    const summarize = vi.fn().mockResolvedValue(undefined);
+    await ingestCompactCommand({
+      commandId: "c",
+      sessionId: "s",
+      chatId: "1",
+      opencodeClient: { getSessionMessagesPage: page, summarize },
+      sendTelegramReply: vi.fn(),
+    });
+    expect(page).toHaveBeenCalledTimes(5);
+    expect(summarize).toHaveBeenCalledWith("s", "p", "newest");
+  });
+});

@@ -142,6 +142,20 @@ export const DEFAULT_TRANSCRIPT_MAX_PAGES = 20;
  * believed. Covers clock skew between daemon and serve stamps.
  */
 export const TRANSCRIPT_WINDOW_MARGIN_MS = 10 * 60_000;
+/**
+ * A row the page cap could not settle is not read deep again for this long. It
+ * needs more history than the cap allows, which is the whole history of a big
+ * session, so re-reading 20 pages every minute would bring the incident back
+ * at a twentieth of the size. With the 24 h horizon that bounds it to ~24 deep
+ * reads in its life.
+ */
+export const DEEP_READ_BACKOFF_MS = 60 * 60_000;
+/**
+ * Extra time past the horizon before a row is retired WITHOUT a look at its
+ * transcript, so a row crossing the horizon during a brief outage (the nightly
+ * serve bounce) still gets a cycle that can verify it.
+ */
+export const UNOBSERVED_RETIRE_GRACE_MS = 60 * 60_000;
 
 /** Delay before a watchdog-initiated redelivery is retried by the arbiter. */
 const RECOVERY_REQUEUE_DELAY_MS = 5_000;
@@ -484,7 +498,18 @@ function lastActivityOf(msg: ParsedMessage): number {
 
 interface FetchOk {
   ok: true;
+  /** The window read, chronological. May be partial: see `unsettled`. */
   messages: ParsedMessage[];
+  /**
+   * Rows the window is NOT deep enough to judge, with why: the page cap was
+   * reached, a later page failed, or a final page could not be told apart
+   * from a server that sends no cursor. Judging them anyway would read a
+   * truncated window as "anchor absent", which is not evidence. A later page's
+   * 404 lands here too, so it can never reach the confirmed-gone terminal.
+   */
+  unsettled: Map<string, string>;
+  /** True when the read stopped at the page cap. */
+  capped: boolean;
   pages: number;
   read: number;
 }
@@ -495,24 +520,18 @@ interface FetchErr {
   pages: number;
   read: number;
 }
-/**
- * The window could not be completed: a later page failed, or the page cap was
- * reached before every row settled. NOT an error about the session (a later
- * page's 404 must never reach the confirmed-gone terminal), and not evidence
- * either: an anchor missing from a truncated window may simply be older.
- */
-interface FetchIncomplete {
-  ok: "incomplete";
-  why: string;
-  pages: number;
-  read: number;
-}
-type FetchResult = FetchOk | FetchErr | FetchIncomplete;
+type FetchResult = FetchOk | FetchErr;
 
 interface TranscriptWindow {
   pageLimit: number;
   maxPages: number;
   marginMs: number;
+  /**
+   * Per row: the newest message time of a window that already proved its
+   * anchor absent. Absence before that is settled, so later cycles read back
+   * only to here instead of to the row's write time (pigeon-hfsj review).
+   */
+  absentThrough: (msgId: string) => number | undefined;
 }
 
 /** OpencodeClient.getSessionMessagesPage throws `getSessionMessages failed (<status>): <body>` on
@@ -544,7 +563,7 @@ function extractStatus(err: unknown): number | null {
 function rowSettled(
   messages: ParsedMessage[],
   row: SwarmMessageRecord,
-  marginMs: number,
+  window: TranscriptWindow,
 ): boolean {
   const anchor = findAnchor(messages, row.msgId);
   if (anchor !== null) {
@@ -552,8 +571,12 @@ function rowSettled(
   }
   const oldest = messages[0];
   if (!oldest) return false;
-  const earliestWrite = row.deliverAt ?? row.createdAt;
-  return oldest.created < earliestWrite - marginMs;
+  // max, not ??: a relayed row that was held has deliverAt < createdAt, and the
+  // local insert (createdAt) is the earliest a local write could happen.
+  const earliestWrite = Math.max(row.deliverAt ?? row.createdAt, row.createdAt);
+  const provenThrough = window.absentThrough(row.msgId);
+  const need = provenThrough !== undefined ? Math.max(provenThrough, earliestWrite) : earliestWrite;
+  return oldest.created < need - window.marginMs;
 }
 
 /**
@@ -574,6 +597,9 @@ async function fetchTranscript(
   const pages: ParsedMessage[][] = [];
   let read = 0;
   let before: string | undefined;
+  const unsettledIn = (messages: ParsedMessage[], why: string) =>
+    new Map(rows.filter((r) => !rowSettled(messages, r, window)).map((r) => [r.msgId, why]));
+
   for (let page = 1; page <= window.maxPages; page++) {
     let res: { messages: unknown[]; nextCursor: string | null };
     try {
@@ -591,20 +617,51 @@ async function fetchTranscript(
           read,
         };
       }
-      return { ok: "incomplete", why: "later-page-failed", pages: page - 1, read };
+      const messages = pages.flat();
+      return {
+        ok: true,
+        messages,
+        unsettled: unsettledIn(messages, "later-page-failed"),
+        capped: false,
+        pages: page - 1,
+        read,
+      };
     }
     const raw = Array.isArray(res.messages) ? res.messages : [];
     read += raw.length;
-    pages.unshift(
-      raw.map(parseMessage).filter((m): m is ParsedMessage => m !== null),
-    );
+    pages.unshift(raw.map(parseMessage).filter((m): m is ParsedMessage => m !== null));
     const messages = pages.flat();
-    if (!res.nextCursor || rows.every((r) => rowSettled(messages, r, window.marginMs))) {
-      return { ok: true, messages, pages: page, read };
+    if (!res.nextCursor) {
+      // Nothing older, so every row is settled: EXCEPT a page of exactly
+      // `limit`, which is also what an opencode older than its cursor support
+      // (pre-1.2.20) answers on EVERY page. There, "anchor absent" from the
+      // newest page would requeue a duplicate, so such rows stay unsettled.
+      // Current opencode reads limit+1 and sends no cursor on a final page of
+      // exactly `limit`, so this costs an occasional skipped cycle at most.
+      const exhausted = raw.length !== window.pageLimit;
+      return {
+        ok: true,
+        messages,
+        unsettled: exhausted ? new Map() : unsettledIn(messages, "no-cursor-full-page"),
+        capped: false,
+        pages: page,
+        read,
+      };
+    }
+    if (rows.every((r) => rowSettled(messages, r, window))) {
+      return { ok: true, messages, unsettled: new Map(), capped: false, pages: page, read };
     }
     before = res.nextCursor;
   }
-  return { ok: "incomplete", why: "page-cap", pages: window.maxPages, read };
+  const messages = pages.flat();
+  return {
+    ok: true,
+    messages,
+    unsettled: unsettledIn(messages, "page-cap"),
+    capped: true,
+    pages: window.maxPages,
+    read,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +686,10 @@ export class DeliveryWatchdog {
   private readonly receiptGraceMs: number;
   private readonly maxWatchMs: number;
   private readonly transcriptWindow: TranscriptWindow;
+  /** See TranscriptWindow.absentThrough. In memory: a restart costs one deep read. */
+  private readonly absentThrough = new Map<string, number>();
+  /** msg_id -> no deep read before this time. See DEEP_READ_BACKOFF_MS. */
+  private readonly deepReadAfter = new Map<string, number>();
   private readonly isReceiptPending: (msgId: string) => boolean;
 
   // Dedupe: msg_id -> the stuck-behind-blocking-turn warn has already fired
@@ -703,9 +764,11 @@ export class DeliveryWatchdog {
       );
     }
     this.transcriptWindow = {
-      pageLimit: opts.transcriptPageLimit ?? DEFAULT_TRANSCRIPT_PAGE_LIMIT,
-      maxPages: opts.transcriptMaxPages ?? DEFAULT_TRANSCRIPT_MAX_PAGES,
+      // >= 1: opencode treats limit=0 as unbounded.
+      pageLimit: Math.max(1, opts.transcriptPageLimit ?? DEFAULT_TRANSCRIPT_PAGE_LIMIT),
+      maxPages: Math.max(1, opts.transcriptMaxPages ?? DEFAULT_TRANSCRIPT_MAX_PAGES),
       marginMs: TRANSCRIPT_WINDOW_MARGIN_MS,
+      absentThrough: (msgId) => this.absentThrough.get(msgId),
     };
     this.isReceiptPending = opts.isReceiptPending ?? (() => false);
     this.directoryTimeoutMs =
@@ -876,6 +939,8 @@ export class DeliveryWatchdog {
     this.overdueAlerted.delete(msgId);
     this.silentInFlightAlerted.delete(msgId);
     this.silentInFlightObserved.delete(msgId);
+    this.absentThrough.delete(msgId);
+    this.deepReadAfter.delete(msgId);
   }
 
   private reconcileOverdueDedupe(overdueIds: ReadonlySet<string>): void {
@@ -935,6 +1000,12 @@ export class DeliveryWatchdog {
     }
     for (const msgId of this.silentInFlightAlerted) {
       if (!eligibleIds.has(msgId)) this.silentInFlightAlerted.delete(msgId);
+    }
+    for (const msgId of Array.from(this.absentThrough.keys())) {
+      if (!eligibleIds.has(msgId)) this.absentThrough.delete(msgId);
+    }
+    for (const msgId of Array.from(this.deepReadAfter.keys())) {
+      if (!eligibleIds.has(msgId)) this.deepReadAfter.delete(msgId);
     }
     for (const msgId of Array.from(this.silentInFlightObserved.keys())) {
       if (!eligibleIds.has(msgId)) this.silentInFlightObserved.delete(msgId);
@@ -1195,7 +1266,7 @@ export class DeliveryWatchdog {
 
     if (!readClient) {
       for (const row of rows) {
-        if (this.pastHorizon(row, now)) {
+        if (this.pastHorizon(row, now, UNOBSERVED_RETIRE_GRACE_MS)) {
           await this.retireUnwatched(row, sessionId, now, counts, "unobserved", "no healthy serve to read its transcript");
           continue;
         }
@@ -1223,13 +1294,17 @@ export class DeliveryWatchdog {
       return;
     }
 
-    const initial = await this.readWindow(readClient, sessionId, rows, counts);
-    let messages: ParsedMessage[];
+    // Rows whose deep read is backed off do not drive this read. They are
+    // skipped (or retired past the horizon) without costing the session's
+    // other rows anything.
+    const deferred = rows.filter((r) => (this.deepReadAfter.get(r.msgId) ?? 0) > now);
+    const live = rows.filter((r) => !deferred.includes(r));
+    await this.skipOrRetire(deferred, sessionId, now, counts, "deep-read-backed-off");
+    if (live.length === 0) return;
+    rows = live;
 
-    if (initial.ok === "incomplete") {
-      await this.skipOrRetire(rows, sessionId, now, counts, `window-incomplete:${initial.why}`);
-      return;
-    }
+    const initial = await this.readWindow(readClient, sessionId, rows, now, counts);
+    let window: FetchOk;
 
     if (!initial.ok) {
       if (initial.status === 404) {
@@ -1239,17 +1314,13 @@ export class DeliveryWatchdog {
           return;
         }
 
-        const second = await this.readWindow(alt, sessionId, rows, counts);
-        if (second.ok === "incomplete") {
-          await this.skipOrRetire(rows, sessionId, now, counts, `window-incomplete:${second.why}`);
-          return;
-        }
+        const second = await this.readWindow(alt, sessionId, rows, now, counts);
         if (second.ok) {
           // Contradicted — the "gone" serve was wrong. Proceed with the
           // second opinion's transcript, and adopt `alt` as the read client
           // for the rest of this session's processing — otherwise every
           // subsequent read keeps hitting the 404-ing client.
-          messages = second.messages;
+          window = second;
           readClient = alt;
         } else if (second.status === 404) {
           // Confirmed — the session is truly gone.
@@ -1315,11 +1386,22 @@ export class DeliveryWatchdog {
         return;
       }
     } else {
-      messages = initial.messages;
+      window = initial;
     }
 
-    let interventionUsed = false;
+    // Judge only the rows this window is deep enough for. One row that cannot
+    // settle must not hold back its siblings (pigeon-hfsj review).
+    const settledRows = rows.filter((r) => !window.unsettled.has(r.msgId));
     for (const row of rows) {
+      const why = window.unsettled.get(row.msgId);
+      if (why !== undefined) {
+        await this.skipOrRetire([row], sessionId, now, counts, `window-incomplete:${why}`);
+      }
+    }
+    const messages = window.messages;
+
+    let interventionUsed = false;
+    for (const row of settledRows) {
       const used = await this.evaluateRow(
         row,
         messages,
@@ -1338,24 +1420,30 @@ export class DeliveryWatchdog {
     client: WatchdogClient,
     sessionId: string,
     rows: SwarmMessageRecord[],
+    now: number,
     counts: CycleSummary,
   ): Promise<FetchResult> {
     const result = await fetchTranscript(client, sessionId, rows, this.transcriptWindow);
     counts.transcriptPages += result.pages;
     counts.transcriptMessages += result.read;
-    if (result.ok === "incomplete") {
+    if (result.ok === true && result.unsettled.size > 0) {
       this.log("transcript window incomplete", {
         sessionId,
-        why: result.why,
+        unsettled: Object.fromEntries(result.unsettled),
         pages: result.pages,
         messages: result.read,
       });
+      if (result.capped) {
+        for (const [msgId, why] of result.unsettled) {
+          if (why === "page-cap") this.deepReadAfter.set(msgId, now + DEEP_READ_BACKOFF_MS);
+        }
+      }
     }
     return result;
   }
 
-  private pastHorizon(row: SwarmMessageRecord, now: number): boolean {
-    return row.handedOffAt !== null && now - row.handedOffAt > this.maxWatchMs;
+  private pastHorizon(row: SwarmMessageRecord, now: number, graceMs = 0): boolean {
+    return row.handedOffAt !== null && now - row.handedOffAt > this.maxWatchMs + graceMs;
   }
 
   /**
@@ -1373,7 +1461,7 @@ export class DeliveryWatchdog {
     reason: string,
   ): Promise<void> {
     for (const row of rows) {
-      if (this.pastHorizon(row, now)) {
+      if (this.pastHorizon(row, now, UNOBSERVED_RETIRE_GRACE_MS)) {
         await this.retireUnwatched(row, sessionId, now, counts, "unobserved", `transcript unreadable: ${reason}`);
         continue;
       }
@@ -1411,7 +1499,7 @@ export class DeliveryWatchdog {
         ? "its envelope IS in the transcript"
         : evidence === "absent"
           ? "its envelope is NOT in the transcript"
-          : "its transcript could not be read";
+          : "its transcript could not be read (it was handed to the session, so it is probably there)";
     const reason =
       `no turn was confirmed to have read it within ${humanDuration(this.maxWatchMs)} ` +
       `of handoff, so the delivery watchdog stopped watching it; ${seen} (${observation})`;
@@ -1590,6 +1678,10 @@ export class DeliveryWatchdog {
     }
 
     if (anchor === null) {
+      // This complete window proves the anchor absent through its newest
+      // message, so later cycles need only read back to there.
+      const newest = messages[messages.length - 1];
+      if (newest) this.absentThrough.set(row.msgId, newest.created);
       // The 2xx lied (or the write was lost) — our prompt never made it
       // into the transcript at all.
       if (isSuppressedFromRecovery(row)) {
