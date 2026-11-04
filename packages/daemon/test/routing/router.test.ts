@@ -1734,3 +1734,25 @@ describe("pigeon-u1a: a stall that outlives its lease must not move the session"
     expect(router.ensureRouted(sid, at).serveId).toBe("serve-1");
   });
 });
+
+describe("IngressRouter.healthyEndpoints", () => {
+  it("lists only healthy, fresh, non-draining serves and places nothing", () => {
+    const s = openStorageDb(":memory:");
+    const router = new IngressRouter(s, {
+      leaseTtlMs: 5000,
+      staleServeMs: 2000,
+      idleMigrateMs: 3000,
+      dormantTtlMs: 10000,
+      activeTurnCap: 10,
+    });
+    const now = 10_000;
+    const base = { binaryEpoch: 0, healthState: "healthy" as const, heartbeatAt: now, draining: false };
+    s.serves.upsert({ ...base, serveId: "serve-0", instanceUuid: "u0", endpoint: "http://127.0.0.1:4096" });
+    s.serves.upsert({ ...base, serveId: "serve-1", instanceUuid: "u1", endpoint: "http://127.0.0.1:4097" });
+    s.serves.upsert({ ...base, serveId: "serve-2", instanceUuid: "u2", endpoint: "http://127.0.0.1:4098", draining: true });
+    s.serves.upsert({ ...base, serveId: "serve-3", instanceUuid: "u3", endpoint: "http://127.0.0.1:4099", heartbeatAt: now - 5000 });
+
+    expect(router.healthyEndpoints(now).sort()).toEqual(["http://127.0.0.1:4096", "http://127.0.0.1:4097"]);
+    expect(s.assignments.get("anything")).toBeNull();
+  });
+});

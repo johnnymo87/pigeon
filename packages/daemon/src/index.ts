@@ -189,6 +189,23 @@ const clientFactory = ingressRouter
  * `undefined` here only makes them log "not routable" and go quiet, and a
  * silent non-answer is exactly what the honest replies exist to avoid.
  */
+/**
+ * Clients for session CREATION on a launch, before any session id exists:
+ * the pool's healthy serves, serve-0 (OPENCODE_URL) first so an ordinary launch
+ * creates where it always has, then the others as failover. Empty when there is
+ * no pool, which keeps the single-serve path.
+ */
+const launchCreateClients = (): OpencodeClient[] => {
+  if (!ingressRouter || !clientFactory) return [];
+  const endpoints = ingressRouter.healthyEndpoints(Date.now());
+  const legacy = opencodeClient ? config.opencodeUrl?.replace(/\/$/, "") : undefined;
+  const ordered = [
+    ...endpoints.filter((e) => e.replace(/\/$/, "") === legacy),
+    ...endpoints.filter((e) => e.replace(/\/$/, "") !== legacy),
+  ];
+  return ordered.map((e) => clientFactory.forEndpoint(e));
+};
+
 const clientForSession = makeClientForSession({
   getSession: (sessionId) => storage.sessions.get(sessionId) ?? undefined,
   clientFactory,
@@ -545,6 +562,7 @@ const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
       relaySendEnabled: config.swarmRelaySend,
       ...(opencodeClient ? { opencodeClient } : {}),
       resolveOwnerClient: clientForSession,
+      createClients: launchCreateClients,
       ack: (items) => remoteLaunchClient.ack(items),
       runOcTags: () => resolveRunOcTags(),
       onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
@@ -723,11 +741,12 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient,
-            // Create on serve-0 (opencodeClient) but run the agent loop on the
-            // serve pigeon HRW-assigns: clientForSession resolves (and places)
-            // the owner. Unconfigured pool => clientForSession returns the
-            // serve-0 client, i.e. today's behavior.
+            // Run the agent loop on the serve pigeon HRW-assigns:
+            // clientForSession resolves (and places) the owner. Unconfigured
+            // pool => clientForSession returns the serve-0 client.
             resolveOwnerClient: clientForSession,
+            // Create on a healthy pool serve, failing over once (serve-0 first).
+            createClients: launchCreateClients,
             // /launch --tag: bookkeeping applied AFTER the session is prompted,
             // and resolved per command so installing oc-tags does not also
             // require restarting the daemon.

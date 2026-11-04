@@ -300,6 +300,18 @@ export class IngressRouter {
     };
   }
 
+  /**
+   * Endpoints of the serves currently in the healthy set, for callers that
+   * need a serve before any session id exists (session creation for /launch
+   * and remote launch). Read-only: places nothing and takes no lease.
+   */
+  healthyEndpoints(now: number): string[] {
+    const epoch = this.repos.meta.get().binaryEpoch;
+    return this.repos.serves
+      .listHealthy(now, this.opts.staleServeMs, epoch)
+      .map((s) => s.endpoint);
+  }
+
   placeSession(
     sessionId: string,
     now: number,
