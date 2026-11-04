@@ -206,6 +206,10 @@ interface Turn {
   /** Last time inflight last_alive_at was touched. Throttled to ~1/min (R1). */
   lastAliveTouchAt?: number;
   text: string[];
+  /** goose `_meta.goose.messageId` of the last text chunk kept (pigeon-y8m5). */
+  lastTextMessageId?: string;
+  /** A tool call arrived after the last text chunk kept (pigeon-y8m5). */
+  toolSinceText?: boolean;
   bytes: number;
   truncated: boolean;
   settled: Promise<void>;
@@ -1504,6 +1508,11 @@ export class GooseSessionRunner {
       }
     }
 
+    if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+      if (turn.text.length > 0) turn.toolSinceText = true;
+      return;
+    }
+
     if (update.sessionUpdate !== "agent_message_chunk") return;
 
     const text = (update.content as { text?: unknown } | undefined)?.text;
@@ -1514,8 +1523,17 @@ export class GooseSessionRunner {
       turn.truncated = true;
       return;
     }
-    turn.text.push(text);
-    turn.bytes += text.length;
+    const messageId = gooseMessageId(update);
+    const newStep =
+      turn.text.length > 0 &&
+      (messageId !== undefined && turn.lastTextMessageId !== undefined
+        ? messageId !== turn.lastTextMessageId
+        : turn.toolSinceText === true);
+    const piece = newStep ? stepSeparator(turn.text[turn.text.length - 1]!) + text : text;
+    turn.text.push(piece);
+    turn.bytes += piece.length;
+    turn.lastTextMessageId = messageId;
+    turn.toolSinceText = false;
   }
 
   private runId(): string | undefined {
@@ -2198,4 +2216,25 @@ export class GooseRunnerRegistry {
   busySessionIds(): string[] {
     return [...this.runners.values()].filter((r) => r.isBusy()).map((r) => r.sessionId);
   }
+}
+
+/**
+ * goose streams each assistant message's text as chunks with no separator of
+ * its own, and a turn is several messages when it narrates before a tool call
+ * and then answers. Glued, the steps read "…to the WD worker.Both are moving".
+ * This is the fallback accumulator's version of honkd's rule (honk-iks): one
+ * blank line between steps, counting newlines the previous step ends with.
+ * A step starts when goose's message id changes or, when either chunk lacks
+ * one, at a tool call between text (pigeon-y8m5).
+ */
+function gooseMessageId(update: Record<string, unknown>): string | undefined {
+  const meta = update._meta as { goose?: { messageId?: unknown } } | undefined;
+  const id = meta?.goose?.messageId;
+  return typeof id === "string" && id !== "" ? id : undefined;
+}
+
+function stepSeparator(previous: string): string {
+  if (previous.endsWith("\n\n")) return "";
+  if (previous.endsWith("\n")) return "\n";
+  return "\n\n";
 }

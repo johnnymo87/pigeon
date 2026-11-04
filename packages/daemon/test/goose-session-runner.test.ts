@@ -311,6 +311,52 @@ describe("GooseSessionRunner turn lifecycle", () => {
     expect(runner.isBusy()).toBe(false);
   });
 
+  // pigeon-y8m5: each goose assistant message is one step of a turn (narration
+  // before a tool call, then the answer). Glued, they read "…worker.Both are…".
+  const chunk = (text: string, messageId?: string) => ({
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text },
+    ...(messageId ? { _meta: { goose: { messageId } } } : {}),
+  });
+
+  it("parts steps with a blank line when goose's messageId changes", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate(chunk("Now the routing", "m1"));
+    runner.onUpdate(chunk(" to the WD worker.", "m1"));
+    runner.onUpdate({ sessionUpdate: "tool_call", toolCallId: "t1", _meta: { goose: { messageId: "m1" } } });
+    runner.onUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" });
+    runner.onUpdate(chunk("Both are moving.", "m2"));
+    client.finishTurn("end_turn");
+    await runner.settled();
+    expect(stops[0]!.message).toBe("Now the routing to the WD worker.\n\nBoth are moving.");
+  });
+
+  it("keeps a message's text together across a tool call in that same message", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate(chunk("ban", "m1"));
+    runner.onUpdate({ sessionUpdate: "tool_call", toolCallId: "t1" });
+    runner.onUpdate(chunk("ana", "m1"));
+    client.finishTurn("end_turn");
+    await runner.settled();
+    expect(stops[0]!.message).toBe("banana");
+  });
+
+  it("without message ids, parts steps at a tool call between text", async () => {
+    const { runner, client, stops } = makeRunner();
+    await runner.deliver("c1", "hello");
+    runner.onUpdate({ sessionUpdate: "tool_call", toolCallId: "t0" });
+    runner.onUpdate(chunk("first\n"));
+    runner.onUpdate({ sessionUpdate: "tool_call", toolCallId: "t1" });
+    runner.onUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" });
+    runner.onUpdate(chunk("second"));
+    runner.onUpdate(chunk(" still second"));
+    client.finishTurn("end_turn");
+    await runner.settled();
+    expect(stops[0]!.message).toBe("first\n\nsecond still second");
+  });
+
   it("touches the session on delivery so the reaper does not collect it", async () => {
     // Every writer of last_seen today is opencode-plugin-driven. A goose session
     // nobody touches is reaped and its Telegram topic unregistered while the
