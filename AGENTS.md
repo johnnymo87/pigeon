@@ -144,8 +144,8 @@ The `/model` command sets a per-session model override stored in the daemon's SQ
 
 ### Session Tagging (`/tag`)
 
-`/tag` shells out to the **`oc-tags`** binary (workstation `pkgs/oc-tags`), which tags
-opencode sessions and charts list-price consumption per tag. Pigeon reimplements none of
+`/tag` shells out to the **`oc-tags`** binary (workstation `pkgs/oc-tags`, now named
+`session-tags`), which tags opencode and goose sessions and charts list-price consumption per tag. Pigeon reimplements none of
 it: oc-tags owns tag precedence and owns the sidecar DB at `~/.local/share/oc-tags/tags.db`,
 and it opens `opencode.db` read-only. There must be exactly one implementation of
 precedence, so pigeon reads neither database.
@@ -182,6 +182,25 @@ Mechanics worth knowing before changing it:
 - **`tag_set` carries two session ids**: `commands.session_id` routes to a machine (and
   clears the unread badge), while `metadata_json.targetSessionId` is the session being
   tagged. They differ whenever the backlog view is used as intended.
+
+**Goose sessions are tagged as `goose:<native id>` (`eng-agent-platform-555.29.7`).** The
+tool was renamed `session-tags` (oc-tags stays as an alias; the daemon prefers
+`session-tags` and falls back), and it attributes goose spend under goose's own id. Pigeon's
+`gse_…` id means nothing to it, and `set` refuses one outright (workstation#779). The native
+id is known only through this daemon's `sessions.backend_session_id` (NULL on a legacy row,
+whose pigeon id *is* goose's id), so every tag call maps a goose row there first
+(`daemon/src/tag-key.ts`): `/launch --backend goose [--tag]`, inheritance from a goose
+context session, `/tag` typed in a goose topic, and the footer's `which`. A `gse_` id with no
+local goose row is refused with a reason, never passed through. `/tag <id> <tag>` also takes
+`gse_…` and `goose:<native>` targets, since the backlog view lists goose rows in the latter
+form. Every call passes `--` before its positional arguments.
+
+**A stall-watch coordinator passes on its program, not its own tag.** A coordinator is tagged
+`stall-watcher-runs`, which says nothing about the work. When a `/launch` (either backend)
+inherits from a session whose `bound_topic_key` is `stallwatch:<tag>`, typically by
+swipe-replying to a coordinator's notification, the new session gets `<tag>`. No `which` is run.
+As a backstop, a `which` answer of `stall-watcher-runs` (a coordinator row that has lost its
+binding) is never inherited either.
 
 ### Telegram Forum Topics
 
@@ -308,7 +327,8 @@ creation**: every session always has exactly one tag. Five things about it are l
 - **The `🏷` line in the daemon's confirmation is the only authoritative word on the tag.** The
   worker's `Launching on …` ack is sent before any daemon has seen the command. Deploy daemons
   before the worker: an old daemon ignores the tag and launches untagged (no `🏷` line), while an
-  old worker cannot emit the flag at all.
+  old worker cannot emit the flag at all. The same holds for `--backend goose --tag`, which the
+  worker refused until 555.29.7: an older daemon's goose branch had no tag handling.
 
 **The `@BotName` suffix.** In a group, Telegram's autocomplete sends `/kill@mohrbacher_01_bot` rather than `/kill`. Every command above accepts either form. The suffix attaches to the **command token**, not the subcommand — Telegram emits `/mcp@mohrbacher_01_bot list`, never `/mcp list@...`. Three things follow from how this is matched (worker `parseTelegramCommand`):
 

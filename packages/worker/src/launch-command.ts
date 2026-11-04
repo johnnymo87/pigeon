@@ -49,9 +49,9 @@ export const LAUNCH_USAGE_TEXT = [
   "/launch <machine> <dir> [--tag <tag>] [--backend <backend>] <prompt>",
   "",
   "<dir> may be a bare project name (pigeon), a ~ path, or an absolute path.",
-  "--tag records what the session is FOR, for oc-tags cost attribution;",
-  "it is one word of letters, digits, . _ - : / that may not start with",
-  '"auto:", and it is opencode-only.',
+  "--tag records what the session is FOR, for session-tags cost attribution",
+  "(opencode and goose alike); it is one word of letters, digits, . _ - : /",
+  'that may not start with "auto:".',
   "--backend picks the agent: opencode (default) or goose.",
   "Flags come after <dir> and before the prompt, in any order.",
   "The prompt itself may not start with a dash.",
@@ -155,16 +155,6 @@ export function parseLaunchMessage(text: string): LaunchCommand | null {
 
   const prompt = rest;
   if (prompt.trim() === "") return { kind: "usage" };
-
-  // `--tag` drives oc-tags, which attributes opencode spend. Accepting it for a
-  // goose launch and then ignoring it would report a tag that exists nowhere;
-  // refusing it here is the only place that can say so before anything runs.
-  if (tag !== undefined && backend === "goose") {
-    return {
-      kind: "usage",
-      reason: `${TAG_FLAG} is opencode-only (it drives oc-tags), so it cannot be combined with ${BACKEND_FLAG} goose.`,
-    };
-  }
 
   return {
     kind: "launch",

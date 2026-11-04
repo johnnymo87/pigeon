@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ingestGooseLaunchCommand, type GooseLaunchInput } from "../src/goose/launch-ingest";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
@@ -269,6 +269,127 @@ describe("ingestGooseLaunchCommand", () => {
       await ingestGooseLaunchCommand(h.input);
       await ingestGooseLaunchCommand(h.input);
       expect(h.mintedCount()).toBe(2);
+      h.storage.db.close();
+    });
+  });
+  /**
+   * 555.29.7: a goose session joins a program the same way an opencode one does.
+   * session-tags keys it as goose:<native id>, never pigeon's gse_ id, which
+   * session-tags refuses on `set`.
+   */
+  describe("tagging", () => {
+    const ok = (stdout: string) => vi.fn().mockResolvedValue({ code: 0, stdout, stderr: "" });
+
+    it("applies --tag to goose:<native> after registering and prompting", async () => {
+      const order: string[] = [];
+      const runOcTags = vi.fn(async (args: string[]) => {
+        order.push(`tag:${args.join(" ")}`);
+        return { code: 0, stdout: "Tagged session 'goose:20260920_1' as 'mono-ci'\n", stderr: "" };
+      });
+      const onTagged = vi.fn();
+      const h = harness({
+        tag: "mono-ci",
+        runOcTags,
+        onTagged,
+        onSessionStart: async () => { order.push("register"); },
+        runnerFor: () => ({ deliver: async () => { order.push("prompt"); return { ok: true as const }; } }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "mono-ci", "goose:20260920_1"]);
+      expect(order).toEqual(["register", "prompt", "tag:set -- mono-ci goose:20260920_1"]);
+      // The footer cache is keyed by PIGEON id, so that is what gets refreshed.
+      expect(onTagged).toHaveBeenCalledWith("gse_fixed");
+      expect(h.replies[0]).toContain("Tagged session 'goose:20260920_1' as 'mono-ci'");
+      h.storage.db.close();
+    });
+
+    it("reports a tagging failure in the reply, and the launch still stands", async () => {
+      const h = harness({
+        tag: "mono-ci",
+        runOcTags: vi.fn().mockResolvedValue({ code: 1, stdout: "", stderr: "Traceback\nsqlite3.OperationalError: database is locked\n" }),
+      });
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.prompted).toHaveLength(1);
+      expect(h.replies[0]).toContain("goose session started");
+      expect(h.replies[0]).toContain("Tag not applied: sqlite3.OperationalError: database is locked");
+      h.storage.db.close();
+    });
+
+    it("reports a tagging runner that rejects (timeout) without throwing", async () => {
+      const h = harness({ tag: "mono-ci", runOcTags: vi.fn().mockRejectedValue(Object.assign(new Error("Command failed"), { killed: true })) });
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.replies[0]).toContain("Tag not applied: oc-tags timed out");
+      h.storage.db.close();
+    });
+
+    it("says so when oc-tags is not installed", async () => {
+      const h = harness({ tag: "mono-ci", runOcTags: null });
+      await ingestGooseLaunchCommand(h.input);
+      expect(h.replies[0]).toContain("Tag not applied: oc-tags is not installed on devbox");
+      h.storage.db.close();
+    });
+
+    it("still tags when the first prompt was not accepted, and says both", async () => {
+      const runOcTags = ok("Tagged session 'goose:20260920_1' as 'mono-ci'\n");
+      const h = harness({
+        tag: "mono-ci",
+        runOcTags,
+        runnerFor: () => ({ deliver: async () => ({ ok: false, error: "busy" }) }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTags).toHaveBeenCalled();
+      expect(h.replies[0]).toContain("its first prompt was not accepted");
+      expect(h.replies[0]).toContain("as 'mono-ci'");
+      h.storage.db.close();
+    });
+
+    it("does not tag when registration failed and no session exists", async () => {
+      const runOcTags = vi.fn();
+      const h = harness({ tag: "mono-ci", runOcTags });
+      // A row of another kind under the pigeon id the mint will pick.
+      h.storage.sessions.upsert({ sessionId: "gse_fixed", backendKind: "opencode" } as never, 1);
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTags).not.toHaveBeenCalled();
+      h.storage.db.close();
+    });
+
+    it("inherits a goose context session's tag through goose:<native>", async () => {
+      const runOcTagsWhich = ok("billing\tmanual\tgoose:20261101_9\tsession\n");
+      const runOcTags = ok("Tagged session 'goose:20260920_1' as 'billing'\n");
+      const h = harness({ inheritFromSessionId: "gse_parent", runOcTagsWhich, runOcTags });
+      h.storage.sessions.upsert({
+        sessionId: "gse_parent", backendKind: GOOSE_BACKEND_KIND, backendSessionId: "20261101_9",
+        backendEndpoint: "ws://x", cwd: "/tmp",
+      } as never, 1);
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTagsWhich).toHaveBeenCalledWith(["which", "--", "goose:20261101_9"]);
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "billing", "goose:20260920_1"]);
+      expect(h.replies[0]).toContain("(inherited from gse_parent)");
+      h.storage.db.close();
+    });
+
+    it("inherits the program, not stall-watcher-runs, from a coordinator context", async () => {
+      const runOcTagsWhich = vi.fn();
+      const runOcTags = ok("Tagged session 'goose:20260920_1' as 'mono-ci'\n");
+      const h = harness({ inheritFromSessionId: "gse_coord", runOcTagsWhich, runOcTags });
+      h.storage.sessions.upsert({
+        sessionId: "gse_coord", backendKind: GOOSE_BACKEND_KIND, backendSessionId: "20261101_2",
+        backendEndpoint: "ws://x", cwd: "/tmp",
+      } as never, 1);
+      h.storage.sessions.setBoundTopicKey("gse_coord", "stallwatch:mono-ci", 1);
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTagsWhich).not.toHaveBeenCalled();
+      expect(runOcTags).toHaveBeenCalledWith(["set", "--", "mono-ci", "goose:20260920_1"]);
+      expect(h.replies[0]).toContain("(program of coordinator gse_coord)");
+      h.storage.db.close();
+    });
+
+    it("says nothing about tags on an ordinary untagged launch", async () => {
+      const runOcTags = vi.fn();
+      const h = harness({ runOcTags });
+      await ingestGooseLaunchCommand(h.input);
+      expect(runOcTags).not.toHaveBeenCalled();
+      expect(h.replies[0]).not.toContain("\u{1F3F7}");
       h.storage.db.close();
     });
   });

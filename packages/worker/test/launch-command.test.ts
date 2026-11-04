@@ -190,16 +190,17 @@ describe("parseLaunchMessage --backend", () => {
   });
 
   /**
-   * `--tag` drives oc-tags, which is opencode-only cost attribution. Accepting
-   * it alongside `--backend goose` and then ignoring it would tell the human
-   * their session was tagged when no tag exists anywhere.
+   * 555.29.7: session-tags attributes goose spend too (keyed goose:<native>),
+   * and the daemon's goose branch applies the tag, so the combination is valid.
    */
-  it("refuses --tag with --backend goose, rather than accepting and ignoring it", () => {
-    const parsed = parseLaunchMessage("/launch devbox pigeon --tag fbm --backend goose do it");
-    expect(parsed?.kind).toBe("usage");
-    // A bare usage dump would not say WHY, and the human would read the
-    // combination as a syntax error and retry it.
-    expect(parsed?.kind === "usage" && parsed.reason).toMatch(/tag/i);
+  it("accepts --tag with --backend goose", () => {
+    expect(parseLaunchMessage("/launch devbox pigeon --tag fbm --backend goose do it")).toMatchObject({
+      kind: "launch", tag: "fbm", backend: "goose", prompt: "do it",
+    });
+  });
+
+  it("does not call --tag opencode-only in the usage text", () => {
+    expect(LAUNCH_USAGE_TEXT).not.toMatch(/opencode-only/);
   });
 
   it("refuses a repeated flag instead of silently taking one of them", () => {

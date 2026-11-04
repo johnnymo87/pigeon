@@ -48,6 +48,7 @@ import {
   ingestTagTopCommand,
 } from "./worker/tag-ingest";
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
+import { whichKeyFor } from "./tag-key";
 import { SessionTagResolver, parseWhichLine } from "./tag-resolver";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
@@ -441,6 +442,9 @@ const tagResolver = new SessionTagResolver({
     if (!bin) throw new Error("oc-tags is not installed on this machine");
     return createOcTagsRunner(bin, 3_000)(args);
   },
+  // A goose session is asked about as goose:<native id>; its gse_ id would
+  // only ever answer `auto:`.
+  keyFor: (sessionId) => whichKeyFor(sessionId, storage.sessions),
 });
 
 function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: number | null }) {
@@ -543,7 +547,7 @@ const remoteLaunchRequester = remoteLaunchClient
         const runner = resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS);
         if (!runner) return null;
         try {
-          const res = await runner(["which", sessionId]);
+          const res = await runner(["which", "--", sessionId]);
           if (!res || res.code !== 0) return null;
           const which = parseWhichLine(String(res.stdout ?? ""));
           return which?.kind === "session" ? which.tag : null;
@@ -714,6 +718,14 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
               onSessionStart: async (sessionId) => {
                 if (poller) await poller.registerSession(sessionId);
               },
+              // /launch --backend goose --tag, or inheritance from the
+              // launch's context session: applied to goose:<native id> after
+              // the first prompt, as on the opencode branch below.
+              ...(msg.tag !== undefined ? { tag: msg.tag } : {}),
+              ...(msg.inheritFromSessionId !== undefined ? { inheritFromSessionId: msg.inheritFromSessionId } : {}),
+              runOcTags: resolveRunOcTags(),
+              runOcTagsWhich: resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS),
+              onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
               sendTelegramReply: reply,
             });
             return;
@@ -755,6 +767,9 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             // Its `oc-tags which` gets the short budget; the `set` that may
             // follow uses the ordinary runner.
             ...(msg.inheritFromSessionId !== undefined ? { inheritFromSessionId: msg.inheritFromSessionId } : {}),
+            // Maps a goose context session to goose:<native>, and spots a
+            // stall-watch coordinator so its program is inherited instead.
+            sessions: storage.sessions,
             runOcTags: resolveRunOcTags(),
             runOcTagsWhich: resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS),
             // The session registers (and warms its tag cache) before the tag is
@@ -878,6 +893,9 @@ const poller = config.workerUrl && config.workerApiKey && config.machineId
             ...tagDeps(msg),
             targetSessionId: msg.targetSessionId,
             tag: msg.tag,
+            // A goose topic's /tag targets its gse_ id; this maps it to
+            // goose:<native>, the only goose key session-tags accepts.
+            sessions: storage.sessions,
             // Without this the footer keeps showing the old tag (or nothing)
             // until the cache entry ages out, which reads as the command having
             // failed.

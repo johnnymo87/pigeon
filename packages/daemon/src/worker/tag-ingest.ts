@@ -1,6 +1,7 @@
 import os from "node:os";
 import { TgMessageBuilder, type TgEntity } from "../telegram-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
+import { tagKeyFor, type TagKeySessionLookup } from "../tag-key";
 
 /**
  * /tag — session tagging from Telegram, backed by the oc-tags binary.
@@ -68,6 +69,13 @@ export interface TagCommandDeps {
 export interface TagSetCommandDeps extends TagCommandDeps {
   targetSessionId: string;
   tag: string;
+  /**
+   * This daemon's session rows. A `/tag <tag>` typed in a goose session's topic
+   * targets its pigeon `gse_…` id, which session-tags refuses (workstation#779);
+   * the row maps it to `goose:<backend_session_id>`, the key goose spend is
+   * ledgered under.
+   */
+  sessions?: TagKeySessionLookup;
 }
 
 // ─── parsing oc-tags top ──────────────────────────────────────────────────────
@@ -322,10 +330,15 @@ function announceTagged(deps: TagCommandDeps): void {
 export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void> {
   const { tag, targetSessionId } = deps;
 
-  if (!isValidSessionId(targetSessionId)) {
-    await deps.sendTelegramReply(deps.chatId, `Invalid session id: ${truncate(targetSessionId, 64)}`);
+  const key = tagKeyFor(targetSessionId, deps.sessions);
+  if (!key.ok) {
+    const text = typeof targetSessionId === "string" && targetSessionId.startsWith("gse_")
+      ? `Cannot tag ${truncate(targetSessionId, 64)}: ${key.reason}.`
+      : `Invalid session id: ${truncate(String(targetSessionId), 64)}`;
+    await deps.sendTelegramReply(deps.chatId, text);
     return;
   }
+  const sessionKey = key.key;
   if (!isValidTag(tag)) {
     await deps.sendTelegramReply(
       deps.chatId,
@@ -334,11 +347,12 @@ export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void
     return;
   }
 
-  // Argv, not a command string: oc-tags set <tag> [session-id].
-  const stdout = await runOrExplain(deps, ["set", tag, targetSessionId], "set");
+  // Argv, not a command string: oc-tags set -- <tag> <session-id>. The id is
+  // never omitted: a bare `set <tag>` tags whatever session oc-tags guesses.
+  const stdout = await runOrExplain(deps, ["set", "--", tag, sessionKey], "set");
   if (stdout === null) return;
 
   announceTagged(deps);
-  console.log(`[tag-ingest] set commandId=${deps.commandId} session=${targetSessionId} tag=${tag}`);
-  await deps.sendTelegramReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${targetSessionId} as ${tag}`, 500)}`);
+  console.log(`[tag-ingest] set commandId=${deps.commandId} session=${targetSessionId} key=${sessionKey} tag=${tag}`);
+  await deps.sendTelegramReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${sessionKey} as ${tag}`, 500)}`);
 }

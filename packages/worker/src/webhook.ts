@@ -998,9 +998,9 @@ export async function handleTelegramWebhook(
       // same rule /tag carries, and it also catches the likely --tag mistakes
       // (flag in the machine/dir position, `-t`, `--tag=x`, an iOS em dash).
       if (parsedLaunch.kind === "usage") {
-        // The reason leads, when there is one. A correctly-spelled combination
-        // that is simply not allowed (--tag with --backend goose) reads as a
-        // syntax error without it, and the human retries it verbatim.
+        // The reason leads, when there is one. A correctly-spelled command
+        // that is simply not allowed (a repeated flag, an unknown backend)
+        // reads as a syntax error without it, and the human retries it verbatim.
         const text = parsedLaunch.reason
           ? `${parsedLaunch.reason}\n\n${LAUNCH_USAGE_TEXT}`
           : LAUNCH_USAGE_TEXT;
@@ -1023,14 +1023,16 @@ export async function handleTelegramWebhook(
       // Tag inheritance: a /launch typed in a session's topic, or swipe-replying
       // to its notification, asks the daemon to copy THAT session's explicit
       // tag onto the new one. Only a candidate here -- the daemon decides,
-      // because only oc-tags knows whether the tag is an explicit session tag.
-      // Skipped when --tag was given (it wins), for goose (oc-tags attributes
-      // opencode spend only), and when the context session lives on another
-      // machine (tags.db is per host, so the lookup would find nothing). The
-      // lookup is silent: a /launch in General has no context and behaves
-      // exactly as it did before.
+      // because only oc-tags knows whether the tag is an explicit session tag,
+      // and only the daemon's session rows map a goose gse_ id to
+      // goose:<native> and mark a stall-watch coordinator (whose PROGRAM is
+      // inherited, not its own tag). Applies to both backends. Skipped when
+      // --tag was given (it wins), and when the context session lives on
+      // another machine (tags.db is per host, so the lookup would find
+      // nothing). The lookup is silent: a /launch in General has no context
+      // and behaves exactly as it did before.
       let inheritFromSessionId: string | undefined;
-      if (!tag && backend !== "goose") {
+      if (!tag) {
         const context = await findContextSession(db, env, update.message as TelegramMessage);
         if (context && context.machineId === machineId) {
           inheritFromSessionId = context.sessionId;
@@ -1069,7 +1071,7 @@ export async function handleTelegramWebhook(
       const tagNote = tag
         ? `, tag ${tag}`
         : inheritFromSessionId
-          ? `, will inherit ${inheritFromSessionId}'s session tag if it has one`
+          ? `, will inherit ${inheritFromSessionId}'s session tag if it has one (a coordinator's program)`
           : "";
       await sendTelegramMessage(env, launchChatId, `Launching on ${machineId} in ${directory}${tagNote}...`, { messageThreadId: update.message.message_thread_id });
       return OK();

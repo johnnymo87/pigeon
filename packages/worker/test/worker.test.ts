@@ -2974,7 +2974,7 @@ describe("/launch command", () => {
       const row = await launchRow(machineId);
       expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ctx.sessionId });
       expect(sent).toHaveLength(1);
-      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one`);
+      expect(sent[0].text).toContain(`, will inherit ${ctx.sessionId}'s session tag if it has one (a coordinator's program)`);
     });
 
     it("treats the topic's ForumTopicCreated service reply as topic context, not a swipe-reply", async () => {
@@ -3054,7 +3054,9 @@ describe("/launch command", () => {
       expect(sent[0].text).not.toContain("inherit");
     });
 
-    it("does not set the key for a goose launch", async () => {
+    // 555.29.7: goose sessions join programs too. The daemon keys them as
+    // goose:<native id> and decides; the worker only names the candidate.
+    it("sets the key for a goose launch too", async () => {
       const machineId = `inh-goose-${Date.now()}`;
       await touchMachine(env.DB, machineId, Date.now());
       const ctx = await seedContext(machineId);
@@ -3064,7 +3066,22 @@ describe("/launch command", () => {
         launchUpdate(`/launch ${machineId} pigeon --backend goose follow up`, { message_thread_id: ctx.threadId }),
       ));
 
-      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ backend: "goose" });
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ backend: "goose", inheritFromSessionId: ctx.sessionId });
+      expect(sent[0].text).toContain(`will inherit ${ctx.sessionId}'s session tag`);
+    });
+
+    it("queues --tag with --backend goose instead of refusing it", async () => {
+      const machineId = `inh-goose-tag-${Date.now()}`;
+      await touchMachine(env.DB, machineId, Date.now());
+      const ctx = await seedContext(machineId);
+      const sent = captureSends();
+
+      await handleTelegramWebhook(env.DB, topicsEnv, makeWebhookRequest(
+        launchUpdate(`/launch ${machineId} pigeon --backend goose --tag mono-ci follow up`, { message_thread_id: ctx.threadId }),
+      ));
+
+      expect(JSON.parse((await launchRow(machineId)).metadata_json!)).toEqual({ tag: "mono-ci", backend: "goose" });
+      expect(sent[0].text).toContain(", tag mono-ci");
       expect(sent[0].text).not.toContain("inherit");
     });
 

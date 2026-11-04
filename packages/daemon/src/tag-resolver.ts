@@ -39,6 +39,16 @@ interface CacheEntry {
 export interface SessionTagResolverOptions {
   /** null when oc-tags is not installed on this machine: the resolver is then inert. */
   runner: OcTagsRunner | null;
+  /**
+   * The id session-tags knows a session by, or null when it has none (nothing
+   * is spawned and no tag is shown). The cache stays keyed by pigeon's id.
+   *
+   * Exists for goose: pigeon's `gse_…` id means nothing to session-tags, whose
+   * key for a goose session is `goose:<native id>` (sessions.backend_session_id).
+   * Without the translation every goose footer resolves to `auto:` and shows no
+   * program tag. Absent: the pigeon id is used as-is.
+   */
+  keyFor?: (sessionId: string) => string | null;
   nowFn?: () => number;
   ttlMs?: number;
   negativeTtlMs?: number;
@@ -58,6 +68,7 @@ export class SessionTagResolver {
    */
   private generation = 0;
   private readonly runner: OcTagsRunner | null;
+  private readonly keyFor: (sessionId: string) => string | null;
   private readonly nowFn: () => number;
   private readonly ttlMs: number;
   private readonly negativeTtlMs: number;
@@ -66,6 +77,7 @@ export class SessionTagResolver {
 
   constructor(opts: SessionTagResolverOptions) {
     this.runner = opts.runner;
+    this.keyFor = opts.keyFor ?? ((id) => id);
     this.nowFn = opts.nowFn ?? Date.now;
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
     this.negativeTtlMs = opts.negativeTtlMs ?? DEFAULT_NEGATIVE_TTL_MS;
@@ -147,7 +159,15 @@ export class SessionTagResolver {
     if (!runner) return;
     const generation = this.generation;
     try {
-      const res = await runner(["which", sessionId]);
+      const key = this.keyFor(sessionId);
+      if (key === null) {
+        this.store(sessionId, null, generation, cacheNegative);
+        return;
+      }
+      // `which` is never id-guarded by session-tags and exits 0 on a degraded
+      // answer (`auto:`), which is what this relies on. `--` keeps a key from
+      // ever being read as an option.
+      const res = await runner(["which", "--", key]);
       if (res.code !== 0) {
         this.warnOnce(sessionId, `oc-tags which exited ${res.code}: ${lastLine(res.stderr)}`);
         this.store(sessionId, null, generation, cacheNegative);

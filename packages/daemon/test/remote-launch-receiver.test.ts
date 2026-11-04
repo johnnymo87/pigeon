@@ -884,7 +884,7 @@ describe("remote-launch-receiver", () => {
 
       // Allow background microtasks to finish
       await vi.waitFor(() => {
-        expect(runOcTagsMock).toHaveBeenCalledWith(["set", "my-tag", "ses_remote12345"]);
+        expect(runOcTagsMock).toHaveBeenCalledWith(["set", "--", "my-tag", "ses_remote12345"]);
         expect(onTaggedMock).toHaveBeenCalledWith("ses_remote12345");
       });
     });
