@@ -48,27 +48,32 @@ refusal). The plugin tools' contracts are in `packages/opencode-plugin/src/swarm
 
 ### D2. Make the requester reachable from other machines (B5, B6, B7)
 
-**Rule: a goose session becomes reachable from other machines when it first reaches out to one —
-by requesting a remote launch, or by having a message relayed.** At that moment the daemon:
+**Rule: a goose session becomes reachable from other machines when a remote contact is accepted —
+by an accepted remote launch request, or by an accepted relayed message.** The daemon:
 
-1. adds `"swarm-remote"` to the row's `pull_sources` (alongside `"swarm"`, which the mailbox
-   route guarantees), and
-2. registers the session with the worker (`onSessionStart` → `/sessions/register`, the same call
-   `/goose/sessions` makes), so D1 knows which machine owns the `gse_` id.
+1. registers the session with the worker (`onSessionStart` → `/sessions/register`, the same call
+   `/goose/sessions` makes) **before** the worker request or relay, so D1 knows which machine owns
+   the `gse_` id, and
+2. grants `"swarm-remote"` (adds it to the row's `pull_sources`, alongside `"swarm"`, which the mailbox
+   route guarantees) **only after** the worker ACCEPTS the launch request or relay.
 
-One helper, `markGooseRemoteReachable(id)`, injected into the requester and the arbiter:
+One helper, `markGooseRemoteReachable(id, { grant })`, injected into the requester and the arbiter:
 
+- Registration (`grant: false` or `grant: true` when not cached) is awaited with a ~5 s bound, once per daemon
+  lifetime per id (an in-memory set); the reaper keeps D1 fresh after that. Worker `/sessions/register` is a
+  pure D1 upsert with ownership checks; it creates no Telegram topic.
+- It registers **before** the worker request: in `RemoteLaunchRequester.handleRequest` after validation and
+  before `client.request`, and in the arbiter's remote branch before `relayRow` when the sender is `gse_`.
+- Swarm-remote is granted (`grant: true`) only after the worker ACCEPTS the launch request or relay:
+  - In `RemoteLaunchRequester`: granted in `handleRequest` on an `accepted` answer, and in `tick()`'s resend path
+    when a pending launch becomes accepted. If registration failed during `handleRequest`, calling grant on accept
+    in `tick()` retries registration. If the request is refused or stays pending, no grant occurs.
+  - In `SwarmArbiter`: before `relayRow` it registers only (`grant: false`); after `relayRow` returns normally
+    (accepted; it throws otherwise), it calls grant (`grant: true`). If the relay throws or is refused, no grant occurs.
 - The `pull_sources` write is additive and synchronous: read the row's effective list (NULL →
   `["telegram-reply"]`), add `swarm` and `swarm-remote`, write back with no `await` between.
   Nothing else rewrites the column for goose rows (`sessions.upsert` never writes it;
   `ensureGooseSwarmMailbox` only appends `swarm`; `registerGooseSession` doesn't touch it).
-- Registration is awaited with a ~5 s bound, once per daemon lifetime per id (an in-memory set);
-  the reaper keeps D1 fresh after that. Worker `/sessions/register` is a pure D1 upsert with
-  ownership checks; it creates no Telegram topic.
-- It runs **before** the worker request: in `RemoteLaunchRequester.handleRequest` after
-  validation and before `client.request` (a `pending` request accepted later in `tick()` would
-  otherwise never mark), and in the arbiter's remote branch before `relayRow` when the sender is
-  `gse_`. Marking on a request that is later refused is harmless: the session did reach out.
 - Registration failure is logged, not fatal; the reply would then fail `unknown_session` until the
   reaper's next refresh, and the remote sender gets `delivery.failed`.
 
@@ -86,6 +91,7 @@ Revocation and exposure (accepted, documented):
   (`PIGEON_SWARM_RELAY_ACCEPT_FROM`) can prompt it, not only the one it launched — the same exposure
   every opencode session has. If remote prompt injection into a coordinator becomes a concern,
   narrow acceptance to contacted peers or give the opt-in a TTL.
+- Open policy question: whether topic-bound coordinators should be excluded from implicit grants or swarm-remote should get a TTL (not built).
 - `from` on `/swarm/send` and `/swarm/launch` is unauthenticated locally (one shared bearer
   token), so a local process can mark any `gse_` row; it could already prompt that row locally.
 
@@ -104,18 +110,19 @@ Why implicit-on-contact and not an explicit opt-in or a blanket exemption:
 Send side on the remote machine (B5): `bankOrInsertSwarmMessage` keeps refusing a `gse_` with no
 local row **only for relayed-in rows** (`relay-receiver.ts`, hop rule) **or when relay send is
 off**. A local sender's `/swarm/send` or `/swarm/schedule` to an unknown `gse_` with relay send on
-is inserted, and the arbiter's existing locality check (`gse_` with no row → remote, never probed,
-`locality.ts:97-98`) relays it. The worker answers `unknown_session` for a `gse_` that no machine
-registered, which comes back to the sender as `delivery.failed` — the same outcome as an unknown
-`ses_`. An input flag (`allowRemoteGoose`) on `BankOrInsertInput` carries the decision. It is set
-**only** by `/swarm/send` and `/swarm/schedule` in `app.ts`, from the relay-send config — never by
-`notify-sender`, the launch requester, the delivery watchdog or the relay receiver, which keeps
-the hop rule and keeps `pigeon` notices from being inserted for unreachable targets.
+is checked against the worker via `shouldAllowRemoteGooseTarget` (P6). An input flag (`allowRemoteGoose`)
+on `BankOrInsertInput` carries the decision. It is set **only** by `/swarm/send` and `/swarm/schedule`
+in `app.ts`, from the relay-send config — never by `notify-sender`, the launch requester, the delivery
+watchdog or the relay receiver, which keeps the hop rule and keeps `pigeon` notices from being inserted
+for unreachable targets.
 
-To keep a typo'd or stale `gse_` an immediate error rather than a later `delivery.failed`, the
-route first asks the worker who owns it (`poller.lookupSessionOwner`): not found, or owned by this
-machine (a reaped local row whose unregister failed) → keep the 409; owned elsewhere → insert;
-worker unreachable → fail open and insert.
+To keep an unregistered, typo'd or stale `gse_` an immediate error rather than a later `delivery.failed`, the
+route first asks the worker who owns it (`poller.lookupSessionOwner`, P6):
+- Owner is null (worker 404): returns 409 refusing with `no goose session <id> on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes`. This synchronous 409 replaces the old `delivery.failed` claim for an unregistered `gse_`.
+- Owned by this machine (a reaped local row whose unregister failed): returns 409 `no goose session <id> on this machine`.
+- Relay send is off: returns 409 `no goose session <id> on this machine`.
+- Owned elsewhere: `allowRemoteGoose` allowed and inserted.
+- Worker unreachable or times out: fail open and insert. On `/swarm/schedule`, failing open when the worker is unreachable defers a typo's error to delivery time.
 
 Scheduled messages to a remote target are held by the **sender**: the ready queries filter on
 `deliver_at <= now` (`swarm-repo.ts:150,167`), so the arbiter relays only due rows, forwarding the

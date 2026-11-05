@@ -8,6 +8,7 @@ import {
   type LaunchResultAck,
 } from "../src/swarm/remote-launch-requester";
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
+import { createMarkGooseRemoteReachable } from "../src/goose/remote-reachable";
 import type { RemoteLaunchClient } from "../src/worker/remote-launch-client";
 
 describe("RemoteLaunchRequester", () => {
@@ -1260,12 +1261,12 @@ describe("RemoteLaunchRequester", () => {
       expect(storage.remoteLaunch.outbound.get("lnch_gse_nongoose")).toBeNull();
     });
 
-    it("mark called before client.request (recording call order)", async () => {
+    it("register only before client.request, grant after accepted in handleRequest", async () => {
       storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
       const callOrder: string[] = [];
 
-      const markRemoteReachable = vi.fn().mockImplementation(async (id: string) => {
-        callOrder.push(`mark:${id}`);
+      const markRemoteReachable = vi.fn().mockImplementation(async (id: string, opts: { grant: boolean }) => {
+        callOrder.push(`mark:${id}:grant=${opts.grant}`);
       });
       (client.request as any).mockImplementation(async () => {
         callOrder.push("client.request");
@@ -1283,8 +1284,54 @@ describe("RemoteLaunchRequester", () => {
       });
 
       expect(res.status).toBe(202);
-      expect(markRemoteReachable).toHaveBeenCalledWith(gseSessionId);
-      expect(callOrder).toEqual([`mark:${gseSessionId}`, "client.request"]);
+      expect(markRemoteReachable).toHaveBeenNthCalledWith(1, gseSessionId, { grant: false });
+      expect(markRemoteReachable).toHaveBeenNthCalledWith(2, gseSessionId, { grant: true });
+      expect(callOrder).toEqual([
+        `mark:${gseSessionId}:grant=false`,
+        "client.request",
+        `mark:${gseSessionId}:grant=true`,
+      ]);
+    });
+
+    it("refused or pending answer in handleRequest: register only, no grant", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+
+      // Case 1: refused
+      const mark1 = vi.fn().mockResolvedValue(undefined);
+      (client.request as any).mockResolvedValueOnce({
+        kind: "refused",
+        code: "unauthorized",
+        status: 401,
+        detail: "bad key",
+      });
+
+      const req1 = makeRequester({ markRemoteReachable: mark1 });
+      const res1 = await req1.handleRequest({
+        launch_id: "lnch_refused_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+      expect(res1.status).toBe(401);
+      expect(mark1).toHaveBeenCalledTimes(1);
+      expect(mark1).toHaveBeenCalledWith(gseSessionId, { grant: false });
+
+      // Case 2: transient (pending)
+      const mark2 = vi.fn().mockResolvedValue(undefined);
+      (client.request as any).mockResolvedValueOnce({ kind: "transient", detail: "network timeout" });
+
+      const req2 = makeRequester({ markRemoteReachable: mark2 });
+      const res2 = await req2.handleRequest({
+        launch_id: "lnch_pending_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+      expect(res2.status).toBe(202);
+      expect(mark2).toHaveBeenCalledTimes(1);
+      expect(mark2).toHaveBeenCalledWith(gseSessionId, { grant: false });
     });
 
     it("mark not called for ses_", async () => {
@@ -1316,7 +1363,7 @@ describe("RemoteLaunchRequester", () => {
         directory: "/home/dev/pigeon",
         prompt: "task",
       });
-      expect(markRemoteReachable).toHaveBeenCalledTimes(1);
+      expect(markRemoteReachable).toHaveBeenCalledTimes(2); // grant: false then grant: true
 
       // Replay call
       markRemoteReachable.mockClear();
@@ -1335,14 +1382,14 @@ describe("RemoteLaunchRequester", () => {
       expect(client.request).not.toHaveBeenCalled();
     });
 
-    it("mark not called from tick() resends", async () => {
+    it("pending then accepted in tick(): calls grant on accept and retries registration if it failed earlier", async () => {
       storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
       const markRemoteReachable = vi.fn().mockResolvedValue(undefined);
       (client.request as any).mockResolvedValueOnce({ kind: "transient", detail: "network hiccup" });
 
       const requester = makeRequester({ markRemoteReachable });
 
-      // First call fails transiently
+      // First call fails transiently -> registered only ({ grant: false })
       await requester.handleRequest({
         launch_id: "lnch_tick_resend",
         from: gseSessionId,
@@ -1351,16 +1398,58 @@ describe("RemoteLaunchRequester", () => {
         prompt: "task",
       });
       expect(markRemoteReachable).toHaveBeenCalledTimes(1);
+      expect(markRemoteReachable).toHaveBeenCalledWith(gseSessionId, { grant: false });
 
       markRemoteReachable.mockClear();
       (client.request as any).mockResolvedValueOnce({ kind: "accepted", toMachine: "devbox", duplicate: false });
 
-      // Advance time and tick
+      // Advance time and tick -> accepted in tick() calls grant: true
       now += 15_000;
       await requester.tick();
 
       expect(client.request).toHaveBeenCalled();
-      expect(markRemoteReachable).not.toHaveBeenCalled();
+      expect(markRemoteReachable).toHaveBeenCalledTimes(1);
+      expect(markRemoteReachable).toHaveBeenCalledWith(gseSessionId, { grant: true });
+    });
+
+    it("integration with real createMarkGooseRemoteReachable: failed registration in handleRequest is retried and pull_sources granted on tick accept", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+      // Ensure initial pull_sources
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply"]);
+
+      const workerRegister = vi.fn()
+        .mockResolvedValueOnce({ ok: false, error: "worker busy" })
+        .mockResolvedValueOnce({ ok: true });
+
+      const realMark = createMarkGooseRemoteReachable({
+        sessions: storage.sessions,
+        register: workerRegister,
+      });
+
+      (client.request as any).mockResolvedValueOnce({ kind: "transient", detail: "worker warming up" });
+
+      const requester = makeRequester({ markRemoteReachable: realMark });
+
+      // handleRequest -> registration fails, answer transient
+      const res = await requester.handleRequest({
+        launch_id: "lnch_real_tick_retry",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+      expect(res.status).toBe(202);
+      expect(workerRegister).toHaveBeenCalledTimes(1);
+      // pull_sources NOT granted yet!
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply"]);
+
+      // In tick(), request succeeds -> grant: true retries worker registration and writes pull_sources!
+      (client.request as any).mockResolvedValueOnce({ kind: "accepted", toMachine: "devbox", duplicate: false });
+      now += 15_000;
+      await requester.tick();
+
+      expect(workerRegister).toHaveBeenCalledTimes(2);
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
     });
   });
 

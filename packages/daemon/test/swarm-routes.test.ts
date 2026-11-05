@@ -662,7 +662,9 @@ describe("POST /swarm/send", () => {
 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("no goose session gse_unknown on this machine");
+      expect(body.error).toContain(
+        "no goose session gse_unknown on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes",
+      );
       expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
     });
 
@@ -1380,7 +1382,9 @@ describe("POST /swarm/schedule", () => {
 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("no goose session gse_unknown on this machine");
+      expect(body.error).toContain(
+        "no goose session gse_unknown on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes",
+      );
       expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
     });
 

@@ -26,14 +26,16 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res1).toBe(false);
+    expect(res1.allowed).toBe(false);
+    expect(res1.error).toBeUndefined();
     expect(lookup).not.toHaveBeenCalled();
 
     const res2 = await shouldAllowRemoteGooseTarget(s, "gse_remote", null, {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res2).toBe(false);
+    expect(res2.allowed).toBe(false);
+    expect(res2.error).toBeUndefined();
     expect(lookup).not.toHaveBeenCalled();
   });
 
@@ -46,7 +48,8 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(false);
+    expect(res.allowed).toBe(false);
+    expect(res.error).toBeUndefined();
     expect(lookup).not.toHaveBeenCalled();
   });
 
@@ -59,7 +62,8 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(false);
+    expect(res.allowed).toBe(false);
+    expect(res.error).toBeUndefined();
     expect(lookup).not.toHaveBeenCalled();
   });
 
@@ -73,7 +77,8 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(false);
+    expect(res.allowed).toBe(false);
+    expect(res.error).toBeUndefined();
     expect(lookup).not.toHaveBeenCalled();
   });
 
@@ -85,10 +90,10 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: undefined,
     });
-    expect(res).toBe(true);
+    expect(res.allowed).toBe(true);
   });
 
-  it("returns false when owner is null (worker 404)", async () => {
+  it("returns false with detailed 409 text when owner is null (worker 404)", async () => {
     const s = newStorage();
     const lookup = vi.fn().mockResolvedValue(null);
 
@@ -97,7 +102,10 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(false);
+    expect(res.allowed).toBe(false);
+    expect(res.error).toBe(
+      "no goose session gse_unknown on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes",
+    );
     expect(lookup).toHaveBeenCalledWith("gse_unknown", expect.any(AbortSignal));
   });
 
@@ -110,7 +118,8 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(false);
+    expect(res.allowed).toBe(false);
+    expect(res.error).toBeUndefined();
   });
 
   it("returns true when owner is registered to another machine", async () => {
@@ -122,7 +131,7 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(true);
+    expect(res.allowed).toBe(true);
   });
 
   it("fails open (returns true) when lookup throws an error", async () => {
@@ -134,7 +143,7 @@ describe("shouldAllowRemoteGooseTarget", () => {
       machineId: "devbox",
       lookupSessionOwner: lookup,
     });
-    expect(res).toBe(true);
+    expect(res.allowed).toBe(true);
   });
 
   it("fails open (returns true) when lookup times out", async () => {
@@ -151,7 +160,7 @@ describe("shouldAllowRemoteGooseTarget", () => {
       lookupSessionOwner: lookup,
       lookupTimeoutMs: 50, // short test timeout
     });
-    expect(res).toBe(true);
+    expect(res.allowed).toBe(true);
     expect(signalReceived?.aborted).toBe(true);
   });
 });

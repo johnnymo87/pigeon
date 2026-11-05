@@ -80,7 +80,7 @@ export interface RemoteLaunchRequesterDeps {
   sendEnabled: boolean;
   selfMachineId: string;
   resolveRequesterTag?: (sessionId: string) => Promise<string | null>;
-  markRemoteReachable?: (sessionId: string) => Promise<unknown>;
+  markRemoteReachable?: (sessionId: string, options: { grant: boolean }) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -91,7 +91,7 @@ export class RemoteLaunchRequester {
   private readonly sendEnabled: boolean;
   private readonly selfMachineId: string;
   private readonly resolveRequesterTag?: (sessionId: string) => Promise<string | null>;
-  private readonly markRemoteReachable?: (sessionId: string) => Promise<unknown>;
+  private readonly markRemoteReachable?: (sessionId: string, options: { grant: boolean }) => Promise<unknown>;
   private readonly nowFn: () => number;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private ticking = false;
@@ -297,7 +297,7 @@ export class RemoteLaunchRequester {
 
     if (this.markRemoteReachable && from.startsWith("gse_")) {
       try {
-        await this.markRemoteReachable(from);
+        await this.markRemoteReachable(from, { grant: false });
       } catch (err) {
         this.log("markRemoteReachable threw", { from, error: err instanceof Error ? err.message : String(err) });
       }
@@ -312,6 +312,13 @@ export class RemoteLaunchRequester {
 
     if (res.kind === "accepted") {
       this.storage.remoteLaunch.outbound.markAccepted(launch_id);
+      if (this.markRemoteReachable && from.startsWith("gse_")) {
+        try {
+          await this.markRemoteReachable(from, { grant: true });
+        } catch (err) {
+          this.log("markRemoteReachable threw", { from, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
       return {
         status: 202,
         body: {
@@ -372,6 +379,16 @@ export class RemoteLaunchRequester {
 
           if (res.kind === "accepted") {
             this.storage.remoteLaunch.outbound.markAccepted(row.launchId);
+            if (this.markRemoteReachable && row.fromSession.startsWith("gse_")) {
+              try {
+                await this.markRemoteReachable(row.fromSession, { grant: true });
+              } catch (err) {
+                this.log("markRemoteReachable threw in tick", {
+                  from: row.fromSession,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
           } else if (res.kind === "refused" && !PRE_DEDUP_REFUSAL_CODES.has(res.code)) {
             const nowRefused = this.nowFn();
             this.storage.db.transaction(() => {

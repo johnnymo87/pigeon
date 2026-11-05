@@ -198,7 +198,7 @@ Request body (JSON):
 ```
 
 - Handled by `RemoteLaunchRequester` (daemon A). Gated on `PIGEON_REMOTE_LAUNCH_SEND=1` (returns 403 `launch_send_disabled` if unset; 503 `no_worker` if worker client is not configured).
-- `launch_id`, `from`, `machine`, `directory`, `prompt` are required (`from` is `ses_` or `gse_`; a `gse_` requester must have a local goose row, is marked remotely reachable, and tag inheritance maps via `goose:<native>` or coordinator program). `tag` is optional (explicit tag overrides).
+- `launch_id`, `from`, `machine`, `directory`, `prompt` are required (`from` is `ses_` or `gse_`; a `gse_` requester must have a local goose row, is registered with the worker before request and granted remote reachability on accept, and tag inheritance maps via `goose:<native>` or coordinator program). `tag` is optional (explicit tag overrides).
 - Validates parameters, inserts an outbound record into SQLite `remote_launch_outbound` with state `sending` before calling the worker, and relays to worker `POST /launch/relay`.
 - Response: HTTP 202 `{ "launch_id": "rl_...", "status": "accepted", "to_machine": "..." }` or `{ "launch_id": "rl_...", "status": "pending" }` (if worker returned a transient error or timed out). Known refusals return the worker's status and error code inline.
 
@@ -279,7 +279,7 @@ The worker sends a relay to the machine in D1 `sessions.machine_id` for the targ
 
 ### Send side (arbiter)
 
-On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label}` to `POST /swarm/relay`. A scheduled row is relayed at its `deliver_at`, because the arbiter only picks it up then. When the sender is a `gse_` session, the arbiter marks it remotely reachable before relaying. The answer is classified **by error code, never by status alone**: 403 and 409 each carry both kinds, and an unknown code from a newer worker is safer retried than made permanent.
+On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label}` to `POST /swarm/relay`. A scheduled row is relayed at its `deliver_at`, because the arbiter only picks it up then. When the sender is a `gse_` session, the arbiter registers it with the worker before relaying, and grants remote reachability (`swarm-remote`) once the relay is accepted. The answer is classified **by error code, never by status alone**: 403 and 409 each carry both kinds, and an unknown code from a newer worker is safer retried than made permanent.
 
 | Worker answer | Treatment |
 |---|---|
@@ -388,7 +388,7 @@ Remote launch allows an agent session on machine A (opencode, or goose via honk'
 
 ### Routes
 
-- **Daemon A (`POST /swarm/launch`):** Authenticated with daemon token. Handled by `RemoteLaunchRequester`. Validates body (`from` is `ses_` or `gse_`), records `sending` in `remote_launch_outbound`, and POSTs to worker `/launch/relay`. For a `gse_` requester, requires a local goose row, marks it remotely reachable, and resolves tag inheritance.
+- **Daemon A (`POST /swarm/launch`):** Authenticated with daemon token. Handled by `RemoteLaunchRequester`. Validates body (`from` is `ses_` or `gse_`), records `sending` in `remote_launch_outbound`, and POSTs to worker `/launch/relay`. For a `gse_` requester, requires a local goose row, registers it before requesting, grants remote reachability on accept, and resolves tag inheritance.
 - **Worker (`POST /launch/relay`):** Requires machine principal key (`requireMachinePrincipal`). Performs validation (`from` is `ses_` or `gse_`), duplicate check, sender check, target retired check, accept check, online check, return path check, queue cap, and rate limit. Writes to `remote_launch`.
 - **Worker (`POST /launch/relay/ack`):** Called by machine B to ack a launch outcome. Requires machine key matching `to_machine`. Settle status: `launched` -> status `launched`, `session_id` (must be `ses_`); `refused` -> status `refused`, `reason`; `unconfirmed` -> status `expired`, reason `unconfirmed`. Mints result row `r:<launch_id>` (or `r:<launch_id>:<outcome>` on corrections) addressed to `from_machine`.
 - **Worker (`POST /launch/relay/ack` kind='result'):** Called by machine A to ack delivery of a `launch_result` item (`outcome='delivered'`).

@@ -18,17 +18,33 @@ function defaultLog(msg: string, fields?: Record<string, unknown>): void {
   }
 }
 
+export interface MarkGooseRemoteReachableOptions {
+  grant: boolean;
+}
+
+export interface MarkGooseRemoteReachableResult {
+  marked: boolean;
+  registered: boolean | "cached" | "skipped";
+}
+
+export type MarkGooseRemoteReachable = {
+  (sessionId: string, options: MarkGooseRemoteReachableOptions): Promise<MarkGooseRemoteReachableResult>;
+  register(sessionId: string): Promise<MarkGooseRemoteReachableResult>;
+  grant(sessionId: string): Promise<MarkGooseRemoteReachableResult>;
+};
+
 export function createMarkGooseRemoteReachable(
   deps: RemoteReachableDeps,
-): (sessionId: string) => Promise<{ marked: boolean; registered: boolean | "cached" | "skipped" }> {
+): MarkGooseRemoteReachable {
   const log = deps.log ?? defaultLog;
   const timeoutMs = deps.timeoutMs ?? 5000;
   const nowFn = deps.nowFn ?? Date.now;
   const registeredThisLifetime = new Set<string>();
 
-  return async function markGooseRemoteReachable(
+  const fn = async function markGooseRemoteReachable(
     sessionId: string,
-  ): Promise<{ marked: boolean; registered: boolean | "cached" | "skipped" }> {
+    options: MarkGooseRemoteReachableOptions,
+  ): Promise<MarkGooseRemoteReachableResult> {
     try {
       if (!sessionId.startsWith("gse_")) {
         return { marked: false, registered: "skipped" };
@@ -49,32 +65,34 @@ export function createMarkGooseRemoteReachable(
         return { marked: false, registered: "skipped" };
       }
 
-      const base = Array.isArray(row.pullSources) ? row.pullSources : [...DEFAULT_PULL_SOURCES];
-      const next = [...base];
-      let changed = false;
-      if (!next.includes("swarm")) {
-        next.push("swarm");
-        changed = true;
-      }
-      if (!next.includes("swarm-remote")) {
-        next.push("swarm-remote");
-        changed = true;
-      }
-
-      const now = nowFn();
-      if (changed) {
-        try {
-          deps.sessions.setPullSources(sessionId, next, now);
-        } catch (err) {
-          log("setPullSources failed", {
-            sessionId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return { marked: false, registered: "skipped" };
+      let marked = false;
+      if (options.grant) {
+        const base = Array.isArray(row.pullSources) ? row.pullSources : [...DEFAULT_PULL_SOURCES];
+        const next = [...base];
+        let changed = false;
+        if (!next.includes("swarm")) {
+          next.push("swarm");
+          changed = true;
         }
-      }
+        if (!next.includes("swarm-remote")) {
+          next.push("swarm-remote");
+          changed = true;
+        }
 
-      const marked = true;
+        const now = nowFn();
+        if (changed) {
+          try {
+            deps.sessions.setPullSources(sessionId, next, now);
+          } catch (err) {
+            log("setPullSources failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return { marked: false, registered: "skipped" };
+          }
+        }
+        marked = true;
+      }
 
       if (!deps.register) {
         return { marked, registered: "skipped" };
@@ -141,4 +159,9 @@ export function createMarkGooseRemoteReachable(
       return { marked: false, registered: "skipped" };
     }
   };
+
+  fn.register = (sessionId: string) => fn(sessionId, { grant: false });
+  fn.grant = (sessionId: string) => fn(sessionId, { grant: true });
+
+  return fn;
 }

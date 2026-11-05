@@ -208,9 +208,9 @@ export interface ArbiterOptions {
   relay?: (body: RelayMessageBody) => Promise<RelaySendAnswer>;
   /**
    * Goose session remote reachability marker. When relaying a message from a goose session,
-   * marks it reachable so replies can be delivered.
+   * registers it before relay and marks it reachable (grants pull_sources) when relay succeeds.
    */
-  markRemoteReachable?: (sessionId: string) => Promise<unknown>;
+  markRemoteReachable?: (sessionId: string, options: { grant: boolean }) => Promise<unknown>;
   /**
    * Goose session delivery. Injected narrow capability (send prompt only, no abort).
    */
@@ -248,7 +248,7 @@ export class SwarmArbiter {
     | undefined;
   private readonly selfMachineId: string | undefined;
   private readonly relay: ((body: RelayMessageBody) => Promise<RelaySendAnswer>) | undefined;
-  private readonly markRemoteReachable: ((sessionId: string) => Promise<unknown>) | undefined;
+  private readonly markRemoteReachable: ((sessionId: string, options: { grant: boolean }) => Promise<unknown>) | undefined;
   private readonly gooseDeliver: ((sessionId: string, commandId: string, text: string) => Promise<void>) | undefined;
   private readonly nowFn: () => number;
   private readonly log: (
@@ -608,7 +608,7 @@ export class SwarmArbiter {
             if (this.relay && RELAY_SENDER_ID.test(next.fromSession) && RELAY_TARGET_ID.test(target)) {
               if (next.fromSession.startsWith("gse_") && this.markRemoteReachable) {
                 try {
-                  await this.markRemoteReachable(next.fromSession);
+                  await this.markRemoteReachable(next.fromSession, { grant: false });
                 } catch (err) {
                   this.log("markRemoteReachable threw", {
                     from: next.fromSession,
@@ -617,6 +617,16 @@ export class SwarmArbiter {
                 }
               }
               await this.relayRow(next, target);
+              if (next.fromSession.startsWith("gse_") && this.markRemoteReachable) {
+                try {
+                  await this.markRemoteReachable(next.fromSession, { grant: true });
+                } catch (err) {
+                  this.log("markRemoteReachable threw", {
+                    from: next.fromSession,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
               continue;
             }
             const owner = await this.lookupOwner(target);

@@ -13,6 +13,8 @@ import { RelayClient, relayPollHeader, type RelayMessageBody, type RelaySendAnsw
 import { Poller } from "../src/worker/poller";
 import { formatRelayFailureNotice } from "../src/swarm/relay-notice";
 import type { Locality } from "../src/routing/locality";
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
+import { createMarkGooseRemoteReachable } from "../src/goose/remote-reachable";
 
 const NOW = 1_800_000_000_000;
 const SENDER = "ses_senderOnDevbox0001";
@@ -353,7 +355,7 @@ describe("late failures of relayed-in rows go back through the worker", () => {
 function arbiterSetup(opts: {
   relay?: (b: RelayMessageBody) => Promise<RelaySendAnswer>;
   locality?: Locality;
-  markRemoteReachable?: (sessionId: string) => Promise<unknown>;
+  markRemoteReachable?: (sessionId: string, options: { grant: boolean }) => Promise<unknown>;
 } = {}) {
   const s = db();
   const sendPrompt = vi.fn(async () => {});
@@ -475,10 +477,10 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
     expect(a.s.swarm.getByMsgId("m1")!.state).toBe("failed");
   });
 
-  it("relays a local gse_ sender to a remote ses_ target and calls markRemoteReachable first", async () => {
+  it("relays a local gse_ sender to a remote ses_ target: registers before relay, grants after accepted", async () => {
     const order: string[] = [];
-    const markRemoteReachable = vi.fn(async (sessionId: string) => {
-      order.push(`mark:${sessionId}`);
+    const markRemoteReachable = vi.fn(async (sessionId: string, opts: { grant: boolean }) => {
+      order.push(`mark:${sessionId}:grant=${opts.grant}`);
     });
     const a = arbiterSetup({
       relay: async (body) => {
@@ -493,7 +495,8 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
 
     await a.arbiter.processOnce();
 
-    expect(markRemoteReachable).toHaveBeenCalledWith(gseSender);
+    expect(markRemoteReachable).toHaveBeenNthCalledWith(1, gseSender, { grant: false });
+    expect(markRemoteReachable).toHaveBeenNthCalledWith(2, gseSender, { grant: true });
     expect(a.relay).toHaveBeenCalledWith(
       expect.objectContaining({
         msg_id: "m_gse_1",
@@ -502,11 +505,104 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
         from_label: "goose work",
       }),
     );
-    expect(order).toEqual([`mark:${gseSender}`, `relay:${gseSender}`]);
+    expect(order).toEqual([
+      `mark:${gseSender}:grant=false`,
+      `relay:${gseSender}`,
+      `mark:${gseSender}:grant=true`,
+    ]);
     expect(a.s.swarm.getByMsgId("m_gse_1")).toMatchObject({
       state: "handed_off",
       verifyFamily: "relayed",
     });
+  });
+
+  it("grant not applied when relay answer is refused (row lacks swarm-remote)", async () => {
+    const a = arbiterSetup({
+      relay: async () => ({ kind: "permanent", code: "unauthorized", status: 401, detail: "bad key" }),
+    });
+    const gseSender = "gse_local_goose_refused";
+    a.s.sessions.upsert({ sessionId: gseSender, backendKind: GOOSE_BACKEND_KIND, label: "goose work" }, NOW);
+
+    const mark = createMarkGooseRemoteReachable({
+      sessions: a.s.sessions,
+    });
+    const markSpy = vi.fn(mark);
+    // Wire real helper
+    (a.arbiter as any).markRemoteReachable = markSpy;
+
+    a.insert("m_gse_refused", { fromSession: gseSender });
+
+    await a.arbiter.processOnce();
+
+    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markSpy).toHaveBeenCalledWith(gseSender, { grant: false });
+    // pull_sources did NOT gain swarm-remote!
+    const row = a.s.sessions.get(gseSender);
+    expect(row!.pullSources).toEqual(["telegram-reply"]);
+    expect(row!.pullSources).not.toContain("swarm-remote");
+  });
+
+  it("grant not applied when relay throws (row lacks swarm-remote)", async () => {
+    const a = arbiterSetup({
+      relay: async () => {
+        throw new Error("network partition");
+      },
+    });
+    const gseSender = "gse_local_goose_throw";
+    a.s.sessions.upsert({ sessionId: gseSender, backendKind: GOOSE_BACKEND_KIND, label: "goose work" }, NOW);
+
+    const mark = createMarkGooseRemoteReachable({
+      sessions: a.s.sessions,
+    });
+    const markSpy = vi.fn(mark);
+    (a.arbiter as any).markRemoteReachable = markSpy;
+
+    a.insert("m_gse_throw", { fromSession: gseSender });
+
+    await a.arbiter.processOnce();
+
+    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markSpy).toHaveBeenCalledWith(gseSender, { grant: false });
+    const row = a.s.sessions.get(gseSender);
+    expect(row!.pullSources).toEqual(["telegram-reply"]);
+  });
+
+  it("grant applied after relay is accepted (row gains swarm-remote)", async () => {
+    const a = arbiterSetup({
+      relay: async () => ({ kind: "accepted", toMachine: "cloudbox", duplicate: false }),
+    });
+    const gseSender = "gse_local_goose_accepted";
+    a.s.sessions.upsert({ sessionId: gseSender, backendKind: GOOSE_BACKEND_KIND, label: "goose work" }, NOW);
+
+    const mark = createMarkGooseRemoteReachable({
+      sessions: a.s.sessions,
+    });
+    const markSpy = vi.fn(mark);
+    (a.arbiter as any).markRemoteReachable = markSpy;
+
+    a.insert("m_gse_accepted", { fromSession: gseSender });
+
+    await a.arbiter.processOnce();
+
+    expect(markSpy).toHaveBeenCalledTimes(2);
+    expect(markSpy).toHaveBeenNthCalledWith(1, gseSender, { grant: false });
+    expect(markSpy).toHaveBeenNthCalledWith(2, gseSender, { grant: true });
+    const row = a.s.sessions.get(gseSender);
+    expect(row!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+  });
+
+  it("mark not called when sender is ses_", async () => {
+    const markRemoteReachable = vi.fn();
+    const a = arbiterSetup({
+      relay: async () => ({ kind: "accepted", toMachine: "cloudbox", duplicate: false }),
+      markRemoteReachable,
+    });
+    a.s.sessions.upsert({ sessionId: SENDER, label: "ses work" }, NOW);
+    a.insert("m_ses_1", { fromSession: SENDER });
+
+    await a.arbiter.processOnce();
+
+    expect(markRemoteReachable).not.toHaveBeenCalled();
   });
 
   it("without relay configured, a remote target still fails as in Phase 1", async () => {

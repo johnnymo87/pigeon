@@ -17,7 +17,89 @@ describe("createMarkGooseRemoteReachable", () => {
     }
   });
 
-  it("additive write from NULL pull_sources", async () => {
+  it("grant: false registers with worker only without writing pull_sources", async () => {
+    const s = storage!;
+    s.sessions.upsert({
+      sessionId: "gse_test_register_only",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://localhost:1/acp",
+      notify: true,
+    });
+
+    const setSpy = vi.spyOn(s.sessions, "setPullSources");
+    const registerMock = vi.fn().mockResolvedValue({ ok: true });
+    const mark = createMarkGooseRemoteReachable({
+      sessions: s.sessions,
+      register: registerMock,
+    });
+
+    const res = await mark("gse_test_register_only", { grant: false });
+    expect(res).toEqual({ marked: false, registered: true });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+    expect(setSpy).not.toHaveBeenCalled();
+
+    const afterRow = s.sessions.get("gse_test_register_only");
+    expect(afterRow!.pullSources).toEqual(["telegram-reply"]);
+  });
+
+  it("grant: false followed by grant: true does not re-register, only writes pull_sources", async () => {
+    const s = storage!;
+    s.sessions.upsert({
+      sessionId: "gse_test_reg_then_grant",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://localhost:1/acp",
+      notify: true,
+    });
+
+    const registerMock = vi.fn().mockResolvedValue({ ok: true });
+    const mark = createMarkGooseRemoteReachable({
+      sessions: s.sessions,
+      register: registerMock,
+    });
+
+    const res1 = await mark("gse_test_reg_then_grant", { grant: false });
+    expect(res1).toEqual({ marked: false, registered: true });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+
+    const res2 = await mark("gse_test_reg_then_grant", { grant: true });
+    expect(res2).toEqual({ marked: true, registered: "cached" });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+
+    const afterRow = s.sessions.get("gse_test_reg_then_grant");
+    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+  });
+
+  it("grant: false registration failure is retried when grant: true is called", async () => {
+    const s = storage!;
+    s.sessions.upsert({
+      sessionId: "gse_test_reg_retry",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://localhost:1/acp",
+      notify: true,
+    });
+
+    const registerMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: "busy" })
+      .mockResolvedValueOnce({ ok: true });
+
+    const mark = createMarkGooseRemoteReachable({
+      sessions: s.sessions,
+      register: registerMock,
+    });
+
+    const res1 = await mark("gse_test_reg_retry", { grant: false });
+    expect(res1).toEqual({ marked: false, registered: false });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+
+    const res2 = await mark("gse_test_reg_retry", { grant: true });
+    expect(res2).toEqual({ marked: true, registered: true });
+    expect(registerMock).toHaveBeenCalledTimes(2);
+
+    const afterRow = s.sessions.get("gse_test_reg_retry");
+    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+  });
+
+  it("additive write from NULL pull_sources with grant: true", async () => {
     const s = storage!;
     s.sessions.upsert({
       sessionId: "gse_test_1",
@@ -36,7 +118,7 @@ describe("createMarkGooseRemoteReachable", () => {
       sessions: s.sessions,
     });
 
-    const res = await mark("gse_test_1");
+    const res = await mark("gse_test_1", { grant: true });
     expect(res).toEqual({ marked: true, registered: "skipped" });
 
     const afterRow = s.sessions.get("gse_test_1");
@@ -57,7 +139,7 @@ describe("createMarkGooseRemoteReachable", () => {
       sessions: s.sessions,
     });
 
-    const res = await mark("gse_test_2");
+    const res = await mark("gse_test_2", { grant: true });
     expect(res).toEqual({ marked: true, registered: "skipped" });
 
     const afterRow = s.sessions.get("gse_test_2");
@@ -80,7 +162,7 @@ describe("createMarkGooseRemoteReachable", () => {
       sessions: s.sessions,
     });
 
-    const res = await mark("gse_test_3");
+    const res = await mark("gse_test_3", { grant: true });
     expect(res).toEqual({ marked: true, registered: "skipped" });
     expect(setSpy).not.toHaveBeenCalled();
   });
@@ -100,11 +182,11 @@ describe("createMarkGooseRemoteReachable", () => {
       register: registerMock,
     });
 
-    const res1 = await mark("gse_test_4");
+    const res1 = await mark("gse_test_4", { grant: true });
     expect(res1).toEqual({ marked: true, registered: true });
     expect(registerMock).toHaveBeenCalledTimes(1);
 
-    const res2 = await mark("gse_test_4");
+    const res2 = await mark("gse_test_4", { grant: true });
     expect(res2).toEqual({ marked: true, registered: "cached" });
     expect(registerMock).toHaveBeenCalledTimes(1);
   });
@@ -127,13 +209,13 @@ describe("createMarkGooseRemoteReachable", () => {
     });
 
     // ses_ id
-    const resSes = await mark("ses_opencode_1");
+    const resSes = await mark("ses_opencode_1", { grant: true });
     expect(resSes).toEqual({ marked: false, registered: "skipped" });
     expect(registerMock).not.toHaveBeenCalled();
     expect(setSpy).not.toHaveBeenCalled();
 
     // unknown gse_ id
-    const resUnknown = await mark("gse_does_not_exist");
+    const resUnknown = await mark("gse_does_not_exist", { grant: true });
     expect(resUnknown).toEqual({ marked: false, registered: "skipped" });
     expect(registerMock).not.toHaveBeenCalled();
     expect(setSpy).not.toHaveBeenCalled();
@@ -156,7 +238,7 @@ describe("createMarkGooseRemoteReachable", () => {
       register: registerMock,
     });
 
-    const res = await mark("gse_not_goose");
+    const res = await mark("gse_not_goose", { grant: true });
     expect(res).toEqual({ marked: false, registered: "skipped" });
     expect(registerMock).not.toHaveBeenCalled();
     expect(setSpy).not.toHaveBeenCalled();
@@ -182,7 +264,7 @@ describe("createMarkGooseRemoteReachable", () => {
       log: (msg, fields) => logs.push({ msg, fields }),
     });
 
-    const res1 = await mark("gse_test_fail");
+    const res1 = await mark("gse_test_fail", { grant: true });
     expect(res1).toEqual({ marked: true, registered: false });
     expect(registerMock).toHaveBeenCalledTimes(1);
     expect(logs).toEqual([
@@ -193,12 +275,12 @@ describe("createMarkGooseRemoteReachable", () => {
     ]);
 
     // Retried next call
-    const res2 = await mark("gse_test_fail");
+    const res2 = await mark("gse_test_fail", { grant: true });
     expect(res2).toEqual({ marked: true, registered: true });
     expect(registerMock).toHaveBeenCalledTimes(2);
 
     // Third call is cached
-    const res3 = await mark("gse_test_fail");
+    const res3 = await mark("gse_test_fail", { grant: true });
     expect(res3).toEqual({ marked: true, registered: "cached" });
     expect(registerMock).toHaveBeenCalledTimes(2);
   });
@@ -223,7 +305,7 @@ describe("createMarkGooseRemoteReachable", () => {
       log: (msg, fields) => logs.push({ msg, fields }),
     });
 
-    const res1 = await mark("gse_test_throw");
+    const res1 = await mark("gse_test_throw", { grant: true });
     expect(res1).toEqual({ marked: true, registered: false });
     expect(registerMock).toHaveBeenCalledTimes(1);
     expect(logs).toEqual([
@@ -233,7 +315,7 @@ describe("createMarkGooseRemoteReachable", () => {
       },
     ]);
 
-    const res2 = await mark("gse_test_throw");
+    const res2 = await mark("gse_test_throw", { grant: true });
     expect(res2).toEqual({ marked: true, registered: true });
     expect(registerMock).toHaveBeenCalledTimes(2);
   });
@@ -250,6 +332,7 @@ describe("createMarkGooseRemoteReachable", () => {
     const logs: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
     let signalSawAbort = false;
     const registerMock = vi.fn((_id: string, _label: string | null, signal: AbortSignal) => {
+      signalSawAbort = true;
       signal.addEventListener("abort", () => {
         signalSawAbort = true;
       });
@@ -264,7 +347,7 @@ describe("createMarkGooseRemoteReachable", () => {
     });
 
     const start = Date.now();
-    const res = await mark("gse_test_timeout");
+    const res = await mark("gse_test_timeout", { grant: true });
     const elapsed = Date.now() - start;
 
     expect(res).toEqual({ marked: true, registered: false });
@@ -302,14 +385,14 @@ describe("createMarkGooseRemoteReachable", () => {
       register: registerMock,
     });
 
-    await mark("gse_labeled");
+    await mark("gse_labeled", { grant: true });
     expect(registerMock).toHaveBeenLastCalledWith(
       "gse_labeled",
       "my-coordinator-label",
       expect.any(AbortSignal),
     );
 
-    await mark("gse_unlabeled");
+    await mark("gse_unlabeled", { grant: true });
     expect(registerMock).toHaveBeenLastCalledWith(
       "gse_unlabeled",
       null,
@@ -331,7 +414,7 @@ describe("createMarkGooseRemoteReachable", () => {
       log: (msg, fields) => logs.push({ msg, fields }),
     });
 
-    const res = await mark("gse_disk_fail");
+    const res = await mark("gse_disk_fail", { grant: true });
     expect(res).toEqual({ marked: false, registered: "skipped" });
     expect(logs[0]?.msg).toBe("session lookup failed");
   });
@@ -353,7 +436,7 @@ describe("createMarkGooseRemoteReachable", () => {
         register: registerMock,
       });
 
-      await mark("gse_test_log");
+      await mark("gse_test_log", { grant: true });
       expect(warnSpy).toHaveBeenCalledWith(
         "[remote-reachable] remote-reachable: registration failed",
         { sessionId: "gse_test_log", reason: "fail" },
@@ -361,5 +444,31 @@ describe("createMarkGooseRemoteReachable", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  it("mark.register and mark.grant helper methods behave identically to { grant: false } and { grant: true }", async () => {
+    const s = storage!;
+    s.sessions.upsert({
+      sessionId: "gse_helper_methods",
+      backendKind: GOOSE_BACKEND_KIND,
+      backendEndpoint: "ws://localhost:1/acp",
+      notify: true,
+    });
+
+    const registerMock = vi.fn().mockResolvedValue({ ok: true });
+    const mark = createMarkGooseRemoteReachable({
+      sessions: s.sessions,
+      register: registerMock,
+    });
+
+    const resReg = await mark.register("gse_helper_methods");
+    expect(resReg).toEqual({ marked: false, registered: true });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["telegram-reply"]);
+
+    const resGrant = await mark.grant("gse_helper_methods");
+    expect(resGrant).toEqual({ marked: true, registered: "cached" });
+    expect(registerMock).toHaveBeenCalledTimes(1);
+    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
   });
 });

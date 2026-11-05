@@ -964,7 +964,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const f = parsed.fields;
         const msgId = f.callerMsgId ?? makeMsgId();
-        const allowRemoteGoose = await shouldAllowRemoteGooseTarget(
+        const remoteGoose = await shouldAllowRemoteGooseTarget(
           storage,
           f.to,
           f.channel,
@@ -975,6 +975,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             lookupTimeoutMs: opts.lookupSessionOwnerTimeoutMs,
           },
         );
+        if (!remoteGoose.allowed && remoteGoose.error) {
+          return Response.json({ error: remoteGoose.error }, { status: 409 });
+        }
         const result = bankOrInsertSwarmMessage(
           storage,
           {
@@ -986,7 +989,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             priority: f.priority,
             replyTo: f.replyTo,
             payload: f.payload,
-            ...(allowRemoteGoose ? { allowRemoteGoose: true } : {}),
+            ...(remoteGoose.allowed ? { allowRemoteGoose: true } : {}),
           },
           nowFn(),
         );
@@ -1076,7 +1079,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
         const msgId = f.callerMsgId ?? makeMsgId();
-        const allowRemoteGoose = await shouldAllowRemoteGooseTarget(
+        const remoteGoose = await shouldAllowRemoteGooseTarget(
           storage,
           f.to,
           f.channel,
@@ -1087,6 +1090,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             lookupTimeoutMs: opts.lookupSessionOwnerTimeoutMs,
           },
         );
+        if (!remoteGoose.allowed && remoteGoose.error) {
+          return Response.json({ error: remoteGoose.error }, { status: 409 });
+        }
         const result = bankOrInsertSwarmMessage(
           storage,
           {
@@ -1101,7 +1107,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             deliverAt: sched.deliverAt,
             expiresAt: sched.expiresAt,
             ref,
-            ...(allowRemoteGoose ? { allowRemoteGoose: true } : {}),
+            ...(remoteGoose.allowed ? { allowRemoteGoose: true } : {}),
           },
           nowFn(),
         );
