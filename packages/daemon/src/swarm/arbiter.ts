@@ -61,6 +61,9 @@ export function formatRemoteFailureNotice(msgId: string, target: string, reason:
 /** Length of an opencode session id: `ses_` + 26 alphanumerics. */
 export const OPENCODE_SESSION_ID_LENGTH = 30;
 
+/** Shared by the preflight error and the expiry alert that keys its revive hint on it. */
+const DIRECTORY_MISSING_MARKER = "working directory missing";
+
 const GSE_ID = /^gse_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -383,10 +386,18 @@ export class SwarmArbiter {
         (row.lastError ? `; last delivery error: ${row.lastError}` : "");
       notifySenderOfFailure(this.storage, row, reason, now);
       if (isSuppressedFromRecovery(row)) {
+        // The revive hint goes to the HUMAN alert only, never into the sender
+        // notice: a peer agent told "revive it" may resurrect a worktree that
+        // was pruned on purpose after its work merged.
+        const alertReason =
+          row.lastError?.includes(DIRECTORY_MISSING_MARKER) && row.toSession
+            ? `${reason}. If ${row.toSession} is still needed, revive it ` +
+              `(interactive): oc-revive ${row.toSession}, then reschedule this wake`
+            : reason;
         this.storage.alerts.enqueue({
           source: "wake-expired",
           refMsgId: row.msgId,
-          text: formatWakePayloadAlert(row, reason, "expired before delivery"),
+          text: formatWakePayloadAlert(row, alertReason, "expired before delivery"),
           severity: "error",
           now,
         });
@@ -759,9 +770,8 @@ export class SwarmArbiter {
         // in index.ts to switch the preflight off rather than editing here.
         if (this.directoryMissing(directory)) {
           throw new TargetUnavailableError(
-            `target ${target} working directory missing: ${directory} ` +
-              `(stat on daemon filesystem; assumes daemon and serve are co-located). ` +
-              `If its worktree was deleted, revive it: oc-revive ${target}`,
+            `target ${target} ${DIRECTORY_MISSING_MARKER}: ${directory} ` +
+              `(stat on daemon filesystem; assumes daemon and serve are co-located)`,
           );
         }
 

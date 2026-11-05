@@ -1450,7 +1450,8 @@ describe("SwarmArbiter", () => {
       const blob = JSON.stringify(notices);
       expect(blob).toContain("expired before delivery");
       expect(blob).toContain("working directory missing");
-      expect(blob).toContain("oc-revive ses_b");
+      // The revive hint is for the human alert, never the (possibly agent) sender.
+      expect(blob).not.toContain("oc-revive");
     });
 
     it("4c. a scheduled WAKE that expires behind a missing directory alerts with the cause", async () => {
@@ -1485,6 +1486,7 @@ describe("SwarmArbiter", () => {
       expect(text).toContain("expired before delivery");
       expect(text).toContain("working directory missing");
       expect(text).toContain("oc-revive ses_self");
+      expect(text).toContain("reschedule");
     });
 
     it("4d. an expiry with no delivery attempt says nothing about a last error", async () => {
