@@ -80,8 +80,9 @@ describe("sanitizeBodyMarkdown", () => {
   });
 
   it("leaves heading-like lines that are not headings alone", () => {
-    expect(sanitizeBodyMarkdown("see\n#5387 merged")).toBe("see  \n#5387 merged");
-    expect(sanitizeBodyMarkdown("a\n\n# H")).toBe("a\n\n# H");
+    // Telegram makes even a lazy `#5387` line a heading, so it is escaped (pigeon-ravn).
+    expect(sanitizeBodyMarkdown("see\n#5387 merged")).toBe("see  \n\\#5387 merged");
+    expect(sanitizeBodyMarkdown("a\n\n# H")).toBe("a\n\n&nbsp;\n\n# H");
     expect(sanitizeBodyMarkdown("```\nx\n# not a heading\n```")).toBe("```\nx\n# not a heading\n```");
   });
 
@@ -127,8 +128,72 @@ describe("sanitizeBodyMarkdown", () => {
     expect(sanitizeBodyMarkdown("line one\nline two")).toBe("line one  \nline two");
   });
 
-  it("leaves paragraph breaks alone", () => {
-    expect(sanitizeBodyMarkdown("para one\n\npara two")).toBe("para one\n\npara two");
+  // pigeon-ravn: Telegram draws rich paragraphs with no gap between them, so a blank line
+  // in the source showed as nothing. An empty (&nbsp;) paragraph gives back the empty line
+  // plain text showed.
+  it("keeps a paragraph break visible with an empty paragraph", () => {
+    expect(sanitizeBodyMarkdown("para one\n\npara two")).toBe("para one\n\n&nbsp;\n\npara two");
+  });
+
+  it("collapses a run of blank lines into one spacer", () => {
+    expect(sanitizeBodyMarkdown("a\n\n\n\nb")).toBe("a\n\n&nbsp;\n\nb");
+  });
+
+  it("puts spacers before and after a list, but not between its items", () => {
+    expect(sanitizeBodyMarkdown("intro\n\n- a\n\n- b\n\n1. c\n\n2. d\n\nend")).toBe(
+      "intro\n\n&nbsp;\n\n- a\n\n- b\n\n1. c\n\n2. d\n\n&nbsp;\n\nend",
+    );
+  });
+
+  it("adds no spacer before an indented continuation of a list item", () => {
+    expect(sanitizeBodyMarkdown("- a\n\n  more of a\n- b")).toBe("- a\n\n  more of a  \n- b");
+  });
+
+  it("adds no spacer inside fenced code", () => {
+    expect(sanitizeBodyMarkdown("```\nx\n\ny\n```")).toBe("```\nx\n\ny\n```");
+  });
+
+  it("adds no spacer where it inserted a blank line itself", () => {
+    expect(sanitizeBodyMarkdown("text\n# Heading")).toBe("text\n\n# Heading");
+  });
+
+  // pigeon-ravn: Telegram reads `#` followed by text at the start of a line as a heading,
+  // where GFM needs a space: "#5620 is ready" rendered as a giant heading.
+  it("escapes a line-start # that GFM would not read as a heading", () => {
+    expect(sanitizeBodyMarkdown("#5620 is ready")).toBe("\\#5620 is ready");
+    expect(sanitizeBodyMarkdown("##5620 x")).toBe("\\##5620 x");
+    expect(sanitizeBodyMarkdown("   #tag x")).toBe("   \\#tag x");
+    expect(sanitizeBodyMarkdown("- #5620 merged")).toBe("- \\#5620 merged");
+    expect(sanitizeBodyMarkdown("1. #5620 merged")).toBe("1. \\#5620 merged");
+    expect(sanitizeBodyMarkdown("> #5620 merged")).toBe("> \\#5620 merged");
+  });
+
+  it("escapes a # after a task-list checkbox", () => {
+    expect(sanitizeBodyMarkdown("- [ ] #5620 merged")).toBe("- [ ] \\#5620 merged");
+    expect(sanitizeBodyMarkdown("- [x] #5621 done")).toBe("- [x] \\#5621 done");
+  });
+
+  it("recognises a fence opened on a list-marker line, so code inside is untouched", () => {
+    const md = "- ```bash\n  #!/bin/bash\n\n  echo $X\n  ```\n\nafter";
+    expect(sanitizeBodyMarkdown(md)).toBe("- ```bash\n  #!/bin/bash\n\n  echo $X\n  ```\n\n&nbsp;\n\nafter");
+  });
+
+  it("closes a fence the agent left open, so the footer is not swallowed into it", () => {
+    expect(sanitizeBodyMarkdown("text\n\n```\ncode")).toBe("text\n\n&nbsp;\n\n```\ncode\n```");
+    expect(sanitizeBodyMarkdown("~~~~\ncode")).toBe("~~~~\ncode\n~~~~");
+  });
+
+  it("does not close a fence left open inside a quote or list item, which their end closes", () => {
+    // A closing fence at column 0 would instead open a new fence that swallows the footer.
+    expect(sanitizeBodyMarkdown("> ```\n> code")).toBe("> ```\n> code");
+    expect(sanitizeBodyMarkdown("- ```\n  code")).toBe("- ```\n  code");
+  });
+
+  it("leaves real headings and mid-line # alone", () => {
+    expect(sanitizeBodyMarkdown("# Title")).toBe("# Title");
+    expect(sanitizeBodyMarkdown("#\tTitle")).toBe("#\tTitle");
+    expect(sanitizeBodyMarkdown("see #5620")).toBe("see #5620");
+    expect(sanitizeBodyMarkdown("```\n#include x\n```")).toBe("```\n#include x\n```");
   });
 
   it("does not add hard breaks inside a table, and keeps || (empty cell) in table rows", () => {
@@ -147,7 +212,7 @@ describe("sanitizeBodyMarkdown", () => {
   });
 
   it("treats an unclosed fence as running to the end", () => {
-    expect(sanitizeBodyMarkdown("```\n$a\nb")).toBe("```\n$a\nb");
+    expect(sanitizeBodyMarkdown("```\n$a\nb")).toBe("```\n$a\nb\n```");
   });
 
   it("does not read line-start inline code (```x```) as a fence", () => {
@@ -199,19 +264,38 @@ describe("tgMessageToMarkdown", () => {
     );
   });
 
-  it("renders code entities as backtick spans without escaping inside", () => {
+  // pigeon-ravn: a plain message's code entity copies with one tap; rich inline code does not.
+  // A copy_text button does.
+  it("renders code entities as copy buttons", () => {
     const msg = new TgMessageBuilder().append("📂 ").appendCode("projects/my_repo").build();
-    expect(tgMessageToMarkdown(msg)).toBe("📂 `projects/my_repo`");
+    expect(tgMessageToMarkdown(msg)).toBe(
+      '📂 <tg-button type="copy_text" text="projects/my_repo">projects/my\\_repo</tg-button>',
+    );
+  });
+
+  it("escapes the copy text as an attribute and the label as markdown", () => {
+    const msg = new TgMessageBuilder().appendCode('a"b&c<d`e*').build();
+    expect(tgMessageToMarkdown(msg)).toBe(
+      '<tg-button type="copy_text" text="a&quot;b&amp;c&lt;d`e*">a"b&c&lt;d\\`e\\*</tg-button>',
+    );
+  });
+
+  it("falls back to a code span when the text is too long for a copy button", () => {
+    const long = "x".repeat(257);
+    const msg = new TgMessageBuilder().appendCode(long).build();
+    expect(tgMessageToMarkdown(msg)).toBe("`" + long + "`");
+    const max = "x".repeat(256);
+    expect(tgMessageToMarkdown(new TgMessageBuilder().appendCode(max).build())).toContain("<tg-button");
   });
 
   it("uses a longer fence for code that contains backticks", () => {
-    const msg = new TgMessageBuilder().appendCode("a`b").build();
-    expect(tgMessageToMarkdown(msg)).toBe("``a`b``");
+    const msg = new TgMessageBuilder().appendCode("a`b".repeat(100)).build();
+    expect(tgMessageToMarkdown(msg)).toBe("``" + "a`b".repeat(100) + "``");
   });
 
   it("pads code that starts or ends with a backtick", () => {
-    const msg = new TgMessageBuilder().appendCode("`a").build();
-    expect(tgMessageToMarkdown(msg)).toBe("`` `a ``");
+    const msg = new TgMessageBuilder().appendCode("`a".repeat(200)).build();
+    expect(tgMessageToMarkdown(msg)).toBe("`` " + "`a".repeat(200) + " ``");
   });
 
   it("renders bold, italic and pre", () => {
@@ -234,7 +318,10 @@ describe("tgMessageToMarkdown", () => {
       .append("🆔 ")
       .appendCode("ses_123")
       .build();
-    expect(tgMessageToMarkdown(footer)).toBe("📂 `a/b` · 🖥 cloudbox  \n🆔 `ses_123`");
+    expect(tgMessageToMarkdown(footer)).toBe(
+      '📂 <tg-button type="copy_text" text="a/b">a/b</tg-button> · 🖥 cloudbox  \n' +
+        '🆔 <tg-button type="copy_text" text="ses_123">ses\\_123</tg-button>',
+    );
   });
 
   it("returns null for overlapping entities", () => {
@@ -253,6 +340,7 @@ describe("tgMessageToMarkdown", () => {
 describe("buildRichMarkdown", () => {
   const header = plain("✅ my_session");
   const footer = new TgMessageBuilder().append("🆔 ").appendCode("ses_1").build();
+  const ID_BUTTON = '<tg-button type="copy_text" text="ses_1">ses\\_1</tg-button>';
 
   it("returns null when the body has no table", () => {
     expect(buildRichMarkdown(header, plain("just **prose**"), footer)).toBeNull();
@@ -260,7 +348,7 @@ describe("buildRichMarkdown", () => {
 
   it("accepts a body without a table when a table is not required", () => {
     expect(buildRichMarkdown(header, plain("just **prose** at $5"), footer, { requireTable: false })).toBe(
-      "✅ my\\_session\n\njust **prose** at \\$5\n\n🆔 `ses_1`",
+      "✅ my\\_session\n\n&nbsp;\n\njust **prose** at \\$5\n\n&nbsp;\n\n🆔 " + ID_BUTTON,
     );
   });
 
@@ -272,9 +360,9 @@ describe("buildRichMarkdown", () => {
     expect(buildRichMarkdown(header, plain(wide), footer, { requireTable: false })).toBeNull();
   });
 
-  it("joins header, sanitized body and footer with blank lines", () => {
+  it("joins header, sanitized body and footer with spacer paragraphs", () => {
     expect(buildRichMarkdown(header, plain("Total $5:\n" + TABLE), footer)).toBe(
-      "✅ my\\_session\n\nTotal \\$5:\n\n" + TABLE + "\n\n🆔 `ses_1`",
+      "✅ my\\_session\n\n&nbsp;\n\nTotal \\$5:\n\n" + TABLE + "\n\n&nbsp;\n\n🆔 " + ID_BUTTON,
     );
   });
 
@@ -311,8 +399,8 @@ describe("buildRichMarkdown", () => {
 
   it("counts code points, not UTF-16 units, against the character limit", () => {
     // 1 emoji = 2 UTF-16 units but 1 code point.
-    const overhead = buildRichMarkdown(header, plain(TABLE + "\n\n"), footer)!;
-    const room = RICH_MAX_CHARS - [...overhead].length;
+    const overhead = buildRichMarkdown(header, plain(TABLE + "\n\nx"), footer)!;
+    const room = RICH_MAX_CHARS - [...overhead].length + 1;
     const body = TABLE + "\n\n" + "😀".repeat(room);
     expect(buildRichMarkdown(header, plain(body), footer)).not.toBeNull();
   });

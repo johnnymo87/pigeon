@@ -857,6 +857,11 @@ function richInlineText(node: unknown): string {
   if (node && typeof node === "object" && "text" in node) {
     return richInlineText((node as { text: unknown }).text);
   }
+  // An inline button (the footer's copy_text ids, pigeon-ravn) keeps its label.
+  const button = (node as { button?: unknown } | null)?.button;
+  if (button && typeof button === "object" && "text" in button) {
+    return richInlineText((button as { text: unknown }).text);
+  }
   return "";
 }
 
@@ -892,7 +897,8 @@ function richListItemText(item: unknown): string {
 }
 
 function richBlocksText(blocks: unknown[]): string {
-  return blocks.map(richBlockText).filter((t) => t.length > 0).join("\n");
+  // A whitespace-only paragraph is pigeon's spacer for a blank line (pigeon-ravn).
+  return blocks.map(richBlockText).filter((t) => t.trim().length > 0).join("\n");
 }
 
 /**

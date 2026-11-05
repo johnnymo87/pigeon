@@ -14746,6 +14746,23 @@ describe("buildExecuteMetadata", () => {
 });
 
 describe("richMessagePlainText", () => {
+  // pigeon-ravn: the footer's ids are copy_text buttons, and blank lines are " " paragraphs.
+  it("keeps a copy button's text and drops spacer paragraphs", () => {
+    expect(
+      richMessagePlainText({
+        blocks: [
+          { type: "paragraph", text: "one" },
+          { type: "paragraph", text: " " },
+          { type: "paragraph", text: "two" },
+          {
+            type: "paragraph",
+            text: ["🆔 ", { type: "button", button: { text: "gse_1", copy_text: { text: "gse_1" } } }],
+          },
+        ],
+      }),
+    ).toBe("one\ntwo\n🆔 gse_1");
+  });
+
   it("flattens headings, lists, quotes, details and pre blocks", () => {
     expect(
       richMessagePlainText({

@@ -28,12 +28,13 @@ export const RICH_MAX_COLUMNS = 20;
 const DELIMITER_ROW =
   /^\s*(?:\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?|\|\s*:?-+:?\s*\|)\s*$/;
 /**
- * A fence opener, after any indentation and blockquote markers: fences under list items are
- * indented, fences in quotes carry `>`. A backtick fence's info string cannot contain a
+ * A fence opener, after any indentation, blockquote markers and list markers: fences under
+ * list items are indented or follow the marker (`- ```bash`), fences in quotes carry `>`. A backtick fence's info string cannot contain a
  * backtick (CommonMark), so ```` ```npm test``` ```` at the start of a line is inline code,
  * not a fence that would swallow the rest of the message.
  */
-const FENCE_OPEN = /^(?:[ \t]*>)*[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
+const FENCE_OPEN =
+  /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+)*)[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
 const FENCE_CLOSE = /^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})\s*$/;
 /** A thematic break made of dashes: under a line of prose it would make that line a heading. */
 const DASH_RULE = /^\s{0,3}-{3,}\s*$/;
@@ -46,6 +47,19 @@ const ATX_HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
 const QUOTE_LINE = /^\s*>/;
 /** A list item marker, which Telegram counts as two blocks (the item and its paragraph). */
 const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
+/**
+ * A `#` that starts a line's content (after indentation, quote markers and list markers) and
+ * is followed by text with no space. GFM reads `#5620 is ready` as a paragraph; Telegram reads
+ * it as a heading (probed, pigeon-ravn), in lists, task lists and quotes too.
+ */
+const LOOSE_HASH =
+  /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)*[ \t]*)#(?=#*[^#\s])/;
+/**
+ * An empty paragraph. Telegram draws rich paragraphs with no gap between them, so the blank
+ * line between two paragraphs, which plain text showed as an empty line, vanished
+ * (pigeon-ravn). This paragraph is that empty line.
+ */
+const SPACER = "&nbsp;";
 
 interface LineInfo {
   text: string;
@@ -57,6 +71,8 @@ interface LineInfo {
   table: boolean;
   /** Column count, on a table's delimiter row only. */
   columns?: number;
+  /** A `SPACER` paragraph pigeon inserted; emitted as is. */
+  spacer?: boolean;
 }
 
 /**
@@ -65,6 +81,16 @@ interface LineInfo {
  * unclosed fence runs to the end of the text, as CommonMark renders it.
  */
 function classifyLines(text: string): LineInfo[] {
+  return classify(text).lines;
+}
+
+/**
+ * `classifyLines`, plus the fence still open at the end when it was opened at top level
+ * (no quote or list marker before it). A fence inside a quote or list item is closed by the
+ * end of its container; only a top-level one would swallow what follows.
+ */
+function classify(text: string): { lines: LineInfo[]; openTopLevelFence: string | null } {
+  let topLevel = false;
   const lines = text.split("\n").map<LineInfo>((t) => ({
     text: t,
     fenced: false,
@@ -87,7 +113,8 @@ function classifyLines(text: string): LineInfo[] {
     if (open) {
       line.fenced = true;
       line.fenceLine = true;
-      fence = (open[1] ?? open[2])!;
+      fence = (open[2] ?? open[3])!;
+      topLevel = open[1] === "";
     }
   }
 
@@ -111,7 +138,7 @@ function classifyLines(text: string): LineInfo[] {
     i = j - 1;
   }
 
-  return lines;
+  return { lines, openTopLevelFence: fence !== null && topLevel ? fence : null };
 }
 
 function countColumns(delimiterRow: string): number {
@@ -230,11 +257,15 @@ function findBacktickRun(line: string, from: number, len: number): number {
  *   (pigeon-6mkr).
  */
 export function sanitizeBodyMarkdown(text: string): string {
-  const lines = classifyLines(text);
+  const classified = classify(text);
+  const lines = withSpacers(classified.lines);
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    out += line.fenced ? line.text : escapeInline(line.text, line.table);
+    out +=
+      line.fenced || line.spacer
+        ? line.text
+        : escapeInline(line.table ? line.text : line.text.replace(LOOSE_HASH, "$1\\#"), line.table);
     const next = lines[i + 1];
     if (!next) break;
     const blank = line.text.trim() === "";
@@ -262,6 +293,46 @@ export function sanitizeBodyMarkdown(text: string): string {
       out += "\n";
     }
   }
+  // An agent's unclosed fence would otherwise take the footer in with it (pigeon-ravn).
+  if (classified.openTopLevelFence !== null) out += "\n" + classified.openTopLevelFence;
+  return out;
+}
+
+/**
+ * Replaces each run of blank lines between two blocks with one `SPACER` paragraph, so the
+ * empty line plain text showed stays visible. Not inside fenced code, not before an indented
+ * line (it would end the list item or code it continues), and not between two list items (it
+ * would split the list, restarting an ordered list's numbering). Blank lines at either end are
+ * left alone, and so are the blank lines the sanitizer adds itself: plain text showed no gap
+ * there.
+ */
+function withSpacers(lines: LineInfo[]): LineInfo[] {
+  const out: LineInfo[] = [];
+  let prev: LineInfo | undefined;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.fenced || line.text.trim() !== "") {
+      out.push(line);
+      prev = line;
+      continue;
+    }
+    let j = i;
+    while (j < lines.length && !lines[j]!.fenced && lines[j]!.text.trim() === "") j++;
+    const next = lines[j];
+    const run = lines.slice(i, j);
+    i = j - 1;
+    const spaced =
+      prev !== undefined &&
+      next !== undefined &&
+      !/^\s/.test(next.text) &&
+      !(LIST_ITEM.test(next.text) && (LIST_ITEM.test(prev.text) || /^\s/.test(prev.text)));
+    if (!spaced) {
+      out.push(...run);
+      continue;
+    }
+    const blank = (): LineInfo => ({ text: "", fenced: false, fenceLine: false, table: false });
+    out.push(blank(), { ...blank(), text: SPACER, spacer: true }, blank());
+  }
   return out;
 }
 
@@ -281,6 +352,21 @@ function codeSpan(content: string): string {
   const fence = "`".repeat(longest + 1);
   const pad = content.startsWith("`") || content.endsWith("`") ? " " : "";
   return `${fence}${pad}${content}${pad}${fence}`;
+}
+
+/** Telegram's limit on a copy_text button's text (probed: 256 passes, 300 is rejected). */
+const COPY_TEXT_MAX = 256;
+
+/**
+ * A code entity as an inline copy button. In a plain message a code entity copies with one
+ * tap (the 🆔 session id, the 📂 path); rich inline code does not (pigeon-ravn). The label is
+ * markdown (Telegram parses markdown inside inline tags), the copy text an HTML attribute.
+ * Null when the text does not fit a button, and the caller uses a code span.
+ */
+function copyButton(content: string): string | null {
+  if (content.length === 0 || content.length > COPY_TEXT_MAX || content.includes("\n")) return null;
+  const attr = content.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<tg-button type="copy_text" text="${attr}">${escapePlain(content)}</tg-button>`;
 }
 
 function codeBlock(content: string): string {
@@ -304,7 +390,7 @@ export function tgMessageToMarkdown(msg: TgMessage): string | null {
     const content = msg.text.slice(e.offset, e.offset + e.length);
     switch (e.type) {
       case "code":
-        out += codeSpan(content);
+        out += copyButton(content) ?? codeSpan(content);
         break;
       case "pre":
         out += codeBlock(content);
@@ -348,7 +434,7 @@ export interface BuildRichOptions {
  * The rich markdown for a notification, or null when it should go plain: no table in the
  * body (unless `requireTable` is false), a header/footer that cannot be converted, or any of
  * Telegram's limits exceeded. Layout matches the plain chunk: header, body, footer separated
- * by blank lines, empty parts skipped.
+ * by blank lines (as `SPACER` paragraphs), empty parts skipped.
  */
 export function buildRichMarkdown(
   header: TgMessage,
@@ -364,7 +450,7 @@ export function buildRichMarkdown(
   if (head === null || foot === null) return null;
 
   const parts = [head, sanitizeBodyMarkdown(body.text), foot].filter((p) => p.length > 0);
-  const markdown = parts.join("\n\n");
+  const markdown = parts.join(`\n\n${SPACER}\n\n`);
 
   if ([...markdown].length > RICH_MAX_CHARS) return null;
   if (estimateBlocks(markdown) > RICH_MAX_BLOCKS) return null;
