@@ -3,9 +3,11 @@ import { openStorageDb, type StorageDb } from "../src/storage/database";
 import {
   RemoteLaunchRequester,
   formatLaunchResult,
+  REQUESTER_ID,
   type RemoteLaunchRequesterDeps,
   type LaunchResultAck,
 } from "../src/swarm/remote-launch-requester";
+import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import type { RemoteLaunchClient } from "../src/worker/remote-launch-client";
 
 describe("RemoteLaunchRequester", () => {
@@ -166,7 +168,7 @@ describe("RemoteLaunchRequester", () => {
         }),
       ).toEqual({
         status: 400,
-        body: { error: "invalid", detail: "from must be a ses_ session id" },
+        body: { error: "invalid", detail: "from must be a ses_ or gse_ session id" },
       });
 
       // invalid machine
@@ -1156,6 +1158,332 @@ describe("RemoteLaunchRequester", () => {
       expect(getSwarmMessages()).toHaveLength(1);
       expect(getSwarmMessages()[0]!.payload).toContain(
         "REMOTE LAUNCH UNCONFIRMED: launch lnch_unconf_with_id created session ses_recovered999 on devbox",
+      );
+    });
+  });
+
+  describe("REQUESTER_ID regex", () => {
+    it("accepts ses_ and gse_ session ids with 8 to 128 characters", () => {
+      expect(REQUESTER_ID.test("ses_12345678")).toBe(true);
+      expect(REQUESTER_ID.test("gse_12345678")).toBe(true);
+      expect(REQUESTER_ID.test("ses_" + "a".repeat(128))).toBe(true);
+      expect(REQUESTER_ID.test("gse_" + "a".repeat(128))).toBe(true);
+      expect(REQUESTER_ID.test("gse_abc-123_xyz")).toBe(true);
+    });
+
+    it("rejects non-ses non-gse prefixes and out-of-range ids", () => {
+      expect(REQUESTER_ID.test("usr_12345678")).toBe(false);
+      expect(REQUESTER_ID.test("pigeon")).toBe(false);
+      expect(REQUESTER_ID.test("ses_short")).toBe(false); // 5 chars
+      expect(REQUESTER_ID.test("gse_short")).toBe(false); // 5 chars
+      expect(REQUESTER_ID.test("ses_" + "a".repeat(129))).toBe(false);
+    });
+  });
+
+  describe("Goose session launch requests and markRemoteReachable", () => {
+    const gseSessionId = "gse_goose123456";
+
+    it("gse_ from with a goose row is accepted and posted with body.from = gse id", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+      const requester = makeRequester();
+
+      const res = await requester.handleRequest({
+        launch_id: "lnch_gse_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task from goose",
+      });
+
+      expect(res).toEqual({
+        status: 202,
+        body: {
+          launch_id: "lnch_gse_1",
+          status: "accepted",
+          to_machine: "devbox",
+        },
+      });
+
+      expect(client.request).toHaveBeenCalledWith(
+        expect.objectContaining({
+          launch_id: "lnch_gse_1",
+          from: gseSessionId,
+          machine: "devbox",
+        }),
+      );
+    });
+
+    it("gse_ from with no row returns 409 no_session, client.request not called, nothing stored", async () => {
+      const requester = makeRequester();
+
+      const res = await requester.handleRequest({
+        launch_id: "lnch_gse_norow",
+        from: "gse_missing_session",
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+
+      expect(res).toEqual({
+        status: 409,
+        body: {
+          error: "no_session",
+          detail: "no goose session gse_missing_session on this machine",
+        },
+      });
+
+      expect(client.request).not.toHaveBeenCalled();
+      expect(storage.remoteLaunch.outbound.get("lnch_gse_norow")).toBeNull();
+    });
+
+    it("gse_ from with a non-goose row returns 409 no_session", async () => {
+      storage.sessions.upsert({ sessionId: "gse_nongoose", backendKind: "opencode", notify: true }, now);
+      const requester = makeRequester();
+
+      const res = await requester.handleRequest({
+        launch_id: "lnch_gse_nongoose",
+        from: "gse_nongoose",
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+
+      expect(res).toEqual({
+        status: 409,
+        body: {
+          error: "no_session",
+          detail: "no goose session gse_nongoose on this machine",
+        },
+      });
+
+      expect(client.request).not.toHaveBeenCalled();
+      expect(storage.remoteLaunch.outbound.get("lnch_gse_nongoose")).toBeNull();
+    });
+
+    it("mark called before client.request (recording call order)", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+      const callOrder: string[] = [];
+
+      const markRemoteReachable = vi.fn().mockImplementation(async (id: string) => {
+        callOrder.push(`mark:${id}`);
+      });
+      (client.request as any).mockImplementation(async () => {
+        callOrder.push("client.request");
+        return { kind: "accepted", toMachine: "devbox", duplicate: false };
+      });
+
+      const requester = makeRequester({ markRemoteReachable });
+
+      const res = await requester.handleRequest({
+        launch_id: "lnch_order_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+
+      expect(res.status).toBe(202);
+      expect(markRemoteReachable).toHaveBeenCalledWith(gseSessionId);
+      expect(callOrder).toEqual([`mark:${gseSessionId}`, "client.request"]);
+    });
+
+    it("mark not called for ses_", async () => {
+      const markRemoteReachable = vi.fn().mockResolvedValue(undefined);
+      const requester = makeRequester({ markRemoteReachable });
+
+      await requester.handleRequest({
+        launch_id: "lnch_ses_1",
+        from: "ses_sender123",
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+
+      expect(markRemoteReachable).not.toHaveBeenCalled();
+      expect(client.request).toHaveBeenCalled();
+    });
+
+    it("mark not called on replay of an existing launch_id", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+      const markRemoteReachable = vi.fn().mockResolvedValue(undefined);
+      const requester = makeRequester({ markRemoteReachable });
+
+      // First call
+      await requester.handleRequest({
+        launch_id: "lnch_replay_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+      expect(markRemoteReachable).toHaveBeenCalledTimes(1);
+
+      // Replay call
+      markRemoteReachable.mockClear();
+      (client.request as any).mockClear();
+
+      const replayRes = await requester.handleRequest({
+        launch_id: "lnch_replay_1",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+
+      expect(replayRes.status).toBe(202);
+      expect(markRemoteReachable).not.toHaveBeenCalled();
+      expect(client.request).not.toHaveBeenCalled();
+    });
+
+    it("mark not called from tick() resends", async () => {
+      storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
+      const markRemoteReachable = vi.fn().mockResolvedValue(undefined);
+      (client.request as any).mockResolvedValueOnce({ kind: "transient", detail: "network hiccup" });
+
+      const requester = makeRequester({ markRemoteReachable });
+
+      // First call fails transiently
+      await requester.handleRequest({
+        launch_id: "lnch_tick_resend",
+        from: gseSessionId,
+        machine: "devbox",
+        directory: "/home/dev/pigeon",
+        prompt: "task",
+      });
+      expect(markRemoteReachable).toHaveBeenCalledTimes(1);
+
+      markRemoteReachable.mockClear();
+      (client.request as any).mockResolvedValueOnce({ kind: "accepted", toMachine: "devbox", duplicate: false });
+
+      // Advance time and tick
+      now += 15_000;
+      await requester.tick();
+
+      expect(client.request).toHaveBeenCalled();
+      expect(markRemoteReachable).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("refused launch.result logging", () => {
+    it("logs refused launch.result in processResults when delivery is refused (e.g. gse session missing)", () => {
+      const log = vi.fn();
+      const requester = makeRequester({ log });
+
+      // Outbound launch from a gse session that does NOT exist in storage.sessions
+      // (so bankOrInsertSwarmMessage will refuse with reason 'no_session')
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_refused_res",
+        fromSession: "gse_missing_recipient",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      const acks = requester.processResults([
+        {
+          item: "launch_result",
+          from_machine: selfMachineId,
+          result_id: "r:refused_res_1",
+          launch_id: "lnch_refused_res",
+          machine: "devbox",
+          outcome: "launched",
+          session_id: "ses_remote1234",
+          reason: null,
+        },
+      ]);
+
+      // Behaviour unchanged: still acked 'delivered'
+      expect(acks).toEqual([
+        {
+          kind: "result",
+          from_machine: selfMachineId,
+          result_id: "r:refused_res_1",
+          outcome: "delivered",
+        },
+      ]);
+
+      // Logged loudly
+      expect(log).toHaveBeenCalledWith(
+        "launch result not delivered",
+        expect.objectContaining({
+          launchId: "lnch_refused_res",
+          to: "gse_missing_recipient",
+          reason: "no_session",
+          error: expect.stringContaining("no goose session gse_missing_recipient on this machine"),
+        }),
+      );
+    });
+
+    it("logs refused launch.result in tick() refusal path when delivery is refused", async () => {
+      const log = vi.fn();
+      const requester = makeRequester({ log });
+
+      // Outbound launch with gse_ missing recipient
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_refused_tick",
+        fromSession: "gse_missing_recipient",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: JSON.stringify({
+          launch_id: "lnch_refused_tick",
+          from: "gse_missing_recipient",
+          machine: "devbox",
+          directory: "/home/dev/pigeon",
+          prompt: "task",
+        }),
+        createdAt: now,
+        nextAttemptAt: now,
+      });
+
+      // Worker refuses permanently
+      (client.request as any).mockResolvedValueOnce({
+        kind: "refused",
+        code: "target_offline",
+        status: 503,
+        detail: "target offline",
+      });
+
+      await requester.tick();
+
+      expect(log).toHaveBeenCalledWith(
+        "launch result not delivered",
+        expect.objectContaining({
+          launchId: "lnch_refused_tick",
+          to: "gse_missing_recipient",
+          reason: "no_session",
+          error: expect.stringContaining("no goose session gse_missing_recipient on this machine"),
+        }),
+      );
+    });
+
+    it("logs refused launch.result in tick() deadline path when delivery is refused", async () => {
+      const log = vi.fn();
+      const requester = makeRequester({ log });
+
+      // Outbound launch with gse_ missing recipient
+      storage.remoteLaunch.outbound.insert({
+        launchId: "lnch_deadline_tick",
+        fromSession: "gse_missing_recipient",
+        toMachine: "devbox",
+        directory: "/home/dev/pigeon",
+        requestJson: "{}",
+        createdAt: now,
+      });
+
+      const row = storage.remoteLaunch.outbound.get("lnch_deadline_tick")!;
+      now = row.deadlineAt + 1_000;
+
+      await requester.tick();
+
+      expect(log).toHaveBeenCalledWith(
+        "launch result not delivered",
+        expect.objectContaining({
+          launchId: "lnch_deadline_tick",
+          to: "gse_missing_recipient",
+          reason: "no_session",
+          error: expect.stringContaining("no goose session gse_missing_recipient on this machine"),
+        }),
       );
     });
   });

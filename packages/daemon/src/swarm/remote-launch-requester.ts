@@ -17,10 +17,12 @@ import type {
 import { isValidTag } from "../worker/tag-ingest";
 import { makeMsgId } from "../ids";
 import { bankOrInsertSwarmMessage } from "./bank-or-insert";
+import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 
 export const MACHINE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export const LAUNCH_ID_RE = /^[^:\s]{1,128}$/;
 export const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]{8,128}$/;
+export const REQUESTER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 export const REASON_RE = /^[a-z0-9_]{1,64}$/;
 export const LAUNCH_MAX_DIRECTORY = 512;
 export const LAUNCH_MAX_PROMPT = 16_000;
@@ -78,6 +80,7 @@ export interface RemoteLaunchRequesterDeps {
   sendEnabled: boolean;
   selfMachineId: string;
   resolveRequesterTag?: (sessionId: string) => Promise<string | null>;
+  markRemoteReachable?: (sessionId: string) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -88,6 +91,7 @@ export class RemoteLaunchRequester {
   private readonly sendEnabled: boolean;
   private readonly selfMachineId: string;
   private readonly resolveRequesterTag?: (sessionId: string) => Promise<string | null>;
+  private readonly markRemoteReachable?: (sessionId: string) => Promise<unknown>;
   private readonly nowFn: () => number;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private ticking = false;
@@ -98,8 +102,9 @@ export class RemoteLaunchRequester {
     this.sendEnabled = deps.sendEnabled;
     this.selfMachineId = deps.selfMachineId;
     this.resolveRequesterTag = deps.resolveRequesterTag;
+    this.markRemoteReachable = deps.markRemoteReachable;
     this.nowFn = deps.nowFn ?? Date.now;
-    this.log = deps.log ?? ((msg, fields) => console.log(`[remote-launch] ${msg}`, fields ?? ""));
+    this.log = deps.log ?? ((msg, fields) => console.warn(`[remote-launch] ${msg}`, fields ?? ""));
   }
 
   async handleRequest(body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -121,10 +126,10 @@ export class RemoteLaunchRequester {
       };
     }
 
-    if (typeof from !== "string" || !SESSION_ID_RE.test(from)) {
+    if (typeof from !== "string" || !REQUESTER_ID.test(from)) {
       return {
         status: 400,
-        body: { error: "invalid", detail: "from must be a ses_ session id" },
+        body: { error: "invalid", detail: "from must be a ses_ or gse_ session id" },
       };
     }
 
@@ -163,6 +168,19 @@ export class RemoteLaunchRequester {
         status: 400,
         body: { error: "invalid", detail: "tag must be null or a valid tag" },
       };
+    }
+
+    if (from.startsWith("gse_")) {
+      const row = this.storage.sessions.get(from);
+      if (!row || row.backendKind !== GOOSE_BACKEND_KIND) {
+        return {
+          status: 409,
+          body: {
+            error: "no_session",
+            detail: `no goose session ${from} on this machine`,
+          },
+        };
+      }
     }
 
     // Existing outbound row check
@@ -277,6 +295,14 @@ export class RemoteLaunchRequester {
       }
     }
 
+    if (this.markRemoteReachable && from.startsWith("gse_")) {
+      try {
+        await this.markRemoteReachable(from);
+      } catch (err) {
+        this.log("markRemoteReachable threw", { from, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
     let res: RemoteLaunchRequestAnswer;
     try {
       res = await this.client.request(requestBody);
@@ -365,7 +391,7 @@ export class RemoteLaunchRequester {
                   sessionId: null,
                   reason: res.code,
                 });
-                bankOrInsertSwarmMessage(
+                const insertRes = bankOrInsertSwarmMessage(
                   this.storage,
                   {
                     msgId: makeMsgId(),
@@ -379,6 +405,14 @@ export class RemoteLaunchRequester {
                   },
                   nowRefused,
                 );
+                if (insertRes.status === "refused") {
+                  this.log("launch result not delivered", {
+                    launchId: row.launchId,
+                    to: row.fromSession,
+                    reason: insertRes.reason,
+                    error: insertRes.error,
+                  });
+                }
               }
             })();
           } else {
@@ -407,7 +441,7 @@ export class RemoteLaunchRequester {
                 sessionId: null,
                 reason: null,
               });
-              bankOrInsertSwarmMessage(
+              const insertRes = bankOrInsertSwarmMessage(
                 this.storage,
                 {
                   msgId: makeMsgId(),
@@ -421,6 +455,14 @@ export class RemoteLaunchRequester {
                 },
                 nowDeadline,
               );
+              if (insertRes.status === "refused") {
+                this.log("launch result not delivered", {
+                  launchId: row.launchId,
+                  to: row.fromSession,
+                  reason: insertRes.reason,
+                  error: insertRes.error,
+                });
+              }
             }
           })();
         } catch (err) {
@@ -517,7 +559,7 @@ export class RemoteLaunchRequester {
               sessionId,
               reason,
             });
-            bankOrInsertSwarmMessage(
+            const insertRes = bankOrInsertSwarmMessage(
               this.storage,
               {
                 msgId: makeMsgId(),
@@ -531,6 +573,14 @@ export class RemoteLaunchRequester {
               },
               now,
             );
+            if (insertRes.status === "refused") {
+              this.log("launch result not delivered", {
+                launchId,
+                to: outbound.fromSession,
+                reason: insertRes.reason,
+                error: insertRes.error,
+              });
+            }
           }
         })();
 
