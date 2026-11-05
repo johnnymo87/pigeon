@@ -49,7 +49,9 @@ import {
 } from "./worker/tag-ingest";
 import { createOcTagsRunner, resolveOcTagsBin } from "./worker/oc-tags";
 import { whichKeyFor } from "./tag-key";
-import { SessionTagResolver, parseWhichLine } from "./tag-resolver";
+import { SessionTagResolver } from "./tag-resolver";
+import { createRequesterTagResolver } from "./swarm/requester-tag";
+import { createMarkGooseRemoteReachable } from "./goose/remote-reachable.js";
 import { createTelegramReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
@@ -537,24 +539,31 @@ if (config.remoteLaunchSend && !remoteLaunchClient) {
   );
 }
 
+const resolveRequesterTag = createRequesterTagResolver({
+  sessions: storage.sessions,
+  runOcTags: (args) => {
+    const runner = resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS);
+    if (!runner) return Promise.resolve(null);
+    return runner(args);
+  },
+});
+
+let poller: Poller | undefined;
+
+const markGooseRemoteReachable = createMarkGooseRemoteReachable({
+  sessions: storage.sessions,
+  register: (id, label, signal) =>
+    poller ? poller.registerSession(id, label ?? undefined, signal) : Promise.resolve(undefined),
+});
+
 const remoteLaunchRequester = remoteLaunchClient
   ? new RemoteLaunchRequester({
       storage,
       client: remoteLaunchClient,
       sendEnabled: config.remoteLaunchSend,
       selfMachineId: config.machineId ?? "",
-      resolveRequesterTag: async (sessionId: string) => {
-        const runner = resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS);
-        if (!runner) return null;
-        try {
-          const res = await runner(["which", "--", sessionId]);
-          if (!res || res.code !== 0) return null;
-          const which = parseWhichLine(String(res.stdout ?? ""));
-          return which?.kind === "session" ? which.tag : null;
-        } catch {
-          return null;
-        }
-      },
+      resolveRequesterTag,
+      markRemoteReachable: markGooseRemoteReachable,
     })
   : undefined;
 
@@ -575,7 +584,7 @@ const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
 
 const launchWorkLock = launchReceiverDeps ? createLaunchWorkLock() : undefined;
 
-const poller = config.workerUrl && config.workerApiKey && config.machineId
+poller = config.workerUrl && config.workerApiKey && config.machineId
   ? new Poller(
       {
         workerUrl: config.workerUrl,
@@ -983,6 +992,7 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter || gooseRunners)
       ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
       selfMachineId: config.machineId,
       relay: config.swarmRelaySend && relayClient ? (body) => relayClient.relay(body) : undefined,
+      markRemoteReachable: markGooseRemoteReachable,
       gooseDeliver: gooseRunners
         ? async (sessionId, commandId, text) => {
             const row = storage.sessions.get(sessionId);
@@ -1323,6 +1333,8 @@ const app = createApp(storage, {
   unbindNamedTopic: poller ? (sessionId, signal) => poller.unbindNamedTopic(sessionId, signal) : undefined,
   // swarm_list remote discovery (pigeon-k0qn.9). Absent without a worker: 503 no_worker.
   listRemoteSessions: poller ? (limit, signal) => poller.listRemoteSessions(limit, signal) : undefined,
+  // Look up session owner for remote goose target send/schedule (pigeon honk-9qf.29 Task P6).
+  lookupSessionOwner: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
   swarmRelaySend: config.swarmRelaySend,
   remoteLaunch: remoteLaunchRequester,
   sessionRename: {

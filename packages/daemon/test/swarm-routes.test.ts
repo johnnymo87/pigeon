@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { createApp } from "../src/app";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createApp, type AppOptions } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { SwarmArbiter } from "../src/swarm/arbiter";
 import { DEFAULT_EXPIRY_MS } from "../src/swarm/schedule-time";
@@ -15,9 +15,9 @@ describe("POST /swarm/send", () => {
     }
   });
 
-  function newApp(now = 1_000) {
+  function newApp(now = 1_000, opts: Partial<AppOptions> = {}) {
     storage = openStorageDb(":memory:");
-    return { app: createApp(storage, { nowFn: () => now }), storage };
+    return { app: createApp(storage, { nowFn: () => now, ...opts }), storage };
   }
 
   it("returns 202 and persists a swarm message", async () => {
@@ -605,6 +605,200 @@ describe("POST /swarm/send", () => {
     );
     expect(res.status).toBe(202);
   });
+
+  describe("POST /swarm/send to remote gse_ (Task P6, design D2)", () => {
+    it("returns 202 and inserts row when owner is elsewhere", async () => {
+      const lookup = vi.fn().mockResolvedValue({ machineId: "cloudbox" });
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_target",
+            kind: "chat",
+            priority: "normal",
+            payload: "hello remote goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string };
+      expect(body.accepted).toBe(true);
+      expect(lookup).toHaveBeenCalledWith("gse_remote_target", expect.any(AbortSignal));
+
+      const stored = s.swarm.getByMsgId(body.msg_id);
+      expect(stored).not.toBeNull();
+      expect(stored?.toSession).toBe("gse_remote_target");
+      expect(stored?.state).toBe("queued");
+    });
+
+    it("returns 409 when owner is null (worker 404)", async () => {
+      const lookup = vi.fn().mockResolvedValue(null);
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_unknown",
+            payload: "hello unknown goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain(
+        "no goose session gse_unknown on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes",
+      );
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+
+    it("returns 409 when owner is registered to this machine (stale/reaped local row)", async () => {
+      const lookup = vi.fn().mockResolvedValue({ machineId: "devbox" });
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_stale_local",
+            payload: "hello stale local goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("no goose session gse_stale_local on this machine");
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+
+    it("fails open (202 accepted + row inserted) when lookup throws", async () => {
+      const lookup = vi.fn().mockRejectedValue(new Error("worker down"));
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_failopen",
+            payload: "hello failopen goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("fails open (202 accepted + row inserted) when lookup times out", async () => {
+      const lookup = vi.fn().mockImplementation(() => new Promise(() => {}));
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+        lookupSessionOwnerTimeoutMs: 50,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_timeout",
+            payload: "hello timeout goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("fails open (202 accepted + row inserted) when lookupSessionOwner option is not wired", async () => {
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: undefined,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_unwired",
+            payload: "hello unwired goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("returns 409 and does not call lookup when swarmRelaySend is off", async () => {
+      const lookup = vi.fn();
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: false,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_relay_off",
+            payload: "hello relay off goose",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("no goose session gse_remote_relay_off on this machine");
+      expect(lookup).not.toHaveBeenCalled();
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+  });
 });
 
 describe("GET /swarm/inbox", () => {
@@ -770,9 +964,9 @@ describe("POST /swarm/schedule", () => {
     }
   });
 
-  function newApp(now = 1_000_000) {
+  function newApp(now = 1_000_000, opts: Partial<AppOptions> = {}) {
     storage = openStorageDb(":memory:");
-    return { app: createApp(storage, { nowFn: () => now }), storage };
+    return { app: createApp(storage, { nowFn: () => now, ...opts }), storage };
   }
 
   it("enqueues a Telegram notice to the receiver when a schedule is accepted", async () => {
@@ -1128,6 +1322,250 @@ describe("POST /swarm/schedule", () => {
     expect(stored!.payload).toBe(
       "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 (first)",
     );
+  });
+
+  describe("POST /swarm/schedule to remote gse_ (Task P6, design D2)", () => {
+    it("returns 202 with deliver_at and inserts row when owner is elsewhere", async () => {
+      const lookup = vi.fn().mockResolvedValue({ machineId: "cloudbox" });
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_target",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; deliver_at: number };
+      expect(body.accepted).toBe(true);
+      expect(body.deliver_at).toBe(1_000 + 3600_000);
+      expect(lookup).toHaveBeenCalledWith("gse_remote_target", expect.any(AbortSignal));
+
+      const stored = s.swarm.getByMsgId(body.msg_id);
+      expect(stored).not.toBeNull();
+      expect(stored?.toSession).toBe("gse_remote_target");
+      expect(stored?.deliverAt).toBe(1_000 + 3600_000);
+      expect(stored?.state).toBe("queued");
+    });
+
+    it("returns 409 when owner is null (worker 404)", async () => {
+      const lookup = vi.fn().mockResolvedValue(null);
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_unknown",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain(
+        "no goose session gse_unknown on this machine, and no machine has registered it with the relay; if it contacted you just now, retry in a few minutes",
+      );
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+
+    it("returns 409 when owner is registered to this machine (stale/reaped local row)", async () => {
+      const lookup = vi.fn().mockResolvedValue({ machineId: "devbox" });
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_stale_local",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("no goose session gse_stale_local on this machine");
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+
+    it("fails open (202 accepted with deliver_at) when lookup throws", async () => {
+      const lookup = vi.fn().mockRejectedValue(new Error("worker unreachable"));
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_throw",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; deliver_at: number };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("fails open (202 accepted with deliver_at) when lookup times out", async () => {
+      const lookup = vi.fn().mockImplementation(() => new Promise(() => {}));
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+        lookupSessionOwnerTimeoutMs: 50,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_timeout",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; deliver_at: number };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("fails open (202 accepted with deliver_at) when lookupSessionOwner option is not wired", async () => {
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: undefined,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_unwired",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; deliver_at: number };
+      expect(body.accepted).toBe(true);
+      expect(s.swarm.getByMsgId(body.msg_id)).not.toBeNull();
+    });
+
+    it("returns 409 and does not call lookup when swarmRelaySend is off", async () => {
+      const lookup = vi.fn();
+      const { app, storage: s } = newApp(1_000, {
+        swarmRelaySend: false,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_relay_off",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("no goose session gse_remote_relay_off on this machine");
+      expect(lookup).not.toHaveBeenCalled();
+      expect(s.swarm.listTargetsWithReady(1_000)).toHaveLength(0);
+    });
+
+    it("scheduled message to remote gse_ is inserted with deliver_at in future and NOT returned by ready query before due", async () => {
+      const lookup = vi.fn().mockResolvedValue({ machineId: "cloudbox" });
+      const now = 10_000;
+      const { app, storage: s } = newApp(now, {
+        swarmRelaySend: true,
+        machineId: "devbox",
+        lookupSessionOwner: lookup,
+      });
+
+      const res = await app(
+        new Request("http://localhost/swarm/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from: "ses_local",
+            to: "gse_remote_wake",
+            after: "1h",
+            payload: "Resume pigeon-c68: run bd show pigeon-c68, then continue W4",
+          }),
+        }),
+      );
+
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { accepted: boolean; msg_id: string; deliver_at: number };
+      const dueAt = now + 3600_000;
+      expect(body.deliver_at).toBe(dueAt);
+
+      // Arbiter's ready query at send time: NOT ready
+      expect(s.swarm.listTargetsWithReady(now)).not.toContain("gse_remote_wake");
+      expect(s.swarm.getReadyForTarget("gse_remote_wake", now)).toHaveLength(0);
+
+      // 1 ms before due: NOT ready
+      expect(s.swarm.listTargetsWithReady(dueAt - 1)).not.toContain("gse_remote_wake");
+      expect(s.swarm.getReadyForTarget("gse_remote_wake", dueAt - 1)).toHaveLength(0);
+
+      // At due time: ready!
+      expect(s.swarm.listTargetsWithReady(dueAt)).toContain("gse_remote_wake");
+      const readyRows = s.swarm.getReadyForTarget("gse_remote_wake", dueAt);
+      expect(readyRows).toHaveLength(1);
+      expect(readyRows[0]?.msgId).toBe(body.msg_id);
+      expect(readyRows[0]?.deliverAt).toBe(dueAt);
+    });
   });
 });
 

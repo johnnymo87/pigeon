@@ -198,7 +198,7 @@ Request body (JSON):
 ```
 
 - Handled by `RemoteLaunchRequester` (daemon A). Gated on `PIGEON_REMOTE_LAUNCH_SEND=1` (returns 403 `launch_send_disabled` if unset; 503 `no_worker` if worker client is not configured).
-- `launch_id`, `from`, `machine`, `directory`, `prompt` are required. `tag` is optional (inherits from requester's session tag via `oc-tags which <from>` if omitted).
+- `launch_id`, `from`, `machine`, `directory`, `prompt` are required (`from` is `ses_` or `gse_`; a `gse_` requester must have a local goose row, is registered with the worker before request and granted remote reachability on accept, and tag inheritance maps via `goose:<native>` or coordinator program). `tag` is optional (explicit tag overrides).
 - Validates parameters, inserts an outbound record into SQLite `remote_launch_outbound` with state `sending` before calling the worker, and relays to worker `POST /launch/relay`.
 - Response: HTTP 202 `{ "launch_id": "rl_...", "status": "accepted", "to_machine": "..." }` or `{ "launch_id": "rl_...", "status": "pending" }` (if worker returned a transient error or timed out). Known refusals return the worker's status and error code inline.
 
@@ -250,7 +250,7 @@ The inbox does **not** return `queued` or `failed` messages — it's an inbox, n
 | no 200 anywhere, at least one 404 | remote (all serves on a machine read one `opencode.db`, pinned by `OPENCODE_DB` + `OPENCODE_DISABLE_CHANNEL_DB`; requiring every base keeps one stray serve from failing a local session) |
 | anything else on every base | unknown |
 
-- **remote, relay on** (`PIGEON_SWARM_RELAY_SEND=1`, a `ses_` sender, a target the worker's validator accepts, and the row did not itself arrive by relay) → relayed through the worker; see "Cross-Machine Relay" below.
+- **remote, relay on** (`PIGEON_SWARM_RELAY_SEND=1`, a `ses_` or `gse_` sender, a target the worker's validator accepts, and the row did not itself arrive by relay) → relayed through the worker; see "Cross-Machine Relay" below.
 - **remote, otherwise** → `RemoteTargetError` (a `PermanentDeliveryError`): failed on the first attempt, `delivery.failed` to the sender (`formatRemoteFailureNotice`: NOT received, do not resend via swarm), `wake-permanent` alert for wakes. The reason names the owning machine from the worker's `GET /sessions/:id/owner` when it answers within `OWNER_LOOKUP_TIMEOUT_MS` (2s); otherwise it just says "not on this machine". If the worker names *this* machine, the text says "not found here, probably deleted" instead of claiming a remote owner.
 - **unknown** → `TargetUnavailableError` (outage class: retried; never a remote verdict).
 - Must precede `clientForSession`: for an id with no local row that path reaches `ensureRouted`, which writes a `session_assignment` + lease (the general unknown-id case is `pigeon-8dhq`).
@@ -279,7 +279,7 @@ The worker sends a relay to the machine in D1 `sessions.machine_id` for the targ
 
 ### Send side (arbiter)
 
-On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label}` to `POST /swarm/relay`. A scheduled row is relayed at its `deliver_at`, because the arbiter only picks it up then. The answer is classified **by error code, never by status alone**: 403 and 409 each carry both kinds, and an unknown code from a newer worker is safer retried than made permanent.
+On a `remote` verdict with relay on, `relayRow` POSTs `{msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label}` to `POST /swarm/relay`. A scheduled row is relayed at its `deliver_at`, because the arbiter only picks it up then. When the sender is a `gse_` session, the arbiter registers it with the worker before relaying, and grants remote reachability (`swarm-remote`) once the relay is accepted. The answer is classified **by error code, never by status alone**: 403 and 409 each carry both kinds, and an unknown code from a newer worker is safer retried than made permanent.
 
 | Worker answer | Treatment |
 |---|---|
@@ -293,7 +293,7 @@ Permanent answers become a `RelayRefusedError` and a `delivery.failed` worded by
 
 **What `handed_off` means on the sender changes.** For a relayed row it means *the worker stored it*, not that the target saw it. It is verified at handoff, so a rolled-back daemon never examines it, and a transcript check against a remote id, which would 404 and wrongly say "safe to resend", never runs. The sender learns of a later failure only through a failure item.
 
-**Never relayed:** a row with a `swarm_relay_inbound` record (the **hop rule**: it fails with the Phase 1 remote failure, which is routed back to its original sender as below). Nor a `pigeon` or `gse_` sender, nor a target the worker's validator would reject (`ses_`/`gse_` plus at least 8 id characters). All of these keep the Phase 1 failure.
+**Never relayed:** a row with a `swarm_relay_inbound` record (the **hop rule**: it fails with the Phase 1 remote failure, which is routed back to its original sender as below). Nor a `pigeon` sender (daemon notices), nor a target the worker's validator would reject (`ses_`/`gse_` plus at least 8 id characters). All of these keep the Phase 1 failure. Goose senders (`gse_`) relay like `ses_` senders (design `2026-11-04-goose-cross-machine-design.md`).
 
 ### Worker
 
@@ -309,7 +309,7 @@ Every poll with a machine identity sends `X-Pigeon-Swarm-Relay: accept=<csv>; fa
 Per message item, first refusal wins and is acked `refused` with the code. The worker then mints a failure item for the sender.
 
 1. `from_machine` not in `PIGEON_SWARM_RELAY_ACCEPT_FROM` → `not_accepted`. The worker checks this too; the daemon re-checks as defence in depth.
-2. Shape (`parseSwarmSendBody`, which rejects `from='pigeon'`, reserved kinds and the close tag; plus a `ses_` sender) → `invalid`.
+2. Shape (`parseSwarmSendBody`, which rejects `from='pigeon'`, reserved kinds and the close tag; plus a `ses_` or `gse_` sender) → `invalid`.
 3. `msg_id` already known here: a re-handout after a lost ack (an inbound record with the same machine, sender, target and payload) is acked `delivered`. Anything else → `msg_id_conflict`.
 4. `from` is a session on this machine (a `sessions` row, or locality `local`, which covers subagents and reaped sessions) → `from_is_local`. Locality `unknown` passes, so a sick serve cannot hold relays hostage.
 5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`.
@@ -362,11 +362,11 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 - A relayed-in row stuck in one of the watchdog's non-terminal states reports nothing to its sender: blocked behind a turn, silent in flight, no healthy serve, or a 404 with no second opinion. The sender's row was already verified at handoff.
 - A failure more than 7 days after the relay is not reported, because the worker has forgotten the row.
 - An ambiguous relay can mislead. Suppose the worker stored a relay whose 202 was lost, every retry then hits a transient error, and the receiver never answers. The attempt budget then reports "NOT received, safe to resend" while the worker still holds the message.
-- Goose sessions are neither remote targets nor relaying senders (`pigeon-k0qn.13`). Channels are not relayed.
+- Channels are not relayed. Goose sessions relay and receive cross-machine once they reach out (design `2026-11-04-goose-cross-machine-design.md`); remote discovery (`swarm_list remote: true`) still lists `ses_` sessions only.
 
 ## Remote Launch (pigeon-k0qn.17)
 
-Remote launch allows an agent session on machine A to start a fresh headless opencode session on machine B with an initial prompt via the `swarm_launch` tool (`{machine, directory, prompt, tag?}`). It copies the cross-machine relay's trust and wire model (per-machine keys, D1 queue, poll hand-out, receipts) instead of using the Telegram `commands` queue.
+Remote launch allows an agent session on machine A (opencode, or goose via honk's swarm MCP) to start a fresh headless opencode session on machine B with an initial prompt via the `swarm_launch` tool (`{machine, directory, prompt, tag?}`). It copies the cross-machine relay's trust and wire model (per-machine keys, D1 queue, poll hand-out, receipts) instead of using the Telegram `commands` queue.
 
 ### Storage Schema
 
@@ -388,9 +388,9 @@ Remote launch allows an agent session on machine A to start a fresh headless ope
 
 ### Routes
 
-- **Daemon A (`POST /swarm/launch`):** Authenticated with daemon token. Handled by `RemoteLaunchRequester`. Validates body, records `sending` in `remote_launch_outbound`, and POSTs to worker `/launch/relay`.
-- **Worker (`POST /launch/relay`):** Requires machine principal key (`requireMachinePrincipal`). Performs validation, duplicate check, sender check, target retired check, accept check, online check, return path check, queue cap, and rate limit. Writes to `remote_launch`.
-- **Worker (`POST /launch/relay/ack`):** Called by machine B to ack a launch outcome. Requires machine key matching `to_machine`. Settle status: `launched` -> status `launched`, `session_id`; `refused` -> status `refused`, `reason`; `unconfirmed` -> status `expired`, reason `unconfirmed`. Mints result row `r:<launch_id>` (or `r:<launch_id>:<outcome>` on corrections) addressed to `from_machine`.
+- **Daemon A (`POST /swarm/launch`):** Authenticated with daemon token. Handled by `RemoteLaunchRequester`. Validates body (`from` is `ses_` or `gse_`), records `sending` in `remote_launch_outbound`, and POSTs to worker `/launch/relay`. For a `gse_` requester, requires a local goose row, registers it before requesting, grants remote reachability on accept, and resolves tag inheritance.
+- **Worker (`POST /launch/relay`):** Requires machine principal key (`requireMachinePrincipal`). Performs validation (`from` is `ses_` or `gse_`), duplicate check, sender check, target retired check, accept check, online check, return path check, queue cap, and rate limit. Writes to `remote_launch`.
+- **Worker (`POST /launch/relay/ack`):** Called by machine B to ack a launch outcome. Requires machine key matching `to_machine`. Settle status: `launched` -> status `launched`, `session_id` (must be `ses_`); `refused` -> status `refused`, `reason`; `unconfirmed` -> status `expired`, reason `unconfirmed`. Mints result row `r:<launch_id>` (or `r:<launch_id>:<outcome>` on corrections) addressed to `from_machine`.
 - **Worker (`POST /launch/relay/ack` kind='result'):** Called by machine A to ack delivery of a `launch_result` item (`outcome='delivered'`).
 
 ### Poll Header Token
@@ -407,7 +407,7 @@ X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
 
 ### Lifecycle and State Transitions
 
-1. **Request:** Agent calls `swarm_launch` tool in opencode. Tool resolves root session id, mints `launch_id = rl_<base36 now>_<8 hex>`, and POSTs to daemon A's `POST /swarm/launch`.
+1. **Request:** Agent calls `swarm_launch` tool in opencode or goose. Tool resolves root session id, mints `launch_id = rl_<base36 now>_<8 hex>`, and POSTs to daemon A's `POST /swarm/launch`.
 2. **Outbound Record & Worker Relay:** Daemon A validates the request, resolves the requester's oc-tags tag if not provided, inserts `remote_launch_outbound` with state `sending` and `request_expires_at = now + 15m`, `deadline_at = request_expires_at + 180s`. It then POSTs to worker `/launch/relay`.
    - On 202 `accepted` -> marks state `accepted`.
    - On transient failure -> marks `next_attempt_at = now + 5s`, returns 202 `pending`. Background `tick()` retries with backoff up to `request_expires_at`.
@@ -415,20 +415,20 @@ X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
 3. **Queueing in Worker:** Worker stores in D1 `remote_launch` (`status='queued'`).
 4. **Poll Hand-out to Target B:** Worker hands out launch to B in `launches` array. Leased for 60s (up to 3 leases).
 5. **Receiver Execution on B (`remote-launch-receiver.ts`):**
-   - Refusal checks: validate shape, check against B's `launchFrom` list, verify B's `relaySendEnabled` is true (`no_return_path` if false), check `opencodeClient` (`serve_unavailable` if missing), verify `expires_at > now`.
+   - Refusal checks: validate shape (`from` is `ses_` or `gse_`), check against B's `launchFrom` list, verify B's `relaySendEnabled` is true (`no_return_path` if false), check `opencodeClient` (`serve_unavailable` if missing), verify `expires_at > now`.
    - Dedup: if `(from_machine, launch_id)` already exists in `remote_launch_inbound`, re-acks per existing state without re-running launch.
    - Insert `remote_launch_inbound` with state `received`.
    - Resolve directory via `resolveHome(expandShorthand(dir))`; checks character code points ≤ 0xff (refuses `invalid_directory` if violated) and filesystem existence (refuses `no_such_directory` if missing or not a directory).
    - Framed prompt: `[Remote launch requested by <from> on <fromMachine>; report back with swarm_send to <from>.]\n\n<prompt>`.
    - `startSession` executes with step budgets: health 5s, create 15s, prompt 20s. Hooks `onCreated` -> updates inbound row state to `created(sessionId)`.
    - Settle inbound row state to `settled` with outcome (`launched`, `refused`, or `unconfirmed`).
-   - Acks outcome to worker `POST /launch/relay/ack` (sent one item per HTTP call).
+   - Acks outcome to worker `POST /launch/relay/ack` (sent one item per HTTP call; launched session id must be `ses_`).
    - Side effects (run detached in background): `autoAttach`, Telegram info alert (`🚀 Remote launch from ...`), and `applyTag` if tag present.
 6. **Result Row Minting on Worker:** On B's ack, worker marks launch row settled and inserts a result row `r:<launch_id>` with status `queued`, addressed to `from_machine`. If an `unconfirmed` launch is later acked as `launched`, a corrective result row `r:<launch_id>:launched` is minted.
 7. **Result Delivery to Requester A:** Worker hands out `launch_result` on A's poll (under `failures=1`).
    - Requester checks `from_machine === self`, matches against `remote_launch_outbound`, and records `result_id` in `remote_launch_results_seen`.
    - **Never-downgrade rule:** If outbound is already `resolved` to `launched` or `refused`, an incoming `unconfirmed` item is dropped. Duplicate `unconfirmed` without session ID is also dropped if already `unconfirmed`.
-   - Formats payload using `formatLaunchResult` and inserts local swarm message (`fromSession='pigeon'`, `kind='launch.result'`) to `from_session`.
+   - Formats payload using `formatLaunchResult` and inserts local swarm message (`fromSession='pigeon'`, `kind='launch.result'`) to `from_session`. If the local insert is refused, it is logged loudly and stays acked.
    - Updates outbound record to `resolved`.
    - Acks `delivered` to worker.
 8. **Deadlines & Expiry:**

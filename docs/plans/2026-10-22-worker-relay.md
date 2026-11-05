@@ -82,7 +82,7 @@ behaviour until a daemon sends `X-Pigeon-Swarm-Relay`. No daemon does yet.
   9. `INSERT ... ON CONFLICT DO NOTHING`. If it lost a race, re-read and apply step 2.
 - **Validation.**
   - `to` is `ses_`/`gse_` plus at least 8 id characters.
-  - `from` is `ses_` plus the same.
+  - `from` is `ses_` plus the same *(2026-11-04: superseded for goose senders by 2026-11-04-goose-cross-machine-design.md: `from` accepts `ses_` or `gse_`)*.
   - `msg_id` is 1–128 characters with no `:`.
   - `priority` is urgent, normal or low.
   - The `payload` is a string of at most 64 KiB in UTF-8. That bounds the D1 row; the pull-session

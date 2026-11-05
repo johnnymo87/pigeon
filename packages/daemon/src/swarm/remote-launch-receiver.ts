@@ -27,6 +27,7 @@ import { isValidTag, truncate } from "../worker/tag-ingest";
 export const MACHINE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export const LAUNCH_ID_RE = /^[^:\s]{1,128}$/;
 export const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]{8,128}$/;
+export const REQUESTER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 export const REASON_RE = /^[a-z0-9_]{1,64}$/;
 
 export interface LaunchAckItem {
@@ -218,8 +219,8 @@ async function processOneLaunchItem(deps: LaunchReceiverDeps, raw: unknown): Pro
   const launchId = it.launch_id;
   const fromSession = typeof it.from === "string" ? it.from : "";
 
-  // 2. Shape invalid (from not ses_, directory/prompt not strings, tag invalid, expires_at not number) -> refused invalid.
-  const isFromValid = typeof it.from === "string" && SESSION_ID_RE.test(it.from);
+  // 2. Shape invalid (from not ses_ or gse_, directory/prompt not strings, tag invalid, expires_at not number) -> refused invalid.
+  const isFromValid = typeof it.from === "string" && REQUESTER_ID.test(it.from);
   const isDirValid = typeof it.directory === "string";
   const isPromptValid = typeof it.prompt === "string";
   const isTagValid =

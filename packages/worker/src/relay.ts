@@ -50,6 +50,7 @@ export const RELAY_MAX_ACCEPT = 16;
 const TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 /** A `ses_` id the relay accepts, as sender or (with `gse_`, TARGET_ID) as target. */
 export const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+export const RELAY_SENDER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 const MSG_ID = /^[^:\s]{1,128}$/;
 const REASON = /^[a-z0-9_]{1,64}$/;
 const PRIORITIES = new Set(["urgent", "normal", "low"]);
@@ -146,7 +147,7 @@ function optNumber(v: unknown): v is number | null {
 export function validateRelayBody(body: Record<string, unknown>, now: number): MessageBody | Response {
   const { msg_id, from, to, kind, priority, reply_to, payload, deliver_at, expires_at, ref, from_label } = body;
   if (typeof msg_id !== "string" || !MSG_ID.test(msg_id)) return bad("msg_id must be 1-128 characters with no ':' or whitespace");
-  if (typeof from !== "string" || !SENDER_ID.test(from)) return bad("from must be a ses_ session id");
+  if (typeof from !== "string" || !RELAY_SENDER_ID.test(from)) return bad("from must be a ses_ or gse_ session id");
   if (typeof to !== "string" || !TARGET_ID.test(to)) return bad("to must be a ses_ or gse_ session id");
   if (typeof kind !== "string" || kind.length === 0 || kind.length > 64) return bad("kind must be a non-empty string");
   if (typeof priority !== "string" || !PRIORITIES.has(priority)) return bad("priority must be urgent, normal or low");

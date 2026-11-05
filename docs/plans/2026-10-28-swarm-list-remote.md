@@ -12,7 +12,7 @@ open. Three pieces, one PR.
 - **Rows:** `sessions` where `machine_id <> caller`, `updated_at` within 7 days
   (`REGISTER_TAKEOVER_STALE_MS`: the same horizon after which a row is considered abandoned), and
   `session_id LIKE 'ses_%'`. `gse_` rows are left out because a goose session cannot be a remote
-  target (§7); listing it would only invite a send that fails. Newest first; `limit` defaults to
+  target (§7); listing it would only invite a send that fails. *(2026-11-04 note: `gse_` targets can now be reached cross-machine under `2026-11-04-goose-cross-machine-design.md`, but remote discovery continues to list `ses_` sessions only; remote sessions learn the `gse_` id from launch framing or an envelope's `from`).* Newest first; `limit` defaults to
   100 and is clamped to 500. `truncated` says whether more rows matched.
 - **Per-machine relay status** (`relayReachability` in `relay.ts`, which `POST /swarm/relay`
   now answers from too, so the two cannot drift), so an agent can tell before sending whether a send could work. For

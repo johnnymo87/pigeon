@@ -143,8 +143,8 @@ export class RelayRefusedError extends RemoteTargetError {
   }
 }
 
-/** A sender id the worker's relay route accepts. Byte-exact with the worker's SENDER_ID. */
-const RELAY_SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+/** A sender id the worker's relay route accepts. Byte-exact with the worker's RELAY_SENDER_ID. */
+const RELAY_SENDER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 /**
  * A target id the worker's relay route accepts (its TARGET_ID). Anything else would come back
  * `400 invalid`; it keeps the Phase 1 path instead, whose incomplete-id check gives the sender the
@@ -207,6 +207,11 @@ export interface ArbiterOptions {
    */
   relay?: (body: RelayMessageBody) => Promise<RelaySendAnswer>;
   /**
+   * Goose session remote reachability marker. When relaying a message from a goose session,
+   * registers it before relay and marks it reachable (grants pull_sources) when relay succeeds.
+   */
+  markRemoteReachable?: (sessionId: string, options: { grant: boolean }) => Promise<unknown>;
+  /**
    * Goose session delivery. Injected narrow capability (send prompt only, no abort).
    */
   gooseDeliver?: (sessionId: string, commandId: string, text: string) => Promise<void>;
@@ -243,6 +248,7 @@ export class SwarmArbiter {
     | undefined;
   private readonly selfMachineId: string | undefined;
   private readonly relay: ((body: RelayMessageBody) => Promise<RelaySendAnswer>) | undefined;
+  private readonly markRemoteReachable: ((sessionId: string, options: { grant: boolean }) => Promise<unknown>) | undefined;
   private readonly gooseDeliver: ((sessionId: string, commandId: string, text: string) => Promise<void>) | undefined;
   private readonly nowFn: () => number;
   private readonly log: (
@@ -272,6 +278,7 @@ export class SwarmArbiter {
     this.ownerOf = opts.ownerOf;
     this.selfMachineId = opts.selfMachineId;
     this.relay = opts.relay;
+    this.markRemoteReachable = opts.markRemoteReachable;
     this.gooseDeliver = opts.gooseDeliver;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log =
@@ -596,10 +603,30 @@ export class SwarmArbiter {
                   `the message was relayed here from ${inbound.fromMachine}, and relayed messages are never relayed again`,
               );
             }
-            // `pigeon` notices and goose senders cannot be relayed (the worker's validator takes
-            // ses_ senders only); they keep the Phase 1 failure.
+            // `pigeon` notices cannot be relayed (the worker's validator takes ses_ or gse_ senders only);
+            // they keep the Phase 1 failure.
             if (this.relay && RELAY_SENDER_ID.test(next.fromSession) && RELAY_TARGET_ID.test(target)) {
+              if (next.fromSession.startsWith("gse_") && this.markRemoteReachable) {
+                try {
+                  await this.markRemoteReachable(next.fromSession, { grant: false });
+                } catch (err) {
+                  this.log("markRemoteReachable threw", {
+                    from: next.fromSession,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
               await this.relayRow(next, target);
+              if (next.fromSession.startsWith("gse_") && this.markRemoteReachable) {
+                try {
+                  await this.markRemoteReachable(next.fromSession, { grant: true });
+                } catch (err) {
+                  this.log("markRemoteReachable threw", {
+                    from: next.fromSession,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
               continue;
             }
             const owner = await this.lookupOwner(target);

@@ -28,6 +28,7 @@ import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./not
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
+import { shouldAllowRemoteGooseTarget } from "./swarm/remote-goose-target";
 import type { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
@@ -293,7 +294,7 @@ export interface TagLookup {
   warm(sessionId: string): void;
 }
 
-interface AppOptions {
+export interface AppOptions {
   nowFn?: () => number;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
@@ -345,6 +346,12 @@ interface AppOptions {
   remoteSessionsTimeoutMs?: number;
   /** `PIGEON_SWARM_RELAY_SEND=1`: reported by `/swarm/remote-sessions` as `relay_send`. */
   swarmRelaySend?: boolean;
+  /**
+   * Look up which machine owns a session from the worker (pigeon honk-9qf.29 Task P6).
+   */
+  lookupSessionOwner?: (id: string, signal: AbortSignal) => Promise<{ machineId: string } | null>;
+  /** Bound on `lookupSessionOwner`. Test seam; defaults to REMOTE_GOOSE_LOOKUP_TIMEOUT_MS (3s). */
+  lookupSessionOwnerTimeoutMs?: number;
   /**
    * The remote launch requester (pigeon-k0qn.17) for `POST /swarm/launch`.
    * Absent on a host with no worker connection or when remote launch is not configured;
@@ -957,6 +964,20 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         const f = parsed.fields;
         const msgId = f.callerMsgId ?? makeMsgId();
+        const remoteGoose = await shouldAllowRemoteGooseTarget(
+          storage,
+          f.to,
+          f.channel,
+          {
+            swarmRelaySend: opts.swarmRelaySend,
+            machineId: opts.machineId,
+            lookupSessionOwner: opts.lookupSessionOwner,
+            lookupTimeoutMs: opts.lookupSessionOwnerTimeoutMs,
+          },
+        );
+        if (!remoteGoose.allowed && remoteGoose.error) {
+          return Response.json({ error: remoteGoose.error }, { status: 409 });
+        }
         const result = bankOrInsertSwarmMessage(
           storage,
           {
@@ -968,6 +989,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             priority: f.priority,
             replyTo: f.replyTo,
             payload: f.payload,
+            ...(remoteGoose.allowed ? { allowRemoteGoose: true } : {}),
           },
           nowFn(),
         );
@@ -1057,6 +1079,20 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
         const msgId = f.callerMsgId ?? makeMsgId();
+        const remoteGoose = await shouldAllowRemoteGooseTarget(
+          storage,
+          f.to,
+          f.channel,
+          {
+            swarmRelaySend: opts.swarmRelaySend,
+            machineId: opts.machineId,
+            lookupSessionOwner: opts.lookupSessionOwner,
+            lookupTimeoutMs: opts.lookupSessionOwnerTimeoutMs,
+          },
+        );
+        if (!remoteGoose.allowed && remoteGoose.error) {
+          return Response.json({ error: remoteGoose.error }, { status: 409 });
+        }
         const result = bankOrInsertSwarmMessage(
           storage,
           {
@@ -1071,6 +1107,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             deliverAt: sched.deliverAt,
             expiresAt: sched.expiresAt,
             ref,
+            ...(remoteGoose.allowed ? { allowRemoteGoose: true } : {}),
           },
           nowFn(),
         );

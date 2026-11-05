@@ -491,6 +491,7 @@ permanent, so the status change is safe.
 - `gse_` targets with no local row are refused synchronously (409) rather than accepted and failed later by the arbiter.
 - Outbox sender drops entries for `notify: false` goose-acp rows terminally with reason `notify_false_goose` as defence in depth.
 - Opencode plugin renders `banked: true` as "waiting in <to>'s mailbox; it is read when that session calls swarm_read" instead of "Delivery is async".
+- *(2026-11-04: superseded for goose requesters/targets/senders by 2026-11-04-goose-cross-machine-design.md).*
 
 ## §5. Rejected alternatives
 
@@ -551,7 +552,7 @@ re-register M's sessions to itself, so receive on M requires M to be retired.
   before it is banked).
 - Goose sessions are neither remote targets nor relaying senders. `/swarm/send` refuses a
   `gse_` id with no local row, and the relay takes `ses_` senders only. `pigeon-k0qn.13` owns
-  goose swarm targets.
+  goose swarm targets. *(2026-11-04: superseded for goose requesters/targets/senders by 2026-11-04-goose-cross-machine-design.md).*
 
 ## §8. Deployment order
 

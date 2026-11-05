@@ -83,9 +83,10 @@ A separate table, handed out in batches on the poll like relay items, avoids all
 - **`POST /launch/relay`**, machine key only (`requireMachinePrincipal`). Checks, in order. The
   duplicate check comes straight after validation, as in the relay (`relay.ts:246-252`), so a retry
   of a stored request gets `202 duplicate` even if B has since gone offline:
-  1. body valid: `machine`, `directory` (non-empty, ≤ 512, no control characters, since it becomes
-     an HTTP header on B), `prompt` (≤ 16 000 code points), `tag` (`isValidTag`), `from` is `ses_…`,
-     `launch_id` without `:`;
+   1. body valid: `machine`, `directory` (non-empty, ≤ 512, no control characters, since it becomes
+      an HTTP header on B), `prompt` (≤ 16 000 code points), `tag` (`isValidTag`), `from` is `ses_…`
+      *(2026-11-04: superseded for goose requesters by 2026-11-04-goose-cross-machine-design.md: `from` accepts `ses_` or `gse_`)*,
+      `launch_id` without `:`;
   1a. same key, same hash → `202 duplicate`; same key, different hash → `409 launch_id_conflict`;
   2. `from` registered to another machine → `403 sender_not_yours` (as the relay);
   3. `to_machine` = caller → `409 same_machine` (use `opencode-launch` locally);
@@ -168,6 +169,7 @@ A separate table, handed out in batches on the poll like relay items, avoids all
 - **Ack** `POST /launch/relay/ack {from_machine, launch_id, outcome, session_id?, reason?}`.
 - **Not in v1:** goose backend (`--backend goose`), worktree creation (the prompt can run `work`),
   and suppressing `oc-auto-attach` (it opens a tmux window on B, same as `/launch`; harmless).
+  *(2026-11-04: superseded for goose requesters/targets/senders by 2026-11-04-goose-cross-machine-design.md; launching a remote goose session remains out of scope).*
 
 ## §4. Result back to the requester (machine A)
 
