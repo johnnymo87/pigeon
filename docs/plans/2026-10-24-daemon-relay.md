@@ -96,6 +96,7 @@ In the arbiter, on a `remote` verdict with relay enabled:
 - The sender is not `ses_` (a `pigeon` notice, a goose sender), or the target fails the
   worker's `TARGET_ID` (`ses_abc`) → the existing remote failure. The worker would answer 400,
   and for a short id the Phase 1 path gives the right "check the id" advice.
+  *(2026-11-04: superseded for goose senders by 2026-11-04-goose-cross-machine-design.md).*
 - Otherwise POST `/swarm/relay`:
   - Any 202, duplicate or not → `markRelayed`: `handed_off` + `verified_at` +
     `verify_family='relayed'`, in one statement.
@@ -154,8 +155,10 @@ analogue of `wake-permanent`.
 - **Remote `gse_` targets are unreachable.** `/swarm/send` on the sender refuses a `gse_` id with
   no local row (`bank-or-insert.ts`, `no_session`), so a goose session cannot be a cross-machine
   target. Goose swarm targets are `pigeon-k0qn.13`'s scope.
+  *(2026-11-04: superseded for goose requesters/targets/senders by 2026-11-04-goose-cross-machine-design.md).*
 - **Goose senders cannot relay.** The worker takes `ses_` senders only, so they keep the Phase 1
   failure.
+  *(2026-11-04: superseded for goose requesters/targets/senders by 2026-11-04-goose-cross-machine-design.md).*
 
 ## Testing
 
