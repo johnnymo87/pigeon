@@ -37,8 +37,8 @@ describe("POST /stop rich payload", () => {
     const rich = payload.rich as { markdown: string };
     expect(rich.markdown).toContain("| tag | \\$ |\n|---|---|\n| a | \\$5 |");
     expect(rich.markdown).toContain("Costs:\n\n| tag");
-    // Footer converted with code spans, session id included.
-    expect(rich.markdown).toContain("🆔 `sess-r`");
+    // Footer code converted to copy buttons, session id included.
+    expect(rich.markdown).toContain('🆔 <tg-button type="copy_text" text="sess-r">sess-r</tg-button>');
     // The plain chunks are still there, unchanged, for the fallback.
     const messages = payload.messages as Array<{ text: string }>;
     expect(messages[0]!.text).toContain("| tag | $ |");
