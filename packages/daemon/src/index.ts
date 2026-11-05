@@ -992,6 +992,7 @@ const swarmArbiter = (config.opencodeUrl || ingressRouter || gooseRunners)
       ownerOf: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
       selfMachineId: config.machineId,
       relay: config.swarmRelaySend && relayClient ? (body) => relayClient.relay(body) : undefined,
+      markRemoteReachable: markGooseRemoteReachable,
       gooseDeliver: gooseRunners
         ? async (sessionId, commandId, text) => {
             const row = storage.sessions.get(sessionId);

@@ -135,7 +135,7 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
 
   it.each([
     ["from='pigeon'", { from: "pigeon" }],
-    ["a goose sender", { from: "gse_00000000-0000-0000-0000-000000000000" }],
+    ["a user sender", { from: "usr_000000000000" }],
     ["a reserved kind", { kind: "swarm.nudge" }],
     ["':' in msg_id", { msg_id: "wake-lost:msg_x" }],
     ["the close tag", { payload: "x </swarm_message> y" }],
@@ -147,10 +147,28 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     expect(ack).toMatchObject({ outcome: "refused", reason: "invalid" });
   });
 
+  it("inserts a relayed item from a remote gse_ sender for a local opencode target", async () => {
+    const s = db();
+    const gseSender = "gse_remote_goose_12345";
+    const [ack] = await receive(s, [message({ from: gseSender })]);
+    expect(ack).toMatchObject({ outcome: "delivered" });
+    const row = s.swarm.getByMsgId("msg_relayed_1");
+    expect(row).not.toBeNull();
+    expect(row?.fromSession).toBe(gseSender);
+  });
+
   it("refuses a sender that is one of this machine's own sessions", async () => {
     const s = db();
     s.sessions.upsert({ sessionId: SENDER }, NOW);
     expect((await receive(s, [message()]))[0]).toMatchObject({ outcome: "refused", reason: "from_is_local" });
+  });
+
+  it("refuses a gse_ sender that is one of this machine's own sessions", async () => {
+    const s = db();
+    const gseSender = "gse_local_goose_12345";
+    s.sessions.upsert({ sessionId: gseSender }, NOW);
+    const [ack] = await receive(s, [message({ from: gseSender })]);
+    expect(ack).toMatchObject({ outcome: "refused", reason: "from_is_local" });
   });
 
   it("refuses a sender the locality check finds on this machine without a sessions row (a subagent)", async () => {
@@ -325,7 +343,11 @@ describe("late failures of relayed-in rows go back through the worker", () => {
   });
 });
 
-function arbiterSetup(opts: { relay?: (b: RelayMessageBody) => Promise<RelaySendAnswer>; locality?: Locality } = {}) {
+function arbiterSetup(opts: {
+  relay?: (b: RelayMessageBody) => Promise<RelaySendAnswer>;
+  locality?: Locality;
+  markRemoteReachable?: (sessionId: string) => Promise<unknown>;
+} = {}) {
   const s = db();
   const sendPrompt = vi.fn(async () => {});
   const relay = opts.relay ? vi.fn(opts.relay) : undefined;
@@ -338,6 +360,7 @@ function arbiterSetup(opts: { relay?: (b: RelayMessageBody) => Promise<RelaySend
     ownerOf: async () => null,
     selfMachineId: "devbox",
     relay,
+    markRemoteReachable: opts.markRemoteReachable,
     nowFn: () => NOW,
     log: () => {},
   });
@@ -437,12 +460,46 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
     expect(pigeonNotices(a.s)[0]!.payload).toContain("Check the id and resend");
   });
 
-  it("keeps the Phase 1 failure for a sender the relay cannot carry", async () => {
+  it("keeps the Phase 1 failure for a sender the relay cannot carry (e.g. pigeon notices)", async () => {
     const a = arbiterSetup({ relay: async () => ({ kind: "accepted", toMachine: "x", duplicate: false }) });
-    a.insert("m1", { fromSession: "gse_00000000-0000-0000-0000-000000000000" });
+    a.insert("m1", { fromSession: "pigeon" });
     await a.arbiter.processOnce();
     expect(a.relay).not.toHaveBeenCalled();
     expect(a.s.swarm.getByMsgId("m1")!.state).toBe("failed");
+  });
+
+  it("relays a local gse_ sender to a remote ses_ target and calls markRemoteReachable first", async () => {
+    const order: string[] = [];
+    const markRemoteReachable = vi.fn(async (sessionId: string) => {
+      order.push(`mark:${sessionId}`);
+    });
+    const a = arbiterSetup({
+      relay: async (body) => {
+        order.push(`relay:${body.from}`);
+        return { kind: "accepted", toMachine: "cloudbox", duplicate: false };
+      },
+      markRemoteReachable,
+    });
+    const gseSender = "gse_local_goose_12345";
+    a.s.sessions.upsert({ sessionId: gseSender, label: "goose work" }, NOW);
+    a.insert("m_gse_1", { fromSession: gseSender });
+
+    await a.arbiter.processOnce();
+
+    expect(markRemoteReachable).toHaveBeenCalledWith(gseSender);
+    expect(a.relay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        msg_id: "m_gse_1",
+        from: gseSender,
+        to: TARGET,
+        from_label: "goose work",
+      }),
+    );
+    expect(order).toEqual([`mark:${gseSender}`, `relay:${gseSender}`]);
+    expect(a.s.swarm.getByMsgId("m_gse_1")).toMatchObject({
+      state: "handed_off",
+      verifyFamily: "relayed",
+    });
   });
 
   it("without relay configured, a remote target still fails as in Phase 1", async () => {

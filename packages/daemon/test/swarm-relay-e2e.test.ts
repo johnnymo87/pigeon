@@ -19,6 +19,7 @@ import { RelayFailSender } from "../src/swarm/relay-fail-sender";
 import { RelayClient, relayPollHeader } from "../src/worker/relay-client";
 import { Poller } from "../src/worker/poller";
 import { bankOrInsertSwarmMessage } from "../src/swarm/bank-or-insert";
+import { createMarkGooseRemoteReachable } from "../src/goose/remote-reachable";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const WORKER_SRC = resolve(here, "../../worker/src");
@@ -75,6 +76,7 @@ const KEY_CLOUDBOX = "pgk_" + "C".repeat(43);
 const SENDER = "ses_senderOnDevbox00000000001";
 const TARGET = "ses_targetOnCloudbox000000001";
 const PULL_TARGET = "ses_pullOnCloudbox00000000001";
+const GSE_A = "gse_gooseOnDevbox000000000001";
 
 interface World {
   worker: BetterSqlite3.Database;
@@ -156,6 +158,14 @@ async function world(): Promise<World> {
       w.loseNextRelayResponse = false;
       return { kind: "transient", detail: "relay request failed: The operation was aborted due to timeout" };
     },
+    markRemoteReachable: createMarkGooseRemoteReachable({
+      sessions: devbox.sessions,
+      register: async (id) => {
+        workerDb
+          .prepare("INSERT OR REPLACE INTO sessions (session_id, machine_id, created_at, updated_at) VALUES (?, ?, ?, ?)")
+          .run(id, "devbox", Date.now(), Date.now());
+      },
+    }),
     log: quiet,
   });
   const cloudArbiter = new SwarmArbiter({
@@ -165,6 +175,15 @@ async function world(): Promise<World> {
     directoryMissing: () => false,
     localityOf: async (id) => (cloudbox.sessions.get(id) ? "local" : "remote"),
     selfMachineId: "cloudbox",
+    relay: async (body) => cloudClient.relay(body),
+    markRemoteReachable: createMarkGooseRemoteReachable({
+      sessions: cloudbox.sessions,
+      register: async (id) => {
+        workerDb
+          .prepare("INSERT OR REPLACE INTO sessions (session_id, machine_id, created_at, updated_at) VALUES (?, ?, ?, ?)")
+          .run(id, "cloudbox", Date.now(), Date.now());
+      },
+    }),
     log: quiet,
   });
 
@@ -192,7 +211,7 @@ async function world(): Promise<World> {
     cloudbox,
     devArbiter,
     cloudArbiter,
-    devPoller: poller(devbox, "devbox", KEY_DEVBOX, [], devClient),
+    devPoller: poller(devbox, "devbox", KEY_DEVBOX, ["cloudbox"], devClient),
     cloudPoller: poller(cloudbox, "cloudbox", KEY_CLOUDBOX, ["devbox"], cloudClient),
     cloudFails: new RelayFailSender(cloudbox, cloudClient),
     sendPrompt,
@@ -334,5 +353,103 @@ describe("cross-machine relay end to end", () => {
 
     expect(relayRow(w, "msg_e2e_6")).toEqual({ status: "delivered", reason: null });
     expect(w.cloudbox.db.prepare("SELECT COUNT(*) AS n FROM swarm_messages WHERE msg_id = 'msg_e2e_6'").get()).toEqual({ n: 1 });
+  });
+
+  it("delivers gse_A on machine A → ses_B on machine B, and ses_B reply → gse_A delivered on A", async () => {
+    const w = await world();
+    const now = Date.now();
+    // Register gse_A on devbox as a goose push row (endpoint present).
+    // Initial pull_sources does NOT contain swarm-remote.
+    w.devbox.sessions.upsert({
+      sessionId: GSE_A,
+      backendKind: "goose-acp",
+      backendEndpoint: "http://127.0.0.1:3000",
+      label: "goose session",
+    });
+    expect(w.devbox.sessions.get(GSE_A)?.pullSources).not.toContain("swarm-remote");
+
+    // Also register gse_A in worker so replies know where gse_A lives
+    w.worker
+      .prepare("INSERT INTO sessions (session_id, machine_id, created_at, updated_at) VALUES (?, ?, ?, ?)")
+      .run(GSE_A, "devbox", now, now);
+
+    await tick(w.cloudPoller);
+    await tick(w.devPoller);
+
+    // Leg 1: gse_A on devbox sends to TARGET on cloudbox
+    bankOrInsertSwarmMessage(w.devbox, {
+      msgId: "msg_gse_to_cloud",
+      fromSession: GSE_A,
+      toSession: TARGET,
+      channel: null,
+      kind: "chat",
+      priority: "normal",
+      replyTo: null,
+      payload: "hello from goose on devbox",
+    });
+
+    await w.devArbiter.processOnce();
+    expect(w.devbox.swarm.getByMsgId("msg_gse_to_cloud")).toMatchObject({
+      state: "handed_off",
+      verifyFamily: "relayed",
+    });
+
+    // Verify markRemoteReachable ran on devbox when gse_A sent:
+    // gse_A now has swarm-remote!
+    const gseRowAfterSend = w.devbox.sessions.get(GSE_A);
+    expect(gseRowAfterSend?.pullSources).toContain("swarm-remote");
+
+    // Cloudbox polls and receives msg_gse_to_cloud
+    await tick(w.cloudPoller);
+    expect(relayRow(w, "msg_gse_to_cloud")).toEqual({ status: "delivered", reason: null });
+    expect(w.cloudbox.swarm.getByMsgId("msg_gse_to_cloud")).toMatchObject({
+      fromSession: GSE_A,
+      state: "queued",
+    });
+
+    await w.cloudArbiter.processOnce();
+    expect(w.sendPrompt).toHaveBeenCalled();
+    const prompt = String(w.sendPrompt.mock.calls[0]![2]);
+    expect(prompt).toContain(`from="${GSE_A}" from_machine="devbox"`);
+    expect(prompt).toContain("hello from goose on devbox");
+
+    // Leg 2: TARGET on cloudbox replies to GSE_A on devbox.
+    // NOTE: /swarm/send on cloudbox to an unknown gse_ is refused 409 today in bank-or-insert.ts:62
+    // until Task P6 implements allowRemoteGoose. We insert directly into cloudbox.swarm as specified.
+    w.cloudbox.swarm.insert(
+      {
+        msgId: "msg_reply_to_gse",
+        fromSession: TARGET,
+        toSession: GSE_A,
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: "msg_gse_to_cloud",
+        payload: "reply from cloudbox target",
+      } as never,
+      now,
+    );
+
+    // Cloudbox arbiter relays the reply to GSE_A
+    await w.cloudArbiter.processOnce();
+    expect(w.cloudbox.swarm.getByMsgId("msg_reply_to_gse")).toMatchObject({
+      state: "handed_off",
+      verifyFamily: "relayed",
+    });
+
+    // Devbox polls worker and receives the reply.
+    // Receiver on devbox accepts it because gse_A has swarm-remote (marked on send).
+    await tick(w.devPoller);
+    expect(relayRow(w, "msg_reply_to_gse")).toEqual({ status: "delivered", reason: null });
+
+    // The reply is queued in devbox.swarm for gse_A
+    const replyRowOnDevbox = w.devbox.swarm.getByMsgId("msg_reply_to_gse");
+    expect(replyRowOnDevbox).not.toBeNull();
+    expect(replyRowOnDevbox).toMatchObject({
+      fromSession: TARGET,
+      toSession: GSE_A,
+      state: "queued",
+      payload: "reply from cloudbox target",
+    });
   });
 });

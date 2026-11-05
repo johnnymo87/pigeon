@@ -24,7 +24,7 @@ import { formatRelayFailureNotice, isReasonCode } from "./relay-notice";
 import { formatWakePayloadAlert, isSuppressedFromRecovery } from "./delivery-policy";
 import type { Locality } from "../routing/locality";
 
-const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
+const SENDER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 const MACHINE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const PRIORITIES = new Set(["urgent", "normal", "low"]);
 
@@ -146,7 +146,7 @@ function receiveMessage(
     });
     if (!parsed.ok || typeof it.to !== "string") throw new Refusal("invalid", "failed /swarm/send validation");
     const f = parsed.fields;
-    if (!SENDER_ID.test(f.from)) throw new Refusal("invalid", "from must be a ses_ id");
+    if (!SENDER_ID.test(f.from)) throw new Refusal("invalid", "from must be a ses_ or gse_ id");
     if (typeof it.kind !== "string" || !PRIORITIES.has(String(it.priority))) {
       throw new Refusal("invalid", "kind and priority are required");
     }
