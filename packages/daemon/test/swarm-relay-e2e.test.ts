@@ -414,9 +414,9 @@ describe("cross-machine relay end to end", () => {
     expect(prompt).toContain("hello from goose on devbox");
 
     // Leg 2: TARGET on cloudbox replies to GSE_A on devbox.
-    // NOTE: /swarm/send on cloudbox to an unknown gse_ is refused 409 today in bank-or-insert.ts:62
-    // until Task P6 implements allowRemoteGoose. We insert directly into cloudbox.swarm as specified.
-    w.cloudbox.swarm.insert(
+    // Task P6: allowRemoteGoose allows sending to a remote gse_ session.
+    const replyRes = bankOrInsertSwarmMessage(
+      w.cloudbox,
       {
         msgId: "msg_reply_to_gse",
         fromSession: TARGET,
@@ -426,9 +426,11 @@ describe("cross-machine relay end to end", () => {
         priority: "normal",
         replyTo: "msg_gse_to_cloud",
         payload: "reply from cloudbox target",
-      } as never,
+        allowRemoteGoose: true,
+      },
       now,
     );
+    expect(replyRes).toMatchObject({ status: "inserted", inserted: true });
 
     // Cloudbox arbiter relays the reply to GSE_A
     await w.cloudArbiter.processOnce();

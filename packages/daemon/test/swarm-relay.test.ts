@@ -171,6 +171,13 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     expect(ack).toMatchObject({ outcome: "refused", reason: "from_is_local" });
   });
 
+  it("refuses a relayed-in item to an unknown gse_ target with reason no_session", async () => {
+    const s = db();
+    const [ack] = await receive(s, [message({ to: "gse_unknown_target" })]);
+    expect(ack).toMatchObject({ outcome: "refused", reason: "no_session" });
+    expect(s.swarm.getByMsgId("msg_relayed_1")).toBeNull();
+  });
+
   it("refuses a sender the locality check finds on this machine without a sessions row (a subagent)", async () => {
     const s = db();
     const localityOf = vi.fn(async (id: string) => (id === SENDER ? "local" : "remote") as Locality);

@@ -1333,6 +1333,8 @@ const app = createApp(storage, {
   unbindNamedTopic: poller ? (sessionId, signal) => poller.unbindNamedTopic(sessionId, signal) : undefined,
   // swarm_list remote discovery (pigeon-k0qn.9). Absent without a worker: 503 no_worker.
   listRemoteSessions: poller ? (limit, signal) => poller.listRemoteSessions(limit, signal) : undefined,
+  // Look up session owner for remote goose target send/schedule (pigeon honk-9qf.29 Task P6).
+  lookupSessionOwner: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
   swarmRelaySend: config.swarmRelaySend,
   remoteLaunch: remoteLaunchRequester,
   sessionRename: {

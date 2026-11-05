@@ -488,4 +488,81 @@ describe("bankOrInsertSwarmMessage", () => {
     expect(s.swarm.getByMsgId("msg_honk_chat")?.toSession).toBe("gse_honk_chat");
     expect(s.pullInbox.pendingCount("gse_honk_chat", 2_000)).toBe(0);
   });
+
+  describe("allowRemoteGoose (Task P6, design D2)", () => {
+    it("refuses with no_session when target is gse_ with no local row and allowRemoteGoose is omitted or false", () => {
+      const s = newStorage();
+      const res1 = bankOrInsertSwarmMessage(s, {
+        msgId: "msg_gse_no_row",
+        fromSession: "ses_local",
+        toSession: "gse_remote_target",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello remote goose",
+      }, 1_000);
+
+      expect(res1).toEqual({
+        status: "refused",
+        reason: "no_session",
+        statusCode: 409,
+        error: "no goose session gse_remote_target on this machine",
+      });
+      expect(s.swarm.getByMsgId("msg_gse_no_row")).toBeNull();
+
+      const res2 = bankOrInsertSwarmMessage(s, {
+        msgId: "msg_gse_no_row_false",
+        fromSession: "ses_local",
+        toSession: "gse_remote_target",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello remote goose",
+        allowRemoteGoose: false,
+      }, 1_000);
+
+      expect(res2).toEqual({
+        status: "refused",
+        reason: "no_session",
+        statusCode: 409,
+        error: "no goose session gse_remote_target on this machine",
+      });
+      expect(s.swarm.getByMsgId("msg_gse_no_row_false")).toBeNull();
+    });
+
+    it("inserts into swarm_messages when target is gse_ with no local row and allowRemoteGoose is true, preserving deliverAt", () => {
+      const s = newStorage();
+      const res = bankOrInsertSwarmMessage(s, {
+        msgId: "msg_gse_remote_ok",
+        fromSession: "ses_local",
+        toSession: "gse_remote_target",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "hello remote goose",
+        deliverAt: 5_000,
+        expiresAt: 20_000,
+        ref: "bd:task-p6",
+        allowRemoteGoose: true,
+      }, 1_000);
+
+      expect(res).toEqual({
+        status: "inserted",
+        msgId: "msg_gse_remote_ok",
+        inserted: true,
+      });
+
+      const row = s.swarm.getByMsgId("msg_gse_remote_ok");
+      expect(row).not.toBeNull();
+      expect(row?.toSession).toBe("gse_remote_target");
+      expect(row?.fromSession).toBe("ses_local");
+      expect(row?.deliverAt).toBe(5_000);
+      expect(row?.expiresAt).toBe(20_000);
+      expect(row?.ref).toBe("bd:task-p6");
+      expect(row?.state).toBe("queued");
+    });
+  });
 });

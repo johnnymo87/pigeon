@@ -20,6 +20,8 @@ export interface BankOrInsertInput {
   remoteSenderName?: string | null;
   /** Pull-inbox TTL override (a relayed message must expire while the worker still has it). */
   pullTtlMs?: number;
+  /** When true, a gse_ target with no local row is permitted to insert into swarm_messages (for cross-machine relay). */
+  allowRemoteGoose?: boolean;
 }
 
 export type BankOrInsertResult =
@@ -60,12 +62,14 @@ export function bankOrInsertSwarmMessage(
   const targetSession = hasSessionTarget && input.toSession ? storage.sessions.get(input.toSession) : null;
 
   if (Boolean(input.toSession?.startsWith("gse_")) && !targetSession) {
-    return {
-      status: "refused",
-      reason: "no_session",
-      error: `no goose session ${input.toSession} on this machine`,
-      statusCode: 409,
-    };
+    if (!input.allowRemoteGoose || input.channel) {
+      return {
+        status: "refused",
+        reason: "no_session",
+        error: `no goose session ${input.toSession} on this machine`,
+        statusCode: 409,
+      };
+    }
   }
 
   // Any goose session pigeon can reach is pushed, like an opencode session: the
