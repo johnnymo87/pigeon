@@ -379,7 +379,8 @@ export class SwarmArbiter {
       const scheduledIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
       const reason =
         `expired before delivery (scheduled for ${scheduledIso}, ` +
-        `expired at ${new Date(now).toISOString()})`;
+        `expired at ${new Date(now).toISOString()})` +
+        (row.lastError ? `; last delivery error: ${row.lastError}` : "");
       notifySenderOfFailure(this.storage, row, reason, now);
       if (isSuppressedFromRecovery(row)) {
         this.storage.alerts.enqueue({
@@ -743,11 +744,9 @@ export class SwarmArbiter {
         //   - rows WITH expires_at (every scheduled wake — parseScheduleTime
         //     always defaults it): isOutageFailure makes the retries UNCOUNTED,
         //     so max-attempts is unreachable and expiry is the only terminal.
-        //     `markRetryUncounted` persists no error and swarm_messages has no
-        //     last_error column, so the wake-expired alert says only "expired
-        //     before delivery" and THIS CAUSE IS LOST to the daemon log.
-        // Carrying it into the expiry terminal needs somewhere to persist it —
-        // filed as a follow-up rather than smuggled in here.
+        //     `markRetryUncounted` persists this message in `last_error`, and
+        //     expireAndNotify appends it to the expiry reason, so the sender
+        //     notice and the wake-expired alert both name it.
         //
         // Ordering is deliberate: renderEnvelope runs FIRST so a
         // PermanentDeliveryError (a fact about the payload, true regardless of
@@ -761,7 +760,8 @@ export class SwarmArbiter {
         if (this.directoryMissing(directory)) {
           throw new TargetUnavailableError(
             `target ${target} working directory missing: ${directory} ` +
-              `(stat on daemon filesystem; assumes daemon and serve are co-located)`,
+              `(stat on daemon filesystem; assumes daemon and serve are co-located). ` +
+              `If its worktree was deleted, revive it: oc-revive ${target}`,
           );
         }
 
@@ -839,6 +839,7 @@ export class SwarmArbiter {
             next.msgId,
             this.nowFn(),
             OUTAGE_RETRY_DELAY_MS,
+            String(err),
           );
           this.log("retry scheduled (uncounted)", {
             msgId: next.msgId,
@@ -878,6 +879,7 @@ export class SwarmArbiter {
               next.msgId,
               this.nowFn(),
               backoffFor(attempts),
+              String(err),
             );
             this.log("retry scheduled", {
               msgId: next.msgId,

@@ -29,7 +29,8 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       ref TEXT,
       nudge_count INTEGER NOT NULL DEFAULT 0,
       -- NULL means the transcript (opencode) family. See swarm/verify-family.ts.
-      verify_family TEXT
+      verify_family TEXT,
+      last_error TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_swarm_target_state
@@ -80,6 +81,10 @@ export function initSwarmSchema(db: BetterSqlite3.Database): void {
       // silently flip a receipt row into the transcript path as it aged. See
       // `swarm/verify-family.ts` for the full reasoning.
       "ALTER TABLE swarm_messages ADD COLUMN verify_family TEXT",
+      // The most recent delivery error, so an expiring row's terminal can name
+      // its cause (its outage retries are uncounted; expiry is its only end).
+      // NULL on every pre-existing row, which simply reads as "no cause known".
+      "ALTER TABLE swarm_messages ADD COLUMN last_error TEXT",
     ];
 
     for (const statement of additiveColumns) {

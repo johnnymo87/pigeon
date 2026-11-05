@@ -1427,12 +1427,11 @@ describe("SwarmArbiter", () => {
       expect(blob.toLowerCase()).toContain("directory");
     });
 
-    it("4b. CHARACTERISATION: an EXPIRING row's terminal does NOT carry the cause", async () => {
-      // Pins a known, deliberate gap so it cannot be silently claimed as fixed.
+    it("4b. an EXPIRING row's terminal carries the last delivery error", async () => {
       // A row with expires_at takes UNCOUNTED outage retries, so max-attempts is
-      // unreachable and expiry is its only terminal. markRetryUncounted persists
-      // no error and swarm_messages has no last_error column, so the cause dies
-      // in the daemon log. INVERT THIS TEST when that is fixed.
+      // unreachable and expiry is its only terminal. The retry persists its
+      // cause in last_error so the expiry notice can name it instead of saying
+      // only "expired before delivery".
       fixture = makeFixture();
       const { storage, arbiter } = fixture;
       fixture.setDirectoryMissing(() => true);
@@ -1450,7 +1449,57 @@ describe("SwarmArbiter", () => {
         .all();
       const blob = JSON.stringify(notices);
       expect(blob).toContain("expired before delivery");
-      expect(blob).not.toContain("working directory missing");
+      expect(blob).toContain("working directory missing");
+      expect(blob).toContain("oc-revive ses_b");
+    });
+
+    it("4c. a scheduled WAKE that expires behind a missing directory alerts with the cause", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+      fixture.setDirectoryMissing(() => true);
+
+      storage.swarm.insert(
+        {
+          msgId: "m_dir_4c",
+          fromSession: "ses_self",
+          toSession: "ses_self",
+          channel: null,
+          kind: "wake",
+          priority: "normal",
+          replyTo: null,
+          payload: "check the deploy",
+          deliverAt: 1_000,
+          expiresAt: 500_000,
+        },
+        1_000,
+      );
+      await arbiter.processOnce();
+      fixture.setNow(600_000);
+      await arbiter.processOnce();
+
+      const alerts = storage.db
+        .prepare("SELECT * FROM operational_alerts WHERE source = 'wake-expired'")
+        .all() as Array<Record<string, unknown>>;
+      expect(alerts).toHaveLength(1);
+      const text = String(alerts[0]!.text);
+      expect(text).toContain("expired before delivery");
+      expect(text).toContain("working directory missing");
+      expect(text).toContain("oc-revive ses_self");
+    });
+
+    it("4d. an expiry with no delivery attempt says nothing about a last error", async () => {
+      fixture = makeFixture();
+      const { storage, arbiter } = fixture;
+
+      queue(storage, "m_dir_4d", { expiresAt: 500 }); // already expired at now=1_000
+      await arbiter.processOnce();
+      expect(storage.swarm.getByMsgId("m_dir_4d")!.state).toBe("expired");
+
+      const blob = JSON.stringify(
+        storage.db.prepare("SELECT * FROM swarm_messages WHERE kind = 'delivery.failed'").all(),
+      );
+      expect(blob).toContain("expired before delivery");
+      expect(blob).not.toContain("last delivery error");
     });
 
     it("9. PRODUCTION WIRING: the real predicate is armed when none is injected", async () => {

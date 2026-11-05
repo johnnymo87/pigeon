@@ -38,6 +38,13 @@ export interface SwarmMessageRecord {
    * `swarm/verify-family.ts`.
    */
   verifyFamily: string | null;
+  /**
+   * The error from the most recent failed delivery attempt, or NULL if none
+   * failed. Read only by the expiry terminal: an expiring row's outage retries
+   * are uncounted, so expiry is its only terminal and without this the cause
+   * would survive only in the daemon log.
+   */
+  lastError: string | null;
 }
 
 /** Cursor-based paging options for {@link SwarmRepository.getInbox}. */
@@ -95,6 +102,7 @@ function asRecord(row: Row): SwarmMessageRecord {
     cancelledAt: (row.cancelled_at as number | null) ?? null,
     ref: (row.ref as string | null) ?? null,
     verifyFamily: (row.verify_family as string | null) ?? null,
+    lastError: (row.last_error as string | null) ?? null,
   };
 }
 
@@ -478,25 +486,32 @@ export class SwarmRepository {
     return rows.map(asRecord);
   }
 
-  markRetry(msgId: string, now: number, backoffMs: number): boolean {
+  markRetry(msgId: string, now: number, backoffMs: number, error: string | null = null): boolean {
     const result = this.db
       .prepare(
         `UPDATE swarm_messages
-         SET attempts = attempts + 1, next_retry_at = ?, updated_at = ?, state = 'queued'
+         SET attempts = attempts + 1, next_retry_at = ?, updated_at = ?, state = 'queued',
+             last_error = COALESCE(?, last_error)
          WHERE msg_id = ? AND state = 'queued'`,
       )
-      .run(now + backoffMs, now, msgId);
+      .run(now + backoffMs, now, error, msgId);
     return result.changes > 0;
   }
 
-  markRetryUncounted(msgId: string, now: number, backoffMs: number): boolean {
+  markRetryUncounted(
+    msgId: string,
+    now: number,
+    backoffMs: number,
+    error: string | null = null,
+  ): boolean {
     const result = this.db
       .prepare(
         `UPDATE swarm_messages
-         SET next_retry_at = ?, updated_at = ?, state = 'queued'
+         SET next_retry_at = ?, updated_at = ?, state = 'queued',
+             last_error = COALESCE(?, last_error)
          WHERE msg_id = ? AND state = 'queued'`,
       )
-      .run(now + backoffMs, now, msgId);
+      .run(now + backoffMs, now, error, msgId);
     return result.changes > 0;
   }
 
