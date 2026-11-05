@@ -28,12 +28,13 @@ export const RICH_MAX_COLUMNS = 20;
 const DELIMITER_ROW =
   /^\s*(?:\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?|\|\s*:?-+:?\s*\|)\s*$/;
 /**
- * A fence opener, after any indentation and blockquote markers: fences under list items are
- * indented, fences in quotes carry `>`. A backtick fence's info string cannot contain a
+ * A fence opener, after any indentation, blockquote markers and list markers: fences under
+ * list items are indented or follow the marker (`- ```bash`), fences in quotes carry `>`. A backtick fence's info string cannot contain a
  * backtick (CommonMark), so ```` ```npm test``` ```` at the start of a line is inline code,
  * not a fence that would swallow the rest of the message.
  */
-const FENCE_OPEN = /^(?:[ \t]*>)*[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
+const FENCE_OPEN =
+  /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+)*)[ \t]*(?:(`{3,})(?![^`]*`)|(~{3,}))/;
 const FENCE_CLOSE = /^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})\s*$/;
 /** A thematic break made of dashes: under a line of prose it would make that line a heading. */
 const DASH_RULE = /^\s{0,3}-{3,}\s*$/;
@@ -49,9 +50,10 @@ const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
 /**
  * A `#` that starts a line's content (after indentation, quote markers and list markers) and
  * is followed by text with no space. GFM reads `#5620 is ready` as a paragraph; Telegram reads
- * it as a heading (probed, pigeon-ravn), in lists and quotes too.
+ * it as a heading (probed, pigeon-ravn), in lists, task lists and quotes too.
  */
-const LOOSE_HASH = /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+)*[ \t]*)#(?=#*[^#\s])/;
+const LOOSE_HASH =
+  /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)*[ \t]*)#(?=#*[^#\s])/;
 /**
  * An empty paragraph. Telegram draws rich paragraphs with no gap between them, so the blank
  * line between two paragraphs, which plain text showed as an empty line, vanished
@@ -79,6 +81,16 @@ interface LineInfo {
  * unclosed fence runs to the end of the text, as CommonMark renders it.
  */
 function classifyLines(text: string): LineInfo[] {
+  return classify(text).lines;
+}
+
+/**
+ * `classifyLines`, plus the fence still open at the end when it was opened at top level
+ * (no quote or list marker before it). A fence inside a quote or list item is closed by the
+ * end of its container; only a top-level one would swallow what follows.
+ */
+function classify(text: string): { lines: LineInfo[]; openTopLevelFence: string | null } {
+  let topLevel = false;
   const lines = text.split("\n").map<LineInfo>((t) => ({
     text: t,
     fenced: false,
@@ -101,7 +113,8 @@ function classifyLines(text: string): LineInfo[] {
     if (open) {
       line.fenced = true;
       line.fenceLine = true;
-      fence = (open[1] ?? open[2])!;
+      fence = (open[2] ?? open[3])!;
+      topLevel = open[1] === "";
     }
   }
 
@@ -125,7 +138,7 @@ function classifyLines(text: string): LineInfo[] {
     i = j - 1;
   }
 
-  return lines;
+  return { lines, openTopLevelFence: fence !== null && topLevel ? fence : null };
 }
 
 function countColumns(delimiterRow: string): number {
@@ -244,7 +257,8 @@ function findBacktickRun(line: string, from: number, len: number): number {
  *   (pigeon-6mkr).
  */
 export function sanitizeBodyMarkdown(text: string): string {
-  const lines = withSpacers(classifyLines(text));
+  const classified = classify(text);
+  const lines = withSpacers(classified.lines);
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -279,6 +293,8 @@ export function sanitizeBodyMarkdown(text: string): string {
       out += "\n";
     }
   }
+  // An agent's unclosed fence would otherwise take the footer in with it (pigeon-ravn).
+  if (classified.openTopLevelFence !== null) out += "\n" + classified.openTopLevelFence;
   return out;
 }
 

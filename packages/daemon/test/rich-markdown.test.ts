@@ -168,6 +168,27 @@ describe("sanitizeBodyMarkdown", () => {
     expect(sanitizeBodyMarkdown("> #5620 merged")).toBe("> \\#5620 merged");
   });
 
+  it("escapes a # after a task-list checkbox", () => {
+    expect(sanitizeBodyMarkdown("- [ ] #5620 merged")).toBe("- [ ] \\#5620 merged");
+    expect(sanitizeBodyMarkdown("- [x] #5621 done")).toBe("- [x] \\#5621 done");
+  });
+
+  it("recognises a fence opened on a list-marker line, so code inside is untouched", () => {
+    const md = "- ```bash\n  #!/bin/bash\n\n  echo $X\n  ```\n\nafter";
+    expect(sanitizeBodyMarkdown(md)).toBe("- ```bash\n  #!/bin/bash\n\n  echo $X\n  ```\n\n&nbsp;\n\nafter");
+  });
+
+  it("closes a fence the agent left open, so the footer is not swallowed into it", () => {
+    expect(sanitizeBodyMarkdown("text\n\n```\ncode")).toBe("text\n\n&nbsp;\n\n```\ncode\n```");
+    expect(sanitizeBodyMarkdown("~~~~\ncode")).toBe("~~~~\ncode\n~~~~");
+  });
+
+  it("does not close a fence left open inside a quote or list item, which their end closes", () => {
+    // A closing fence at column 0 would instead open a new fence that swallows the footer.
+    expect(sanitizeBodyMarkdown("> ```\n> code")).toBe("> ```\n> code");
+    expect(sanitizeBodyMarkdown("- ```\n  code")).toBe("- ```\n  code");
+  });
+
   it("leaves real headings and mid-line # alone", () => {
     expect(sanitizeBodyMarkdown("# Title")).toBe("# Title");
     expect(sanitizeBodyMarkdown("#\tTitle")).toBe("#\tTitle");
@@ -191,7 +212,7 @@ describe("sanitizeBodyMarkdown", () => {
   });
 
   it("treats an unclosed fence as running to the end", () => {
-    expect(sanitizeBodyMarkdown("```\n$a\nb")).toBe("```\n$a\nb");
+    expect(sanitizeBodyMarkdown("```\n$a\nb")).toBe("```\n$a\nb\n```");
   });
 
   it("does not read line-start inline code (```x```) as a fence", () => {
