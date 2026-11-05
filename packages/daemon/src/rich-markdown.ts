@@ -60,6 +60,8 @@ const LOOSE_HASH =
  * (pigeon-ravn). This paragraph is that empty line.
  */
 const SPACER = "&nbsp;";
+/** A list item indented under another: a nested list. */
+const NESTED_ITEM = /^[ \t]+([-*+]|\d+[.)])[ \t]+(.*)$/;
 
 interface LineInfo {
   text: string;
@@ -73,6 +75,8 @@ interface LineInfo {
   columns?: number;
   /** A `SPACER` paragraph pigeon inserted; emitted as is. */
   spacer?: boolean;
+  /** A nested list item flattened into a `◦` line of its parent item. */
+  subItem?: boolean;
 }
 
 /**
@@ -258,7 +262,7 @@ function findBacktickRun(line: string, from: number, len: number): number {
  */
 export function sanitizeBodyMarkdown(text: string): string {
   const classified = classify(text);
-  const lines = withSpacers(classified.lines);
+  const lines = withSpacers(flattenSublists(classified.lines));
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -299,6 +303,46 @@ export function sanitizeBodyMarkdown(text: string): string {
 }
 
 /**
+ * Turns a nested list into lines of its parent item: `  - sub` becomes `◦ sub`, and
+ * `  2. sub` becomes `2\. sub` (escaped, or it would start a new list). The Telegram app
+ * draws a list item that holds a nested list with its bullet on a line of its own, above the
+ * text (seen on a phone, pigeon-ravn); a list item that is one paragraph is drawn properly.
+ * A blank line before a sub-item is dropped so it joins its item. Applies only under a list
+ * item (an indented list with no parent is left alone), and not in fences, tables or quotes.
+ */
+function flattenSublists(lines: LineInfo[]): LineInfo[] {
+  const out: LineInfo[] = [];
+  // Indentation of the item whose sub-items are being flattened, or null outside a list.
+  let itemIndent: number | null = null;
+  const indentOf = (text: string) => text.length - text.trimStart().length;
+  for (const line of lines) {
+    if (line.table || line.fenceLine) {
+      // A fence under an item is indented; anything else at the margin ends the list.
+      if (line.table || indentOf(line.text) === 0) itemIndent = null;
+      out.push(line);
+      continue;
+    }
+    if (line.fenced || line.text.trim() === "") {
+      out.push(line);
+      continue;
+    }
+    const nested =
+      itemIndent !== null && indentOf(line.text) > itemIndent ? line.text.match(NESTED_ITEM) : null;
+    if (nested) {
+      while (out.length > 0 && !out[out.length - 1]!.fenced && out[out.length - 1]!.text.trim() === "") out.pop();
+      const marker = nested[1]!;
+      const lead = /\d/.test(marker) ? marker.slice(0, -1) + "\\" + marker.slice(-1) : "◦";
+      out.push({ ...line, text: `${lead} ${nested[2]!}`, subItem: true });
+      continue;
+    }
+    if (LIST_ITEM.test(line.text) && !QUOTE_LINE.test(line.text)) itemIndent = indentOf(line.text);
+    else if (indentOf(line.text) === 0) itemIndent = null;
+    out.push(line);
+  }
+  return out;
+}
+
+/**
  * Replaces each run of blank lines between two blocks with one `SPACER` paragraph, so the
  * empty line plain text showed stays visible. Not inside fenced code, not before an indented
  * line (it would end the list item or code it continues), and not between two list items (it
@@ -325,7 +369,7 @@ function withSpacers(lines: LineInfo[]): LineInfo[] {
       prev !== undefined &&
       next !== undefined &&
       !/^\s/.test(next.text) &&
-      !(LIST_ITEM.test(next.text) && (LIST_ITEM.test(prev.text) || /^\s/.test(prev.text)));
+      !(LIST_ITEM.test(next.text) && (LIST_ITEM.test(prev.text) || prev.subItem === true || /^\s/.test(prev.text)));
     if (!spaced) {
       out.push(...run);
       continue;
