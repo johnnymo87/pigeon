@@ -61,6 +61,9 @@ export function formatRemoteFailureNotice(msgId: string, target: string, reason:
 /** Length of an opencode session id: `ses_` + 26 alphanumerics. */
 export const OPENCODE_SESSION_ID_LENGTH = 30;
 
+/** Shared by the preflight error and the expiry alert that keys its revive hint on it. */
+const DIRECTORY_MISSING_MARKER = "working directory missing";
+
 const GSE_ID = /^gse_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -379,13 +382,22 @@ export class SwarmArbiter {
       const scheduledIso = new Date(row.deliverAt ?? row.createdAt).toISOString();
       const reason =
         `expired before delivery (scheduled for ${scheduledIso}, ` +
-        `expired at ${new Date(now).toISOString()})`;
+        `expired at ${new Date(now).toISOString()})` +
+        (row.lastError ? `; last delivery error: ${row.lastError}` : "");
       notifySenderOfFailure(this.storage, row, reason, now);
       if (isSuppressedFromRecovery(row)) {
+        // The revive hint goes to the HUMAN alert only, never into the sender
+        // notice: a peer agent told "revive it" may resurrect a worktree that
+        // was pruned on purpose after its work merged.
+        const alertReason =
+          row.lastError?.includes(DIRECTORY_MISSING_MARKER) && row.toSession
+            ? `${reason}. If ${row.toSession} is still needed, revive it ` +
+              `(interactive): oc-revive ${row.toSession}, then reschedule this wake`
+            : reason;
         this.storage.alerts.enqueue({
           source: "wake-expired",
           refMsgId: row.msgId,
-          text: formatWakePayloadAlert(row, reason, "expired before delivery"),
+          text: formatWakePayloadAlert(row, alertReason, "expired before delivery"),
           severity: "error",
           now,
         });
@@ -743,11 +755,9 @@ export class SwarmArbiter {
         //   - rows WITH expires_at (every scheduled wake — parseScheduleTime
         //     always defaults it): isOutageFailure makes the retries UNCOUNTED,
         //     so max-attempts is unreachable and expiry is the only terminal.
-        //     `markRetryUncounted` persists no error and swarm_messages has no
-        //     last_error column, so the wake-expired alert says only "expired
-        //     before delivery" and THIS CAUSE IS LOST to the daemon log.
-        // Carrying it into the expiry terminal needs somewhere to persist it —
-        // filed as a follow-up rather than smuggled in here.
+        //     `markRetryUncounted` persists this message in `last_error`, and
+        //     expireAndNotify appends it to the expiry reason, so the sender
+        //     notice and the wake-expired alert both name it.
         //
         // Ordering is deliberate: renderEnvelope runs FIRST so a
         // PermanentDeliveryError (a fact about the payload, true regardless of
@@ -760,7 +770,7 @@ export class SwarmArbiter {
         // in index.ts to switch the preflight off rather than editing here.
         if (this.directoryMissing(directory)) {
           throw new TargetUnavailableError(
-            `target ${target} working directory missing: ${directory} ` +
+            `target ${target} ${DIRECTORY_MISSING_MARKER}: ${directory} ` +
               `(stat on daemon filesystem; assumes daemon and serve are co-located)`,
           );
         }
@@ -839,6 +849,7 @@ export class SwarmArbiter {
             next.msgId,
             this.nowFn(),
             OUTAGE_RETRY_DELAY_MS,
+            String(err),
           );
           this.log("retry scheduled (uncounted)", {
             msgId: next.msgId,
@@ -878,6 +889,7 @@ export class SwarmArbiter {
               next.msgId,
               this.nowFn(),
               backoffFor(attempts),
+              String(err),
             );
             this.log("retry scheduled", {
               msgId: next.msgId,
