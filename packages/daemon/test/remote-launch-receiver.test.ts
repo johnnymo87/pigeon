@@ -5,6 +5,8 @@ import { RequestTimeoutError } from "../src/routing/serve-outcome";
 import {
   processLaunchItems,
   retryLaunchAcks,
+  isValidLaunchAckItem,
+  REQUESTER_ID,
   type LaunchReceiverDeps,
   type LaunchAckItem,
 } from "../src/swarm/remote-launch-receiver";
@@ -940,6 +942,155 @@ describe("remote-launch-receiver", () => {
         ["ses_remote12345"],
         expect.objectContaining({ detached: true }),
       );
+    });
+  });
+
+  describe("gse_ requester (Task P4, design D1)", () => {
+    it("processes launch item from gse_ requester, frames prompt naming the gse_ id, settles launched and acks", async () => {
+      const deps = makeDeps();
+      const item = {
+        item: "launch",
+        from_machine: "devbox",
+        launch_id: "lnch_gse_001",
+        from: "gse_requester12345",
+        directory: "/home/dev/projects/pigeon",
+        prompt: "echo hello from goose",
+        tag: null,
+        expires_at: now + 60_000,
+      };
+
+      await processLaunchItems(deps, [item]);
+
+      expect(client.createSession).toHaveBeenCalledWith("/home/dev/projects/pigeon", { timeoutMs: 20000 });
+      expect(client.sendPrompt).toHaveBeenCalledWith(
+        "ses_remote12345",
+        "/home/dev/projects/pigeon",
+        "[Remote launch requested by gse_requester12345 on devbox; report back with swarm_send to gse_requester12345.]\n\necho hello from goose",
+        { timeoutMs: 20000 },
+      );
+
+      expect(ackMock).toHaveBeenCalledWith([
+        {
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_gse_001",
+          outcome: "launched",
+          session_id: "ses_remote12345",
+        },
+      ]);
+
+      const record = storage.remoteLaunch.inbound.get("devbox", "lnch_gse_001");
+      expect(record).not.toBeNull();
+      expect(record?.state).toBe("settled");
+      expect(record?.outcome).toBe("launched");
+      expect(record?.sessionId).toBe("ses_remote12345");
+      expect(record?.fromSession).toBe("gse_requester12345");
+      expect(record?.ackDone).toBe(true);
+    });
+
+    it("refuses invalid when from is malformed (not ses_ or gse_ id, or too short/long)", async () => {
+      const deps = makeDeps();
+      const malformedFroms = [
+        "pigeon",
+        "usr_12345678",
+        "ses_short", // 5 chars
+        "gse_short", // 5 chars
+        "ses_" + "a".repeat(129),
+        "gse_" + "a".repeat(129),
+        "invalid with spaces",
+      ];
+
+      for (let i = 0; i < malformedFroms.length; i++) {
+        const launchId = `lnch_malformed_${i}`;
+        const item = {
+          item: "launch",
+          from_machine: "devbox",
+          launch_id: launchId,
+          from: malformedFroms[i],
+          directory: "/home/dev/projects/pigeon",
+          prompt: "echo hello",
+          tag: null,
+          expires_at: now + 60_000,
+        };
+
+        await processLaunchItems(deps, [item]);
+
+        expect(ackMock).toHaveBeenLastCalledWith([
+          {
+            kind: "launch",
+            from_machine: "devbox",
+            launch_id: launchId,
+            outcome: "refused",
+            reason: "invalid",
+          },
+        ]);
+
+        const record = storage.remoteLaunch.inbound.get("devbox", launchId);
+        expect(record?.state).toBe("settled");
+        expect(record?.outcome).toBe("refused");
+        expect(record?.reason).toBe("invalid");
+      }
+    });
+
+    it("keeps ack session_id validation ses_-only and refuses gse_ session_id", () => {
+      // Valid launched ack with ses_ session_id
+      expect(
+        isValidLaunchAckItem({
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_ack_1",
+          outcome: "launched",
+          session_id: "ses_valid12345",
+        }),
+      ).toBe(true);
+
+      // Launched ack with gse_ session_id must be refused (launched session is opencode, ses_-only)
+      expect(
+        isValidLaunchAckItem({
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_ack_2",
+          outcome: "launched",
+          session_id: "gse_invalid12345",
+        }),
+      ).toBe(false);
+
+      // Unconfirmed ack with gse_ session_id must also be refused
+      expect(
+        isValidLaunchAckItem({
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_ack_3",
+          outcome: "unconfirmed",
+          session_id: "gse_invalid12345",
+        }),
+      ).toBe(false);
+
+      // Unconfirmed ack with ses_ session_id is valid
+      expect(
+        isValidLaunchAckItem({
+          kind: "launch",
+          from_machine: "devbox",
+          launch_id: "lnch_ack_4",
+          outcome: "unconfirmed",
+          session_id: "ses_valid12345",
+        }),
+      ).toBe(true);
+    });
+
+    it("REQUESTER_ID regex accepts ses_ and gse_ but rejects other prefixes and bad lengths", () => {
+      expect(REQUESTER_ID.test("ses_12345678")).toBe(true);
+      expect(REQUESTER_ID.test("gse_12345678")).toBe(true);
+      expect(REQUESTER_ID.test("ses_" + "a".repeat(128))).toBe(true);
+      expect(REQUESTER_ID.test("gse_" + "a".repeat(128))).toBe(true);
+      expect(REQUESTER_ID.test("gse_abc-123_xyz")).toBe(true);
+
+      expect(REQUESTER_ID.test("usr_12345678")).toBe(false);
+      expect(REQUESTER_ID.test("pigeon")).toBe(false);
+      expect(REQUESTER_ID.test("ses_short")).toBe(false);
+      expect(REQUESTER_ID.test("gse_short")).toBe(false);
+      expect(REQUESTER_ID.test("ses_" + "a".repeat(129))).toBe(false);
+      expect(REQUESTER_ID.test("gse_" + "a".repeat(129))).toBe(false);
     });
   });
 });
