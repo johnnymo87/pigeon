@@ -312,32 +312,62 @@ export function sanitizeBodyMarkdown(text: string): string {
  */
 function flattenSublists(lines: LineInfo[]): LineInfo[] {
   const out: LineInfo[] = [];
-  // Indentation of the item whose sub-items are being flattened, or null outside a list.
-  let itemIndent: number | null = null;
+  // Content column of the item whose sub-items are flattened, or null outside a list.
+  let parentContent: number | null = null;
+  // The last flattened sub-item: lines under it (its fences, its later paragraphs) move left
+  // by `delta`, so they stay where they belong relative to its new position.
+  let sub: { content: number; delta: number } | null = null;
   const indentOf = (text: string) => text.length - text.trimStart().length;
-  for (const line of lines) {
-    if (line.table || line.fenceLine) {
-      // A fence under an item is indented; anything else at the margin ends the list.
-      if (line.table || indentOf(line.text) === 0) itemIndent = null;
+  const dedent = (line: LineInfo, by: number): LineInfo => {
+    const strip = Math.min(by, indentOf(line.text));
+    return { ...line, text: line.text.slice(strip) };
+  };
+  for (const raw of lines) {
+    const blank = raw.text.trim() === "";
+    const indent = indentOf(raw.text);
+    if (raw.table) {
+      parentContent = null;
+      sub = null;
+      out.push(raw);
+      continue;
+    }
+    if (raw.fenced || blank) {
+      const line = sub && !blank && indent >= sub.content ? dedent(raw, sub.delta) : raw;
+      // A fence at the margin ends the list; one under an item is indented.
+      if (raw.fenceLine && indent === 0) {
+        parentContent = null;
+        sub = null;
+      }
       out.push(line);
       continue;
     }
-    if (line.fenced || line.text.trim() === "") {
-      out.push(line);
-      continue;
-    }
-    const nested =
-      itemIndent !== null && indentOf(line.text) > itemIndent ? line.text.match(NESTED_ITEM) : null;
+    const nested = parentContent !== null && indent >= parentContent ? raw.text.match(NESTED_ITEM) : null;
     if (nested) {
       while (out.length > 0 && !out[out.length - 1]!.fenced && out[out.length - 1]!.text.trim() === "") out.pop();
       const marker = nested[1]!;
-      const lead = /\d/.test(marker) ? marker.slice(0, -1) + "\\" + marker.slice(-1) : "◦";
-      out.push({ ...line, text: `${lead} ${nested[2]!}`, subItem: true });
+      const bullet = /\d/.test(marker) ? marker.slice(0, -1) + "\\" + marker.slice(-1) : "◦";
+      const rest = nested[2]!.replace(/^\[ \](?=[ \t])/, "☐").replace(/^\[[xX]\](?=[ \t])/, "☑");
+      // Right after a fence or quote there is no paragraph to continue, so the line is
+      // indented into the item as a paragraph of its own instead of falling out of the list.
+      const prev = out[out.length - 1];
+      const inside = prev !== undefined && (prev.fenceLine || QUOTE_LINE.test(prev.text));
+      out.push({ ...raw, text: `${inside ? " ".repeat(parentContent!) : ""}${bullet} ${rest}`, subItem: true });
+      const content = raw.text.match(LIST_ITEM)![0].length;
+      sub = { content, delta: content - parentContent! };
       continue;
     }
-    if (LIST_ITEM.test(line.text) && !QUOTE_LINE.test(line.text)) itemIndent = indentOf(line.text);
-    else if (indentOf(line.text) === 0) itemIndent = null;
-    out.push(line);
+    if (sub && indent >= sub.content) {
+      out.push(dedent(raw, sub.delta));
+      continue;
+    }
+    sub = null;
+    if (LIST_ITEM.test(raw.text) && !QUOTE_LINE.test(raw.text)) {
+      // Four spaces with no list open is an indented code block, not a list.
+      if (parentContent !== null || indent < 4) parentContent = raw.text.match(LIST_ITEM)![0].length;
+    } else if (indent === 0) {
+      parentContent = null;
+    }
+    out.push(raw);
   }
   return out;
 }
