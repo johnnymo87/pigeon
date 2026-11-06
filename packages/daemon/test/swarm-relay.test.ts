@@ -251,6 +251,63 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     expect(s.pullInbox.getIdentity("msg_relayed_1")).toBeNull();
   });
 
+  describe("stall-watch coordinators (pigeon-a0o8)", () => {
+    const COORD = "gse_c82dc1cc-cd47-50fd-a5a2-7860b54abc20";
+    function gooseRow(s: StorageDb, over: { endpoint?: string | null; key?: string | null; kind?: string } = {}) {
+      s.sessions.upsert(
+        {
+          sessionId: COORD,
+          backendKind: over.kind ?? GOOSE_BACKEND_KIND,
+          backendEndpoint: over.endpoint === undefined ? "ws://127.0.0.1:4280/acp" : over.endpoint,
+          backendSessionId: "20261104_3",
+          label: "📋 eternal-machinery",
+        },
+        NOW,
+      );
+      const key = over.key === undefined ? "stallwatch:eternal-machinery" : over.key;
+      if (key !== null) s.sessions.pinTopicKey(COORD, key, NOW);
+    }
+
+    it("accepts a coordinator that never granted swarm-remote, and queues it for push delivery", async () => {
+      const s = db();
+      gooseRow(s);
+      expect((await receive(s, [message({ to: COORD })]))[0]).toMatchObject({ outcome: "delivered" });
+      expect(s.swarm.getByMsgId("msg_relayed_1")).toMatchObject({ toSession: COORD, state: "queued" });
+      expect(s.pullInbox.getIdentity("msg_relayed_1")).toBeNull();
+    });
+
+    it("keeps a command-shaped payload a swarm message, never a bare goose command", async () => {
+      const s = db();
+      gooseRow(s);
+      (await receive(s, [message({ to: COORD, payload: "/clear" })]));
+      expect(s.swarm.getByMsgId("msg_relayed_1")?.payload).toBe("/clear");
+    });
+
+    it("still refuses an unbound goose-acp session, a non-tag binding, and a pull session on a coordinator key", async () => {
+      for (const over of [{ key: null }, { key: "stallwatch:_notices" }, { key: "digest:daily" }, { kind: "goose-pull", endpoint: null }]) {
+        const s = db();
+        gooseRow(s, over);
+        s.sessions.setPullSources(COORD, ["telegram-reply", "swarm"], NOW);
+        expect((await receive(s, [message({ to: COORD })]))[0], JSON.stringify(over)).toMatchObject({
+          reason: "remote_not_accepted",
+        });
+      }
+    });
+
+    it("refuses an endpoint-less coordinator row whose mailbox is closed", async () => {
+      const s = db();
+      gooseRow(s, { endpoint: null });
+      expect((await receive(s, [message({ to: COORD })]))[0]).toMatchObject({ reason: "remote_not_accepted" });
+    });
+
+    it("refuses a coordinator again once its topic is unbound", async () => {
+      const s = db();
+      gooseRow(s);
+      s.sessions.setBoundTopicKey(COORD, null, NOW);
+      expect((await receive(s, [message({ to: COORD })]))[0]).toMatchObject({ reason: "remote_not_accepted" });
+    });
+  });
+
   it("banks for a pull session with swarm and swarm-remote, under the worker's retention", async () => {
     const s = db();
     s.sessions.upsert({ sessionId: TARGET, backendKind: "goose-pull" }, NOW);

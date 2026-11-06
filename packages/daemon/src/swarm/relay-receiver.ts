@@ -19,6 +19,7 @@ import { isPullBackend } from "../adapters/goose-pull";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import type { RelayAckItem } from "../worker/relay-client";
 import { bankOrInsertSwarmMessage } from "./bank-or-insert";
+import { coordinatorProgram, isSwarmReachableGooseRow } from "./coordinators";
 import { notifySenderOfFailure } from "./notify-sender";
 import { formatRelayFailureNotice, isReasonCode } from "./relay-notice";
 import { formatWakePayloadAlert, isSuppressedFromRecovery } from "./delivery-policy";
@@ -189,8 +190,12 @@ function receiveMessage(
     }
 
     // 5. `swarm` in pull_sources was a local-trust decision; remote senders need `swarm-remote`.
+    //    Except a stall-watch coordinator (pigeon-a0o8): it is the program's standing address,
+    //    so any session on a machine we accept relays from may reach it without the
+    //    coordinator having contacted that machine first.
     const target = storage.sessions.get(to);
-    if (target && (isPullBackend(target) || target.backendKind === GOOSE_BACKEND_KIND)) {
+    const openCoordinator = coordinatorProgram(target) !== null && isSwarmReachableGooseRow(target);
+    if (target && !openCoordinator && (isPullBackend(target) || target.backendKind === GOOSE_BACKEND_KIND)) {
       if (!target.pullSources.includes("swarm") || !target.pullSources.includes("swarm-remote")) {
         throw new Refusal("remote_not_accepted", `${to} does not accept swarm messages from other machines`);
       }

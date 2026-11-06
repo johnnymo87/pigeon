@@ -37,6 +37,7 @@ import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
 import { handleSessionRename, type SessionRenameDeps } from "./session-rename.js";
+import { coordinatorProgram, isSwarmReachableGooseRow } from "./swarm/coordinators";
 
 const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
 const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
@@ -1216,6 +1217,31 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           },
           { status: 409 },
         );
+      }
+
+      // swarm_list local discovery of goose sessions (pigeon-a0o8): opencode's own session
+      // list cannot show them, and they include every stall-watch coordinator on this machine.
+      // Only rows a local swarm_send reaches, by the predicate delivery itself uses.
+      if (request.method === "GET" && url.pathname === "/swarm/goose-sessions") {
+        const rows = storage.sessions
+          .list({ now: nowFn() })
+          .filter(isSwarmReachableGooseRow)
+          .map((r) => ({
+            session_id: r.sessionId,
+            label: r.label,
+            title: r.title ?? null,
+            cwd: r.cwd ?? null,
+            last_seen: r.lastSeen,
+            program: coordinatorProgram(r),
+          }));
+        // A failed rebind leaves two pinned rows for one program until a bind succeeds. Say so
+        // rather than guess which is live.
+        const perProgram = new Map<string, number>();
+        for (const r of rows) if (r.program) perProgram.set(r.program, (perProgram.get(r.program) ?? 0) + 1);
+        const sessions = rows
+          .map((r) => ({ ...r, rotation_pending: r.program !== null && (perProgram.get(r.program) ?? 0) > 1 }))
+          .sort((a, b) => Number(b.program !== null) - Number(a.program !== null) || b.last_seen - a.last_seen);
+        return Response.json({ sessions });
       }
 
       // swarm_list remote discovery (pigeon-k0qn.9): sessions on OTHER machines, from the
