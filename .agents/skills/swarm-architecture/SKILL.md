@@ -312,7 +312,7 @@ Per message item, first refusal wins and is acked `refused` with the code. The w
 2. Shape (`parseSwarmSendBody`, which rejects `from='pigeon'`, reserved kinds and the close tag; plus a `ses_` or `gse_` sender) → `invalid`.
 3. `msg_id` already known here: a re-handout after a lost ack (an inbound record with the same machine, sender, target and payload) is acked `delivered`. Anything else → `msg_id_conflict`.
 4. `from` is a session on this machine (a `sessions` row, or locality `local`, which covers subagents and reaped sessions) → `from_is_local`. Locality `unknown` passes, so a sick serve cannot hold relays hostage.
-5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`.
+5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`. Exception (`pigeon-a0o8`): a stall-watch coordinator (goose-acp, bound to `stallwatch:<tag>` with a valid tag, locally reachable) is accepted without `swarm-remote` (`swarm/coordinators.ts`).
 6. Insert through `bankOrInsertSwarmMessage` with the original fields, plus the `swarm_relay_inbound` record, in one transaction. A `refused` result (`scheduled`, `payload_too_large`, `no_mailbox`, `no_session`) is acked with that code. A relayed message banked in a pull inbox gets a 5-day TTL (`RELAYED_PULL_TTL_MS`), not 7, so its expiry is still reportable while the worker remembers the row.
 
 An item whose processing throws is left unacked, so the worker offers it again (up to its 5 leases); a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its Telegram notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
@@ -362,7 +362,7 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 - A relayed-in row stuck in one of the watchdog's non-terminal states reports nothing to its sender: blocked behind a turn, silent in flight, no healthy serve, or a 404 with no second opinion. The sender's row was already verified at handoff.
 - A failure more than 7 days after the relay is not reported, because the worker has forgotten the row.
 - An ambiguous relay can mislead. Suppose the worker stored a relay whose 202 was lost, every retry then hits a transient error, and the receiver never answers. The attempt budget then reports "NOT received, safe to resend" while the worker still holds the message.
-- Channels are not relayed. Goose sessions relay and receive cross-machine once they reach out (design `2026-11-04-goose-cross-machine-design.md`); remote discovery (`swarm_list remote: true`) still lists `ses_` sessions only.
+- Channels are not relayed. Goose sessions relay and receive cross-machine once they reach out (design `2026-11-04-goose-cross-machine-design.md`); stall-watch coordinators receive cross-machine without reaching out (`pigeon-a0o8`, design `2026-11-06-coordinator-discovery-design.md`). Remote discovery (`swarm_list remote: true`) lists `ses_` sessions plus, in a separate `coordinators` array outside `limit`, other machines' coordinators; other `gse_` sessions are not listed. Local `swarm_list` lists this machine's swarm-reachable goose sessions from daemon `GET /swarm/goose-sessions`, coordinators marked.
 
 ## Remote Launch (pigeon-k0qn.17)
 

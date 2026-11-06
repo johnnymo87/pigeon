@@ -213,7 +213,7 @@ curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_token)" 
 # A 401 machine_credential_required inside worker_error: this daemon polls with the shared key, not a pgk_ key.
 ```
 
-This is the same data agents get from `swarm_list remote: true`.
+This is the same data agents get from `swarm_list remote: true`. Its `coordinators` array (`pigeon-a0o8`) is other machines' stall-watch coordinators; local ones come from `GET /swarm/goose-sessions`, which local `swarm_list` appends after the opencode table.
 
 ### Inspecting relayed rows
 
