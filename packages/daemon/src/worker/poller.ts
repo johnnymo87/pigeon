@@ -148,6 +148,8 @@ async function safeExecuteWorkerFetch<T = unknown>(
 export interface RemoteSessionsListing {
   machine_id: string;
   sessions: Array<{ session_id: string; machine_id: string; label: string | null; updated_at: number }>;
+  /** Stall-watch coordinators on other machines (pigeon-a0o8). Absent from an older worker; passed through as is. */
+  coordinators?: Array<{ session_id: string; machine_id: string; program: string; label: string | null; updated_at: number }>;
   machines: Array<{ machine_id: string; relay: string; last_poll_at: number | null }>;
   truncated: boolean;
 }

@@ -47,7 +47,8 @@ export const RELAY_MAX_ACK_ITEMS = 100;
 /** Most machines an accept list may name (also bounds D1's bound-parameter count). */
 export const RELAY_MAX_ACCEPT = 16;
 
-const TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
+/** An id the relay accepts as a target. */
+export const TARGET_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
 /** A `ses_` id the relay accepts, as sender or (with `gse_`, TARGET_ID) as target. */
 export const SENDER_ID = /^ses_[A-Za-z0-9_-]{8,128}$/;
 export const RELAY_SENDER_ID = /^(ses|gse)_[A-Za-z0-9_-]{8,128}$/;
