@@ -145,6 +145,59 @@ describe("sanitizeBodyMarkdown", () => {
     );
   });
 
+  // pigeon-ravn: the Telegram app draws a list item that holds a nested list with its bullet
+  // on a line of its own (seen on phone, probes A/B/D). Sub-items become `◦` lines of the
+  // parent item instead (the user's pick, probe E).
+  it("flattens a nested list into ◦ lines of its parent item", () => {
+    expect(sanitizeBodyMarkdown("- **A:** text\n  - sub one\n  - sub two\n- **B:** more")).toBe(
+      "- **A:** text  \n◦ sub one  \n◦ sub two  \n- **B:** more",
+    );
+  });
+
+  it("escapes an ordered sub-item's number so it does not start a new list", () => {
+    expect(sanitizeBodyMarkdown("1. a\n   1. sub\n   2) sub")).toBe("1. a  \n1\\. sub  \n2\\) sub");
+  });
+
+  it("flattens deeper levels and keeps a sub-item's own continuation", () => {
+    expect(sanitizeBodyMarkdown("- a\n  - b\n    - c\n      more of c")).toBe(
+      "- a  \n◦ b  \n◦ c  \n  more of c",
+    );
+  });
+
+  it("pulls a sub-list separated by a blank line into its item", () => {
+    expect(sanitizeBodyMarkdown("- a\n\n  - b\n\n- c")).toBe("- a  \n◦ b\n\n- c");
+  });
+
+  it("leaves an indented list that has no parent item alone", () => {
+    expect(sanitizeBodyMarkdown("para\n\n  - x\n  - y")).toBe("para\n\n  - x  \n  - y");
+  });
+
+  it("keeps a fence under a sub-item a fence, moved left with its item", () => {
+    const md = "- a\n    - b:\n        ```ts\n        const x = 1;\n        ```\n- c";
+    expect(sanitizeBodyMarkdown(md)).toBe("- a  \n◦ b:\n    ```ts\n    const x = 1;\n    ```\n- c");
+  });
+
+  it("keeps a sub-item after a fence inside its item", () => {
+    const md = "1. Step\n   ```bash\n   cmd\n   ```\n   - note\n2. Next";
+    expect(sanitizeBodyMarkdown(md)).toBe("1. Step\n   ```bash\n   cmd\n   ```\n   ◦ note  \n2. Next");
+  });
+
+  it("does not flatten a sibling indented less than its item's content", () => {
+    expect(sanitizeBodyMarkdown("- a\n - b")).toBe("- a  \n - b");
+  });
+
+  it("turns task-list checkboxes on sub-items into ☐ and ☑", () => {
+    expect(sanitizeBodyMarkdown("- a\n  - [ ] t\n  - [x] u")).toBe("- a  \n◦ ☐ t  \n◦ ☑ u");
+  });
+
+  it("leaves an indented code block that looks like a list alone", () => {
+    expect(sanitizeBodyMarkdown("para\n\n    - x\n      - y")).toBe("para\n\n    - x  \n      - y");
+  });
+
+  it("leaves list-like lines in fenced code alone", () => {
+    expect(sanitizeBodyMarkdown("- a\n  ```\n  - x\n  ```")).toBe("- a\n  ```\n  - x\n  ```");
+  });
+
   it("adds no spacer before an indented continuation of a list item", () => {
     expect(sanitizeBodyMarkdown("- a\n\n  more of a\n- b")).toBe("- a\n\n  more of a  \n- b");
   });
