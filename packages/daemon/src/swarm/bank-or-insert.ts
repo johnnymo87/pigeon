@@ -3,6 +3,7 @@ import type { Priority } from "../storage/swarm-repo";
 import { isPullBackend } from "../adapters/goose-pull";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { enqueueSwarmTelegramNotice } from "./telegram-notice";
+import { isGoosePushRow } from "./coordinators";
 
 export interface BankOrInsertInput {
   msgId: string;
@@ -76,11 +77,7 @@ export function bankOrInsertSwarmMessage(
   // coordinators (notify on) and honk chat sessions known only from a swarm-tool
   // call (notify off, so their turns are not mirrored to Telegram). Only a goose
   // row with no endpoint falls back to the pull mailbox.
-  const isGoosePush = Boolean(
-    targetSession &&
-      targetSession.backendKind === GOOSE_BACKEND_KIND &&
-      targetSession.backendEndpoint,
-  );
+  const isGoosePush = isGoosePushRow(targetSession);
 
   if (
     targetSession &&

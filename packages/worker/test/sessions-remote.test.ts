@@ -22,6 +22,7 @@ const RETIRED: Partial<Env> = { SHARED_KEY_REFUSED_MACHINES: `${A},${B},${C}` };
 interface Listing {
   machine_id: string;
   sessions: Array<{ session_id: string; machine_id: string; label: string | null; updated_at: number }>;
+  coordinators: Array<{ session_id: string; machine_id: string; program: string; label: string | null; updated_at: number }>;
   machines: Array<{ machine_id: string; relay: string; last_poll_at: number | null }>;
   truncated: boolean;
 }
@@ -69,6 +70,7 @@ beforeEach(async () => {
   clearCredentialCache();
   await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_rmt%' OR session_id LIKE 'gse_rmt%'").run();
   await env.DB.prepare("DELETE FROM machines WHERE machine_id LIKE 'rmt-%'").run();
+  await env.DB.prepare("DELETE FROM named_topic_bindings WHERE session_id LIKE 'gse_rmt%'").run();
   await env.DB.prepare("DELETE FROM machine_relay_accept WHERE machine_id LIKE 'rmt-%'").run();
   await env.DB.prepare(
     `INSERT OR REPLACE INTO machine_credentials (key_sha256, machine_id, created_at, revoked_at, note)
@@ -76,6 +78,48 @@ beforeEach(async () => {
   )
     .bind(await sha256Hex(KEY_A), A, Date.now())
     .run();
+});
+
+async function seedBinding(sessionId: string, topicKey: string, chatId = "-100rmt") {
+  await env.DB.prepare(
+    "INSERT OR REPLACE INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+  )
+    .bind(chatId, topicKey, sessionId, Date.now())
+    .run();
+}
+
+const myCoords = (l: Listing) => l.coordinators.filter((c) => c.session_id.startsWith("gse_rmt"));
+
+describe("GET /sessions/remote coordinators (pigeon-a0o8)", () => {
+  it("lists other machines' stall-watch coordinators, with their program, outside the limit", async () => {
+    const now = Date.now() + 600_000;
+    await seedSession("gse_rmtCoordOnB01", B, now - 3_600_000, "📋 pigeon");
+    await seedBinding("gse_rmtCoordOnB01", "stallwatch:pigeon");
+    await seedSession("ses_rmtFillerOnB1", B, now);
+    const l = await list("?limit=1");
+    expect(myCoords(l)).toEqual([
+      { session_id: "gse_rmtCoordOnB01", machine_id: B, program: "pigeon", label: "📋 pigeon", updated_at: now - 3_600_000 },
+    ]);
+    expect(l.sessions.some((s) => s.session_id.startsWith("gse_"))).toBe(false);
+    expect(machine(l, B)).toBeDefined();
+  });
+
+  it("leaves out the caller's own coordinators, stale rows, other bindings, non-tag suffixes and unbound goose rows", async () => {
+    const now = Date.now();
+    const cases: Array<[string, string, number, string | null]> = [
+      ["gse_rmtCoordOnA01", A, now, "stallwatch:mine"],
+      ["gse_rmtCoordStale", B, now - REGISTER_TAKEOVER_STALE_MS - 1_000, "stallwatch:old"],
+      ["gse_rmtDigestOnB1", B, now, "digest:daily"],
+      ["gse_rmtNoticesOnB", B, now, "stallwatch:_notices"],
+      ["gse_rmtUnboundOnB", B, now, null],
+    ];
+    for (const [id, m, at, key] of cases) {
+      await seedSession(id, m, at);
+      if (key) await seedBinding(id, key);
+    }
+    await seedBinding("gse_rmtNoSessionRow", "stallwatch:ghost");
+    expect(myCoords(await list())).toEqual([]);
+  });
 });
 
 describe("GET /sessions/remote", () => {

@@ -4,6 +4,8 @@ import {
   swarmListRemote,
   formatRemoteSessions,
   formatSessions,
+  formatGooseSessions,
+  swarmListGoose,
   type RemoteSessionsListing,
   createSwarmListTool,
   SWARM_LIST_TOOL_NAME,
@@ -298,6 +300,103 @@ describe("createSwarmListTool remote: true", () => {
     await def.execute({ remote: false }, ctx([]))
     await def.execute({}, ctx([]))
     expect(serve.seen).toHaveLength(2)
-    expect(daemon.seen).toHaveLength(0)
+    // The local listing asks the daemon only for this machine's goose sessions.
+    expect(daemon.seen.map((c) => new URL(c.url).pathname)).toEqual(["/swarm/goose-sessions", "/swarm/goose-sessions"])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// goose sessions and coordinators (pigeon-a0o8)
+// ---------------------------------------------------------------------------
+
+const GOOSE = {
+  sessions: [
+    {
+      session_id: "gse_c82dc1cc-cd47-50fd-a5a2-7860b54abc20",
+      label: "📋 eternal-machinery",
+      title: null,
+      cwd: "/tmp",
+      last_seen: 4_000,
+      program: "eternal-machinery",
+      rotation_pending: false,
+    },
+    { session_id: "gse_chat0000000001", label: "20261104_2", title: "e2e pong", cwd: "/tmp", last_seen: 9_000, program: null },
+  ],
+}
+
+describe("local swarm_list lists goose sessions too (pigeon-a0o8)", () => {
+  const tool = (daemonResponse: () => Response) => {
+    const serve = capturingFetch(() => okSessions(SAMPLE))
+    const daemon = capturingFetch(daemonResponse)
+    return createSwarmListTool("http://127.0.0.1:4096", serve.fetchFn, {
+      daemonBaseUrl: "http://127.0.0.1:4731",
+      fetchFn: daemon.fetchFn,
+    })
+  }
+
+  test("appends the goose table after the opencode one, marking coordinators", async () => {
+    const out = (await tool(() => okJson(GOOSE)).execute({}, ctx([]))) as string
+    expect(out.indexOf("ses_new")).toBeLessThan(out.indexOf("Goose sessions on this machine"))
+    expect(out).toMatch(/gse_c82dc1cc-cd47-50fd-a5a2-7860b54abc20\s+\S+\s+"📋 eternal-machinery"\s+coordinator of eternal-machinery/)
+    expect(out).toMatch(/gse_chat0000000001\s+\S+\s+"e2e pong"$/m)
+    expect(out).toMatch(/Program coordinators on other machines: swarm_list with remote: true\.$/)
+  })
+
+  test("marks a program whose coordinator rotation is pending", () => {
+    const out = formatGooseSessions([{ ...GOOSE.sessions[0]!, rotation_pending: true }], 10_000)
+    expect(out).toContain("coordinator of eternal-machinery (rotation pending")
+  })
+
+  test("a daemon failure costs one line, never the opencode listing", async () => {
+    const cases: Array<[() => Response, RegExp]> = [
+      [() => okJson({ error: "nope" }, 404), /could not be listed: this machine's pigeon daemon is too old/],
+      [() => okJson({ error: "boom" }, 500), /could not be listed: daemon answered 500/],
+      [() => { throw new Error("ECONNREFUSED") }, /could not be listed: ECONNREFUSED/],
+    ]
+    for (const [res, line] of cases) {
+      const out = (await tool(res).execute({}, ctx([]))) as string
+      expect(out).toContain("ses_new")
+      expect(out).toMatch(line)
+    }
+  })
+
+  test("without a daemon configured, says so", async () => {
+    const serve = capturingFetch(() => okSessions(SAMPLE))
+    const out = (await createSwarmListTool("http://127.0.0.1:4096", serve.fetchFn).execute({}, ctx([]))) as string
+    expect(out).toContain("ses_new")
+    expect(out).toMatch(/could not be listed: no pigeon daemon is configured/)
+  })
+
+  test("swarmListGoose gives up after its timeout", async () => {
+    const hang = ((_u: unknown, init?: RequestInit) =>
+      new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("timed out"))))) as typeof fetch
+    await expect(swarmListGoose({ daemonBaseUrl: "http://127.0.0.1:4731", fetchFn: hang, timeoutMs: 20 })).rejects.toThrow(/timed out/)
+  })
+
+  test("remote listing prints coordinators on other machines first", () => {
+    const out = formatRemoteSessions(
+      {
+        ...REMOTE,
+        coordinators: [
+          { session_id: "gse_onCloudbox0001", machine_id: "cloudbox2", program: "pigeon", label: "📋 pigeon", updated_at: 9_000 },
+        ],
+      },
+      10_000,
+    )
+    expect(out.indexOf("Program coordinators")).toBeLessThan(out.indexOf("Sessions on machines other than"))
+    expect(out).toMatch(/gse_onCloudbox0001\s+cloudbox2\s+coordinator of pigeon/)
+  })
+
+  test("remote listing with only coordinators is not reported as empty", () => {
+    const out = formatRemoteSessions(
+      {
+        ...REMOTE,
+        sessions: [],
+        coordinators: [{ session_id: "gse_onCloudbox0001", machine_id: "x", program: "p", label: null, updated_at: 1 }],
+      },
+      10_000,
+    )
+    expect(out).not.toContain("No sessions on other machines")
+    expect(out).toContain("coordinator of p")
   })
 })

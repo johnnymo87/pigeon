@@ -10,7 +10,8 @@
  */
 
 import { requireMachinePrincipal, MACHINE_ID_PATTERN } from "./credentials";
-import { isMissingTable, relayReachability, SENDER_ID, type RelayReachability } from "./relay";
+import { isMissingTable, relayReachability, SENDER_ID, TARGET_ID, type RelayReachability } from "./relay";
+import { isValidTag } from "./tag-command";
 import { REGISTER_TAKEOVER_STALE_MS } from "./sessions";
 import { withD1, StorageError } from "./d1";
 
@@ -66,9 +67,11 @@ export async function handleRemoteSessions(
   }
 
   try {
-    // Only ids the relay would accept as a target are listed: `gse_` because a goose session
-    // cannot be a remote target (design §7), and anything malformed because the relay would
-    // answer 400 and because ids are unvalidated free text (see cleanLabel). The same goes for
+    // Only `ses_` ids here: a goose session is reachable from another machine only once it has
+    // made contact itself (design 2026-11-04 D2), so listing every `gse_` would offer targets
+    // that answer remote_not_accepted. Coordinators are the exception and are listed below.
+    // Anything malformed is left out because the relay would answer 400 and because ids are
+    // unvalidated free text (see cleanLabel). The same goes for
     // machine ids: the shared key may still register a session as any unretired machine name. The filter is in
     // JS, so the query is not LIMITed; it is bounded by MAX_SESSIONS (~820 rows today).
     const { results } = await withD1(
@@ -91,10 +94,42 @@ export async function handleRemoteSessions(
       updated_at: r.updated_at,
     }));
 
+    // Stall-watch program coordinators on other machines (pigeon-a0o8): goose sessions bound to
+    // the named topic `stallwatch:<tag>`. Their receivers accept relayed messages without prior
+    // contact. Outside `limit` on purpose: the point is that they are always findable, and one
+    // busy machine registers hundreds of `ses_` rows a week. The binding's key is unique per
+    // chat, so a coordinator rotation that has not rebound yet shows only the bound row.
+    // `substr`, not LIKE: LIKE ignores ASCII case, and the receiver's rule does not. Legacy
+    // goose-pull coordinator readers use `ses_stallwatch_<tag>` ids, so the gse_ filter
+    // leaves them out (the receiver would refuse them).
+    const { results: coordRows } = await withD1(
+      "remoteSessions.coordinators",
+      db
+        .prepare(
+          `SELECT s.session_id, s.machine_id, s.label, s.updated_at, b.topic_key
+           FROM named_topic_bindings b JOIN sessions s ON s.session_id = b.session_id
+           WHERE substr(b.topic_key, 1, 11) = 'stallwatch:' AND s.machine_id <> ? AND s.updated_at >= ?
+             AND substr(s.session_id, 1, 4) = 'gse_'
+           ORDER BY s.machine_id ASC, b.topic_key ASC`,
+        )
+        .bind(caller, now - REMOTE_SESSIONS_HORIZON_MS)
+        .all<Row & { topic_key: string }>(),
+    );
+    const coordinators = coordRows
+      .map((r) => ({ ...r, program: r.topic_key.slice("stallwatch:".length) }))
+      .filter((r) => TARGET_ID.test(r.session_id) && MACHINE_ID_PATTERN.test(r.machine_id) && isValidTag(r.program))
+      .map((r) => ({
+        session_id: r.session_id,
+        machine_id: r.machine_id,
+        program: r.program,
+        label: cleanLabel(r.label),
+        updated_at: r.updated_at,
+      }));
+
     // What a send from the caller would be told, per machine listed. A snapshot only: the
     // relay route re-checks on every send. A missing relay schema reads as "unknown" rather
     // than failing the listing, which is still useful without it.
-    const machineIds = [...new Set(sessions.map((s) => s.machine_id))].sort();
+    const machineIds = [...new Set([...sessions, ...coordinators].map((s) => s.machine_id))].sort();
     const machines: Array<{ machine_id: string; relay: RelayReachability | "unknown"; last_poll_at: number | null }> = [];
     for (const id of machineIds) {
       try {
@@ -111,7 +146,7 @@ export async function handleRemoteSessions(
       }
     }
 
-    return Response.json({ machine_id: caller, sessions, machines, truncated });
+    return Response.json({ machine_id: caller, sessions, coordinators, machines, truncated });
   } catch (err) {
     if (err instanceof StorageError) {
       console.error("[worker] storage error", { op: err.op, error: err.message });

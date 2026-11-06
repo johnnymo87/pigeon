@@ -2,7 +2,9 @@
  * swarm_list — opencode tool that lists local opencode sessions across all
  * projects, so an agent can discover the session ids of its peers (e.g. to
  * pick a `to` for swarm_send). This replaces the old `opencode-send --list`
- * CLI.
+ * CLI. It then lists this machine's goose sessions from the pigeon daemon, with
+ * stall-watch program coordinators marked (pigeon-a0o8): those are the sessions
+ * an agent asked to "report to the coordinator" needs, and no opencode list has them.
  *
  * With `remote: true` (pigeon-k0qn.9) it lists sessions on OTHER machines
  * instead, from the pigeon daemon's `GET /swarm/remote-sessions`, which
@@ -98,6 +100,72 @@ export function formatSessions(sessions: SwarmSession[], now: number): string {
   return [header.join("  "), ...rows].join("\n")
 }
 
+/** One row of the daemon's `GET /swarm/goose-sessions` (pigeon-a0o8). */
+export interface GooseSession {
+  session_id: string
+  label: string | null
+  title: string | null
+  cwd: string | null
+  last_seen: number
+  /** The program this session coordinates (stall-watch), or null. */
+  program: string | null
+  /** Two rows claim this program until a coordinator rebind succeeds. */
+  rotation_pending?: boolean
+}
+
+/** Bound on the daemon call: the opencode listing must never wait long on it. */
+export const GOOSE_LIST_TIMEOUT_MS = 2_000
+
+/**
+ * GET the daemon's /swarm/goose-sessions: goose sessions on this machine a swarm_send
+ * reaches, including every stall-watch coordinator. Throws on any failure; the tool
+ * turns that into one line rather than failing the whole listing.
+ */
+export async function swarmListGoose(opts: {
+  daemonBaseUrl: string
+  fetchFn?: typeof fetch
+  timeoutMs?: number
+}): Promise<GooseSession[]> {
+  const fetchFn = opts.fetchFn ?? fetch
+  const url = new URL("/swarm/goose-sessions", opts.daemonBaseUrl).toString()
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? GOOSE_LIST_TIMEOUT_MS)
+  const send = () => {
+    const token = resolveDaemonToken()
+    const headers: Record<string, string> = {}
+    if (token) headers["Authorization"] = `Bearer ${token}`
+    return fetchFn(url, { headers, signal })
+  }
+  let res = await send()
+  if (res.status === 401) {
+    invalidateDaemonToken()
+    res = await send()
+  }
+  if (!res.ok) {
+    throw new Error(res.status === 404 ? "this machine's pigeon daemon is too old to list them" : `daemon answered ${res.status}`)
+  }
+  const body = (await res.json()) as { sessions?: GooseSession[] }
+  return Array.isArray(body.sessions) ? body.sessions : []
+}
+
+function coordinatorNote(program: string, rotationPending?: boolean): string {
+  return `coordinator of ${program}${rotationPending ? " (rotation pending: two sessions claim it; run `coordinator " + program + "` to see which is bound)" : ""}`
+}
+
+/** Render the goose table that follows the opencode one in a local listing. */
+export function formatGooseSessions(sessions: GooseSession[], now: number): string {
+  if (sessions.length === 0) return "No goose sessions on this machine accept swarm messages."
+  const rows = sessions.map((s) => {
+    const name = s.title ?? s.label ?? ""
+    const note = s.program ? coordinatorNote(s.program, s.rotation_pending) : ""
+    return `${s.session_id}  ${relativeAge(s.last_seen, now)}  ${JSON.stringify(name.slice(0, 60))}  ${note}`.trimEnd()
+  })
+  return [
+    "Goose sessions on this machine (stall-watch program coordinators marked; swarm_send reaches each):",
+    ["ID", "SEEN", "NAME", "ROLE"].join("  "),
+    ...rows,
+  ].join("\n")
+}
+
 /** The worker clamps `limit` to this (REMOTE_SESSIONS_MAX_LIMIT). */
 export const REMOTE_LIMIT_MAX = 500
 
@@ -106,6 +174,8 @@ export interface RemoteSessionsListing {
   /** The machine this daemon runs on, as the worker resolved its credential. */
   machine_id: string
   sessions: Array<{ session_id: string; machine_id: string; label: string | null; updated_at: number }>
+  /** Stall-watch coordinators on other machines (pigeon-a0o8), outside `limit`. Absent from an old worker. */
+  coordinators?: Array<{ session_id: string; machine_id: string; program: string; label: string | null; updated_at: number }>
   /** Per listed machine: what POST /swarm/relay would answer for a send from this machine. */
   machines: Array<{ machine_id: string; relay: string; last_poll_at: number | null }>
   truncated: boolean
@@ -183,7 +253,8 @@ function explainRelay(
  */
 export function formatRemoteSessions(listing: RemoteSessionsListing, now: number): string {
   const self = listing.machine_id
-  if (listing.sessions.length === 0) {
+  const coordinators = Array.isArray(listing.coordinators) ? listing.coordinators : []
+  if (listing.sessions.length === 0 && coordinators.length === 0) {
     return `No sessions on other machines were active in the last 7 days (asked from ${self}).`
   }
   // SEEN, not UPDATED: the worker row is also bumped by the owner's daily re-registration, so
@@ -193,7 +264,16 @@ export function formatRemoteSessions(listing: RemoteSessionsListing, now: number
   const rows = listing.sessions.map((s) =>
     `${s.session_id}  ${relativeAge(s.updated_at, now)}  ${s.machine_id}  ${s.label ? JSON.stringify(s.label) : ""}`.trimEnd(),
   )
-  const out = [`Sessions on machines other than ${self}:`, header.join("  "), ...rows]
+  const out: string[] = []
+  if (coordinators.length > 0) {
+    out.push(
+      `Program coordinators (stall-watch) on machines other than ${self}:`,
+      ["ID", "MACHINE", "ROLE"].join("  "),
+      ...coordinators.map((c) => `${c.session_id}  ${c.machine_id}  ${coordinatorNote(c.program)}`),
+      "",
+    )
+  }
+  out.push(`Sessions on machines other than ${self}:`, header.join("  "), ...rows)
   if (listing.truncated) {
     out.push(`(more sessions matched; pass a larger limit, up to ${REMOTE_LIMIT_MAX}, to see them)`)
   }
@@ -234,10 +314,11 @@ export function createSwarmListTool(
   return tool({
     description:
       "List local opencode sessions across all projects (id, last-updated, " +
-      "directory, title), most-recently-updated first. Use this to discover " +
-      "the session id of a peer to message with swarm_send. With remote: true, " +
-      "list sessions on OTHER machines instead (id, last-updated, machine, label), " +
-      "and whether a swarm_send to each machine can be relayed right now.",
+      "directory, title), most-recently-updated first, then this machine's goose " +
+      "sessions, with each stall-watch program coordinator marked `coordinator of <program>`. " +
+      "Use this to discover the session id of a peer, or of a program's coordinator, to " +
+      "message with swarm_send. With remote: true, list sessions and program coordinators " +
+      "on OTHER machines instead, and whether a swarm_send to each machine can be relayed right now.",
     args: {
       limit: tool.schema
         .number()
@@ -264,16 +345,28 @@ export function createSwarmListTool(
         })
         return formatRemoteSessions(listing, Date.now())
       }
-      const sessions = await swarmList({
-        serverUrl,
-        fetchFn,
-        limit: args.limit,
-      })
+      // Both at once; the goose half never fails the listing (pigeon-a0o8).
+      const goose = remote
+        ? swarmListGoose({ daemonBaseUrl: remote.daemonBaseUrl, fetchFn: remote.fetchFn }).then(
+            (rows) => ({ ok: true as const, rows }),
+            (err: unknown) => ({ ok: false as const, why: err instanceof Error ? err.message : String(err) }),
+          )
+        : Promise.resolve({ ok: false as const, why: "no pigeon daemon is configured for this plugin" })
+      const [sessions, gooseResult] = await Promise.all([
+        swarmList({ serverUrl, fetchFn, limit: args.limit }),
+        goose,
+      ])
       ctx.metadata({
         title: `swarm sessions (${sessions.length})`,
         metadata: { count: sessions.length },
       })
-      return formatSessions(sessions, Date.now())
+      const now = Date.now()
+      const gooseText = gooseResult.ok
+        ? formatGooseSessions(gooseResult.rows, now)
+        : `Goose sessions (including program coordinators) could not be listed: ${gooseResult.why}.`
+      // Coordinators of programs run on other machines are not here; say where they are.
+      const elsewhere = "Program coordinators on other machines: swarm_list with remote: true."
+      return `${formatSessions(sessions, now)}\n\n${gooseText}\n${elsewhere}`
     },
   })
 }

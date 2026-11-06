@@ -91,7 +91,7 @@ Revocation and exposure (accepted, documented):
   (`PIGEON_SWARM_RELAY_ACCEPT_FROM`) can prompt it, not only the one it launched — the same exposure
   every opencode session has. If remote prompt injection into a coordinator becomes a concern,
   narrow acceptance to contacted peers or give the opt-in a TTL.
-- Open policy question: whether topic-bound coordinators should be excluded from implicit grants or swarm-remote should get a TTL (not built).
+- Open policy question: whether topic-bound coordinators should be excluded from implicit grants or swarm-remote should get a TTL (not built). Answered the other way on 2026-11-06: coordinators are reachable from other machines without contact (`2026-11-06-coordinator-discovery-design.md`, `pigeon-a0o8`).
 - `from` on `/swarm/send` and `/swarm/launch` is unauthenticated locally (one shared bearer
   token), so a local process can mark any `gse_` row; it could already prompt that row locally.
 
