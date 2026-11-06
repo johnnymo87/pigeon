@@ -339,6 +339,7 @@ describe("local swarm_list lists goose sessions too (pigeon-a0o8)", () => {
     expect(out.indexOf("ses_new")).toBeLessThan(out.indexOf("Goose sessions on this machine"))
     expect(out).toMatch(/gse_c82dc1cc-cd47-50fd-a5a2-7860b54abc20\s+\S+\s+"📋 eternal-machinery"\s+coordinator of eternal-machinery/)
     expect(out).toMatch(/gse_chat0000000001\s+\S+\s+"e2e pong"$/m)
+    expect(out).toMatch(/Program coordinators on other machines: swarm_list with remote: true\.$/)
   })
 
   test("marks a program whose coordinator rotation is pending", () => {

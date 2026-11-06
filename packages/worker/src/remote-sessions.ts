@@ -99,13 +99,16 @@ export async function handleRemoteSessions(
     // contact. Outside `limit` on purpose: the point is that they are always findable, and one
     // busy machine registers hundreds of `ses_` rows a week. The binding's key is unique per
     // chat, so a coordinator rotation that has not rebound yet shows only the bound row.
+    // `substr`, not LIKE: LIKE ignores ASCII case, and the receiver's rule does not. Legacy
+    // goose-pull coordinator readers use `ses_stallwatch_<tag>` ids, so the gse_ filter
+    // leaves them out (the receiver would refuse them).
     const { results: coordRows } = await withD1(
       "remoteSessions.coordinators",
       db
         .prepare(
           `SELECT s.session_id, s.machine_id, s.label, s.updated_at, b.topic_key
            FROM named_topic_bindings b JOIN sessions s ON s.session_id = b.session_id
-           WHERE b.topic_key LIKE 'stallwatch:%' AND s.machine_id <> ? AND s.updated_at >= ?
+           WHERE substr(b.topic_key, 1, 11) = 'stallwatch:' AND s.machine_id <> ? AND s.updated_at >= ?
              AND substr(s.session_id, 1, 4) = 'gse_'
            ORDER BY s.machine_id ASC, b.topic_key ASC`,
         )

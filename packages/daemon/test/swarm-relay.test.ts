@@ -276,7 +276,9 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
       expect(s.pullInbox.getIdentity("msg_relayed_1")).toBeNull();
     });
 
-    it("keeps a command-shaped payload a swarm message, never a bare goose command", async () => {
+    // Delivery wraps every swarm row in its <swarm_message> envelope (renderPrompt), so a row,
+    // not a raw prompt, is what keeps `/clear` from running as a goose command.
+    it("stores a command-shaped payload as an ordinary swarm row", async () => {
       const s = db();
       gooseRow(s);
       (await receive(s, [message({ to: COORD, payload: "/clear" })]));

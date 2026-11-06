@@ -37,14 +37,16 @@ with the worker every hour, so D1 always knows which machine owns them.
 
 - New daemon route `GET /swarm/goose-sessions` returns goose-acp rows that a local
   `swarm_send` can reach, by the same predicate `bankOrInsertSwarmMessage` uses (an
-  endpoint, so pushed; or no endpoint and `"swarm"` in `pull_sources`, so banked), state
-  not `ended`:
+  endpoint, so pushed; or no endpoint and `"swarm"` in `pull_sources`, so banked):
   `{sessions: [{session_id, label, title, cwd, last_seen, program}]}`, where `program` is
   the `stallwatch:` suffix or null. Coordinators first, then by `last_seen` desc.
 - The plugin's local `swarm_list` appends a second table, "Goose sessions on this
   machine", marking each coordinator `coordinator of <program>`.
 - **Rotation.** A failed rebind leaves two pinned rows for one program until a bind
-  succeeds. Both are listed, each marked `(rotation pending)`, rather than guessing.
+  succeeds. Both are listed, each marked `(rotation pending)` with a pointer to
+  `coordinator <program>`, rather than guessing.
+- The local listing always ends with one line pointing at `remote: true` for coordinators
+  of programs run on other machines.
 - **Failure never fails the tool.** A daemon error, timeout (2s) or 404 (old daemon)
   appends one line saying goose sessions could not be listed and why; the opencode table
   is still returned. The tool must not become less available than it is today.

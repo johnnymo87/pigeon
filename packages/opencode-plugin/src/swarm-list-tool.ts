@@ -148,7 +148,7 @@ export async function swarmListGoose(opts: {
 }
 
 function coordinatorNote(program: string, rotationPending?: boolean): string {
-  return `coordinator of ${program}${rotationPending ? " (rotation pending: two sessions claim it; prefer the newer)" : ""}`
+  return `coordinator of ${program}${rotationPending ? " (rotation pending: two sessions claim it; run `coordinator " + program + "` to see which is bound)" : ""}`
 }
 
 /** Render the goose table that follows the opencode one in a local listing. */
@@ -364,7 +364,9 @@ export function createSwarmListTool(
       const gooseText = gooseResult.ok
         ? formatGooseSessions(gooseResult.rows, now)
         : `Goose sessions (including program coordinators) could not be listed: ${gooseResult.why}.`
-      return `${formatSessions(sessions, now)}\n\n${gooseText}`
+      // Coordinators of programs run on other machines are not here; say where they are.
+      const elsewhere = "Program coordinators on other machines: swarm_list with remote: true."
+      return `${formatSessions(sessions, now)}\n\n${gooseText}\n${elsewhere}`
     },
   })
 }
