@@ -107,8 +107,9 @@ export type RunState = "unknown" | "idle" | "running";
  *  - "foreign": the run was started by another client (or our prompt settled
  *    without matching the run, or a busy rejection named the run).
  *  - "unknown": no live evidence for the session (e.g. untracked session, or
- *    after reconnect/restart, since honk-aware viewers get no synthesized run
- *    state on attach). Also authorizes nothing.
+ *    after a reconnect/restart until the `session/load` replay sent with a
+ *    reattaching resend has resolved it -- see `prompt`'s `reattach` option).
+ *    Also authorizes nothing.
  */
 export type RunOwnership = "own" | "pending" | "foreign" | "unknown";
 
@@ -418,6 +419,9 @@ interface HeldPermissionRequest {
   params: PermissionParams;
 }
 
+/** Stands in for the crid of a crid-less honkd echo. Never one of ours. */
+const CRIDLESS_ECHO = "\u0000crid-less-echo";
+
 export class GooseAcpClient {
   private readonly opts: GooseAcpClientOptions;
   private transport: AcpTransport | undefined;
@@ -440,6 +444,12 @@ export class GooseAcpClient {
   private lastNotified = new Map<string, RunStateInfo>();
   private nextSentinelId = 0;
   private heldRequests = new Map<string, HeldPermissionRequest[]>();
+  /**
+   * Sessions this socket has already sent `session/load` for. honkd's Attach
+   * re-offers its pending permission requests, so loading twice on one socket
+   * offers them twice. Cleared when a new socket connects.
+   */
+  private loadedSessions = new Set<string>();
 
   constructor(opts: GooseAcpClientOptions) {
     this.opts = opts;
@@ -753,6 +763,8 @@ export class GooseAcpClient {
     // would then reject the CURRENT connection's turn as DisconnectedDuringTurn
     // and clear its run ids, telling the human a healthy turn was lost. The
     // zombie has nothing to say about the connection that replaced it.
+    // A new socket has attached nothing yet.
+    this.loadedSessions.clear();
     transport.onMessage((data) => {
       if (this.transport !== transport) return;
       this.onMessage(data);
@@ -917,7 +929,25 @@ export class GooseAcpClient {
   async prompt(
     sessionId: string,
     text: string,
-    options?: { clientReqId?: string; resumeOnly?: boolean },
+    options?: {
+      clientReqId?: string;
+      resumeOnly?: boolean;
+      /**
+       * This prompt resends a turn on a NEW connection (a reconnect mid-turn, or
+       * recovery after a pigeon restart). Against honkd, a `session/load` is sent
+       * first, so honkd replays the session's history to this socket and the
+       * replayed `synth_<crid>` echo shows whether the active run is ours
+       * (bead eng-agent-platform-555.26). Without it the run stays "unknown"
+       * until it ends: honkd gives a honk-aware viewer no run state on attach,
+       * and a same-crid resend joins the run with no echo.
+       *
+       * Sent at most once per session per socket (`loadedSessions`): honkd's
+       * Attach re-offers its pending permission requests, so a second load on
+       * the same socket would offer them twice. Ignored for bare goose, where
+       * `session/load` is a real reload of the session.
+       */
+      reattach?: boolean;
+    },
   ): Promise<PromptOutcome> {
     const params: Record<string, unknown> = {
       sessionId,
@@ -938,6 +968,12 @@ export class GooseAcpClient {
     this.addOurCrid(sessionId, crid);
     let res: JsonRpcResponse;
     try {
+      // Inside the try, so a load that throws (closed socket) cannot leak the
+      // crid into ourCrids. Not awaited, like honk chat: honkd's viewer loop
+      // finishes the Attach (reset, replayed log, load response, replay_done,
+      // pending requests) before it reads the prompt frame, so the replay is
+      // tracked before any live frame of the resend.
+      if (options?.reattach && this.honk) this.sendReattachLoad(sessionId);
       res = await this.call(
         "session/prompt",
         params,
@@ -1132,6 +1168,42 @@ export class GooseAcpClient {
   }
 
   /**
+   * Fire-and-forget `session/load` for a reattaching resend. Fails soft: any
+   * error leaves ownership exactly as it was before this existed ("unknown"
+   * until the run ends), so it is logged and never thrown.
+   */
+  private sendReattachLoad(sessionId: string): void {
+    if (this.loadedSessions.has(sessionId)) return;
+    const startedAt = Date.now();
+    const fail = (error: string) =>
+      this.log("goose acp: session/load replay failed; run ownership stays unknown", {
+        sessionId,
+        error,
+      });
+    let pending: Promise<JsonRpcResponse>;
+    try {
+      pending = this.call("session/load", { sessionId }, { sessionId, isTurn: false });
+      this.loadedSessions.add(sessionId);
+    } catch (err) {
+      fail(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    pending.then(
+      (res) => {
+        if (res.error) {
+          fail(`${res.error.code} ${res.error.message}`);
+        } else {
+          this.log("goose acp: session/load replayed", {
+            sessionId,
+            ms: Date.now() - startedAt,
+          });
+        }
+      },
+      (err: unknown) => fail(err instanceof Error ? err.message : String(err)),
+    );
+  }
+
+  /**
    * The run id of the session's in-flight turn, if one has been observed.
    * Returns runId only when state is running.
    */
@@ -1195,7 +1267,18 @@ export class GooseAcpClient {
 
     if (update.sessionUpdate === "user_message_chunk") {
       const honkSource = (update._meta as { honk?: { source?: { client_req_id?: unknown } } } | undefined)?.honk?.source;
-      const c = typeof honkSource?.client_req_id === "string" ? honkSource.client_req_id : undefined;
+      let c = typeof honkSource?.client_req_id === "string" ? honkSource.client_req_id : undefined;
+      // honkd's run-start echo for a prompt sent WITHOUT a client_req_id is
+      // `synth_<n>` with no _meta. It is still evidence that the next run is
+      // somebody else's: ignoring it would leave an earlier echo of ours in
+      // lastEchoCrid and mark that client's run "own".
+      if (
+        c === undefined &&
+        typeof update.messageId === "string" &&
+        update.messageId.startsWith("synth_")
+      ) {
+        c = CRIDLESS_ECHO;
+      }
       if (c !== undefined) {
         if (track.state === "running" && track.ownership === "pending") {
           const ourCrids = this.ourCrids.get(sessionId);
@@ -1462,6 +1545,15 @@ export function refuse(options: PermissionParams["options"]): string | undefined
  *
  * Human decision (2026-11-02, Jonathan): rename goose/honk sessions when a
  * coordinator reassigns a worker. Renames only; executes nothing.
+ *
+ * Human decision (2026-10-30, confirmed 2026-11-16, Jonathan; bead
+ * eng-agent-platform-555.26): `session/load`, sent only to honkd and only
+ * before a reattaching resend, so pigeon can tell from the replayed history
+ * whether the run it rejoined is its own. honkd answers the frame itself
+ * (viewer.rs): it attaches the socket and replays its log. If the session is
+ * not in honkd's memory, honkd first loads it into goose, exactly as a prompt
+ * would. It executes nothing. The honkd-only gate in `prompt` is load-bearing:
+ * on bare goose `session/load` is a direct reload of the session.
  */
 export const ALLOWED_ACP_METHODS = [
   "initialize",
@@ -1470,4 +1562,5 @@ export const ALLOWED_ACP_METHODS = [
   "_goose/unstable/session/steer",
   "session/cancel",
   "_goose/unstable/session/rename",
+  "session/load",
 ] as const;
