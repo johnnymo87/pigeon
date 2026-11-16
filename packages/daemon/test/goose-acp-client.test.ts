@@ -1462,6 +1462,7 @@ describe("GooseAcpClient", () => {
         "_goose/unstable/session/steer",
         "session/cancel",
         "_goose/unstable/session/rename",
+        "session/load",
       ]);
     });
 
@@ -3211,3 +3212,257 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
 });
 
 
+
+describe("bead eng-agent-platform-555.26: session/load replay recovers run ownership on reattach", () => {
+  function honkPeer(): FakePeer {
+    const peer = new FakePeer();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "initialize") {
+        p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+      }
+    };
+    return peer;
+  }
+  const echo = (crid: string | undefined, sessionId = "sess-1") => ({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: "user_message_chunk",
+        messageId: crid ? `synth_${crid}` : "synth_17",
+        content: { type: "text", text: "hi" },
+        ...(crid ? { _meta: { honk: { source: { client_req_id: crid } } } } : {}),
+      },
+    },
+  });
+  const runStart = (runId: string | null, sessionId = "sess-1") => ({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "session_info_update", _meta: { goose: { activeRunId: runId } } },
+    },
+  });
+  const reset = { jsonrpc: "2.0", method: "_honk/reset", params: { sessionId: "sess-1" } };
+  const replayDone = { jsonrpc: "2.0", method: "_honk/replay_done", params: { sessionId: "sess-1" } };
+
+  it("sends session/load {sessionId} before session/prompt when reattaching to honkd", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", resumeOnly: true, reattach: true });
+    const methods = peer.sent.map((m) => m.method).filter((m) => m !== "initialize");
+    expect(methods).toEqual(["session/load", "session/prompt"]);
+    expect(peer.lastOf("session/load")!.params).toEqual({ sessionId: "sess-1" });
+
+    peer.reply(peer.lastOf("session/load")!.id, {});
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("never sends session/load to bare goose, where it would really reload the session", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer);
+    const client = makeClient(peer);
+    await client.connect();
+
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    expect(peer.countOf("session/load")).toBe(0);
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("does not send session/load on an ordinary (non-reattach) prompt", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1" });
+    expect(peer.countOf("session/load")).toBe(0);
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("replay naming our crid makes the run own; a pending permission re-offered after replay_done gets allow_once", async () => {
+    const peer = honkPeer();
+    const stateChanges: Array<Record<string, unknown>> = [];
+    const client = makeClient(peer, {
+      permissionPolicy: ownRunPolicy,
+      onRunStateChange: (sessionId, state) => stateChanges.push({ sessionId, ...state }),
+    });
+    await client.connect();
+    const base = peer.sent.length;
+    // Script honkd's Attach: reset, log, load response, replay_done, pending requests.
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") {
+        p.emit(reset);
+        p.emit(echo("crid-old-foreign"));
+        p.emit(runStart("run_old"));
+        p.emit(runStart(null));
+        p.emit(echo("crid-1"));
+        p.emit(runStart("run_ours"));
+        p.reply(msg.id, {});
+        p.emit(replayDone);
+        p.emit({
+          jsonrpc: "2.0",
+          id: "perm-pending",
+          method: "session/request_permission",
+          params: { sessionId: "sess-1", options: MEASURED_GOOSE_PERMISSION_OPTIONS },
+        });
+      }
+    };
+
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", resumeOnly: true, reattach: true });
+    await Promise.resolve();
+
+    expect(client.runOwnership("sess-1")).toBe("own");
+    expect(client.activeRunId("sess-1")).toBe("run_ours");
+    expect(stateChanges).toEqual([
+      { sessionId: "sess-1", state: "running", runId: "run_ours", ownership: "own" },
+    ]);
+    const answer = peer.sent.slice(base).find((m) => m.id === "perm-pending");
+    expect(answer!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("run start then our echo in the replay (probe path) resolves pending to own", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") {
+        p.emit(reset);
+        p.emit(runStart("run_ours"));
+        p.emit(echo("crid-1"));
+        p.reply(msg.id, {});
+        p.emit(replayDone);
+      }
+    };
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    await Promise.resolve();
+    expect(client.runOwnership("sess-1")).toBe("own");
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("our run followed by a foreign run with no run end between replays as foreign", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer, { permissionPolicy: ownRunPolicy });
+    await client.connect();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") {
+        p.emit(reset);
+        p.emit(echo("crid-1"));
+        p.emit(runStart("run_ours"));
+        p.emit(echo("crid-foreign"));
+        p.emit(runStart("run_foreign"));
+        p.reply(msg.id, {});
+        p.emit(replayDone);
+      }
+    };
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    await Promise.resolve();
+    expect(client.runOwnership("sess-1")).toBe("foreign");
+    expect(client.activeRunId("sess-1")).toBe("run_foreign");
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("a run started by a client with no crid is foreign, never pending or own", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") {
+        p.emit(reset);
+        p.emit(echo(undefined));
+        p.emit(runStart("run_anon"));
+        p.reply(msg.id, {});
+        p.emit(replayDone);
+      }
+    };
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    await Promise.resolve();
+    expect(client.runOwnership("sess-1")).toBe("foreign");
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("a crid-less echo clears an earlier leftover echo of ours, so the next run is not wrongly own", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") {
+        p.emit(reset);
+        p.emit(echo("crid-1"));
+        p.emit(echo(undefined));
+        p.emit(runStart("run_anon"));
+        p.reply(msg.id, {});
+        p.emit(replayDone);
+      }
+    };
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    await Promise.resolve();
+    expect(client.runOwnership("sess-1")).toBe("foreign");
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("a crid-less echo while our run is pending resolves it to foreign", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1" });
+    peer.emit(runStart("run_x"));
+    expect(client.runOwnership("sess-1")).toBe("pending");
+    peer.emit(echo(undefined));
+    expect(client.runOwnership("sess-1")).toBe("foreign");
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p;
+  });
+
+  it("a session/load error is logged and the resend still goes out; ownership stays unknown", async () => {
+    const peer = honkPeer();
+    const logs: Array<[string, unknown]> = [];
+    const client = makeClient(peer, { log: (m, f) => logs.push([m, f]) });
+    await client.connect();
+    peer.onRequest = (msg, p) => {
+      if (msg.method === "session/load") p.replyError(msg.id, -32603, "Session actor terminated");
+    };
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", resumeOnly: true, reattach: true });
+    await Promise.resolve();
+    expect(peer.countOf("session/prompt")).toBe(1);
+    expect(client.runOwnership("sess-1")).toBe("unknown");
+    expect(logs.some(([m]) => /session\/load/.test(m))).toBe(true);
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await expect(p).resolves.toMatchObject({ kind: "receipt" });
+  });
+
+  it("a socket that drops with the load outstanding rejects the turn loudly and nothing escapes unhandled", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    const p = client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true });
+    peer.drop();
+    await expect(p).rejects.toBeInstanceOf(DisconnectedDuringTurn);
+    // Give a stray rejection of the load call a chance to surface.
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  it("a closed socket at reattach throws without leaking the crid into ourCrids", async () => {
+    const peer = honkPeer();
+    const client = makeClient(peer);
+    await client.connect();
+    peer.drop();
+    await expect(
+      client.prompt("sess-1", "hello", { clientReqId: "crid-1", reattach: true }),
+    ).rejects.toThrow(/closed/);
+    const ourCrids = (client as unknown as { ourCrids: Map<string, Set<string>> }).ourCrids;
+    expect(ourCrids.has("sess-1")).toBe(false);
+  });
+});

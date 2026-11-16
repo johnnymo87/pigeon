@@ -1,7 +1,7 @@
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
 import { describe, expect, it, vi } from "vitest";
 import { GooseRunnerRegistry, GooseSessionRunner } from "../src/goose/session-runner";
-import { DisconnectedDuringTurn } from "../src/goose/acp-client";
+import { DisconnectedDuringTurn, type RunOwnership } from "../src/goose/acp-client";
 import type { SessionRecord } from "../src/storage/types";
 import type { GooseInflightRecord, GooseInflightStore, InsertGooseInflightInput } from "../src/storage/goose-inflight-repo";
 
@@ -109,7 +109,7 @@ class FakeRecoveryClient {
   connectFailsRemaining = 0;
   connectCalls = 0;
   prompts: string[] = [];
-  promptOptions: Array<{ clientReqId?: string; resumeOnly?: boolean } | undefined> = [];
+  promptOptions: Array<{ clientReqId?: string; resumeOnly?: boolean; reattach?: boolean } | undefined> = [];
   turns: Array<{
     text: string;
     resolve: (v: unknown) => void;
@@ -118,6 +118,11 @@ class FakeRecoveryClient {
   steers: Array<{ runId: string; text: string }> = [];
   runIds = new Map<string, string>();
   cancelCalls: string[] = [];
+  ownership: RunOwnership = "unknown";
+
+  runOwnership(_sessionId: string): RunOwnership {
+    return this.ownership;
+  }
 
   async connect(): Promise<void> {
     this.connectCalls++;
@@ -138,7 +143,7 @@ class FakeRecoveryClient {
   prompt(
     sessionId: string,
     text: string,
-    options?: { clientReqId?: string; resumeOnly?: boolean },
+    options?: { clientReqId?: string; resumeOnly?: boolean; reattach?: boolean },
   ): Promise<unknown> {
     this.prompts.push(text);
     this.promptOptions.push(options);
@@ -636,6 +641,7 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     expect(client.promptOptions[0]).toEqual({
       clientReqId: "cmd_rec_wire",
       resumeOnly: true,
+      reattach: true,
     });
 
     client.finishTurn("end_turn", { text: "recovered successfully" });
@@ -850,6 +856,9 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     // Reconnected and resent: should still NOT have resumeOnly!
     expect(client.prompts).toHaveLength(2);
     expect(client.promptOptions[1]?.resumeOnly).toBeUndefined();
+    // ...but it does reattach, so honkd replays the session (bead 555.26).
+    expect(client.promptOptions[0]?.reattach).toBeUndefined();
+    expect(client.promptOptions[1]?.reattach).toBe(true);
 
     client.finishTurn("end_turn", { text: "done after in-run reconnect" });
     await runner.settled();
@@ -890,6 +899,56 @@ describe("GooseSessionRunner Recovery (Commit 2)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(client.prompts).toHaveLength(2);
     expect(client.prompts[1]).toBe("human message");
+  });
+
+  it("recovered-turn reconnect resend carries resumeOnly and reattach", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+      honkReconnectInitialDelayMs: 10,
+    });
+    const row = makeInflightRow({ commandId: "cmd_rec_reconn" });
+    inflight.insert(row);
+    runner.resume(row);
+    await new Promise((r) => setTimeout(r, 10));
+    client.failTurn(new DisconnectedDuringTurn("ses_rec_1", "run_1", 1006));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(client.promptOptions[1]).toEqual({
+      clientReqId: "cmd_rec_reconn",
+      resumeOnly: true,
+      reattach: true,
+    });
+    client.finishTurn("end_turn", { text: "done" });
+    await runner.settled();
+  });
+
+  it("deliver() during a recovered turn whose run the replay confirmed own steers (bead 555.26)", async () => {
+    const inflight = new FakeInflightStore();
+    const client = new FakeRecoveryClient();
+    const postStop = vi.fn().mockResolvedValue(undefined);
+    const runner = new GooseSessionRunner({
+      session: makeSession(),
+      client,
+      inflight,
+      postStop,
+      touch: () => {},
+    });
+    const row = makeInflightRow({ commandId: "cmd_rec_own" });
+    inflight.insert(row);
+    runner.resume(row);
+    await new Promise((r) => setTimeout(r, 10));
+    client.runIds.set("20261012_rec", "run_rec");
+    client.ownership = "own";
+
+    const outcome = await runner.deliver("cmd_steer_own", "steer text");
+    expect(outcome.meta?.mode).toBe("steered");
+    expect(client.steers).toEqual([{ runId: "run_rec", text: "steer text" }]);
   });
 
   it("deliver() during a recovered turn enqueues and does not steer (R3 wait removed)", async () => {

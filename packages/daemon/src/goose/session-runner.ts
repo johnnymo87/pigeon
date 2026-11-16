@@ -139,7 +139,11 @@ export interface RunnerClient {
   readonly supportsResumeOnly?: boolean;
   /** Round-trips a cheap request; never settles on a dead socket. */
   ping(): Promise<void>;
-  prompt(sessionId: string, text: string, options?: { clientReqId?: string; resumeOnly?: boolean }): Promise<unknown>;
+  prompt(
+    sessionId: string,
+    text: string,
+    options?: { clientReqId?: string; resumeOnly?: boolean; reattach?: boolean },
+  ): Promise<unknown>;
   steer(sessionId: string, expectedRunId: string, text: string): Promise<unknown>;
   activeRunId(sessionId: string): string | undefined;
   runOwnership?(sessionId: string): RunOwnership;
@@ -486,7 +490,7 @@ export class GooseSessionRunner {
         session_id: this.sessionId,
         notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}:permission`,
         message:
-          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat.",
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own, so it did not answer. Answer it in honk chat.",
         event: "Permission",
       });
     } catch (err) {
@@ -675,6 +679,9 @@ export class GooseSessionRunner {
           const outcome = await this.opts.client.prompt(this.backendSessionId, row.promptText, {
             clientReqId: row.commandId,
             resumeOnly: true,
+            // A fresh client after a restart: replay the session so the run can
+            // be confirmed as ours (bead eng-agent-platform-555.26).
+            reattach: true,
           });
           await this.onPromptOutcome(turn, row.promptText, outcome);
         } catch (err) {
@@ -794,14 +801,18 @@ export class GooseSessionRunner {
 
     // 3c. this.turn set (our turn in flight):
     // For origin "swarm": NEVER steer into a live turn: in the "our turn in flight" branch go straight to enqueue.
-    // if client ownership is "own" AND a run id is known AND not a recovered turn -> steer as today
-    // Otherwise (pending, unknown, foreign, or no run id yet -- this REPLACES the "no-run-id-yet" refusal
-    // and also covers recovered turns) -> enqueue.
+    // if client ownership is "own" AND a run id is known -> steer as today
+    // Otherwise (pending, unknown, foreign, or no run id yet -- this REPLACES the "no-run-id-yet" refusal)
+    // -> enqueue.
+    // A recovered turn (picked up after a pigeon restart) steers too once its run is
+    // confirmed own: the reattaching resend replays the session with session/load,
+    // and the replay is what confirms it (bead eng-agent-platform-555.26). Until
+    // then its ownership is "unknown" and messages queue, as before.
     if (this.turn) {
       if (origin === "swarm") {
         return this.enqueue(commandId, text, undefined, origin);
       }
-      const isOwn = !this.turn.recovered && this.ownsActiveRun();
+      const isOwn = this.ownsActiveRun();
       const runId = this.runId();
       if (!isOwn || !runId) {
         return this.enqueue(commandId, text, undefined, origin);
@@ -1205,9 +1216,13 @@ export class GooseSessionRunner {
       }
 
       try {
-        const promptOpts: { clientReqId: string; resumeOnly?: boolean } = {
+        // reattach: this resend is on a new socket, so ask honkd to replay the
+        // session first and let the replay confirm whose run it rejoins
+        // (bead eng-agent-platform-555.26).
+        const promptOpts: { clientReqId: string; resumeOnly?: boolean; reattach: boolean } = {
           clientReqId: turn.commandId,
           ...(turn.recovered ? { resumeOnly: true } : {}),
+          reattach: true,
         };
         const outcome = await this.opts.client.prompt(this.backendSessionId, text, promptOpts);
         if (this.closed || turn.abandoned || turn.cancelRequested) {

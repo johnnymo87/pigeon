@@ -1232,7 +1232,7 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(client.connectCalls).toBe(2);
       expect(client.promptOptions).toEqual([
         { clientReqId: "c1" },
-        { clientReqId: "c1" },
+        { clientReqId: "c1", reattach: true },
       ]);
 
       // Resent prompt finishes with receipt carrying honk text
@@ -2209,7 +2209,7 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(inflight.get("c2")).toBeUndefined();
     });
 
-    it("message during pending / unknown / foreign / no-run-id-yet / recovered turn -> queued and NOT steered", async () => {
+    it("message during pending / unknown / foreign / no-run-id-yet -> queued and NOT steered; a recovered turn confirmed own steers", async () => {
       // 1. Pending ownership
       const { runner, client, stops, inflight } = makeRunner();
       await runner.deliver("c1", "first");
@@ -2253,7 +2253,8 @@ describe("GooseSessionRunner liveness probing", () => {
       expect(r4.client.steers).toHaveLength(0);
       expect(r4.inflight.get("c2_norunid")?.state).toBe("queued");
 
-      // 5. Recovered turn
+      // 5. Recovered turn whose run the session/load replay confirmed own: steers
+      // (bead eng-agent-platform-555.26; it used to queue regardless of ownership).
       const r5 = makeRunner();
       r5.client.ownership = "own";
       r5.client.setRunId("20260918_1", "run_rec");
@@ -2275,9 +2276,9 @@ describe("GooseSessionRunner liveness probing", () => {
 
       const resRecovered = await r5.runner.deliver("c2_rec", "text rec");
       expect(resRecovered.ok).toBe(true);
-      expect(resRecovered.meta?.mode).toBe("queued");
-      expect(r5.client.steers).toHaveLength(0);
-      expect(r5.inflight.get("c2_rec")?.state).toBe("queued");
+      expect(resRecovered.meta?.mode).toBe("steered");
+      expect(r5.client.steers).toHaveLength(1);
+      expect(r5.inflight.get("c2_rec")).toBeUndefined();
     });
 
     it("already-queued redelivery -> ok:true meta.mode already-queued (no second notice)", async () => {
@@ -2846,7 +2847,7 @@ describe("GooseSessionRunner liveness probing", () => {
         notification_id: "s:20260918_1:cmd-perm-1:permission",
         event: "Permission",
         message:
-          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own (for example after a reconnect), so it did not answer. Answer it in honk chat.",
+          "goose is asking permission for a tool call, and pigeon cannot confirm this run is its own, so it did not answer. Answer it in honk chat.",
       });
 
       // Deferred again in the same turn -> no second notice
