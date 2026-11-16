@@ -3466,3 +3466,34 @@ describe("bead eng-agent-platform-555.26: session/load replay recovers run owner
     expect(ourCrids.has("sess-1")).toBe(false);
   });
 });
+
+describe("bead eng-agent-platform-555.26: session/load at most once per session per socket", () => {
+  it("a second reattaching prompt on the same socket does not load again; a new socket does", async () => {
+    let peer = new FakePeer();
+    const init = (msg: Record<string, unknown>, p: FakePeer) => {
+      if (msg.method === "initialize") p.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+    };
+    peer.onRequest = init;
+    let current = peer;
+    const client = new GooseAcpClient({ url: "ws://fake/acp", transportFactory: () => current, log: () => {} });
+    await client.connect();
+
+    const p1 = client.prompt("sess-1", "a", { clientReqId: "c1", reattach: true });
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p1;
+    const p2 = client.prompt("sess-1", "b", { clientReqId: "c2", reattach: true });
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p2;
+    expect(peer.countOf("session/load")).toBe(1);
+
+    peer.drop();
+    peer = new FakePeer();
+    peer.onRequest = init;
+    current = peer;
+    await client.connect();
+    const p3 = client.prompt("sess-1", "c", { clientReqId: "c3", reattach: true });
+    expect(peer.countOf("session/load")).toBe(1);
+    peer.reply(peer.lastOf("session/prompt")!.id, { stopReason: "end_turn" });
+    await p3;
+  });
+});

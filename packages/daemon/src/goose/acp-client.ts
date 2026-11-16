@@ -444,6 +444,12 @@ export class GooseAcpClient {
   private lastNotified = new Map<string, RunStateInfo>();
   private nextSentinelId = 0;
   private heldRequests = new Map<string, HeldPermissionRequest[]>();
+  /**
+   * Sessions this socket has already sent `session/load` for. honkd's Attach
+   * re-offers its pending permission requests, so loading twice on one socket
+   * offers them twice. Cleared when a new socket connects.
+   */
+  private loadedSessions = new Set<string>();
 
   constructor(opts: GooseAcpClientOptions) {
     this.opts = opts;
@@ -757,6 +763,8 @@ export class GooseAcpClient {
     // would then reject the CURRENT connection's turn as DisconnectedDuringTurn
     // and clear its run ids, telling the human a healthy turn was lost. The
     // zombie has nothing to say about the connection that replaced it.
+    // A new socket has attached nothing yet.
+    this.loadedSessions.clear();
     transport.onMessage((data) => {
       if (this.transport !== transport) return;
       this.onMessage(data);
@@ -933,9 +941,9 @@ export class GooseAcpClient {
        * until it ends: honkd gives a honk-aware viewer no run state on attach,
        * and a same-crid resend joins the run with no echo.
        *
-       * Only on a socket that has not attached this session yet: honkd's Attach
-       * re-offers its pending permission requests, so a second load on the same
-       * socket would offer them twice. Ignored for bare goose, where
+       * Sent at most once per session per socket (`loadedSessions`): honkd's
+       * Attach re-offers its pending permission requests, so a second load on
+       * the same socket would offer them twice. Ignored for bare goose, where
        * `session/load` is a real reload of the session.
        */
       reattach?: boolean;
@@ -1165,6 +1173,7 @@ export class GooseAcpClient {
    * until the run ends), so it is logged and never thrown.
    */
   private sendReattachLoad(sessionId: string): void {
+    if (this.loadedSessions.has(sessionId)) return;
     const startedAt = Date.now();
     const fail = (error: string) =>
       this.log("goose acp: session/load replay failed; run ownership stays unknown", {
@@ -1174,6 +1183,7 @@ export class GooseAcpClient {
     let pending: Promise<JsonRpcResponse>;
     try {
       pending = this.call("session/load", { sessionId }, { sessionId, isTurn: false });
+      this.loadedSessions.add(sessionId);
     } catch (err) {
       fail(err instanceof Error ? err.message : String(err));
       return;
@@ -1539,10 +1549,11 @@ export function refuse(options: PermissionParams["options"]): string | undefined
  * Human decision (2026-10-30, confirmed 2026-11-16, Jonathan; bead
  * eng-agent-platform-555.26): `session/load`, sent only to honkd and only
  * before a reattaching resend, so pigeon can tell from the replayed history
- * whether the run it rejoined is its own. honkd answers it itself (viewer.rs):
- * it attaches the socket and replays the log, and forwards nothing to goose.
- * It executes nothing. The honkd-only gate in `prompt` is load-bearing: on
- * bare goose `session/load` really reloads the session.
+ * whether the run it rejoined is its own. honkd answers the frame itself
+ * (viewer.rs): it attaches the socket and replays its log. If the session is
+ * not in honkd's memory, honkd first loads it into goose, exactly as a prompt
+ * would. It executes nothing. The honkd-only gate in `prompt` is load-bearing:
+ * on bare goose `session/load` is a direct reload of the session.
  */
 export const ALLOWED_ACP_METHODS = [
   "initialize",
