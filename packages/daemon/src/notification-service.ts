@@ -228,8 +228,9 @@ export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
   footer: TgMessage;
 } {
   // The event time is required, not decoration. Task 1's arbitration allows a conversational row (question/stop)
-  // to preempt a backlogged swarm post within the same session, so a swarm post can arrive below the stop
-  // notification it caused. Always printing the event time makes that legible instead of misleading.
+  // to preempt a backlogged swarm post within the same session, so a swarm post can arrive below a later
+  // stop (not the one answering it: that waits behind this notice, pigeon-mwtg). The event time keeps
+  // the order legible.
   const now = input.now ?? Date.now();
   const createdAtTime = formatEventTime(input.createdAt, now);
   const headerBuilder = new TgMessageBuilder()
