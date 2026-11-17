@@ -751,7 +751,21 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       ...(richMarkdown !== null ? { rich: { markdown: richMarkdown } } : {}),
     };
 
-    const afterNotificationId = stopOpts?.afterNotificationId ?? null;
+    // The goose runner's answer to a swarm message (s:<sid>:swarm-<msgId>) waits behind that
+    // message's notice (w:<msgId>), which the swarm sub-budget can defer: posted first, the
+    // answer sits above the request and the topic ends on what looks unanswered (pigeon-mwtg).
+    // Suffixed ids of the same turn (`:stalled`) wait too. Derived from the notice row of this
+    // same session, never taken from the body. It only holds while the notice is queued/sending
+    // (at most AFTER_HOLD_MAX_MS), so an absent, quieted or failed one holds nothing.
+    const swarmAnswerPrefix = `s:${sessionId}:swarm-`;
+    const swarmNotice = notificationId.startsWith(swarmAnswerPrefix)
+      ? storage.outbox.getByNotificationId(
+          `w:${notificationId.slice(swarmAnswerPrefix.length).split(":")[0]}`,
+        )
+      : null;
+    const afterNotificationId =
+      stopOpts?.afterNotificationId ??
+      (swarmNotice?.sessionId === sessionId ? swarmNotice.notificationId : null);
 
     // Queue in outbox — OutboxSender will deliver with retry
     storage.outbox.upsert({

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { GOOSE_BACKEND_KIND } from "../src/goose/backend-kind";
+import { AFTER_HOLD_MAX_MS } from "../src/storage/outbox-repo";
 
 describe("POST /goose/turn-event", () => {
   let storage: StorageDb | null = null;
@@ -618,6 +619,82 @@ describe("POST /goose/turn-event", () => {
       const readySecond = storage!.outbox.getReady(1_000);
       expect(readySecond).toHaveLength(1);
       expect(readySecond[0]!.notificationId).toBe(`s:${gseId}:h-hk3_7-order1`);
+    });
+
+    // pigeon-mwtg: a runner swarm turn's answer must not overtake the notice of the
+    // swarm message it answers (the notice can be deferred by the swarm sub-budget).
+    function queueNotice(msgId: string, sessionId: string) {
+      storage!.outbox.upsert(
+        {
+          notificationId: `w:${msgId}`,
+          sessionId,
+          requestId: `swarm-${msgId}`,
+          kind: "swarm",
+          payload: JSON.stringify({ messages: [{ text: "notice" }] }),
+          token: "",
+        },
+        1_000,
+      );
+    }
+
+    function postSwarmAnswer(
+      app: ReturnType<typeof createApp>,
+      sessionId: string,
+      msgId: string,
+      suffix = "",
+    ) {
+      return app(
+        new Request("http://localhost/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId,
+            notification_id: `s:${sessionId}:swarm-${msgId}${suffix}`,
+            message: "the answer",
+            event: "Stop",
+          }),
+        }),
+      );
+    }
+
+    it("a runner's swarm-turn answer waits behind that message's notice", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+      queueNotice("msg_a", gseId);
+
+      expect((await postSwarmAnswer(app, gseId, "msg_a")).status).toBe(202);
+
+      const readyFirst = storage!.outbox.getReady(1_000);
+      expect(readyFirst.map((r) => r.notificationId)).toEqual(["w:msg_a"]);
+
+      storage!.outbox.markSent("w:msg_a", 1_000);
+      const readySecond = storage!.outbox.getReady(1_000);
+      expect(readySecond.map((r) => r.notificationId)).toEqual([`s:${gseId}:swarm-msg_a`]);
+    });
+
+    it("a stalled-turn notice waits behind the same notice, and no hold outlasts AFTER_HOLD_MAX_MS", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+      queueNotice("msg_s", gseId);
+
+      expect((await postSwarmAnswer(app, gseId, "msg_s", ":stalled")).status).toBe(202);
+      const stalledId = `s:${gseId}:swarm-msg_s:stalled`;
+      expect(storage!.outbox.getByNotificationId(stalledId)!.afterNotificationId).toBe("w:msg_s");
+      expect(storage!.outbox.getReady(1_000).map((r) => r.notificationId)).toEqual(["w:msg_s"]);
+
+      // The notice is still queued (say, deferred) long after: the answer goes anyway.
+      const later = 1_000 + AFTER_HOLD_MAX_MS;
+      expect(storage!.outbox.getReady(later).map((r) => r.notificationId)).toContain(stalledId);
+    });
+
+    it("a notice belonging to another session holds nothing", async () => {
+      const app = newApp(1_000);
+      const gseId = await registerGoose(app, "goose-sess-1");
+      queueNotice("msg_b", "some-other-session");
+
+      expect((await postSwarmAnswer(app, gseId, "msg_b")).status).toBe(202);
+      const row = storage!.outbox.getByNotificationId(`s:${gseId}:swarm-msg_b`);
+      expect(row!.afterNotificationId).toBeNull();
     });
 
     it("burst of 3 turns ends started/ended interleaved in order A-prompt, A-reply, B-prompt...", async () => {
