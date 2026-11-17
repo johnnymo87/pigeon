@@ -2,6 +2,12 @@ import type BetterSqlite3 from "better-sqlite3";
 
 type SqlRow = Record<string, unknown>;
 
+/**
+ * How long a row may wait behind its after_notification_id. Order is worth a short
+ * wait, not a lost-looking reply: past this the row goes out regardless (pigeon-mwtg).
+ */
+export const AFTER_HOLD_MAX_MS = 5 * 60_000;
+
 export interface OutboxRecord {
   notificationId: string;
   sessionId: string;
@@ -163,7 +169,7 @@ export class OutboxRepository {
         `SELECT * FROM outbox
          WHERE state = 'queued'
            AND (next_retry_at IS NULL OR next_retry_at <= ?)
-           AND (after_notification_id IS NULL OR NOT EXISTS (
+           AND (after_notification_id IS NULL OR outbox.created_at <= ? OR NOT EXISTS (
              SELECT 1 FROM outbox dep
              WHERE dep.notification_id = outbox.after_notification_id
                AND dep.state IN ('queued', 'sending')
@@ -175,7 +181,7 @@ export class OutboxRepository {
                   rowid ASC
          LIMIT ?`,
       )
-      .all(now, limit) as SqlRow[];
+      .all(now, now - AFTER_HOLD_MAX_MS, limit) as SqlRow[];
     return rows.map(asOutbox);
   }
 
