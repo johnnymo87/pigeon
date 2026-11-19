@@ -347,7 +347,7 @@ opencode attach http://localhost:4096 --session <session-id>
 
 The session ID is included in the Telegram confirmation message.
 
-On a host with `oc-auto-attach` (honors `OC_AUTO_ATTACH_BIN`; logs to `/tmp/oc-auto-attach.log`), both `/launch` and `/launch --backend goose` also open the new session in nvim+tmux once its first prompt is sent: the opencode TUI for the first, `honk chat` for the second (via `oc-auto-attach goose:<goose id>`, honk-9qf.30). Best-effort; a failure to open never affects the launch or its reply.
+Where the daemon can resolve `oc-auto-attach` (on its PATH, or pinned by `OC_AUTO_ATTACH_BIN`; today only cloudbox), both `/launch` and `/launch --backend goose` also open the new session in nvim+tmux: the opencode TUI once the prompt was sent or is unconfirmed, `honk chat` once goose accepted the first prompt (via `oc-auto-attach goose:<goose id>`, honk-9qf.30). It logs to `/tmp/oc-auto-attach.log`. Best-effort; a failure to open never affects the launch or its reply.
 
 ### Notifications
 
