@@ -100,6 +100,13 @@ export interface GooseLaunchInput {
    * tag (keyed by pigeon id) is refetched. A throw is swallowed.
    */
   onTagged?: (sessionId: string) => void;
+  /**
+   * Opens the new session in `honk chat` in nvim+tmux (honk-9qf.30), called
+   * with `goose:<native id>` once the first prompt was accepted -- the target
+   * form `oc-auto-attach` resolves through `honk list`. Fire-and-forget and
+   * best-effort: a throw is logged and swallowed. Absent: nothing is opened.
+   */
+  autoAttach?: (target: string) => void;
   /** Injected for tests. */
   reachability?: typeof classifyReachability;
   mintPigeonId?: () => string;
@@ -236,6 +243,18 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
   } catch (err) {
     console.error(`[goose-launch] commandId=${input.commandId} failed after minting ${backendSessionId}:`, err);
     failure = `starting its first turn failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  // Open it in honk chat once the first prompt is in, as the opencode path
+  // opens its TUI. `deliver` returned without waiting for the turn, so the tab
+  // opens while the turn runs. Before tagging, which can take seconds, and
+  // outside the try above so a throw cannot be relabelled as a launch failure.
+  if (failure === undefined && sessionId !== undefined && input.autoAttach) {
+    try {
+      input.autoAttach(`goose:${backendSessionId}`);
+    } catch (err) {
+      console.warn(`[goose-launch] commandId=${input.commandId} autoAttach failed for goose:${backendSessionId}:`, err);
+    }
   }
 
   // Tag once the session is registered, whether or not its first prompt went

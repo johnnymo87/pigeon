@@ -272,6 +272,70 @@ describe("ingestGooseLaunchCommand", () => {
       h.storage.db.close();
     });
   });
+
+  /**
+   * honk-9qf.30: a launched goose session opens in `honk chat` in nvim+tmux, as
+   * an opencode launch opens its TUI. `oc-auto-attach goose:<native id>` does
+   * the opening; this path only fires it, once the first prompt is sent.
+   */
+  describe("auto-attach", () => {
+    it("opens goose:<native id> once the first prompt is accepted", async () => {
+      const attached: string[] = [];
+      const h = harness({ autoAttach: (target) => { attached.push(target); } });
+      await ingestGooseLaunchCommand(h.input);
+      expect(attached).toEqual(["goose:20260920_1"]);
+      h.storage.db.close();
+    });
+
+    it("does not open a session whose first prompt was refused", async () => {
+      const attached: string[] = [];
+      const h = harness({
+        autoAttach: (target) => { attached.push(target); },
+        runnerFor: () => ({ deliver: async () => ({ ok: false, error: "steer-timeout" }) }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(attached).toEqual([]);
+      h.storage.db.close();
+    });
+
+    it("does not open a session whose first prompt threw", async () => {
+      const attached: string[] = [];
+      const h = harness({
+        autoAttach: (target) => { attached.push(target); },
+        runnerFor: () => ({ deliver: async () => { throw new Error("socket died"); } }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(attached).toEqual([]);
+      h.storage.db.close();
+    });
+
+    it("does not open anything when the mint fails", async () => {
+      const attached: string[] = [];
+      const h = harness({
+        autoAttach: (target) => { attached.push(target); },
+        createMintClient: () => ({
+          connect: async () => {},
+          newSession: async () => { throw new Error("no extensions"); },
+          close: () => {},
+        }),
+      });
+      await ingestGooseLaunchCommand(h.input);
+      expect(attached).toEqual([]);
+      h.storage.db.close();
+    });
+
+    it("a throwing autoAttach changes nothing the human is told", async () => {
+      const plain = harness();
+      await ingestGooseLaunchCommand(plain.input);
+      plain.storage.db.close();
+
+      const h = harness({ autoAttach: () => { throw new Error("spawn EACCES"); } });
+      await expect(ingestGooseLaunchCommand(h.input)).resolves.toBeUndefined();
+      expect(h.replies).toEqual(plain.replies);
+      h.storage.db.close();
+    });
+  });
+
   /**
    * 555.29.7: a goose session joins a program the same way an opencode one does.
    * session-tags keys it as goose:<native id>, never pigeon's gse_ id, which

@@ -36,7 +36,7 @@ import { DeliveryWatchdog } from "./swarm/delivery-watchdog";
 import { makeWatchdogResolveClients } from "./swarm/watchdog-client-resolver";
 import { SessionDirectoryRegistry } from "./swarm/registry";
 import { ingestWorkerCommand } from "./worker/command-ingest";
-import { ingestLaunchCommand, INHERIT_WHICH_TIMEOUT_MS } from "./worker/launch-ingest";
+import { autoAttach, ingestLaunchCommand, INHERIT_WHICH_TIMEOUT_MS } from "./worker/launch-ingest";
 import { ingestKillCommand } from "./worker/kill-ingest";
 import { ingestInterruptCommand } from "./worker/interrupt-ingest";
 import { ingestCompactCommand } from "./worker/compact-ingest";
@@ -735,6 +735,10 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
               runOcTags: resolveRunOcTags(),
               runOcTagsWhich: resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS),
               onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
+              // Opens the session in honk chat, as the opencode branch below
+              // opens its TUI (honk-9qf.30). Wrapped so autoAttach's optional
+              // `spawn` parameter is never handed anything.
+              autoAttach: (target) => autoAttach(target),
               sendTelegramReply: reply,
             });
             return;
