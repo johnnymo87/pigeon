@@ -223,3 +223,13 @@ CREATE TABLE IF NOT EXISTS slack_posts (
 CREATE INDEX IF NOT EXISTS idx_slack_posts_created ON slack_posts(created_at);
 INSERT OR IGNORE INTO slack_posts (handle, team_id, channel_id, ts, text, created_at)
   VALUES (1099511627775, '_seed', '_seed', '_seed', NULL, 0);
+
+-- Slack Events API dedup (chat-transport phase 2, pigeon-4ogz.4). Slack retries an event it did
+-- not see acked (and, with Delayed Events, hourly for 24 h), always with the same event_id. The
+-- row is inserted in the same D1 batch as the command the event queues, so a retry either finds
+-- it (duplicate, 200) or finds neither. Kept 48 h, swept by the hourly cron.
+CREATE TABLE IF NOT EXISTS slack_seen_events (
+  event_id   TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slack_seen_events_created ON slack_seen_events(created_at);

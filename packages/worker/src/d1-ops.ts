@@ -33,20 +33,39 @@ export function generateCommandId(): string {
  * Returns the commandId on success, or null if the per-machine queue limit is
  * reached.
  */
-export async function queueCommand(
+export interface QueueCommandInput {
+  machineId: string;
+  sessionId: string | null;
+  command: string;
+  chatId: string;
+  commandType?: string;
+  directory?: string | null;
+  mediaJson?: string | null;
+  metadataJson?: string | null;
+  messageThreadId?: number | null;
+}
+
+/** True when the machine already has `MAX_QUEUE_PER_MACHINE` pending or leased commands. */
+export async function isQueueFull(db: D1Database, machineId: string): Promise<boolean> {
+  const countRow = await db
+    .prepare(
+      `SELECT COUNT(*) as count FROM commands
+       WHERE machine_id = ? AND status IN ('pending', 'leased')`,
+    )
+    .bind(machineId)
+    .first<{ count: number }>();
+  return (countRow?.count ?? 0) >= MAX_QUEUE_PER_MACHINE;
+}
+
+/**
+ * The INSERT for one pending command, unexecuted, with its fresh id. For a caller that must write
+ * the command atomically with something else (the Slack ingress batches it with its event dedup
+ * row, pigeon-4ogz.4). It does not check the queue depth: call `isQueueFull` first.
+ */
+export function commandInsertStatement(
   db: D1Database,
-  opts: {
-    machineId: string;
-    sessionId: string | null;
-    command: string;
-    chatId: string;
-    commandType?: string;
-    directory?: string | null;
-    mediaJson?: string | null;
-    metadataJson?: string | null;
-    messageThreadId?: number | null;
-  },
-): Promise<string | null> {
+  opts: QueueCommandInput,
+): { commandId: string; statement: D1PreparedStatement } {
   const {
     machineId,
     sessionId,
@@ -58,33 +77,22 @@ export async function queueCommand(
     metadataJson = null,
     messageThreadId = null,
   } = opts;
-
-  // Check queue depth
-  const countRow = await db
-    .prepare(
-      `SELECT COUNT(*) as count FROM commands
-       WHERE machine_id = ? AND status IN ('pending', 'leased')`,
-    )
-    .bind(machineId)
-    .first<{ count: number }>();
-
-  if ((countRow?.count ?? 0) >= MAX_QUEUE_PER_MACHINE) {
-    return null;
-  }
-
   const commandId = generateCommandId();
-  const now = Date.now();
-
-  await db
+  const statement = db
     .prepare(
       `INSERT INTO commands
          (command_id, machine_id, session_id, command_type, command, chat_id,
           directory, media_json, metadata_json, message_thread_id, status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     )
-    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, metadataJson, messageThreadId ?? null, now)
-    .run();
+    .bind(commandId, machineId, sessionId, commandType, command, chatId, directory, mediaJson, metadataJson, messageThreadId ?? null, Date.now());
+  return { commandId, statement };
+}
 
+export async function queueCommand(db: D1Database, opts: QueueCommandInput): Promise<string | null> {
+  if (await isQueueFull(db, opts.machineId)) return null;
+  const { commandId, statement } = commandInsertStatement(db, opts);
+  await statement.run();
   return commandId;
 }
 

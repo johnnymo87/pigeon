@@ -218,6 +218,61 @@ export async function callSlack<T = SlackBody>(
   }
 }
 
+/** The only host an inbound file is fetched from: the bot token is sent with the request. */
+const SLACK_FILES_HOST = "files.slack.com";
+
+/** True for an `https://files.slack.com/...` URL, the only kind `downloadSlackFile` will fetch. */
+export function isSlackFileUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && u.hostname === SLACK_FILES_HOST;
+  } catch {
+    return false;
+  }
+}
+
+export interface DownloadSlackFileOptions {
+  signal?: AbortSignal;
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Fetches an inbound file's bytes (`url_private_download`) with the bot token (bead
+ * pigeon-4ogz.4, spec §5 "Files"). The URL comes from a signed event, but it still has to be a
+ * `files.slack.com` URL: anything else would be handed the bot token. Slack answers a request it
+ * will not serve (a missing `files:read` scope, say) with a 200 HTML login page, so an HTML body is
+ * a failure unless the file itself is HTML.
+ */
+export async function downloadSlackFile(
+  token: string,
+  url: string,
+  expectHtml: boolean,
+  opts: DownloadSlackFileOptions = {},
+): Promise<{ ok: true; body: ReadableStream | null } | { ok: false; error: string }> {
+  if (!isSlackFileUrl(url)) return { ok: false, error: "not_a_slack_file_url" };
+  const startedAt = Date.now();
+  let outcome = "threw";
+  try {
+    const doFetch = opts.fetchFn ?? ((u, init) => fetch(u, init));
+    const res = await doFetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    if (!res.ok) {
+      outcome = `http_${res.status}`;
+      return { ok: false, error: outcome };
+    }
+    if (!expectHtml && (res.headers.get("content-type") ?? "").toLowerCase().startsWith("text/html")) {
+      outcome = "html_instead_of_file";
+      return { ok: false, error: outcome };
+    }
+    outcome = "ok";
+    return { ok: true, body: res.body };
+  } finally {
+    logSlackCall("file_download", Date.now() - startedAt, outcome);
+  }
+}
+
 export interface UploadToSlackOptions {
   signal?: AbortSignal;
   fetchFn?: typeof fetch;
