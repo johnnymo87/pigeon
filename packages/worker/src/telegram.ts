@@ -21,10 +21,14 @@ export interface SendRichMessageOptions {
   chatId: string | number;
   /** GFM plus Telegram's extensions; see https://core.telegram.org/bots/api/rich-messages.md */
   markdown: string;
+  /** Slack only: the plain-text rendering, used as the notification text instead of the raw markdown. */
+  text?: string;
   replyMarkup?: unknown;
   messageThreadId?: number;
   /** Slack only: mention the workspace owner so the post notifies them. Telegram ignores it. */
   notifyOwner?: boolean;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
 }
 
 export interface EditMessageTextOptions {
@@ -35,6 +39,8 @@ export interface EditMessageTextOptions {
   replyMarkup?: unknown;
   /** Slack only: keep the owner mention on the edited message. Telegram ignores it. */
   notifyOwner?: boolean;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
 }
 
 export interface SendPhotoOptions {
@@ -43,6 +49,8 @@ export interface SendPhotoOptions {
   filename: string;
   replyToMessageId?: number;
   messageThreadId?: number;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
 }
 
 export interface SendDocumentOptions {
@@ -51,6 +59,8 @@ export interface SendDocumentOptions {
   filename: string;
   replyToMessageId?: number;
   messageThreadId?: number;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
 }
 
 export interface AnswerCallbackQueryOptions {
@@ -90,6 +100,8 @@ export interface EditForumTopicOptions {
   iconCustomEmojiId?: string;
   /** Slack only: the session this conversation is for (channel name suffix, topic line). */
   sessionId?: string;
+  /** Slack only: a named topic's key, which fixes the channel name. Without it or `sessionId`, the channel is not renamed. */
+  channelKey?: string;
   /** Slack only: the channel's topic line, replacing the one derived from `name`. */
   topic?: string;
 }

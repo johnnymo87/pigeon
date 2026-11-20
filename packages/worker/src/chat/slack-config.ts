@@ -42,9 +42,20 @@ const SLACK_CHAT_PREFIX = "slack:";
 /** Keys already reported broken in this isolate, so one bad secret logs once, not per request. */
 const warned = new Set<string>();
 
-/** Test seam: forget which keys were already reported. */
+/**
+ * Parsed secrets by their raw string, per isolate. A request resolves a workspace several times
+ * (the `SLACK_WORKSPACE_*` scan parses every secret), and the secrets never change within an
+ * isolate, so the JSON is parsed once per distinct string. Failures are cached too (null), so a
+ * broken secret is neither re-parsed nor re-logged. Keyed on the string, not the env key, so a
+ * rotated secret misses the cache by construction. Bounded, since keys are secret values.
+ */
+const parsed = new Map<string, SlackWorkspace | null>();
+const PARSED_MAX = 64;
+
+/** Test seam: forget which keys were already reported, and every cached parse. */
 export function clearSlackConfigWarnings(): void {
   warned.clear();
+  parsed.clear();
 }
 
 function warnOnce(key: string, reason: string): void {
@@ -55,26 +66,34 @@ function warnOnce(key: string, reason: string): void {
 
 function parseWorkspace(key: string, raw: unknown): SlackWorkspace | null {
   if (typeof raw !== "string") return null;
-  let parsed: unknown;
+  if (parsed.has(raw)) return parsed.get(raw) ?? null;
+  const ws = parseWorkspaceUncached(key, raw);
+  if (parsed.size >= PARSED_MAX) parsed.clear();
+  parsed.set(raw, ws);
+  return ws;
+}
+
+function parseWorkspaceUncached(key: string, raw: string): SlackWorkspace | null {
+  let value: unknown;
   try {
-    parsed = JSON.parse(raw);
+    value = JSON.parse(raw);
   } catch {
     warnOnce(key, "not valid JSON");
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) {
+  if (typeof value !== "object" || value === null) {
     warnOnce(key, "not a JSON object");
     return null;
   }
-  const obj = parsed as Record<string, unknown>;
+  const obj = value as Record<string, unknown>;
   const out: Record<string, string> = {};
   for (const field of FIELDS) {
-    const value = obj[field];
-    if (typeof value !== "string" || value === "") {
+    const v = obj[field];
+    if (typeof v !== "string" || v === "") {
       warnOnce(key, `missing or empty field: ${field}`);
       return null;
     }
-    out[field] = value;
+    out[field] = v;
   }
   return out as unknown as SlackWorkspace;
 }

@@ -191,3 +191,42 @@ describe("GET /whoami transport", () => {
     expect(await whoami(e, "test-api-key")).toEqual({ credential: "shared", machine_id: null });
   });
 });
+
+describe("parse cache", () => {
+  const secretParses = (spy: ReturnType<typeof vi.spyOn>, raw: string) =>
+    spy.mock.calls.filter((c: unknown[]) => c[0] === raw).length;
+
+  it("parses a given secret string once per isolate, however often it is looked up", () => {
+    const raw = JSON.stringify(WS);
+    const e = withSecret("SLACK_WORKSPACE_CACHED", raw);
+    const spy = vi.spyOn(JSON, "parse");
+    try {
+      for (let i = 0; i < 3; i++) {
+        expect(slackWorkspaceForMachine(e, "cached")).toEqual(WS);
+        expect(slackWorkspaceForTeam(e, WS.teamId)).toEqual(WS);
+      }
+      expect(secretParses(spy, raw)).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("is keyed on the raw string, so a rotated secret is read afresh", () => {
+    const first = withSecret("SLACK_WORKSPACE_ROTATED", WS);
+    expect(slackWorkspaceForMachine(first, "rotated")?.botToken).toBe("xoxb-1");
+    const second = withSecret("SLACK_WORKSPACE_ROTATED", { ...WS, botToken: "xoxb-2" });
+    expect(slackWorkspaceForMachine(second, "rotated")?.botToken).toBe("xoxb-2");
+  });
+
+  it("caches a broken secret too, and still logs it once", () => {
+    const e = withSecret("SLACK_WORKSPACE_BAD_CACHE", "{nope");
+    const spy = vi.spyOn(JSON, "parse");
+    try {
+      for (let i = 0; i < 3; i++) expect(slackWorkspaceForMachine(e, "bad-cache")).toBeNull();
+      expect(secretParses(spy, "{nope")).toBe(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

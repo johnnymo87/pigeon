@@ -220,31 +220,70 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     return row ? { handle, channelId: row.channel_id } : null;
   }
 
-  /** The handle of a channel, minting one on first sight. */
-  async function ensureConversation(channelId: string): Promise<number> {
-    await db
-      .prepare("INSERT OR IGNORE INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
-      .bind(ws.teamId, channelId, Date.now())
-      .run();
-    const row = await db
-      .prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
-      .bind(ws.teamId, channelId)
-      .first<{ handle: number }>();
-    if (!row) throw new Error("slack_conversations row missing after insert");
-    return row.handle;
+  /**
+   * The handle of a channel, minting one on first sight; null when D1 would not record it.
+   *
+   * Only called AFTER Slack accepted something (the channel exists). A thrown D1 error here would
+   * surface as a 500, the daemon would retry the whole operation, and the retry would create a
+   * second channel. So the insert is retried once and, if it still fails, the failure is logged
+   * with the channel id (an operator can recover from that) and reported as null for the caller to
+   * turn into a structured transient failure.
+   */
+  async function ensureConversation(channelId: string): Promise<number | null> {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await db
+          .prepare("INSERT OR IGNORE INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
+          .bind(ws.teamId, channelId, Date.now())
+          .run();
+        const row = await db
+          .prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
+          .bind(ws.teamId, channelId)
+          .first<{ handle: number }>();
+        if (!row) throw new Error("slack_conversations row missing after insert");
+        return row.handle;
+      } catch (err) {
+        if (attempt === 2) {
+          console.error("[worker] slack conversation created but not recorded", { channelId, err: String(err) });
+        }
+      }
+    }
+    return null;
   }
 
+  /**
+   * Records a post and returns its handle, or 0 when D1 would not record it.
+   *
+   * Only called after Slack accepted the post. Throwing would make the daemon retry a message that
+   * is already in the channel, a visible duplicate, so a failed insert is retried once and then
+   * downgraded: the send succeeds with message_id 0. The cost is that this one post cannot later be
+   * edited or used as a reply target (0 is an unknown handle), which only matters for a wizard
+   * question and a reply-threaded file.
+   */
   async function recordPost(channelId: string, ts: string, text: string): Promise<number> {
-    await db
-      .prepare("INSERT OR IGNORE INTO slack_posts (team_id, channel_id, ts, text, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind(ws.teamId, channelId, ts, cutPoints(text, POST_TEXT_MAX), Date.now())
-      .run();
-    const row = await db
-      .prepare("SELECT handle FROM slack_posts WHERE team_id = ? AND channel_id = ? AND ts = ?")
-      .bind(ws.teamId, channelId, ts)
-      .first<{ handle: number }>();
-    if (!row) throw new Error("slack_posts row missing after insert");
-    return row.handle;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await db
+          .prepare("INSERT OR IGNORE INTO slack_posts (team_id, channel_id, ts, text, created_at) VALUES (?, ?, ?, ?, ?)")
+          .bind(ws.teamId, channelId, ts, cutPoints(text, POST_TEXT_MAX), Date.now())
+          .run();
+        const row = await db
+          .prepare("SELECT handle FROM slack_posts WHERE team_id = ? AND channel_id = ? AND ts = ?")
+          .bind(ws.teamId, channelId, ts)
+          .first<{ handle: number }>();
+        if (!row) throw new Error("slack_posts row missing after insert");
+        return row.handle;
+      } catch (err) {
+        if (attempt === 2) {
+          console.warn("[worker] slack post sent but not recorded; returning message_id 0", {
+            channelId,
+            ts,
+            err: String(err),
+          });
+        }
+      }
+    }
+    return 0;
   }
 
   async function postForHandle(handle: number): Promise<{ channelId: string; ts: string } | null> {
@@ -276,14 +315,19 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
   const join = (channelId: string, signal?: AbortSignal) => bot("conversations.join", { channel: channelId }, signal);
 
   /**
-   * Runs one channel operation; on `not_in_channel` joins and retries once, and on `is_archived`
-   * unarchives (as the user: a bot may not), joins and retries once. A failure of a recovery step
-   * is that step's own mapped error, so an unarchive 429 stays a transient 503.
+   * Runs one channel operation; on `not_in_channel` joins and retries once, and (when `unarchive`)
+   * on `is_archived` unarchives (as the user: a bot may not), joins and retries once. A failure of
+   * a recovery step is that step's own mapped error, so an unarchive 429 stays a transient 503.
+   *
+   * `unarchive` is for posting, which should reach the conversation whatever its state. Metadata
+   * edits pass false: renaming or re-topicking a closed conversation must not reopen it, so
+   * `is_archived` stays `thread_not_found` for them.
    */
   async function withChannelRecovery(
     channelId: string,
     op: () => Promise<TgResult<SlackBody>>,
     signal?: AbortSignal,
+    unarchive = true,
   ): Promise<TgResult<SlackBody>> {
     const first = await op();
     if (first.ok) return first;
@@ -293,7 +337,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       if (!joined.ok) return joined;
       return op();
     }
-    if (error === "is_archived") {
+    if (error === "is_archived" && unarchive) {
       const unarchived = await asUser("conversations.unarchive", { channel: channelId }, signal);
       if (!unarchived.ok && slackErr(unarchived) !== "not_archived") return unarchived;
       const joined = await join(channelId, signal);
@@ -318,24 +362,32 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     return row ? { handle: row.handle, channelId: row.channel_id } : null;
   }
 
-  /** An existing public `#alerts`, found by listing (at most 5 pages), or undefined. */
-  async function findAlertsChannel(signal?: AbortSignal): Promise<TgResult<string | undefined>> {
+  /**
+   * An existing public `#alerts`, archived or not, found by listing (at most 5 pages), or
+   * undefined. Archived channels are included because an archived `alerts` still owns the name:
+   * creating one would answer `name_taken` forever.
+   */
+  async function findAlertsChannel(
+    signal?: AbortSignal,
+  ): Promise<TgResult<{ id: string; archived: boolean } | undefined>> {
     let cursor: string | undefined;
     for (let page = 0; page < ALERTS_LIST_PAGES; page++) {
       const res = await bot(
         "conversations.list",
         {
           types: "public_channel",
-          exclude_archived: true,
+          exclude_archived: false,
           limit: ALERTS_LIST_PAGE_SIZE,
           ...(cursor ? { cursor } : {}),
         },
         signal,
       );
       if (!res.ok) return res;
-      const channels = Array.isArray(res.result.channels) ? (res.result.channels as Array<{ id?: string; name?: string }>) : [];
+      const channels = Array.isArray(res.result.channels)
+        ? (res.result.channels as Array<{ id?: string; name?: string; is_archived?: boolean }>)
+        : [];
       const hit = channels.find((c) => c.name === ALERTS_CHANNEL_NAME && typeof c.id === "string");
-      if (hit?.id) return { ok: true, result: hit.id };
+      if (hit?.id) return { ok: true, result: { id: hit.id, archived: hit.is_archived === true } };
       const next = res.result.response_metadata?.next_cursor;
       if (typeof next !== "string" || next === "") break;
       cursor = next;
@@ -349,6 +401,20 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
    * one (owner invited). Concurrent first use: the loser's INSERT OR IGNORE is a no-op and both
    * read the winner's row back.
    */
+  /** Makes a discovered `#alerts` usable: unarchive it (as the user) when archived, then join. */
+  async function adoptAlertsChannel(
+    hit: { id: string; archived: boolean },
+    signal?: AbortSignal,
+  ): Promise<ChatResult<string>> {
+    if (hit.archived) {
+      const unarchived = await asUser("conversations.unarchive", { channel: hit.id }, signal);
+      if (!unarchived.ok && slackErr(unarchived) !== "not_archived") return unarchived;
+    }
+    const joined = await join(hit.id, signal);
+    if (!joined.ok) return joined;
+    return { ok: true, result: hit.id };
+  }
+
   async function resolveAlertsChannel(signal?: AbortSignal): Promise<ChatResult<Target>> {
     const existing = await alertsFromDb();
     if (existing) return { ok: true, result: existing };
@@ -366,25 +432,33 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     const found = await findAlertsChannel(signal);
     if (!found.ok) return found;
     if (found.result !== undefined) {
-      const joined = await join(found.result, signal);
-      if (!joined.ok) return joined;
-      channelId = found.result;
+      const adopted = await adoptAlertsChannel(found.result, signal);
+      if (!adopted.ok) return adopted;
+      channelId = adopted.result;
     } else {
       const created = await bot("conversations.create", { name: ALERTS_CHANNEL_NAME, is_private: false }, signal);
       if (!created.ok) {
-        if (slackErr(created) === "name_taken") {
-          const raced = await alertsFromDb();
-          if (raced) return { ok: true, result: raced };
-        }
-        return created;
+        if (slackErr(created) !== "name_taken") return created;
+        // Someone else made it between our listing and our create (or the listing missed it).
+        // Their row may already be stored; if not, look again and adopt what they made.
+        const raced = await alertsFromDb();
+        if (raced) return { ok: true, result: raced };
+        const again = await findAlertsChannel(signal);
+        if (!again.ok) return again;
+        if (again.result === undefined) return created;
+        const adopted = await adoptAlertsChannel(again.result, signal);
+        if (!adopted.ok) return adopted;
+        channelId = adopted.result;
+      } else {
+        const id = created.result.channel?.id;
+        if (typeof id !== "string") return upstreamFailure("create_without_channel");
+        channelId = id;
+        await inviteOwner(id, signal);
       }
-      const id = created.result.channel?.id;
-      if (typeof id !== "string") return upstreamFailure("create_without_channel");
-      channelId = id;
-      await inviteOwner(id, signal);
     }
 
     const handle = await ensureConversation(channelId);
+    if (handle === null) return upstreamFailure("handle_not_recorded");
     const now = Date.now();
     await db
       .prepare(
@@ -546,7 +620,12 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
   async function archive(handle: number, signal?: AbortSignal): Promise<ChatResult<boolean>> {
     const target = await targetForHandle(handle);
     if (!target) return unknownHandle("conversation");
-    const res = await bot("conversations.archive", { channel: target.channelId }, signal);
+    const res = await withChannelRecovery(
+      target.channelId,
+      () => bot("conversations.archive", { channel: target.channelId }, signal),
+      signal,
+      false,
+    );
     if (res.ok || slackErr(res) === "already_archived") return OK_TRUE;
     return res;
   }
@@ -572,16 +651,19 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     async sendRichMessage(options: SendRichMessageOptions) {
       return post({
         messageThreadId: options.messageThreadId,
-        recordText: options.markdown,
+        recordText: options.text ?? options.markdown,
         notifyOwner: options.notifyOwner,
         build: (notify) =>
           buildSlackMessage({
-            text: options.markdown,
+            // The fallback text is what a notification shows: the caller's plain text when it
+            // sent one, else the markdown source.
+            text: options.text ?? options.markdown,
             markdown: options.markdown,
             replyMarkup: options.replyMarkup,
             ownerUserId: ws.ownerUserId,
             notifyOwner: notify,
           }),
+        ...(options.signal ? { signal: options.signal } : {}),
       });
     },
 
@@ -601,26 +683,30 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         ownerUserId: ws.ownerUserId,
         notifyOwner: notify,
       });
-      const res = await bot("chat.update", {
-        channel: original.channelId,
-        ts: original.ts,
-        text: message.text,
-        blocks: message.blocks,
-      });
+      const res = await bot(
+        "chat.update",
+        { channel: original.channelId, ts: original.ts, text: message.text, blocks: message.blocks },
+        options.signal,
+      );
       if (!res.ok) return res;
-      await db
-        .prepare("UPDATE slack_posts SET text = ? WHERE handle = ? AND team_id = ?")
-        .bind(cutPoints(options.text, POST_TEXT_MAX), options.messageId, ws.teamId)
-        .run();
+      try {
+        await db
+          .prepare("UPDATE slack_posts SET text = ? WHERE handle = ? AND team_id = ?")
+          .bind(cutPoints(options.text, POST_TEXT_MAX), options.messageId, ws.teamId)
+          .run();
+      } catch (err) {
+        // Slack already has the edit; the stored text is only a convenience copy.
+        console.warn("[worker] slack post edited but its stored text was not updated", { err: String(err) });
+      }
       return { ok: true, result: { message_id: options.messageId } };
     },
 
     async sendPhoto(options: SendPhotoOptions) {
-      return sendFile(options.photo, options.filename, options.messageThreadId, options.replyToMessageId);
+      return sendFile(options.photo, options.filename, options.messageThreadId, options.replyToMessageId, options.signal);
     },
 
     async sendDocument(options: SendDocumentOptions) {
-      return sendFile(options.document, options.filename, options.messageThreadId, options.replyToMessageId);
+      return sendFile(options.document, options.filename, options.messageThreadId, options.replyToMessageId, options.signal);
     },
 
     async createForumTopic(options: CreateForumTopicOptions): Promise<ChatResult<ForumTopic>> {
@@ -631,10 +717,16 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       if (!created.result.ok) return created.result;
       const channelId = created.result.result.channel?.id;
       if (typeof channelId !== "string") return upstreamFailure("create_without_channel");
-      const channelName: string = typeof created.result.result.channel?.name === "string" ? created.result.result.channel.name : (created.name as string);
+      const channelName: string =
+        typeof created.result.result.channel?.name === "string"
+          ? created.result.result.channel.name
+          : (created.name as string);
 
       // Durable before the cosmetic steps, so a failure below cannot orphan a channel from its handle.
       const handle = await ensureConversation(channelId);
+      // The channel exists but has no handle, so nothing can address it. A transient failure (not a
+      // thrown 500): the retry makes a fresh channel, and the logged channel id lets one be tidied.
+      if (handle === null) return upstreamFailure("handle_not_recorded");
       await inviteOwner(channelId);
       const topic = await bot("conversations.setTopic", { channel: channelId, topic: topicText(options) });
       if (!topic.ok) console.warn("[worker] slack setTopic failed", { channelId, error: slackErr(topic) ?? topic.kind });
@@ -642,40 +734,59 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return { ok: true, result: { message_thread_id: handle, name: channelName, icon_color: 0 } };
     },
 
+    /**
+     * Renames only when the channel name can be computed in full: with a `sessionId` (the name
+     * ends in the session's 8 characters) or a `channelKey` (the name is the key). With neither,
+     * a rename would strip the suffix that makes the name unique, so only the topic is edited.
+     */
     async editForumTopic(options: EditForumTopicOptions) {
       if (options.name === undefined && options.topic === undefined) return OK_TRUE;
       const target = await targetForHandle(options.messageThreadId);
       if (!target) return unknownHandle("conversation");
+      const channel = (op: () => Promise<TgResult<SlackBody>>) =>
+        withChannelRecovery(target.channelId, op, undefined, false);
 
-      const info = await bot("conversations.info", { channel: target.channelId });
+      const info = await channel(() => bot("conversations.info", { channel: target.channelId }));
       if (!info.ok) return info;
       const currentName = typeof info.result.channel?.name === "string" ? (info.result.channel.name as string) : "";
-      const currentTopic = typeof info.result.channel?.topic?.value === "string" ? (info.result.channel.topic.value as string) : "";
+      const currentTopic =
+        typeof info.result.channel?.topic?.value === "string" ? (info.result.channel.topic.value as string) : "";
 
       if (options.name !== undefined) {
         const parts = nameParts({
           name: options.name,
           ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+          ...(options.channelKey ? { channelKey: options.channelKey } : {}),
         });
-        let unchanged = false;
-        for (let n = 1; n <= MAX_COLLISION_SUFFIX; n++) {
-          if (composeName(parts, n) === currentName) unchanged = true;
-        }
-        if (!unchanged) {
-          const renamed = await withUniqueName(parts, (name) =>
-            bot("conversations.rename", { channel: target.channelId, name }),
-          );
-          if (!renamed.result.ok) return renamed.result;
+        if (parts.sid !== null || options.channelKey) {
+          let unchanged = false;
+          for (let n = 1; n <= MAX_COLLISION_SUFFIX; n++) {
+            if (composeName(parts, n) === currentName) unchanged = true;
+          }
+          if (!unchanged) {
+            const renamed = await withUniqueName(parts, (name) =>
+              channel(() => bot("conversations.rename", { channel: target.channelId, name })),
+            );
+            if (!renamed.result.ok) return renamed.result;
+          }
         }
       }
 
-      const desired = topicText({
+      let desired = topicText({
         ...(options.name !== undefined ? { name: options.name } : {}),
         ...(options.sessionId ? { sessionId: options.sessionId } : {}),
         ...(options.topic !== undefined ? { topic: options.topic } : {}),
       });
+      if (options.sessionId === undefined && options.topic === undefined) {
+        // Nothing here says which session this is, but the channel's current topic line may, and
+        // dropping its id would lose the one place a human can read it.
+        const idSuffix = currentTopic.match(/ · 🆔 \S+$/)?.[0];
+        if (idSuffix) desired = topicText({ topic: `${cutPoints(desired, TOPIC_MAX - [...idSuffix].length)}${idSuffix}` });
+      }
       if (desired !== currentTopic) {
-        const set = await bot("conversations.setTopic", { channel: target.channelId, topic: desired });
+        const set = await channel(() =>
+          bot("conversations.setTopic", { channel: target.channelId, topic: desired }),
+        );
         if (!set.ok) return set;
       }
       return OK_TRUE;

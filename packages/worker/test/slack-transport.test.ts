@@ -8,12 +8,13 @@
  * `disableNetConnect` plus `assertNoPendingInterceptors` make a missing OR an extra call fail.
  */
 import { env, fetchMock } from "cloudflare:test";
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
 import { transportForChat } from "../src/chat";
 import { SLACK_HANDLE_MIN, slackChatId, type SlackWorkspace } from "../src/chat/slack-config";
 import { createSlackTransport, slugify } from "../src/chat/slack-transport";
 import type { ChatTransport } from "../src/chat";
+import { createTelegramClient } from "../src/telegram";
 
 beforeAll(async () => {
   for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
@@ -489,7 +490,7 @@ describe("#alerts", () => {
     expect(res.ok).toBe(true);
     expect(methods()).toEqual(["conversations.list", "conversations.list", "conversations.join", "chat.postMessage"]);
     expect(calls[0]!.params.get("types")).toBe("public_channel");
-    expect(calls[0]!.params.get("exclude_archived")).toBe("true");
+    expect(calls[0]!.params.get("exclude_archived")).toBe("false");
     expect(calls[0]!.params.get("limit")).toBe("200");
     expect(calls[1]!.params.get("cursor")).toBe("page2");
     expect(calls[2]!.params.get("channel")).toBe("CFOUND");
@@ -969,5 +970,401 @@ describe("transportForChat routing", () => {
     const marker = { ok: true, result: { message_id: 1 } } as const;
     const fake = { sendMessage: async () => marker } as unknown as ChatTransport;
     expect(transportForChat("8248645256", "tok", fake, { env: envWith(ws), db: env.DB })).toBe(fake);
+  });
+});
+
+// ─── review fixes ──────────────────────────────────────────────────────────
+
+describe("editForumTopic without enough to compute the channel name", () => {
+  it("never renames without a sessionId or channelKey, and keeps the id on the topic line", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRV1");
+    slack("conversations.info", {
+      ok: true,
+      channel: { name: "old-title-abcdef12", topic: { value: "Old title · ~/p · 🆔 ses_abcdef1234" } },
+    });
+    slack("conversations.setTopic", { ok: true });
+    const res = await transport(ws).editForumTopic({
+      chatId: slackChatId(ws),
+      messageThreadId: handle,
+      name: "New title · ~/p",
+    });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual(["conversations.info", "conversations.setTopic"]);
+    expect(calls[1]!.params.get("topic")).toBe("New title · ~/p · 🆔 ses_abcdef1234");
+  });
+
+  it("does not touch the topic when only the unchanged name was sent", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRV2");
+    slack("conversations.info", { ok: true, channel: { name: "x-abcdef12", topic: { value: "Same · 🆔 ses_abcdef1234" } } });
+    const res = await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: "Same" });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual(["conversations.info"]);
+  });
+
+  it("a channelKey fixes the name, so a named channel is renamed to its key when it differs, and left alone when it matches", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRV3");
+    slack("conversations.info", { ok: true, channel: { name: "wrong", topic: { value: "Digest" } } });
+    slack("conversations.rename", { ok: true });
+    const t = transport(ws);
+    const res = await t.editForumTopic({
+      chatId: slackChatId(ws),
+      messageThreadId: handle,
+      name: "Digest",
+      channelKey: "stall-watch:Digest",
+    });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual(["conversations.info", "conversations.rename"]);
+    expect(calls[1]!.params.get("name")).toBe("stall-watch-digest");
+
+    calls.length = 0;
+    slack("conversations.info", { ok: true, channel: { name: "stall-watch-digest", topic: { value: "Digest" } } });
+    expect(
+      (await t.editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: "Digest", channelKey: "stall-watch:Digest" })).ok,
+    ).toBe(true);
+    expect(methods()).toEqual(["conversations.info"]);
+  });
+
+  it("does not unarchive a closed channel to edit its metadata", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRV4");
+    slack("conversations.info", { ok: false, error: "is_archived" });
+    const res = await transport(ws).editForumTopic({
+      chatId: slackChatId(ws),
+      messageThreadId: handle,
+      name: "n",
+      sessionId: "ses_abcdef1234",
+    });
+    expect(!res.ok && res.kind).toBe("thread_not_found");
+    expect(methods()).toEqual(["conversations.info"]);
+  });
+});
+
+describe("#alerts discovery, review fixes", () => {
+  it("re-runs discovery after name_taken and adopts the channel it finds", async () => {
+    const ws = mkWs();
+    slack("conversations.list", { ok: true, channels: [] });
+    slack("conversations.create", { ok: false, error: "name_taken" });
+    slack("conversations.list", { ok: true, channels: [{ id: "CRACE", name: "alerts", is_archived: false }] });
+    slack("conversations.join", { ok: true });
+    slack("chat.postMessage", posted);
+    const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual([
+      "conversations.list",
+      "conversations.create",
+      "conversations.list",
+      "conversations.join",
+      "chat.postMessage",
+    ]);
+    expect(calls[3]!.params.get("channel")).toBe("CRACE");
+    expect(calls[4]!.params.get("channel")).toBe("CRACE");
+  });
+
+  it("returns the name_taken error when even a second discovery finds nothing", async () => {
+    const ws = mkWs();
+    slack("conversations.list", { ok: true, channels: [] });
+    slack("conversations.create", { ok: false, error: "name_taken" });
+    slack("conversations.list", { ok: true, channels: [] });
+    const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect((res.response as { error: string }).error).toBe("name_taken");
+  });
+
+  it("finds an ARCHIVED #alerts, unarchives it with the user token, then joins", async () => {
+    const ws = mkWs();
+    slack("conversations.list", { ok: true, channels: [{ id: "CARCHALERT", name: "alerts", is_archived: true }] });
+    slack("conversations.unarchive", { ok: true });
+    slack("conversations.join", { ok: true });
+    slack("chat.postMessage", posted);
+    const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual(["conversations.list", "conversations.unarchive", "conversations.join", "chat.postMessage"]);
+    expect(calls[0]!.params.get("exclude_archived")).toBe("false");
+    expect(calls[1]!.auth).toBe("Bearer xoxp-user");
+    expect(calls[1]!.params.get("channel")).toBe("CARCHALERT");
+    expect(calls[2]!.auth).toBe("Bearer xoxb-bot");
+  });
+
+  it("does not unarchive an alerts channel that is not archived", async () => {
+    const ws = mkWs();
+    slack("conversations.list", { ok: true, channels: [{ id: "CLIVE", name: "alerts", is_archived: false }] });
+    slack("conversations.join", { ok: true });
+    slack("chat.postMessage", posted);
+    expect((await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "x" })).ok).toBe(true);
+    expect(methods()).not.toContain("conversations.unarchive");
+  });
+});
+
+describe("not_in_channel recovery beyond posts", () => {
+  it("joins and retries archive, info, rename and setTopic once", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CNIC");
+    const t = transport(ws);
+
+    slack("conversations.archive", { ok: false, error: "not_in_channel" });
+    slack("conversations.join", { ok: true });
+    slack("conversations.archive", { ok: true });
+    expect((await t.closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect(methods()).toEqual(["conversations.archive", "conversations.join", "conversations.archive"]);
+
+    calls.length = 0;
+    slack("conversations.info", { ok: false, error: "not_in_channel" });
+    slack("conversations.join", { ok: true });
+    slack("conversations.info", { ok: true, channel: { name: "old", topic: { value: "" } } });
+    slack("conversations.rename", { ok: false, error: "not_in_channel" });
+    slack("conversations.join", { ok: true });
+    slack("conversations.rename", { ok: true });
+    slack("conversations.setTopic", { ok: false, error: "not_in_channel" });
+    slack("conversations.join", { ok: true });
+    slack("conversations.setTopic", { ok: true });
+    const res = await t.editForumTopic({
+      chatId: slackChatId(ws),
+      messageThreadId: handle,
+      name: "New",
+      sessionId: "ses_abcdef1234",
+    });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual([
+      "conversations.info",
+      "conversations.join",
+      "conversations.info",
+      "conversations.rename",
+      "conversations.join",
+      "conversations.rename",
+      "conversations.setTopic",
+      "conversations.join",
+      "conversations.setTopic",
+    ]);
+  });
+
+  it("a failed join is that join's own error", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CNIC2");
+    slack("conversations.archive", { ok: false, error: "not_in_channel" });
+    slack("conversations.join", { ok: false, error: "channel_not_found" });
+    const res = await transport(ws).closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle });
+    expect(!res.ok && res.kind).toBe("thread_not_found");
+  });
+});
+
+describe("a D1 failure after Slack accepted the call", () => {
+  /** A D1 whose first `failures` prepares of statements matching `pattern` throw. */
+  function flakyDb(pattern: RegExp, failures: number): D1Database {
+    let left = failures;
+    return {
+      prepare(sql: string) {
+        if (pattern.test(sql) && left-- > 0) throw new Error("d1 unavailable");
+        return env.DB.prepare(sql);
+      },
+    } as unknown as D1Database;
+  }
+
+  it("retries the post record once, so a single failure still returns a real handle", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CDB1");
+    slack("chat.postMessage", posted);
+    const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 1), ws });
+    const res = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.result.message_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
+  });
+
+  it("returns message_id 0 with a warning, not a thrown error, when the record keeps failing", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CDB2");
+    slack("chat.postMessage", posted);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 99), ws });
+      const res = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
+      expect(res).toEqual({ ok: true, result: { message_id: 0 } });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("not recorded"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does the same for a file post", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CDB3");
+    slack("files.getUploadURLExternal", { ok: true, upload_url: "https://files.slack.com/upload/v1/D", file_id: "FD" });
+    fetchMock.get("https://files.slack.com").intercept({ method: "POST", path: "/upload/v1/D" }).reply(200, "OK - 1");
+    slack("files.completeUploadExternal", { ok: true, files: [] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 99), ws });
+      const res = await t.sendDocument({ chatId: slackChatId(ws), messageThreadId: handle, document: new Blob(["x"]), filename: "a" });
+      expect(res).toEqual({ ok: true, result: { message_id: 0 } });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an edit whose stored-text update fails is still a success", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CDB4");
+    slack("chat.postMessage", posted);
+    const sent = await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "q" });
+    if (!sent.ok) throw new Error("send failed");
+    slack("chat.update", { ok: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/UPDATE slack_posts/, 99), ws });
+      const res = await t.editMessageText({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "q2" });
+      expect(res.ok).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a created channel whose handle cannot be recorded is a transient failure that names the channel in the log, not a throw", async () => {
+    const ws = mkWs();
+    slack("conversations.create", { ok: true, channel: { id: "CORPHAN", name: "x" } });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/INTO slack_conversations/, 99), ws });
+      const res = await t.createForumTopic({ chatId: slackChatId(ws), name: "x" });
+      expect(res.ok).toBe(false);
+      if (!res.ok && res.kind === "error") expect(res.errorCode).toBe(502);
+      else throw new Error("expected a 502 failure");
+      expect(JSON.stringify(err.mock.calls)).toContain("CORPHAN");
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("the same for a newly created #alerts", async () => {
+    const ws = mkWs();
+    slack("conversations.list", { ok: true, channels: [] });
+    slack("conversations.create", { ok: true, channel: { id: "CAORPHAN", name: "alerts" } });
+    slack("conversations.invite", { ok: true });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/INTO slack_conversations/, 99), ws });
+      const res = await t.sendMessage({ chatId: slackChatId(ws), text: "x" });
+      expect(res.ok).toBe(false);
+    } finally {
+      err.mockRestore();
+    }
+  });
+});
+
+describe("sendRichMessage fallback text", () => {
+  it("uses the caller's plain text as the notification text, and keeps the markdown block", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRT");
+    slack("chat.postMessage", posted);
+    const res = await transport(ws).sendRichMessage({
+      chatId: slackChatId(ws),
+      messageThreadId: handle,
+      markdown: "**Done** — see `a.ts`",
+      text: "Done — see a.ts",
+    });
+    expect(res.ok).toBe(true);
+    expect(calls[0]!.params.get("text")).toBe("Done — see a.ts");
+    expect((json(calls[0], "blocks") as Array<{ type: string; text: string }>)[0]).toEqual({
+      type: "markdown",
+      text: "**Done** — see `a.ts`",
+    });
+    const post = await env.DB.prepare("SELECT text FROM slack_posts WHERE handle = ?")
+      .bind((res as { result: { message_id: number } }).result.message_id)
+      .first<{ text: string }>();
+    expect(post?.text).toBe("Done — see a.ts");
+  });
+
+  it("falls back to the markdown source when no text is given", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRT2");
+    slack("chat.postMessage", posted);
+    await transport(ws).sendRichMessage({ chatId: slackChatId(ws), messageThreadId: handle, markdown: "# Hi" });
+    expect(calls[0]!.params.get("text")).toBe("# Hi");
+  });
+});
+
+describe("signal on every operation that carries one", () => {
+  const signalFetch = () => {
+    const seen: Array<{ method: string; signal: AbortSignal | null | undefined }> = [];
+    const answers: Record<string, unknown> = {
+      "chat.postMessage": { ok: true, ts: "4.4" },
+      "chat.update": { ok: true },
+      "files.getUploadURLExternal": { ok: true, upload_url: "https://files.slack.com/upload/v1/SG", file_id: "FSG" },
+      "files.completeUploadExternal": { ok: true, files: [] },
+    };
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      const method = url.startsWith("https://files.slack.com") ? "upload" : url.replace("https://slack.com/api/", "");
+      seen.push({ method, signal: init?.signal });
+      if (method === "upload") return new Response("OK - 1");
+      return new Response(JSON.stringify(answers[method] ?? { ok: false, error: "unexpected" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return { seen, fetchFn };
+  };
+
+  it("sendRichMessage, editMessageText, sendPhoto and sendDocument pass it to each Slack call", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CSG");
+    const ac = new AbortController();
+    const { seen, fetchFn } = signalFetch();
+    const t = createSlackTransport({ db: env.DB, ws, fetchFn });
+    const chatId = slackChatId(ws);
+
+    const rich = await t.sendRichMessage({ chatId, messageThreadId: handle, markdown: "m", signal: ac.signal });
+    expect(rich.ok).toBe(true);
+    if (!rich.ok) return;
+    expect((await t.editMessageText({ chatId, messageId: rich.result.message_id, text: "e", signal: ac.signal })).ok).toBe(true);
+    expect((await t.sendPhoto({ chatId, messageThreadId: handle, photo: new Blob(["p"]), filename: "p.png", signal: ac.signal })).ok).toBe(true);
+    expect((await t.sendDocument({ chatId, messageThreadId: handle, document: new Blob(["d"]), filename: "d.txt", signal: ac.signal })).ok).toBe(true);
+
+    expect(seen.map((s) => s.method)).toEqual([
+      "chat.postMessage",
+      "chat.update",
+      "files.getUploadURLExternal",
+      "upload",
+      "files.completeUploadExternal",
+      "files.getUploadURLExternal",
+      "upload",
+      "files.completeUploadExternal",
+    ]);
+    for (const s of seen) expect(s.signal).toBe(ac.signal);
+  });
+});
+
+describe("Telegram requests are unchanged by the new option fields", () => {
+  it("sends byte-identical bodies with or without signal / notifyOwner (and text on a rich message)", async () => {
+    const bodies: Array<{ method: string; body: unknown }> = [];
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation((async (url: string, init?: RequestInit) => {
+      const body = init?.body;
+      bodies.push({
+        method: String(url).split("/").pop()!,
+        body:
+          body instanceof FormData
+            ? [...body.entries()].map(([k, v]) => [k, typeof v === "string" ? v : `file:${(v as File).name}:${(v as File).size}`])
+            : body,
+      });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+    }) as typeof fetch);
+    try {
+      const tg = createTelegramClient("tok-byte");
+      const ac = new AbortController();
+      const run = async (extra: Record<string, unknown>, richExtra: Record<string, unknown> = {}) => {
+        bodies.length = 0;
+        await tg.sendRichMessage({ chatId: "1", markdown: "m", messageThreadId: 5, replyMarkup: { a: 1 }, ...extra, ...richExtra });
+        await tg.editMessageText({ chatId: "1", messageId: 2, text: "t", entities: [{ type: "bold" }], ...extra });
+        await tg.sendPhoto({ chatId: "1", photo: new Blob(["abc"]), filename: "p.png", messageThreadId: 5, replyToMessageId: 3, ...extra });
+        await tg.sendDocument({ chatId: "1", document: new Blob(["abc"]), filename: "d.txt", ...extra });
+        await tg.sendMessage({ chatId: "1", text: "t", ...extra });
+        return structuredClone(bodies);
+      };
+      const plain = await run({});
+      const extended = await run({ signal: ac.signal, notifyOwner: true }, { text: "plain" });
+      expect(extended).toEqual(plain);
+      expect(plain).toHaveLength(5);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
