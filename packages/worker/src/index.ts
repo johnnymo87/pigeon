@@ -1,3 +1,4 @@
+import { handleSendMessage, handleUnpinTopic } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
@@ -121,6 +122,14 @@ export default {
         }
         if (path === "/notifications/edit" && method === "POST") {
           return handleEditNotification(db, env, request);
+        }
+
+        // Session-free sends (chat-transport, pigeon-lenr.1)
+        if (path === "/messages/send" && method === "POST") {
+          return handleSendMessage(env, request);
+        }
+        if (path === "/topics/unpin" && method === "POST") {
+          return handleUnpinTopic(env, request);
         }
 
         // Telegram webhook

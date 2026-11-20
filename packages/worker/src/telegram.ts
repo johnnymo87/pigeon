@@ -11,6 +11,8 @@ export interface SendMessageOptions {
   entities?: unknown[];
   replyMarkup?: unknown;
   messageThreadId?: number;
+  /** Aborts the call (the fetch rejects). Callers that bound a request use this. */
+  signal?: AbortSignal;
 }
 
 export interface SendRichMessageOptions {
@@ -94,6 +96,7 @@ export interface DeleteForumTopicOptions {
 export interface UnpinAllForumTopicMessagesOptions {
   chatId: string | number;
   messageThreadId: number;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
@@ -191,9 +194,9 @@ export function logTelegramCall(method: string, elapsedMs: number, outcome: stri
  *
  * Every exported method routes through here. That is the point: a per-method wrapper would
  * have to be remembered at each of the twelve call sites, and the thirteenth would silently
- * go unmeasured. Note the one call this does NOT cover: the media download in `webhook.ts`
- * hits `api.telegram.org/file/bot.../<path>`, which is a file fetch rather than a Bot API
- * method and does not go through here.
+ * go unmeasured. The one Telegram fetch that is not a Bot API method, the file download, has
+ * its own function below (`downloadFile`). It is timed to response headers only, because its
+ * body is streamed into R2 by the caller, and it has no abort (unchanged from before it moved).
  *
  * Two things about the measurement are easy to misread:
  *
@@ -318,6 +321,7 @@ export async function sendMessage(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
 }
 
@@ -547,7 +551,27 @@ export async function unpinAllForumTopicMessages(
       chat_id: options.chatId,
       message_thread_id: options.messageThreadId,
     }),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
+}
+
+/**
+ * Downloads a file Telegram is hosting (`file_path` from `getFile`). Not a Bot API method, so it
+ * returns the raw Response rather than a TgResult: the caller streams the body into R2.
+ *
+ * It lives here, not at its call site, so that this file stays the only one that knows
+ * Telegram's host (the egress guard test enforces that; chat-transport, pigeon-lenr.1).
+ */
+export async function downloadFile(botToken: string, filePath: string): Promise<Response> {
+  const startedAt = Date.now();
+  let outcome = "threw";
+  try {
+    const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+    outcome = res.ok ? "ok" : `http_${res.status}`;
+    return res;
+  } finally {
+    logTelegramCall("downloadFile", Date.now() - startedAt, outcome);
+  }
 }
 
 export function createTelegramClient(botToken: string) {
@@ -566,6 +590,7 @@ export function createTelegramClient(botToken: string) {
     deleteForumTopic: (options: DeleteForumTopicOptions) => deleteForumTopic(botToken, options),
     unpinAllForumTopicMessages: (options: UnpinAllForumTopicMessagesOptions) =>
       unpinAllForumTopicMessages(botToken, options),
+    downloadFile: (filePath: string) => downloadFile(botToken, filePath),
   };
 }
 
