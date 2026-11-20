@@ -225,8 +225,8 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
 - **Direct-fallback alarm:** `direct-slack-alarm.ts` posts to the workspace's incoming webhook for
   `#alerts` (`PIGEON_SLACK_ALARM_WEBHOOK_URL`). It can post to one channel only, which is narrower
   than the bot token the daemon holds today. Same worker-first ladder, suffix and throttled health
-  alert as phase 1. The daemon picks the alarm for its current `whoami.transport`; if `whoami`
-  cannot be read, it uses whichever direct path is configured (Slack first). Guard test:
+  alert as phase 1. The daemon picks the alarm for its current `whoami.transport`; before the first
+  successful `whoami` it uses whichever direct path is configured (Slack first). Guard test:
   `hooks.slack.com` appears only in that file (and `api.telegram.org` only in the Telegram one,
   until deleted).
 - **`launchCapable`**: worker credentials, an opencode client, and an alarm path for the current
@@ -243,10 +243,13 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
 - **`whoami.transport`** (§1, §6); `/topics/named(/bind)` return `chatId`.
 - **`/topics/lookup` returns `url`.**
 - **`rich.dialect`**: the daemon's `rich-markdown.ts` produces Telegram dialect today (copy-text
-  buttons as `<tg-button>`, `\$ \= \| \!` escapes, `&lt;`), which Slack would show literally. On a
-  Slack chat id the daemon renders standard GFM instead (no `tg-button`; code spans for copyable
-  ids; Slack's escapes only) and sends `dialect: "slack"`. Goose turns are always rich, so this is
-  not optional.
+  buttons as `<tg-button>`, `\$ \= \| \!` escapes, `&lt;`), which Slack would show literally. When its
+  persisted `whoami.transport` is Slack, the daemon renders standard GFM instead (no `tg-button`;
+  code spans for copyable ids; Slack's escapes only) and sends `dialect: "slack"`. Goose turns are
+  always rich, so this is not optional. The outbox stores the payload at enqueue time, so a flip can
+  put either dialect in front of either transport: the worker sends `rich` only when its dialect
+  matches the target (absent = Telegram), and otherwise takes the plain path, which is always
+  present.
 - **`notifyOwner: true`** on questions and error-severity alerts (D7); ignored by Telegram.
 - **`errorClass`** in worker error responses (§4 table). The daemon prefers it and falls back to
   today's `details.error_code` / description, so either deploy order is safe.
