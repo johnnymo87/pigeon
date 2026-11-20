@@ -40,7 +40,7 @@ export async function editTopicName(
     return { ok: false, error: getTelegramErrorDetails(editRes) };
   }
 
-  await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, name }));
+  await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, chatId: topic.chat_id, name }));
   return { ok: true };
 }
 

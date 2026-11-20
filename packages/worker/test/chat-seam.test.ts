@@ -221,10 +221,16 @@ describe("parseChatCommand", () => {
     expect(parseChatCommand(`/kill ${goose}`)).toMatchObject({ type: "kill", target: goose });
   });
 
-  it("does not take a too-short or non-id token as a target (falls through as before)", () => {
-    expect(parseChatCommand("/kill ses_abc")).toBeNull();
-    expect(parseChatCommand("/kill now")).toBeNull();
-    expect(parseChatCommand("/kill ses_e71285de extra")).toBeNull();
+  it("answers a session command with unparseable arguments with usage, never as a prompt", () => {
+    expect(parseChatCommand("/kill ses_abc")).toEqual({ kind: "usage", command: "kill" });
+    expect(parseChatCommand("/kill now")).toEqual({ kind: "usage", command: "kill" });
+    expect(parseChatCommand("/kill ses_e71285de extra")).toEqual({ kind: "usage", command: "kill" });
+    expect(parseChatCommand("/interrupt Ses_e71285de")).toEqual({ kind: "usage", command: "interrupt" });
+    expect(parseChatCommand("/compact please")).toEqual({ kind: "usage", command: "compact" });
+    expect(parseChatCommand("/mcp")).toEqual({ kind: "usage", command: "mcp" });
+    expect(parseChatCommand("/mcp ses_e71285de")).toEqual({ kind: "usage", command: "mcp" });
+    expect(parseChatCommand("/killall")).toBeNull();
+    expect(parseChatCommand("/mcpx list")).toBeNull();
   });
 
   it("parses /rename, /tag and /launch", () => {
@@ -365,6 +371,17 @@ describe("session commands with a leading <session-id>", () => {
     expect(reply).toContain(`${base}2`);
   });
 
+  it("/kill with a malformed argument answers with usage and injects nothing", async () => {
+    const machineId = uniq("m_usage_");
+    const sessionId = uniq("ses_usagetarget");
+    await seedSession(sessionId, machineId);
+    await touchMachine(env.DB, machineId);
+    const sends = captureSends();
+    await handleTelegramWebhook(env.DB, env as Env, webhook("/kill now"));
+    expect(sends.at(-1)).toMatch(/^Usage/);
+    expect(await commandsFor(machineId)).toEqual([]);
+  });
+
   it("/kill <unknown id> answers and queues nothing", async () => {
     const sends = captureSends();
     await handleTelegramWebhook(env.DB, env as Env, webhook("/kill ses_nosuchsession00"));
@@ -409,5 +426,21 @@ describe("session commands with a leading <session-id>", () => {
     await handleTelegramWebhook(env.DB, env as Env, webhook(`/compact ${target}`));
     expect(await commandsFor(machineId)).toEqual([]);
     expect(sends.at(-1)).toBe(`${machineId} is not recently seen.`);
+  });
+});
+
+describe("post-provider-call topic writes are chat-scoped too", () => {
+  it("markClosed and rename with a chatId leave another chat's row alone", async () => {
+    const { markClosed, rename } = await import("../src/topics");
+    const sessionId = uniq("ses_cas_close_");
+    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: SLACK_CHAT, name: "s" });
+    await finalize(env.DB, { sessionId, chatId: SLACK_CHAT, messageThreadId: 44, name: "s", provisional: true });
+    await markClosed(env.DB, { sessionId, chatId: TG_CHAT });
+    await rename(env.DB, { sessionId, chatId: TG_CHAT, name: "renamed" });
+    const row = await getBySession(env.DB, sessionId);
+    expect(row?.state).toBe("open");
+    expect(row?.name).toBe("s");
+    await markClosed(env.DB, { sessionId, chatId: SLACK_CHAT });
+    expect((await getBySession(env.DB, sessionId))?.state).toBe("closed");
   });
 });

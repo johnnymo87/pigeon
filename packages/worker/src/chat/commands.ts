@@ -35,7 +35,27 @@ export type ChatCommand =
    */
   | { kind: "session"; type: SessionCommandType; arg: string; target?: string }
   | { kind: "rename"; title: string | undefined }
-  | { kind: "tag"; args: TagCommand };
+  | { kind: "tag"; args: TagCommand }
+  /**
+   * A session command whose arguments do not parse (`/kill now`, `/kill ses_e7128` with a
+   * too-short id, `/mcp`). Answered with `SESSION_COMMAND_USAGE_TEXT`, never forwarded: the same
+   * rule /launch and /tag carry, and the one that matters once `<session-id>` arguments are
+   * invited, because a near-miss would otherwise be injected into the session as a prompt.
+   */
+  | { kind: "usage"; command: string };
+
+export const SESSION_COMMAND_USAGE_TEXT = [
+  "Usage (the session id is optional: a full ses_/gse_ id or at least 8 characters of one;",
+  "without it, the session you replied to or whose topic this is):",
+  "/kill [<session-id>]",
+  "/interrupt [<session-id>]",
+  "/compact [<session-id>]",
+  "/mcp [<session-id>] list | enable <server> | disable <server>",
+  "/model [<session-id>] [<provider/model>]",
+].join("\n");
+
+/** Command names whose malformed forms answer with usage (`/killall` is not one of them). */
+const SESSION_COMMAND_NAME_RE = /^\/(kill|interrupt|compact|mcp)(?=$|\s)/;
 
 /**
  * A session reference: an opencode (`ses_`) or goose (`gse_`) id, whole or cut short after at
@@ -88,6 +108,10 @@ export function parseChatCommand(text: string): ChatCommand | null {
 
   const tag = text.match(TAG_RE);
   if (tag) return { kind: "tag", args: parseTagArgs(tag[1]) };
+
+  // /model always parses (any single argument without "/" lists), so it never reaches here.
+  const named = text.match(SESSION_COMMAND_NAME_RE);
+  if (named) return { kind: "usage", command: named[1]! };
 
   return null;
 }

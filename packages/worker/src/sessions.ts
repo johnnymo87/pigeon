@@ -285,7 +285,7 @@ async function unregisterSession(
     if (topic && topic.state === "open") {
       // Mark closed in D1 before touching Telegram, so a failed/timed-out Telegram call still
       // leaves a row the reaper will collect.
-      await markClosed(db, { sessionId });
+      await markClosed(db, { sessionId, chatId: topic.chat_id });
       // A reservation row (NULL thread id) has no Telegram topic yet; closeForumTopic on it is a
       // guaranteed 400.
       if (topic.message_thread_id !== null) {

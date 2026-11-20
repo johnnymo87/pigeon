@@ -276,17 +276,20 @@ export async function rename(
   opts: {
     sessionId: string;
     name: string;
+    /** Scope to the chat whose topic was renamed (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET name = ?, name_provisional = 0, updated_at = ?
-       WHERE session_id = ?`,
+       WHERE session_id = ?${scope.sql}`,
     )
-    .bind(opts.name, now, opts.sessionId)
+    .bind(opts.name, now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
 }
@@ -334,17 +337,20 @@ export async function markClosed(
   db: D1Database,
   opts: {
     sessionId: string;
+    /** Scope to the chat whose topic was closed (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET state = 'closed', closed_at = ?, updated_at = ?
-       WHERE session_id = ?`,
+       WHERE session_id = ?${scope.sql}`,
     )
-    .bind(now, now, opts.sessionId)
+    .bind(now, now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
 }

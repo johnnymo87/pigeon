@@ -6,7 +6,7 @@ import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } fr
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
 import { transportForChat } from "./chat";
-import { parseChatCommand, sessionCommandAck } from "./chat/commands";
+import { parseChatCommand, sessionCommandAck, SESSION_COMMAND_USAGE_TEXT } from "./chat/commands";
 import { ambiguousRefText, noSessionRefText, resolveSessionRef } from "./chat/session-ref";
 import { TAG_USAGE_TEXT } from "./tag-command";
 import { LAUNCH_USAGE_TEXT } from "./launch-command";
@@ -1118,6 +1118,13 @@ export async function handleTelegramWebhook(
 
     // /kill /interrupt /compact /mcp /model: one session each, named by the optional leading
     // <session-id> (full id or unique prefix, spec §5) or else by context (swipe-reply, topic).
+    if (parsedCmd?.kind === "usage") {
+      await sendTelegramMessage(env, update.message.chat.id, SESSION_COMMAND_USAGE_TEXT, {
+        messageThreadId: update.message.message_thread_id,
+      });
+      return OK();
+    }
+
     if (parsedCmd?.kind === "session") {
       const cmdChatId = update.message.chat.id;
       const threadId = update.message.message_thread_id;

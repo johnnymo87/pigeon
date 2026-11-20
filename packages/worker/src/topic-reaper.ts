@@ -176,7 +176,7 @@ export async function closeOrphanedTopics(
 
   for (const row of rows) {
     if (row.message_thread_id === null) {
-      await markClosed(db, { sessionId: row.session_id, now });
+      await markClosed(db, { sessionId: row.session_id, chatId: row.chat_id, now });
       closedOrphans++;
       continue;
     }
@@ -201,7 +201,7 @@ export async function closeOrphanedTopics(
     // Safe because the orphan-closer only ever fires on a session that is absent or idle past the
     // liveness TTL, and `listReapable` independently refuses to reap a topic whose session is live.
     // So marking closed here cannot strand a topic a live session is still posting to.
-    await markClosed(db, { sessionId: row.session_id, now });
+    await markClosed(db, { sessionId: row.session_id, chatId: row.chat_id, now });
     closedOrphans++;
   }
 
