@@ -35,7 +35,7 @@ const D=require("better-sqlite3");const db=new D(process.argv[1]);
 db.prepare(process.argv[2]).run();' "$DB" "$1"; }
 
 echo "### 1. Boot the real daemon entrypoint against the scratch DB"
-env -u OPENCODE_SERVE_ID -u OPENCODE_ROUTING_DB -u OPENCODE_DB \
+env -u OPENCODE_SERVE_ID -u OPENCODE_ROUTING_DB -u OPENCODE_DB -u CCR_WORKER_URL -u CCR_API_KEY \
     -u OPENCODE_SESSION_ID -u OPENCODE_DISABLE_CHANNEL_DB \
     PIGEON_DAEMON_DB_PATH="$DB" \
     PIGEON_DAEMON_PORT="$PORT" \
@@ -83,7 +83,7 @@ process.stdout.write(r ? r.endpoint : "");' "$DB")
   if [ "$ep" = "http://127.0.0.1:34097" ]; then REPAIRED="yes (after ~$((i*250))ms)"; break; fi
 done
 
-# The alert is an awaited network call to api.telegram.org; give it a bounded
+# The alert is an awaited network call to the Telegram Bot API (direct-only host); give it a bounded
 # window to land rather than racing it (an unbounded assume-it-happened here
 # would be exactly the vacuous check this exercise is guarding against).
 for i in $(seq 1 60); do
@@ -127,8 +127,9 @@ else
   echo "  FAIL  drift was not logged"; fail=$((fail+1))
 fi
 
-if grep -q 'alertDelivery":"telegram"' "$LOG"; then
-  echo "  PASS  startup line reports plain-alert delivery is AVAILABLE"; pass=$((pass+1))
+# No worker here (no CCR_*), so alerts take the daemon's direct path only.
+if grep -q 'alertDelivery":"direct-only"' "$LOG"; then
+  echo "  PASS  startup line reports plain-alert delivery is AVAILABLE (direct-only)"; pass=$((pass+1))
 else
   echo "  FAIL  startup line did not report an available alert channel"; fail=$((fail+1))
 fi

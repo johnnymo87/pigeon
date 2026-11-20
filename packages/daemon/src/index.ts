@@ -16,7 +16,6 @@ import {
   createLaunchWorkLock,
 } from "./swarm/remote-launch-poll";
 import {
-  TelegramNotificationService,
   generateToken,
   type StopNotifier,
 } from "./notification-service";
@@ -29,6 +28,10 @@ import { SESSION_EVENTS_RETENTION_MS } from "./storage/session-events-schema";
 import { Poller } from "./worker/poller";
 import { advertisedBackends, checkLaunchServable } from "./worker/backends";
 import { WorkerHealthMonitor } from "./worker/worker-health";
+import { WorkerMessageClient } from "./worker/worker-message-client";
+import { createCommandReplySender, type CommandReplySender } from "./worker/command-reply";
+import { createAlertNotifier, describeAlertDelivery } from "./alert-notifier";
+import { DirectTelegramAlarm } from "./direct-telegram-alarm";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
 import { AlertDrainer, DEFAULT_DRAIN_INTERVAL_MS, type AlertDrainerNotifier } from "./swarm/alert-drainer";
@@ -376,39 +379,16 @@ async function handleGooseControl(
   return true;
 }
 
-async function sendTelegramMessage(
-  chatId: string,
-  text: string,
-  opts: { entities?: TgEntity[]; messageThreadId: number | undefined },
-): Promise<void> {
-  if (!config.telegramBotToken) return;
-  try {
-    const apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
-    const payload: Record<string, unknown> = { chat_id: chatId, text };
-    if (opts.entities && opts.entities.length > 0) {
-      payload.entities = opts.entities;
-    }
-    if (opts.messageThreadId !== undefined) {
-      payload.message_thread_id = opts.messageThreadId;
-    }
-    const res = await fetch(`${apiBase}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      // The body, not just the status. Telegram answers an over-long message, a
-      // bad entity offset or invalid UTF-8 with an indistinguishable 400, and a
-      // command reply that vanishes between the worker's ack and the user's
-      // screen leaves a bare "400" as the only trace. That dead end is what made
-      // the surrogate-pair bug in the /tag backlog hard to find.
-      const detail = await res.text().catch(() => "");
-      console.warn(`[pigeon-daemon] sendTelegramMessage failed: ${res.status} ${detail.slice(0, 500)}`);
-    }
-  } catch (err) {
-    console.warn("[pigeon-daemon] sendTelegramMessage fetch error:", err);
-  }
-}
+/**
+ * The worker's session-free send route (chat-transport phase 1, pigeon-lenr). Used for
+ * slash-command replies (no fallback) and as the first leg of operational alerts.
+ */
+const workerMessageClient = config.workerUrl && config.workerApiKey
+  ? new WorkerMessageClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
+  : undefined;
+
+/** Slash-command replies go through the worker; see worker/command-reply.ts. */
+const sendTelegramMessage: CommandReplySender = createCommandReplySender(workerMessageClient);
 
 /**
  * Builds the dependencies for a /tag command.
@@ -510,6 +490,9 @@ const remoteLaunchClient = config.workerUrl && config.workerApiKey
   ? new RemoteLaunchClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
   : undefined;
 
+// Still requires TELEGRAM_BOT_TOKEN even though launch notices now go worker-first
+// (chat-transport phase 1): a worker-only host is deliberately not treated as launch-capable
+// until that is decided on its own.
 const launchCapable = Boolean(
   config.remoteLaunchFrom.length > 0 &&
   opencodeClient &&
@@ -923,7 +906,8 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
       {
         healthMonitor: workerHealthMonitor,
         // pigeon-k0qn.8: a rotated key the worker refuses would otherwise fail every poll
-        // with only a warn line. The alert goes straight to Telegram, not via the worker.
+        // with only a warn line. The alert tries the worker first and falls back to the
+        // direct alarm path (alert-notifier.ts), so it still gets out when the worker refuses us.
         onPollAuthRejected: (status, consecutive) => {
           storage.alerts.enqueue({
             source: "worker-auth",
@@ -974,11 +958,28 @@ if (outboxSender) {
   outboxSender.start(5_000);
 }
 
-const telegramNotifier = config.telegramBotToken && config.telegramChatId
-  ? new TelegramNotificationService(storage, config.telegramBotToken, config.telegramChatId, Date.now, fetch, config.machineId)
+// Operational alerts (chat-transport phase 1, pigeon-lenr): worker first, then the daemon's
+// one direct Bot API path as a visible fallback, so an alarm about a broken worker can still
+// get out (see alert-notifier.ts). Either leg alone also works; with neither there is no
+// notifier and alerts are only recorded.
+const alertDirect = config.telegramBotToken && config.telegramChatId
+  ? new DirectTelegramAlarm(config.telegramBotToken, config.telegramChatId)
   : undefined;
-
-const notifier: StopNotifier | undefined = telegramNotifier;
+const alertDelivery = describeAlertDelivery({
+  worker: Boolean(workerMessageClient && config.telegramChatId),
+  direct: Boolean(alertDirect),
+});
+const notifier: StopNotifier | undefined = config.telegramChatId
+  ? createAlertNotifier({
+      chatId: config.telegramChatId,
+      worker: workerMessageClient,
+      direct: alertDirect,
+      alerts: storage.alerts,
+      machineId: config.machineId,
+      log: (msg, fields) => console.warn(`[alert] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    })
+  : undefined;
+console.log(`[pigeon-daemon] alert delivery: ${alertDelivery}`);
 
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.
@@ -1042,7 +1043,8 @@ if (swarmArbiter) {
 
 // Operational alert drainer: sends queued operational alerts to Telegram.
 // Note on notifier capability gate: sendPlainAlert is optional on StopNotifier. On a host
-// with no TELEGRAM_BOT_TOKEN, there is no plain-alert notifier. Alerts are still enqueued in DB
+// with no TELEGRAM_CHAT_ID, or with neither a worker nor TELEGRAM_BOT_TOKEN, there is no
+// plain-alert notifier (`alertDelivery` UNAVAILABLE). Alerts are still enqueued in DB
 // as an honest record of events; they are simply never drained. Do NOT mark them sent when no
 // notifier exists — that would record a configuration fact as a delivery fact.
 const alertDrainer = notifier?.sendPlainAlert
@@ -1161,9 +1163,9 @@ if (poller) {
 // the failure mode this whole bead is about.
 //
 // NOTE on alert delivery: `StopNotifier.sendPlainAlert` is OPTIONAL
-// (notification-service.ts), so on a host with no TELEGRAM_BOT_TOKEN there is no
-// plain-alert notifier at all and drift alerts are dropped. The repair still happens.
-// The startup line below states which of the two it is, so an undeliverable alert
+// (notification-service.ts), so on a host with no plain-alert notifier (`alertDelivery`
+// UNAVAILABLE) drift alerts are dropped. The repair still happens.
+// The startup line below states which mode it is, so an undeliverable alert
 // is visible once rather than invisible forever. Cannot use the durable outbox here:
 // the worker's POST /notifications/send 404s unless `sessionId` exists in its
 // sessions table, and an operational alert has no session — it would retry 10x and
@@ -1186,7 +1188,7 @@ if (endpointReconciler) {
   console.log("[pigeon-daemon] serve endpoint reconciler started", JSON.stringify({
     intervalMs: config.healthPollMs,
     serves: config.serveEndpoints.length,
-    alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
+    alertDelivery,
   }));
 }
 
@@ -1270,7 +1272,7 @@ if (flapDetector) {
       breadth: `${DEFAULT_BREADTH_SESSIONS} sessions x ${DEFAULT_BREADTH_MOVES_EACH} moves / 15m (PROVISIONAL)`,
       slowBurn: `${DEFAULT_SLOW_BURN_MOVES} moves by one session / 24h (PROVISIONAL)`,
     },
-    alertDelivery: notifier?.sendPlainAlert ? "telegram" : "UNAVAILABLE (no plain-alert notifier)",
+    alertDelivery,
   }));
 }
 

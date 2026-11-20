@@ -19,10 +19,13 @@
  * on that same endpoint.
  *
  * DELIVERY. The alert leaves via `AlertRepository` -> `AlertDrainer` ->
- * `StopNotifier.sendPlainAlert`, which POSTs directly to api.telegram.org
- * (notification-service.ts:386) and does NOT traverse the worker. That is what makes this
- * alarm meaningful: it can still get out while the thing it is reporting on is broken.
- * Everything else the daemon sends to Telegram goes through the worker and would be stuck
+ * `StopNotifier.sendPlainAlert`, which since chat-transport phase 1 (pigeon-lenr) tries the
+ * worker's `POST /messages/send` first and, when the WORKER fails, re-sends through the
+ * daemon's one direct Bot API path (`DirectTelegramAlarm`, see alert-notifier.ts), marked
+ * `sent direct; worker: <reason>`. The fallback is what keeps this alarm meaningful: it can
+ * still get out while the thing it is reporting on is broken. On a host with no bot token
+ * there is no fallback, and an alert about a broken worker is only recorded. Everything else
+ * the daemon sends to Telegram goes through the worker with no fallback and would be stuck
  * behind the very outage being reported.
  *
  * WHAT THIS DOES NOT COVER. The counters observe CALLS, so they measure "our writes to the

@@ -83,7 +83,17 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 
 Both notification types display a session ID on its own line for easy copy-paste in Telegram.
 
-The notifier tries the worker path first (`WorkerNotificationService`), falling back to direct Telegram API (`TelegramNotificationService`).
+### Telegram egress (chat-transport phase 1, pigeon-lenr)
+
+The worker is the only normal caller of the Telegram Bot API. Design:
+`docs/plans/2026-11-20-telegram-single-egress-design.md`.
+
+- **Session notifications** (stop, question, swarm, mirror) go through the durable outbox to the worker's `/notifications/send`, as before.
+- **Slash-command replies** (`worker/command-reply.ts`) go to the worker's session-free `POST /messages/send` through `WorkerMessageClient`, with a 30s worker-side Telegram abort and no fallback. A worker 404 (worker older than the daemon) is logged as an **error**.
+- **Operational alerts** (`sendPlainAlert`: `/alert`, the alert drainer, the reconciler, flap detector, watchdog) go through `createAlertNotifier` (`alert-notifier.ts`): worker first (capped at 5s), and when the *worker* fails (not when Telegram says 400/429) they are re-sent through `DirectTelegramAlarm` with a `· sent direct; worker: <reason>` suffix, and one `worker-health-fallback` alert per failure kind per hour is recorded. Under 2s of budget a host with a direct path goes direct only. `unpinTopic` is worker-only.
+- `direct-telegram-alarm.ts` is the only `daemon/src` file allowed to contain `api.telegram.org` (guard: `test/telegram-egress-guard.test.ts`).
+- Startup line `[pigeon-daemon] alert delivery: worker+direct-fallback | worker-only | direct-only | UNAVAILABLE`.
+- Rollout rule: once a daemon runs this code, the worker must not be rolled back below the `/messages/send` version, or every command reply is lost.
 
 ## Media Relay
 
