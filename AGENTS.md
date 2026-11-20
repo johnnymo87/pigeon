@@ -542,6 +542,8 @@ Health check URLs are listed in the Quickstart section above.
   - Use when deploying to Cloudflare and validating production health/auth.
 - [telegram-forum-migration](docs/runbooks/telegram-forum-migration.md)
   - Runbook for Telegram Forum Topics supergroup migration and rollback steps.
+- [slack-workspace-setup](docs/runbooks/slack-workspace-setup.md)
+  - Runbook for creating a machine's Slack workspace and app from `packages/worker/slack/manifest.template.json` and staging its credentials (chat-transport phase 2, `pigeon-4ogz`).
 - [worker-operations](.agents/skills/worker-operations/SKILL.md)
   - Use for incident triage, log tailing, quick diagnostics, and rollback steps.
 - [worker-troubleshooting](.agents/skills/worker-troubleshooting/SKILL.md)
