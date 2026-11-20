@@ -421,8 +421,7 @@ async function relayMediaToR2(
     return { error: "Could not download file from Telegram" };
   }
 
-  const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${getFileResult.result.file_path}`;
-  const fileRes = await fetch(fileUrl);
+  const fileRes = await tg.downloadFile(getFileResult.result.file_path);
   if (!fileRes.ok || !fileRes.body) {
     return { error: "Could not download file from Telegram" };
   }
