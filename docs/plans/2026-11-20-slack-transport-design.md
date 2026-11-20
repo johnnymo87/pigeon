@@ -21,7 +21,7 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
 | D6 | **One channel per session.** Rename = channel rename; close = archive; plain messages in the channel go to the session; native slash commands work there. stall-watch named topics become named channels. |
 | D7 | Notifications (revised again 2026-11-20, after setup): **no pushes at all to start; Jonathan introduces them gradually.** The owner-mention machinery (`notifyOwner`, the named-channel and `#alerts` mention, the mention prefix on direct-alarm and em-* posts) is built, but each category is **off by default** behind config (§3 "Muting"), so turning one on later is a config change, not a code change. The workspaces are set to notify on mentions only, and no channel has a per-channel override, so with every category off nothing pushes. A real mute is impossible (setup test failed), so session channels still show unread badges. |
 | D8 | Per-workspace `#alerts` (Telegram's General). `#em-alerts` in the devbox workspace for the eternal-machinery monitors, fed by a separate app/incoming webhook (no pigeon credential). healthchecks.io moves to its built-in Slack integration (Jonathan, in its UI). |
-| D9 | Cutover per machine: the worker picks the transport per machine; devbox → cloudbox → macbook; Telegram code deleted after all three. A flipped machine's live sessions get a Slack channel **at the flip** (`slack-flip` creates one for every live session with an open Telegram topic, §3), so every session can be talked to from Slack straight away, not only after its next notification; coordinators keep theirs through the binding move. No history migration: old conversation stays readable in Telegram until step 9. Three Slack apps generated from one manifest in the repo, one per workspace (no OAuth distribution). Slash commands keep their names (except `/rename`, a Slack built-in: it becomes **`/retitle`**, §2). |
+| D9 | Cutover per machine: the worker picks the transport per machine; devbox → cloudbox → macbook; Telegram code deleted after all three. Coordinators get their Slack channel **at the flip** through the binding move (§3); every other live session gets one on its next notification (prompt it in the TUI to bring it back). No history migration: old conversation stays readable in Telegram until step 9. Three Slack apps generated from one manifest in the repo, one per workspace (no OAuth distribution). Slash commands keep their names (except `/rename`, a Slack built-in: it becomes **`/retitle`**, §2). |
 | D10 | Workspaces are owned by `jonathan.mohrbacher@gmail.com` and named like the Telegram groups: `pigeon <box>`. An agent (the planning session) creates them and their apps, with Jonathan's OK (2026-11-20); verification codes are read through `gws` on devbox. A user token for unarchive is approved. |
 
 ## Design
@@ -161,16 +161,12 @@ so pigeon never mutes. What controls pushes:
 - The devbox live check is "worker blocked → the alarm posts in `#alerts`" (it pushes only if the
   categories are on).
 
-**Flip creates the live sessions' channels.** A session that never notifies after the flip would
-otherwise have no Slack channel, and so no way to be talked to from Slack. `slack-flip <m> on`
-therefore, after putting the secret, supersedes every open `topics` row of the machine's live
-sessions (worker `sessions.machine_id = <m>`) toward Slack: it creates the channel (same name and
-topic rules as a lazy create, and no mention) and posts one line,
-"Continued from Telegram. Reply here.", paced under `conversations.create`'s Tier 2 limit. It goes
-through the worker (an authenticated admin route that runs the lazy supersede path per session,
-rather than the script talking to Slack and D1 itself), and uses the same chat-scoped CAS: a notification racing it cannot produce two channels. The old
-Telegram topic is left in place as readable history, but once its row is superseded a reply typed
-there no longer routes (the worker answers that the session moved to Slack). `off` does not undo this; the next notification supersedes back.
+**What the flip carries over (Jonathan, 2026-11-20).** Only the stall-watch coordinators, which
+live on devbox and cloudbox: the binding batch below creates each bound coordinator's Slack named
+channel **at the flip** (not on first use), so he can talk to every coordinator from Slack straight
+away. Nothing is done for ordinary sessions: a session gets its Slack channel on its next
+notification, and a session he wants back he finds in the TUI and prompts there, which makes it
+notify. Old Telegram topics stay as readable history until step 9.
 
 **Named channels** (`/topics/named`, `/alert topic`): a `named_topics` row under `slack:<team>`
 with a handle; channel name from the key (`stallwatch:chat-transport` →
@@ -184,7 +180,7 @@ binds) reject them.
 **Flip and unflip move bindings explicitly.** `named_topic_bindings` is `UNIQUE(session_id)`, and a
 coordinator's own notifications go through `getBindingForSession`, never through a key resolve, so
 carry-over cannot be lazy. The flip runbook step is a D1 batch: for each binding whose session
-belongs to the machine, ensure the Slack named channel exists (or create on first use) and
+belongs to the machine, create the Slack named channel if it does not exist (at the flip, not on first use) and
 re-point the binding's `chat_id` to `slack:<team>`. Unflip is the inverse batch. Both are a script
 in the repo (`scripts/slack-flip.ts <machine> on|off`) that also puts or deletes the secret, and
 both directions are tested.
@@ -334,14 +330,15 @@ The bead graph under `pigeon-4ogz` is authoritative.
    injects; `/kill` in a channel and `/kill <id>` in `#alerts`; question button; wizard edit; photo
    each way; `/retitle`; archive + unarchive; goose turn renders markdown and a table; `/alert` with
    links (iOS link opens the app); a devbox coordinator channel receives and answers; direct alarm
-   with the worker blocked; every live session has a channel right after the flip and a message
-   typed there reaches it. **Rollback:** `slack-flip devbox off`.
+   with the worker blocked; every devbox coordinator has a channel right after the flip and a
+   message typed there reaches it. **Rollback:** `slack-flip devbox off`.
 6. **em-alerts** (`pigeon-lenr.4`), after 5.
 7. **cloudbox**, same as 5 (the main coordinator check: work programs live there); then
    **macbook** (a worker session on the Mac, launched with `swarm_launch`, stages the Keychain
    items ahead and flips after cloudbox).
-8. **Gate (Jonathan, 2026-11-20):** on all three machines, existing sessions (coordinators and
-   workers) can be talked to from Slack and their new messages arrive in Slack. No week-long soak
+8. **Gate (Jonathan, 2026-11-20):** the coordinators on devbox and cloudbox can be talked to from
+   Slack and their new messages arrive in Slack (other sessions come back by being prompted in the
+   TUI). No week-long soak
    and no further go-ahead: once the gate holds, delete Telegram. Message history is not migrated.
 9. **Delete Telegram:** client, webhook, Telegram rows, vars and secrets, daemon Telegram alarm and
    config, contract renames, docs and skills; then the cross-repo `telegram-reply` rename. **No
