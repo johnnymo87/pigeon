@@ -19,9 +19,10 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
 | D4 | Events API into the Cloudflare worker (HTTP). No Socket Mode. |
 | D5 | Owner-only, as now. |
 | D6 | **One channel per session.** Rename = channel rename; close = archive; plain messages in the channel go to the session; native slash commands work there. stall-watch named topics become named channels. |
-| D7 | Notifications: Jonathan sets each workspace's preference to "All new messages"; pigeon additionally @-mentions him on questions and error-severity alerts. |
+| D7 | Notifications (revised 2026-11-20): **session channels are created muted; coordinator channels are not.** pigeon @-mentions him on questions and error-severity alerts, which notify even in a muted channel. How "muted" is achieved is §3 "Muting". |
 | D8 | Per-workspace `#alerts` (Telegram's General). `#em-alerts` in the devbox workspace for the eternal-machinery monitors, fed by a separate app/incoming webhook (no pigeon credential). healthchecks.io moves to its built-in Slack integration (Jonathan, in its UI). |
-| D9 | Cutover per machine: the worker picks the transport per machine; devbox → cloudbox → macbook; Telegram code deleted after all three. A flipped machine's live sessions get a fresh channel on their next notification; no history migration. Three Slack apps generated from one manifest in the repo, one per workspace (no OAuth distribution). Slash commands keep their names (except `/rename`, a Slack built-in: `/title`, §2). |
+| D9 | Cutover per machine: the worker picks the transport per machine; devbox → cloudbox → macbook; Telegram code deleted after all three. A flipped machine's live sessions get a fresh channel on their next notification; no history migration. Three Slack apps generated from one manifest in the repo, one per workspace (no OAuth distribution). Slash commands keep their names (except `/rename`, a Slack built-in: it becomes **`/retitle`**, §2). |
+| D10 | Workspaces are owned by `jonathan.mohrbacher@gmail.com` and named like the Telegram groups: `pigeon <box>`. An agent (the planning session) creates them and their apps, with Jonathan's OK (2026-11-20); verification codes are read through `gws` on devbox. A user token for unarchive is approved. |
 
 ## Design
 
@@ -94,17 +95,26 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
 ### 2. Slack apps and workspaces
 
 - One manifest template in the repo (`packages/worker/slack/manifest.template.json`) and a
-  script that renders it per machine. Runbook `docs/runbooks/slack-workspace-setup.md`. Jonathan
-  (or an agent with his explicit go-ahead) creates the workspace, creates `#alerts`, creates the
-  app from the rendered manifest, installs it (choosing `#alerts` for the incoming webhook), and
-  stores the credentials.
+  script that renders it per machine. Runbook `docs/runbooks/slack-workspace-setup.md`. The agent
+  (D10) creates the workspace (`pigeon <box>`, owner `jonathan.mohrbacher@gmail.com`), creates
+  `#alerts`, creates the app from the rendered manifest, installs it (choosing `#alerts` for the
+  incoming webhook), and stores the credentials. All three workspaces can be created from devbox;
+  only the Mac's daemon config needs the Mac. Signup is a web flow with no API, so it needs a
+  browser (a headless Chromium under CDP on devbox, or Jonathan's browser on port 9222); if Slack
+  blocks automation, that step falls back to Jonathan. App creation can use `apps.manifest.create`
+  with an app configuration token; install is an OAuth consent in the same browser session.
+- **Where credentials live:** the worker config JSON for each machine is staged in workstation
+  sops `secrets/devbox.yaml` as `pigeon_slack_workspace_<machine>` (the flip script, run from
+  devbox, reads it); each machine's `#alerts` incoming-webhook URL goes into that machine's own
+  secrets (sops on devbox/cloudbox, Keychain on the Mac). Nothing is put into the worker until the
+  flip.
 - **Bot scopes:** `chat:write`, `channels:manage`, `channels:read`, `channels:history`,
   `channels:join`, `commands`, `files:read`, `files:write`, `incoming-webhook`.
   **User scope:** `channels:write`, used only for `conversations.unarchive`, which bot tokens cannot
-  call (Slack docs).
+  call (Slack docs), and as the candidate token for muting (§3).
   **Events:** `message.channels`, with **Delayed Events** on (hourly retries for 24 h).
-  **Interactivity:** on. **Slash commands:** `/launch /kill /interrupt /compact /title /mcp /model
-  /tag`. `/rename` is a Slack built-in, so the rename command is **`/title`** on Slack (Telegram keeps
+  **Interactivity:** on. **Slash commands:** `/launch /kill /interrupt /compact /retitle /mcp /model
+  /tag`. `/rename` is a Slack built-in, so the rename command is **`/retitle`** on Slack (Telegram keeps
   `/rename`); this is the one exception to D9's "keep the names".
 - **Request URLs, per machine:** `/slack/<machine>/events`, `/slack/<machine>/interactivity`,
   `/slack/<machine>/commands`. The path picks the workspace config; the signature is checked
@@ -121,13 +131,28 @@ reserve/finalize CAS, same `topic_unavailable` hold).
   while provisional. `name_taken` (archived channels keep names; Jonathan may make channels; ids
   are time-prefixed) → retry with `-2`, `-3`, …. **Topic** (`setTopic`, 250): `title · ~/dir ·
   🆔 <session id>`.
-- **Provisional title upgrade** (`pigeon-353p`), `/title` and `/topics/rename`:
+- **Provisional title upgrade** (`pigeon-353p`), `/retitle` and `/topics/rename`:
   `conversations.rename` + `setTopic`.
 - **Close = archive**, keeping today's orphan rule, 7-day idle and the daily 04:00 UTC tick
   (sessions vanish and come back routinely; the window is the grace). **Reopen = unarchive** with
   the user token, then post. Reap after 30 days: drop the row, no provider call.
 - **Gone:** `channel_not_found` / `is_archived` on a send = Telegram's `thread not found`
   (unarchive or recreate once). `not_in_channel` → `conversations.join`, retry once.
+
+**Muting (D7).** Slack has no public API for a user's mute or per-channel notification
+preferences; the only route is the undocumented `users.prefs.set` (`muted_channels`), which is
+known to work with client tokens and is unverified with an app's user token. So:
+- **Guaranteed mechanism:** the runbook sets each workspace's notification preference to
+  **"Mentions only"** (Jonathan's account, set once by the agent in the signup session). Session
+  channels then never push, except for the @-mentions pigeon adds to questions and error alerts.
+  Coordinator channels push because **every bot post in a channel whose named-topic key starts
+  `stallwatch:`** (the coordinator channels) carries the owner @-mention, as a channel-level
+  `notifyOwner`. Unread badges still show in the sidebar; that is the difference from a real mute.
+- **Real mute, if it works:** at workspace setup, test `users.prefs.set muted_channels` with the
+  app's user token on a scratch channel. If it takes effect, the worker also mutes each new session
+  channel right after creating it (best-effort; a failure logs and never blocks a send), and
+  coordinator channels stay unmuted. The result of the test is recorded on the setup bead and in
+  the runbook.
 
 **Named channels** (`/topics/named`, `/alert topic`): a `named_topics` row under `slack:<team>`
 with a handle; channel name from the key (`stallwatch:chat-transport` →
@@ -250,7 +275,9 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
   put either dialect in front of either transport: the worker sends `rich` only when its dialect
   matches the target (absent = Telegram), and otherwise takes the plain path, which is always
   present.
-- **`notifyOwner: true`** on questions and error-severity alerts (D7); ignored by Telegram.
+- **`notifyOwner: true`** on questions and error-severity alerts (D7); ignored by Telegram. The
+  worker also applies it to every post in a coordinator channel (`stallwatch:` key), so stall-watch
+  needs no change.
 - **`errorClass`** in worker error responses (§4 table). The daemon prefers it and falls back to
   today's `details.error_code` / description, so either deploy order is safe.
 
@@ -287,7 +314,7 @@ The bead graph under `pigeon-4ogz` is authoritative.
 5. **devbox:** Jonathan's go-ahead → workspace + app per runbook → workstation PR (alarm webhook,
    allowlist) → `slack-flip devbox on`. Live checks: notification creates a channel; typed message
    injects; `/kill` in a channel and `/kill <id>` in `#alerts`; question button; wizard edit; photo
-   each way; `/title`; archive + unarchive; goose turn renders markdown and a table; `/alert` with
+   each way; `/retitle`; archive + unarchive; goose turn renders markdown and a table; `/alert` with
    links (iOS link opens the app); a devbox coordinator channel receives and answers; direct alarm
    with the worker blocked. **Rollback:** `slack-flip devbox off`.
 6. **em-alerts** (`pigeon-lenr.4`), after 5.
