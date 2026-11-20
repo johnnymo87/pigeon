@@ -272,6 +272,48 @@ describe("AlertNotifier: the fallback health alert cannot loop", () => {
     expect(healthAlerts()).toHaveLength(3);
   });
 
+  it("a Telegram stall behind a healthy worker is reported as Telegram being slow, not as a broken worker", async () => {
+    const f = makeFetch({ worker: () => json({ ok: false, error: "telegram call timed out after 4000ms" }, 502), direct: directOk });
+    await build(f.fetch, { storage })!.sendPlainAlert!("a", "info");
+    expect(String(f.calls[1]!.body.text)).toContain("telegram call timed out after 4000ms");
+    const [row] = healthAlerts();
+    expect(row!.text).toMatch(/could not get a reply from Telegram/);
+    expect(row!.text).not.toMatch(/bypassing the worker/);
+  });
+
+  it("a worker leg starved of budget that times out records no health alert (it proves nothing)", async () => {
+    vi.useFakeTimers();
+    const f = makeFetch({ worker: hang, direct: directOk });
+    const p = build(f.fetch, { storage })!.sendPlainAlert!("x", "info", { timeoutMs: 2_500 });
+    await vi.advanceTimersByTimeAsync(2_500);
+    await p;
+    expect(f.calls.map((c) => c.leg)).toEqual(["worker", "direct"]);
+    expect(healthAlerts()).toHaveLength(0);
+  });
+
+  it("a worker leg starved of budget that gets a definite 404 still records it", async () => {
+    const f = makeFetch({ worker: () => new Response("", { status: 404 }), direct: directOk });
+    await build(f.fetch, { storage })!.sendPlainAlert!("x", "info", { timeoutMs: 2_500 });
+    expect(healthAlerts()).toHaveLength(1);
+  });
+
+  it("worker-only host: one health alert per outage, not one per hour, re-armed by a success", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(80_000_000);
+    let status = 503;
+    const f = makeFetch({ worker: () => (status === 200 ? json({ ok: true, messageId: 1 }) : new Response("", { status })) });
+    const n = build(f.fetch, { storage, direct: false })!;
+    await n.sendPlainAlert!("a", "info").catch(() => {});
+    vi.setSystemTime(80_000_000 + 3 * FALLBACK_ALERT_THROTTLE_MS);
+    await n.sendPlainAlert!("b", "info").catch(() => {});
+    expect(healthAlerts()).toHaveLength(1);
+    status = 200;
+    await n.sendPlainAlert!("c", "info");
+    status = 503;
+    await n.sendPlainAlert!("d", "info").catch(() => {});
+    expect(healthAlerts()).toHaveLength(2);
+  });
+
   it("names the machine when given one", async () => {
     const f = makeFetch({ worker: () => new Response("", { status: 404 }), direct: directOk });
     await build(f.fetch, { storage, machineId: "devbox" })!.sendPlainAlert!("a", "info");

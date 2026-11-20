@@ -42,6 +42,12 @@ export type WorkerSendOutcome =
       reason: string;
       /** Stable and low-cardinality, for throttling one health alert per kind of failure. */
       key: string;
+      /**
+       * `telegram_unreachable`: the worker answered but could not get a reply from Telegram
+       * in time (its own abort, or a transport error to Telegram). The worker itself is
+       * probably fine. `worker`: everything else.
+       */
+      cause: "worker" | "telegram_unreachable";
       status?: number;
     };
 
@@ -122,8 +128,8 @@ export class WorkerMessageClient {
     try {
       res = await this.post("/messages/send", wire, opts.timeoutMs);
     } catch (err) {
-      if (err instanceof Timeout) return { kind: "worker_failed", reason: err.message, key: "timeout" };
-      return { kind: "worker_failed", reason: `transport error: ${errText(err)}`, key: "transport" };
+      if (err instanceof Timeout) return { kind: "worker_failed", reason: err.message, key: "timeout", cause: "worker" };
+      return { kind: "worker_failed", reason: `transport error: ${errText(err)}`, key: "transport", cause: "worker" };
     }
 
     const obj = isObject(res.parsed) ? res.parsed : undefined;
@@ -137,6 +143,7 @@ export class WorkerMessageClient {
           kind: "worker_failed",
           reason: res.parseable ? "200 with an unexpected body" : "200 with a non-JSON body",
           key: "bad_body",
+          cause: "worker",
           status: 200,
         };
       }
@@ -154,6 +161,7 @@ export class WorkerMessageClient {
         kind: "worker_failed",
         reason: `200 ok:false${tgStatus !== undefined ? ` (Telegram ${tgStatus})` : ""}`,
         key: `ok_false${tgStatus !== undefined ? `:tg${tgStatus}` : ""}`,
+        cause: "worker",
         status: 200,
       };
     }
@@ -161,14 +169,25 @@ export class WorkerMessageClient {
     const error = obj && typeof obj.error === "string" ? obj.error : undefined;
     let reason = `HTTP ${res.status}`;
     let key = `http${res.status}`;
+    let cause: "worker" | "telegram_unreachable" = "worker";
     if (tgStatus !== undefined) {
       reason += ` (Telegram ${tgStatus}${tgDesc ? `: ${tgDesc}` : ""})`;
       key += `:tg${tgStatus}`;
     } else if (error && /^[a-z_]{1,40}$/.test(error)) {
+      // A slug: low-cardinality, safe as a throttle key.
       reason += ` ${error}`;
       key += `:${error}`;
+    } else if (error) {
+      // Free text (the worker's "telegram call timed out after 4000ms" / "telegram call
+      // failed: ..."). Kept in the reason, sanitised and short, but never in the key, which
+      // must stay low-cardinality.
+      reason += ` (${sanitise(error, 80)})`;
+      if (res.status === 502 && /^telegram call /.test(error)) {
+        key += ":telegram_unreachable";
+        cause = "telegram_unreachable";
+      }
     }
-    return { kind: "worker_failed", reason, key, status: res.status };
+    return { kind: "worker_failed", reason, key, cause, status: res.status };
   }
 
   /** `POST /topics/unpin`. Best-effort: throws on any failure, for the caller to log. */
@@ -188,6 +207,12 @@ export class WorkerMessageClient {
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function sanitise(text: string, max: number): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 function errText(err: unknown): string {

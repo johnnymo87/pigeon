@@ -90,6 +90,12 @@ class AlertNotifier {
    * as long as the row is still there.
    */
   private readonly lastFallbackAlertAt = new Map<string, number>();
+  /**
+   * Worker-only hosts: the health alert can only be delivered by the very worker that is
+   * failing, so an hourly re-alert would just pile up undeliverable rows that drain as a
+   * stale burst on recovery. One per outage instead, re-armed by the next successful send.
+   */
+  private workerOnlyOutageReported = false;
 
   constructor(private readonly deps: AlertNotifierDeps) {
     this.nowFn = deps.nowFn ?? (() => Date.now());
@@ -124,7 +130,10 @@ class AlertNotifier {
       { timeoutMs: workerBudget },
     );
 
-    if (outcome.kind === "sent") return;
+    if (outcome.kind === "sent") {
+      this.workerOnlyOutageReported = false;
+      return;
+    }
     if (outcome.kind === "telegram_rejected") {
       throw new TelegramSendError(
         outcome.status,
@@ -137,7 +146,12 @@ class AlertNotifier {
       reason: outcome.reason,
       fallback: direct ? "direct" : "none",
     });
-    this.noteWorkerFailure(outcome, Boolean(direct));
+    // A timeout under a starved budget (an /alert ladder rung late in its 10s) proves
+    // nothing about the worker: it may simply not have had time. A definite answer still
+    // counts, however short the budget.
+    const starved = workerBudget < WORKER_LEG_MS;
+    const indefinite = outcome.key === "timeout" || outcome.cause === "telegram_unreachable";
+    if (!(starved && indefinite)) this.noteWorkerFailure(outcome, Boolean(direct));
     if (!direct) {
       throw new Error(`worker /messages/send failed: ${outcome.reason}`);
     }
@@ -171,18 +185,27 @@ class AlertNotifier {
   private noteWorkerFailure(outcome: Extract<WorkerSendOutcome, { kind: "worker_failed" }>, hasDirect: boolean): void {
     try {
       const now = this.nowFn();
+      if (!hasDirect) {
+        if (this.workerOnlyOutageReported) return;
+        this.workerOnlyOutageReported = true;
+      }
       const last = this.lastFallbackAlertAt.get(outcome.key);
       if (last !== undefined && now - last < FALLBACK_ALERT_THROTTLE_MS) return;
       this.lastFallbackAlertAt.set(outcome.key, now);
       if (!this.deps.alerts) return;
       const where = this.deps.machineId ? ` on ${this.deps.machineId}` : "";
-      const text = hasDirect
-        ? `Alerts${where} are bypassing the worker: POST /messages/send failed (${outcome.reason}), ` +
-          `so operational alerts are being sent direct to Telegram. Slash-command replies have no ` +
-          `fallback and are probably being lost. Reported at most once an hour per kind of failure.`
-        : `Worker POST /messages/send failed${where} (${outcome.reason}) and this host has no direct ` +
-          `Telegram path, so operational alerts and slash-command replies are not getting out. ` +
-          `Reported at most once an hour per kind of failure.`;
+      const text = !hasDirect
+        ? `Worker POST /messages/send failed${where} (${outcome.reason}) and this host has no direct ` +
+          `Telegram path, so operational alerts and slash-command replies were not getting out. ` +
+          `Reported once per outage.`
+        : outcome.cause === "telegram_unreachable"
+          ? `The worker could not get a reply from Telegram in time for an alert${where} ` +
+            `(${outcome.reason}), so it was re-sent direct and may appear twice. The worker itself ` +
+            `is probably fine; slash-command replies wait longer and are probably landing. ` +
+            `Reported at most once an hour per kind of failure.`
+          : `Alerts${where} are bypassing the worker: POST /messages/send failed (${outcome.reason}), ` +
+            `so operational alerts are being sent direct to Telegram. Slash-command replies have no ` +
+            `fallback and are probably being lost. Reported at most once an hour per kind of failure.`;
       this.deps.alerts.enqueue({
         source: "worker-health-fallback",
         refMsgId: `workerdirect:${outcome.key}:${Math.floor(now / FALLBACK_ALERT_THROTTLE_MS)}`,
