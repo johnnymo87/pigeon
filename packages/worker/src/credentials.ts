@@ -19,6 +19,7 @@
  */
 
 import { unauthorized } from "./auth";
+import { slackWorkspaceForMachine } from "./chat/slack-config";
 
 export type Principal = { kind: "shared" } | { kind: "machine"; machineId: string };
 
@@ -199,9 +200,12 @@ export async function requireMachinePrincipal(
 export async function handleWhoami(request: Request, env: Env): Promise<Response> {
   const principal = await authenticate(request, env);
   if (!principal) return unauthorized();
+  if (principal.kind !== "machine") return Response.json({ credential: "shared", machine_id: null });
+  // `transport` appears only for a machine on Slack, so a Telegram machine's answer is exactly
+  // what it was before Slack existed; a daemon reads its absence in a 200 as Telegram.
   return Response.json(
-    principal.kind === "machine"
-      ? { credential: "machine", machine_id: principal.machineId }
-      : { credential: "shared", machine_id: null },
+    slackWorkspaceForMachine(env, principal.machineId)
+      ? { credential: "machine", machine_id: principal.machineId, transport: "slack" }
+      : { credential: "machine", machine_id: principal.machineId },
   );
 }
