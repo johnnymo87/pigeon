@@ -1,6 +1,6 @@
 # Slack as pigeon's chat transport (chat-transport phase 2)
 
-Status: design, 2026-11-20, reviewed by adversarial-reviewer-opus (buy-in after two rounds of changes, all applied). Bead `pigeon-4ogz`. Decisions D1–D9 are Jonathan's (2026-11-20).
+Status: design, 2026-11-20, reviewed by adversarial-reviewer-opus (buy-in; revised for Jonathan's batch-4 asks and re-reviewed: buy-in). Bead `pigeon-4ogz`. Decisions D1–D9 are Jonathan's (2026-11-20).
 Phase 1: `docs/plans/2026-11-20-telegram-single-egress-design.md` (epic `pigeon-lenr`).
 
 ## Goal
@@ -166,8 +166,9 @@ known to work with client tokens and is unverified with an app's user token. So:
 - **Real mute, only if it passes cleanly:** at setup, test `users.prefs.set muted_channels` with
   the app's **user token** on a scratch channel. It passes only if the channel then shows as muted
   (dimmed, no badge) on a device, not merely if the API echoes the value. `muted_channels` is a
-  whole-list write, so even when it passes the worker does read-then-write under a per-workspace
-  lock and never removes an id it did not add. If it does not pass cleanly, it is dropped: the
+  whole-list write, so even when it passes the worker does read-then-write and never removes an id
+  it did not add; an occasional lost update leaves one session channel unmuted, which is harmless
+  (the mention mechanism already meets D7). If it does not pass cleanly, it is dropped: the
   mention mechanism already meets D7. Result recorded on the setup bead and in the runbook.
 
 **Named channels** (`/topics/named`, `/alert topic`): a `named_topics` row under `slack:<team>`
