@@ -1,5 +1,5 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { transportForChat, type ChatTransport } from "./chat";
+import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
   listOrphaned,
   listReapable,
@@ -61,6 +61,8 @@ export interface ReapTopicsOptions {
   limit?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
 }
 
 export interface ReapResult {
@@ -75,6 +77,8 @@ export interface CloseOrphanedTopicsOptions {
   limit?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
 }
 
 export interface CloseOrphanedResult {
@@ -90,6 +94,8 @@ export interface RunTopicReaperOptions {
   orphanCap?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
   /**
    * Run the orphan-closer this tick. Defaults to true so the reaper stays window-agnostic —
    * the cron handler owns the schedule decision via `shouldCloseOrphans`.
@@ -106,7 +112,7 @@ export interface TopicReaperResult {
 /**
  * Job 1 — reap. Delete topics with state='closed' AND closed_at < now - 30 days.
  * Capped at limit per run (default 5). On thread_not_found, drops the D1 row anyway.
- * NULL message_thread_id rows skip Telegram entirely.
+ * NULL message_thread_id rows skip Telegram entirely, and so do Slack rows (nothing to delete).
  */
 export async function reapTopics(
   db: D1Database,
@@ -125,12 +131,20 @@ export async function reapTopics(
   }
 
   // Rows of every chat are mixed here, so the transport is picked per row, by its address.
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let reaped = 0;
 
   for (const row of rows) {
     if (row.message_thread_id === null) {
       const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, null);
+      if (deleted) reaped++;
+      continue;
+    }
+
+    // Slack has nothing to delete: a channel can only be archived (which the orphan-closer did
+    // when the row closed), never removed. The row is just forgotten, with no provider call.
+    if (isSlackChatId(row.chat_id)) {
+      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
       if (deleted) reaped++;
       continue;
     }
@@ -171,8 +185,12 @@ export async function closeOrphanedTopics(
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let closedOrphans = 0;
+  // A 429 limits ONE provider, so it stops that transport's remaining rows and no others: Slack
+  // being limited must not leave Telegram orphans open until tomorrow's tick, nor the reverse.
+  // Telegram-only (or Slack-only) runs therefore behave exactly as the single flag did.
+  const limited = new Set<"slack" | "telegram">();
 
   for (const row of rows) {
     if (row.message_thread_id === null) {
@@ -181,13 +199,17 @@ export async function closeOrphanedTopics(
       continue;
     }
 
+    const transport = isSlackChatId(row.chat_id) ? "slack" : "telegram";
+    if (limited.has(transport)) continue;
+
     const res = await tgFor(row.chat_id).closeForumTopic({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });
 
     if (!res.ok && res.kind === "rate_limited") {
-      return { closedOrphans, rateLimited: true };
+      limited.add(transport);
+      continue;
     }
 
     // Everything that is not a 429 marks the row closed — including a GENERIC failure.
@@ -205,7 +227,7 @@ export async function closeOrphanedTopics(
     closedOrphans++;
   }
 
-  return { closedOrphans, rateLimited: false };
+  return { closedOrphans, rateLimited: limited.size > 0 };
 }
 
 /**
@@ -233,6 +255,7 @@ export async function runTopicReaper(
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.reapCap,
     tgClient: opts.tgClient,
+    env: opts.env,
   });
 
   if (reapRes.rateLimited) {
@@ -255,6 +278,7 @@ export async function runTopicReaper(
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.orphanCap,
     tgClient: opts.tgClient,
+    env: opts.env,
   });
 
   return {

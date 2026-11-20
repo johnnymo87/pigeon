@@ -457,7 +457,7 @@ async function sendTelegramMessage(
   text: string,
   opts: { messageThreadId: number | undefined },
 ): Promise<void> {
-  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
   const messageThreadId = topicsEnabled(env) ? opts.messageThreadId : undefined;
   const res = await tg.sendMessage({
     chatId,

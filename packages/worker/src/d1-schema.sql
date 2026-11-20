@@ -191,3 +191,35 @@ CREATE TABLE IF NOT EXISTS machine_launch_accept (
   accept_csv  TEXT NOT NULL,
   updated_at  INTEGER NOT NULL
 );
+
+-- Slack conversations (chat-transport phase 2, pigeon-4ogz.3). The daemon contract stays
+-- Telegram-shaped, so a Slack channel is addressed by an integer handle. The seed row at 2^40 - 1
+-- makes AUTOINCREMENT hand out handles from 2^40 up without writing sqlite_sequence (D1-safe),
+-- which keeps them clear of any Telegram thread id. Scoped by team so two workspaces never mix.
+CREATE TABLE IF NOT EXISTS slack_conversations (
+  handle     INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id    TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  -- 1 once the owner is known to be in the channel (invite ok or already_in_channel). A post into a
+  -- row with 0 retries the invite best-effort, so one failed invite does not leave the owner out forever.
+  owner_invited INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (team_id, channel_id)
+);
+INSERT OR IGNORE INTO slack_conversations (handle, team_id, channel_id, created_at)
+  VALUES (1099511627775, '_seed', '_seed', 0);
+
+-- Posts the worker made, by handle, so a later edit (the question wizard) can find the channel and ts.
+-- Same seed trick. The seed row has created_at 0, so the retention sweep must skip team_id _seed.
+CREATE TABLE IF NOT EXISTS slack_posts (
+  handle     INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id    TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  ts         TEXT NOT NULL,
+  text       TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE (team_id, channel_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_posts_created ON slack_posts(created_at);
+INSERT OR IGNORE INTO slack_posts (handle, team_id, channel_id, ts, text, created_at)
+  VALUES (1099511627775, '_seed', '_seed', '_seed', NULL, 0);

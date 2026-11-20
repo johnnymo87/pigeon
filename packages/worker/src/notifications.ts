@@ -1,12 +1,21 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { getTelegramErrorDetails, isPermanentTopicFailure, TgResult } from "./telegram";
-import { transportForChat, type ChatTransport } from "./chat";
+import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
+import { machineSlackWorkspace, resolveWorkerTarget } from "./chat/address";
+import { isAllowedChatId } from "./chat/allowlist";
+import { slackWorkspaceForTeam, teamIdOfChat } from "./chat/slack-config";
+import { SLACK_MARKDOWN_MAX } from "./chat/slack-render";
+import { explicitCategory } from "./chat/slack-notify";
+import { errorClassOf } from "./slack";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
 import { hasButtons, resolveMentionKeyboard } from "./mention-links";
+
+// Kept importable from here: the allowlist moved to a leaf module to break an import cycle.
+export { isAllowedChatId };
 
 interface SendNotificationBody {
   sessionId: string;
@@ -21,7 +30,9 @@ interface SendNotificationBody {
   threaded?: boolean;
   onTopicUnavailable?: "retry" | "general";
   /** Send the whole notification as one Telegram rich message; `text` is the fallback (pigeon-p909). */
-  rich?: { markdown?: unknown };
+  rich?: { markdown?: unknown; /** Absent = Telegram's markdown; `"slack"` = a Slack markdown block (pigeon-4ogz.3). */ dialect?: unknown };
+  /** Slack only: mention the workspace owner so this post notifies them. Telegram ignores it. */
+  notifyOwner?: boolean;
 }
 
 /**
@@ -159,6 +170,25 @@ export async function alertRelocation(
     label?: string | null;
   },
 ): Promise<boolean> {
+  if (isSlackChatId(opts.chatId)) {
+    // A Slack target has no General thread and no allowlist: the alert goes into the same
+    // workspace's #alerts, through the transport the notification itself used.
+    const alertText =
+      `⚠️ Notification went to #alerts, not its channel\n` +
+      `session: ${opts.sessionId}${opts.label ? ` (${opts.label})` : ""}\n` +
+      `reason: ${opts.reason}\n` +
+      `chat: ${opts.chatId} · message: ${opts.messageId}`;
+    try {
+      const res = await tg.sendMessage({ chatId: opts.chatId, text: alertText });
+      if (res.ok) return true;
+      console.error("[worker] relocation alert failed", { sessionId: opts.sessionId, res });
+      return false;
+    } catch (err) {
+      console.error("[worker] relocation alert threw", { sessionId: opts.sessionId, error: String(err) });
+      return false;
+    }
+  }
+
   const allowed = (env.ALLOWED_CHAT_IDS || "")
     .split(",")
     .map((id) => id.trim())
@@ -195,17 +225,6 @@ export async function alertRelocation(
     });
     return false;
   }
-}
-
-export function isAllowedChatId(chatId: string | number, env: Env): boolean {
-  const raw = env.ALLOWED_CHAT_IDS;
-  if (!raw) return false;
-  const allowed = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (allowed.length === 0) return false;
-  return allowed.includes(String(chatId));
 }
 
 /**
@@ -338,17 +357,21 @@ export async function handleSendNotification(
   request: Request,
 ): Promise<Response> {
   try {
-    if (!(await authenticate(request, env))) {
+    const principal = await authenticate(request, env);
+    if (!principal) {
       return unauthorized();
     }
 
     const body = (await request.json()) as SendNotificationBody;
-    const { sessionId, chatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
+    const { sessionId, chatId: requestedChatId, text, replyMarkup, media, entities, title, dir, threaded } = body;
     const notificationId = typeof body.notificationId === "string" ? body.notificationId : null;
     const holdForTopic = body.onTopicUnavailable === "retry";
 
     // Validate required fields
-    if (!sessionId || !chatId || !text) {
+    // A machine on Slack has no use for a chat id (its target is its workspace), so it is not
+    // required of it; everyone else still has to send one.
+    const onSlack = machineSlackWorkspace(env, principal) !== null;
+    if (!sessionId || (!requestedChatId && !onSlack) || !text) {
       return json({ error: "sessionId, chatId, and text required" }, 400);
     }
 
@@ -364,10 +387,20 @@ export async function handleSendNotification(
       return json({ error: "Session not found" }, 404);
     }
 
-    // Check chat ID allowlist
-    if (!isAllowedChatId(chatId, env)) {
+    // Where this notification goes. Resolved ONCE, here, and used for everything below: a
+    // machine on Slack targets its workspace whatever chat id its daemon sent, so a stale
+    // numeric id cannot pull one of its sessions back to Telegram. Everyone else keeps the
+    // allowlist rule (and a `slack:` chat id from them is refused).
+    const target = resolveWorkerTarget(env, principal, requestedChatId);
+    if (!target.ok) {
       return json({ error: "Chat ID not allowed" }, 403);
     }
+    const chatId = target.chatId;
+    const isSlack = target.slack;
+    // Slack failures carry their class at top level so the daemon can tell a rejected payload
+    // from an outage without parsing Telegram-shaped details.
+    const slackClass = (details?: unknown, fallback = "upstream") =>
+      isSlack ? { errorClass: errorClassOf(details) ?? fallback } : {};
 
     // Idempotency: if notificationId was provided and we already sent this notification,
     // return the existing message data without calling Telegram again.
@@ -452,10 +485,13 @@ export async function handleSendNotification(
         dir: dir ?? "",
         title: title ?? "",
         botToken: env.TELEGRAM_BOT_TOKEN,
+        env,
+        // Only the machine that owns the session may move its conversation between transports.
+        supersede: principal.kind === "machine" && principal.machineId === session.machine_id,
       });
 
       if (!topicRes.ok && topicRes.kind === "rate_limited") {
-        return json({ error: "rate_limited", retryAfter: topicRes.retryAfter }, 429);
+        return json({ error: "rate_limited", retryAfter: topicRes.retryAfter, ...slackClass(undefined, "rate_limited") }, 429);
       }
 
       // pigeon-iqpd: transient topic-resolution failures must be retried into the right topic
@@ -469,12 +505,14 @@ export async function handleSendNotification(
           reason,
           createError: topicRes.createError,
         });
-        const payload: { error: string; reason: string; createError?: unknown } = {
+        const payload: { error: string; reason: string; createError?: unknown; errorClass?: string } = {
           error: "topic_unavailable",
           reason,
         };
         if (topicRes.createError !== undefined) {
           payload.createError = topicRes.createError;
+          const cls = isSlack ? errorClassOf(topicRes.createError) : undefined;
+          if (cls) payload.errorClass = cls;
         }
         return json(payload, 502);
       }
@@ -488,7 +526,7 @@ export async function handleSendNotification(
       }
     }
 
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
 
     // Rich message (pigeon-p909): the daemon offers the whole notification as Telegram rich
     // markdown when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is
@@ -500,16 +538,35 @@ export async function handleSendNotification(
       typeof body.rich?.markdown === "string" && body.rich.markdown.length > 0
         ? body.rich.markdown
         : undefined;
-    let richEnabled = richMarkdown !== undefined && env.TELEGRAM_RICH_MESSAGES !== "off";
-    if (richEnabled && [...richMarkdown!].length > RICH_MAX_CHARS) {
+    // Which dialect the daemon wrote the markdown in decides whether it may be sent as rich to
+    // THIS target: Telegram takes only dialect-less markdown (today's behaviour), Slack only
+    // `dialect: "slack"`. Anything else goes plain, which is always safe. The two kill switches
+    // are per transport.
+    const richDialect = body.rich?.dialect;
+    let richEnabled =
+      richMarkdown !== undefined &&
+      (isSlack
+        ? richDialect === "slack" && env.SLACK_MARKDOWN_BLOCKS !== "off"
+        : richDialect === undefined && env.TELEGRAM_RICH_MESSAGES !== "off");
+    const richLimit = isSlack ? SLACK_MARKDOWN_MAX : RICH_MAX_CHARS;
+    if (richEnabled && [...richMarkdown!].length > richLimit) {
       // The daemon checks this too; a skewed or buggy daemon must not cost a round trip.
-      console.warn("[worker] rich markdown over Telegram's limit, sending plain", {
+      console.warn(`[worker] rich markdown over ${isSlack ? "Slack" : "Telegram"}'s limit, sending plain`, {
         sessionId,
         notificationId,
         chars: [...richMarkdown!].length,
       });
       richEnabled = false;
     }
+    // Slack posts honour `notifyOwner`, as a category: a flagged `q:` notification is a question,
+    // anything else flagged is an error. Whether that mentions anyone is `SLACK_NOTIFY_OWNER`'s
+    // call, inside the transport. Telegram has no such option, so it is not even passed.
+    const slackOnly = isSlack
+      ? {
+          notifyOwner: body.notifyOwner === true,
+          ...(body.notifyOwner === true ? { notifyCategory: explicitCategory(notificationId) } : {}),
+        }
+      : {};
     let lastSendWasRich = false;
     let richError: unknown;
 
@@ -524,7 +581,7 @@ export async function handleSendNotification(
     let linkMarkupResolved = false;
     const sendPlain = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
       if (!linkMarkupResolved) {
-        linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId);
+        linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId, env);
         linkMarkupResolved = true;
       }
       const result = await tg.sendMessage({
@@ -533,6 +590,7 @@ export async function handleSendNotification(
         text,
         entities: entities as unknown[] | undefined,
         replyMarkup: linkMarkup ?? replyMarkup,
+        ...slackOnly,
       });
       if (linkMarkup && !result.ok && result.kind === "error" && result.errorCode === 400) {
         console.warn("[worker] mention link buttons rejected, resending without them", {
@@ -551,7 +609,7 @@ export async function handleSendNotification(
         if (!richLinkMarkupResolved) {
           richLinkMarkup = callerHasButtons
             ? undefined
-            : await resolveMentionKeyboard(db, richMarkdown!, sessionId);
+            : await resolveMentionKeyboard(db, richMarkdown!, sessionId, env);
           richLinkMarkupResolved = true;
         }
         const result = await tg.sendRichMessage({
@@ -559,6 +617,9 @@ export async function handleSendNotification(
           messageThreadId: threadId,
           markdown: richMarkdown!,
           replyMarkup: richLinkMarkup ?? replyMarkup,
+          // Slack's notification text: the plain chunk, not the raw markdown source.
+          ...(isSlack ? { text } : {}),
+          ...slackOnly,
         });
         if (!isRichRejection(result)) {
           lastSendWasRich = true;
@@ -614,10 +675,15 @@ export async function handleSendNotification(
         dir: dir ?? "",
         title: title ?? "",
         botToken: env.TELEGRAM_BOT_TOKEN,
+        env,
+        supersede: principal.kind === "machine" && principal.machineId === session.machine_id,
       });
 
       if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
-        return json({ error: "rate_limited", retryAfter: retryTopicRes.retryAfter }, 429);
+        return json(
+          { error: "rate_limited", retryAfter: retryTopicRes.retryAfter, ...slackClass(undefined, "rate_limited") },
+          429,
+        );
       }
 
       if (
@@ -633,12 +699,14 @@ export async function handleSendNotification(
           reason,
           createError: retryTopicRes.createError,
         });
-        const payload: { error: string; reason: string; createError?: unknown } = {
+        const payload: { error: string; reason: string; createError?: unknown; errorClass?: string } = {
           error: "topic_unavailable",
           reason,
         };
         if (retryTopicRes.createError !== undefined) {
           payload.createError = retryTopicRes.createError;
+          const cls = isSlack ? errorClassOf(retryTopicRes.createError) : undefined;
+          if (cls) payload.errorClass = cls;
         }
         return json(payload, 502);
       }
@@ -708,14 +776,15 @@ export async function handleSendNotification(
     // The daemon converts to ms when it pauses the outbox; don't change the unit here
     // without changing that multiplication too.
     if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
-      return json({ error: "rate_limited", retryAfter: telegramResult.retryAfter }, 429);
+      return json(
+        { error: "rate_limited", retryAfter: telegramResult.retryAfter, ...slackClass(telegramResult.response, "rate_limited") },
+        429,
+      );
     }
 
     if (!telegramResult.ok) {
-      return json(
-        { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
-        502,
-      );
+      const details = getTelegramErrorDetails(telegramResult);
+      return json({ error: "Telegram API error", details, ...slackClass(details) }, 502);
     }
 
     const messageId = telegramResult.result.message_id;
@@ -875,7 +944,8 @@ export async function handleEditNotification(
   env: Env,
   request: Request,
 ): Promise<Response> {
-  if (!(await authenticate(request, env))) {
+  const principal = await authenticate(request, env);
+  if (!principal) {
     return unauthorized();
   }
 
@@ -901,8 +971,21 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
+  // A Slack post is editable only by a machine on that post's workspace: the shared key, a
+  // Telegram machine, or another team's machine never reaches Slack. When the post's team has no
+  // configured workspace (the secret was deleted) there is nothing to authorize against, so the
+  // call falls through to the transport's transient SLACK_UNAVAILABLE and the daemon retries.
+  const isSlackRow = isSlackChatId(row.chat_id);
+  const rowTeam = teamIdOfChat(row.chat_id);
+  if (isSlackRow && rowTeam !== null && slackWorkspaceForTeam(env, rowTeam)) {
+    const ws = machineSlackWorkspace(env, principal);
+    if (!ws || ws.teamId !== rowTeam) {
+      return json({ error: "chat_not_allowed" }, 403);
+    }
+  }
+
   // Routed by the STORED post's chat, not by any transport the machine is on now (spec §1).
-  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
 
   const telegramResult = await tg.editMessageText({
     chatId: row.chat_id,
@@ -913,8 +996,13 @@ export async function handleEditNotification(
   });
 
   if (!telegramResult.ok) {
+    const details = getTelegramErrorDetails(telegramResult);
     return json(
-      { error: "Telegram API error", details: getTelegramErrorDetails(telegramResult) },
+      {
+        error: "Telegram API error",
+        details,
+        ...(isSlackRow ? { errorClass: errorClassOf(details) ?? "upstream" } : {}),
+      },
       502,
     );
   }

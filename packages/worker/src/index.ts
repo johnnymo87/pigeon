@@ -12,6 +12,8 @@ import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
 import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
+import { sweepSlackPosts } from "./chat/slack-posts";
+import { hasSlackWorkspaceSecret } from "./chat/slack-config";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
@@ -217,6 +219,18 @@ export default {
     } catch (err) {
       console.error("Session high-water alert failed:", err);
     }
+    // Only a worker with a Slack workspace secret has Slack tables to tidy: without one this must
+    // not touch D1 at all (the schema may not even be applied), so Telegram-only stays as it was.
+    if (hasSlackWorkspaceSecret(env)) {
+      try {
+        // Best-effort on its own (a missing table is a quiet log line, any other D1 error is
+        // logged inside), so it needs no wrapper to protect the jobs around it.
+        const swept = await sweepSlackPosts(env.DB);
+        if (swept > 0) console.log("[slack] slack_posts retention", { swept });
+      } catch (err) {
+        console.error("Slack post retention failed:", err);
+      }
+    }
     try {
       // The orphan-closer is gated to a daily window (pigeon-4890) because each close posts a
       // service message that marks the topic unread; the reap half still runs every tick.
@@ -224,6 +238,7 @@ export default {
       // long the jobs above took.
       await runTopicReaper(env.DB, env, {
         closeOrphans: shouldCloseOrphans(controller.scheduledTime),
+        env,
       });
     } catch (err) {
       console.error("Topic reaper failed:", err);

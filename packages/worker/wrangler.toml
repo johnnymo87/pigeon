@@ -25,6 +25,11 @@ TELEGRAM_BOT_USERNAME = "mohrbacher_01_bot"
 # because keep_vars = true would keep the deployed value. Runbook:
 # docs/runbooks/per-machine-credentials.md.
 SHARED_KEY_REFUSED_MACHINES = "cloudbox,devbox,macbook"
+# SLACK_NOTIFY_OWNER (optional, deliberately NOT set here; the default is empty): which Slack posts
+# @-mention the workspace owner. Comma list of questions, errors, named, alerts (case-insensitive;
+# unknown entries ignored). Empty or unset = no mention at all, so Slack pushes are off. Set it
+# in the Cloudflare dashboard or with `wrangler secret put SLACK_NOTIFY_OWNER`. keep_vars = true
+# keeps whatever is deployed. See packages/worker/src/chat/slack-notify.ts.
 
 [observability]
 enabled = true

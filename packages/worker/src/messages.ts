@@ -32,9 +32,10 @@
 
 import { authenticate } from "./credentials";
 import { unauthorized } from "./auth";
-import { isAllowedChatId } from "./notifications";
 import { type TgResult } from "./telegram";
 import { transportForChat } from "./chat";
+import { authorizeStoredAddress } from "./chat/address";
+import { errorClassOf } from "./slack";
 
 /** Default bound on the Telegram call. Below the daemon's ~5 s worker leg for alerts. */
 export const MESSAGES_SEND_DEFAULT_TIMEOUT_MS = 4_000;
@@ -100,15 +101,28 @@ function descriptionOf(res: { response?: unknown; description?: string }): strin
   return typeof d === "string" ? d : undefined;
 }
 
-/** Map a client result onto the contract above. `okBody` is the success payload. */
-function toResponse<T>(res: TgResult<T>, okBody: (result: T) => Record<string, unknown>): Response {
-  if (res.ok) return Response.json({ ok: true, ...okBody(res.result) });
+/**
+ * Map a client result onto the contract above. `okBody` is the success payload. For a Slack
+ * result (`slack`) the same contract holds, with the Slack failure's class added at top level and
+ * the resolved address on success; Telegram's responses are byte-for-byte what they were.
+ */
+function toResponse<T>(
+  res: TgResult<T>,
+  okBody: (result: T) => Record<string, unknown>,
+  slack?: { chatId: string },
+): Response {
+  if (res.ok) return Response.json({ ok: true, ...okBody(res.result), ...(slack ? { chatId: slack.chatId } : {}) });
 
   const description = descriptionOf(res);
   const withDescription = description !== undefined ? { description } : {};
+  const errorClass = slack ? { errorClass: errorClassOf(res.response) ?? "upstream" } : {};
 
   if (res.kind === "rate_limited") {
-    return Response.json({ ok: false, telegram: { status: 429, retryAfter: res.retryAfter, ...withDescription } });
+    return Response.json({
+      ok: false,
+      telegram: { status: 429, retryAfter: res.retryAfter, ...withDescription },
+      ...errorClass,
+    });
   }
   // A 400 counts as Telegram speaking only when Telegram's JSON body came back. A bare HTTP 400
   // with an unparseable body (an intermediary's error page) says nothing about the payload, so
@@ -118,7 +132,7 @@ function toResponse<T>(res: TgResult<T>, okBody: (result: T) => Record<string, u
     res.kind === "topic_not_modified" ||
     (res.kind === "error" && res.errorCode === 400 && res.response !== undefined)
   ) {
-    return Response.json({ ok: false, telegram: { status: 400, ...withDescription } });
+    return Response.json({ ok: false, telegram: { status: 400, ...withDescription }, ...errorClass });
   }
   const status = res.kind === "error" ? res.errorCode : undefined;
   return Response.json(
@@ -126,6 +140,7 @@ function toResponse<T>(res: TgResult<T>, okBody: (result: T) => Record<string, u
       ok: false,
       error: status === undefined ? "telegram_unparseable" : "telegram_error",
       ...(status !== undefined ? { telegram: { status, ...withDescription } } : {}),
+      ...errorClass,
     },
     { status: 502 },
   );
@@ -177,7 +192,8 @@ function remaining(startedAt: number, timeoutMs: number): number {
 
 export async function handleSendMessage(env: Env, request: Request): Promise<Response> {
   const startedAt = Date.now();
-  if (!(await authenticate(request, env))) return unauthorized();
+  const principal = await authenticate(request, env);
+  if (!principal) return unauthorized();
   const body = await readBody(request);
   if (body instanceof Response) return body;
 
@@ -200,29 +216,30 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
       { status: 400 },
     );
   }
-  if (!isAllowedChatId(chatId, env)) {
-    return Response.json({ error: "chat_not_allowed" }, { status: 403 });
-  }
+  const addr = await authorizeStoredAddress(env, env.DB, principal, chatId, thread as number | undefined);
+  if (!addr.ok) return addr.response;
 
-  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(addr.chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
   return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
       await tg.sendMessage({
-        chatId,
+        chatId: addr.chatId,
         text,
         ...(entities !== undefined ? { entities: entities as unknown[] } : {}),
-        ...(thread !== undefined ? { messageThreadId: thread as number } : {}),
+        ...(addr.threadId !== undefined ? { messageThreadId: addr.threadId } : {}),
         ...(urlButtons && urlButtons.length > 0 ? { replyMarkup: { inline_keyboard: urlButtons } } : {}),
         signal,
       }),
       (r) => ({ messageId: r.message_id }),
+      addr.slack ? { chatId: addr.chatId } : undefined,
     ),
   );
 }
 
 export async function handleUnpinTopic(env: Env, request: Request): Promise<Response> {
   const startedAt = Date.now();
-  if (!(await authenticate(request, env))) return unauthorized();
+  const principal = await authenticate(request, env);
+  if (!principal) return unauthorized();
   const body = await readBody(request);
   if (body instanceof Response) return body;
 
@@ -231,12 +248,18 @@ export async function handleUnpinTopic(env: Env, request: Request): Promise<Resp
   if (!chatId || !isPositiveInt(thread)) {
     return Response.json({ error: "chatId and a positive messageThreadId are required" }, { status: 400 });
   }
-  if (!isAllowedChatId(chatId, env)) {
-    return Response.json({ error: "chat_not_allowed" }, { status: 403 });
-  }
+  const addr = await authorizeStoredAddress(env, env.DB, principal, chatId, thread);
+  if (!addr.ok) return addr.response;
 
-  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+  // Slack pins nothing on its own, so there is nothing to clear: no call, and no need for the
+  // handle to resolve.
+  if (addr.slack) return Response.json({ ok: true });
+
+  const tg = transportForChat(addr.chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
   return bounded(remaining(startedAt, MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
-    toResponse(await tg.unpinAllForumTopicMessages({ chatId, messageThreadId: thread, signal }), () => ({})),
+    toResponse(
+      await tg.unpinAllForumTopicMessages({ chatId: addr.chatId, messageThreadId: thread, signal }),
+      () => ({}),
+    ),
   );
 }

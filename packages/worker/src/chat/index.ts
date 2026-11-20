@@ -2,7 +2,11 @@
  * Picking a ChatTransport by address (spec §1, "A stored conversation goes where it lives").
  * See `./transport.ts` for the interface and why it is Telegram-shaped.
  */
+import type { D1Database } from "@cloudflare/workers-types";
 import { createTelegramClient } from "../telegram";
+import { parseNotifyCategories } from "./slack-notify";
+import { slackWorkspaceForTeam, teamIdOfChat } from "./slack-config";
+import { createSlackTransport } from "./slack-transport";
 import type { ChatResult, ChatTransport } from "./transport";
 
 export type { ChatResult, ChatTransport } from "./transport";
@@ -15,10 +19,11 @@ export function isSlackChatId(chatId: string | number): boolean {
 }
 
 /**
- * The failure every call to a Slack address gets until the Slack transport exists
- * (pigeon-4ogz.3). No `slack:` row can exist before then, so this is a guard, not a path: it makes
- * sure a Slack address can never be handed to the Telegram Bot API. It is classified transient
- * (no 4xx code), so a caller holds and retries rather than relocating to General.
+ * The failure every call to a Slack address gets when no Slack transport can be built for it: the
+ * caller passed no env/db, or no `SLACK_WORKSPACE_*` secret is configured for the address's team
+ * (the secret was deleted, or never existed). It is a guard, not a path: it makes sure a Slack
+ * address can never be handed to the Telegram Bot API. It is classified transient (no 4xx code),
+ * so a caller holds and retries rather than relocating to General.
  */
 function slackUnavailable<T>(method: string): Promise<ChatResult<T>> {
   console.warn("[worker] slack transport not available", { method });
@@ -39,17 +44,41 @@ const SLACK_UNAVAILABLE: ChatTransport = {
   unpinAllForumTopicMessages: () => slackUnavailable("unpinAllForumTopicMessages"),
 };
 
+/** What a Slack address needs beyond the address itself: the workspace secrets and the handle tables. */
+export interface SlackContext {
+  env: Env;
+  db: D1Database;
+  /** Replaces the global `fetch` for Slack calls (tests). */
+  fetchFn?: typeof fetch;
+}
+
 /**
  * The transport for a chat address.
  *
  * `telegram` replaces the Telegram transport only (tests inject fakes this way, through the
- * existing `tgClient` options); a Slack address never reaches it.
+ * existing `tgClient` options); a Slack address never reaches it. `slack` is what a Slack address
+ * needs: without it, or when no workspace is configured for the address's team, the address gets
+ * the `SLACK_UNAVAILABLE` guard. A numeric address ignores it, so with no Slack secret every
+ * call behaves exactly as before Slack existed.
  */
 export function transportForChat(
   chatId: string | number,
   botToken: string,
   telegram?: ChatTransport,
+  slack?: SlackContext,
 ): ChatTransport {
-  if (isSlackChatId(chatId)) return SLACK_UNAVAILABLE;
+  if (isSlackChatId(chatId)) {
+    const team = teamIdOfChat(chatId);
+    const ws = slack && team ? slackWorkspaceForTeam(slack.env, team) : null;
+    if (slack && ws) {
+      return createSlackTransport({
+        db: slack.db,
+        ws,
+        notifyCategories: parseNotifyCategories(slack.env.SLACK_NOTIFY_OWNER),
+        ...(slack.fetchFn ? { fetchFn: slack.fetchFn } : {}),
+      });
+    }
+    return SLACK_UNAVAILABLE;
+  }
   return telegram ?? createTelegramClient(botToken);
 }

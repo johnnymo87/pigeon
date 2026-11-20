@@ -76,6 +76,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `machine_relay_accept`: which senders each machine accepts relays from, from its poll header
 - `remote_launch`: cross-machine remote launch items and result receipts (pigeon-k0qn.17)
 - `machine_launch_accept`: which machines a target accepts remote launches from, from its poll header
+- `slack_conversations`, `slack_posts`: Slack handles (>= 2^40) to channel / channel + ts, per team (pigeon-4ogz.3). `slack_posts` rows live 30 days. Apply the schema before creating any `SLACK_WORKSPACE_<MACHINE>` secret; with no secret none of the Slack behaviour below exists.
 
 ## Endpoint Contracts
 
@@ -87,12 +88,14 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `GET /sessions` (Bearer) -> JSON list of session rows
 - `POST /sessions/register` (Bearer) -> upsert session
 - `POST /sessions/unregister` (Bearer) -> remove session
-- `POST /topics/lookup` (Bearer) `{sessionIds: string[]}` (0-50) -> `{topics: {[sessionId]: {chatId, messageThreadId, state} | null}}`. Read-only view of the `topics` table; `null` = no topic (topics are created lazily). Used by the daemon's `/alert` link buttons.
+- `POST /topics/lookup` (Bearer) `{sessionIds: string[]}` (0-50) -> `{topics: {[sessionId]: {chatId, messageThreadId, state, url?} | null}}` (`url` only on Slack rows: the channel's archive link, `null` if unbuildable). Read-only view of the `topics` table; `null` = no topic (topics are created lazily). Used by the daemon's `/alert` link buttons.
+- `POST /topics/rename` on a Slack row renames the channel and its topic line (the edit carries the row's session id); `POST /topics/named*` on Slack creates channels (`channelKey` becomes the name) and refuses `_`-prefixed keys.
 - `POST /topics/named` (Bearer) `{chatId, key, name, staleThreadId?}` -> `{chatId, messageThreadId, created}`. Find-or-create a caller-keyed forum topic (D1 `named_topics`, exempt from the orphan-closer and reaper). `staleThreadId` reports a thread deleted out of band and gets a new topic. Every non-200 means "post to General" to the daemon.
 - `POST /topics/named/bind` (Bearer) `{chatId, key, name, sessionId}` -> `{chatId, messageThreadId, created, bound: true, sessionId}`; `409 session not registered` when `sessions` has no row. Plain messages typed in the bound topic route to that session (D1 `named_topic_bindings`; slash commands do not follow bindings).
 - `POST /topics/named/unbind` (Bearer) `{sessionId}` -> `{unbound: n}` (0 is success).
-- `POST /notifications/send` (Bearer) -> send Telegram message + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
-- `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions.
+- `POST /notifications/send` (Bearer) -> send Telegram message (a machine on Slack goes to its own `slack:<team>` whatever `chatId` it sent: one channel per session, `#alerts` unthreaded; optional `notifyOwner` (flags the post; the owner mention is applied only when its category, `questions` for a `q:` notificationId else `errors`, is listed in the `SLACK_NOTIFY_OWNER` var, default none; named channels and `#alerts` follow the `named`/`alerts` categories; never a broadcast); `rich.dialect: "slack"` for a markdown block; Slack failures add top-level `errorClass`) + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
+- `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions. A Slack row is editable only by a machine of that team (403 otherwise); with the team's secret deleted it is a transient failure with no Slack call.
+- `GET /whoami` adds `transport: "slack"` for a machine on Slack (absent = Telegram). `POST /messages/send` and `/topics/unpin` route by the stored address; `/messages/send` returns `chatId` on Slack.
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
 - `GET /media/<key>` (Bearer) -> download file from R2
 - `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks
@@ -237,6 +240,8 @@ Cross-machine remote session launching (`docs/plans/2026-10-29-remote-launch-des
   - `cleanupSeenUpdates(env.DB)` -- deletes old Telegram dedup entries from D1
   - `runRelayExpiry(env.DB)` -- expires uncollected relays and prunes past retention
   - `runLaunchExpiry(env.DB)` -- expires overdue remote launches and prunes past retention
+  - `sweepSlackPosts(env.DB)` -- deletes `slack_posts` older than 30 days (5000 per tick, never the `_seed` row), best-effort
+  - the topic reaper: Slack rows are archived by the orphan-closer and forgotten (no provider call) by the reaper
 
 ## Future Improvement: Long Polling
 
