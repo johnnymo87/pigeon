@@ -13,6 +13,8 @@ export interface SendMessageOptions {
   messageThreadId?: number;
   /** Aborts the call (the fetch rejects). Callers that bound a request use this. */
   signal?: AbortSignal;
+  /** Slack only: mention the workspace owner so the post notifies them. Telegram ignores it. */
+  notifyOwner?: boolean;
 }
 
 export interface SendRichMessageOptions {
@@ -21,6 +23,8 @@ export interface SendRichMessageOptions {
   markdown: string;
   replyMarkup?: unknown;
   messageThreadId?: number;
+  /** Slack only: mention the workspace owner so the post notifies them. Telegram ignores it. */
+  notifyOwner?: boolean;
 }
 
 export interface EditMessageTextOptions {
@@ -29,6 +33,8 @@ export interface EditMessageTextOptions {
   text: string;
   entities?: unknown[];
   replyMarkup?: unknown;
+  /** Slack only: keep the owner mention on the edited message. Telegram ignores it. */
+  notifyOwner?: boolean;
 }
 
 export interface SendPhotoOptions {
@@ -69,6 +75,12 @@ export interface CreateForumTopicOptions {
   name: string;
   iconColor?: number;
   iconCustomEmojiId?: string;
+  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
+  sessionId?: string;
+  /** Slack only: a named topic's key, which becomes the channel name. */
+  channelKey?: string;
+  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
+  topic?: string;
 }
 
 export interface EditForumTopicOptions {
@@ -76,6 +88,10 @@ export interface EditForumTopicOptions {
   messageThreadId: number;
   name?: string;
   iconCustomEmojiId?: string;
+  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
+  sessionId?: string;
+  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
+  topic?: string;
 }
 
 export interface CloseForumTopicOptions {

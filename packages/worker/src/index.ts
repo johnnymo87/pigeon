@@ -224,6 +224,7 @@ export default {
       // long the jobs above took.
       await runTopicReaper(env.DB, env, {
         closeOrphans: shouldCloseOrphans(controller.scheduledTime),
+        env,
       });
     } catch (err) {
       console.error("Topic reaper failed:", err);

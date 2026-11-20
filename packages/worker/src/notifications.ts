@@ -452,6 +452,7 @@ export async function handleSendNotification(
         dir: dir ?? "",
         title: title ?? "",
         botToken: env.TELEGRAM_BOT_TOKEN,
+        env,
       });
 
       if (!topicRes.ok && topicRes.kind === "rate_limited") {
@@ -488,7 +489,7 @@ export async function handleSendNotification(
       }
     }
 
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
 
     // Rich message (pigeon-p909): the daemon offers the whole notification as Telegram rich
     // markdown when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is
@@ -614,6 +615,7 @@ export async function handleSendNotification(
         dir: dir ?? "",
         title: title ?? "",
         botToken: env.TELEGRAM_BOT_TOKEN,
+        env,
       });
 
       if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
@@ -902,7 +904,7 @@ export async function handleEditNotification(
   }
 
   // Routed by the STORED post's chat, not by any transport the machine is on now (spec §1).
-  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
 
   const telegramResult = await tg.editMessageText({
     chatId: row.chat_id,

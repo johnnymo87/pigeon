@@ -354,7 +354,7 @@ export async function checkSessionHighWaterAlert(
 
   let alerted = false;
   try {
-    const client = transportForChat(firstChatId, env.TELEGRAM_BOT_TOKEN);
+    const client = transportForChat(firstChatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
     const res = await client.sendMessage({ chatId: firstChatId, text });
     if (res.ok) {
       alerted = true;

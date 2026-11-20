@@ -290,7 +290,7 @@ async function unregisterSession(
       // guaranteed 400.
       if (topic.message_thread_id !== null) {
         try {
-          const client = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN);
+          const client = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
           await client.closeForumTopic({
             chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,

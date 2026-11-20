@@ -54,6 +54,8 @@ export interface ResolveTopicOptions {
   pollIntervalMs?: number;
   /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack address needs for its workspace secret. */
+  env?: Env;
 }
 
 export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
@@ -77,6 +79,7 @@ export async function resolveTopic(
   // the daemon to have done it — is what stops a daemon that has not been updated yet from
   // minting another timestamp-named topic (pigeon-353p).
   const title = isPlaceholderTitle(opts.title) ? "" : opts.title.trim();
+  const slackCtx = opts.env ? { env: opts.env, db } : undefined;
 
   /**
    * One-shot upgrade of a directory-only topic name, fired by the first notification that
@@ -100,7 +103,7 @@ export async function resolveTopic(
       row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
     const name = topicName(opts.dir || fallbackDir, title);
 
-    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
+    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
     try {
       const res = await tgClient.editForumTopic({
         chatId: opts.chatId,
@@ -160,7 +163,7 @@ export async function resolveTopic(
   }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
-      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
+      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
       // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
       // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
       // Removing this reopen call is tracked as roadmap item 6c.
@@ -233,7 +236,7 @@ export async function resolveTopic(
   const delay =
     opts.delayFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
 
   // Helper for creator flow (executed by initial reserve winner or steal winner)
   async function runCreatorFlow(): Promise<ResolveTopicResult> {

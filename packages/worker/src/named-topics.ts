@@ -107,10 +107,12 @@ export async function resolveNamedTopic(
     now?: number;
     /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
     tgClient?: ChatTransport;
+    /** The worker env, which a Slack address needs for its workspace secret. */
+    env?: Env;
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 
@@ -229,6 +231,7 @@ export async function handleNamedTopic(
     name,
     staleThreadId: stale as number | undefined,
     botToken: env.TELEGRAM_BOT_TOKEN,
+    env,
   });
   if (res.ok) {
     return Response.json({ chatId, messageThreadId: res.messageThreadId, created: res.created });
@@ -266,7 +269,7 @@ export async function maybeAnswerInNamedTopic(
     .bind(now, chatId, row.topic_key, now - NAMED_TOPIC_HINT_INTERVAL_MS)
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
     const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
       console.warn("[worker] named topic hint failed", { key: row.topic_key, details: getTelegramErrorDetails(res) });
@@ -387,6 +390,7 @@ export async function handleNamedTopicBind(
     key,
     name,
     botToken: env.TELEGRAM_BOT_TOKEN,
+    env,
   });
   if (!res.ok) {
     if (res.kind === "rate_limited") {

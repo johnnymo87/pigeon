@@ -204,7 +204,7 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
     return Response.json({ error: "chat_not_allowed" }, { status: 403 });
   }
 
-  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
   return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
       await tg.sendMessage({
@@ -235,7 +235,7 @@ export async function handleUnpinTopic(env: Env, request: Request): Promise<Resp
     return Response.json({ error: "chat_not_allowed" }, { status: 403 });
   }
 
-  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
   return bounded(remaining(startedAt, MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(await tg.unpinAllForumTopicMessages({ chatId, messageThreadId: thread, signal }), () => ({})),
   );

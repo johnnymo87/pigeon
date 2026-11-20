@@ -22,7 +22,7 @@ export async function editTopicName(
     return { ok: false, error: "topic has no message thread" };
   }
 
-  const tg = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
   const editRes = await tg.editForumTopic({
     chatId: topic.chat_id,
     messageThreadId: topic.message_thread_id,

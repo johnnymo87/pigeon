@@ -61,6 +61,8 @@ export interface ReapTopicsOptions {
   limit?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
 }
 
 export interface ReapResult {
@@ -75,6 +77,8 @@ export interface CloseOrphanedTopicsOptions {
   limit?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
 }
 
 export interface CloseOrphanedResult {
@@ -90,6 +94,8 @@ export interface RunTopicReaperOptions {
   orphanCap?: number;
   /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
   tgClient?: ChatTransport;
+  /** The worker env, which a Slack row needs for its workspace secret. */
+  env?: Env;
   /**
    * Run the orphan-closer this tick. Defaults to true so the reaper stays window-agnostic —
    * the cron handler owns the schedule decision via `shouldCloseOrphans`.
@@ -125,7 +131,7 @@ export async function reapTopics(
   }
 
   // Rows of every chat are mixed here, so the transport is picked per row, by its address.
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let reaped = 0;
 
   for (const row of rows) {
@@ -171,7 +177,7 @@ export async function closeOrphanedTopics(
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let closedOrphans = 0;
 
   for (const row of rows) {
@@ -233,6 +239,7 @@ export async function runTopicReaper(
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.reapCap,
     tgClient: opts.tgClient,
+    env: opts.env,
   });
 
   if (reapRes.rateLimited) {
@@ -255,6 +262,7 @@ export async function runTopicReaper(
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.orphanCap,
     tgClient: opts.tgClient,
+    env: opts.env,
   });
 
   return {
