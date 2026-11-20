@@ -1,6 +1,6 @@
 # Slack as pigeon's chat transport (chat-transport phase 2)
 
-Status: design, 2026-11-20. Bead `pigeon-4ogz`. Decisions D1–D9 are Jonathan's (2026-11-20).
+Status: design, 2026-11-20, reviewed by adversarial-reviewer-opus (buy-in after two rounds of changes, all applied). Bead `pigeon-4ogz`. Decisions D1–D9 are Jonathan's (2026-11-20).
 Phase 1: `docs/plans/2026-11-20-telegram-single-egress-design.md` (epic `pigeon-lenr`).
 
 ## Goal
@@ -68,7 +68,7 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
 - **Authorization of a `slack:` address.** Requires a machine principal (the shared key is refused
   for `slack:` addresses). Session-bound sends must be for a session whose conversation the worker
   resolves in the principal's current workspace. A `/messages/send` to a `slack:` address + handle
-  from a principal of another machine is honoured only when a `commands` row from the last 24 h has
+  from a principal of another machine is honoured only when a `commands` row still present (acked rows are deleted 1–2 h after ack, `d1-ops.ts:258-273`; command replies arrive within a minute) has
   that `(chat_id, message_thread_id)` and `machine_id` = the principal (a command reply goes where
   the command was typed, e.g. `/launch` typed in devbox's workspace targeting cloudbox). Handles are
   sequential, so without this any machine key could post into any channel. `ALLOWED_CHAT_IDS` keeps
