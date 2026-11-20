@@ -184,6 +184,8 @@ Spec D7: session channels must not push; questions, error alerts, coordinator ch
 `#alerts` must. pigeon gets there with mentions, and the preferences below are what make mentions
 the line:
 
+0. *Preferences → Availability → Allow notifications*: **Every day, 12:00 AM to Midnight**. A new
+   workspace defaults to weekdays 9:00–17:00 and pauses everything outside it, `#alerts` included.
 1. *Preferences → Notifications → Notify me about*: **"Direct messages, mentions & keywords"**
    ("Mentions only"). Session channels then push only when pigeon @-mentions him (questions, error
    alerts).
@@ -330,6 +332,37 @@ Filled in by `pigeon-4ogz.7`.
 
 | Machine | Team id | App id | Domain | Owner id | Mobile follows desktop | Real-mute test |
 |---|---|---|---|---|---|---|
-| devbox | | | | | | |
-| cloudbox | | | | | | |
-| macbook | | | | | | |
+| devbox | `T0CLL1EQAM6` | `A0CKTHXA7Q9` | `pigeon-devbox` | `U0CKTGLSULR` | desktop pref off; phone unchecked | fail |
+| cloudbox | `T0CLL4Y8HL0` | `A0CKRJH4FPU` | `pigeon-cloudbox` | `U0CKLESTD45` | desktop pref off; phone unchecked | fail (same scopes, not re-run) |
+| macbook | `T0CKTMDR0AV` | `A0CKTN5CD8R` | `pigeon-macbook` | `U0CKKHX34MR` | desktop pref off; phone unchecked | fail (same scopes, not re-run) |
+
+Done 2026-11-20 by `pigeon-4ogz.7`. Bot users: devbox `U0CKPNC3TKQ`, cloudbox `U0CKVFC4MEG`,
+macbook `U0CKLGY0F37`. Webhook channel: `#alerts` in each. `#em-alerts` (devbox) is `C0CKPMQ81AA`.
+Configs are staged in workstation `secrets/devbox.yaml` (workstation #880), and devbox's webhook
+as `pigeon_slack_alarm_webhook`. The cloudbox and macbook webhooks are **not** staged: devbox cannot
+write `secrets/cloudbox.yaml` (it is encrypted only to cloudbox's key). `.10`/`.11` read them off
+that app's *Incoming Webhooks* page with the stage-field recipe.
+
+What setup actually looked like, differing from the steps above:
+
+- **Headless Chromium hits a reCAPTCHA** after the email on `get-started#/createnew`. It was
+  done in Jonathan's browser on 9222, where he ticked the captcha once. After that first
+  workspace, `https://slack.com/get-started#/landing` (already signed in) offers *Create a new
+  workspace* with no email, code or captcha.
+- That browser is also signed into his **work** workspace. *Create New App → Paste a manifest*
+  lists every signed-in workspace; pick `pigeon <m>` and check it before *Next*. The manifest
+  editor is CodeMirror 5: `cm.setValue()` is reset by React, so type the minified JSON in with
+  `Input.insertText`. *Next → Create and Install* goes straight to the consent page.
+- Slack assigned `pigeon<m>` URLs (no dash); renamed at `https://<old>.slack.com/admin/name`.
+- **New workspaces pause notifications outside weekdays 9:00–17:00** (*Preferences →
+  Availability*). That would silence `#alerts` at night, so it was set to *Every day*, 12:00 AM
+  to *Midnight* (the last end option, below the visible list). Step 6 needs this added.
+- Notification pref is *Mentions and direct messages* (which also counts `@channel`/`@here`, so
+  pigeon must never use those). *Thread replies* was left on (Slack's default), so a bot reply in a
+  thread Jonathan follows still pushes.
+- Real-mute test: `users.prefs.get` → `missing_scope`, `needed: read`; `users.prefs.set` (both
+  argument forms) → `missing_scope`, `needed: post`, `provided: identify,channels:write`. These
+  are legacy scopes a granular app cannot request, so the app user token can never mute.
+  **Fail.** The worker does not mute (`pigeon-4ogz.3`); mentions alone meet D7.
+- The onboarding creates `#all-pigeon-<m>` (the default channel, which can't be archived),
+  `#new-channel` and `#social`. The last two were archived.
