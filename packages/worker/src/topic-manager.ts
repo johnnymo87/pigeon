@@ -1,6 +1,6 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { getTelegramErrorDetails, isPermanentTopicFailure } from "./telegram";
-import { transportForChat, type ChatTransport } from "./chat";
+import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
   deleteBySession,
   deleteTopicBySession,
@@ -56,7 +56,19 @@ export interface ResolveTopicOptions {
   tgClient?: ChatTransport;
   /** The worker env, which a Slack address needs for its workspace secret. */
   env?: Env;
+  /**
+   * The caller is the session's owning machine, so a row it left in the OTHER transport (a
+   * machine that moved from Telegram to Slack or back) is replaced rather than honoured: the old
+   * row is removed, its conversation closed, and a new one created in `chatId`. Without it, and
+   * for a row in another chat of the SAME transport, the row stays and the notification goes
+   * unthreaded (pigeon-533h). The worker cannot tell a machine's rollout from a foreign machine
+   * on its own, so the handler passes this only for the owner.
+   */
+  supersede?: boolean;
 }
+
+/** How long a superseded conversation's close is awaited before the notification carries on. */
+export const SUPERSEDE_CLOSE_BOUND_MS = 3_000;
 
 export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
 
@@ -109,6 +121,7 @@ export async function resolveTopic(
         chatId: opts.chatId,
         messageThreadId,
         name,
+        sessionId: opts.sessionId,
       });
 
       // `topic_not_modified` means Telegram already shows this name — most likely because a
@@ -156,8 +169,83 @@ export async function resolveTopic(
     return { ok: true, messageThreadId: null, reason: "topic_in_other_chat", transient: false };
   }
 
+  /** At most one supersede per call: a second foreign row means something is flapping. */
+  let superseded = false;
+
+  /**
+   * Replaces a row that lives in the other transport, when the caller may. Returns true when a
+   * supersede was attempted (so the caller re-reads the row: it is gone if the CAS won, and
+   * whatever a rival wrote if it missed), false when the row is to be left alone.
+   *
+   * The delete is the commit point and is chat- and thread-scoped (a CAS), so two isolates
+   * cannot both supersede, and a rival that moved the row meanwhile is not undone. Only the
+   * winner closes the old conversation, through ITS transport, awaited because a Worker may stop
+   * as soon as it responds, but bounded: a slow or dead provider (a deleted Slack secret, say)
+   * must not hold the notification. Close failures are logged and never change the result.
+   */
+  async function maybeSupersede(row: TopicRow): Promise<boolean> {
+    if (!opts.supersede || superseded) return false;
+    if (isSlackChatId(row.chat_id) === isSlackChatId(opts.chatId)) return false;
+    superseded = true;
+    const deleted = await deleteTopicBySession(db, opts.sessionId, row.chat_id, row.message_thread_id);
+    console.warn("[worker] superseding the session's conversation in the other transport", {
+      sessionId: opts.sessionId,
+      fromChatId: row.chat_id,
+      toChatId: opts.chatId,
+      messageThreadId: row.message_thread_id,
+      deleted,
+    });
+    if (deleted && row.message_thread_id !== null) {
+      const threadId = row.message_thread_id;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const old = transportForChat(row.chat_id, opts.botToken, undefined, slackCtx);
+        const closing = old
+          .closeForumTopic({ chatId: row.chat_id, messageThreadId: threadId })
+          .then((res) => {
+            if (!res.ok) {
+              console.warn("[worker] closing the superseded conversation failed", {
+                sessionId: opts.sessionId,
+                chatId: row.chat_id,
+                kind: res.kind,
+              });
+            }
+          })
+          .catch((err) => {
+            console.warn("[worker] closing the superseded conversation threw", {
+              sessionId: opts.sessionId,
+              chatId: row.chat_id,
+              error: String(err),
+            });
+          });
+        const bound = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            console.warn("[worker] closing the superseded conversation timed out", {
+              sessionId: opts.sessionId,
+              chatId: row.chat_id,
+            });
+            resolve();
+          }, SUPERSEDE_CLOSE_BOUND_MS);
+        });
+        await Promise.race([closing, bound]);
+      } catch (err) {
+        console.warn("[worker] closing the superseded conversation threw", {
+          sessionId: opts.sessionId,
+          chatId: row.chat_id,
+          error: String(err),
+        });
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+    return true;
+  }
+
   // 1. Existing topic lookup
   let existing = await getBySession(db, opts.sessionId);
+  if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
+    existing = await getBySession(db, opts.sessionId);
+  }
   if (existing && existing.chat_id !== opts.chatId) {
     return topicInOtherChat(existing);
   }
@@ -248,6 +336,7 @@ export async function resolveTopic(
       chatId: opts.chatId,
       name,
       iconColor,
+      sessionId: opts.sessionId,
     });
 
     if (!createRes.ok) {
@@ -330,13 +419,15 @@ export async function resolveTopic(
   }
 
   // 2. Reserve
-  const wonReserve = await reserve(db, {
-    sessionId: opts.sessionId,
-    machineId: opts.machineId,
-    chatId: opts.chatId,
-    name,
-    now,
-  });
+  const reserveHere = () =>
+    reserve(db, {
+      sessionId: opts.sessionId,
+      machineId: opts.machineId,
+      chatId: opts.chatId,
+      name,
+      now,
+    });
+  const wonReserve = await reserveHere();
 
   if (wonReserve) {
     return runCreatorFlow();
@@ -344,6 +435,11 @@ export async function resolveTopic(
 
   // 3. Loser path. The row that beat our reserve may belong to another chat (pigeon-533h).
   existing = await getBySession(db, opts.sessionId);
+  if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
+    // The row that beat our reserve was the other transport's, and it is gone now: reserve again.
+    if (await reserveHere()) return runCreatorFlow();
+    existing = await getBySession(db, opts.sessionId);
+  }
   if (existing && existing.chat_id !== opts.chatId) {
     return topicInOtherChat(existing);
   }
@@ -355,6 +451,10 @@ export async function resolveTopic(
   for (let i = 0; i < pollAttempts; i++) {
     await delay(pollIntervalMs);
     existing = await getBySession(db, opts.sessionId);
+    if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
+      if (await reserveHere()) return runCreatorFlow();
+      existing = await getBySession(db, opts.sessionId);
+    }
     if (existing && existing.chat_id !== opts.chatId) {
       return topicInOtherChat(existing);
     }
