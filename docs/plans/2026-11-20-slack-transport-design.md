@@ -34,40 +34,58 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
   `SLACK_WORKSPACE_DEVBOX`) holds JSON `{teamId, appId, domain, botToken, userToken,
   signingSecret, ownerUserId}`. Present → that machine is on Slack; absent → Telegram.
 - **Chat addresses carry the transport.** A Slack workspace's chat id is the string
-  `slack:<teamId>`; Telegram chat ids stay numeric. The worker routes **every** call by the
-  address it is given or has stored, never by "what is this machine on now". That makes the
-  in-flight cases fall out naturally: an edit, a reply or a command reply addressed to a Telegram
-  post still goes to Telegram after the flip, and vice versa.
+  `slack:<teamId>`; Telegram chat ids stay numeric. Two rules decide where a call goes:
+  - **A stored conversation goes where it lives.** An edit (by `notificationId`), a command reply
+    (the command's `chatId` + thread/handle), a send to a handle the worker returned: routed by
+    that address. So an edit, a button or a reply to a Telegram post made before the flip still
+    goes to Telegram afterwards, and vice versa.
+  - **Anything the worker resolves itself uses the machine's transport now** (is the secret
+    present?), never the daemon's `chatId`: a session's topic/channel, a named-topic resolve or
+    bind, and General-addressed sends (a numeric `chatId` with no thread → that machine's
+    `#alerts`). The daemon's configured Telegram chat id is cached in several places
+    (`outbox-sender.ts:307`, `index.ts:576,950,974,1326`, the poller), and a stale value must not
+    be able to pull a session back to Telegram.
 - **Slack conversations get integer handles,** so every existing contract field and D1 column that
   holds a Telegram thread id (`messageThreadId`, `commands.message_thread_id`,
   `topics.message_thread_id`, `named_topics.message_thread_id`) holds a Slack conversation without a
   type change. Side table `slack_conversations(handle INTEGER PK AUTOINCREMENT, team_id, channel_id,
   UNIQUE(team_id, channel_id))`. Likewise Slack posts get an integer `message_id`: side table
   `slack_posts(handle INTEGER PK AUTOINCREMENT, team_id, channel_id, ts, text, UNIQUE(team_id,
-  channel_id, ts))`, with `text` (≤ 500) kept for reply context (§5).
+  channel_id, ts))`, with `text` (≤ 500) kept for reply context (§5), and a 30-day TTL in the
+  hourly cron (rows not tied to a session are otherwise never deleted). Both sequences are seeded
+  at 2^40 (`sqlite_sequence`), out of reach of Telegram ids, so any mix-up of a handle with a
+  Telegram thread or message id misses instead of hitting another conversation.
 - **Slack rows live in the existing tables** (`topics`, `named_topics`, `named_topic_bindings`,
   `messages`, `commands`) under `chat_id = 'slack:<team>'`. Every existing query, join, dedup
   (`notificationId`), CAS, the orphan closer and mention-links then work across both transports;
   only the calls to the provider differ. The final Telegram deletion removes Telegram rows, not
   tables.
-- **How a daemon learns its address.** `GET /whoami` gains `{transport, chatId}`: for a Slack
-  machine `chatId = "slack:<team>"`. The daemon uses that as its chat id for every send and
-  re-reads `whoami` every 60 s (and at startup). So **flip = put the secret**, and within a minute
-  the daemon's new sends address Slack; **rollback = delete the secret**. Until it re-reads, the
-  daemon keeps addressing Telegram, which still works.
+- **Flip = put the secret; rollback = delete it** (plus the binding batch, §3). The daemon needs
+  no chat id of its own for Slack: the worker resolves it. `GET /whoami` gains `transport`, which
+  the daemon uses only for its alarm path, `rich.dialect` and `launchCapable` (§6); it re-reads it
+  every 60 s and persists the last value in SQLite, and an unreadable `whoami` keeps the last value
+  (never "assume Telegram").
 - **Authorization of a `slack:` address.** Requires a machine principal (the shared key is refused
-  for `slack:` addresses). A session-bound send (`/notifications/send`, `/topics/*` for a session)
-  must address the workspace of the principal; a `/messages/send` to a `slack:` address with a
-  handle is honoured if that handle exists in that team, whoever the principal is (a command reply
-  goes where the command was typed, e.g. `/launch` typed in devbox's workspace targeting cloudbox).
-  `ALLOWED_CHAT_IDS` keeps governing numeric ids.
+  for `slack:` addresses). Session-bound sends must be for a session whose conversation the worker
+  resolves in the principal's current workspace. A `/messages/send` to a `slack:` address + handle
+  from a principal of another machine is honoured only when a `commands` row from the last 24 h has
+  that `(chat_id, message_thread_id)` and `machine_id` = the principal (a command reply goes where
+  the command was typed, e.g. `/launch` typed in devbox's workspace targeting cloudbox). Handles are
+  sequential, so without this any machine key could post into any channel. `ALLOWED_CHAT_IDS` keeps
+  governing numeric ids.
 - **The transport switch of a live session.** Today a `topics` row in a chat other than the
   requested one is `topic_in_other_chat` (`pigeon-533h`) and the notification goes unthreaded.
-  New rule: when the requester is the session's **owning machine** and the row's chat belongs to
-  the **other transport**, the row is superseded (replaced by a fresh conversation in the requested
-  chat; the old topic/channel is closed best-effort). A foreign machine still gets
-  `topic_in_other_chat`. This is what gives a flipped machine's live sessions a channel on their
-  next notification (D9), and the same rule makes rollback symmetric.
+  New rule: when the requester is the session's **owning machine** and the row is in the other
+  transport's chat, the row is **superseded toward the machine's current transport** (and only that
+  direction): replaced by a fresh conversation, the old one closed best-effort. A foreign machine
+  still gets `topic_in_other_chat`. This gives a flipped machine's live sessions a channel on their
+  next notification (D9), and rollback is symmetric.
+- **Every topic CAS is scoped to `chat_id`.** `finalize` today matches `session_id AND
+  message_thread_id IS NULL` (`topics.ts:222-241`); `deleteBySession` and `stealReservation` are
+  unscoped too. A Telegram create that finishes (57 s is possible, `pigeon-iqpd`) after a supersede
+  would otherwise write its thread id into the Slack row. So `finalize`, `deleteBySession`,
+  `steal`, the loser's cleanup and the supersede itself are CASes on the observed
+  `(session_id, chat_id, message_thread_id)`.
 - **Contract naming stays Telegram-shaped until Telegram is gone** (`text`+`entities`,
   `replyMarkup.inline_keyboard`, `urlButtons`). The worker translates those mechanically (§4). What
   the worker cannot translate is pre-rendered dialect, so three things are neutralized now: the
@@ -116,7 +134,9 @@ with a handle; channel name from the key (`stallwatch:chat-transport` →
 `stallwatch-chat-transport`, `name_taken` → suffix), topic = the given `name`. Bindings stay in
 `named_topic_bindings`; the existing joins work because both sides use the same chat id.
 `/topics/named` and `/topics/named/bind` already return `messageThreadId`; they now also return
-`chatId`, and the daemon uses the returned one.
+`chatId` (resolved from the machine's current transport, §1), and the daemon uses the returned one
+for the send that follows. Keys with a leading `_` are reserved: caller paths (`/alert topic`,
+binds) reject them.
 
 **Flip and unflip move bindings explicitly.** `named_topic_bindings` is `UNIQUE(session_id)`, and a
 coordinator's own notifications go through `getBindingForSession`, never through a key resolve, so
@@ -148,8 +168,9 @@ Every Slack post is recorded in `slack_posts` (with its text), including `/messa
 which on Telegram get no `messages` row; that is what lets a thread reply to a digest or an alert
 carry `inReplyTo` (§5).
 
-**Links:** `https://<domain>.slack.com/archives/<channel>`, from both mention-links (which query
-`topics`, so they cover Slack rows as-is) and `/topics/lookup`, which gains a `url` field the
+**Links:** `https://<domain>.slack.com/archives/<channel>` (`domain` from the workspace secret),
+from both mention-links (their query covers Slack rows, but `topicUrl` accepts only `-100…` chats,
+`mention-links.ts:59-63`, so it gets a per-transport URL builder) and `/topics/lookup`, which gains a `url` field the
 daemon's `alert-links.ts` prefers over building `t.me` URLs. Works across workspaces. iOS
 behaviour (opens the app, not a browser) is a devbox live check.
 
@@ -174,8 +195,8 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
 `team_id`/`api_app_id`, and the owner (`user == ownerUserId`, else dropped silently, on all three).
 
 - **Events** (`message.channels`): `url_verification` answered. The D1 work is done **inline** (it
-  takes milliseconds): one batch that inserts `slack_seen_events(event_id)` and the command. A D1
-  failure returns 5xx so Slack retries; only media download runs in `ctx.waitUntil` (30 s cap).
+  takes milliseconds): one batch that inserts `slack_seen_events(event_id)` and the command. A
+  conflict on `event_id` is a duplicate → 200; any other D1 failure returns 5xx so Slack retries; only media download runs in `ctx.waitUntil` (30 s cap).
   Ignore `bot_id`, our bot user, and subtypes other than none, `file_share` and `thread_broadcast`.
   - **Session resolution, in this order** (Telegram's swipe-reply also comes first,
     `webhook.ts:558`): (1) thread reply: `thread_ts` → `slack_posts` → `messages` → its session
@@ -184,7 +205,7 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
   - **Reply context:** any thread reply whose parent is in `slack_posts` gets `inReplyTo` = the
     parent's text (≤ 500), whether or not the parent belongs to a session, as Telegram gives it for
     any bot message (`webhook.ts:941-951`). If the parent is not recorded, `conversations.replies`
-    fetches it. `inReplyToQuote` is always absent (Slack has no partial quote).
+    fetches it, bounded at ~1 s; past that `inReplyTo` is left out, so the 3 s ack holds. `inReplyToQuote` is always absent (Slack has no partial quote).
   - **Forwarded:** a shared-message attachment → `forwarded: true`.
   - **Files:** `files[]` → `url_private_download` with the bot token → R2, same `MediaRef`.
   - `senderId` = the Slack user id (see §6, allowlist).
@@ -193,7 +214,8 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
   resolves the session as a topic does; `/tag <id> <tag>` and `/launch` work anywhere. Because
   commands do not work in threads, and `#alerts` and named channels have no session,
   `/kill /interrupt /compact /mcp /model` accept an optional leading `<session-id>` (also useful on
-  Telegram). The parsers are extracted from `webhook.ts` and shared. Daemon replies arrive by
+  Telegram): a full id or a unique prefix (coordinators write prefixes); an ambiguous prefix is
+  refused with the candidates, since `/kill` is destructive. The parsers are extracted from `webhook.ts` and shared. Daemon replies arrive by
   `/messages/send` to the command's `chatId` + handle.
 - **Interactivity** (`block_actions`): `value` parsed exactly as `callback_data` is today;
   answered with an empty ack; the wizard's `chat.update` is the feedback.
@@ -208,7 +230,8 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
   `hooks.slack.com` appears only in that file (and `api.telegram.org` only in the Telegram one,
   until deleted).
 - **`launchCapable`**: worker credentials, an opencode client, and an alarm path for the current
-  transport; `TELEGRAM_*` no longer required on a Slack machine.
+  transport; `TELEGRAM_*` no longer required on a Slack machine. Computed per poll from the
+  persisted `whoami.transport`, not once at startup (`index.ts:496`), so a flip needs no restart.
 - **Owner allowlist:** `PIGEON_PULL_ALLOWED_USER_IDS` is compared against `senderId`
   (`goose/adapter.ts:82-88`, `adapters/goose-pull.ts:86`). Each workspace's Slack user id is added
   to its machine's list **before** that machine flips (workstation PR), keeping the Telegram id
@@ -217,7 +240,7 @@ All three endpoints verify `X-Slack-Signature` (HMAC-SHA256 of `v0:<ts>:<body>`,
 
 ### 7. Daemon↔worker contract: additive neutral fields
 
-- **`chatId` from `whoami`** (§1); `/topics/named(/bind)` return `chatId`.
+- **`whoami.transport`** (§1, §6); `/topics/named(/bind)` return `chatId`.
 - **`/topics/lookup` returns `url`.**
 - **`rich.dialect`**: the daemon's `rich-markdown.ts` produces Telegram dialect today (copy-text
   buttons as `<tg-button>`, `\$ \= \| \!` escapes, `&lt;`), which Slack would show literally. On a
@@ -255,7 +278,7 @@ The bead graph under `pigeon-4ogz` is authoritative.
 2. **Manifest + setup runbook + flip script**, in parallel with 1.
 3. **Worker Slack outbound** (§1, §3, §4) and **worker Slack inbound** (§5), on the seam; dark
    until a `SLACK_WORKSPACE_*` secret exists. `whoami` reports `transport: telegram` until then.
-4. **Daemon** (§6, §7): `whoami` chat id + re-read, `rich.dialect`, `notifyOwner`, `errorClass`,
+4. **Daemon** (§6, §7): `whoami.transport` re-read and persisted, named-topic `chatId` used, `rich.dialect`, `notifyOwner`, `errorClass`,
    `url` links, Slack alarm, `launchCapable`. Deploy worker before daemons (all additive). The
    Telegram suite must pass untouched throughout.
 5. **devbox:** Jonathan's go-ahead → workspace + app per runbook → workstation PR (alarm webhook,
@@ -280,10 +303,14 @@ The bead graph under `pigeon-4ogz` is authoritative.
   channel and by `<session-id>`; button → token; each rendering row; markdown fallback and
   dialect-less `rich`; each error-class row; create 429 → hold, not `retryAfter`; `name_taken`
   suffix; unarchive on reopen; supersede rule both directions vs `topic_in_other_chat` for a
-  foreign machine; `slack:` address auth (shared key refused, foreign team refused for session-bound,
-  command-reply handle honoured); edit routed by stored chat; dedup across the flip; flip/unflip
+  foreign machine;
+  CAS scoping (a late Telegram finalize after a supersede must not touch the Slack row); a stale
+  daemon `chatId` cannot pull a flipped session back; `slack:` address auth (shared key refused;
+  cross-machine `/messages/send` only with a matching recent command row); `_`-prefixed keys
+  refused; `slack_posts` TTL; edit routed by stored chat; dedup across the flip; flip/unflip
   binding batches; Telegram behaviour unchanged with no Slack secret.
-- Daemon: `whoami` re-read switches the chat id; `rich.dialect` Slack rendering (no `tg-button`,
+- Daemon: `whoami.transport` re-read and persisted (unreadable keeps the last value); per-poll
+  `launchCapable`; named-topic `chatId` from the worker used; `rich.dialect` Slack rendering (no `tg-button`,
   no Telegram escapes); `errorClass` preferred, legacy honoured; `notifyOwner` only on questions
   and error alerts; Slack alarm ladder via the composed notifier; guard tests.
 
