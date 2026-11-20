@@ -143,6 +143,7 @@ Either:
   carries `credentials.signing_secret` and `client_secret`, so never print it:
 
   ```bash
+  umask 077
   curl -s -H @<(printf 'Authorization: Bearer %s' "$(cat ~/slack-config-token.<m>)") \
     --data-urlencode manifest@/tmp/slack-manifest.<m>.json https://slack.com/api/apps.manifest.create \
     > ~/slack-create.<m>.json   # 0600 under the umask below
@@ -152,7 +153,7 @@ Either:
   rm ~/slack-create.<m>.json ~/slack-config-token.<m>
   ```
 
-  Then revoke the token on the *Your App Configuration Tokens* page. Run `umask 077` first.
+  Then revoke the token on the *Your App Configuration Tokens* page.
 
 Expect the Events request URL to be **unverified** ("Your URL didn't respond…"). That is correct:
 the worker answers Slack only for a workspace whose config secret it holds, and it gets that only
