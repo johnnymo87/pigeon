@@ -33,6 +33,7 @@ import type {
   UnpinAllForumTopicMessagesOptions,
 } from "../telegram";
 import { slackChatId, type SlackWorkspace } from "./slack-config";
+import { shouldMention, type ConversationKind, type ExplicitNotifyCategory, type NotifyCategory } from "./slack-notify";
 import { buildSlackMessage, type SlackMessage } from "./slack-render";
 import type { ChatResult, ChatTransport } from "./transport";
 
@@ -62,6 +63,11 @@ export interface SlackTransportDeps {
   ws: SlackWorkspace;
   /** Replaces the global `fetch` for every Slack call and upload (tests). */
   fetchFn?: typeof fetch;
+  /**
+   * The categories whose posts mention the owner (`SLACK_NOTIFY_OWNER`, parsed). Absent or empty
+   * means no post ever mentions: Slack pushes are off by default (spec D7).
+   */
+  notifyCategories?: ReadonlySet<NotifyCategory>;
 }
 
 // ─── Names ─────────────────────────────────────────────────────────────────
@@ -203,6 +209,7 @@ interface Target {
 
 export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
   const { db, ws, fetchFn } = deps;
+  const notifyCategories: ReadonlySet<NotifyCategory> = deps.notifyCategories ?? new Set();
   const chat = slackChatId(ws);
 
   const bot = (method: string, args: Record<string, unknown>, signal?: AbortSignal) =>
@@ -294,13 +301,14 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     return row ? { channelId: row.channel_id, ts: row.ts } : null;
   }
 
-  /** Does any named topic of this workspace live in this conversation (`_alerts` included)? */
-  async function isNamedConversation(handle: number): Promise<boolean> {
+  /** `alerts` for the `_alerts` row, `named` for any other named topic, else `session`. */
+  async function conversationKind(handle: number): Promise<ConversationKind> {
     const row = await db
-      .prepare("SELECT 1 AS one FROM named_topics WHERE chat_id = ? AND message_thread_id = ? LIMIT 1")
+      .prepare("SELECT topic_key FROM named_topics WHERE chat_id = ? AND message_thread_id = ? LIMIT 1")
       .bind(chat, handle)
-      .first<{ one: number }>();
-    return row !== null;
+      .first<{ topic_key: string }>();
+    if (row === null) return "session";
+    return row.topic_key === ALERTS_TOPIC_KEY ? "alerts" : "named";
   }
 
   // ── conversation operations ──
@@ -493,12 +501,18 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     /** Plain text (or markdown) kept in `slack_posts`. */
     recordText: string;
     notifyOwner: boolean | undefined;
+    notifyCategory: ExplicitNotifyCategory | undefined;
     build: (notifyOwner: boolean) => SlackMessage;
     signal?: AbortSignal;
   }
 
   async function postOnce(target: Target, input: PostInput): Promise<TgResult<SlackBody>> {
-    const notify = input.notifyOwner === true || (await isNamedConversation(target.handle));
+    const notify = shouldMention({
+      categories: notifyCategories,
+      notifyOwner: input.notifyOwner,
+      notifyCategory: input.notifyCategory,
+      conversationKind: await conversationKind(target.handle),
+    });
     const message = input.build(notify);
     return withChannelRecovery(
       target.channelId,
@@ -636,6 +650,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         messageThreadId: options.messageThreadId,
         recordText: options.text,
         notifyOwner: options.notifyOwner,
+        notifyCategory: options.notifyCategory,
         build: (notify) =>
           buildSlackMessage({
             text: options.text,
@@ -653,6 +668,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         messageThreadId: options.messageThreadId,
         recordText: options.text ?? options.markdown,
         notifyOwner: options.notifyOwner,
+        notifyCategory: options.notifyCategory,
         build: (notify) =>
           buildSlackMessage({
             // The fallback text is what a notification shows: the caller's plain text when it
@@ -675,7 +691,12 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         .prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
         .bind(ws.teamId, original.channelId)
         .first<{ handle: number }>();
-      const notify = options.notifyOwner === true || (conversation !== null && (await isNamedConversation(conversation.handle)));
+      const notify = shouldMention({
+        categories: notifyCategories,
+        notifyOwner: options.notifyOwner,
+        notifyCategory: options.notifyCategory,
+        conversationKind: conversation !== null ? await conversationKind(conversation.handle) : "session",
+      });
       const message = buildSlackMessage({
         text: options.text,
         ...(options.entities ? { entities: options.entities } : {}),

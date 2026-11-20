@@ -307,13 +307,34 @@ describe("/notifications/send routing", () => {
     expect(missing.status).toBe(400);
   });
 
-  it("notifyOwner reaches a Slack post as a mention, and is not sent to Telegram", async () => {
+  it("notifyOwner reaches a Slack post as a mention only for an enabled category, and is not sent to Telegram", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
     const { channelId } = await seedSlackTopic(sessionId, m.machineId, m.ws!);
-    slack("chat.postMessage", posted(channelId));
-    await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId, { notifyOwner: true })));
-    expect(slackOf("chat.postMessage")[0]?.params.get("text")).toContain("<@U0OWNER>");
+    const send = async (extraEnv: Record<string, unknown>, extra: Record<string, unknown>) => {
+      slack("chat.postMessage", posted(channelId, `1.${stamp()}`));
+      const res = await handleSendNotification(
+        env.DB,
+        envFor([m], extraEnv),
+        request("/notifications/send", m.key, sendBody(sessionId, { notificationId: `s:${sessionId}:${stamp()}`, ...extra })),
+      );
+      expect(res.status).toBe(200);
+      const calls = slackOf("chat.postMessage");
+      return calls[calls.length - 1]?.params.get("text") ?? "";
+    };
+
+    // Default: off, even when the daemon flags the post.
+    expect(await send({}, { notifyOwner: true })).not.toContain("<@U0OWNER>");
+    expect(await send({ SLACK_NOTIFY_OWNER: "" }, { notifyOwner: true })).not.toContain("<@U0OWNER>");
+    // An error-severity flag needs `errors`; `questions` alone does not cover it.
+    expect(await send({ SLACK_NOTIFY_OWNER: "questions" }, { notifyOwner: true })).not.toContain("<@U0OWNER>");
+    expect(await send({ SLACK_NOTIFY_OWNER: " Errors " }, { notifyOwner: true })).toContain("<@U0OWNER>");
+    // A flagged `q:` notification is a question.
+    const q = { notifyOwner: true, notificationId: `q:${sessionId}:req1` };
+    expect(await send({ SLACK_NOTIFY_OWNER: "errors" }, q)).not.toContain("<@U0OWNER>");
+    expect(await send({ SLACK_NOTIFY_OWNER: "QUESTIONS" }, { ...q, notificationId: `q:${sessionId}:req2` })).toContain("<@U0OWNER>");
+    // No flag: a session channel never mentions.
+    expect(await send({ SLACK_NOTIFY_OWNER: "questions,errors,named,alerts" }, {})).not.toContain("<@U0OWNER>");
   });
 });
 

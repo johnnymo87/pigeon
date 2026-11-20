@@ -13,8 +13,10 @@ export interface SendMessageOptions {
   messageThreadId?: number;
   /** Aborts the call (the fetch rejects). Callers that bound a request use this. */
   signal?: AbortSignal;
-  /** Slack only: mention the workspace owner so the post notifies them. Telegram ignores it. */
+  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
   notifyOwner?: boolean;
+  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
+  notifyCategory?: "questions" | "errors";
 }
 
 export interface SendRichMessageOptions {
@@ -25,8 +27,10 @@ export interface SendRichMessageOptions {
   text?: string;
   replyMarkup?: unknown;
   messageThreadId?: number;
-  /** Slack only: mention the workspace owner so the post notifies them. Telegram ignores it. */
+  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
   notifyOwner?: boolean;
+  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
+  notifyCategory?: "questions" | "errors";
   /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
   signal?: AbortSignal;
 }
@@ -37,8 +41,10 @@ export interface EditMessageTextOptions {
   text: string;
   entities?: unknown[];
   replyMarkup?: unknown;
-  /** Slack only: keep the owner mention on the edited message. Telegram ignores it. */
+  /** Slack only: keep the owner mention on the edited message (gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
   notifyOwner?: boolean;
+  /** Slack only: the category of that mention. Telegram ignores it. */
+  notifyCategory?: "questions" | "errors";
   /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
   signal?: AbortSignal;
 }

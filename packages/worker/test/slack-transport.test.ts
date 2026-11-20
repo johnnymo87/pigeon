@@ -12,6 +12,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import d1Schema from "../src/d1-schema.sql?raw";
 import { transportForChat } from "../src/chat";
 import { SLACK_HANDLE_MIN, slackChatId, type SlackWorkspace } from "../src/chat/slack-config";
+import { parseNotifyCategories } from "../src/chat/slack-notify";
 import { createSlackTransport, slugify } from "../src/chat/slack-transport";
 import type { ChatTransport } from "../src/chat";
 import { createTelegramClient } from "../src/telegram";
@@ -102,8 +103,8 @@ async function seedNamed(ws: SlackWorkspace, key: string, handle: number) {
     .run();
 }
 
-function transport(ws: SlackWorkspace): ChatTransport {
-  return createSlackTransport({ db: env.DB, ws });
+function transport(ws: SlackWorkspace, notify = ""): ChatTransport {
+  return createSlackTransport({ db: env.DB, ws, notifyCategories: parseNotifyCategories(notify) });
 }
 
 const posted = { ok: true, ts: "1700000000.000100", channel: "C1" };
@@ -355,14 +356,14 @@ describe("sendMessage", () => {
     expect([...post!.text].length).toBe(500);
   });
 
-  it("mentions the owner when asked, in a named channel, and in #alerts, but never in a plain session channel", async () => {
+  it("with every category on: mentions when flagged, in a named channel and in #alerts, never in an unflagged session channel", async () => {
     const ws = mkWs();
     const session = await seedChannel(ws, "CPLAIN");
     const named = await seedChannel(ws, "CNAMED");
     await seedNamed(ws, "digest", named);
     const alerts = await seedChannel(ws, "CALERTS");
     await seedNamed(ws, "_alerts", alerts);
-    const t = transport(ws);
+    const t = transport(ws, "questions,errors,named,alerts");
     const chatId = slackChatId(ws);
 
     const send = async (opts: { messageThreadId?: number; notifyOwner?: boolean }, expected: string) => {
@@ -640,11 +641,19 @@ describe("editMessageText", () => {
     expect(calls).toEqual([]);
   });
 
-  it("keeps the owner mention on an edit in a named channel", async () => {
+  it("keeps the owner mention on an edit in a named channel when `named` is enabled, and drops it otherwise", async () => {
     const ws = mkWs();
     const named = await seedChannel(ws, "CEDN");
     await seedNamed(ws, "wiz", named);
-    const t = transport(ws);
+    const off = transport(ws);
+    slack("chat.postMessage", { ok: true, ts: "8.0" });
+    const sentOff = await off.sendMessage({ chatId: slackChatId(ws), messageThreadId: named, text: "Q?" });
+    if (!sentOff.ok) throw new Error("send failed");
+    slack("chat.update", { ok: true });
+    await off.editMessageText({ chatId: slackChatId(ws), messageId: sentOff.result.message_id, text: "Q2" });
+    expect(calls[1]!.params.get("text")).toBe("Q2");
+    calls.length = 0;
+    const t = transport(ws, "named");
     slack("chat.postMessage", { ok: true, ts: "8.1" });
     const sent = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: named, text: "Q?" });
     if (!sent.ok) throw new Error("send failed");

@@ -232,3 +232,30 @@ Each task: TDD in a new test file `test/slack-*.test.ts` (fetchMock on `https://
 8. Rendering: never emit an empty `text` element; entity-less text renders as one plain section;
    `unfurl_links=false`, `unfurl_media=false` on posts. `editForumTopic` skips `setTopic` when
    `conversations.info` shows the same topic, and skips `rename` when the name is unchanged.
+
+## D7 revision (2026-11-20, design PR #231) — overrides every `notifyOwner` statement above
+
+Slack pushes are OFF by default. The owner mention is no longer "always in a named channel or
+`#alerts`, and whenever `notifyOwner` is set".
+
+- New worker var `SLACK_NOTIFY_OWNER` (`Env`, optional): comma list of `questions`, `errors`,
+  `named`, `alerts`; case-insensitive, trimmed, unknown entries ignored. Empty or unset = no
+  mention at all. Documented as a comment in `wrangler.toml`; nothing is added to `[vars]`
+  (`keep_vars = true`, default empty).
+- `src/chat/slack-notify.ts`: `parseNotifyCategories(raw)` → `Set`, `explicitCategory(id)`
+  (`q:` → `questions`, else `errors`), `shouldMention({categories, notifyOwner, notifyCategory,
+  notificationId, conversationKind})`. Categories: explicit `notifyOwner` on a `q:` send →
+  `questions`, other explicit → `errors`, `_alerts` row → `alerts`, other named row → `named`,
+  session channel with no flag → never. Mention iff any applicable category is enabled.
+- Transport: `createSlackTransport` takes `notifyCategories` (built from env in `transportForChat`);
+  `isNamedConversation` became `conversationKind` (reads `named_topics.topic_key`). Send/edit options
+  gain `notifyCategory?: "questions" | "errors"`; the `notifyOwner` boolean still works and maps to
+  `errors`. `notifications.ts` passes the category derived from `notificationId`. Edits follow the
+  conversation rule only (no flag on `/notifications/edit`).
+- Never a broadcast: `slack-render` neutralises `<!channel|here|everyone|subteam…>` and bare
+  `@channel`/`@here`/`@everyone` with a zero-width joiner in the fallback text and markdown
+  blocks; rich_text carries only `text` and `user` elements (tested).
+- Tests: `test/slack-notify.test.ts` (parser, decision table, transport matrix, broadcast);
+  the old always-mention assertions in `slack-transport` and `slack-routing` tests now run with the
+  categories they need. `users.prefs.set` is still never called.
+

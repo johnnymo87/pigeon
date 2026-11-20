@@ -6,6 +6,7 @@ import { machineSlackWorkspace, resolveWorkerTarget } from "./chat/address";
 import { isAllowedChatId } from "./chat/allowlist";
 import { slackWorkspaceForTeam, teamIdOfChat } from "./chat/slack-config";
 import { SLACK_MARKDOWN_MAX } from "./chat/slack-render";
+import { explicitCategory } from "./chat/slack-notify";
 import { errorClassOf } from "./slack";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
@@ -557,8 +558,15 @@ export async function handleSendNotification(
       });
       richEnabled = false;
     }
-    // Slack posts honour `notifyOwner`; Telegram has no such option, so it is not even passed.
-    const slackOnly = isSlack ? { notifyOwner: body.notifyOwner === true } : {};
+    // Slack posts honour `notifyOwner`, as a category: a flagged `q:` notification is a question,
+    // anything else flagged is an error. Whether that mentions anyone is `SLACK_NOTIFY_OWNER`'s
+    // call, inside the transport. Telegram has no such option, so it is not even passed.
+    const slackOnly = isSlack
+      ? {
+          notifyOwner: body.notifyOwner === true,
+          ...(body.notifyOwner === true ? { notifyCategory: explicitCategory(notificationId) } : {}),
+        }
+      : {};
     let lastSendWasRich = false;
     let richError: unknown;
 

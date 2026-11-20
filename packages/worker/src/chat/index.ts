@@ -4,6 +4,7 @@
  */
 import type { D1Database } from "@cloudflare/workers-types";
 import { createTelegramClient } from "../telegram";
+import { parseNotifyCategories } from "./slack-notify";
 import { slackWorkspaceForTeam, teamIdOfChat } from "./slack-config";
 import { createSlackTransport } from "./slack-transport";
 import type { ChatResult, ChatTransport } from "./transport";
@@ -70,7 +71,12 @@ export function transportForChat(
     const team = teamIdOfChat(chatId);
     const ws = slack && team ? slackWorkspaceForTeam(slack.env, team) : null;
     if (slack && ws) {
-      return createSlackTransport({ db: slack.db, ws, ...(slack.fetchFn ? { fetchFn: slack.fetchFn } : {}) });
+      return createSlackTransport({
+        db: slack.db,
+        ws,
+        notifyCategories: parseNotifyCategories(slack.env.SLACK_NOTIFY_OWNER),
+        ...(slack.fetchFn ? { fetchFn: slack.fetchFn } : {}),
+      });
     }
     return SLACK_UNAVAILABLE;
   }

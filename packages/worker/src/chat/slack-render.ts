@@ -242,8 +242,22 @@ export interface SlackMessage {
 /** Slack user ids are upper-case alphanumerics. Anything else is not put inside `<@…>`. */
 const USER_ID_RE = /^[A-Z0-9]{2,}$/;
 
+/**
+ * Pigeon never broadcasts. Slack turns `<!channel>`, `<!here>`, `<!everyone>` (and a user group,
+ * `<!subteam^…>`) into a mention of many people, and its markdown renderer may also turn a bare
+ * `@channel` / `@here` / `@everyone` into one. Both are defused with a zero-width joiner, which
+ * keeps the text readable and stops it matching.
+ */
+const ZWJ = "\u200d";
+
+function neutralizeBroadcast(text: string): string {
+  return text
+    .replace(/<!(?=\s*(?:channel|here|everyone|subteam))/gi, `<${ZWJ}!`)
+    .replace(/(?<![A-Za-z0-9_.])@(?=(?:channel|here|everyone)(?![A-Za-z0-9_]))/gi, `@${ZWJ}`);
+}
+
 function escapeMrkdwn(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return neutralizeBroadcast(text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 }
 
 /** Caps text at `SLACK_TEXT_MAX` without leaving half a surrogate pair or half an `&amp;`. */
@@ -281,7 +295,7 @@ export function buildSlackMessage(options: BuildSlackMessageOptions): SlackMessa
   const lead: SlackBlock[] = [];
   if (useMarkdown) {
     if (mention) lead.push({ type: "section", text: { type: "mrkdwn", text: `<@${mention}>` } });
-    lead.push(markdownBlock(md));
+    lead.push(markdownBlock(neutralizeBroadcast(md)));
   } else {
     let rich = entitiesToRichText(options.text, options.entities);
     if (mention) rich = withMention(rich, mention);
