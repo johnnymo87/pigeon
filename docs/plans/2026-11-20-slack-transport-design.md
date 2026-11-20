@@ -101,7 +101,10 @@ channel. The worker stays the only ingress and the only normal egress; daemons k
   incoming webhook), and stores the credentials. All three workspaces can be created from devbox;
   only the Mac's daemon config needs the Mac. Signup is a web flow with no API, so it needs a
   browser (a headless Chromium under CDP on devbox, or Jonathan's browser on port 9222); if Slack
-  blocks automation, that step falls back to Jonathan. App creation can use `apps.manifest.create`
+  blocks automation, that step falls back to Jonathan. Safeguards: a throwaway Chromium profile,
+  CDP over `--remote-debugging-pipe` (or a random localhost port, not 9222); **no client token or
+  session cookie is ever extracted or stored**; the app configuration token is discarded after
+  `apps.manifest.create`; sign out and delete the profile when done. App creation can use `apps.manifest.create`
   with an app configuration token; install is an OAuth consent in the same browser session.
 - **Where credentials live:** the worker config JSON for each machine is staged in workstation
   sops `secrets/devbox.yaml` as `pigeon_slack_workspace_<machine>` (the flip script, run from
@@ -145,16 +148,27 @@ known to work with client tokens and is unverified with an app's user token. So:
 - **Guaranteed mechanism:** the runbook sets each workspace's notification preference to
   **"Mentions only"** (Jonathan's account, set once by the agent in the signup session). Session
   channels then never push, except for the @-mentions pigeon adds to questions and error alerts.
-  Coordinator channels push because **every bot post in a channel whose named-topic key starts
-  `stallwatch:`** (the coordinator channels) carries the owner @-mention, as a channel-level
-  `notifyOwner`. `#alerts` (`_alerts`) is treated the same way: it is not a session channel and
-  replaces Telegram's General, where every alert pushed. `#em-alerts` posts by incoming webhook
-  and cannot mention; Jonathan can set that one channel to "All new messages" if wanted. Unread badges still show in the sidebar; that is the difference from a real mute.
-- **Real mute, if it works:** at workspace setup, test `users.prefs.set muted_channels` with the
-  app's user token on a scratch channel. If it takes effect, the worker also mutes each new session
-  channel right after creating it (best-effort; a failure logs and never blocks a send), and
-  coordinator channels stay unmuted. The result of the test is recorded on the setup bead and in
-  the runbook.
+  Coordinator channels push because **every bot post in a named channel** carries the owner
+  @-mention, as a channel-level `notifyOwner`. Only session channels are "muted". The named
+  channels are the stall-watch coordinators (`stallwatch:<tag>`, pigeon's own predicate,
+  `daemon/src/swarm/coordinators.ts:32`), plus `stallwatch:_notices` and `agent-wait`, which exist
+  to tell him something; treating every named channel alike avoids a second coordinator test.
+  `#alerts` (`_alerts`) pushes the same way: it replaces Telegram's General, where every alert
+  pushed.
+- **Paths that bypass the worker mention too**, or "Mentions only" would silence exactly the
+  alarms that matter when the worker is broken: `direct-slack-alarm` and the em-* `slack_send`
+  prefix `<@ownerUserId>` (an incoming webhook's text notifies on a mention; the user id is not a
+  secret, daemon env `PIGEON_SLACK_OWNER_USER_ID` beside the webhook URL). healthchecks.io cannot
+  mention, so in the signup session the agent also sets per-channel "All new messages" on
+  `#alerts`, `#em-alerts` and the channel healthchecks posts to, and checks that the mobile
+  notification setting follows desktop. The devbox live check is "worker blocked → the phone gets a
+  push", not only "the alarm posts". Unread badges still show in the sidebar; that is the difference from a real mute.
+- **Real mute, only if it passes cleanly:** at setup, test `users.prefs.set muted_channels` with
+  the app's **user token** on a scratch channel. It passes only if the channel then shows as muted
+  (dimmed, no badge) on a device, not merely if the API echoes the value. `muted_channels` is a
+  whole-list write, so even when it passes the worker does read-then-write under a per-workspace
+  lock and never removes an id it did not add. If it does not pass cleanly, it is dropped: the
+  mention mechanism already meets D7. Result recorded on the setup bead and in the runbook.
 
 **Named channels** (`/topics/named`, `/alert topic`): a `named_topics` row under `slack:<team>`
 with a handle; channel name from the key (`stallwatch:chat-transport` →
