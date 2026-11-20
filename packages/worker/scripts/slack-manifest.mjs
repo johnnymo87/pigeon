@@ -11,11 +11,17 @@
  *       Checks the shape of a worker config file (what becomes SLACK_WORKSPACE_<MACHINE>):
  *       exactly {teamId, appId, domain, botToken, userToken, signingSecret, ownerUserId}.
  *       Refuses a file other users can read. Prints the non-secret ids only.
+ *   <value on stdin> | node packages/worker/scripts/slack-manifest.mjs stage-field <file> <field>
+ *       Merges one field into the staging config <file> (created 0600, outside any git work
+ *       tree), or with field alarmWebhookUrl writes the #alerts webhook URL as <file>. Takes the
+ *       value on stdin so a browser driver can pipe it in without the value ever reaching argv,
+ *       stdout or the agent's transcript; prints only a prefix and length for secrets.
  *
  * Neither command talks to Slack, and NEITHER EVER PRINTS A TOKEN OR THE SIGNING SECRET:
  * problems name the field, never its value.
  */
-import { readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MACHINE_ID_PATTERN } from "./machine-key.mjs";
@@ -108,6 +114,81 @@ export function checkConfig(cfg) {
   return problems;
 }
 
+/** Pseudo-field for stage-field: the #alerts incoming-webhook URL, kept in its own file. */
+export const WEBHOOK_FIELD = "alarmWebhookUrl";
+const WEBHOOK_PATTERN = /^https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+$/;
+
+function insideGitWorkTree(dir) {
+  try {
+    return (
+      execFileSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], {
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim() === "true"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function describe(field, value) {
+  const spec = CONFIG_FIELDS[field];
+  if (spec && !spec.secret) return value;
+  // Only the fixed, non-secret part of the shape: "xoxb-", the webhook host, nothing of the rest.
+  const prefix =
+    field === WEBHOOK_FIELD ? "https://hooks.slack.com/…" : /^xox[bp]-/.test(value) ? `${value.slice(0, 5)}…` : "…";
+  return `${prefix}, ${value.length} chars`;
+}
+
+/**
+ * Write one value into a staging file without it ever being printed: a config field is merged
+ * into the JSON object in <file>; alarmWebhookUrl makes <file> a one-line file of its own. The
+ * file is created 0600 and must stay 0600, outside any git work tree. Returns what may be shown.
+ */
+export function stageField(file, field, value) {
+  if (field !== WEBHOOK_FIELD && !(field in CONFIG_FIELDS)) {
+    throw new Error(`unknown field "${field}" (want one of ${Object.keys(CONFIG_FIELDS).join(", ")}, ${WEBHOOK_FIELD})`);
+  }
+  if (field === WEBHOOK_FIELD) {
+    if (!WEBHOOK_PATTERN.test(value)) throw new Error(`value is not an incoming-webhook URL (https://hooks.slack.com/services/…)`);
+  } else {
+    const problems = checkConfig({ ...placeholderConfig(), [field]: value });
+    if (problems.length) throw new Error(problems.join("\n"));
+  }
+  const abs = resolve(file);
+  if (insideGitWorkTree(dirname(abs))) throw new Error(`refusing to write inside a git work tree: ${abs}`);
+  let cfg = {};
+  if (existsSync(abs)) {
+    if ((statSync(abs).mode & 0o077) !== 0) throw new Error(`${abs} is readable by other users: chmod 0600 it first`);
+    if (field !== WEBHOOK_FIELD) {
+      try {
+        cfg = JSON.parse(readFileSync(abs, "utf8"));
+      } catch {
+        throw new Error(`${abs} is not valid JSON`);
+      }
+      if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) throw new Error(`${abs} is not a JSON object`);
+    }
+  }
+  const body = field === WEBHOOK_FIELD ? value + "\n" : JSON.stringify({ ...cfg, [field]: value }, null, 2) + "\n";
+  const tmp = `${abs}.tmp-${process.pid}`;
+  writeFileSync(tmp, body, { mode: 0o600, flag: "wx" });
+  renameSync(tmp, abs);
+  return { shown: describe(field, value) };
+}
+
+function placeholderConfig() {
+  return {
+    teamId: "T0000000",
+    appId: "A0000000",
+    domain: "x",
+    botToken: "xoxb-0",
+    userToken: "xoxp-0",
+    signingSecret: "0".repeat(32),
+    ownerUserId: "U0000000",
+  };
+}
+
 function main(argv) {
   const [cmd, ...rest] = argv;
   if (cmd === "render") {
@@ -140,7 +221,17 @@ function main(argv) {
     );
     return;
   }
-  throw new Error("usage: slack-manifest.mjs render <machine> [--base-url <url>] | check-config <file>");
+  if (cmd === "stage-field") {
+    const [file, field] = rest;
+    if (!file || !field) throw new Error("usage: stage-field <file> <field>   (value on stdin)");
+    const value = readFileSync(0, "utf8").trim();
+    const { shown } = stageField(file, field, value);
+    console.log(`staged ${field} in ${file}: ${shown}`);
+    return;
+  }
+  throw new Error(
+    "usage: slack-manifest.mjs render <machine> [--base-url <url>] | check-config <file> | stage-field <file> <field>",
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -8,7 +8,7 @@
  * to this test too, so a scope cannot be added or dropped by accident.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -246,6 +246,71 @@ describe("CLI", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("userToken");
     expect(r.stdout + r.stderr).not.toContain("SECRET");
+  });
+
+  function stage(file: string, field: string, value: string) {
+    try {
+      const stdout = execFileSync(process.execPath, [SCRIPT, "stage-field", file, field], {
+        input: value + "\n",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).toString();
+      return { code: 0, stdout, stderr: "" };
+    } catch (err) {
+      const e = err as { status: number; stdout: Buffer; stderr: Buffer };
+      return { code: e.status, stdout: e.stdout.toString(), stderr: e.stderr.toString() };
+    }
+  }
+
+  it("stage-field builds a config one field at a time, 0600, printing no secret", () => {
+    const f = join(dir, "cfg.json");
+    let out = "";
+    for (const [k, v] of Object.entries(GOOD)) {
+      const r = stage(f, k, v);
+      expect(r.code).toBe(0);
+      out += r.stdout + r.stderr;
+    }
+    expect(out).not.toContain("SECRET");
+    expect(out).not.toContain(GOOD.signingSecret.slice(0, 8));
+    expect(out).toContain("xoxb-…");
+    expect(out).toContain("T0123ABCD");
+    expect(statSync(f).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(f, "utf8"))).toEqual(GOOD);
+    expect(run(["check-config", f]).code).toBe(0);
+  });
+
+  it("stage-field writes the webhook URL as a one-line file of its own", () => {
+    const f = join(dir, "hook");
+    const url = "https://hooks.slack.com/services/T0123/B0456/SECRETpart";
+    const r = stage(f, "alarmWebhookUrl", url);
+    expect(r.code).toBe(0);
+    expect(r.stdout).not.toContain("SECRET");
+    expect(r.stdout).not.toContain("T0123");
+    expect(readFileSync(f, "utf8")).toBe(url + "\n");
+    expect(statSync(f).mode & 0o777).toBe(0o600);
+  });
+
+  it("stage-field refuses a bad value without echoing it, and leaves the file alone", () => {
+    const f = join(dir, "cfg.json");
+    stage(f, "teamId", GOOD.teamId);
+    const r = stage(f, "userToken", "xoxc-SECRETclient");
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/client/);
+    expect(r.stdout + r.stderr).not.toContain("SECRET");
+    expect(JSON.parse(readFileSync(f, "utf8"))).toEqual({ teamId: GOOD.teamId });
+    expect(stage(join(dir, "h"), "alarmWebhookUrl", "https://evil.test/SECRET").stderr).not.toContain("SECRET");
+  });
+
+  it("stage-field refuses unknown fields, loose permissions and git work trees", () => {
+    const f = join(dir, "cfg.json");
+    expect(stage(f, "clientToken", "x").code).toBe(1);
+    writeFileSync(f, "{}");
+    chmodSync(f, 0o644);
+    expect(stage(f, "teamId", GOOD.teamId).stderr).toMatch(/0600/);
+    execFileSync("git", ["init", "-q", dir]);
+    const g = join(dir, "inside.json");
+    const r = stage(g, "teamId", GOOD.teamId);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/git work tree/);
   });
 
   it("check-config on unparseable JSON does not echo its content", () => {

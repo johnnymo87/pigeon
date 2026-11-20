@@ -15,7 +15,7 @@ Slack resource beyond the ones listed here is created without asking Jonathan.
 | | devbox | cloudbox | macbook |
 |---|---|---|---|
 | Machine id (`CCR_MACHINE_ID`, used in the manifest and the secret names) | `devbox` | `cloudbox` | `macbook` |
-| Workspace name (the Telegram group's name) | `pigeon devbox` | `pigeon cloudbox` | `pigeon <mac name>`: read the Mac group's title with Telegram `getChat` |
+| Workspace name (the Telegram group's name) | `pigeon devbox` | `pigeon cloudbox` | `pigeon <mac name>`: the Mac Telegram group's title as Jonathan sees it; ask him if no note records it, and use `pigeon macbook` if he has no preference. Do not call the Bot API for it (`getChat` puts the bot token in the URL) |
 | Workspace owner | `jonathan.mohrbacher@gmail.com` | same | same |
 | Preferred URL | `pigeon-devbox.slack.com` | `pigeon-cloudbox.slack.com` | `pigeon-macbook.slack.com` |
 | Channels created here | `#alerts`, `#em-alerts` | `#alerts` | `#alerts` |
@@ -53,10 +53,44 @@ get around it.
 - **An app configuration token** (if you create the app through `apps.manifest.create` rather than
   the UI) is used for that one call, then revoked on the *Your App Configuration Tokens* page and
   discarded. It is never stored.
-- **Secrets never pass through argv you type, a log, a commit, or a chat.** Write each one from the
-  page straight into the staging file (below), mode 0600, outside any git work tree.
+- **Secrets never pass through argv, stdout, a log, a commit, a screenshot, or your own
+  transcript.** Anything a tool returns to you is stored in the session database and sent to the
+  model provider, so "I'll read it and write it to the file" already leaks it. See *Getting a
+  secret off a page* below.
 - **When done**: sign out of every workspace in that browser, close it, and delete the profile
   directory.
+
+### Getting a secret off a page
+
+The pages that show secrets are *OAuth & Permissions* (bot and user tokens), *Basic Information →
+App Credentials* (signing secret, after *Show*), *Incoming Webhooks* (the webhook URL) and the
+app configuration token modal. On those pages:
+
+- **No screenshots** and no accessibility-tree or DOM dumps returned to you. If you need to see
+  where you are, inject `input, code, pre, [data-qa*="token"] { filter: blur(8px) !important }`
+  first, and screenshot only after.
+- **Read the value inside your browser-driver process and pipe it to `stage-field`**, which writes
+  it into the staging file (0600, outside any work tree) and prints only its shape:
+
+  ```js
+  // inside the Node CDP driver, never returned to the agent
+  const { spawnSync } = require("node:child_process");
+  const { result } = await cdp.send("Runtime.evaluate", {
+    expression: `document.querySelector(${JSON.stringify(selector)})?.value
+                 ?? document.querySelector(${JSON.stringify(selector)})?.textContent ?? ""`,
+    returnByValue: true,
+  });
+  const r = spawnSync("node", [SCRIPT, "stage-field", FILE, FIELD], { input: result.value.trim() });
+  console.log(r.stdout.toString(), r.stderr.toString()); // "staged botToken …: xoxb-…, 57 chars"
+  ```
+
+  `SCRIPT` is `packages/worker/scripts/slack-manifest.mjs`; `FILE` is `~/slack-workspace.<m>.json`
+  (config fields) or `~/slack-alarm-webhook.<m>` (with `FIELD` = `alarmWebhookUrl`). Find the
+  selector on a blurred page; print the element's tag and attributes, never its value. If a value
+  sits behind a *Copy* button rather than in the DOM, click *Show* first. `stage-field` refuses a
+  value of the wrong shape (an `xoxc` token, a truncated secret) without echoing it, so a
+  wrong selector fails loudly instead of staging junk.
+- Non-secret ids (team, app, owner) can be read normally, or staged the same way.
 
 ## Per workspace
 
@@ -103,8 +137,22 @@ Either:
 
 - **UI**: `https://api.slack.com/apps` → *Create New App* → *From a manifest* → pick the workspace
   → paste `/tmp/slack-manifest.<m>.json` (JSON tab) → *Create*; or
-- **API**: generate an app configuration token for the workspace on that same page, call
-  `apps.manifest.create` with it and the manifest, then revoke and discard the token.
+- **API**: generate an app configuration token for the workspace on that same page, staged with
+  the recipe above into its own 0600 file (`~/slack-config-token.<m>`; it is not a config field,
+  so write it from the driver with `fs.writeFileSync(path, value, {mode: 0o600})`). The response
+  carries `credentials.signing_secret` and `client_secret`, so never print it:
+
+  ```bash
+  curl -s -H @<(printf 'Authorization: Bearer %s' "$(cat ~/slack-config-token.<m>)") \
+    --data-urlencode manifest@/tmp/slack-manifest.<m>.json https://slack.com/api/apps.manifest.create \
+    > ~/slack-create.<m>.json   # 0600 under the umask below
+  jq '{ok, error, errors, app_id}' ~/slack-create.<m>.json
+  jq -r .app_id ~/slack-create.<m>.json | node packages/worker/scripts/slack-manifest.mjs stage-field ~/slack-workspace.<m>.json appId
+  jq -r .credentials.signing_secret ~/slack-create.<m>.json | node packages/worker/scripts/slack-manifest.mjs stage-field ~/slack-workspace.<m>.json signingSecret
+  rm ~/slack-create.<m>.json ~/slack-config-token.<m>
+  ```
+
+  Then revoke the token on the *Your App Configuration Tokens* page. Run `umask 077` first.
 
 Expect the Events request URL to be **unverified** ("Your URL didn't respond…"). That is correct:
 the worker answers Slack only for a workspace whose config secret it holds, and it gets that only
@@ -116,7 +164,8 @@ Note the app id (`A…`, *Basic Information*).
 ### 5. Install the app
 
 *Install App* → *Install to Workspace*. On the consent page, choose **`#alerts`** as the channel
-for the incoming webhook. Then collect, each straight into the staging file:
+for the incoming webhook. Then collect each value with `stage-field` (*Getting a secret off a
+page*), under `umask 077`:
 
 | Field | Where |
 |---|---|
@@ -153,7 +202,9 @@ Slack has no public API for muting. The only route is the undocumented `users.pr
 `muted_channels`, known to work with client tokens and unknown with an app's user token. Test it
 **with the app's user token only** (never a client token):
 
-1. Create a scratch public channel `#mute-test`.
+1. Create a scratch public channel `#mute-test`. Do not invite the bot or post in it: the worker
+   refuses every event until the flip, and each refused delivery counts towards Slack disabling the
+   app's event subscriptions (see *At the flip*).
 2. Call `users.prefs.set` with the user token to add that channel's id to `muted_channels` (read
    `users.prefs.get` first and write back the existing list plus the one id; it is a whole-list
    write):
@@ -169,8 +220,9 @@ Slack has no public API for muting. The only route is the undocumented `users.pr
    `invalid_arguments` (a shape problem, not a token one), try the other form once,
    `--data-urlencode 'prefs={"muted_channels":"<existing,>C…"}'`, before calling it a fail.
 
-3. **Pass** only if `#mute-test` then shows as muted on a device (dimmed in the sidebar, no
-   unread badge after a bot post), not merely if the API answers `ok: true`. Any error
+3. **Pass** only if `#mute-test` then shows as muted in the client (reload it: the channel is
+   dimmed in the sidebar and its menu offers *Unmute channel*), not merely if the API answers
+   `ok: true`. Any error
    (`missing_scope`, `not_allowed_token_type`, `unknown_method`), or `ok` with no visible effect,
    is a **fail**. Do not retry with another kind of token.
 4. Archive `#mute-test`.
@@ -181,10 +233,10 @@ Slack has no public API for muting. The only route is the undocumented `users.pr
 
 ### 8. Check and stage the credentials
 
-The staging files live in your home directory, mode 0600, never in a work tree:
+The staging files live in your home directory, mode 0600, never in a work tree, written by
+`stage-field`:
 
 ```bash
-umask 077
 # ~/slack-workspace.<m>.json  : the worker config JSON (7 fields)
 # ~/slack-alarm-webhook.<m>   : the #alerts webhook URL, one line
 node packages/worker/scripts/slack-manifest.mjs check-config ~/slack-workspace.<m>.json
@@ -212,8 +264,11 @@ typed or echoed:
 
 All three machines' configs go into **devbox's** file, because the flip script runs on devbox. They
 are not declared as NixOS secrets here; how the flip reads them is `pigeon-4ogz.6`'s. Check it
-round-trips: `sops -d --extract '["pigeon_slack_workspace_<m>"]' secrets/devbox.yaml | jq -e .teamId`
-prints the team id (an empty value is accepted silently by `sops set`).
+round-trips (an empty value is accepted silently by `sops set`); this prints only the team id:
+
+```bash
+/run/wrappers/bin/sudo nix-shell -p sops -p jq --run 'SOPS_AGE_KEY_FILE=/persist/sops-age-key.txt sops -d --extract "[\"pigeon_slack_workspace_<m>\"]" secrets/devbox.yaml | jq -r .teamId'
+```
 
 The webhook URL is not staged here: hand `~/slack-alarm-webhook.<m>` to the machine's config bead
 (`.15` devbox: sops `pigeon_slack_alarm_webhook` in `secrets/devbox.yaml`; `.10` cloudbox: same key
@@ -232,26 +287,33 @@ sops (or the Keychain) and the PR is merged.
 
 ## At the flip (for `pigeon-4ogz.8`, `.10`, `.11`)
 
-These need the worker holding the workspace's config, so they cannot be done at setup:
+These need the worker holding the workspace's config, so they cannot be done at setup. They need
+the app settings page, so sign in again in a fresh throwaway profile under the same safeguards
+(code through `gws`), and sign out and delete it afterwards.
 
 1. `scripts/slack-flip.ts <m> on` (the only way to put the secret).
 2. App settings → *Event Subscriptions* → **Retry** next to the request URL. It must turn
-   *Verified*. If it does not, the worker is refusing Slack's signature: check the
-   `signingSecret` in the staged config before anything else.
-3. *Event Subscriptions* → turn **Delayed Events** on (hourly retries for 24 h after the first
-   three). It is not a manifest field. Turn it on at setup if the page allows it with the URL
-   unverified; either way, confirm it here.
-4. Then the live checks listed on the flip bead.
+   *Verified*. If it does not, either the worker is refusing Slack's signature (check the
+   `signingSecret` in the staged config) or it is applying the `team_id`/`api_app_id` check to
+   `url_verification`, whose body carries neither (`pigeon-4ogz.4`).
+3. Check that event subscriptions are **enabled** on that page, and search Gmail (`gws`) for a
+   Slack mail saying the app's event subscriptions were disabled. Slack disables them when more than
+   95% of deliveries fail within an hour, and before the flip every delivery fails, so a message
+   typed in a channel the bot is in (`#alerts`, once pigeon posts there) can trip it. If disabled,
+   re-enable them there.
+4. *Event Subscriptions* → turn **Delayed Events** on (hourly retries for 24 h after the first
+   three). It is not a manifest field. Turn it on only now, after *Verified*.
+5. Then the live checks listed on the flip bead.
 
-Events Slack sent before the flip (messages typed in `#alerts`, say) were refused and are not
-replayed unless Delayed Events was already on; that is harmless.
+Events Slack sent before the flip were refused and are not replayed; that is harmless.
 
 ## Changing the manifest later
 
 Edit `packages/worker/slack/manifest.template.json` (and the test that pins it,
 `packages/daemon/test/slack-manifest-script.test.ts`), merge, re-render, and paste into each app's
-*App Manifest* page (or `apps.manifest.update`). A **scope** change needs a reinstall, which issues
-new tokens: re-stage the config and put it into the worker with the flip script. Adding a slash
+*App Manifest* page (or `apps.manifest.update`). A **scope** change needs a reinstall. Check with
+`auth.test` afterwards whether the tokens changed; if they did, re-stage the config and put it into
+the worker with the flip script. Adding a slash
 command needs no reinstall, but the worker must handle it first (`pigeon-4ogz.4`).
 
 ## Limits worth knowing
