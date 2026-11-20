@@ -1,6 +1,6 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs, refusedCsvForSql, type Principal } from "./credentials";
-import { createTelegramClient } from "./telegram";
+import { transportForChat } from "./chat";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 import { withD1, StorageError } from "./d1";
 
@@ -290,7 +290,7 @@ async function unregisterSession(
       // guaranteed 400.
       if (topic.message_thread_id !== null) {
         try {
-          const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+          const client = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN);
           await client.closeForumTopic({
             chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,

@@ -1,6 +1,7 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
-import { createTelegramClient, getTelegramErrorDetails, isPermanentTopicFailure, TelegramClient, TgResult } from "./telegram";
+import { getTelegramErrorDetails, isPermanentTopicFailure, TgResult } from "./telegram";
+import { transportForChat, type ChatTransport } from "./chat";
 import { resolveTopic } from "./topic-manager";
 import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { getBindingForSession } from "./named-topics";
@@ -149,7 +150,7 @@ const json = (body: unknown, status = 200) =>
  */
 export async function alertRelocation(
   env: Env,
-  tg: TelegramClient,
+  tg: ChatTransport,
   opts: {
     sessionId: string;
     chatId: string | number;
@@ -287,7 +288,7 @@ type MediaSendResult =
   | { ok: false; details: unknown };
 
 async function sendTelegramPhoto(
-  tg: TelegramClient,
+  tg: ChatTransport,
   chatId: string | number,
   photoBlob: Blob,
   filename: string,
@@ -308,7 +309,7 @@ async function sendTelegramPhoto(
 }
 
 async function sendTelegramDocument(
-  tg: TelegramClient,
+  tg: ChatTransport,
   chatId: string | number,
   documentBlob: Blob,
   filename: string,
@@ -487,7 +488,7 @@ export async function handleSendNotification(
       }
     }
 
-    const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
 
     // Rich message (pigeon-p909): the daemon offers the whole notification as Telegram rich
     // markdown when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is
@@ -900,7 +901,8 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  // Routed by the STORED post's chat, not by any transport the machine is on now (spec §1).
+  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN);
 
   const telegramResult = await tg.editMessageText({
     chatId: row.chat_id,

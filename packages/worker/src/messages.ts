@@ -33,7 +33,8 @@
 import { authenticate } from "./credentials";
 import { unauthorized } from "./auth";
 import { isAllowedChatId } from "./notifications";
-import { createTelegramClient, type TgResult } from "./telegram";
+import { type TgResult } from "./telegram";
+import { transportForChat } from "./chat";
 
 /** Default bound on the Telegram call. Below the daemon's ~5 s worker leg for alerts. */
 export const MESSAGES_SEND_DEFAULT_TIMEOUT_MS = 4_000;
@@ -203,7 +204,7 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
     return Response.json({ error: "chat_not_allowed" }, { status: 403 });
   }
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
   return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
       await tg.sendMessage({
@@ -234,7 +235,7 @@ export async function handleUnpinTopic(env: Env, request: Request): Promise<Resp
     return Response.json({ error: "chat_not_allowed" }, { status: 403 });
   }
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
   return bounded(remaining(startedAt, MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(await tg.unpinAllForumTopicMessages({ chatId, messageThreadId: thread, signal }), () => ({})),
   );

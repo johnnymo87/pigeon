@@ -1,5 +1,5 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { createTelegramClient, type TelegramClient } from "./telegram";
+import { transportForChat, type ChatTransport } from "./chat";
 import {
   listOrphaned,
   listReapable,
@@ -59,7 +59,8 @@ export interface ReapTopicsOptions {
   reapTtlMs?: number;
   orphanTtlMs?: number;
   limit?: number;
-  tgClient?: TelegramClient;
+  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
+  tgClient?: ChatTransport;
 }
 
 export interface ReapResult {
@@ -72,7 +73,8 @@ export interface CloseOrphanedTopicsOptions {
   now?: number;
   orphanTtlMs?: number;
   limit?: number;
-  tgClient?: TelegramClient;
+  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
+  tgClient?: ChatTransport;
 }
 
 export interface CloseOrphanedResult {
@@ -86,7 +88,8 @@ export interface RunTopicReaperOptions {
   orphanTtlMs?: number;
   reapCap?: number;
   orphanCap?: number;
-  tgClient?: TelegramClient;
+  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
+  tgClient?: ChatTransport;
   /**
    * Run the orphan-closer this tick. Defaults to true so the reaper stays window-agnostic —
    * the cron handler owns the schedule decision via `shouldCloseOrphans`.
@@ -121,7 +124,8 @@ export async function reapTopics(
     return { reaped: 0, rateLimited: false };
   }
 
-  const tg = opts.tgClient ?? createTelegramClient(opts.botToken);
+  // Rows of every chat are mixed here, so the transport is picked per row, by its address.
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
   let reaped = 0;
 
   for (const row of rows) {
@@ -131,7 +135,7 @@ export async function reapTopics(
       continue;
     }
 
-    const res = await tg.deleteForumTopic({
+    const res = await tgFor(row.chat_id).deleteForumTopic({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });
@@ -167,7 +171,7 @@ export async function closeOrphanedTopics(
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tg = opts.tgClient ?? createTelegramClient(opts.botToken);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient);
   let closedOrphans = 0;
 
   for (const row of rows) {
@@ -177,7 +181,7 @@ export async function closeOrphanedTopics(
       continue;
     }
 
-    const res = await tg.closeForumTopic({
+    const res = await tgFor(row.chat_id).closeForumTopic({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });

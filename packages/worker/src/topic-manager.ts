@@ -1,5 +1,6 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { createTelegramClient, getTelegramErrorDetails, isPermanentTopicFailure, type TelegramClient } from "./telegram";
+import { getTelegramErrorDetails, isPermanentTopicFailure } from "./telegram";
+import { transportForChat, type ChatTransport } from "./chat";
 import {
   deleteBySession,
   deleteTopicBySession,
@@ -51,7 +52,8 @@ export interface ResolveTopicOptions {
   ttlMs?: number;
   pollAttempts?: number;
   pollIntervalMs?: number;
-  tgClient?: TelegramClient;
+  /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
+  tgClient?: ChatTransport;
 }
 
 export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
@@ -98,7 +100,7 @@ export async function resolveTopic(
       row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
     const name = topicName(opts.dir || fallbackDir, title);
 
-    const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
+    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
     try {
       const res = await tgClient.editForumTopic({
         chatId: opts.chatId,
@@ -110,7 +112,7 @@ export async function resolveTopic(
       // rival isolate got there first, or because a previous attempt succeeded and only the D1
       // write was lost. Either way the desired end state holds, so clear the flag.
       if (res.ok || res.kind === "topic_not_modified") {
-        await renameProvisional(db, { sessionId: opts.sessionId, name, now: opts.now });
+        await renameProvisional(db, { sessionId: opts.sessionId, name, chatId: opts.chatId, now: opts.now });
         return;
       }
 
@@ -158,7 +160,7 @@ export async function resolveTopic(
   }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
-      const tgClient = opts.tgClient ?? createTelegramClient(opts.botToken);
+      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
       // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
       // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
       // Removing this reopen call is tracked as roadmap item 6c.
@@ -180,7 +182,7 @@ export async function resolveTopic(
           await deleteTopicBySession(db, opts.sessionId, opts.chatId, existing.message_thread_id);
         } else if (reopenRes.kind === "topic_not_modified") {
           // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
-          await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+          await markOpen(db, { sessionId: opts.sessionId, chatId: opts.chatId, now: opts.now });
           await upgradeProvisionalName(existing, existing.message_thread_id);
           return { ok: true, messageThreadId: existing.message_thread_id };
         } else {
@@ -210,7 +212,7 @@ export async function resolveTopic(
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
       } else {
-        await markOpen(db, { sessionId: opts.sessionId, now: opts.now });
+        await markOpen(db, { sessionId: opts.sessionId, chatId: opts.chatId, now: opts.now });
         await upgradeProvisionalName(existing, existing.message_thread_id);
         return { ok: true, messageThreadId: existing.message_thread_id };
       }
@@ -231,7 +233,7 @@ export async function resolveTopic(
   const delay =
     opts.delayFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const tg = opts.tgClient ?? createTelegramClient(opts.botToken);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
 
   // Helper for creator flow (executed by initial reserve winner or steal winner)
   async function runCreatorFlow(): Promise<ResolveTopicResult> {
@@ -247,7 +249,8 @@ export async function resolveTopic(
 
     if (!createRes.ok) {
       // Conditional-delete the reservation row so subsequent calls can try again
-      await deleteBySession(db, opts.sessionId);
+      // Chat-scoped: the row may have moved to another chat while the create ran (topics.ts chatScope).
+      await deleteBySession(db, opts.sessionId, opts.chatId);
 
       if (createRes.kind === "rate_limited") {
         return {
@@ -276,9 +279,11 @@ export async function resolveTopic(
 
     const threadId = createRes.result.message_thread_id;
 
-    // Finalize CAS: only updates if message_thread_id IS NULL
+    // Finalize CAS: only updates if message_thread_id IS NULL, and only in THIS chat. A create
+    // that finishes after the row moved to another chat must not write its thread id there.
     const finalized = await finalize(db, {
       sessionId: opts.sessionId,
+      chatId: opts.chatId,
       messageThreadId: threadId,
       name,
       provisional,

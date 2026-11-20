@@ -1,7 +1,7 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs } from "./credentials";
 import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
-import { createTelegramClient } from "./telegram";
+import { transportForChat } from "./chat";
 import { handOutRelayItems, SWARM_RELAY_HEADER, type HandOutItem } from "./relay";
 import { handOutLaunchItems, type LaunchHandOut } from "./remote-launch";
 import { topicsEnabled } from "./topics";
@@ -263,7 +263,7 @@ async function refuseUnservableLaunch(
     "The command was dropped; nothing was started. Re-send it once the machine can serve that backend.",
   ].join("\n");
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(info.chatId, env.TELEGRAM_BOT_TOKEN);
   const res = await tg.sendMessage({
     chatId: info.chatId,
     text,

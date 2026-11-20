@@ -5,8 +5,11 @@ import { editTopicName } from "./topic-rename";
 import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
-import { parseTagArgs, TAG_USAGE_TEXT } from "./tag-command";
-import { LAUNCH_USAGE_TEXT, parseLaunchMessage } from "./launch-command";
+import { transportForChat } from "./chat";
+import { parseChatCommand, sessionCommandAck } from "./chat/commands";
+import { ambiguousRefText, noSessionRefText, resolveSessionRef } from "./chat/session-ref";
+import { TAG_USAGE_TEXT } from "./tag-command";
+import { LAUNCH_USAGE_TEXT } from "./launch-command";
 
 type CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set";
 
@@ -454,7 +457,7 @@ async function sendTelegramMessage(
   text: string,
   opts: { messageThreadId: number | undefined },
 ): Promise<void> {
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
   const messageThreadId = topicsEnabled(env) ? opts.messageThreadId : undefined;
   const res = await tg.sendMessage({
     chatId,
@@ -847,6 +850,34 @@ async function resolveReplySession(
 }
 
 /**
+ * Resolve an explicit `<session-id>` argument (spec §5). Answers in the chat and returns null
+ * when it names no session, more than one, or one whose machine is not recently seen; the last
+ * check is the same one context resolution makes.
+ */
+async function resolveTargetSession(
+  db: D1Database,
+  env: Env,
+  ref: string,
+  chatId: number | string,
+  messageThreadId: number | undefined,
+): Promise<{ sessionId: string; machineId: string; label: string | null } | null> {
+  const found = await resolveSessionRef(db, ref);
+  if (found.kind === "none") {
+    await sendTelegramMessage(env, chatId, noSessionRefText(ref), { messageThreadId });
+    return null;
+  }
+  if (found.kind === "ambiguous") {
+    await sendTelegramMessage(env, chatId, ambiguousRefText(ref, found.candidates), { messageThreadId });
+    return null;
+  }
+  if (!(await isMachineRecent(db, found.machineId))) {
+    await sendTelegramMessage(env, chatId, `${found.machineId} is not recently seen.`, { messageThreadId });
+    return null;
+  }
+  return { sessionId: found.sessionId, machineId: found.machineId, label: found.label };
+}
+
+/**
  * Handle an incoming Telegram webhook request.
  */
 /** Plain text of a `RichText` value: a string, an array of RichText, or an object with `text`. */
@@ -994,8 +1025,11 @@ export async function handleTelegramWebhook(
     }
     update.message.text = cmdNorm.text;
 
-    const parsedLaunch = parseLaunchMessage(update.message.text);
-    if (parsedLaunch) {
+    // One parser for every chat ingress (src/chat/commands.ts); null = an ordinary message.
+    const parsedCmd = parseChatCommand(update.message.text);
+
+    if (parsedCmd?.kind === "launch") {
+      const parsedLaunch = parsedCmd.launch;
       const launchChatId = update.message.chat.id;
 
       // A malformed /launch must never fall through to the plain-message path:
@@ -1082,77 +1116,36 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    // Handle /kill command (reply-based)
-    if (/^\/kill$/.test(update.message.text)) {
-      const killChatId = update.message.chat.id;
+    // /kill /interrupt /compact /mcp /model: one session each, named by the optional leading
+    // <session-id> (full id or unique prefix, spec §5) or else by context (swipe-reply, topic).
+    if (parsedCmd?.kind === "session") {
+      const cmdChatId = update.message.chat.id;
+      const threadId = update.message.message_thread_id;
 
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
+      const resolved = parsedCmd.target !== undefined
+        ? await resolveTargetSession(db, env, parsedCmd.target, cmdChatId, threadId)
+        : await resolveReplySession(db, env, update.message as TelegramMessage);
       if (!resolved) return OK();
 
       const commandId = await queueCommand(db, env, {
         machineId: resolved.machineId,
         sessionId: resolved.sessionId,
-        command: "",
-        chatId: String(killChatId),
+        command: parsedCmd.arg,
+        chatId: String(cmdChatId),
         label: resolved.label,
-        commandType: "kill",
-        messageThreadId: update.message.message_thread_id,
+        commandType: parsedCmd.type,
+        messageThreadId: threadId,
       });
       if (!commandId) return OK();
 
-      await sendTelegramMessage(env, killChatId, `Killing session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
-    // Handle /interrupt command (reply-based) — interrupts in-flight processing without destroying the session
-    if (/^\/interrupt$/.test(update.message.text)) {
-      const interruptChatId = update.message.chat.id;
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command: "",
-        chatId: String(interruptChatId),
-        label: resolved.label,
-        commandType: "interrupt",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, interruptChatId, `Interrupting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
-    // Handle /compact command (reply-based)
-    if (/^\/compact$/.test(update.message.text)) {
-      const compactChatId = update.message.chat.id;
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command: "",
-        chatId: String(compactChatId),
-        label: resolved.label,
-        commandType: "compact",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, compactChatId, `Compacting session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
+      await sendTelegramMessage(env, cmdChatId, sessionCommandAck(parsedCmd, resolved.sessionId, resolved.machineId), { messageThreadId: threadId });
       return OK();
     }
 
     // Handle /rename command (reply-based)
-    const renameMatch = update.message.text.match(/^\/rename(?:\s+([\s\S]*))?$/);
-    if (renameMatch) {
+    if (parsedCmd?.kind === "rename") {
       const renameChatId = update.message.chat.id;
-      const rawTitle = renameMatch[1]?.trim();
+      const rawTitle = parsedCmd.title;
 
       if (!rawTitle) {
         await sendTelegramMessage(env, renameChatId, "Usage: /rename <new title>", {
@@ -1232,117 +1225,6 @@ export async function handleTelegramWebhook(
       return OK();
     }
 
-    // Handle /mcp list (reply-based)
-    if (/^\/mcp\s+list$/.test(update.message.text)) {
-      const mcpChatId = update.message.chat.id;
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command: "",
-        chatId: String(mcpChatId),
-        label: resolved.label,
-        commandType: "mcp_list",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, mcpChatId, `Listing MCP servers for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
-    // Handle /mcp enable <SERVER> (reply-based)
-    const mcpEnableMatch = update.message.text.match(/^\/mcp\s+enable\s+(\S+)$/);
-    if (mcpEnableMatch) {
-      const serverName = mcpEnableMatch[1]!;
-      const mcpChatId = update.message.chat.id;
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command: serverName,
-        chatId: String(mcpChatId),
-        label: resolved.label,
-        commandType: "mcp_enable",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, mcpChatId, `Enabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
-    // Handle /mcp disable <SERVER> (reply-based)
-    const mcpDisableMatch = update.message.text.match(/^\/mcp\s+disable\s+(\S+)$/);
-    if (mcpDisableMatch) {
-      const serverName = mcpDisableMatch[1]!;
-      const mcpChatId = update.message.chat.id;
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command: serverName,
-        chatId: String(mcpChatId),
-        label: resolved.label,
-        commandType: "mcp_disable",
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      await sendTelegramMessage(env, mcpChatId, `Disabling MCP server \`${serverName}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      return OK();
-    }
-
-    // Handle /model (list) or /model <PROVIDER/MODEL> (set) — reply-based
-    const modelMatch = update.message.text.match(/^\/model(?:\s+(\S+))?$/);
-    if (modelMatch) {
-      const modelChatId = update.message.chat.id;
-      const firstArg = modelMatch[1];
-
-      const resolved = await resolveReplySession(db, env, update.message as TelegramMessage);
-      if (!resolved) return OK();
-
-      let commandType: CommandType;
-      let modelCode: string | undefined;
-
-      if (firstArg && firstArg.includes("/")) {
-        // /model <PROVIDER/MODEL> → model_set
-        modelCode = firstArg;
-        commandType = "model_set";
-      } else {
-        // /model → model_list
-        commandType = "model_list";
-      }
-
-      const command = modelCode ?? "";
-      const commandId = await queueCommand(db, env, {
-        machineId: resolved.machineId,
-        sessionId: resolved.sessionId,
-        command,
-        chatId: String(modelChatId),
-        label: resolved.label,
-        commandType,
-        messageThreadId: update.message.message_thread_id,
-      });
-      if (!commandId) return OK();
-
-      if (commandType === "model_set") {
-        await sendTelegramMessage(env, modelChatId, `Setting model to \`${modelCode}\` for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      } else {
-        await sendTelegramMessage(env, modelChatId, `Listing models for session \`${resolved.sessionId}\` on ${resolved.machineId}...`, { messageThreadId: update.message.message_thread_id });
-      }
-      return OK();
-    }
-
     // ─── /tag ────────────────────────────────────────────────────────────────
     //
     // Every form routes through resolveReplySession, exactly like /mcp and
@@ -1355,10 +1237,9 @@ export async function handleTelegramWebhook(
     // context session in session_id (routing, unread badge) and the session
     // being tagged in metadata_json. They are usually the same, but the backlog
     // view exists precisely to invite tagging some OTHER session from here.
-    const tagMatch = update.message.text.match(/^\/tag(?:\s+([\s\S]*))?$/);
-    if (tagMatch) {
+    if (parsedCmd?.kind === "tag") {
       const tagChatId = update.message.chat.id;
-      const parsed = parseTagArgs(tagMatch[1]);
+      const parsed = parsedCmd.args;
 
       // A malformed /tag must never fall through to the plain-message path: a
       // typo silently becoming a prompt in a live session is a worse outcome
