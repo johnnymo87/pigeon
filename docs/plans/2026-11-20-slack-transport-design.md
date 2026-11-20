@@ -147,7 +147,9 @@ known to work with client tokens and is unverified with an app's user token. So:
   channels then never push, except for the @-mentions pigeon adds to questions and error alerts.
   Coordinator channels push because **every bot post in a channel whose named-topic key starts
   `stallwatch:`** (the coordinator channels) carries the owner @-mention, as a channel-level
-  `notifyOwner`. Unread badges still show in the sidebar; that is the difference from a real mute.
+  `notifyOwner`. `#alerts` (`_alerts`) is treated the same way: it is not a session channel and
+  replaces Telegram's General, where every alert pushed. `#em-alerts` posts by incoming webhook
+  and cannot mention; Jonathan can set that one channel to "All new messages" if wanted. Unread badges still show in the sidebar; that is the difference from a real mute.
 - **Real mute, if it works:** at workspace setup, test `users.prefs.set muted_channels` with the
   app's user token on a scratch channel. If it takes effect, the worker also mutes each new session
   channel right after creating it (best-effort; a failure logs and never blocks a send), and
